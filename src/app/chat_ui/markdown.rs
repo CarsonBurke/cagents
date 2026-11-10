@@ -893,8 +893,12 @@ impl Text {
         self.spans.iter().collect::<Vec<_>>()
     }
     fn new(spans: Vec<Span>) -> Self {
+        Self::from_spans(Spans::new(spans))
+    }
+
+    fn from_spans(spans: Spans) -> Self {
         Self {
-            spans: Arc::new(Spans::new(spans)),
+            spans: Arc::new(spans),
             plain: std::cell::OnceCell::new(),
             plain_source: std::cell::OnceCell::new(),
             styled_cache: RefCell::default(),
@@ -1217,6 +1221,104 @@ fn collect_images(items: &[Item], images: &mut HashSet<Uri>) {
     }
 }
 
+/// Parser-local text and ranges. Text fragments enter their final backing
+/// directly; publication never builds and then rejoins owned span Strings.
+#[derive(Default)]
+struct SpanBuffer {
+    text: String,
+    runs: Vec<Run>,
+}
+
+impl SpanBuffer {
+    fn is_empty(&self) -> bool {
+        self.runs.is_empty()
+    }
+
+    fn push(
+        &mut self,
+        text: pulldown_cmark::CowStr<'_>,
+        attributes: Attributes,
+        link: Option<Uri>,
+    ) {
+        if self.text.is_empty() {
+            self.text = text.into_string();
+        } else {
+            self.text.push_str(&text);
+        }
+        self.runs.push(Run {
+            end: self.text.len(),
+            link,
+            attributes,
+        });
+    }
+
+    fn finish(&mut self, linkify: bool) -> Text {
+        let mut text = mem::take(&mut self.text);
+        let mut runs = mem::take(&mut self.runs);
+        if linkify {
+            // Match the existing bare-reference rule: only adjacent unlinked,
+            // non-code fragments in the same style can form one reference.
+            runs.dedup_by(|next, previous| {
+                if next.link.is_none()
+                    && previous.link.is_none()
+                    && !next.attributes.code
+                    && next.attributes == previous.attributes
+                {
+                    previous.end = next.end;
+                    true
+                } else {
+                    false
+                }
+            });
+            let mut linked = Vec::with_capacity(runs.len());
+            let mut start = 0;
+            for mut run in runs {
+                let end = run.end;
+                let fragment = &text[start..end];
+                if run.link.is_none() && run.attributes.code {
+                    run.link = destination(fragment);
+                    linked.push(run);
+                } else if run.link.is_none() {
+                    let mut copied = 0;
+                    for (from, to, destination) in references(fragment) {
+                        if copied < from {
+                            linked.push(Run {
+                                end: start + from,
+                                link: None,
+                                attributes: run.attributes,
+                            });
+                        }
+                        linked.push(Run {
+                            end: start + to,
+                            link: Some(destination),
+                            attributes: run.attributes,
+                        });
+                        copied = to;
+                    }
+                    if copied == 0 || copied < fragment.len() {
+                        linked.push(Run {
+                            end,
+                            link: None,
+                            attributes: run.attributes,
+                        });
+                    }
+                } else {
+                    linked.push(run);
+                }
+                start = end;
+            }
+            runs = linked;
+        }
+        text.shrink_to_fit();
+        Text::from_spans(Spans {
+            text,
+            runs: runs.into_boxed_slice(),
+            #[cfg(test)]
+            disposed: None,
+        })
+    }
+}
+
 fn parse_with<'a>(
     mut state: impl BorrowMut<State> + 'a,
     markdown: &'a str,
@@ -1240,7 +1342,7 @@ fn parse_with<'a>(
 
     let reference_labels = Rc::new(RefCell::new(HashSet::new()));
 
-    let mut spans = Vec::new();
+    let mut spans = SpanBuffer::default();
     let mut code = String::new();
     let mut code_language = None;
     let mut code_lines = Vec::new();
@@ -1355,8 +1457,6 @@ fn parse_with<'a>(
 
     let parser = parser.into_offset_iter();
 
-    // We want to keep the `spans` capacity
-    #[allow(clippy::drain_collect)]
     parser.filter_map(move |(event, source)| match event {
         pulldown_cmark::Event::Start(tag) => match tag {
             pulldown_cmark::Tag::Heading { level, .. } if !metadata => {
@@ -1400,7 +1500,7 @@ fn parse_with<'a>(
                 ..
             } if !metadata => {
                 if !spans.is_empty() {
-                    let text = Text::new(linked(spans.drain(..)));
+                    let text = spans.finish(true);
                     RefCell::borrow_mut(&inline_items).push(match inline_heading {
                         Some(level) => Item::Heading(level, text),
                         None => Item::Paragraph(text),
@@ -1426,7 +1526,7 @@ fn parse_with<'a>(
                     produce(
                         state.borrow_mut(),
                         &mut stack,
-                        Item::Paragraph(Text::new(linked(spans.drain(..)))),
+                        Item::Paragraph(spans.finish(true)),
                         source,
                     )
                 };
@@ -1452,7 +1552,7 @@ fn parse_with<'a>(
                     produce(
                         state.borrow_mut(),
                         &mut stack,
-                        Item::Paragraph(Text::new(linked(spans.drain(..)))),
+                        Item::Paragraph(spans.finish(true)),
                         source,
                     )
                 };
@@ -1473,7 +1573,7 @@ fn parse_with<'a>(
                     produce(
                         state.borrow_mut(),
                         &mut stack,
-                        Item::Paragraph(Text::new(linked(spans.drain(..)))),
+                        Item::Paragraph(spans.finish(true)),
                         source,
                     )
                 }
@@ -1515,7 +1615,7 @@ fn parse_with<'a>(
                     produce(
                         state.borrow_mut(),
                         &mut stack,
-                        Item::Heading(level, Text::new(linked(spans.drain(..)))),
+                        Item::Heading(level, spans.finish(true)),
                         source,
                     )
                 }
@@ -1543,7 +1643,7 @@ fn parse_with<'a>(
                     produce(
                         state.borrow_mut(),
                         &mut stack,
-                        Item::Paragraph(Text::new(linked(spans.drain(..)))),
+                        Item::Paragraph(spans.finish(true)),
                         source,
                     )
                 }
@@ -1555,7 +1655,7 @@ fn parse_with<'a>(
                     produce(
                         state.borrow_mut(),
                         &mut stack,
-                        Item::Paragraph(Text::new(linked(spans.drain(..)))),
+                        Item::Paragraph(spans.finish(true)),
                         source,
                     )
                 }
@@ -1588,7 +1688,7 @@ fn parse_with<'a>(
             }
             pulldown_cmark::TagEnd::Image if !metadata => {
                 let (url, title) = image.take()?;
-                let alt = Text::new(spans.drain(..).collect());
+                let alt = spans.finish(false);
 
                 let state = state.borrow_mut();
                 let _ = state.images.insert(url.clone());
@@ -1653,7 +1753,7 @@ fn parse_with<'a>(
                     let _ = produce(
                         state.borrow_mut(),
                         &mut stack,
-                        Item::Paragraph(Text::new(linked(spans.drain(..)))),
+                        Item::Paragraph(spans.finish(true)),
                         source.clone(),
                     );
                 }
@@ -1689,67 +1789,70 @@ fn parse_with<'a>(
         pulldown_cmark::Event::Text(text) if !metadata => {
             if code_block {
                 code.push_str(&text);
-
                 return None;
             }
-
-            let span = Span::Standard {
-                text: text.into_string(),
-                strong,
-                emphasis,
-                strikethrough,
-                link: link.clone(),
-                code: false,
-            };
-
-            spans.push(span);
-
+            spans.push(
+                text,
+                Attributes {
+                    strong,
+                    emphasis,
+                    strikethrough,
+                    code: false,
+                },
+                link.clone(),
+            );
             None
         }
         pulldown_cmark::Event::Code(code) if !metadata => {
-            let span = Span::Standard {
-                text: code.into_string(),
-                strong,
-                emphasis,
-                strikethrough,
-                link: link.clone(),
-                code: true,
-            };
-
-            spans.push(span);
+            spans.push(
+                code,
+                Attributes {
+                    strong,
+                    emphasis,
+                    strikethrough,
+                    code: true,
+                },
+                link.clone(),
+            );
             None
         }
         pulldown_cmark::Event::SoftBreak if !metadata => {
-            spans.push(Span::Standard {
-                text: String::from(" "),
-                strikethrough,
-                strong,
-                emphasis,
-                link: link.clone(),
-                code: false,
-            });
+            spans.push(
+                " ".into(),
+                Attributes {
+                    strong,
+                    emphasis,
+                    strikethrough,
+                    code: false,
+                },
+                link.clone(),
+            );
             None
         }
         pulldown_cmark::Event::HardBreak if !metadata => {
-            spans.push(Span::Standard {
-                text: String::from("\n"),
-                strikethrough,
-                strong,
-                emphasis,
-                link: link.clone(),
-                code: false,
-            });
+            spans.push(
+                "\n".into(),
+                Attributes {
+                    strong,
+                    emphasis,
+                    strikethrough,
+                    code: false,
+                },
+                link.clone(),
+            );
             None
         }
         pulldown_cmark::Event::InlineHtml(h) if !metadata && h.eq_ignore_ascii_case("<br>") => {
-            spans.push(Span::Standard {
-                text: String::from("\n"),
-                strikethrough,
-                strong,
-                emphasis,
-                link: link.clone(),
-                code: false,
-            });
+            spans.push(
+                "\n".into(),
+                Attributes {
+                    strong,
+                    emphasis,
+                    strikethrough,
+                    code: false,
+                },
+                link.clone(),
+            );
             None
         }
         pulldown_cmark::Event::Rule => produce(state.borrow_mut(), &mut stack, Item::Rule, source),
@@ -1782,6 +1885,7 @@ fn parse_with<'a>(
 /// The parser can hand over one run of text as several pieces, so neighbours
 /// set in the same style are joined first: an address cut in two would
 /// otherwise link neither half.
+#[cfg(test)]
 fn linked(spans: impl Iterator<Item = Span>) -> Vec<Span> {
     let mut joined: Vec<Span> = Vec::new();
     for span in spans {
@@ -2064,6 +2168,76 @@ mod tests {
         match content.items() {
             [Item::Paragraph(text)] => text.clone(),
             other => panic!("expected paragraph: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn direct_parser_runs_match_owned_span_linking_and_image_text() {
+        let span = |text: &str, strong, code, link: Option<Uri>| Span::Standard {
+            text: text.into(),
+            strikethrough: false,
+            link,
+            strong,
+            emphasis: false,
+            code,
+        };
+        let cases = [
+            vec![
+                span("https://exa", false, false, None),
+                span("mple.test/λ", false, false, None),
+            ],
+            vec![
+                span("", false, false, None),
+                span("λ café ", true, false, None),
+                span("src/lib.rs:12", false, true, None),
+                span("", true, false, None),
+            ],
+            vec![
+                span(
+                    "https://example.test",
+                    false,
+                    false,
+                    Some("app://explicit".into()),
+                ),
+                span(" /tmp/λ.rs:8", false, false, None),
+            ],
+        ];
+        for spans in cases {
+            for linkify in [false, true] {
+                let expected = Text::new(if linkify {
+                    linked(spans.clone().into_iter())
+                } else {
+                    spans.clone()
+                });
+                let mut builder = SpanBuffer::default();
+                for Span::Standard {
+                    text,
+                    strikethrough,
+                    link,
+                    strong,
+                    emphasis,
+                    code,
+                } in spans.clone()
+                {
+                    builder.push(
+                        text.into(),
+                        Attributes {
+                            strikethrough,
+                            strong,
+                            emphasis,
+                            code,
+                        },
+                        link,
+                    );
+                }
+                let actual = builder.finish(linkify);
+                assert_eq!(
+                    format!("{:?}", actual.semantic_spans()),
+                    format!("{:?}", expected.semantic_spans())
+                );
+                assert_eq!(actual.plain(), expected.plain());
+                assert!(builder.is_empty());
+            }
         }
     }
 
