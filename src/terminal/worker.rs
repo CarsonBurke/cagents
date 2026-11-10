@@ -6500,7 +6500,7 @@ mod tests {
             host_incarnation: proof.host_incarnation.clone(),
         };
         let config = TerminalConfig {
-            holder_recovery: Some(holder::Recovery {
+            holder_recovery: Some(crate::terminal::holder::Recovery {
                 source: source.clone(),
                 previous_sources: Vec::new(),
                 relaunches: Vec::new(),
@@ -6557,7 +6557,7 @@ mod tests {
         result.join().unwrap().unwrap();
         assert!(handle.is_completed());
         assert!(
-            holder::cleanup::confirmed_with_role(
+            crate::terminal::holder::cleanup::confirmed_with_role(
                 &source,
                 &expected,
                 &proof,
