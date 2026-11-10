@@ -90,34 +90,18 @@ pub(super) fn restore(host: &SharedHost) -> Result<bool, String> {
     // Preserve every original pane. A paused native owner opens as recorded
     // history through the existing stop ledger; neither the crash scanner nor
     // a pane reattachment may launch its provider behind the user's back.
-    let paused_chats = record
-        .census
-        .chats
-        .iter()
-        .filter(|source| record.paused_chats.contains(&source.id))
-        .cloned()
-        .collect();
-    let mut paused = crate::upgrade::floor::Record::new(
+    let mut paused = paused_record(
         record.source.clone(),
-        paused_chats,
+        &record.census,
+        &record.paused_chats,
         record.paused_terminals.clone(),
-    );
+    )?;
     if let Some(previous) = crate::upgrade::floor::load()?
         .records
         .iter()
         .find(|previous| previous.source == record.source)
     {
         paused.protocol = previous.protocol;
-    }
-    for source in &paused.chats {
-        let saved = record
-            .census
-            .snapshots
-            .iter()
-            .find(|saved| saved.source == *source)
-            .cloned()
-            .ok_or("The paused conversation lost its exact captured page")?;
-        paused.snapshots.push(saved);
     }
     paused.save()?;
     // A close performed by the already-approved floor can retire its managed
@@ -157,6 +141,48 @@ pub(super) fn restore(host: &SharedHost) -> Result<bool, String> {
     Ok(true)
 }
 
+fn paused_record(
+    source: crate::model::HostSessionProof,
+    census: &recovery::Census,
+    paused_chats: &[crate::model::TerminalId],
+    paused_terminals: Vec<crate::model::TerminalId>,
+) -> Result<crate::upgrade::floor::Record, String> {
+    let chats = census
+        .chats
+        .iter()
+        .filter(|chat| paused_chats.contains(&chat.id))
+        .cloned()
+        .collect();
+    let mut paused = crate::upgrade::floor::Record::new(source, chats, paused_terminals);
+    for source in &paused.chats {
+        let saved = census
+            .snapshots
+            .iter()
+            .find(|saved| saved.source == *source)
+            .cloned()
+            .ok_or("The paused conversation lost its exact captured page")?;
+        paused.snapshots.push(saved);
+    }
+    paused.aliases = census
+        .aliases
+        .iter()
+        .filter(|alias| {
+            paused
+                .chats
+                .iter()
+                .any(|source| crate::upgrade::floor::same_allocation(source, alias))
+        })
+        .cloned()
+        .collect();
+    paused.presentations = census
+        .presentations
+        .iter()
+        .filter(|presentation| paused.chats.contains(&presentation.session))
+        .cloned()
+        .collect();
+    Ok(paused)
+}
+
 fn ensure_no_ambiguous_adoption(host: &SharedHost) -> Result<(), String> {
     if let Some(reason) = host
         .lock()
@@ -185,7 +211,7 @@ mod tests {
     };
 
     #[test]
-    fn captured_paused_codex_pane_attaches_as_history_without_executing_its_provider() {
+    fn captured_unnamed_managed_codex_pane_attaches_as_history_without_executing_its_provider() {
         const ROOT: &str = "CAGENTS_RECOVERY_HISTORY_TEST_ROOT";
         let root = if let Some(root) = std::env::var_os(ROOT) {
             std::path::PathBuf::from(root)
@@ -263,17 +289,101 @@ mod tests {
                 },
             )
             .unwrap();
-        let mut paused =
+        let mut alias = source.clone();
+        alias.launch.session_id = None;
+        let agent = crate::agent_execution::Agent {
+            id: crate::model::AgentId::new(),
+            name: None,
+            origin: crate::agent_execution::Origin::User,
+            spec: crate::agent_execution::Spec {
+                provider: crate::agent::Provider::Codex,
+                account: None,
+                target: crate::agent_execution::Target {
+                    repository: root.join("project"),
+                    directory: root.join("project"),
+                    placement: None,
+                },
+                surface: crate::agent_execution::Surface::Chat,
+                model: None,
+                permission_mode: None,
+                reasoning_effort: None,
+            },
+            placement: crate::workspace_model::views::Scope::Channel(crate::model::ChannelId::new()),
+            session: Some(crate::agent_execution::HostedSession::Chat(alias.clone())),
+            console: None,
+            created_ms: 1,
+            closed: false,
+        };
+        let pane = crate::workspace_model::views::Pane {
+            id: crate::model::CardId::from_uuid(agent.id.as_uuid()),
+            title: "Paused managed Codex".into(),
+            user_title: None,
+            pending_terminal_start: false,
+            width_fraction: 0.5,
+            kind: crate::model::CardKind::Chat(alias.clone()),
+            scope: Some(root.join("project")),
+        };
+        let registry_path = root.join("registry.sqlite3");
+        let mut registry = super::super::model::Registry::at(&registry_path).unwrap();
+        registry
+            .apply(&crate::workspace_model::ModelEdit::OpenProject {
+                repository: root.join("project"),
+                name: "Recovery fixture".into(),
+                kind: Default::default(),
+            })
+            .unwrap();
+        let crate::workspace_model::views::Scope::Channel(channel) = &agent.placement else {
+            unreachable!()
+        };
+        registry
+            .apply(&crate::workspace_model::ModelEdit::CreateChannel {
+                id: *channel,
+                repository: root.join("project"),
+                title: "Paused Codex".into(),
+                title_source: Default::default(),
+            })
+            .unwrap();
+        let db = rusqlite::Connection::open(&registry_path).unwrap();
+        db.execute(
+            "INSERT INTO agents(id,origin,record,session_id,closed) VALUES(?1,'user',?2,?3,0)",
+            rusqlite::params![
+                agent.id.to_string(),
+                serde_json::to_string(&agent).unwrap(),
+                source.id.to_string()
+            ],
+        )
+        .unwrap();
+        drop(db);
+        registry
+            .apply(&crate::workspace_model::ModelEdit::SeedView {
+                scope: agent.placement.clone(),
+                panes: vec![pane.clone()],
+                closed: Vec::new(),
+            })
+            .unwrap();
+        let mut presentation =
             crate::upgrade::floor::Record::new(proof("old"), vec![source.clone()], Vec::new());
-        paused.snapshots = captured.finish();
+        registry.capture_update_floor(&mut presentation).unwrap();
+        assert_eq!(presentation.aliases, vec![alias.clone()]);
+        assert_eq!(presentation.presentations.len(), 1);
+        let census = recovery::Census {
+            chats: vec![source.clone()],
+            snapshots: captured.finish(),
+            aliases: presentation.aliases,
+            presentations: presentation.presentations,
+            ..Default::default()
+        };
+        let paused = paused_record(proof("old"), &census, &[source.id], Vec::new()).unwrap();
+        assert_eq!(paused.presentations[0].pane, pane);
         paused.save().unwrap();
+        let ledger = crate::upgrade::floor::load().unwrap();
+        assert_eq!(ledger.resume_source(&alias), Some(&source));
+        assert_eq!(ledger.records[0].presentations[0].pane, pane);
         let mut initial = state::HostState::new(proof("new"));
-        initial.install_model(
-            super::super::model::Registry::at(&root.join("registry.sqlite3")).unwrap(),
-        );
+        initial.install_model(registry);
         initial.register_client(1);
         let host = Arc::new(state::HostLock::new(initial));
-        let resolved = super::super::chat::upgrade_resolution::resolve(&host, 1, &source).unwrap();
+        let resolved = super::super::chat::upgrade_resolution::resolve(&host, 1, &alias).unwrap();
         assert!(matches!(
             super::super::chat::process(&host, 1, ClientRequest::ChatAttach { session: resolved })
                 .unwrap(),

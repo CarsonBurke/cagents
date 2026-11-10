@@ -233,12 +233,22 @@ pub(crate) fn has_inherited_lease() -> io::Result<bool> {
         .is_some())
 }
 
+/// Forward only the ordinary daemon reservation. Maintenance and downgrade
+/// helpers use this path and must never receive update recovery authority.
 pub(crate) fn inherit_daemon_lease(command: &mut Command) -> io::Result<()> {
-    crate::upgrade::recovery::forward_inherited(command)?;
+    crate::upgrade::recovery::initialize_inherited()?;
+    command.env_remove(crate::upgrade::recovery::RECOVERY_FD_ENV);
     if let Some((lock, inherited_slot)) = inherited()? {
         forward(command, lock, DAEMON_LEASE_FD, inherited_slot)?;
     }
     Ok(())
+}
+
+/// Only the selected daemon executable may receive the recovery bundle.
+/// Call after descriptor sealing and the ordinary daemon admission hook.
+pub(crate) fn inherit_target_daemon_lease(command: &mut Command) -> io::Result<()> {
+    inherit_daemon_lease(command)?;
+    crate::upgrade::recovery::forward_target_daemon(command)
 }
 
 /// Consume startup authority before any diagnostics/runtime threads exist.

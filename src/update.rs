@@ -1477,6 +1477,12 @@ fn perform_update(
     let confirmed = confirmation::wait(state, job, |policy| {
         Ok(context.apply(observe(policy)?.with_inspection(&inspection)))
     })?;
+    if confirmed.replaces_daemon {
+        // Recovery may need to carry high-numbered descriptors through the
+        // release installer. Establish its shell support before the source
+        // receives any shutdown request.
+        preflight_recovery_shell(Path::new("/bin/bash"))?;
+    }
     set_phase(
         state,
         job,
@@ -2052,6 +2058,36 @@ fn archive_daemon_digest(
     Ok(format!("{:x}", hash.finalize()))
 }
 
+fn preflight_recovery_shell(shell: &Path) -> Result<(), UpdateError> {
+    let mut command = Command::new(shell);
+    crate::install_guard::sanitize_child_environment(&mut command);
+    command
+        .args([
+            "--noprofile",
+            "--norc",
+            "-p",
+            "-c",
+            "[[ -n $BASH_VERSION ]] || exit 1; exec 189</dev/null 193</dev/null 194</dev/null 195</dev/null 196</dev/null; exec 189<&- 193<&- 194<&- 195<&- 196<&-",
+        ])
+        .env_remove("BASH_ENV")
+        .env_remove("ENV")
+        .stdin(Stdio::null());
+    unsafe { command.pre_exec(crate::daemon::seal_inherited_descriptors) };
+    bounded_command(
+        &mut command,
+        "Checking the recovery installer shell",
+        4096,
+        Duration::from_secs(5),
+        &CancellationToken::new(),
+    )
+    .map(|_| ())
+    .map_err(|error| {
+        invalid(format!(
+            "The update needs /bin/bash to preserve recovery ownership: {error}. The source daemon and panes are still running; nothing was changed in the installation"
+        ))
+    })
+}
+
 fn run_installer(
     installation: &Installation,
     release: &Release,
@@ -2076,7 +2112,14 @@ fn run_installer(
         })
         .collect::<io::Result<_>>()?;
     let inherited_files = [190, 191, 192];
-    let mut command = Command::new("/bin/sh");
+    let mut command = Command::new(if restart_daemon {
+        "/bin/bash"
+    } else {
+        "/bin/sh"
+    });
+    if restart_daemon {
+        command.args(["--noprofile", "--norc", "-p"]);
+    }
     command
         .arg(format!("/proc/self/fd/{}", inherited_files[0]))
         .args(["--version", &release.version, "--prefix"])
@@ -2637,6 +2680,17 @@ fn verify_digest(file: &mut File, expected: &[u8; 32]) -> Result<(), UpdateError
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recovery_installer_shell_requires_high_descriptor_support_before_shutdown() {
+        preflight_recovery_shell(Path::new("/bin/bash")).unwrap();
+        for shell in ["/bin/false", "/missing-cagents-recovery-shell"] {
+            let error = preflight_recovery_shell(Path::new(shell)).unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains("source daemon and panes are still running"));
+            assert!(message.contains("nothing was changed in the installation"));
+        }
+    }
+
     #[test]
     fn review_prompt_defaults_to_update_but_eof_cancels() {
         let mut output = Vec::new();
