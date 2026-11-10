@@ -295,13 +295,31 @@ class Rehearsal:
             self.observe(self.root/'records/before/windows.json',shots='before')
             update_args = ['--yes'] if args.yes else ['--answer',args.answer]
             update_args += ['--working',args.working,'--stop',args.stop]
+            if args.fail_new_daemon:
+                update_args.append('--fail-new-daemon')
             for flag in args.upgrade_arg:
                 update_args.append(flag)
             code, _ = self.call('update',args.new_dir,args.new_version,args.new_installer,*update_args,timeout=300,check=False)
-            if code:
+            if args.fail_new_daemon:
+                if not code:
+                    self.errors.append('forced daemon startup failure unexpectedly succeeded')
+                status_path = self.root/'home/.local/share/cagents-install/.update/status.json'
+                try:
+                    status = json.loads(status_path.read_text())
+                    if status['phase'] != 'Failed' or 'forced rehearsal daemon startup failure' not in Path(status['log_path']).read_text():
+                        self.errors.append('worker did not report the forced daemon startup failure')
+                except (OSError, KeyError, ValueError) as exc:
+                    self.errors.append(f'forced failure evidence missing: {exc}')
+                current = self.root/'home/.local/share/cagents-install/current'
+                if current.resolve().name != args.old_version:
+                    self.errors.append('failed update did not restore the old current version')
+                serving_code, serving = self.cli('daemon','status',check=False)
+                if serving_code or serving.get('data',{}).get('running') is not True:
+                    self.errors.append('old daemon is not serving after failed update')
+            elif code:
                 self.errors.append(f'update exited {code}')
             try:
-                self.wait_windows(['main','second'],timeout=args.reopen_timeout,version=args.new_version if code==0 else None)
+                self.wait_windows(['main','second'],timeout=args.reopen_timeout,version=args.old_version if args.fail_new_daemon else args.new_version if code==0 else None)
             except RuntimeError as exc:
                 self.errors.append(str(exc))
             code, _ = self.call('record','after',timeout=150,check=False)
@@ -391,6 +409,7 @@ def main():
     run.add_argument('--working',default='',help='typed at the working-agents choice; empty waits for them')
     run.add_argument('--stop',default='',help='typed at the destructive stop list; empty cancels')
     run.add_argument('--upgrade-arg',action='append',default=[],help='use --upgrade-arg=--interrupt, for example')
+    run.add_argument('--fail-new-daemon', action='store_true', help='fail private candidate startup; require old current, serving daemon and preserved work')
     run.add_argument('--reopen-timeout',type=float,default=45)
     seed_options(run)
     seed_options(commands.add_parser('seed'))

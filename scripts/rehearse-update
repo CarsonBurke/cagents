@@ -211,9 +211,10 @@ cmd_update() {
     require_init
     local archive_dir=${1:?update needs the archive directory} version=${2:?update needs a version} installer=${3:?update needs an install.sh}
     shift 3
-    local answer= working= stop= upgrade_args=()
+    local answer= working= stop= fail_new_daemon=0 upgrade_args=()
     while [ "$#" -gt 0 ]; do
         case $1 in
+            --fail-new-daemon) fail_new_daemon=1; shift ;;
             --answer) answer=${2?}; shift 2 ;;
             --working) working=${2?}; shift 2 ;;
             --stop) stop=${2?}; shift 2 ;;
@@ -231,6 +232,9 @@ cmd_update() {
         local stage_status=0
         cmd_install "$archive_dir" "$version" "$installer" --stage-only 2>&1 | tee -a "$transcript" || stage_status=${PIPESTATUS[0]}
         [ "$stage_status" -eq 0 ] || return "$stage_status"
+    fi
+    if [ "$fail_new_daemon" -eq 1 ]; then
+        user_env /usr/bin/python3 "$tool_root/scripts/rehearse_update_fault.py" "$root" "$version"
     fi
     printf 'staged after %ss\n' "$((SECONDS - started))" | tee -a "$transcript"
     cmd_app_or_env /usr/bin/python3 "$tool_root/scripts/rehearse_update_pty.py" --answer "$answer" --working "$working" --stop "$stop" -- \

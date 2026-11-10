@@ -1939,6 +1939,13 @@ Optional problem states each have their own switch:
   cleanup. If preparation unexpectedly succeeds, it can stop the private
   daemon; the report identifies that outcome.
 - `--unreachable`: SIGSTOP the selected terminal's private holder.
+- `--fail-new-daemon`: after staging, replace only the private candidate's daemon
+  entrypoint with a script that exits 1 on normal startup. Informational,
+  source-inspection and store-maintenance commands still use the candidate's
+  real binary. The scenario requires the worker to report this failure, restore
+  OLD as `current`, serve daemon requests again, reopen OLD's windows and retain
+  the seeded work. The fault and original binary digests are saved in
+  `logs/startup-fault.txt`. This option never modifies either input archive.
 
 A seeded state does not guarantee a particular refusal on every revision.
 `seeds.json` preserves spawn results, OLD's actual inventories, verification

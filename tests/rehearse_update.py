@@ -462,6 +462,38 @@ class PrivateRoot(unittest.TestCase):
             self.assertEqual(environment["PATH"], str(desktop / "tools")+":/usr/local/bin:/usr/bin:/bin")
 
 
+class StartupFault(unittest.TestCase):
+    def test_fault_only_changes_marked_private_candidate_and_preserves_maintenance(self):
+        spec = importlib.util.spec_from_file_location("rehearsal_fault", REPOSITORY / "scripts/rehearse_update_fault.py")
+        fault = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fault)
+        with tempfile.TemporaryDirectory(prefix="ru-fault-") as temporary:
+            root = Path(temporary)
+            prefix = root / 'home/.local/share/cagents-install'
+            candidate = prefix / 'versions/new'
+            (candidate / 'bin').mkdir(parents=True)
+            (root / 'logs').mkdir()
+            (prefix / 'current').symlink_to('versions/new')
+            daemon = candidate / 'bin/cagentsd'
+            daemon.write_text('#!/bin/sh\nprintf "maintenance %s\\n" "$*"\n')
+            daemon.chmod(0o755)
+            with self.assertRaises(FileNotFoundError):
+                fault.fail_start(root, 'new')
+            (root / '.rehearse-update').write_text(str(root))
+            with self.assertRaises(ValueError):
+                fault.fail_start(root, '../../outside')
+            fault.fail_start(root, 'new')
+            result = subprocess.run([daemon], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn('forced rehearsal daemon startup failure', result.stderr)
+            result = subprocess.run([daemon, '--stored-schema'], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, 'maintenance --stored-schema\n')
+            self.assertTrue((root / 'logs/startup-fault.txt').exists())
+            with self.assertRaises(ValueError):
+                fault.fail_start(root, 'new')
+
+
 class FailedInitialization(unittest.TestCase):
     def test_partial_init_still_records_failure_and_stops(self):
         spec = importlib.util.spec_from_file_location("rehearsal_run", REPOSITORY / "scripts/rehearse_update_run.py")
