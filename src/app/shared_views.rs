@@ -4635,9 +4635,11 @@ mod tests {
         assert!(app.shared_views.initialized.contains(&scope));
         assert!(app.shared_views.attached.contains(&pane.id));
         assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
-        app.refresh_chat_drafts();
         assert_eq!(
-            app.durable.chat_drafts.get(&pane.id).map(String::as_str),
+            app.persistent_workspace()
+                .chat_drafts
+                .get(&pane.id)
+                .map(String::as_str),
             Some("Saved unsent draft  ")
         );
         assert!(!std::iter::from_fn(|| rx.try_recv().ok()).any(
