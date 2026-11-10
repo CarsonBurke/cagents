@@ -355,6 +355,22 @@ mod tests {
     }
 
     #[test]
+    fn a_parked_warm_chat_follows_a_syntax_theme_change() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (mut runtime, _handle) = shown(items());
+        runtime.set_visible(false).unwrap();
+        assert!(runtime.warm_stamp().is_some());
+        let card = runtime.target.card;
+        app.chat_ui.parked.insert(card, Box::new(runtime));
+        let previous = app.settings.clone();
+        let next = crate::settings::EditorSyntaxTheme::Ocean;
+        assert_ne!(previous.editor_syntax_theme, next);
+        app.settings.editor_syntax_theme = next;
+        drop(app.synchronize_settings(&previous));
+        assert_eq!(app.chat_ui.parked[&card].syntax_theme, next);
+    }
+
+    #[test]
     fn the_budget_keeps_the_most_recently_hidden_chats_warm() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let mut cards = Vec::new();

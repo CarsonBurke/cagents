@@ -14479,6 +14479,7 @@ impl Cagents {
                     _ => {}
                 }
             }
+            self.chat_ui.set_parked_syntax_theme(syntax_theme);
         }
         if previous.diff_hide_unchanged != self.settings.diff_hide_unchanged {
             for runtime in self.cards.values_mut() {

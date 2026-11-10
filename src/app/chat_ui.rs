@@ -887,6 +887,14 @@ impl State {
 }
 
 impl State {
+    /// Give parked chats a changed syntax theme: one can still be warm, and is
+    /// shown again as it is.
+    pub(super) fn set_parked_syntax_theme(&mut self, theme: crate::settings::EditorSyntaxTheme) {
+        for runtime in self.parked.values_mut() {
+            runtime.set_syntax_theme(theme);
+        }
+    }
+
     pub(super) fn transition_pending(&self) -> bool {
         !self.phases.is_empty() || !self.abandoned.is_empty() || !self.retiring.is_empty()
     }
