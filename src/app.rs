@@ -27773,6 +27773,10 @@ mod tests {
         include!("app/window_restore_tests.rs");
     }
 
+    mod home_admission {
+        include!("app/home_admission_tests.rs");
+    }
+
     mod repository_clone_lsp_ownership {
         include!("app/repository_clone_lsp_ownership_tests.rs");
     }
