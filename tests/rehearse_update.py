@@ -462,6 +462,31 @@ class PrivateRoot(unittest.TestCase):
             self.assertEqual(environment["PATH"], str(desktop / "tools")+":/usr/local/bin:/usr/bin:/bin")
 
 
+class RefusalIdentity(unittest.TestCase):
+    def test_same_versions_cannot_hide_replaced_daemon_or_windows(self):
+        spec = importlib.util.spec_from_file_location("rehearsal_run", REPOSITORY / "scripts/rehearse_update_run.py")
+        scenario = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(scenario)
+        with tempfile.TemporaryDirectory(prefix="ru-refusal-") as temporary:
+            records = Path(temporary)
+            proof = {'host_session_id':'original','host_incarnation':'first','boot_id':'boot'}
+            processes = [{'pid':42,'start_ticks':100,'argv':['/private/bin/cagents-ui']},
+                         {'pid':43,'start_ticks':101,'argv':['/private/bin/cagents-ui','--window','second']}]
+            for name in ('before','after'):
+                folder = records/name
+                folder.mkdir()
+                (folder/'terminals.json').write_text(json.dumps({'data':{'proof':proof}}))
+                (folder/'snapshot.json').write_text(json.dumps({'processes':processes}))
+            self.assertEqual(scenario.refusal_preserved_processes(records), [])
+            (records/'after/terminals.json').write_text(json.dumps({'data':{'proof':dict(proof,host_incarnation='second')}}))
+            processes[0]['start_ticks'] = 999
+            (records/'after/snapshot.json').write_text(json.dumps({'processes':processes}))
+            errors = scenario.refusal_preserved_processes(records)
+            self.assertEqual(len(errors), 2)
+            self.assertIn('original daemon', errors[0])
+            self.assertIn('original windows', errors[1])
+
+
 class StartupFault(unittest.TestCase):
     def test_fault_only_changes_marked_private_candidate_and_preserves_maintenance(self):
         spec = importlib.util.spec_from_file_location("rehearsal_fault", REPOSITORY / "scripts/rehearse_update_fault.py")

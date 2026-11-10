@@ -10,6 +10,26 @@ import sys
 import time
 
 
+def refusal_preserved_processes(records):
+    """A refusal keeps the original daemon and UI processes, not just their version."""
+    try:
+        proofs = [json.loads((records/name/'terminals.json').read_text())['data']['proof']
+                  for name in ('before','after')]
+        snapshots = [json.loads((records/name/'snapshot.json').read_text())
+                     for name in ('before','after')]
+        windows = [{(row['pid'], row['start_ticks']) for row in snapshot['processes']
+                    if row.get('argv') and Path(row['argv'][0]).name == 'cagents-ui'}
+                   for snapshot in snapshots]
+        errors = []
+        if not proofs[0] or proofs[0] != proofs[1]:
+            errors.append('console refusal replaced the original daemon')
+        if len(windows[0]) != 2 or windows[0] != windows[1]:
+            errors.append('console refusal closed or replaced the original windows')
+        return errors
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        return [f'console refusal identity evidence missing: {exc}']
+
+
 class Rehearsal:
     def __init__(self, root, shell):
         self.root = Path(root)
@@ -337,6 +357,8 @@ class Rehearsal:
             code, _ = self.call('record','after',timeout=150,check=False)
             if code:
                 self.errors.append('after record has evidence gaps')
+            if args.expect_console_refusal:
+                self.errors.extend(refusal_preserved_processes(self.root/'records'))
             self.observe(self.root/'records/after/windows.json',shots='after')
             code, _ = self.call('compare','before','after',timeout=30,check=False)
             if code:
