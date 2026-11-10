@@ -2409,6 +2409,13 @@ impl<E: ProcessExecutor> GitHubService<E> {
         if output.exit_code == Some(75) && output.stderr.starts_with(b"cagents-gh: deferred ") {
             let mut failure = output.require_success(&self.gh).unwrap_err();
             failure.started = false;
+            failure.message = String::from_utf8_lossy(&failure.stderr)
+                .lines()
+                .next()
+                .and_then(|line| line.strip_prefix("cagents-gh: deferred "))
+                .filter(|reason| !reason.is_empty())
+                .unwrap_or("GitHub requests are waiting for local admission")
+                .to_owned();
             return Err(failure);
         }
         Ok(output)

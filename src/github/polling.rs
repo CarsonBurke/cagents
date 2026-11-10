@@ -160,6 +160,11 @@ mod tests {
             panic!("local refusal is never an unknown write outcome")
         };
         assert!(!failure.started);
+        assert!(
+            failure
+                .to_string()
+                .contains("paused by the shared rate limit")
+        );
         assert!(GitHubError::Process(failure).rate_limit().unwrap().retry_at >= now() + 3599);
         BUDGETS
             .lock()
