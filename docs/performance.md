@@ -191,7 +191,22 @@ whereas the runner's `--instance` launch returns as soon as its window maps.
 Report cumulative UI update wall time per requested edit and notification count
 for each window, as well as per-notification percentiles: a change can alter how
 many notifications an edit produces. Report main-thread CPU separately from
-inclusive wall time. Redraw-event intervals show event-loop cadence while a
+inclusive wall time. When replica snapshot capture is deferred, also report
+instrumented synchronization wall time: sum `ui_update` and
+`replica_snapshot_timer` handler durations, plus debt-bearing
+`window_snapshot_capture` durations whose parent is `other_update` or
+`outside_update`. Observer and timer capture children are already included in
+their handlers. Count rejected captures too. Require classified wakes and
+complete timer/capture coverage on the instrumented revision. A missing event,
+or an in-bounds capture or wake whose parent completes outside the interval,
+invalidates the sample. Include whole handlers ending inside the interval,
+including those that began before it. Historical
+revisions without deferred capture have no additional work in this accounting.
+This sum covers the measured synchronization paths, not all UI-thread work;
+retain main-thread CPU as the broader measure. The controlled edit burst must
+avoid recursive close-confirm dispatch, whose inclusive handlers can overlap.
+
+Redraw-event intervals show event-loop cadence while a
 busy indicator is visible; they do not establish compositor presentation,
 scanout, or input latency. Fixture providers exercise the transport and native
 UI without a live model, and generated saved panes do not establish successful
