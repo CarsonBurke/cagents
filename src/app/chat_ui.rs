@@ -15,35 +15,43 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
-/// A bounded executor that the whole application shares. Each libtest thread
-/// is its own application, so a concurrent test can neither take nor release
-/// this test's capacity. Call it on the UI thread; a permit keeps its
-/// semaphore alive on whichever thread it drops.
-macro_rules! application_capacity {
-    ($permits:expr) => {{
+/// A value the whole application shares, such as an admission queue. Each
+/// libtest thread is its own application, so a concurrent test can neither
+/// take nor release what this test holds. Call it on the UI thread and keep
+/// the returned `Arc`; it stays valid on whichever thread it moves to.
+macro_rules! application_shared {
+    ($shared:ty, $init:expr) => {{
         #[cfg(not(test))]
-        let capacity = {
-            static CAPACITY: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
-                std::sync::OnceLock::new();
-            CAPACITY
-                .get_or_init(|| Arc::new(tokio::sync::Semaphore::new($permits)))
-                .clone()
+        let shared = {
+            static SHARED: std::sync::OnceLock<Arc<$shared>> = std::sync::OnceLock::new();
+            SHARED.get_or_init(|| Arc::new($init)).clone()
         };
         #[cfg(test)]
-        let capacity = {
+        let shared = {
             thread_local! {
-                static CAPACITY: Arc<tokio::sync::Semaphore> =
-                    Arc::new(tokio::sync::Semaphore::new($permits));
+                static SHARED: Arc<$shared> = Arc::new($init);
             }
-            CAPACITY.with(Arc::clone)
+            SHARED.with(Arc::clone)
         };
-        capacity
+        shared
     }};
+}
+
+/// A bounded executor that the whole application shares, under the same
+/// per-test-thread rule as `application_shared`. A permit keeps its semaphore
+/// alive on whichever thread it drops.
+macro_rules! application_capacity {
+    ($permits:expr) => {
+        application_shared!(
+            tokio::sync::Semaphore,
+            tokio::sync::Semaphore::new($permits)
+        )
+    };
 }
 
 /// A zeroed atomic the whole application shares, such as which selection owns
 /// the keyboard, under the same per-test-thread rule as
-/// `application_capacity`. The returned reference may be stored and used from
+/// `application_shared`. The returned reference may be stored and used from
 /// any thread. Each test thread leaks one cell.
 macro_rules! application_atomic {
     ($vis:vis fn $name:ident() -> $atomic:ident) => {
@@ -4508,11 +4516,23 @@ impl Runtime {
         let start = resume.unwrap_or(0).min(items.len());
         let end = resume.map_or(items.len(), |_| start.saturating_add(128).min(items.len()));
         let mut stopped = false;
-        // Admit the newest item first so the currently streaming answer does
-        // not wait behind a full historical window. Remaining history keeps
-        // deterministic source order; the cursor stores this metadata order.
-        for position in start..end {
-            let index = if position == 0 { newest } else { position - 1 };
+        // Admit the rows a returning reader's saved window showed first, then
+        // from the newest item back: the streaming answer and the rows a
+        // reader at the latest edge sees come next, and admission that runs
+        // out leaves the oldest history waiting. The cursor stores the
+        // newest-back position; the saved window's rows lead every pass, and
+        // are cheap to pass over once staged.
+        let reading = self.scroll_memory.reading_rows(context.as_deref());
+        let returning: Vec<usize> = (0..items.len())
+            .rev()
+            .filter(|&index| reading.contains(&items[index].id))
+            .map(|index| newest - index)
+            .collect();
+        let walk = returning.iter().copied().chain(
+            (start..end).filter(|&position| !reading.contains(&items[newest - position].id)),
+        );
+        for position in walk {
+            let index = newest - position;
             let item = &items[index];
             let report = matches!(
                 &item.content,
@@ -4654,6 +4674,18 @@ impl Runtime {
                         theme,
                         |old, new| known_append(handle.as_ref(), &self.logical_prose, old, new),
                     );
+                    // The answer being written, then the rows the reader
+                    // returns to, then everything else from the newest back.
+                    self.preparation.rank(
+                        &item.id,
+                        if growing {
+                            0
+                        } else if reading.contains(&item.id) {
+                            1
+                        } else {
+                            2 + position as u64
+                        },
+                    );
                     // A presentation that reaches further into the same
                     // revision of a long message is not an append when its
                     // window starts elsewhere, but what is shown stays true
@@ -4690,7 +4722,14 @@ impl Runtime {
                     cached.reader_memory = self.scroll_memory.clone();
                     cached.reader_context.clone_from(&context);
                     if self.preparation.was_deferred() {
-                        self.preparation.defer(position);
+                        // A saved row that waits is met again at the head of
+                        // the next pass; the newest-back walk resumes where
+                        // this pass's own range starts.
+                        self.preparation.defer(if reading.contains(&item.id) {
+                            start
+                        } else {
+                            position
+                        });
                         if resume.is_some() {
                             stopped = true;
                             break;
@@ -4769,8 +4808,8 @@ impl Runtime {
             presentation_changed = true;
         }
         let today = chat::now_ms().and_then(|now| chat::local_time((now / 1000) as i64));
-        for position in start..end {
-            let index = if position == 0 { newest } else { position - 1 };
+        for position in returning.iter().copied().chain(start..end) {
+            let index = newest - position;
             let item = &items[index];
             if let Some(cached) = cache.get_mut(&item.id)
                 && cached.stamp.as_ref().map(|stamp| stamp.0) != item.at
