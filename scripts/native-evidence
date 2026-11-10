@@ -509,33 +509,49 @@ path_without_shims() {
 # gone: nobody would drive or stop a session that began after that.
 wait_for_native_lock() {
     local wait_lock=$1 starter=$2 waited=0
-    # Stay in the kernel's queue the whole time: retrying with a short timeout
-    # loses to every blocked waiter, and could wait out the limit behind them.
-    # The child shares this descriptor, so the lock outlives it.
-    flock 9 &
-    lock_waiter=$!
-    local waiter=$lock_waiter
-    while kill -0 "$waiter" 2>/dev/null; do
-        if [ -e "$state/stop" ] || ! kill -0 "$starter" 2>/dev/null; then
-            kill -KILL "$waiter" 2>/dev/null || true
-            wait "$waiter" 2>/dev/null || true
-            printf 'stopped while waiting for the native lock\n' >"$state/failed"
+    if [ "$wait_lock" -eq 0 ]; then
+        # A zero budget still tries the idle lock. Starting a queued helper
+        # and immediately cancelling it races the helper's first scheduling.
+        if flock -n 9; then
+            :
+        else
+            local status=$?
+            if [ "$status" -eq 1 ]; then
+                printf 'the native lock stayed busy for 0 seconds (see scripts/lock-holders %s)\n' "$native_lock" >"$state/failed"
+            else
+                printf 'could not take the native lock\n' >"$state/failed"
+            fi
             return 1
         fi
-        if [ "$waited" -ge "$wait_lock" ]; then
-            kill -KILL "$waiter" 2>/dev/null || true
-            wait "$waiter" 2>/dev/null || true
-            printf 'the native lock stayed busy for %s seconds (see scripts/lock-holders %s)\n' "$wait_lock" "$native_lock" >"$state/failed"
+    else
+        # Stay in the kernel's queue the whole time: retrying with a short timeout
+        # loses to every blocked waiter, and could wait out the limit behind them.
+        # The child shares this descriptor, so the lock outlives it.
+        flock 9 &
+        lock_waiter=$!
+        local waiter=$lock_waiter
+        while kill -0 "$waiter" 2>/dev/null; do
+            if [ -e "$state/stop" ] || ! kill -0 "$starter" 2>/dev/null; then
+                kill -KILL "$waiter" 2>/dev/null || true
+                wait "$waiter" 2>/dev/null || true
+                printf 'stopped while waiting for the native lock\n' >"$state/failed"
+                return 1
+            fi
+            if [ "$waited" -ge "$wait_lock" ]; then
+                kill -KILL "$waiter" 2>/dev/null || true
+                wait "$waiter" 2>/dev/null || true
+                printf 'the native lock stayed busy for %s seconds (see scripts/lock-holders %s)\n' "$wait_lock" "$native_lock" >"$state/failed"
+                return 1
+            fi
+            sleep 1
+            waited=$((waited + 1))
+        done
+        wait "$waiter" || {
+            printf 'could not take the native lock\n' >"$state/failed"
             return 1
-        fi
-        sleep 1
-        waited=$((waited + 1))
-    done
-    wait "$waiter" || {
-        printf 'could not take the native lock\n' >"$state/failed"
-        return 1
-    }
-    lock_waiter=
+        }
+        lock_waiter=
+    fi
     if [ -e "$state/stop" ] || ! kill -0 "$starter" 2>/dev/null; then
         printf 'stopped while waiting for the native lock\n' >"$state/failed"
         return 1
