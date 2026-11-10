@@ -1448,9 +1448,13 @@ fn perform_update(
     }
     let inspection = reconcile_saved_sources(staged.identity.protocol, false)?;
     let context = ReviewContext::capture(installation)?;
-    let confirmed = confirmation::wait(state, job, |policy| {
+    let mut turns = source::TurnReview::default();
+    let mut observe = |policy| {
         Installation::detect()?;
-        Ok(context.apply(observe_impact(&staged.identity, policy)?.with_inspection(&inspection)))
+        turns.apply(observe_impact(&staged.identity, policy)?)
+    };
+    let confirmed = confirmation::wait(state, job, |policy| {
+        Ok(context.apply(observe(policy)?.with_inspection(&inspection)))
     })?;
     set_phase(
         state,
@@ -1470,8 +1474,7 @@ fn perform_update(
                 .map(|daemon| daemon.capability.proof.clone()),
             confirmed.replaces_daemon,
         )?;
-        let latest = observe_impact(
-            &staged.identity,
+        let latest = observe(
             confirmed
                 .daemon
                 .as_ref()
@@ -1491,11 +1494,7 @@ fn perform_update(
             job,
             &confirmed,
             terminal,
-            |policy| {
-                Installation::detect()?;
-                Ok(context
-                    .apply(observe_impact(&staged.identity, policy)?.with_inspection(&inspection)))
-            },
+            |policy| Ok(context.apply(observe(policy)?.with_inspection(&inspection))),
             handoff,
             survivors,
             &guard,

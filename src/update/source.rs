@@ -1,6 +1,9 @@
 //! Upgrade-only access to an authenticated source daemon. Ordinary application
 //! clients continue to require a fully matched protocol.
+mod turns;
 mod v77;
+
+pub(super) use turns::TurnReview;
 
 use super::{UpdateError, impact, invalid};
 use crate::{

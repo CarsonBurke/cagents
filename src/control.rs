@@ -1059,6 +1059,54 @@ impl ControlClient {
         }
     }
 
+    /// Keep one attachment while an updater observes an already listed owner.
+    /// Old source protocols expose parent-turn state only in their resident
+    /// snapshot. Attach once, then read only publications newer than the last
+    /// observed generation; repeatedly attaching could recover history.
+    pub(crate) fn observe_update_chat(
+        &mut self,
+        session: crate::chat::Session,
+    ) -> Result<crate::chat::Snapshot, ControlError> {
+        let id = session.id;
+        self.attached_chats.insert(id);
+        let snapshot = match self.request_strict(ClientRequest::ChatAttach {
+            session: session.clone(),
+        })? {
+            ServerResponse::ChatAttached {
+                session: attached,
+                snapshot,
+            } if attached == session => snapshot,
+            response => return Err(unexpected_response("the observed chat's owner", &response)),
+        };
+        match self.request_strict(ClientRequest::ChatVisibility {
+            chat_id: id,
+            visible: true,
+        })? {
+            ServerResponse::Accepted => Ok(snapshot),
+            response => Err(unexpected_response("chat observation admission", &response)),
+        }
+    }
+
+    pub(crate) fn read_update_chat(
+        &mut self,
+        chat_id: TerminalId,
+        generation: u64,
+    ) -> Result<Option<crate::chat::Snapshot>, ControlError> {
+        match self.request_strict(ClientRequest::ChatRead {
+            chat_id,
+            after_generation: Some(generation),
+        })? {
+            ServerResponse::ChatSnapshot {
+                chat_id: actual,
+                snapshot,
+            } if actual == chat_id => Ok(snapshot),
+            response => Err(unexpected_response(
+                "the observed chat's publication",
+                &response,
+            )),
+        }
+    }
+
     /// Capture a listed chat's transcript immediately before acting on it.
     /// This can recover source history, so it must never be used for polling.
     pub(crate) fn capture_chat_snapshot(

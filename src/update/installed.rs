@@ -108,13 +108,14 @@ pub(super) fn perform(
     let cancellation = CancellationToken::for_job(state, &job.id)?;
     let staged =
         candidate::Staged::from_file(executable, job.version.clone(), identity, &cancellation)?;
-    let observe = |policy| {
+    let mut turns = source::TurnReview::default();
+    let mut observe = |policy| {
         if served_version_root(&layout)? != root || stamp(root)? != before {
             return Err(invalid(
                 "the installed application changed; review the new build before updating",
             ));
         }
-        observe_installed_source(&layout, root, &staged, policy)
+        turns.apply(observe_installed_source(&layout, root, &staged, policy)?)
     };
     if staged.identity.protocol == source_protocol {
         staged.verify_compatible_handshake(&cancellation)?;
