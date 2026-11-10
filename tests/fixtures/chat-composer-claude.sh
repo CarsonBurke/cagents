@@ -372,11 +372,164 @@ if [ "$probe" = false ] && [ -e "$config/fixture-slow-start" ]; then
     sleep "$start_delay"
 fi
 
+# Keep the delayed text writer self-contained: native evidence and Rust tests
+# copy this shell file alone. The awaited helper owns stdout only while the
+# shell waits; incoming frames return to the existing control/history handlers.
+stream_directory=
+stream_pid=
+stream_active=false
+cleanup_stream() {
+    if [ -n "$stream_pid" ]; then
+        kill -TERM "$stream_pid" 2>/dev/null || :
+        wait "$stream_pid" 2>/dev/null || :
+        stream_pid=
+    fi
+    if [ -n "$stream_directory" ]; then
+        rm -rf -- "$stream_directory"
+        stream_directory=
+    fi
+}
+trap cleanup_stream EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+next_frame() {
+    if [ -n "$stream_directory" ] && [ -s "$stream_directory/pending" ]; then
+        if IFS= read -r frame < "$stream_directory/pending"; then
+            tail -n +2 "$stream_directory/pending" > "$stream_directory/pending.next"
+            mv "$stream_directory/pending.next" "$stream_directory/pending"
+            return 0
+        fi
+        # A raw read can include the start of the following frame. Join that
+        # prefix to stdin rather than losing it or parsing an incomplete JSON.
+        stream_input_prefix=$frame
+        : > "$stream_directory/pending"
+        IFS= read -r frame || return 1
+        frame=$stream_input_prefix$frame
+        return 0
+    fi
+    IFS= read -r frame
+}
+
+stream_step() {
+    /usr/bin/python3 - "$stream_directory" "$stream_delay" 3<&0 <<'PYTHON' &
+import ctypes
+import json
+import os
+from pathlib import Path
+import selectors
+import signal
+import sys
+import time
+
+root = Path(sys.argv[1])
+delay = float(sys.argv[2])
+if not 0 <= delay < float("inf"):
+    raise ValueError("fixture-stream-reply must hold finite nonnegative seconds")
+parent = os.getppid()
+# The helper creates no children. Even an uncatchable shell death must not
+# leave an orphan scheduling frames after its owning fixture has gone away.
+if ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGTERM, 0, 0, 0) != 0:
+    raise OSError(ctypes.get_errno(), "set fixture helper parent-death signal")
+if os.getppid() != parent:
+    sys.exit(143)
+state_file = root / "state.json"
+state = json.loads(state_file.read_text()) if state_file.exists() else {
+    "offset": 0, "next_at": time.monotonic()}
+text = (root / "reply").read_text()
+pending = root / "pending"
+buffer = pending.read_bytes()
+pending.write_bytes(b"")
+selector = selectors.DefaultSelector()
+selector.register(3, selectors.EVENT_READ)
+input_open = True
+status = 0
+try:
+    while True:
+        if b"\n" in buffer:
+            line = buffer.split(b"\n", 1)[0]
+            value = json.loads(line)
+            # Replay the entire buffered input, including this frame, through
+            # the shell. Only interrupt cancels the remaining scheduled text.
+            status = 10 if (value.get("type") == "control_request" and
+                            value.get("request", {}).get("subtype") == "interrupt") else 11
+            break
+        now = time.monotonic()
+        timeout = max(0, state["next_at"] - now)
+        ready = selector.select(timeout) if input_open else []
+        if ready:
+            data = os.read(3, 65536)
+            if data:
+                buffer += data
+            else:
+                selector.unregister(3)
+                input_open = False
+            continue
+        if not input_open and timeout:
+            time.sleep(timeout)
+        if state["offset"] >= len(text):
+            break
+        delta = text[state["offset"]:state["offset"] + 16384]
+        print(json.dumps({"type": "stream_event", "event": {
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "text_delta", "text": delta}}},
+            ensure_ascii=False, separators=(",", ":")), flush=True)
+        with (root / "prefix").open("a") as prefix:
+            prefix.write(delta)
+        state["offset"] += len(delta)
+        state["next_at"] = time.monotonic() + delay
+finally:
+    selector.close()
+    pending.write_bytes(buffer)
+    state_file.write_text(json.dumps(state))
+sys.exit(status)
+PYTHON
+    stream_pid=$!
+    if wait "$stream_pid"; then stream_status=0; else stream_status=$?; fi
+    stream_pid=
+    return "$stream_status"
+}
+
+finish_reply() {
+    assistant=$(jq -cn --arg turn "$turn" --rawfile text "$reply" \
+        --arg default "I’m checking the submission logs and comparing the failed run with the last successful version." \
+        '{type:"assistant",uuid:("fixture-message-"+$turn),message:{id:("fixture-message-"+$turn),role:"assistant",content:[{type:"text",text:(if $text == "" then $default else $text end)}],usage:{input_tokens:4200,output_tokens:180}}}')
+    persist_record "$assistant"
+    printf '%s\n' "$assistant"
+}
+
+advance_stream() {
+    if stream_step; then stream_status=0; else stream_status=$?; fi
+    case $stream_status in
+        11) return ;; # Let the existing handler serve the yielded input first.
+        0|10) ;;
+        *) exit "$stream_status" ;;
+    esac
+    stream_active=false
+    jq -cn '{type:"stream_event",event:{type:"content_block_stop",index:0}}'
+    if [ "$stream_status" -eq 10 ]; then
+        reply=$stream_directory/prefix
+        if [ -s "$reply" ]; then finish_reply; fi
+        # The pending interrupt is still handled by the unchanged dispatcher.
+        return
+    fi
+    reply=$stream_directory/reply
+    finish_reply
+    if [ "$turn" -eq 1 ]; then
+        busy=true
+    else
+        busy=false
+        jq -cn --arg session "$session" --arg turn "$turn" \
+            '{type:"result",uuid:("fixture-result-"+$turn),subtype:"success",is_error:false,session_id:$session}'
+    fi
+}
+
 busy=false
 fast=off
 model=haiku
 if [ "$fast_fixture" = 1 ]; then model=opus; fi
-while IFS= read -r frame; do
+while next_frame; do
     kind=$(printf '%s' "$frame" | jq -r '.type')
     case $kind in
         control_request)
@@ -487,27 +640,28 @@ while IFS= read -r frame; do
                 # Optionally stream the answer as Claude does, in text deltas
                 # before the final record, so a long answer grows across cuts.
                 if [ "$stream_reply" = 1 ] && [ -s "$reply" ]; then
+                    if [ -z "$stream_directory" ]; then
+                        stream_directory=$(mktemp -d "$config/.fixture-stream.XXXXXX")
+                        : > "$stream_directory/pending"
+                    fi
+                    cp "$reply" "$stream_directory/reply"
+                    : > "$stream_directory/prefix"
+                    rm -f "$stream_directory/state.json"
+                    busy=true
+                    stream_active=true
                     jq -cn --arg id "fixture-message-$turn" '{type:"stream_event",event:{type:"message_start",message:{id:$id,role:"assistant"}}}'
                     jq -cn '{type:"stream_event",event:{type:"content_block_start",index:0,content_block:{type:"text",text:""}}}'
-                    jq -cn --rawfile text "$reply" '$text | range(0; length; 16384) as $at | .[$at:$at + 16384]' |
-                        while IFS= read -r delta; do
-                            jq -cn --argjson delta "$delta" '{type:"stream_event",event:{type:"content_block_delta",index:0,delta:{type:"text_delta",text:$delta}}}'
-                            sleep "$stream_delay"
-                        done
-                    jq -cn '{type:"stream_event",event:{type:"content_block_stop",index:0}}'
-                fi
-                assistant=$(jq -cn --arg turn "$turn" --rawfile text "$reply" \
-                    --arg default "I’m checking the submission logs and comparing the failed run with the last successful version." \
-                    '{type:"assistant",uuid:("fixture-message-"+$turn),message:{id:("fixture-message-"+$turn),role:"assistant",content:[{type:"text",text:(if $text == "" then $default else $text end)}],usage:{input_tokens:4200,output_tokens:180}}}')
-                persist_record "$assistant"
-                printf '%s\n' "$assistant"
-                if [ "$turn" -eq 1 ]; then
-                    busy=true
                 else
-                    jq -cn --arg session "$session" --arg turn "$turn" \
-                        '{type:"result",uuid:("fixture-result-"+$turn),subtype:"success",is_error:false,session_id:$session}'
+                    finish_reply
+                    if [ "$turn" -eq 1 ]; then
+                        busy=true
+                    else
+                        jq -cn --arg session "$session" --arg turn "$turn" \
+                            '{type:"result",uuid:("fixture-result-"+$turn),subtype:"success",is_error:false,session_id:$session}'
+                    fi
                 fi
             fi
             ;;
     esac
+    if [ "$stream_active" = true ]; then advance_stream; fi
 done

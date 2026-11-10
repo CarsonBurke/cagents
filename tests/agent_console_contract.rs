@@ -539,6 +539,149 @@ fn terminal_console_prints_each_line_once_without_tool_payloads() {
 }
 
 #[test]
+fn retained_agent_closes_during_a_delayed_fixture_stream() {
+    if retained_fixture::run_isolated() {
+        return;
+    }
+    use cagents::{
+        chat::{ItemContent, NativeContinuity},
+        control::ControlClient,
+        terminal::ipc::{
+            ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage,
+            ServerResponse, read_frame, write_frame,
+        },
+    };
+    let fixture = Fixture::with_provider(include_str!("fixtures/chat-composer-claude.sh"));
+    let config = fixture.root.path().join("home/.claude");
+    let reply = "Offline background update for responsiveness comparison.\n".repeat(40000);
+    assert_eq!(reply.len(), 2_280_000);
+    fs::write(config.join("fixture-reply.md"), &reply).unwrap();
+    fs::write(config.join("fixture-stream-reply"), "0.5\n").unwrap();
+    let project = fixture.root.path().join("project");
+    let project = project.to_str().unwrap();
+    fixture.cli(&["project", "open", project]);
+    let accepted = fixture.cli(&[
+        "agent",
+        "spawn",
+        "--provider",
+        "claude",
+        "--repository",
+        project,
+        "--surface",
+        "chat",
+        "--prompt",
+        "Stream the offline background fixture.",
+        "--idempotency-key",
+        "close-delayed-stream",
+    ]);
+    let agent = accepted["agent"]["id"].as_str().unwrap();
+    let status = fixture.cli(&["daemon", "status"]);
+    let socket = Path::new(status["socket"].as_str().unwrap());
+    let mut inventory = ControlClient::connect(socket).unwrap();
+    let session = inventory.list_chats().unwrap().into_iter().next().unwrap();
+    assert!(matches!(
+        &session.native_continuity,
+        NativeContinuity::RetainedClaudeActor { .. }
+    ));
+    let chat_id = session.id;
+    let mut observer = std::os::unix::net::UnixStream::connect(socket).unwrap();
+    observer
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    observer
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut proof = None;
+    let mut sequence = 0;
+    let mut request = |value| {
+        sequence += 1;
+        write_frame(
+            &mut observer,
+            &ClientEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: sequence,
+                proof: proof.clone(),
+                request: value,
+            },
+        )
+        .unwrap();
+        loop {
+            let envelope: ServerEnvelope = read_frame(&mut observer).unwrap().unwrap();
+            if let Some(expected) = &proof {
+                assert_eq!(&envelope.proof, expected);
+            } else {
+                proof = Some(envelope.proof.clone());
+            }
+            if envelope.request_id == Some(sequence) {
+                let ServerMessage::Response { response } = envelope.message else {
+                    panic!("unexpected private daemon response");
+                };
+                break response;
+            }
+        }
+    };
+    assert!(matches!(
+        request(ClientRequest::Connect {
+            expected_host: None,
+            resume: Vec::new(),
+        }),
+        ServerResponse::Connected { .. }
+    ));
+    assert!(matches!(
+        request(ClientRequest::ChatAttach { session }),
+        ServerResponse::ChatAttached { .. }
+    ));
+    assert!(matches!(
+        request(ClientRequest::ChatVisibility {
+            chat_id,
+            visible: true,
+        }),
+        ServerResponse::Accepted
+    ));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let ServerResponse::ChatSnapshot { snapshot, .. } = request(ClientRequest::ChatRead {
+            chat_id,
+            after_generation: None,
+        }) else {
+            panic!("expected the actual retained actor snapshot");
+        };
+        let snapshot = snapshot.unwrap();
+        if let Some(text) = snapshot.items.iter().find_map(|item| match &item.content {
+            ItemContent::Text { text, .. } if text.starts_with("Offline background update") => {
+                Some(text)
+            }
+            _ => None,
+        }) {
+            assert!(snapshot.busy, "close must start during the active stream");
+            assert!(text.len() < reply.len());
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the actor never received a delta"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let began = Instant::now();
+    let closed = fixture.cli(&["agent", "close", agent]);
+    assert_eq!(closed["agent"]["closed"], true);
+    assert!(
+        began.elapsed() < Duration::from_secs(10),
+        "close must serve control, not wait for the roughly 70-second reply"
+    );
+    assert!(inventory.list_chats().unwrap().is_empty());
+    assert!(
+        fs::read_dir(config).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".fixture-stream.")),
+        "provider teardown must remove its private stream state"
+    );
+}
+
+#[test]
 fn repeated_private_cli_capture_does_not_renew_original_deadline() {
     let root = tempfile::tempdir().unwrap();
     let command = |script: &str| {

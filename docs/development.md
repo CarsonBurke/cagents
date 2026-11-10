@@ -1182,6 +1182,11 @@ and [systemd's numeric scope PID handling](https://github.com/systemd/systemd/bl
 
 ## Testing
 
+The self-contained synthetic Claude provider in `tests/fixtures/chat-composer-claude.sh`
+requires `jq` and `/usr/bin/python3`. Its optional delayed reply stream serves
+control requests while producing text and records only the emitted prefix when
+interrupted. Run its offline contracts with `/usr/bin/python3 tests/chat_composer_provider.py -v`.
+
 A bare `cargo test` runs only the shared CLI lane: under the default `full`
 feature, the `ui` and `host` unit tests are compiled out. Cargo skips integration
 targets whose required features are absent, rather than compiling and linking
