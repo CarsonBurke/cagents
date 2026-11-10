@@ -28,8 +28,6 @@ use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
 use cosmic::iced::{Size, mouse};
 use std::time::{Duration, Instant};
 
-mod heap_cost;
-
 const FRAMES: usize = 240;
 /// Frames a recorded workload discards while caches and allocations settle.
 const WARMUP: usize = 8;
@@ -1608,6 +1606,7 @@ fn what_a_warm_hidden_chat_holds() {
             pane.frame();
         }
         pane.cache = Cache::new();
+        preparation::retirement_barrier();
         // What the budget would charge; a chat over a chat's share goes cold
         // as it hides, so what it frees is measured either way.
         let counted = pane.runtime.warm_bytes();
