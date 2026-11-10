@@ -755,18 +755,23 @@ run_app() {
 # Observe the explicit machine format; display text is not a window contract.
 app_window_is_open() {
     local observed
-    observed=$(timeout -k 1 10 niri-harness --no-heal --session "$session_name" --json observe --no-text 2>/dev/null) || return 1
+    observed=$(timeout -k 1 10 niri-harness --no-heal --session "$session_name" --json observe --no-text 2>/dev/null) || return 2
     /usr/bin/python3 -c 'import json,sys
 try:
     state=json.load(sys.stdin)
-    sys.exit(not bool(state.get("window")))
+    if not isinstance(state,dict) or "window" not in state:
+        sys.exit(2)
+    window=state["window"]
+    if window is None:
+        sys.exit(1)
+    sys.exit(0 if isinstance(window,dict) and window else 2)
 except (ValueError,AttributeError):
-    sys.exit(1)
+    sys.exit(2)
 ' <<<"$observed"
 }
 
 cmd_relaunch() {
-    local side watcher status=0 chat_stage_output=
+    local side watcher observed status=0 chat_stage_output=
     side=$(current_side)
     case ${1:-} in
         --chat-stages)
@@ -785,9 +790,12 @@ cmd_relaunch() {
     local session_environment
     session_environment=$(timeout -k 5 30 niri-harness --session "$session_name" session env)
     eval "$session_environment"
-    if app_window_is_open; then
-        die 'close the app window before relaunching it'
-    fi
+    app_window_is_open && observed=0 || observed=$?
+    case $observed in
+        0) die 'close the app window before relaunching it' ;;
+        1) ;;
+        *) die "could not observe whether the app window is closed; see $harness_root/session.log" ;;
+    esac
     # Product copies need not contain Cargo dependency lists, so the runner's
     # ordinary warm-build shortcut may decline them. Replay the exact recorded
     # builds again until the new window appears; never compile under this lock.

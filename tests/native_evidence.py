@@ -64,7 +64,9 @@ STUBS = {
                 shot) shot=${args[i + 1]} ;;
                 env) printf 'export NESTED_MARKER=nested\\n'; exit 0 ;;
                 observe)
-                    [ ! -e "$STUB_LOG/ui-absent" ] || exit 0
+                    [ ! -e "$STUB_LOG/observe-error" ] || exit 1
+                    if [ -e "$STUB_LOG/observe-malformed" ]; then printf 'invalid'; exit 0; fi
+                    if [ -e "$STUB_LOG/ui-absent" ]; then printf '{"window":null}\\n'; exit 0; fi
                     if [ -e "$STUB_LOG/cropped" ]; then
                         printf '{"window":{"size":[900,600]},"output":{"logical":{"width":900,"height":561}},"text":"'
                     else
@@ -834,6 +836,26 @@ class Evidence(unittest.TestCase):
         self.assertIn("DBUS_SESSION_BUS_ADDRESS=stub\n", runner)
         self.assertIn("WAYLAND_DISPLAY=evidence\n", runner)
         self.assertIn(f"CARGO_HOME={self.root}/real-home/.cargo\n", runner)
+
+    def test_relaunch_refuses_an_unconfirmed_window_observation(self) -> None:
+        self.built()
+        self.run_tool("start", "after")
+        os.kill(int((self.logs / "ui-pid").read_text()), 15)
+        (self.task / "niri" / "session.rc").write_text("0")
+        (self.logs / "ui-absent").touch()
+        before = (self.logs / "runner").read_text()
+        for marker in ("observe-error", "observe-malformed"):
+            with self.subTest(marker=marker):
+                failed = self.logs / marker
+                failed.touch()
+                try:
+                    result = self.run_tool("relaunch", check=False)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("could not observe whether", result.stderr)
+                    self.assertEqual((self.logs / "runner").read_text(), before)
+                finally:
+                    failed.unlink()
+        self.run_tool("stop")
 
     def test_relaunch_keeps_the_session_and_replays_only_the_built_products(self) -> None:
         self.built()
