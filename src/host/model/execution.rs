@@ -2385,6 +2385,60 @@ mod tests {
     }
 
     #[test]
+    fn execution_delta_does_not_close_a_pane_reseeded_before_announcement() {
+        use crate::workspace_model::views::Scope;
+
+        let (mut execution, directory, accepted, source, original_scope) = delta_pane_fixture();
+        let saved_pane = execution
+            .view_snapshot(&original_scope)
+            .unwrap()
+            .0
+            .unwrap()
+            .panes
+            .remove(0);
+        let mut window = execution.execution_connection().unwrap();
+        let destination = ChannelId::new();
+        window
+            .apply(&ModelEdit::CreateChannel {
+                id: destination,
+                repository: directory.path().into(),
+                title: "Delayed window seed".into(),
+                title_source: Default::default(),
+            })
+            .unwrap();
+
+        // Execution commits before announcing, so another WAL connection can
+        // deliver an already queued seed from an independent window meanwhile.
+        // This destination never held the card and has no local tombstone.
+        assert!(execution.retire_agent_process(&source, 3).unwrap());
+        let destination = Scope::Channel(destination);
+        assert!(
+            window
+                .apply(&ModelEdit::SeedView {
+                    scope: destination.clone(),
+                    panes: vec![saved_pane.clone()],
+                    closed: vec![],
+                })
+                .unwrap()
+                .changed
+        );
+        assert_eq!(
+            window.view_snapshot(&destination).unwrap().0.unwrap().panes,
+            vec![saved_pane]
+        );
+
+        let (_, effects) = execution.execution_delta().unwrap();
+        assert!(
+            effects.closed.is_empty(),
+            "a current authoritative owner must not receive a global closed-identity fence"
+        );
+        assert_eq!(effects.removed_agents, vec![accepted.agent.id]);
+        assert_eq!(effects.views.len(), 1);
+        assert_eq!(effects.views[0].scope, original_scope);
+        assert!(execution.execution_delta().unwrap().1.is_empty());
+    }
+
+    #[test]
     fn execution_delta_rolls_back_with_failed_retirement() {
         let (mut registry, _, _, source, scope) = delta_pane_fixture();
         let before = registry.view_snapshot(&scope).unwrap();

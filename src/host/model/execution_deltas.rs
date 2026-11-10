@@ -139,7 +139,9 @@ impl Registry {
         }
         effects.closed = identities::<CardId>(
             &tx,
-            "SELECT pane FROM execution_closed_changes ORDER BY pane",
+            "SELECT pane FROM execution_closed_changes
+             WHERE NOT EXISTS(SELECT 1 FROM panes WHERE panes.id=execution_closed_changes.pane)
+             ORDER BY pane",
         )?;
         for id in identities::<AgentId>(
             &tx,
