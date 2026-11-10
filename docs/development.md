@@ -294,7 +294,10 @@ no model/provider; its server has the fixture's HOME and runtime and is ended by
 normal fixture teardown. Steps receive the recorded build lane and explicit
 fixture root; the server requires that root's private HOME, independent of where
 Cargo keeps its build output. The same step interface can drive an isolated
-named instance. `BROWSER_SMOKE_OPEN_ONLY=1` opens only the animated
+named instance. `env --side after CMD...` selects its recorded environment
+before the first window, retains helper ownership for `stop`, and refuses to
+change scope while fixture processes remain. Use short instance names when the
+fixture's runtime is already deep enough to approach Unix socket path limits. `BROWSER_SMOKE_OPEN_ONLY=1` opens only the animated
 page for a controlled resource/presentation sample.
 
 ### Parallel instances

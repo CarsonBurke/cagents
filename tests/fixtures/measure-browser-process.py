@@ -53,7 +53,8 @@ def main():
         if not process.name.isdigit():
             continue
         try:
-            if process.joinpath('comm').read_text().strip() != 'cagents-ui':
+            executable = process.joinpath('exe').readlink().name.removesuffix(' (deleted)')
+            if executable != 'cagents-ui':
                 continue
             if marker not in process.joinpath('environ').read_bytes().split(b'\0'):
                 continue

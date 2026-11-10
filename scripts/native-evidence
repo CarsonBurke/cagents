@@ -51,10 +51,11 @@ both use the same fixture data and synthetic provider.
                   --software-rendering explicitly selects software GL clients
                   for comparison; the default keeps runtime rendering.
   cli ARGS...     Run this side's cagents CLI in the fixture environment.
-  env CMD...      Run a command in the fixture environment, which keeps nothing
-                  from this shell beyond locale and terminal settings and
-                  where Cargo and rustup live. Between sessions it runs under
-                  the side the last session ran, with no daemon running.
+  env [--side SIDE] CMD...
+                  Run in the fixture environment, keeping locale, terminal
+                  settings, Cargo and rustup locations. --side selects a built
+                  side before the first session or between sessions, refusing
+                  active fixture processes. Otherwise keep the selected side.
   drive ARGS...   Run niri-harness against the session (observe, click, key...).
   nested CMD...   Run a command in the nested compositor's environment.
   shot NAME       Capture shots/SIDE-NAME.webp and record its source revision.
@@ -979,12 +980,26 @@ case $command in
         # Between sessions the fixture is still there, with no daemon holding
         # its stores, so setup that needs the daemon stopped runs then, under
         # the side the last session ran.
-        if live_session || [ ! -f "$state/side" ]; then
-            side=$(current_side)
+        if [ "${1:-}" = --side ]; then
+            side=${2:-}
+            require_side "$side"
+            shift 2
+            if live_session || [ -n "$(session_processes)" ]; then
+                die 'stop fixture processes before selecting an environment side'
+            fi
+            load_side "$side"
+            # Retain ownership for stop even when env starts detached helpers
+            # before a window supervisor has ever run.
+            cp -- "$target/evidence-source" "$state/source"
+            printf '%s\n' "$side" >"$state/side"
         else
-            side=$(cat "$state/side")
+            if live_session || [ ! -f "$state/side" ]; then
+                side=$(current_side)
+            else
+                side=$(cat "$state/side")
+            fi
+            load_side "$side" "$state/source"
         fi
-        load_side "$side" "$state/source"
         fixture_env "$@"
         ;;
     drive) cmd_drive "$@" ;;

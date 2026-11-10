@@ -660,6 +660,29 @@ class Evidence(unittest.TestCase):
         self.assertNotIn("development,ui --bin cagents-ui", cargo)
         self.assertEqual((self.task / "target-after/evidence-source").read_text().splitlines()[-1], "integrated")
 
+    def test_an_environment_side_can_be_selected_before_the_first_window(self):
+        self.built()
+        result = self.run_tool("env", "--side", "after", "sh", "-c",
+                               'printf "%s\\n" "$HOME" "$CAGENTS_EVIDENCE_BUILD_LANE"')
+        self.assertEqual(result.stdout.splitlines(), [str(self.task / "fixture/home"), "browserless"])
+        self.assertEqual((self.task / "session/source").read_bytes(),
+                         (self.task / "target-after/evidence-source").read_bytes())
+        self.assertFalse((self.logs / "kwin").exists())
+
+    def test_an_environment_side_owns_helpers_and_cannot_change_while_they_run(self):
+        self.built("before")
+        self.built("after")
+        self.run_tool("env", "--side", "after", "true")
+        helper = subprocess.Popen(["sleep", "300"], env={**os.environ,
+                                  "HOME": str(self.task / "fixture/home")})
+        self.addCleanup(lambda: helper.terminate() if helper.poll() is None else None)
+        refused = self.run_tool("env", "--side", "before", "true", check=False)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("stop fixture processes before selecting an environment side", refused.stderr)
+        self.assertEqual((self.task / "session/side").read_text().strip(), "after")
+        self.run_tool("stop")
+        self.assertEqual(helper.wait(timeout=10), -15)
+
     def test_fixture_steps_receive_the_recorded_lane_instead_of_the_callers(self):
         checkout = self.checkout("after")
         for options, expected in (((), "browserless"), (("--integrated-browser",), "integrated")):
