@@ -1924,7 +1924,7 @@ that build with its matched `cagents` and `cagentsd`, in the same private runtim
 The scenario verifies its mapped window too. The default seed includes Claude
 chat and console agents, an offline Codex app-server, two untitled conversations
 in one project, a channel containing ` Details: `, a shell and `sleep 86400`.
-Use `--untitled 0|1|2`, `--no-codex` and `--no-child` to vary that baseline.
+Use `--untitled 0|1|2`, `--no-codex`, `--no-console` and `--no-child` to vary that baseline.
 
 Optional problem states each have their own switch:
 
@@ -1945,7 +1945,11 @@ Optional problem states each have their own switch:
   real binary. The scenario requires the worker to report this failure, restore
   OLD as `current`, serve daemon requests again, reopen OLD's windows and retain
   the seeded work. The fault and original binary digests are saved in
-  `logs/startup-fault.txt`. This option never modifies either input archive.
+  `logs/startup-fault.txt`; `logs/daemon-start-failure.txt` records actual
+  execution. This option never modifies either input archive. Use `--no-console`
+  to test rollback with ordinary terminals. With a managed console, add
+  `--expect-console-refusal` instead: the scenario requires a refusal before
+  startup, no execution receipt, the original daemon serving and all work intact.
 
 A seeded state does not guarantee a particular refusal on every revision.
 `seeds.json` preserves spawn results, OLD's actual inventories, verification

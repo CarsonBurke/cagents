@@ -136,7 +136,8 @@ class Rehearsal:
         details_id = details['response'].get('data',{}).get('channel',{}).get('id')
         placement = ['--channel',details_id] if details_id else []
         seed('named-chat', ['agent','spawn','--provider','claude','--surface','chat','--name','chat-alpha',*placement,'Seeded alpha chat'], 'alpha')
-        seed('console', ['agent','spawn','--provider','claude','--surface','terminal','--name','console-alpha','Seeded console'], 'alpha')
+        if not args.no_console:
+            seed('console', ['agent','spawn','--provider','claude','--surface','terminal','--name','console-alpha','Seeded console'], 'alpha')
         if not args.no_codex:
             seed('codex-chat', ['agent','spawn','--provider','codex','--surface','chat','--name','codex-alpha','Offline Codex rehearsal'], 'alpha')
         for index in range(args.untitled):
@@ -306,14 +307,22 @@ class Rehearsal:
                 status_path = self.root/'home/.local/share/cagents-install/.update/status.json'
                 try:
                     status = json.loads(status_path.read_text())
-                    receipt = (self.root/'logs/daemon-start-failure.txt').read_text().split()
-                    if (status['phase'] != 'Failed' or 'exit status: 1' not in Path(status['log_path']).read_text()
-                            or len(receipt) != 2 or receipt[0] != args.new_version or int(receipt[1]) <= 1):
-                        self.errors.append('worker did not report the forced daemon startup failure')
+                    log = Path(status['log_path']).read_text()
+                    receipt_path = self.root/'logs/daemon-start-failure.txt'
+                    if status['phase'] != 'Failed':
+                        self.errors.append('worker did not report a failed update')
+                    if args.expect_console_refusal:
+                        if 'cannot keep a running agent console connected' not in log or receipt_path.exists():
+                            self.errors.append('unsafe console replacement was not refused before candidate startup')
+                    else:
+                        receipt = receipt_path.read_text().split()
+                        if ('exit status: 1' not in log or len(receipt) != 2
+                                or receipt[0] != args.new_version or int(receipt[1]) <= 1):
+                            self.errors.append('worker did not report the executed daemon startup failure')
                 except (OSError, KeyError, ValueError) as exc:
                     self.errors.append(f'forced failure evidence missing: {exc}')
                 current = self.root/'home/.local/share/cagents-install/current'
-                if current.resolve().name != args.old_version:
+                if not args.expect_console_refusal and current.resolve().name != args.old_version:
                     self.errors.append('failed update did not restore the old current version')
                 serving_code, serving = self.cli('--no-start','daemon','status',check=False)
                 if (serving_code or serving.get('data',{}).get('running') is not True
@@ -384,6 +393,7 @@ class Rehearsal:
 def seed_options(parser):
     parser.add_argument('--untitled',type=int,choices=(0,1,2),default=2)
     parser.add_argument('--no-codex',action='store_true')
+    parser.add_argument('--no-console',action='store_true',help='seed native chats and ordinary terminals without a managed agent console')
     parser.add_argument('--no-child',action='store_true')
     for flag in ('ignore-term','no-init','exit-mid-turn','uncarryable','unreachable'):
         parser.add_argument('--'+flag,action='store_true')
@@ -391,7 +401,7 @@ def seed_options(parser):
 
 def seed_flags(args):
     flags = ['--untitled',str(args.untitled)]
-    for flag in ('no_codex','no_child','ignore_term','no_init','exit_mid_turn','uncarryable','unreachable'):
+    for flag in ('no_codex','no_console','no_child','ignore_term','no_init','exit_mid_turn','uncarryable','unreachable'):
         if getattr(args,flag):
             flags.append('--'+flag.replace('_','-'))
     return flags
@@ -412,6 +422,7 @@ def main():
     run.add_argument('--working',default='',help='typed at the working-agents choice; empty waits for them')
     run.add_argument('--stop',default='',help='typed at the destructive stop list; empty cancels')
     run.add_argument('--upgrade-arg',action='append',default=[],help='use --upgrade-arg=--interrupt, for example')
+    run.add_argument('--expect-console-refusal', action='store_true', help='with --fail-new-daemon, require console refusal before startup and preserve all work')
     run.add_argument('--fail-new-daemon', action='store_true', help='fail private candidate startup; require old current, serving daemon and preserved work')
     run.add_argument('--reopen-timeout',type=float,default=45)
     seed_options(run)
@@ -421,6 +432,8 @@ def main():
     observe=commands.add_parser('observe')
     observe.add_argument('output')
     args=parser.parse_args()
+    if args.command == 'run' and args.expect_console_refusal and (not args.fail_new_daemon or args.no_console):
+        parser.error('--expect-console-refusal requires --fail-new-daemon and a seeded console')
     rehearsal=Rehearsal(args.root,args.shell)
     try:
         if args.command=='wait':
