@@ -31,6 +31,7 @@ pub struct Recovery {
     pub source: TerminalSession,
     pub previous_sources: Vec<TerminalSession>,
     pub relaunches: Vec<super::ipc::UpgradeRelaunch>,
+    #[serde(serialize_with = "serialize_recovery_options")]
     pub options: super::TerminalSpawnOptions,
     pub execution_environment: Option<super::ipc::ChatExecutionEnvironment>,
     /// The actual restart recipe retained by this original holder. It must
@@ -66,4 +67,33 @@ impl Recovery {
         }
         Ok(())
     }
+}
+
+// Recovery travels as private holder JSON. The Rust field was renamed to make
+// its byte units explicit, but old holders require the original JSON key on
+// Attach. Current readers accept that same key through their alias.
+fn serialize_recovery_options<S: serde::Serializer>(
+    options: &super::TerminalSpawnOptions,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    #[derive(Serialize)]
+    struct Options<'a> {
+        columns: u16,
+        rows: u16,
+        cell_width_px: u32,
+        cell_height_px: u32,
+        max_scrollback: usize,
+        initially_visible: bool,
+        theme: &'a super::TerminalTheme,
+    }
+    Options {
+        columns: options.columns,
+        rows: options.rows,
+        cell_width_px: options.cell_width_px,
+        cell_height_px: options.cell_height_px,
+        max_scrollback: options.max_scrollback_bytes,
+        initially_visible: options.initially_visible,
+        theme: &options.theme,
+    }
+    .serialize(serializer)
 }

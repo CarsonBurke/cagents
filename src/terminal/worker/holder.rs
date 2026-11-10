@@ -2022,6 +2022,122 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_recovery_attach_preserves_the_historical_scrollback_key() {
+        // Frozen protocol-4 holder DTOs from 0387aa2. Inbound aliases on the
+        // new Options do not make an old holder accept a newly named key.
+        #[derive(Deserialize)]
+        enum LegacyRequest {
+            Attach {
+                protocol: u32,
+                recovery: LegacyRecovery,
+            },
+        }
+        #[derive(Deserialize)]
+        struct LegacyRecovery {
+            source: crate::model::TerminalSession,
+            previous_sources: Vec<crate::model::TerminalSession>,
+            relaunches: Vec<crate::terminal::ipc::UpgradeRelaunch>,
+            options: LegacyOptions,
+            execution_environment: Option<crate::terminal::ipc::ChatExecutionEnvironment>,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct LegacyOptions {
+            columns: u16,
+            rows: u16,
+            cell_width_px: u32,
+            cell_height_px: u32,
+            max_scrollback: usize,
+            initially_visible: bool,
+            theme: crate::terminal::TerminalTheme,
+        }
+        let recipe = crate::model::LaunchRecipe {
+            program: "/bin/bash".into(),
+            arguments: vec!["-l".into()],
+            working_directory: "/private/source56".into(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        let source = crate::terminal::ipc::TerminalDescriptor::relaunchable(
+            crate::model::TerminalId::new(),
+            recipe,
+            None,
+        )
+        .session;
+        let options = crate::terminal::TerminalSpawnOptions {
+            columns: 123,
+            rows: 45,
+            cell_width_px: 7,
+            cell_height_px: 13,
+            max_scrollback_bytes: 131072,
+            initially_visible: false,
+            theme: crate::terminal::TerminalTheme::Dark,
+        };
+        let recovery = Recovery {
+            source: source.clone(),
+            previous_sources: Vec::new(),
+            relaunches: Vec::new(),
+            options: options.clone(),
+            execution_environment: None,
+            execution_recipe: None,
+        };
+        let encoded = serde_json::to_value(Request::Attach {
+            protocol: PROTOCOL,
+            recovery: Some(recovery),
+        })
+        .unwrap();
+        let object = &encoded["Attach"]["recovery"]["options"];
+        assert_eq!(object["max_scrollback"], 131072);
+        assert!(object.get("max_scrollback_bytes").is_none());
+        let LegacyRequest::Attach {
+            protocol,
+            recovery: old,
+        } = serde_json::from_value::<LegacyRequest>(encoded.clone()).unwrap();
+        assert!(protocol >= 4);
+        assert_eq!(old.source, source);
+        assert!(
+            old.previous_sources.is_empty()
+                && old.relaunches.is_empty()
+                && old.execution_environment.is_none()
+        );
+        assert_eq!(
+            (
+                old.options.columns,
+                old.options.rows,
+                old.options.cell_width_px,
+                old.options.cell_height_px,
+                old.options.max_scrollback,
+                old.options.initially_visible,
+                old.options.theme
+            ),
+            (
+                123,
+                45,
+                7,
+                13,
+                131072,
+                false,
+                crate::terminal::TerminalTheme::Dark
+            )
+        );
+        let Request::Attach {
+            recovery: Some(current),
+            ..
+        } = serde_json::from_value::<Request>(encoded.clone()).unwrap()
+        else {
+            panic!("Attach lost its recovery");
+        };
+        assert_eq!(current.options, options);
+        let mut incompatible = encoded;
+        let object = incompatible["Attach"]["recovery"]["options"]
+            .as_object_mut()
+            .unwrap();
+        let value = object.remove("max_scrollback").unwrap();
+        object.insert("max_scrollback_bytes".into(), value);
+        assert!(serde_json::from_value::<LegacyRequest>(incompatible).is_err());
+    }
+
+    #[test]
     fn failed_adoption_commit_acknowledgement_keeps_unconsumed_replay() {
         let (successor, holder) = UnixStream::pair().unwrap();
         successor.shutdown(std::net::Shutdown::Read).unwrap();
