@@ -1518,7 +1518,14 @@ impl ControlClient {
 
     /// Answered during startup recovery, when other requests are refused.
     pub fn startup_state(&mut self) -> Result<terminal::ipc::StartupState, ControlError> {
-        match self.request_strict(ClientRequest::StartupState)? {
+        self.startup_state_with_deadline(Instant::now() + IO_TIMEOUT)
+    }
+
+    pub(crate) fn startup_state_with_deadline(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<terminal::ipc::StartupState, ControlError> {
+        match self.request_with_deadline(ClientRequest::StartupState, deadline)? {
             ServerResponse::StartupState(state) => Ok(state),
             response => Err(unexpected_response("daemon startup state", &response)),
         }

@@ -87,6 +87,13 @@ impl Peer {
         self.alive()
     }
 
+    pub(super) fn executable(&self) -> Result<PathBuf, UpdateError> {
+        self.alive()?;
+        let executable = fs::read_link(format!("/proc/{}/exe", self.pid))?;
+        self.alive()?;
+        Ok(executable)
+    }
+
     fn alive(&self) -> Result<(), UpdateError> {
         let mut poll = libc::pollfd {
             fd: self.process.as_raw_fd(),
