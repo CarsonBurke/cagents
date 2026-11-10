@@ -486,8 +486,8 @@ impl Cagents {
                     .map_or(Ok(Vec::new()), |store| store.saved_conversations())
                     .map_err(|error| error.to_string());
                 if let Ok(entries) = &mut saved {
-                    for card in current {
-                        if let CardKind::Chat(session) = card.kind
+                    for card in &current {
+                        if let CardKind::Chat(session) = &card.kind
                             && session.launch.session_id.is_some()
                         {
                             let updated_at_unix_ms = entries
@@ -500,8 +500,8 @@ impl Cagents {
                             entries.retain(|entry| entry.card != card.id);
                             entries.push(SavedConversation {
                                 card: card.id,
-                                title: card.title,
-                                session,
+                                title: card.title.clone(),
+                                session: session.clone(),
                                 open: card.existence.is_open(),
                                 updated_at_unix_ms,
                             });

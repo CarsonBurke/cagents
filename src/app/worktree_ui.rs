@@ -2302,7 +2302,7 @@ mod tests {
         let a = terminal("/repo");
         let b = terminal("/repo/nested");
         app.durable = Arc::new(WorkspaceState {
-            cards: vec![a.clone(), b.clone()],
+            cards: vec![a.clone(), b.clone()].into(),
             focused: Some(a.id),
             ..WorkspaceState::default()
         });
