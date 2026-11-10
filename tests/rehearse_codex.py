@@ -2,6 +2,7 @@
 """Focused offline checks for the update rehearsal's Codex compatibility peer."""
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -9,6 +10,7 @@ import tempfile
 import threading
 import unittest
 import uuid
+from unittest import mock
 
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -128,6 +130,21 @@ class PersistenceTests(unittest.TestCase):
             states = [item["agentsStates"][final.child]["status"] for item in final.latest["items"]
                       if item["type"] == "collabAgentToolCall"]
             self.assertEqual(states, ["interrupted", "interrupted"])
+
+    def test_unconfirmed_interrupt_survives_listener_replacement(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {
+                "CAGENTS_TOOL_ROWS_NEVER_CONFIRM_INTERRUPT": "1"}):
+            storage = Path(directory) / "state"
+            first = adapter.scenario_class(peer, storage, Path("/first/control.sock"))()
+            remaining, _ = self.start_paused(first, directory)
+            self.interrupt(first, first.thread, directory)
+            replacement = adapter.scenario_class(peer, storage, Path("/first/control.sock"))()
+            self.assertEqual(replacement.state(), first.state())
+            sent = []
+            replacement.play(remaining, sent.append, threading.Lock(), replacement.playback(remaining))
+            self.assertEqual(replacement.latest["status"], "inProgress")
+            self.assertFalse(any(frame.get("method") == "turn/completed"
+                                 and frame["params"]["threadId"] == first.thread for frame in sent))
 
     def test_loading_named_history_fences_playback_of_the_previous_allocation(self):
         with tempfile.TemporaryDirectory() as directory:

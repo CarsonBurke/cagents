@@ -61,6 +61,9 @@ impl HandoffSource {
 }
 
 impl LeaseHandoff {
+    pub(crate) fn duplicate_for_recovery(&self) -> io::Result<File> {
+        self.lock.try_clone()
+    }
     pub(crate) fn wait(paths: &RuntimePaths, expected_pid: u32) -> Result<Self, PlatformError> {
         let lock = open_lock(paths)?;
         loop {
@@ -205,6 +208,7 @@ fn inherited_cache() -> io::Result<&'static Mutex<Option<File>>> {
 
 /// Called at CLI startup, before any child can inherit the reserved slot.
 pub(crate) fn initialize_inherited_lease() -> io::Result<()> {
+    crate::upgrade::recovery::initialize_inherited()?;
     inherited_cache().map(|_| ())
 }
 
@@ -230,6 +234,7 @@ pub(crate) fn has_inherited_lease() -> io::Result<bool> {
 }
 
 pub(crate) fn inherit_daemon_lease(command: &mut Command) -> io::Result<()> {
+    crate::upgrade::recovery::forward_inherited(command)?;
     if let Some((lock, inherited_slot)) = inherited()? {
         forward(command, lock, DAEMON_LEASE_FD, inherited_slot)?;
     }
@@ -241,6 +246,11 @@ pub(crate) fn inherit_daemon_lease(command: &mut Command) -> io::Result<()> {
 /// The caller must be the single-threaded daemon entry point.
 #[cfg(feature = "host")]
 pub(crate) unsafe fn take_inherited_lease() -> io::Result<Option<File>> {
+    crate::upgrade::recovery::initialize_inherited()?;
+    // The cache owns and seals recovery descriptors before any thread or
+    // provider child exists. The daemon must not export their marker to its
+    // ordinary children after it consumes the one-shot startup authority.
+    unsafe { env::remove_var(crate::upgrade::recovery::RECOVERY_FD_ENV) };
     let lock = inherited_cache()?
         .lock()
         .map_err(|_| io::Error::other("daemon startup reservation is unavailable"))?

@@ -32,7 +32,7 @@ pub(crate) struct Record {
     pub presentations: Vec<Presentation>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct StoppedSnapshot {
     pub source: Session,
     pub snapshot: crate::chat::Snapshot,
@@ -459,6 +459,14 @@ fn record_for_source(source: &HostSessionProof) -> Result<Option<Record>, String
         return Err("Stopped update record changed its source".into());
     }
     Ok(Some(record))
+}
+
+/// Preparation budgets its captured pages together with already-approved
+/// floor evidence before any source shutdown can become irreversible.
+pub(crate) fn existing_capture_size(source: &HostSessionProof) -> Result<usize, String> {
+    record_for_source(source)?.map_or(Ok(0), |mut record| {
+        record.encode_capture().map(|bytes| bytes.len())
+    })
 }
 
 #[cfg(feature = "host")]

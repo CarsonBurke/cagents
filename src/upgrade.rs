@@ -1,5 +1,6 @@
 //! Shared exact-session recovery authority and durable daemon upgrade handoff.
 pub(crate) mod floor;
+pub(crate) mod recovery;
 #[cfg(any(feature = "host", test))]
 use crate::model::HostSessionProof;
 #[cfg(any(feature = "host", feature = "ui", test))]
@@ -1438,7 +1439,7 @@ pub(crate) mod handoff {
                 || header.phase != "Prepared")
         }
 
-        fn read_bytes(&self) -> Result<Option<Vec<u8>>, String> {
+        pub(super) fn read_bytes(&self) -> Result<Option<Vec<u8>>, String> {
             self.read_named(FILE)
         }
 
@@ -1521,7 +1522,7 @@ pub(crate) mod handoff {
 
         /// Atomically and durably replaces `name` with `bytes`.
         #[cfg(any(feature = "host", test))]
-        fn write_named(&self, name: &str, bytes: &[u8]) -> Result<(), String> {
+        pub(super) fn write_named(&self, name: &str, bytes: &[u8]) -> Result<(), String> {
             let (mut file, temporary) = fs_safety::create_temporary_in(&self.root, 0o600)
                 .map_err(|error| error.to_string())?;
             let result = (|| {

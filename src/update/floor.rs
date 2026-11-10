@@ -225,7 +225,22 @@ trait FloorSource {
         daemon: &impact::DaemonImpact,
         service: bool,
     ) -> Result<Inventory, UpdateError>;
-    fn prepare(&mut self, daemon: &impact::DaemonImpact) -> Result<(), UpdateError>;
+    fn begin_preparation(
+        &mut self,
+        _state: &Path,
+        _job: &UpdateJob,
+        _daemon: &impact::DaemonImpact,
+    ) -> Result<(), UpdateError> {
+        Ok(())
+    }
+    fn prepare(&mut self, daemon: &impact::DaemonImpact) -> Result<(), source::PrepareError>;
+    fn begin_interrupts(
+        &mut self,
+        daemon: &impact::DaemonImpact,
+        deadline: Instant,
+    ) -> Result<(), UpdateError>;
+    fn pending_interrupts(&mut self) -> Result<Vec<TerminalId>, UpdateError>;
+    fn interrupt_impact(&self) -> Result<impact::DaemonImpact, UpdateError>;
     fn close_chat(
         &mut self,
         daemon: &impact::DaemonImpact,
@@ -293,6 +308,10 @@ struct NativeSource<'a, O> {
     survivors: &'a mut Survivors,
     reviewed: &'a impact::Preview,
     guard: &'a crate::instance::UiUpdateGuard,
+    interrupts: Option<source::Interrupts>,
+    interrupt_reviewed: Option<impact::DaemonImpact>,
+    preparing_client: Option<source::Client>,
+    preparation: Option<crate::upgrade::recovery::Preparation>,
 }
 
 impl<O: FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>> FloorSource
@@ -342,10 +361,104 @@ impl<O: FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>> FloorSour
             terminals,
         })
     }
-    fn prepare(&mut self, daemon: &impact::DaemonImpact) -> Result<(), UpdateError> {
-        source_client_for(daemon)?.prepare_confirmed_upgrade(daemon.clone(), false)?;
-        self.survivors.record_prepared(self.reviewed, daemon);
+    fn begin_preparation(
+        &mut self,
+        state: &Path,
+        job: &UpdateJob,
+        daemon: &impact::DaemonImpact,
+    ) -> Result<(), UpdateError> {
+        let mut client = source_client_for(daemon)?;
+        let chats = client.list_chats()?;
+        let mut snapshots = crate::upgrade::recovery::SnapshotCapture::default();
+        for chat in &chats {
+            let snapshot = client.capture_chat_snapshot(chat.clone())?;
+            snapshots.push(chat.clone(), snapshot).map_err(invalid)?;
+        }
+        let census = crate::upgrade::recovery::Census {
+            terminals: client
+                .list()?
+                .into_iter()
+                .map(|item| item.session)
+                .collect(),
+            chats,
+            snapshots: snapshots.finish(),
+        };
+        self.preparation = Some(
+            crate::upgrade::recovery::Preparation::begin(
+                state,
+                &job.id,
+                daemon,
+                census.clone(),
+                self.guard,
+            )
+            .map_err(invalid)?,
+        );
+        self.survivors.prepared_source = Some((daemon.clone(), census));
+        for item in &daemon.sessions {
+            self.survivors.labels.insert(
+                item.id,
+                self.reviewed
+                    .labels
+                    .names
+                    .get(&item.id)
+                    .unwrap_or(&item.title)
+                    .clone(),
+            );
+        }
+        self.preparing_client = Some(client);
         Ok(())
+    }
+    fn prepare(&mut self, daemon: &impact::DaemonImpact) -> Result<(), source::PrepareError> {
+        let mut client = self.preparing_client.take().ok_or_else(|| {
+            source::PrepareError::Invalid(invalid(
+                "The update has not captured its source preparation census",
+            ))
+        })?;
+        client.prepare_confirmed_upgrade(daemon.clone(), false)?;
+        // An accepted prepare has crossed the point of no return even when
+        // capturing its checkpoint subsequently fails. Never classify that
+        // local capture failure as a refused prepare and stop the service.
+        self.survivors.record_prepared(self.reviewed, daemon);
+        if let Some(interrupted) = &self.interrupt_reviewed {
+            self.survivors.record_prepared(self.reviewed, interrupted);
+        }
+        if let Some(preparation) = self.preparation.take() {
+            match preparation.acknowledged() {
+                Ok(captured) => self.survivors.captured_preparation = Some(captured),
+                Err(error) => self.survivors.recovery_capture_error = Some(error),
+            }
+        }
+        Ok(())
+    }
+    fn begin_interrupts(
+        &mut self,
+        daemon: &impact::DaemonImpact,
+        deadline: Instant,
+    ) -> Result<(), UpdateError> {
+        self.survivors
+            .record_interrupt_requests(self.reviewed, daemon);
+        self.interrupt_reviewed = Some(daemon.clone());
+        self.interrupts = Some(source::Interrupts::begin(daemon, deadline)?);
+        Ok(())
+    }
+    fn pending_interrupts(&mut self) -> Result<Vec<TerminalId>, UpdateError> {
+        let interrupts = self
+            .interrupts
+            .as_mut()
+            .ok_or_else(|| invalid("The update has not requested these interruptions"))?;
+        let pending = interrupts.poll()?;
+        if let Some(reviewed) = &self.interrupt_reviewed {
+            self.survivors
+                .record_settled_interruptions(self.reviewed, reviewed, &pending);
+        }
+        self.survivors.late_turns.extend(interrupts.late_turns());
+        Ok(pending)
+    }
+    fn interrupt_impact(&self) -> Result<impact::DaemonImpact, UpdateError> {
+        self.interrupts
+            .as_ref()
+            .map(|interrupts| interrupts.current_impact().clone())
+            .ok_or_else(|| invalid("The update has not observed interruption settlement"))
     }
     fn close_chat(
         &mut self,
@@ -506,6 +619,10 @@ pub(super) fn quiesce(
         survivors,
         reviewed: confirmed,
         guard,
+        interrupts: None,
+        interrupt_reviewed: None,
+        preparing_client: None,
+        preparation: None,
     };
     quiesce_source(state, job, confirmed, terminal, &mut source)
 }
@@ -633,6 +750,10 @@ fn quiesce_inner(
             source.observe_policy(policy)
         })?;
     }
+    // Interrupted is a consented outcome, not a provider receipt. Old sources
+    // prepare their checkpoint before attempting interruption during shutdown;
+    // settle it while they can still serve, before crossing that boundary.
+    preview = settle_interrupts(state, job, preview, source, Duration::from_secs(30))?;
     let daemon = preview
         .daemon
         .as_ref()
@@ -641,14 +762,16 @@ fn quiesce_inner(
     // With no known ends, prepare itself determines whether the service can
     // checkpoint. A refusal has not ended anything and precedes the one stop list.
     if !daemon.blocked() {
+        source.begin_preparation(state, job, daemon)?;
         confirmation::prepared(state, job)?;
         match source.prepare(daemon) {
             Ok(()) => return source.stopped(state, job, false),
-            Err(error) => {
+            Err(source::PrepareError::Refused(error)) => {
                 confirmation::resume_cancellation(state, job)?;
                 eprintln!("The source could not checkpoint its work: {error}");
                 service = true;
             }
+            Err(error) => return Err(error.into()),
         }
     }
     if !service {
@@ -840,12 +963,133 @@ fn quiesce_inner(
             .daemon
             .as_ref()
             .ok_or_else(|| invalid("The source disappeared after ending conversations"))?;
+        if daemon
+            .sessions
+            .iter()
+            .any(|item| item.disposition == impact::Disposition::Interrupted)
+        {
+            return Err(invalid(
+                "A conversation started working again; review the update before preparing it",
+            ));
+        }
         // No prompt or new destructive scope is permitted after the first end.
+        source.begin_preparation(state, job, daemon)?;
         if completed.is_empty() {
             confirmation::prepared(state, job)?;
         }
         source.prepare(daemon)?;
         return source.stopped(state, job, false);
+    }
+}
+
+fn settle_interrupts(
+    state: &Path,
+    job: &mut UpdateJob,
+    preview: impact::Preview,
+    source: &mut impl FloorSource,
+    timeout: Duration,
+) -> Result<impact::Preview, UpdateError> {
+    let Some(daemon) = preview.daemon.as_ref() else {
+        return Ok(preview);
+    };
+    let interrupted: BTreeMap<_, _> = daemon
+        .sessions
+        .iter()
+        .filter(|item| item.disposition == impact::Disposition::Interrupted)
+        .map(|item| {
+            let label = preview.labels.names.get(&item.id).unwrap_or(&item.title);
+            (item.id, label.clone())
+        })
+        .collect();
+    if interrupted.is_empty() {
+        return Ok(preview);
+    }
+    confirmation::check_cancelled(state, job)?;
+    let deadline = Instant::now() + timeout;
+    let timeout_error = |pending: &[TerminalId]| {
+        let names: Vec<_> = if pending.is_empty() {
+            interrupted.values().map(String::as_str).collect()
+        } else {
+            pending
+                .iter()
+                .filter_map(|id| interrupted.get(id).map(String::as_str))
+                .collect()
+        };
+        invalid(format!(
+            "{} did not stop in time; nothing was changed in the installation. The source daemon and panes are still running.",
+            names.join(", ")
+        ))
+    };
+    let mut pending: Vec<_> = interrupted.keys().copied().collect();
+    set_phase(
+        state,
+        job,
+        UpdatePhase::ClosingWindows,
+        "Waiting for the confirmed interruptions before preparing the update",
+    )?;
+    eprintln!(
+        "Waiting for these conversations to stop: {}",
+        interrupted.values().cloned().collect::<Vec<_>>().join(", ")
+    );
+    if let Err(error) = source.begin_interrupts(daemon, deadline) {
+        return Err(if Instant::now() >= deadline {
+            timeout_error(&pending)
+        } else {
+            error
+        });
+    }
+    loop {
+        confirmation::check_cancelled(state, job)?;
+        if Instant::now() >= deadline {
+            return Err(timeout_error(&pending));
+        }
+        pending = match source.pending_interrupts() {
+            Ok(pending) => pending,
+            Err(error) => {
+                return Err(if Instant::now() >= deadline {
+                    timeout_error(&pending)
+                } else {
+                    error
+                });
+            }
+        };
+        confirmation::check_cancelled(state, job)?;
+        if Instant::now() >= deadline {
+            return Err(timeout_error(&pending));
+        }
+        if pending.is_empty() {
+            // The interrupt observer obtains this final idle capability with
+            // the same deadline. An independent observation here could extend
+            // the bound or allow Interrupt preparation of newly busy work.
+            let mut current = preview.clone();
+            current.daemon = Some(source.interrupt_impact()?);
+            let mut expected = preview.clone();
+            let idle = expected.daemon.as_mut().unwrap();
+            idle.policy = impact::Policy::WhenIdle;
+            for item in &mut idle.sessions {
+                if interrupted.contains_key(&item.id) {
+                    item.disposition = impact::Disposition::Resumes;
+                }
+            }
+            confirmation::check_cancelled(state, job)?;
+            if !expected.preserves_consent(&current)
+                || current.daemon.as_ref().is_none_or(|daemon| {
+                    daemon.policy != impact::Policy::WhenIdle
+                        || daemon.sessions.iter().any(|item| {
+                            interrupted.contains_key(&item.id)
+                                && item.disposition != impact::Disposition::Resumes
+                        })
+                })
+            {
+                return Err(invalid(
+                    "Conversations changed while stopping their turns; review the update again. The source daemon is still running.",
+                ));
+            }
+            return Ok(current);
+        }
+        thread::sleep(
+            Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now())),
+        );
     }
 }
 
@@ -909,7 +1153,14 @@ pub(super) struct Survivors {
     ended: BTreeMap<(impact::SessionKind, TerminalId), super::floor_display::StopItem>,
     service_stopped: bool,
     source_prepared: bool,
+    prepared_source: Option<(impact::DaemonImpact, crate::upgrade::recovery::Census)>,
+    captured_preparation: Option<crate::upgrade::recovery::CapturedPreparation>,
+    recovery_capture_error: Option<String>,
+    receipt: Option<crate::upgrade::recovery::Receipt>,
+    recovery_outcome: Option<crate::upgrade::recovery::RecoveryOutcome>,
     interrupted: BTreeMap<(impact::SessionKind, TerminalId), InterruptedTurn>,
+    unconfirmed_interrupts: BTreeMap<(impact::SessionKind, TerminalId), String>,
+    late_turns: BTreeSet<TerminalId>,
     background_tasks: u64,
     processes: BTreeMap<(i32, u64), Survivor>,
     labels: BTreeMap<TerminalId, String>,
@@ -926,15 +1177,195 @@ struct InterruptedTurn {
 }
 
 impl Survivors {
+    /// Run only after the original daemon exited and its exact lease was
+    /// acquired. A foreign or changed Prepared checkpoint never authorizes a
+    /// normal startup, even if the original prepare was acknowledged.
+    pub(super) fn authorize_successor(
+        &mut self,
+        target_daemon: &Path,
+        verified_digest: Option<&str>,
+        handoff: Option<&crate::daemon::lease_handoff::LeaseHandoff>,
+    ) -> Result<(), UpdateError> {
+        if !self.source_prepared {
+            return Ok(());
+        }
+        let (daemon, census) = self
+            .prepared_source
+            .as_ref()
+            .ok_or_else(|| invalid("The acknowledged source has no captured preparation census"))?;
+        let handoff = handoff.ok_or_else(|| {
+            invalid("The acknowledged source has not released its daemon lease for recovery")
+        })?;
+        if let Some(captured) = self.captured_preparation.take() {
+            let receipt = match verified_digest {
+                Some(digest) => captured.receipt_with_digest(target_daemon, digest, handoff),
+                None => captured.receipt(target_daemon, handoff),
+            };
+            match receipt {
+                Ok(receipt) => {
+                    self.receipt = receipt;
+                    return Ok(());
+                }
+                Err(error) => self.recovery_capture_error = Some(error),
+            }
+        }
+        crate::upgrade::recovery::require_ready(daemon, census).map_err(|error| {
+            invalid(match &self.recovery_capture_error {
+                Some(capture) => format!("{error}. Automatic recovery was refused: {capture}"),
+                None => error,
+            })
+        })
+    }
+
+    pub(super) fn inherit_recovery(&self, command: &mut Command) -> Result<(), UpdateError> {
+        if let Some(receipt) = &self.receipt {
+            receipt.inherit(command)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn verify_successor(&mut self, target_daemon: &Path) -> Result<(), UpdateError> {
+        if crate::daemon::running_executable()
+            .map_err(|error| invalid(error.to_string()))?
+            .as_deref()
+            != Some(target_daemon)
+        {
+            return Err(invalid(
+                "The terminal service does not belong to the confirmed installation; its saved panes and recovery state were retained. Check cagents daemon status before retrying",
+            ));
+        }
+        let socket = crate::terminal_ipc::daemon_socket_path()?;
+        let source =
+            source::Client::connect(&socket).map_err(|error| invalid(error.to_string()))?;
+        let source::Client::Current { mut client, peer } = source else {
+            return Err(invalid(
+                "The confirmed successor cannot verify its recovery inventory",
+            ));
+        };
+        if client.protocol() != crate::terminal_ipc::PROTOCOL_VERSION {
+            return Err(invalid(
+                "The confirmed successor does not serve this update's matched protocol",
+            ));
+        }
+        peer.verify(client.proof())?;
+        if client
+            .startup_state()
+            .map_err(|error| invalid(error.to_string()))?
+            != crate::terminal_ipc::StartupState::Ready
+        {
+            return Err(invalid(
+                "The confirmed terminal service has not finished recovering its saved panes",
+            ));
+        }
+        if let Some(receipt) = &self.receipt {
+            let terminals = client.list().map_err(|error| invalid(error.to_string()))?;
+            let chats = client
+                .list_chats()
+                .map_err(|error| invalid(error.to_string()))?;
+            self.recovery_outcome = Some(
+                receipt
+                    .verify(client.proof(), &terminals, &chats)
+                    .map_err(invalid)?,
+            );
+        }
+        peer.verify(client.proof())?;
+        Ok(())
+    }
+
+    /// Failure cleanup cannot fall through to the ordinary checkpoint replay
+    /// after an accepted preparation. It may keep a verified serving daemon or
+    /// retain Prepared evidence for explicit recovery.
+    pub(super) fn require_normal_restart(&self) -> Result<(), UpdateError> {
+        if !self.source_prepared {
+            return Ok(());
+        }
+        let (daemon, census) = self
+            .prepared_source
+            .as_ref()
+            .ok_or_else(|| invalid("The acknowledged source has no captured preparation census"))?;
+        crate::upgrade::recovery::require_ready(daemon, census).map_err(invalid)
+    }
+
+    pub(super) fn paused_report(&self) -> String {
+        let Some(outcome) = &self.recovery_outcome else {
+            return String::new();
+        };
+        if outcome.paused_chats.is_empty() && outcome.paused_terminals.is_empty() {
+            return String::new();
+        }
+        let mut report = String::from("\nPaused after update recovery:\n");
+        for id in &outcome.paused_chats {
+            let label = self
+                .labels
+                .get(id)
+                .map(String::as_str)
+                .unwrap_or("Conversation");
+            let recorded = self.prepared_source.as_ref().is_some_and(|(_, census)| {
+                census.chats.iter().any(|chat| {
+                    chat.id == *id
+                        && chat
+                            .launch
+                            .session_id
+                            .as_ref()
+                            .is_some_and(|id| !id.trim().is_empty())
+                })
+            });
+            let action = if recorded {
+                "choose Resume conversation in the new tab (+) menu to continue"
+            } else {
+                "start a new conversation to continue"
+            };
+            report.push_str(&format!("  {label}: {action}\n"));
+        }
+        for id in &outcome.paused_terminals {
+            let label = self
+                .labels
+                .get(id)
+                .map(String::as_str)
+                .unwrap_or("Terminal");
+            report.push_str(&format!("  {label}: reopen a terminal to continue\n"));
+        }
+        report
+    }
+
+    fn record_interrupt_requests(
+        &mut self,
+        reviewed: &impact::Preview,
+        daemon: &impact::DaemonImpact,
+    ) {
+        for session in &daemon.sessions {
+            if session.disposition == impact::Disposition::Interrupted {
+                self.unconfirmed_interrupts.insert(
+                    (session.kind, session.id),
+                    reviewed
+                        .labels
+                        .names
+                        .get(&session.id)
+                        .unwrap_or(&session.title)
+                        .clone(),
+                );
+            }
+        }
+    }
     /// Call only after the source accepts preparation. An interrupted turn is
     /// different from a whole chat ended by the floor, so retain that scope in
     /// its report rather than describing the conversation itself as stopped.
     fn record_prepared(&mut self, reviewed: &impact::Preview, daemon: &impact::DaemonImpact) {
         self.source_prepared = true;
+        self.record_settled_interruptions(reviewed, daemon, &[]);
+    }
+
+    fn record_settled_interruptions(
+        &mut self,
+        reviewed: &impact::Preview,
+        daemon: &impact::DaemonImpact,
+        pending: &[TerminalId],
+    ) {
         for session in &daemon.sessions {
             let key = (session.kind, session.id);
             if session.disposition != impact::Disposition::Interrupted
                 || self.ended.contains_key(&key)
+                || pending.contains(&session.id)
             {
                 continue;
             }
@@ -944,12 +1375,13 @@ impl Survivors {
                 .get(&session.id)
                 .unwrap_or(&session.title)
                 .clone();
+            self.unconfirmed_interrupts.remove(&key);
             let recovery = reviewed
                 .stopped
                 .iter()
                 .find(|pane| pane.pane == session.id)
                 .map_or_else(
-                    || "its saved conversation resumes after the update".to_owned(),
+                    || "its saved conversation was kept".to_owned(),
                     |pane| format!("after the update: {}. {}", pane.reason, pane.recovery),
                 );
             self.interrupted
@@ -967,20 +1399,52 @@ impl Survivors {
             .interrupted
             .iter()
             .filter(|(key, _)| !self.ended.contains_key(*key))
-            .map(|(_, turn)| turn)
             .collect();
-        if turns.is_empty() {
+        if turns.is_empty() && self.unconfirmed_interrupts.is_empty() {
             return String::new();
         }
-        let mut report = String::from("\nCurrent turns interrupted:\n");
-        for turn in &turns {
+        let mut report = String::new();
+        if !turns.is_empty() {
+            report.push_str("\nCurrent turns interrupted:\n");
+        }
+        for ((_, id), turn) in &turns {
+            let recovery = if self
+                .recovery_outcome
+                .as_ref()
+                .is_some_and(|outcome| outcome.paused_chats.contains(id))
+            {
+                "its conversation is paused after recovery"
+            } else {
+                &turn.recovery
+            };
             report.push_str(&format!(
                 "  {}: current turn interrupted; {}\n",
-                turn.label, turn.recovery
+                turn.label, recovery
             ));
         }
-        let background_tasks: usize = turns.iter().map(|turn| turn.background_tasks.len()).sum();
+        for ((_, id), turn) in &self.interrupted {
+            if self.late_turns.contains(id) {
+                report.push_str(&format!(
+                    "  {}: also stopped a turn that started during review\n",
+                    turn.label
+                ));
+            }
+        }
+        let background_tasks: usize = turns
+            .iter()
+            .map(|(_, turn)| turn.background_tasks.len())
+            .sum();
         report.push_str(&background_recovery(background_tasks as u64));
+        if !self.unconfirmed_interrupts.is_empty() {
+            report.push_str("\nInterruption was not confirmed:\n");
+            for (key, label) in &self.unconfirmed_interrupts {
+                if !self.ended.contains_key(key) {
+                    report.push_str(&format!(
+                        "  {label}: check its current turn in the running daemon\n"
+                    ));
+                }
+            }
+        }
         report
     }
 

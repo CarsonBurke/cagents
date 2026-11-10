@@ -1388,6 +1388,7 @@ pub fn run_worker(job_id: &str) -> Result<(), UpdateError> {
     if !job.message.contains("Current turns interrupted:") {
         job.message.push_str(&survivors.prepared_report());
     }
+    job.message.push_str(&survivors.paused_report());
     let (remaining, unchecked) = survivors.report();
     if !remaining.is_empty() {
         job.message.push_str("\nStill running, not attached:\n");
@@ -1460,6 +1461,7 @@ fn perform_update(
         "Verifying sealed release bytes",
     )?;
     verify_digest(&mut archive, &archive_hash)?;
+    let daemon_digest = archive_daemon_digest(&release, &archive, &cancellation)?;
     let staged = candidate::Staged::from_archive(&release, &archive, &archive_hash, &cancellation)?;
     let (source_protocol, _) = source::inspect_identity(None)?;
     if staged.identity.protocol == source_protocol {
@@ -1518,6 +1520,12 @@ fn perform_update(
             survivors,
             &guard,
         )?;
+        let target_daemon = installation
+            .prefix
+            .join("versions")
+            .join(&release.version)
+            .join("bin/cagentsd");
+        survivors.authorize_successor(&target_daemon, Some(&daemon_digest), handoff.as_ref())?;
         confirmation::prepared(state, job)?;
         guard.close_prepared_windows(&windows, Duration::from_secs(45))?;
         Installation::detect()?;
@@ -1536,7 +1544,12 @@ fn perform_update(
             confirmed.replaces_daemon,
             &guard,
             handoff.as_ref(),
-        )
+            survivors,
+        )?;
+        if confirmed.replaces_daemon {
+            survivors.verify_successor(&target_daemon)?;
+        }
+        Ok(())
     })();
     let recovery_result = finish_handoff(
         installation,
@@ -1547,10 +1560,10 @@ fn perform_update(
         survivors,
         &guard,
     );
+    recovery_result?;
     let reopen_result = guard
         .relaunch_closed_windows(&installation.prefix.join("current/bin/cagents-ui"))
         .map_err(UpdateError::from);
-    recovery_result?;
     install_result?;
     reopen_result
 }
@@ -1885,6 +1898,19 @@ fn finish_handoff(
     guard: &crate::instance::UiUpdateGuard,
 ) -> Result<(), UpdateError> {
     let reserved = handoff.is_some() || survivors.needs_daemon_recovery();
+    // Keep any actual serving owner, especially an adoption-only recovery
+    // daemon. Starting the current pointer could otherwise replay Prepared
+    // work or replace a healthy successor after an unrelated installer error.
+    let serving = reserved
+        && result.is_err()
+        && crate::daemon::running_executable()
+            .map_err(|error| invalid(error.to_string()))?
+            .is_some();
+    let restart_allowed = if reserved && result.is_err() && !serving {
+        survivors.require_normal_restart()
+    } else {
+        Ok(())
+    };
     record_handoff_failure(
         state,
         job,
@@ -1896,7 +1922,14 @@ fn finish_handoff(
     // Success has confirmed serving readiness. Only close our copy: LOCK_UN
     // would also unlock the successor's shared open-file description.
     drop(handoff.take());
-    if reserved && result.is_err() {
+    if let Err(error) = restart_allowed {
+        job.message.push_str(&format!(
+            "\nThe terminal service was not restarted: {error}. The checkpoint was retained for explicit recovery."
+        ));
+        write_job(state, job)?;
+        return Err(invalid(job.message.clone()));
+    }
+    if reserved && result.is_err() && !serving {
         let mut command = Command::new(installation.prefix.join("current/bin/cagents"));
         command.args(["daemon", "start"]);
         crate::install_guard::sanitize_child_environment(&mut command);
@@ -1916,6 +1949,38 @@ fn finish_handoff(
     Ok(())
 }
 
+fn archive_daemon_digest(
+    release: &Release,
+    archive: &File,
+    cancellation: &CancellationToken,
+) -> Result<String, UpdateError> {
+    let archive_fd = archive.as_raw_fd();
+    let mut extract = Command::new("tar");
+    extract
+        .args(["-xOz", "--file"])
+        .arg(format!("/proc/self/fd/{archive_fd}"))
+        .arg("--")
+        .arg(format!("cagents-{}/bin/cagentsd", release.version));
+    candidate::inherit(&mut extract, archive_fd);
+    let mut daemon = bounded_command(
+        &mut extract,
+        "candidate daemon extraction",
+        512 * 1024 * 1024,
+        Duration::from_secs(120),
+        cancellation,
+    )?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let count = daemon.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hash.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
 fn run_installer(
     installation: &Installation,
     release: &Release,
@@ -1925,6 +1990,7 @@ fn run_installer(
     restart_daemon: bool,
     guard: &crate::instance::UiUpdateGuard,
     handoff: Option<&crate::daemon::lease_handoff::LeaseHandoff>,
+    survivors: &floor::Survivors,
 ) -> Result<(), UpdateError> {
     // Keep sources above the destinations so remapping cannot overwrite a
     // still-needed input, even in a worker with many open descriptors.
@@ -1987,6 +2053,7 @@ fn run_installer(
     if let Some(handoff) = handoff {
         handoff.inherit_for_installer(&mut command)?;
     }
+    survivors.inherit_recovery(&mut command)?;
     // Do not kill an installer mid-transaction. Its migration protocol owns
     // bounded shutdown/startup and rollback, and its log survives every UI.
     let result = command.status()?;
@@ -2562,6 +2629,37 @@ mod tests {
             floor::terminal_confirmation(directory.path(), &job).unwrap(),
             "Stopping live work needs confirmation in a terminal. Run `cagents daemon upgrade --version 9.8.7` from a system terminal outside cagents."
         );
+    }
+
+    #[test]
+    fn recovery_daemon_digest_uses_the_exact_verified_archive_member() {
+        let directory = tempfile::tempdir().unwrap();
+        let release = applicable_release(release("9.8.7")).unwrap();
+        let package = format!("cagents-{}", release.version);
+        let bin = directory.path().join(&package).join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(bin.join("cagentsd"), b"verified candidate daemon").unwrap();
+        fs::write(bin.join("cagents"), b"different CLI bytes").unwrap();
+        let archive = directory.path().join("release.tar.gz");
+        assert!(
+            Command::new("tar")
+                .args(["-czf"])
+                .arg(&archive)
+                .arg("-C")
+                .arg(directory.path())
+                .arg(&package)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let archive = File::open(archive).unwrap();
+        assert_eq!(
+            archive_daemon_digest(&release, &archive, &CancellationToken::new()).unwrap(),
+            format!("{:x}", Sha256::digest(b"verified candidate daemon"))
+        );
+        let mut absent = release;
+        absent.version = "9.8.8".into();
+        assert!(archive_daemon_digest(&absent, &archive, &CancellationToken::new()).is_err());
     }
 
     #[test]

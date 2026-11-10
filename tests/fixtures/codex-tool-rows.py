@@ -7,6 +7,11 @@ image generation, a context compaction and a turn diff, first as started and
 then, after a short pause, as completed. It exists to check how each item
 reads in the native transcript, running and settled.
 
+Set CAGENTS_TOOL_ROWS_NEVER_CONFIRM_INTERRUPT=1 to acknowledge interruptions
+without completing either the interrupted turn or its delayed successful script.
+Set CAGENTS_TOOL_ROWS_NEVER_CONFIRM_CLOSE=1 to keep a WebSocket connection open
+after a close frame until its peer disconnects, without changing turn settlement.
+
 Requires a private CAGENTS_TOOL_ROWS_FIXTURE_ROOT and CODEX_HOME beneath it,
 and a private XDG_RUNTIME_DIR. Launch it through the ordinary development
 runner as the isolated Codex executable. It models the app-server protocol
@@ -92,6 +97,9 @@ class Scenario:
         self.thread, self.child = str(uuid.uuid4()), str(uuid.uuid4())
         self.latest = None
         self.child_latest = None
+        self.never_confirm_interrupt = os.environ.get("CAGENTS_TOOL_ROWS_NEVER_CONFIRM_INTERRUPT") == "1"
+        self.never_confirm_close = os.environ.get("CAGENTS_TOOL_ROWS_NEVER_CONFIRM_CLOSE") == "1"
+        self.interrupting = set()
         self._generation = 0
         self._generations = {}
         self._published = set()
@@ -107,7 +115,8 @@ class Scenario:
     def state(self):
         with self._changed:
             return copy.deepcopy({"thread": self.thread, "child": self.child,
-                                  "latest": self.latest, "child_latest": self.child_latest})
+                                  "latest": self.latest, "child_latest": self.child_latest,
+                                  "interrupting": sorted(self.interrupting)})
 
     def restore(self, state):
         """Loading another listener's history invalidates every old playback."""
@@ -118,12 +127,17 @@ class Scenario:
         self.thread, self.child = state["thread"], state["child"]
         self.latest = copy.deepcopy(state["latest"])
         self.child_latest = copy.deepcopy(state.get("child_latest"))
+        self.interrupting = set(map(tuple, state.get("interrupting", ())))
         self._generations.clear()
         for thread in (self.thread, self.child):
             self._advance(thread)
 
     def _latest(self, thread):
-        return self.latest if thread == self.thread else self.child_latest
+        if thread == self.thread:
+            return self.latest
+        if thread == self.child:
+            return self.child_latest
+        return None
 
     def _store(self, thread, turn):
         if thread == self.thread:
@@ -174,6 +188,12 @@ class Scenario:
         latest = self._latest(thread)
         turn_id = params.get("turnId", params.get("turn", {}).get("id"))
         if turn_id is not None and (latest is None or latest["id"] != turn_id):
+            return False
+        # An interrupt request fences scripted success immediately. History
+        # becomes settled only when its exact interrupted receipt is published.
+        interrupted_receipt = (method == "turn/completed"
+                               and params["turn"]["status"] == "interrupted")
+        if turn_id is not None and (thread, turn_id) in self.interrupting and not interrupted_receipt:
             return False
         if method in ("turn/started", "turn/completed"):
             turn = copy.deepcopy(params["turn"])
@@ -312,7 +332,9 @@ class Scenario:
         elif method == "turn/start":
             if params.get("threadId") != self.thread:
                 return [{"id": identifier, "error": {"code": -32602, "message": "Prompt the fixture thread"}}]
-            if self.latest and self.latest["status"] == "inProgress":
+            if (self.latest and self.latest["status"] == "inProgress"
+                    or self.child_latest and self.child_latest["status"] == "inProgress"
+                    and (self.child, self.child_latest["id"]) in self.interrupting):
                 return [{"id": identifier, "error": {"code": -32602, "message": "Fixture turn is still active"}}]
             turn = str(uuid.uuid4())
             result = {"turn": {"id": turn, "status": "inProgress", "items": []}}
@@ -328,18 +350,17 @@ class Scenario:
             if thread not in (self.thread, self.child):
                 return [{"id": identifier, "error": {"code": -32602, "message": "Unknown fixture thread"}}]
             latest = self._latest(thread)
-            if latest is None or params.get("turnId") != latest["id"]:
-                return [{"id": identifier, "error": {"code": -32602, "message": "Unknown fixture turn"}}]
-            if latest["status"] == "inProgress":
+            if (latest is None or params.get("turnId") != latest["id"]
+                    or latest["status"] != "inProgress"):
+                return [{"id": identifier, "error": {"code": -32602, "message": "No matching active fixture turn"}}]
+            self.interrupting.add((thread, latest["id"]))
+            self._advance(thread)
+            if not self.never_confirm_interrupt:
                 interrupted = copy.deepcopy(latest)
                 interrupted["status"] = "interrupted"
                 for item in interrupted["items"]:
                     if item.get("status") == "inProgress":
                         item["status"] = "interrupted"
-                self._store(thread, interrupted)
-                self._advance(thread)
-                if thread == self.child and self.latest:
-                    self.latest["items"] = [self._child_state(item) for item in self.latest["items"]]
                 after = [{"method": "turn/completed", "params": {"threadId": thread, "turn": interrupted}},
                          {"method": "thread/status/changed", "params": {"threadId": thread, "status": {"type": "idle"}}}]
             result = {}
@@ -363,7 +384,15 @@ def serve(connection, codex_home, scenario, request_lock):
     connection.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + b"\r\n\r\n")
     send = threading.Lock()
     while True:
-        request = transport.receive(connection, lambda payload: connection.sendall(transport.frame(payload, opcode=10)))
+        try:
+            request = transport.receive(connection, lambda payload: connection.sendall(transport.frame(payload, opcode=10)))
+        except EOFError:
+            if scenario.never_confirm_close:
+                # A Close frame leaves the transport connected. Withhold its
+                # handshake until the peer disconnects; EOF returns immediately.
+                while connection.recv(65536):
+                    pass
+            raise
         with request_lock:
             responses = scenario.request(request, codex_home)
             generations = scenario.playback(responses)

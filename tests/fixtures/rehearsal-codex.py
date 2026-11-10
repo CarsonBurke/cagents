@@ -81,8 +81,8 @@ def scenario_class(peer, storage, listener):
             descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
             with os.fdopen(descriptor) as stream:
                 state = json.load(stream)
-            if set(state) not in ({"thread", "child", "latest"},
-                                  {"thread", "child", "latest", "child_latest"}):
+            if (not {"thread", "child", "latest"} <= set(state)
+                    or set(state) - {"thread", "child", "latest", "child_latest", "interrupting"}):
                 raise ValueError("invalid persisted rehearsal app-server state")
             thread_path(state["thread"])
             thread_path(state["child"])

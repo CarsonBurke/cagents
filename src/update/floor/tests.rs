@@ -21,6 +21,7 @@ struct FakeSource {
     records: Arc<Mutex<Vec<Record>>>,
     outcomes: VecDeque<ShutdownOutcome>,
     prepare_refusals: usize,
+    lose_prepare_ack: bool,
     predicted_service: bool,
     fail_inventory: bool,
     close_attempts: usize,
@@ -33,6 +34,11 @@ struct FakeSource {
     change_after_capture: bool,
     cancel_on_capture: Option<PathBuf>,
     cancel_after_close: Option<PathBuf>,
+    interrupt_polls: usize,
+    never_confirm_interrupts: bool,
+    interrupt_pending: Vec<TerminalId>,
+    change_after_interrupt: bool,
+    cancel_on_interrupt: Option<PathBuf>,
 }
 
 impl FakeSource {
@@ -93,15 +99,64 @@ impl FloorSource for FakeSource {
         }
         Ok(self.inventory.clone())
     }
-    fn prepare(&mut self, _: &impact::DaemonImpact) -> Result<(), UpdateError> {
+    fn prepare(&mut self, _: &impact::DaemonImpact) -> Result<(), source::PrepareError> {
+        if self.lose_prepare_ack {
+            self.event("PrepareConfirmedUpgrade sent; acknowledgement lost");
+            return Err(source::PrepareError::Unconfirmed(invalid(
+                "connection closed",
+            )));
+        }
         if self.prepare_refusals > 0 {
             self.prepare_refusals -= 1;
             self.event("PrepareConfirmedUpgrade refused");
-            Err(invalid("No exact resumable conversation"))
+            Err(source::PrepareError::Refused(invalid(
+                "No exact resumable conversation",
+            )))
         } else {
             self.event("PrepareConfirmedUpgrade accepted");
             Ok(())
         }
+    }
+    fn begin_interrupts(
+        &mut self,
+        daemon: &impact::DaemonImpact,
+        _: Instant,
+    ) -> Result<(), UpdateError> {
+        self.event("Interrupt acknowledged; provider still working");
+        self.interrupt_pending = daemon
+            .sessions
+            .iter()
+            .filter(|item| item.disposition == impact::Disposition::Interrupted)
+            .map(|item| item.id)
+            .collect();
+        if let Some(state) = &self.cancel_on_interrupt {
+            let job: UpdateJob = serde_json::from_slice(&fs::read(state.join("status.json"))?)?;
+            assert!(confirmation::cancel_at(state, &job.id)?);
+        }
+        Ok(())
+    }
+    fn pending_interrupts(&mut self) -> Result<Vec<TerminalId>, UpdateError> {
+        if self.never_confirm_interrupts || self.interrupt_polls > 0 {
+            self.interrupt_polls = self.interrupt_polls.saturating_sub(1);
+            self.event("provider still working");
+            return Ok(self.interrupt_pending.clone());
+        }
+        self.event("provider interruption confirmed; run inactive");
+        for item in &mut self.preview.daemon.as_mut().unwrap().sessions {
+            if self.interrupt_pending.contains(&item.id) {
+                item.disposition = impact::Disposition::Resumes;
+                item.interrupted_subagents.clear();
+                if self.change_after_interrupt {
+                    item.identity.push_str(" replacement owner");
+                }
+            }
+        }
+        self.interrupt_pending.clear();
+        self.preview.daemon.as_mut().unwrap().policy = impact::Policy::WhenIdle;
+        Ok(Vec::new())
+    }
+    fn interrupt_impact(&self) -> Result<impact::DaemonImpact, UpdateError> {
+        Ok(self.preview.daemon.clone().unwrap())
     }
     fn close_chat(
         &mut self,
@@ -338,6 +393,7 @@ fn fixture() -> FakeSource {
         records: Arc::new(Mutex::new(Vec::new())),
         outcomes: VecDeque::new(),
         prepare_refusals: 1,
+        lose_prepare_ack: false,
         predicted_service: false,
         fail_inventory: false,
         close_attempts: 0,
@@ -350,6 +406,11 @@ fn fixture() -> FakeSource {
         change_after_capture: false,
         cancel_on_capture: None,
         cancel_after_close: None,
+        interrupt_polls: 0,
+        never_confirm_interrupts: false,
+        interrupt_pending: Vec::new(),
+        change_after_interrupt: false,
+        cancel_on_interrupt: None,
     }
 }
 
@@ -419,6 +480,288 @@ fn job(directory: &Path) -> UpdateJob {
     confirmation::initialize(directory, &job.id).unwrap();
     write_job(directory, &job).unwrap();
     job
+}
+
+fn interrupt_fixture() -> (FakeSource, TerminalId) {
+    let mut source = fixture();
+    let daemon = source.preview.daemon.as_mut().unwrap();
+    daemon.policy = impact::Policy::Interrupt;
+    daemon.blockers.clear();
+    for item in &mut daemon.sessions {
+        item.disposition = impact::Disposition::Continues;
+    }
+    source.prepare_refusals = 0;
+    let id = add_chat(&mut source, impact::Disposition::Interrupted, true);
+    source
+        .preview
+        .labels
+        .names
+        .insert(id, "Offline tool rows · alpha".into());
+    (source, id)
+}
+
+#[test]
+fn interrupted_unblocked_source_waits_for_provider_and_inactive_run_before_prepare() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path();
+    let (mut source, _) = interrupt_fixture();
+    source.interrupt_polls = 2;
+    let preview = source.preview.clone();
+    assert!(!preview.daemon.as_ref().unwrap().blocked());
+    quiesce_source(path, &mut job(path), &preview, true, &mut source).unwrap();
+    let events = source.events.lock().unwrap();
+    let confirmed = events
+        .iter()
+        .position(|event| event == "provider interruption confirmed; run inactive")
+        .unwrap();
+    let prepared = events
+        .iter()
+        .position(|event| event == "PrepareConfirmedUpgrade accepted")
+        .unwrap();
+    assert!(confirmed < prepared, "{events:?}");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| *event == "provider still working")
+            .count(),
+        2
+    );
+    assert!(
+        !events.iter().any(|event| event.contains("ChatClose")
+            || event.contains("shutdown")
+            || event.contains("archive")),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn lost_prepare_ack_does_not_reach_stop_review_or_automatic_recovery() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path();
+    let (mut source, _) = interrupt_fixture();
+    source.lose_prepare_ack = true;
+    let preview = source.preview.clone();
+    let mut current_job = job(path);
+    let error = quiesce_source(path, &mut current_job, &preview, true, &mut source)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("preparation was not confirmed"), "{error}");
+    assert!(
+        error.contains("automatic recovery was not authorized"),
+        "{error}"
+    );
+    assert!(current_job.confirmation.is_none());
+    let events = source.events.lock().unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.contains("acknowledgement lost"))
+    );
+    assert!(
+        !events.iter().any(|event| event.contains("ChatClose")
+            || event.contains("shutdown")
+            || event.contains("handoff")
+            || event.contains("archive")),
+        "{events:?}"
+    );
+    drop(events);
+    source.assert_running_panes_are_unmarked();
+}
+
+#[test]
+fn settled_interruption_preserves_known_blocked_panes_for_their_stop_review() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path();
+    let (mut source, interrupted) = interrupt_fixture();
+    let blocked = add_chat(&mut source, impact::Disposition::Blocked, true);
+    let before = source.preview.clone();
+    let settled = settle_interrupts(
+        path,
+        &mut job(path),
+        before.clone(),
+        &mut source,
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    let daemon = settled.daemon.as_ref().unwrap();
+    assert_eq!(daemon.policy, impact::Policy::WhenIdle);
+    assert!(daemon.sessions.iter().any(|item| {
+        item.id == interrupted && item.disposition == impact::Disposition::Resumes
+    }));
+    assert!(
+        daemon
+            .sessions
+            .iter()
+            .any(|item| { item.id == blocked && item.disposition == impact::Disposition::Blocked })
+    );
+    assert!(daemon.blocked());
+    assert_no_destructive_actions(&source);
+    source.assert_running_panes_are_unmarked();
+}
+
+#[test]
+fn recovered_paused_conversations_name_the_manual_resume_action() {
+    let (mut source, chat) = interrupt_fixture();
+    let unrecorded = add_chat(&mut source, impact::Disposition::Resumes, false);
+    let mut survivors = Survivors::default();
+    survivors.record_prepared(&source.preview, source.preview.daemon.as_ref().unwrap());
+    survivors.prepared_source = Some((
+        source.preview.daemon.clone().unwrap(),
+        crate::upgrade::recovery::Census {
+            chats: source.inventory.chats.clone(),
+            ..Default::default()
+        },
+    ));
+    let terminal = TerminalId::new();
+    survivors
+        .labels
+        .insert(chat, "Offline tool rows · alpha".into());
+    survivors
+        .labels
+        .insert(terminal, "Build shell · alpha".into());
+    survivors
+        .labels
+        .insert(unrecorded, "Unrecorded chat · alpha".into());
+    survivors.recovery_outcome = Some(crate::upgrade::recovery::RecoveryOutcome {
+        paused_chats: vec![chat, unrecorded],
+        paused_terminals: vec![terminal],
+    });
+    let report = survivors.paused_report();
+    assert!(report.contains("Offline tool rows · alpha: choose Resume conversation in the new tab (+) menu to continue"), "{report}");
+    assert!(
+        report.contains("Build shell · alpha: reopen a terminal to continue"),
+        "{report}"
+    );
+    assert!(!report.contains("resumes after the update"), "{report}");
+    assert!(
+        report.contains("Unrecorded chat · alpha: start a new conversation to continue"),
+        "{report}"
+    );
+    assert!(
+        !report.contains("Unrecorded chat · alpha: choose Resume"),
+        "{report}"
+    );
+    assert!(
+        survivors
+            .prepared_report()
+            .contains("its conversation is paused after recovery")
+    );
+    assert!(
+        !survivors
+            .prepared_report()
+            .contains("resumes after the update")
+    );
+}
+
+#[test]
+fn unconfirmed_interrupt_times_out_before_prepare_and_keeps_panes_running() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path();
+    let (mut source, id) = interrupt_fixture();
+    source.never_confirm_interrupts = true;
+    let preview = source.preview.clone();
+    let mut current_job = job(path);
+    let error = settle_interrupts(
+        path,
+        &mut current_job,
+        preview,
+        &mut source,
+        Duration::from_millis(20),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("Offline tool rows · alpha did not stop in time; nothing was changed"),
+        "{error}"
+    );
+    let events = source.events.lock().unwrap();
+    assert!(
+        !events.iter().any(|event| event.contains("Prepare")
+            || event.contains("ChatClose")
+            || event.contains("shutdown")
+            || event.contains("archive")),
+        "{events:?}"
+    );
+    assert!(source.inventory.chats.iter().any(|chat| chat.id == id));
+    source.assert_running_panes_are_unmarked();
+    assert!(
+        confirmation::cancel_at(path, &current_job.id).unwrap(),
+        "preparation did not revoke cancellation"
+    );
+}
+
+#[test]
+fn changed_owner_after_interrupt_never_prepares_or_stops_service() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path();
+    let (mut source, _) = interrupt_fixture();
+    source.change_after_interrupt = true;
+    let preview = source.preview.clone();
+    let error = quiesce_source(path, &mut job(path), &preview, true, &mut source)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("Conversations changed"), "{error}");
+    assert!(
+        !source
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event.contains("Prepare") || event.contains("shutdown"))
+    );
+    source.assert_running_panes_are_unmarked();
+}
+
+#[test]
+fn interrupt_settlement_remains_cancellable_before_prepare() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path();
+    let (mut source, _) = interrupt_fixture();
+    source.never_confirm_interrupts = true;
+    source.cancel_on_interrupt = Some(path.into());
+    let preview = source.preview.clone();
+    let error = quiesce_source(path, &mut job(path), &preview, true, &mut source).unwrap_err();
+    assert!(matches!(error, UpdateError::Cancelled));
+    assert!(
+        !source
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event.contains("Prepare") || event.contains("shutdown"))
+    );
+    source.assert_running_panes_are_unmarked();
+}
+
+#[test]
+fn partial_interruption_effects_are_reported_without_claiming_daemon_preparation() {
+    let (mut source, first) = interrupt_fixture();
+    let second = add_chat(&mut source, impact::Disposition::Interrupted, true);
+    source
+        .preview
+        .labels
+        .names
+        .insert(second, "Still working · alpha".into());
+    let daemon = source.preview.daemon.as_ref().unwrap();
+    let mut survivors = Survivors::default();
+    survivors.record_interrupt_requests(&source.preview, daemon);
+    survivors.record_settled_interruptions(&source.preview, daemon, &[second]);
+    survivors.late_turns.insert(first);
+    let report = survivors.prepared_report();
+    assert!(
+        report.contains("Offline tool rows · alpha: current turn interrupted"),
+        "{report}"
+    );
+    assert!(
+        report.contains("also stopped a turn that started during review"),
+        "{report}"
+    );
+    assert!(
+        report.contains("Interruption was not confirmed:\n  Still working · alpha"),
+        "{report}"
+    );
+    assert!(!survivors.needs_daemon_recovery());
+    assert!(!survivors.source_prepared);
 }
 
 fn await_prompt(directory: &Path, predicate: impl Fn(&UpdateConfirmation) -> bool) -> UpdateJob {
@@ -1932,7 +2275,12 @@ fn accepted_prepare_reports_only_interrupted_turns_with_their_reviewed_recovery(
     let daemon = source.preview.daemon.as_ref().unwrap();
     survivors.record_prepared(&source.preview, daemon);
     let report = survivors.prepared_report();
-    assert!(report.contains("Reviewed automatic resume: current turn interrupted; its saved conversation resumes after the update"), "{report}");
+    assert!(
+        report.contains(
+            "Reviewed automatic resume: current turn interrupted; its saved conversation was kept"
+        ),
+        "{report}"
+    );
     assert!(report.contains("Reviewed paused conversation: current turn interrupted; after the update: its conversation could not be confirmed. Choose Resume conversation in the new tab (+) menu"), "{report}");
     assert!(
         report.contains("3 background tasks stopped; they do not resume automatically."),

@@ -179,6 +179,7 @@ pub(super) fn perform(
             survivors,
             &guard,
         )?;
+        survivors.authorize_successor(&root.join("bin/cagentsd"), None, handoff.as_ref())?;
         confirmation::prepared(state, job)?;
         guard.close_prepared_windows(&windows, Duration::from_secs(45))?;
         set_phase(
@@ -197,6 +198,7 @@ pub(super) fn perform(
         if let Some(handoff) = handoff.as_ref() {
             handoff.inherit(&mut command)?;
         }
+        survivors.inherit_recovery(&mut command)?;
         let timeout = crate::install_guard::daemon_start_timeout()?;
         startup_attempted = true;
         let started = wait_for_daemon_start(&mut command, timeout, state, job);
@@ -214,14 +216,10 @@ pub(super) fn perform(
                 successor_runs,
             ));
         }
-        if crate::daemon::running_executable().map_err(|error| invalid(error.to_string()))?
-            != Some(root.join("bin/cagentsd"))
-        {
-            return Err(invalid(
-                "The terminal service does not belong to the confirmed installation; its saved panes and recovery state were retained. Check cagents daemon status before retrying",
-            ));
-        }
-        confirm_daemon_ready(&root.join("bin/cagentsd"), timeout)
+        // Wait through bounded restoration until the exact successor is
+        // Ready, then prove this job's recovery inventory against it.
+        confirm_daemon_ready(&root.join("bin/cagentsd"), timeout)?;
+        survivors.verify_successor(&root.join("bin/cagentsd"))
     })();
     // Before startup, retain the previous matched executable on failure. Once
     // the successor owns the runtime or an actual startup command was spawned,
@@ -248,10 +246,10 @@ pub(super) fn perform(
         survivors,
         &guard,
     );
+    recovery_result?;
     let reopened = guard
         .relaunch_closed_windows(&reopen.join("bin/cagents-ui"))
         .map_err(UpdateError::from);
-    recovery_result?;
     result?;
     reopened
 }
