@@ -30,8 +30,12 @@
 //! to its standard utility paths. Codex may still reach the network for its own
 //! housekeeping; the model endpoint never leaves this process.
 
+#[path = "support/daemon_readiness.rs"]
+mod daemon_readiness;
 #[path = "support/hosted_agent_cleanup.rs"]
 mod hosted_agent_cleanup;
+#[path = "support/private_cli_capture.rs"]
+mod private_cli_capture;
 
 use cagents::{
     chat::{Command as ChatCommand, NativeContinuity, Session, Snapshot},
@@ -491,7 +495,7 @@ unified_exec = true
         )
         .unwrap();
         let daemon = Self::daemon(root.path());
-        let fixture = Self {
+        let mut fixture = Self {
             root,
             daemon,
             model,
@@ -515,19 +519,10 @@ unified_exec = true
             .unwrap()
     }
 
-    fn await_daemon(&self) {
+    fn await_daemon(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            let output = self.output(&["daemon", "status"]);
-            if output.status.success()
-                && serde_json::from_slice::<Value>(&output.stdout).unwrap()["data"]["running"]
-                    == true
-            {
-                return;
-            }
-            assert!(Instant::now() < deadline, "fixture daemon did not start");
-            thread::sleep(Duration::from_millis(20));
-        }
+        daemon_readiness::wait(self.root.path(), &mut self.daemon, deadline)
+            .unwrap_or_else(|error| panic!("fixture daemon did not become ready: {error}"));
     }
 
     fn output(&self, arguments: &[&str]) -> Output {

@@ -3,6 +3,8 @@
 #[path = "support/hosted_agent_cleanup.rs"]
 mod hosted_agent_cleanup;
 
+#[path = "support/daemon_readiness.rs"]
+mod daemon_readiness;
 #[path = "support/private_cli_capture.rs"]
 mod private_cli_capture;
 #[path = "support/retained_fixture.rs"]
@@ -113,42 +115,10 @@ impl Fixture {
         fixture
     }
 
-    fn ready_status(response: &Value) -> bool {
-        // `running` includes a live process that has not bound its endpoint.
-        // A version reply proves both the control handshake and a request.
-        response["data"]["running"] == true
-            && response["data"]["daemon_version"]
-                .as_str()
-                .is_some_and(|version| !version.is_empty())
-    }
-
     fn ready(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            self.assert_daemon_alive();
-            let output = self.output_until(&["daemon", "status"], deadline);
-            self.assert_daemon_alive();
-            if output.status.success()
-                && serde_json::from_slice::<Value>(&output.stdout)
-                    .is_ok_and(|v| Self::ready_status(&v))
-            {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "daemon failed: {}",
-                fs::read_to_string(self.root.path().join("daemon.log")).unwrap()
-            );
-            thread::sleep(Duration::from_millis(20));
-        }
-    }
-
-    fn assert_daemon_alive(&mut self) {
-        assert!(
-            self.daemon.try_wait().unwrap().is_none(),
-            "fixture daemon exited before readiness: {}",
-            fs::read_to_string(self.root.path().join("daemon.log")).unwrap()
-        );
+        daemon_readiness::wait(self.root.path(), &mut self.daemon, deadline)
+            .unwrap_or_else(|error| panic!("fixture daemon did not become ready: {error}"));
     }
 
     fn output(&self, arguments: &[&str]) -> Output {
@@ -188,11 +158,11 @@ impl Fixture {
 fn a_live_process_without_a_control_reply_is_not_ready() {
     // This is the status response during the real pre-bind startup window.
     let mut status = json!({"ok":true,"data":{"running":true,"daemon_version":null}});
-    assert!(!Fixture::ready_status(&status));
+    assert!(!daemon_readiness::serving_status(&status));
     status["data"]["daemon_version"] = "verified-daemon-build".into();
-    assert!(Fixture::ready_status(&status));
+    assert!(daemon_readiness::serving_status(&status));
     status["data"]["running"] = false.into();
-    assert!(!Fixture::ready_status(&status));
+    assert!(!daemon_readiness::serving_status(&status));
 }
 
 #[test]
