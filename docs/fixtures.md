@@ -17,7 +17,6 @@ person.
 | GitHub availability, project avatars or a worktree's pull request in the sidebar, offline | The fixture's forge, [`tests/fixtures/fixture-gh.sh`](#an-offline-github), switched on by `home/.config/fixture-forge` |
 | A saved Claude conversation damaged by a crash and a huge tool output, to resume | [`tests/fixtures/claude-damaged-history.py`](../tests/fixtures/claude-damaged-history.py)` PROJECT`, run in a session's fixture with `scripts/native-evidence env python3 ...`; it writes the transcript under the fixture HOME's `.claude` |
 | A Codex app-server peer that plays scripted items | `tests/fixtures/terminal-escape-codex.py` and the peers built on its transport, such as `codex-tool-rows.py` |
-| Saved Codex turns for the Resume conversation picker | `tests/fixtures/codex-resume-history.py ROOT --turns 3` |
 | Test a script's contract without a compositor or Cargo | The stubbed Python suites in `tests/*.py`, such as `tests/native_evidence.py` |
 
 From a terminal or chat that cagents hosts, your shell carries
@@ -162,28 +161,6 @@ evidence shot sidebar-avatar
 
 ## Adding a provider behaviour
 
-### Saved Codex history
-
-`/usr/bin/python3 tests/fixtures/codex-resume-history.py ROOT --turns 3`
-creates one invented conversation under `ROOT/home/.codex` and prints its
-thread ID, rollout path and working directory as JSON. Run it once in a new
-fixture before saving the seed; it refuses an existing Codex home. For native
-evidence, use that home with a real Codex executable and the ordinary development
-runner. The generator does not install or launch Codex, sign in, or call a model.
-
-Each user message has a `task_started` event before it, and each turn ends with
-`task_complete`. The rollout also includes the user and agent message events
-that Codex consumes for history. Model `response_item` records alone can leave
-the native history empty even though the Resume picker finds the conversation.
-`/usr/bin/python3 -I -B tests/codex_resume_history.py -v` checks the fixture;
-set `CAGENTS_TEST_CODEX` to an absolute native Codex executable to also verify
-`thread/resume` and `thread/turns/list` without starting a model turn. That
-optional check gives Codex fresh HOME, config and cache directories and an
-unreachable local model endpoint. It compares the original incomplete fixture
-shape with the corrected one, including message contents and turn identities.
-
-### Synthetic provider behaviours
-
 The synthetic Claude provider reads switches from files in its config
 directory, `$CAGENTS_EVIDENCE_FIXTURE/home/.claude` in a native-evidence
 fixture, because the daemon removes `CAGENTS_*` variables from a provider's
@@ -238,6 +215,29 @@ side's steps. `{fixture}` in a steps file means the fixture's root on the
 host. `pair` can wait 30 minutes for the native lock, so run it in the
 background rather than under a short command timeout, and run `clean` once the
 PR merges to remove the task's checkouts from the host.
+
+## Saved Codex history
+
+For saved Codex turns in the Resume conversation picker, use
+[`tests/fixtures/codex-resume-history.py`](../tests/fixtures/codex-resume-history.py).
+
+`/usr/bin/python3 tests/fixtures/codex-resume-history.py ROOT --turns 3`
+creates one invented conversation under `ROOT/home/.codex` and prints its
+thread ID, rollout path and working directory as JSON. Run it once in a new
+fixture before saving the seed; it refuses an existing Codex home. For native
+evidence, use that home with a real Codex executable and the ordinary development
+runner. The generator does not install or launch Codex, sign in, or call a model.
+
+Each user message has a `task_started` event before it, and each turn ends with
+`task_complete`. The rollout also includes the user and agent message events
+that Codex consumes for history. Model `response_item` records alone can leave
+the native history empty even though the Resume picker finds the conversation.
+`/usr/bin/python3 -I -B tests/codex_resume_history.py -v` checks the fixture;
+set `CAGENTS_TEST_CODEX` to an absolute native Codex executable to also verify
+`thread/resume` and `thread/turns/list` without starting a model turn. That
+optional check gives Codex fresh HOME, config and cache directories and an
+unreachable local model endpoint. It compares the original incomplete fixture
+shape with the corrected one, including message contents and turn identities.
 
 ## When a fixture fails
 
