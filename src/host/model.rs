@@ -1521,8 +1521,12 @@ mod tests {
                 title_source: Default::default(),
             })
             .unwrap();
-        registry
-            .db
+        // Build the legacy store with no live Registry connection: its TEMP
+        // execution triggers describe the current schema, not the old one.
+        drop(registry);
+        let path = directory.path().join("model.sqlite3");
+        let legacy = Connection::open(&path).unwrap();
+        legacy
             .execute_batch(
                 "DROP TABLE automation_precheck_history_cleanup;
                  DROP TABLE automation_retired_manual_requests;
@@ -1548,8 +1552,8 @@ mod tests {
                  ALTER TABLE channels DROP COLUMN title_source; PRAGMA user_version = 2;",
             )
             .unwrap();
-        drop(registry);
-        let mut restored = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        drop(legacy);
+        let mut restored = Registry::at(&path).unwrap();
         assert!(
             !restored
                 .apply(&ModelEdit::SuggestChannelTitle {
