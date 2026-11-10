@@ -4619,6 +4619,33 @@ mod tests {
     }
 
     #[test]
+    fn exact_chat_admission_tracks_attachment_without_changing_source_or_draft() {
+        let (mut app, source, _, pane) = retained_chat_move_fixture();
+        let scope = Scope::Channel(source);
+        app.shared_views.initialized.remove(&scope);
+        app.shared_views.baseline.remove(&scope);
+        app.shared_views.attached.remove(&pane.id);
+        app.chat_ui = super::super::chat_ui::State::with_drafts(HashMap::from([(
+            pane.id,
+            "Saved unsent draft  ".into(),
+        )]));
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        drop(app.reconcile_shared_views());
+        assert!(app.shared_views.initialized.contains(&scope));
+        assert!(app.shared_views.attached.contains(&pane.id));
+        assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
+        app.refresh_chat_drafts();
+        assert_eq!(
+            app.durable.chat_drafts.get(&pane.id).map(String::as_str),
+            Some("Saved unsent draft  ")
+        );
+        assert!(!std::iter::from_fn(|| rx.try_recv().ok()).any(
+            |edit| matches!(edit, ModelEdit::SeedView { scope: seeded, .. } if seeded == scope)
+        ));
+    }
+
+    #[test]
     fn populated_admission_checks_the_current_strip_order_before_equality() {
         let (mut app, source, _, pane) = channel_move_fixture();
         app.active_workspace = Some("/repo".into());
