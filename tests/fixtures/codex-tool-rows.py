@@ -12,6 +12,7 @@ and a private XDG_RUNTIME_DIR. Launch it through the ordinary development
 runner as the isolated Codex executable. It models the app-server protocol
 only: no provider, credentials, network service or tool is contacted.
 """
+import copy
 import importlib.util
 import json
 import os
@@ -91,8 +92,62 @@ class Scenario:
         self.thread, self.child = str(uuid.uuid4()), str(uuid.uuid4())
         self.latest = None
         self.child_latest = None
+        self._generation = 0
+        self._generations = {}
+        self._published = set()
+        self._changed = threading.Condition()
+
+    def _advance(self, thread):
+        self._generation += 1
+        self._generations[thread] = self._generation
+        self._published = {entry for entry in self._published if entry[0] != thread}
+        with self._changed:
+            self._changed.notify_all()
+
+    def state(self):
+        with self._changed:
+            return copy.deepcopy({"thread": self.thread, "child": self.child,
+                                  "latest": self.latest, "child_latest": self.child_latest})
+
+    def restore(self, state):
+        """Loading another listener's history invalidates every old playback."""
+        with self._changed:
+            self._restore(state)
+
+    def _restore(self, state):
+        self.thread, self.child = state["thread"], state["child"]
+        self.latest = copy.deepcopy(state["latest"])
+        self.child_latest = copy.deepcopy(state.get("child_latest"))
+        self._generations.clear()
+        for thread in (self.thread, self.child):
+            self._advance(thread)
+
+    def _latest(self, thread):
+        return self.latest if thread == self.thread else self.child_latest
+
+    def _store(self, thread, turn):
+        if thread == self.thread:
+            self.latest = copy.deepcopy(turn)
+        else:
+            self.child_latest = copy.deepcopy(turn)
+
+    def _child_state(self, item):
+        """A parent tool's history cannot overwrite its child's actual outcome."""
+        item = copy.deepcopy(item)
+        if self.child_latest:
+            status = self.child_latest["status"]
+            active = status == "inProgress"
+            if self.child in item.get("agentsStates", {}):
+                item["agentsStates"][self.child]["status"] = "running" if active else status
+            if item.get("type") == "subAgentActivity" and item.get("agentThreadId") == self.child:
+                item["kind"] = "started" if active else "completed"
+        return item
 
     def metadata(self, thread):
+        with self._changed:
+            return self._metadata(thread)
+
+    def _metadata(self, thread):
         child = thread == self.child
         latest = self.child_latest if child else self.latest
         return {"id": thread, "name": "Child review" if child else "Offline tool rows",
@@ -101,17 +156,91 @@ class Scenario:
                 "status": {"type": "active" if latest and latest["status"] == "inProgress"
                            else "idle"}, "canAcceptDirectInput": not child}
 
-    def observe(self, notification):
-        """Publish lifecycle state only as its corresponding frame is sent."""
-        if notification.get("method") not in ("turn/started", "turn/completed"):
-            return
-        params = notification["params"]
-        if params["threadId"] == self.thread:
-            self.latest = params["turn"]
-        elif params["threadId"] == self.child:
-            self.child_latest = params["turn"]
+    def observe(self, notification, generations=None):
+        """Accept a current frame, updating the history served on reconnection."""
+        with self._changed:
+            return self._observe(notification, generations)
 
-    def notifications(self, turn):
+    def _observe(self, notification, generations):
+        method = notification.get("method")
+        if method is None:
+            return True  # Correlated responses are never cancelled.
+        params = notification.get("params", {})
+        thread = params.get("threadId")
+        if thread not in (self.thread, self.child):
+            return False
+        if generations is not None and generations.get(thread) != self._generations.get(thread):
+            return False
+        latest = self._latest(thread)
+        turn_id = params.get("turnId", params.get("turn", {}).get("id"))
+        if turn_id is not None and (latest is None or latest["id"] != turn_id):
+            return False
+        if method in ("turn/started", "turn/completed"):
+            turn = copy.deepcopy(params["turn"])
+            if (method == "turn/started" and latest["status"] != "inProgress"
+                    or method == "turn/completed" and latest["status"] != "inProgress"
+                    and latest != turn):
+                return False
+            key = (thread, turn_id, method)
+            if key in self._published:
+                return False
+            if thread == self.thread:
+                turn["items"] = [self._child_state(item) for item in turn["items"]]
+            params["turn"] = turn
+            self._store(thread, turn)
+            self._published.add(key)
+            if thread == self.child and self.latest:
+                self.latest["items"] = [self._child_state(item) for item in self.latest["items"]]
+            self._changed.notify_all()
+        elif turn_id is not None:
+            if latest["status"] != "inProgress":
+                return False
+            if method in ("item/started", "item/completed"):
+                item = self._child_state(params["item"]) if thread == self.thread else params["item"]
+                params["item"] = item
+                present = next((index for index, old in enumerate(latest["items"])
+                                if old["id"] == item["id"]), None)
+                if present is None:
+                    latest["items"].append(copy.deepcopy(item))
+                else:
+                    latest["items"][present] = copy.deepcopy(item)
+        elif method == "thread/status/changed":
+            if params["status"] != self.metadata(thread)["status"]:
+                return False
+        return True
+
+    def playback(self, responses):
+        with self._changed:
+            return {response["params"]["threadId"]: self._generations.get(response["params"]["threadId"])
+                    for response in responses if response.get("method") and "threadId" in response.get("params", {})}
+
+    def _pause(self, seconds, generations):
+        deadline = time.monotonic() + seconds
+        with self._changed:
+            while True:
+                if not any(self._generations.get(thread) == generation
+                           and self._latest(thread) and self._latest(thread)["status"] == "inProgress"
+                           for thread, generation in generations.items()):
+                    return False
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return True
+                self._changed.wait(remaining)
+
+    def play(self, responses, publish, request_lock, generations):
+        """Publish only current frames; stop a cancelled delayed turn promptly."""
+        for response in responses:
+            if "_sleep" in response:
+                if not self._pause(response["_sleep"], generations):
+                    return
+            else:
+                # Fencing, history publication and the wire send share the
+                # request lock, so interruption cannot race a late success.
+                with request_lock:
+                    if self.observe(response, generations):
+                        publish(response)
+
+    def notifications(self, turn, starts_child=True):
         def notify(method, **params):
             return {"method": method, "params": {"threadId": self.thread, **params}}
         started, completed = [], []
@@ -124,20 +253,26 @@ class Scenario:
         settled = [end for _, end in items(self.child)]
         finished = {"id": turn, "status": "completed", "items": settled}
         answer = {"id": "answer", "type": "agentMessage", "text": "Done.", "phase": None}
+        child_started = [notify("turn/started", threadId=self.child,
+                               turn={"id": f"{turn}-child", "status": "inProgress", "items": []})] if starts_child else []
+        child_completed = [notify("turn/completed", threadId=self.child,
+                                 turn={"id": f"{turn}-child", "status": "completed", "items": []}),
+                           notify("thread/status/changed", threadId=self.child, status={"type": "idle"})] if starts_child else []
         return [notify("turn/started", turn={"id": turn, "status": "inProgress", "items": []}),
-                notify("turn/started", threadId=self.child,
-                       turn={"id": f"{turn}-child", "status": "inProgress", "items": []}),
+                *child_started,
                 *started, diff, {"_sleep": PAUSE}, *completed,
                 # A subAgentActivity item only renders a row. The child needs
                 # its own lifecycle receipt, as an actual app-server sends.
-                notify("turn/completed", threadId=self.child,
-                       turn={"id": f"{turn}-child", "status": "completed", "items": []}),
-                notify("thread/status/changed", threadId=self.child, status={"type": "idle"}),
+                *child_completed,
                 notify("item/completed", turnId=turn, item=answer),
                 notify("turn/completed", turn={**finished,
                                                "items": [*settled, answer]})]
 
     def request(self, frame, codex_home):
+        with self._changed:
+            return self._request(frame, codex_home)
+
+    def _request(self, frame, codex_home):
         identifier, method = frame.get("id"), frame.get("method")
         params = frame.get("params", {})
         if identifier is None:
@@ -177,12 +312,38 @@ class Scenario:
         elif method == "turn/start":
             if params.get("threadId") != self.thread:
                 return [{"id": identifier, "error": {"code": -32602, "message": "Prompt the fixture thread"}}]
+            if self.latest and self.latest["status"] == "inProgress":
+                return [{"id": identifier, "error": {"code": -32602, "message": "Fixture turn is still active"}}]
             turn = str(uuid.uuid4())
             result = {"turn": {"id": turn, "status": "inProgress", "items": []}}
-            self.latest = result["turn"]
-            self.child_latest = {"id": f"{turn}-child", "status": "inProgress", "items": []}
-            after = self.notifications(turn)
-        elif method in ("thread/unsubscribe", "turn/interrupt"):
+            self.latest = copy.deepcopy(result["turn"])
+            self._advance(self.thread)
+            starts_child = not self.child_latest or self.child_latest["status"] != "inProgress"
+            if starts_child:
+                self.child_latest = {"id": f"{turn}-child", "status": "inProgress", "items": []}
+                self._advance(self.child)
+            after = self.notifications(turn, starts_child)
+        elif method == "turn/interrupt":
+            thread = params.get("threadId")
+            if thread not in (self.thread, self.child):
+                return [{"id": identifier, "error": {"code": -32602, "message": "Unknown fixture thread"}}]
+            latest = self._latest(thread)
+            if latest is None or params.get("turnId") != latest["id"]:
+                return [{"id": identifier, "error": {"code": -32602, "message": "Unknown fixture turn"}}]
+            if latest["status"] == "inProgress":
+                interrupted = copy.deepcopy(latest)
+                interrupted["status"] = "interrupted"
+                for item in interrupted["items"]:
+                    if item.get("status") == "inProgress":
+                        item["status"] = "interrupted"
+                self._store(thread, interrupted)
+                self._advance(thread)
+                if thread == self.child and self.latest:
+                    self.latest["items"] = [self._child_state(item) for item in self.latest["items"]]
+                after = [{"method": "turn/completed", "params": {"threadId": thread, "turn": interrupted}},
+                         {"method": "thread/status/changed", "params": {"threadId": thread, "status": {"type": "idle"}}}]
+            result = {}
+        elif method == "thread/unsubscribe":
             result = {}
         else:
             return [{"id": identifier, "error": {"code": -32601, "message": "Unsupported offline fixture method"}}]
@@ -205,17 +366,17 @@ def serve(connection, codex_home, scenario, request_lock):
         request = transport.receive(connection, lambda payload: connection.sendall(transport.frame(payload, opcode=10)))
         with request_lock:
             responses = scenario.request(request, codex_home)
+            generations = scenario.playback(responses)
         # A turn's later frames follow its pause on their own thread, so the
         # client's requests in the meantime are still answered.
-        def play(responses=responses):
-            for response in responses:
-                if "_sleep" in response:
-                    time.sleep(response["_sleep"])
-                    continue
-                with request_lock:
-                    scenario.observe(response)
+        def play(responses=responses, generations=generations):
+            def publish(response):
                 with send:
                     connection.sendall(transport.frame(response))
+            try:
+                scenario.play(responses, publish, request_lock, generations)
+            except (EOFError, ConnectionError):
+                pass
         if any("_sleep" in response for response in responses):
             threading.Thread(target=play, daemon=True).start()
         else:
