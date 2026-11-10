@@ -1345,7 +1345,8 @@ fn staged_candidate_startup_authenticates_the_inherited_coordinator_fence() {
     let candidate_status = run(None, None);
     assert!(candidate_status.status.success(), "{candidate_status:?}");
     let result: serde_json::Value = serde_json::from_slice(&candidate_status.stdout).unwrap();
-    assert_eq!(result["data"]["running"], true);
+    assert_eq!(result["data"]["running"], false);
+    assert_eq!(result["data"]["daemon_present"], true);
     assert_eq!(
         unsafe { libc::flock(legacy.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
         0
@@ -1661,11 +1662,9 @@ printf '%s\n' "$*"
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
-    assert!(
-        String::from_utf8(output.stdout)
-            .unwrap()
-            .contains("\"running\":true")
-    );
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["data"]["running"], false);
+    assert_eq!(status["data"]["daemon_present"], true);
     drop(candidate);
     drop(candidate_lock);
 }
