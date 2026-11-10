@@ -1711,7 +1711,12 @@ fn require_ended_codex_execution_for_launch(
                     return Err(std::io::Error::other(running_codex_process(writer.pid)));
                 }
                 Ok(None) => CodexExecution::Ended,
-                Err(reason) => CodexExecution::Unproved { reason },
+                Err(reason) => {
+                    return Err(std::io::Error::new(
+                        reason.kind(),
+                        unproved_codex_execution(&reason.to_string()),
+                    ));
+                }
             },
             None => CodexExecution::Ended,
         },
@@ -1731,11 +1736,15 @@ fn require_ended_codex_execution_for_launch(
         {
             "A process was still starting; try again in a moment.".into()
         }
-        CodexExecution::Unproved { reason } => format!(
-            "The old Codex execution could not be checked: {reason}. This conversation was not restarted. Restore access to this evidence and try again."
-        ),
+        CodexExecution::Unproved { reason } => unproved_codex_execution(&reason),
     };
     Err(std::io::Error::other(message))
+}
+
+fn unproved_codex_execution(reason: &str) -> String {
+    format!(
+        "The old Codex execution could not be checked: {reason}. This conversation was not restarted. Restore access to this evidence and try again."
+    )
 }
 
 fn running_codex_process(pid: impl std::fmt::Display) -> String {

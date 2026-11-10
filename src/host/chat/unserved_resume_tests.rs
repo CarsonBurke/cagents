@@ -74,18 +74,53 @@ impl ThreadWriter {
             .open(locks.join(format!("{}.lock", thread_id())))
             .unwrap();
         assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) }, 0);
-        assert_eq!(
-            codex_owners::writer(
-                Some(&locks.join(format!("{}.lock", thread_id()))),
-                thread_id()
-            )
-            .unwrap()
-            .unwrap()
-            .pid,
-            std::process::id() as libc::pid_t,
-        );
+        assert_kernel_writer(&locks.join(format!("{}.lock", thread_id())));
         Self(file)
     }
+}
+
+fn assert_kernel_writer(lock: &Path) {
+    use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+    let independent = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(lock)
+        .unwrap();
+    let result = unsafe { libc::flock(independent.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        assert_eq!(
+            unsafe { libc::flock(independent.as_raw_fd(), libc::LOCK_UN) },
+            0
+        );
+        panic!("the fixture's independent kernel probe found no writer");
+    }
+    assert_eq!(
+        std::io::Error::last_os_error().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+fn unknown_writer_refusal(home: &Path) -> String {
+    let lock = home
+        .join("thread-writer-locks")
+        .join(format!("{}.lock", thread_id()));
+    let reason = format!(
+        "Cannot inspect Codex thread writer lock {}: {}",
+        lock.display(),
+        std::io::Error::from_raw_os_error(libc::EWOULDBLOCK)
+    );
+    format!(
+        "The old Codex execution could not be checked: {reason}. This conversation was not restarted. Restore access to this evidence and try again."
+    )
+}
+
+fn assert_writer_refusal(message: &str, pid: impl std::fmt::Display, home: &Path, prefix: &str) {
+    let known = format!("{prefix}{}", running_codex_process(pid));
+    let unknown = format!("{prefix}{}", unknown_writer_refusal(home));
+    assert!(
+        message == known || message == unknown,
+        "unexpected writer refusal: {message}"
+    );
 }
 
 impl Drop for ThreadWriter {
@@ -458,8 +493,22 @@ fn a_reopened_codex_thread_joins_a_long_published_shared_endpoint() {
 
 #[test]
 fn a_long_stale_shared_endpoint_waits_for_its_writer_then_reopens_privately() {
-    const NAME: &str = "host::chat::unserved_resume_tests::a_long_stale_shared_endpoint_waits_for_its_writer_then_reopens_privately";
-    if isolated(NAME).is_some() {
+    long_stale_shared_endpoint_waits_for_writer(
+        "host::chat::unserved_resume_tests::a_long_stale_shared_endpoint_waits_for_its_writer_then_reopens_privately",
+        false,
+    );
+}
+
+#[test]
+fn a_missing_writer_row_cannot_start_a_private_server_until_kernel_release() {
+    long_stale_shared_endpoint_waits_for_writer(
+        "host::chat::unserved_resume_tests::a_missing_writer_row_cannot_start_a_private_server_until_kernel_release",
+        true,
+    );
+}
+
+fn long_stale_shared_endpoint_waits_for_writer(name: &str, missing_row: bool) {
+    if isolated(name).is_some() {
         return;
     }
     use std::os::unix::fs::MetadataExt;
@@ -469,6 +518,7 @@ fn a_long_stale_shared_endpoint_waits_for_its_writer_then_reopens_privately() {
     install_codex(&root);
     let home = root.join("long-stale-account-directory-".repeat(5));
     let writer = ThreadWriter::hold(&home);
+    let table = missing_row.then(|| codex_owners::LockTableScope::new(String::new()));
     let control = home.join("app-server-control");
     std::fs::create_dir_all(&control).unwrap();
     let published = control.join("app-server-control.sock");
@@ -496,7 +546,20 @@ fn a_long_stale_shared_endpoint_waits_for_its_writer_then_reopens_privately() {
     )
     .unwrap_err();
     assert!(prepare.retryable, "{prepare:?}");
-    assert_eq!(prepare.message, running_codex_process(std::process::id()));
+    assert_eq!(prepare.code, ProtocolErrorCode::TerminalUnavailable);
+    assert_writer_refusal(&prepare.message, std::process::id(), &home, "");
+    if let Some(table) = &table {
+        assert!(table.reads() > 0, "the controlled missing row was not read");
+        assert_eq!(prepare.message, unknown_writer_refusal(&home));
+        let boot = host.lock().unwrap().proof().boot_id.clone();
+        assert_eq!(
+            require_ended_codex_execution(&host, &requested, &boot)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+    let reads_before_start = table.as_ref().map_or(0, |table| table.reads());
     let refused = process(
         &host,
         1,
@@ -511,17 +574,27 @@ fn a_long_stale_shared_endpoint_waits_for_its_writer_then_reopens_privately() {
         crate::host::finish_chat_shutdown(&host).unwrap();
     }
     let refused = refused.unwrap_err();
-    assert_eq!(
-        refused.message,
-        format!(
-            "Cannot restart Codex: {}",
-            running_codex_process(std::process::id())
-        ),
-        "a refused long shared socket must reach writer proof before any server is launched"
+    assert_writer_refusal(
+        &refused.message,
+        std::process::id(),
+        &home,
+        "Cannot restart Codex: ",
     );
+    if let Some(table) = &table {
+        assert!(
+            table.reads() > reads_before_start,
+            "Start did not read the controlled table"
+        );
+        assert_eq!(
+            refused.message,
+            format!("Cannot restart Codex: {}", unknown_writer_refusal(&home))
+        );
+    }
     assert!(refused.retryable, "{refused:?}");
     assert!(!root.join("codex-arguments").exists());
     assert!(host.lock().unwrap().chats.is_empty());
+    assert!(host.lock().unwrap().chat_spawning.is_empty());
+    assert!(!requested.owns_codex_listener());
     drop(writer);
     let ServerResponse::ChatResumePrepared { session: prepared } = process(
         &host,
@@ -533,6 +606,10 @@ fn a_long_stale_shared_endpoint_waits_for_its_writer_then_reopens_privately() {
     .unwrap() else {
         panic!("expected preparation after the writer exited")
     };
+    assert_eq!(
+        prepared, requested,
+        "preparation must preserve the saved source"
+    );
     let (methods, received) = mpsc::channel();
     let (server_root, server_home) = (root.clone(), home);
     let server = thread::spawn(move || {
@@ -791,12 +868,11 @@ fn a_prepared_codex_resume_rechecks_the_shared_service_before_starting() {
     )
     .unwrap_err();
     assert!(refusal.retryable, "{refusal:?}");
-    assert_eq!(
-        refusal.message,
-        format!(
-            "Cannot restart Codex: {}",
-            running_codex_process(std::process::id())
-        )
+    assert_writer_refusal(
+        &refusal.message,
+        std::process::id(),
+        &home,
+        "Cannot restart Codex: ",
     );
     let refuse_prepare = || {
         process(
@@ -814,12 +890,11 @@ fn a_prepared_codex_resume_rechecks_the_shared_service_before_starting() {
         prepare.retryable,
         "a live writer can end before Retry: {prepare:?}"
     );
-    assert_eq!(prepare.message, running_codex_process(std::process::id()));
-    assert_eq!(
-        refuse_prepare(),
-        prepare,
-        "Retry while held repeats the same refusal"
-    );
+    assert_writer_refusal(&prepare.message, std::process::id(), &home, "");
+    let repeated = refuse_prepare();
+    assert_eq!(repeated.code, prepare.code);
+    assert_eq!(repeated.retryable, prepare.retryable);
+    assert_writer_refusal(&repeated.message, std::process::id(), &home, "");
     assert!(
         !root.join("codex-arguments").exists(),
         "no private replacement was launched"
@@ -969,13 +1044,8 @@ fn a_reopened_codex_thread_served_on_another_private_listener_is_refused() {
         );
         thread::sleep(Duration::from_millis(10));
     }
-    let writer = super::codex_owners::writer(
-        Some(&locks.join(format!("{}.lock", thread_id()))),
-        thread_id(),
-    )
-    .unwrap()
-    .expect("the private server holds the real kernel writer lock");
-    assert_eq!(writer.pid, server.id() as libc::pid_t);
+    assert_kernel_writer(&locks.join(format!("{}.lock", thread_id())));
+    let writer_pid = server.id() as libc::pid_t;
     host.lock().unwrap().register_client(1);
     let requested = reopened(&root);
     // A stopped entry allocated for this pane must remain available to the
@@ -1046,18 +1116,16 @@ fn a_reopened_codex_thread_served_on_another_private_listener_is_refused() {
     let refusal = result.unwrap_err();
     let repeated = repeated.unwrap_err();
     assert_eq!(refusal.code, ProtocolErrorCode::TerminalUnavailable);
-    assert_eq!(
-        repeated, refusal,
-        "Retry while held must repeat the refusal"
-    );
-    assert!(
-        refusal.message
-            == format!(
-                "Cannot restart Codex: {}",
-                running_codex_process(writer.pid)
-            ),
-        "{refusal:?}"
-    );
+    assert_eq!(repeated.code, refusal.code);
+    assert_eq!(repeated.retryable, refusal.retryable);
+    for failure in [&refusal, &repeated] {
+        assert_writer_refusal(
+            &failure.message,
+            writer_pid,
+            &root.join("home/.codex"),
+            "Cannot restart Codex: ",
+        );
+    }
     assert!(
         refusal.retryable,
         "the same card may retry after its writer closes"
