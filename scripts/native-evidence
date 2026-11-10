@@ -752,8 +752,21 @@ run_app() {
     return "$status"
 }
 
+# Observe the explicit machine format; display text is not a window contract.
+app_window_is_open() {
+    local observed
+    observed=$(timeout -k 1 10 niri-harness --no-heal --session "$session_name" --json observe --no-text 2>/dev/null) || return 1
+    /usr/bin/python3 -c 'import json,sys
+try:
+    state=json.load(sys.stdin)
+    sys.exit(not bool(state.get("window")))
+except (ValueError,AttributeError):
+    sys.exit(1)
+' <<<"$observed"
+}
+
 cmd_relaunch() {
-    local side observed watcher status=0 chat_stage_output=
+    local side watcher status=0 chat_stage_output=
     side=$(current_side)
     case ${1:-} in
         --chat-stages)
@@ -772,8 +785,7 @@ cmd_relaunch() {
     local session_environment
     session_environment=$(timeout -k 5 30 niri-harness --session "$session_name" session env)
     eval "$session_environment"
-    observed=$(timeout -k 1 10 niri-harness --no-heal --session "$session_name" observe --no-text 2>/dev/null) || observed=
-    if grep -q '^window=' <<<"$observed"; then
+    if app_window_is_open; then
         die 'close the app window before relaunching it'
     fi
     # Product copies need not contain Cargo dependency lists, so the runner's
@@ -783,8 +795,7 @@ cmd_relaunch() {
     (
         for _ in {1..300}; do
             live_session || exit 1
-            observed=$(timeout -k 1 10 niri-harness --no-heal --session "$session_name" observe --no-text 2>/dev/null) || observed=
-            if grep -q '^window=' <<<"$observed"; then
+            if app_window_is_open; then
                 rm -f -- "$state/replaying"
                 exit 0
             fi
