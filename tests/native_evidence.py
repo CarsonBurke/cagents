@@ -983,6 +983,9 @@ class Evidence(unittest.TestCase):
         (self.logs / "ui-absent").touch()
         cargo_before = (self.logs / "cargo").read_text()
         identity = (self.task / "fixture" / "home" / ".claude").stat().st_ino
+        # The stub appends each launch's environment. Assert only the new
+        # launch, so preserved flags cannot be satisfied by the original app.
+        (self.logs / "runner-env").write_text("")
         output = self.logs / "relaunch-output"
         with output.open("w") as sink:
             process = subprocess.Popen([str(SCRIPT), "relaunch", "--chat-stages"], env=self.env,
