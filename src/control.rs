@@ -2851,6 +2851,12 @@ fn routes_to_staged_owner(command: &TopCommand) -> bool {
         command,
         TopCommand::Completions { .. }
             | TopCommand::Diagnostics
+            // A paired console already has its exact daemon endpoint and
+            // opaque execution authority. It starts during daemon restore,
+            // while the updater still holds the installation launch fence.
+            | TopCommand::Agent {
+                command: AgentCommand::Console { .. }
+            }
             | TopCommand::CoordinateInstall { .. }
             | TopCommand::VerifyInstallGuard { .. }
             | TopCommand::RecordDeferredInstall { .. }
@@ -4852,6 +4858,74 @@ mod tests {
         assert!(routed(&["cagents", "daemon", "prepare-upgrade", "--yes"]));
         assert!(routed(&["cagents", "daemon", "abandon-upgrade", "--yes"]));
         assert!(routed(&["cagents", "daemon", "start"]));
+    }
+
+    #[test]
+    fn paired_console_attaches_without_staged_install_routing_or_daemon_recovery() {
+        use clap::Parser;
+        const CHILD: &str = "CAGENTS_TEST_CONSOLE_ENTRY_ROUTE";
+        let name = thread::current().name().unwrap().to_owned();
+        if std::env::var(CHILD).as_deref() != Ok(name.as_str()) {
+            let root = tempfile::tempdir().unwrap();
+            for leaf in ["home", "runtime", "config", "data", "cache"] {
+                std::fs::create_dir(root.path().join(leaf)).unwrap();
+            }
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", root.path().join("home"))
+                .env("XDG_RUNTIME_DIR", root.path().join("runtime"))
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .env("XDG_CACHE_HOME", root.path().join("cache"))
+                .env(CHILD, &name)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "console entry child failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("Open consoles through agent spawn --surface terminal")
+            );
+            return;
+        }
+        // Model the installed updater's exclusive launch fence at the actual
+        // entry-point hook. Reaching it would reject this console before its
+        // existing-only capability check, exactly as the installed build did.
+        assert_eq!(
+            run_from_with_staged_lookup(
+                [
+                    "cagents",
+                    "--json",
+                    "--no-start",
+                    "agent",
+                    "console",
+                    "abcdef00-0000-4000-8000-000000000001",
+                ],
+                |_, _| panic!("paired console consulted the staged installation launch fence"),
+            ),
+            ExitCode::FAILURE
+        );
+        let console = super::Cli::try_parse_from([
+            "cagents",
+            "agent",
+            "console",
+            "abcdef00-0000-4000-8000-000000000001",
+        ])
+        .unwrap()
+        .command;
+        assert!(!super::routes_to_staged_owner(&console));
+        assert!(!super::staged_command_requires_daemon(&console));
+        let user = super::Cli::try_parse_from(["cagents", "agent", "list"])
+            .unwrap()
+            .command;
+        assert!(super::routes_to_staged_owner(&user));
+        assert!(super::staged_command_requires_daemon(&user));
     }
 
     #[test]
