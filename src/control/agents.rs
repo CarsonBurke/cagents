@@ -2097,6 +2097,32 @@ mod tests {
     #[test]
     fn console_reads_and_controls_keep_ordinary_reply_budget() {
         use crate::agent_execution::ConsoleCommand;
+        use std::{net::Shutdown, sync::mpsc};
+
+        struct ShutdownOnDrop(UnixStream);
+
+        impl Drop for ShutdownOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.shutdown(Shutdown::Both);
+            }
+        }
+
+        struct Peer {
+            stream: UnixStream,
+            release: mpsc::Sender<()>,
+            task: Option<thread::JoinHandle<()>>,
+        }
+
+        impl Drop for Peer {
+            fn drop(&mut self) {
+                let _ = self.release.send(());
+                let _ = self.stream.shutdown(Shutdown::Both);
+                if let Some(task) = self.task.take() {
+                    let _ = task.join();
+                }
+            }
+        }
+
         for command in [
             ConsoleCommand::Read {
                 after_generation: None,
@@ -2109,25 +2135,26 @@ mod tests {
         ] {
             let expected = command.clone();
             let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
-            let server = thread::spawn(move || {
+            let (release, wait) = mpsc::channel();
+            let mut server = Peer {
+                stream: server_stream.try_clone().unwrap(),
+                release,
+                task: None,
+            };
+            let shutdown = ShutdownOnDrop(server_stream.try_clone().unwrap());
+            server.task = Some(thread::spawn(move || {
+                let _shutdown = shutdown;
                 answer(&mut server_stream, |_| true, connected());
                 let request: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
                 assert!(matches!(request.request, ClientRequest::Agent {
                 operation: Operation::Console { command, .. }, ..
             } if command == expected));
-                thread::sleep(IO_TIMEOUT + Duration::from_millis(500));
-                let _ = write_frame(
-                    &mut server_stream,
-                    &ServerEnvelope {
-                        version: PROTOCOL_VERSION,
-                        request_id: Some(request.request_id),
-                        proof: proof(),
-                        message: ServerMessage::Response {
-                            response: ServerResponse::Agent(Reply::Console(None)),
-                        },
-                    },
-                );
-            });
+                // Keep the peer silent until the client finishes. A fixed sleep
+                // can expire before a descheduled client starts its socket read.
+                // The independent 60s cleanup backstop (twice the submission
+                // budget) does not change the client's ordinary reply timeout.
+                wait.recv_timeout(AGENT_SUBMIT_TIMEOUT * 2).unwrap();
+            }));
             let mut client = ControlClient::from_stream(client_stream).unwrap();
             let read = client.agent(
                 Authority::default(),
@@ -2137,9 +2164,10 @@ mod tests {
                 },
             );
             drop(client);
-            server.join().unwrap();
+            server.release.send(()).unwrap();
+            server.task.take().unwrap().join().unwrap();
             assert!(
-                read.is_err(),
+                matches!(read, Err(ControlError::ReplyTimeout { timeout, .. }) if timeout == IO_TIMEOUT),
                 "a stalled console poll must keep the ordinary timeout: {read:?}"
             );
         }
