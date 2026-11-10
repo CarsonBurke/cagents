@@ -68,6 +68,7 @@ history=$config/projects/$project/$session.jsonl
 mkdir -p "$(dirname "$history")"
 parent=null
 turn=0
+records='[]'
 if [ -f "$history" ]; then
     # As Claude Code does, skip a line that isn't a record, such as one a
     # crash cut short, rather than refusing the whole transcript.
@@ -84,6 +85,17 @@ if [ -f "$history" ]; then
     if [ -s "$history" ] && [ "$(tail -c 1 -- "$history" | wc -l)" -eq 0 ]; then
         printf '\n' >>"$history"
     fi
+fi
+# Resume from an earlier main record to reproduce a provider branch without
+# removing anything the person previously saw. Keep the full turn counter so
+# later generated record IDs remain distinct on every branch.
+if [ "$probe" = false ] && [ -n "$resumed" ] && [ -f "$config/fixture-resume-parent" ]; then
+    resume_parent=$(cat "$config/fixture-resume-parent")
+    if ! printf '%s' "$records" | jq -e --arg uuid "$resume_parent"         'any(.[]; .uuid == $uuid and (.isSidechain // false) != true and (.teamName // "") == "")' >/dev/null; then
+        printf '%s\n' 'Invalid fixture-resume-parent: expected an existing main record UUID' >&2
+        exit 2
+    fi
+    parent=$resume_parent
 fi
 persist_record() {
     record=$(printf '%s' "$1" | jq -c --arg session "$session" --arg parent "$parent" \

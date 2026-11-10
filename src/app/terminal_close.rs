@@ -1152,7 +1152,7 @@ mod tests {
                 .is_empty(),
             "persist prunes closed membership after the original Home was captured"
         );
-        assert!(app.channel_work.retire_candidates.contains(&home));
+        assert!(app.channel_ui.retire_candidates.contains(&home));
         let (send, received) = async_channel::unbounded();
         app.workspace_model_tx = send;
         app.retire_settled_empty_channels();

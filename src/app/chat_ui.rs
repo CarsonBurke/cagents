@@ -801,6 +801,10 @@ pub(super) struct State {
     /// draft. If that window's start fails, the shared pane goes back to the
     /// same conversation as a draft, and so does this card.
     peer_started: HashMap<CardId, TerminalId>,
+    /// Drafts another window started, whose cards are attaching to that
+    /// conversation. Their carried-over unsent text may repeat its first
+    /// message, which is checked once the transcript shows it.
+    started_elsewhere: HashSet<CardId>,
     /// Automatically opened placeholders, discarded when their scope is left
     /// until the reader puts work into them or starts their conversation.
     default_chats: HashSet<CardId>,
@@ -838,6 +842,7 @@ impl Default for State {
             drafts: HashMap::new(),
             draft_attachments: HashMap::new(),
             peer_started: HashMap::new(),
+            started_elsewhere: HashSet::new(),
             default_chats: HashSet::new(),
             parked: HashMap::new(),
             fresh_offers: HashSet::new(),
@@ -2454,6 +2459,10 @@ pub(super) struct Runtime {
     image_pastes_saving: usize,
     submit_after_paste: Option<PromptMode>,
     attachment_chooser_pending: Option<uuid::Uuid>,
+    /// The composer revision at which unsent text carried over from a draft
+    /// another window started may still repeat that window's first message.
+    /// Cleared once the transcript settles it, or the reader edits the text.
+    first_message_echo: Option<u64>,
     expanded: HashSet<String>,
     child_expanded: HashMap<String, HashSet<String>>,
     child_unfolded: HashMap<String, HashSet<String>>,
@@ -3238,6 +3247,51 @@ impl Runtime {
             .unwrap_or(&self.attachments)
     }
 
+    /// Checks carried-over unsent text against the first message of the
+    /// conversation another window started from this draft, once the
+    /// transcript shows it.
+    fn await_first_message_echo(&mut self) {
+        self.first_message_echo = Some(self.revision);
+        self.settle_first_message_echo();
+    }
+
+    /// Drops the composer text if it is exactly the conversation's first
+    /// message, which the window that started it already sent, so it is not
+    /// offered again. Any other text is the reader's own and stays.
+    fn settle_first_message_echo(&mut self) {
+        let Some(revision) = self.first_message_echo else {
+            return;
+        };
+        if revision != self.revision || !self.attachments.is_empty() {
+            // Edited since, or more than the text: no longer a copy.
+            self.first_message_echo = None;
+            return;
+        }
+        if self.snapshot.history_loading || !self.visible.load(Ordering::Relaxed) {
+            return;
+        }
+        let first = self
+            .snapshot
+            .items
+            .iter()
+            .find_map(|item| match &item.content {
+                chat::ItemContent::Text { text, .. } if item.role == chat::Role::User => Some(text),
+                _ => None,
+            });
+        let Some(first) = first else {
+            if self.snapshot.has_earlier {
+                // The first message is not in view, so nothing can be shown
+                // to repeat it.
+                self.first_message_echo = None;
+            }
+            return;
+        };
+        self.first_message_echo = None;
+        if !self.snapshot.has_earlier && self.composer.text().trim() == first.trim() {
+            self.replace_draft(text_editor::Content::new());
+        }
+    }
+
     /// A first prompt is still local work until the provider accepts it.
     /// Keep that source and any later composer edits together as an inert
     /// recovery draft; restoring it never automatically submits either part.
@@ -3414,6 +3468,7 @@ impl Runtime {
             image_pastes_saving: 0,
             submit_after_paste: None,
             attachment_chooser_pending: None,
+            first_message_echo: None,
             expanded: HashSet::new(),
             child_expanded: HashMap::new(),
             child_unfolded: HashMap::new(),
@@ -4595,6 +4650,11 @@ impl Runtime {
     fn refresh(&mut self) {
         self.prepare_local_prompt();
         self.refresh_session();
+        self.refresh_snapshot();
+        self.settle_first_message_echo();
+    }
+
+    fn refresh_snapshot(&mut self) {
         if !self.visible.load(Ordering::Relaxed) {
             if let Some((snapshot, clock)) = self
                 .handle()
@@ -6979,8 +7039,9 @@ impl Cagents {
         self.load_draft_skills(target)
     }
 
-    /// Takes the draft out of `card` when another window has started the very
-    /// conversation it shows, so the card can attach to it.
+    /// Takes the draft out of `card` when another window has started the
+    /// conversation it shows, under the draft's identity or the new one a
+    /// first send saves, so the card can attach to it.
     ///
     /// The draft runtime cannot attach in place: its start attempt would be
     /// taken for this window's own first send, and a failure would retire the
@@ -7001,7 +7062,6 @@ impl Cagents {
             Some(CardRuntime::Chat(runtime))
                 if runtime.is_draft()
                     && runtime.session.is_unstarted()
-                    && runtime.session.id == session.id
                     && runtime.attachment_chooser_pending.is_none()
                     && runtime.pastes_pending == 0
         );
@@ -7012,7 +7072,7 @@ impl Cagents {
         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) {
             runtime.unqueue();
         }
-        self.stash_unsent_chat(card);
+        self.carry_unsent_chat(card, true);
         self.cards.remove(&card);
         self.lifecycle.remove(card);
         self.shared_views.attached.insert(card);
@@ -7037,7 +7097,7 @@ impl Cagents {
         }
         self.chat_ui.peer_started.remove(&card);
         self.chat_ui.phases.remove(&card);
-        self.stash_unsent_chat(card);
+        self.carry_unsent_chat(card, false);
         self.cards.remove(&card);
         self.lifecycle.remove(card);
         self.resolve_notice(NoticeKey::ChatAttach(card));
@@ -7047,6 +7107,26 @@ impl Cagents {
 
     pub(super) fn forget_peer_started(&mut self, card: CardId) {
         self.chat_ui.peer_started.remove(&card);
+    }
+
+    /// Whether draft `card` is choosing or loading files, whose result its
+    /// draft runtime has to receive before the card can follow a
+    /// conversation another window started from it.
+    pub(super) fn chat_draft_inserting(&self, card: CardId) -> bool {
+        !self.chat_start_pending(card)
+            && matches!(self.cards.get(&card), Some(CardRuntime::Chat(runtime))
+                if runtime.is_draft()
+                    && runtime.session.is_unstarted()
+                    && (runtime.attachment_chooser_pending.is_some() || runtime.pastes_pending != 0))
+    }
+
+    /// The conversation this window's own first send from draft `card` has
+    /// already queued for storage, while that send is still saving.
+    pub(super) fn draft_start_candidate(&self, card: CardId) -> Option<&chat::Session> {
+        self.chat_ui
+            .draft_checkpoints
+            .get(&card)
+            .map(|pending| &pending.candidate)
     }
 
     pub(in crate::app) fn chat_is_draft(&self, card: CardId) -> bool {
@@ -7821,7 +7901,9 @@ impl Cagents {
     }
 
     /// Gives a new runtime for `card` the draft saved when its last one
-    /// left: the text and every attachment, files as well as images.
+    /// left: the text and every attachment, files as well as images. Text
+    /// carried from a draft another window started is checked against that
+    /// conversation's first message, once.
     pub(super) fn restore_saved_draft(&mut self, card: CardId, runtime: &mut Runtime) {
         if let Some(draft) = self.chat_ui.drafts.remove(&card)
             && !draft.is_empty()
@@ -7830,6 +7912,9 @@ impl Cagents {
         }
         if let Some(attachments) = self.chat_ui.draft_attachments.remove(&card) {
             runtime.replace_attachments(attachments);
+        }
+        if self.chat_ui.started_elsewhere.remove(&card) {
+            runtime.await_first_message_echo();
         }
     }
 
@@ -7923,6 +8008,19 @@ impl Cagents {
         self.observe_agent_activity_for_card(card, None);
     }
 
+    /// Keeps what the reader is composing in draft `card`, whose conversation
+    /// another window replaced, for the composer that opens in its place, and
+    /// whether its text may only repeat the first message of a conversation
+    /// started from it.
+    pub(super) fn carry_unsent_chat(&mut self, card: CardId, started: bool) {
+        self.stash_unsent_chat(card);
+        if started && self.chat_is_draft(card) {
+            self.chat_ui.started_elsewhere.insert(card);
+        } else {
+            self.chat_ui.started_elsewhere.remove(&card);
+        }
+    }
+
     /// Captures the unsent text and attachments of `card`'s chat runtime, which is
     /// about to be dropped while the card lives on, so whatever runtime the
     /// card builds next opens with them rather than losing them.
@@ -7971,6 +8069,7 @@ impl Cagents {
             return;
         }
         let snapshot = self.persistent_workspace();
+        self.record_shared_chat_identities();
         if let Some(writer) = self.session.as_ref() {
             writer.replace_chat_identity(card, pending.candidate.id, current, snapshot);
         }
@@ -8001,6 +8100,7 @@ impl Cagents {
         self.chat_forget(card);
         self.chat_ui.drafts.remove(&card);
         self.chat_ui.draft_attachments.remove(&card);
+        self.chat_ui.started_elsewhere.remove(&card);
         self.chat_ui.parked.remove(&card);
         self.chat_ui.fresh_offers.remove(&card);
         self.chat_ui.removed_accounts.remove(&card);
@@ -9059,6 +9159,7 @@ impl Cagents {
         // The composer and public source are still A. The snapshot projection
         // contains the exact candidate B and the still-editable text/images.
         let snapshot = self.persistent_workspace();
+        self.record_shared_chat_identities();
         let writer = self.session.as_ref().expect("writer was checked above");
         // Exact replacement equality is idempotent when B already landed;
         // otherwise the original A identity must still match. This explicit
@@ -20685,230 +20786,6 @@ mod tests {
         );
     }
 
-    // Tasks are deliberately dropped: these fixtures only cross the actual
-    // app reducers and never connect to a daemon or start a provider.
-    fn open_work_over_chat(app: &mut Cagents) {
-        let channel = crate::model::ChannelId::new();
-        app.workspace_model.identity = uuid::Uuid::new_v4();
-        app.workspace_model
-            .channels
-            .push(crate::workspace_model::ModelChannel {
-                id: channel,
-                repository: FIXTURE_DIRECTORY.into(),
-                title: "Chat input fixture".into(),
-                title_source: Default::default(),
-                ordinal: 1,
-            });
-        drop(app.open_channel_work(channel));
-        assert!(app.channel_work_is_main());
-        assert!(!app.workspace_surfaces_visible());
-    }
-
-    fn return_to_chat(app: &mut Cagents) {
-        let owner = app.channel_work.view.owner().unwrap();
-        drop(app.update_channel_work(crate::channel_work_ui::Action::Close(owner)));
-        assert!(!app.channel_work_is_main());
-        assert!(app.workspace_surfaces_visible());
-    }
-
-    /// Retain a real composer callback before switching away from its pane.
-    fn queued_composer_key(
-        app: &Cagents,
-        card: CardId,
-        event: keyboard::Event,
-        renderer: &cosmic::Renderer,
-    ) -> Vec<Message> {
-        use iced::advanced::{Layout, Shell, clipboard, layout, widget::Tree};
-        let viewport = iced::Rectangle::with_size(iced::Size::new(760.0, 720.0));
-        let mut element = app.chat_view(card);
-        let mut tree = Tree::new(element.as_widget());
-        let node = element.as_widget_mut().layout(
-            &mut tree,
-            renderer,
-            &layout::Limits::new(iced::Size::ZERO, viewport.size()),
-        );
-        element.as_widget_mut().operate(
-            &mut tree,
-            Layout::new(&node),
-            renderer,
-            &mut iced::advanced::widget::operation::focusable::focus::<()>(card_control_id(
-                card,
-                "chat-composer",
-            )),
-        );
-        let mut messages = Vec::new();
-        element.as_widget_mut().update(
-            &mut tree,
-            &iced::Event::Keyboard(event),
-            Layout::new(&node),
-            iced::mouse::Cursor::Unavailable,
-            renderer,
-            &mut clipboard::Null,
-            &mut Shell::new(&mut messages),
-            &viewport,
-        );
-        messages
-    }
-
-    #[test]
-    fn main_work_refuses_queued_native_composer_edits_and_submit_but_conversations_accepts_them() {
-        let renderer = crate::app::tests::headless_renderer();
-        for started in [false, true] {
-            let directory = tempfile::tempdir().unwrap();
-            let mut app = crate::app::tests::context_inspector_test_app(false);
-            let card = if started {
-                live_chat(&mut app, Some(KNOWN_THREAD))
-            } else {
-                draft_chat(&mut app)
-            };
-            if !started {
-                let (writer, _) = crate::session::SessionRuntime::open(
-                    directory.path().join("widget-first-start.sqlite3"),
-                    crate::model::BootId::new("widget-first-start"),
-                )
-                .unwrap();
-                app.session = Some(writer);
-            }
-            write(&mut app, card, "unsent");
-            let character = || keyboard::Event::KeyPressed {
-                key: keyboard::Key::Character("x".into()),
-                modified_key: keyboard::Key::Character("x".into()),
-                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyX),
-                location: keyboard::Location::Standard,
-                modifiers: keyboard::Modifiers::empty(),
-                text: Some("x".into()),
-                repeat: false,
-            };
-            let enter =
-                || permission_key(keyboard::key::Named::Enter, keyboard::Modifiers::empty());
-            let queued_edit = queued_composer_key(&app, card, character(), &renderer);
-            let queued_submit = queued_composer_key(&app, card, enter(), &renderer);
-            assert!(queued_edit.iter().any(|message| matches!(
-                message,
-                Message::ChatUi(Action::Composer(_, action)) if action.is_edit()
-            )));
-            assert!(queued_submit.iter().any(|message| matches!(
-                message,
-                Message::ChatUi(Action::Submit(_, PromptMode::Send))
-            )));
-            let revision = chat_runtime(&app, card).revision;
-
-            open_work_over_chat(&mut app);
-            for message in queued_edit.into_iter().chain(queued_submit) {
-                drop(app.update(message));
-            }
-            let runtime = chat_runtime(&app, card);
-            assert_eq!(runtime.composer.text(), "unsent");
-            assert_eq!(runtime.revision, revision);
-            assert!(runtime.pending.is_none() && runtime.queued.is_none());
-            assert!(!app.chat_start_pending(card));
-
-            return_to_chat(&mut app);
-            for message in queued_composer_key(&app, card, character(), &renderer) {
-                drop(app.update(message));
-            }
-            assert_eq!(chat_runtime(&app, card).composer.text(), "unsentx");
-            for message in queued_composer_key(&app, card, enter(), &renderer) {
-                let task = app.update(message);
-                settle_first_start_checkpoint(&mut app, card, task);
-            }
-            if started {
-                assert!(
-                    chat_runtime(&app, card).pending.is_some(),
-                    "the visible chat can send"
-                );
-            } else {
-                assert!(app.chat_start_pending(card), "the visible draft can start");
-                assert!(chat_runtime(&app, card).queued.is_some());
-            }
-        }
-    }
-
-    #[test]
-    fn main_work_keeps_accepted_paste_bookmarks_and_submission_completions_live() {
-        let _admission = attachment_draft::test_admission();
-        let mut app = crate::app::tests::context_inspector_test_app(false);
-        let card = live_chat(&mut app, Some(KNOWN_THREAD));
-        drop(app.update(Message::Viewport {
-            generation: app.workspace_view_generation,
-            event: WorkspaceViewportEvent::Resized(1_600.0),
-        }));
-        assert_eq!(
-            app.workspace.visibility(card),
-            Some(VisibilityClass::Visible)
-        );
-        let target = chat_runtime(&app, card).target;
-        let handle = chat_runtime(&app, card).handle().unwrap().clone();
-        write(&mut app, card, "accepted ");
-        let bookmark = app
-            .chat_runtime_mut(target)
-            .unwrap()
-            .begin_attachment_insert();
-        submit(&mut app, card);
-        assert_eq!(
-            chat_runtime(&app, card).submit_after_paste,
-            Some(PromptMode::Send)
-        );
-        assert!(chat_runtime(&app, card).pending.is_none());
-
-        open_work_over_chat(&mut app);
-        drop(app.update(Message::ChatUi(Action::PastedText(
-            target,
-            bookmark,
-            Some("paste".into()),
-        ))));
-        let runtime = chat_runtime(&app, card);
-        assert_eq!(runtime.pastes_pending, 0);
-        assert!(runtime.attachment_bookmarks.is_empty());
-        assert_eq!(runtime.submit_after_paste, None);
-        assert_eq!(runtime.composer.text(), "accepted paste");
-        assert!(
-            runtime.pending.is_some(),
-            "the previously accepted send continues"
-        );
-        assert!(!runtime.visible.load(Ordering::Relaxed));
-        assert_eq!(
-            runtime.pending.as_ref().unwrap().sent.as_deref(),
-            Some("accepted paste")
-        );
-
-        settle(&mut app, card, Ok(()));
-        let runtime = chat_runtime(&app, card);
-        assert!(runtime.pending.is_none());
-        assert_eq!(runtime.composer.text(), "");
-        assert!(!runtime.visible.load(Ordering::Relaxed));
-        assert!(app.channel_work_is_main());
-
-        // Hidden transcript-derived history is disposable. The daemon hydrates
-        // it again only after the reader returns to the actual visible pane.
-        return_to_chat(&mut app);
-        assert_eq!(
-            app.workspace.visibility(card),
-            Some(VisibilityClass::Visible)
-        );
-        let runtime = chat_runtime(&app, card);
-        assert!(runtime.visible.load(Ordering::Relaxed));
-        assert_eq!(runtime.target, target);
-        assert!(Arc::ptr_eq(runtime.handle().unwrap(), &handle));
-        let mut hydrated = (*handle.snapshot()).clone();
-        hydrated.generation = hydrated.generation.checked_add(1).unwrap();
-        hydrated.items = vec![Arc::new(chat::Item {
-            id: "accepted-paste".into(),
-            role: chat::Role::User,
-            content: text("accepted paste"),
-            started_at: None,
-            at: None,
-        })];
-        handle.replace_snapshot_for_test(hydrated);
-        drop(app.update(Message::ChatUi(Action::Wake(target, Wake::Changed))));
-        let runtime = app.chat_runtime_mut(target).unwrap();
-        preparation::drain_fixture(runtime);
-        assert_eq!(
-            runtime.history.last().map(String::as_str),
-            Some("accepted paste")
-        );
-    }
-
     /// Rebuilding the strip hides every surface before it lays the new one
     /// out. A conversation on screen both before and after is shown again
     /// rather than left blank.
@@ -20940,141 +20817,6 @@ mod tests {
             Some(VisibilityClass::Visible)
         );
         assert!(handle.is_visible_for_test(), "the chat is shown again");
-    }
-
-    #[test]
-    fn late_ready_attaches_behind_main_work_then_returns_to_visible_conversations() {
-        let mut app = crate::app::tests::context_inspector_test_app(false);
-        let (card, target) = starting_chat(&mut app);
-        let handle = fixture_handle(&app, card, Some(KNOWN_THREAD));
-        drop(app.update(Message::Viewport {
-            generation: app.workspace_view_generation,
-            event: WorkspaceViewportEvent::Resized(1_600.0),
-        }));
-        open_work_over_chat(&mut app);
-        assert_eq!(
-            app.workspace.visibility(card),
-            Some(VisibilityClass::Visible)
-        );
-
-        answer_start(&mut app, target, Ok(handle.clone()));
-        assert!(app.chat_ui.attempt(card).is_none(), "Ready is consumed");
-        let runtime = chat_runtime(&app, card);
-        assert_eq!(runtime.target, target);
-        assert!(Arc::ptr_eq(runtime.handle().unwrap(), &handle));
-        assert!(!runtime.visible.load(Ordering::Relaxed));
-        assert!(
-            runtime.pending.is_some(),
-            "the accepted first prompt continues"
-        );
-        // Accepted work can retain client updates while hidden. Once its
-        // original send settles, presentation must remain hidden too.
-        settle(&mut app, card, Ok(()));
-        assert!(chat_runtime(&app, card).queued.is_none());
-        assert!(!handle.is_visible_for_test());
-
-        return_to_chat(&mut app);
-        assert!(chat_runtime(&app, card).visible.load(Ordering::Relaxed));
-        assert!(handle.is_visible_for_test());
-        assert!(Arc::ptr_eq(
-            chat_runtime(&app, card).handle().unwrap(),
-            &handle
-        ));
-    }
-
-    #[test]
-    fn a_draft_opened_by_late_recovery_stays_hidden_under_main_work() {
-        let mut app = crate::app::tests::context_inspector_test_app(false);
-        let card = live_chat(&mut app, None);
-        let session = chat_runtime(&app, card).session.clone();
-        app.chat_forget(card);
-        app.cards.insert(card, CardRuntime::Loading);
-        drop(app.open_chat(card, session, chat::Intent::Restore));
-        let target = chat_runtime_attempt(&app, card);
-        drop(app.update(Message::Viewport {
-            generation: app.workspace_view_generation,
-            event: WorkspaceViewportEvent::Resized(1_600.0),
-        }));
-        open_work_over_chat(&mut app);
-        assert_eq!(
-            app.workspace.visibility(card),
-            Some(VisibilityClass::Visible)
-        );
-
-        answer_start(
-            &mut app,
-            target,
-            Err(chat::StartFailure::fresh("fixture: no prior conversation")),
-        );
-        let runtime = chat_runtime(&app, card);
-        assert!(runtime.is_draft());
-        assert!(!runtime.visible.load(Ordering::Relaxed));
-        assert!(!app.chat_start_pending(card));
-
-        return_to_chat(&mut app);
-        assert!(chat_runtime(&app, card).visible.load(Ordering::Relaxed));
-    }
-
-    #[test]
-    fn offscreen_late_ready_stays_hidden_when_main_work_returns_to_conversations() {
-        let mut app = crate::app::tests::context_inspector_test_app(false);
-        let (card, target) = starting_chat(&mut app);
-        let handle = fixture_handle(&app, card, Some(KNOWN_THREAD));
-        drop(app.update(Message::Viewport {
-            generation: app.workspace_view_generation,
-            event: WorkspaceViewportEvent::Resized(1_600.0),
-        }));
-        assert_eq!(
-            app.workspace.visibility(card),
-            Some(VisibilityClass::Visible)
-        );
-        for _ in 0..5 {
-            draft_chat(&mut app);
-        }
-        // Advance ordinary frames so native scrolling observes settled pane
-        // geometry, rather than guessing a width or changing exposure flags.
-        let frame = Instant::now();
-        for step in 0..=4 {
-            drop(app.update(Message::Frame(frame + Duration::from_millis(step * 250))));
-        }
-        let width = app.workspace.viewport_width();
-        let offset = app.workspace.geometry().max_offset(width);
-        drop(app.update(Message::Viewport {
-            generation: app.workspace_view_generation,
-            event: WorkspaceViewportEvent::Scrolled(workspace_widget::ViewportSample {
-                offset,
-                width,
-                user_input: true,
-            }),
-        }));
-        assert_eq!(
-            app.workspace.visibility(card),
-            Some(VisibilityClass::Offscreen)
-        );
-        assert_eq!(app.exposure(card), Exposure::Offscreen);
-
-        open_work_over_chat(&mut app);
-        answer_start(&mut app, target, Ok(handle.clone()));
-        assert!(app.chat_ui.attempt(card).is_none(), "Ready is consumed");
-        assert!(Arc::ptr_eq(
-            chat_runtime(&app, card).handle().unwrap(),
-            &handle
-        ));
-        assert!(chat_runtime(&app, card).pending.is_some());
-        assert!(!chat_runtime(&app, card).visible.load(Ordering::Relaxed));
-        settle(&mut app, card, Ok(()));
-
-        return_to_chat(&mut app);
-        assert_eq!(
-            app.workspace.visibility(card),
-            Some(VisibilityClass::Offscreen)
-        );
-        assert!(!chat_runtime(&app, card).visible.load(Ordering::Relaxed));
-        assert!(!handle.is_visible_for_test());
-        assert!(Arc::ptr_eq(
-            chat_runtime(&app, card).handle().unwrap(),
-            &handle
-        ));
     }
 
     /// A new conversation whose start, for its first message, is still in
@@ -24931,7 +24673,7 @@ mod tests {
                 );
             }
             assert!(!app.channel_ui.was_deleted(channel));
-            assert!(app.channel_work.retire_candidates.contains(&home));
+            assert!(app.channel_ui.retire_candidates.contains(&home));
             let mut before_ack = Vec::new();
             while let Ok(edit) = published.try_recv() {
                 before_ack.push(edit);

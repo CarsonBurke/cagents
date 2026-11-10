@@ -333,6 +333,16 @@ pub enum DaemonCommand {
     },
     /// Print this executable's wire protocol version without contacting a daemon.
     ProtocolVersion,
+    /// Print the schema of the shared-model store on disk, or nothing if there
+    /// is none. Refuses while a daemon runs.
+    StoreSchema,
+    /// Convert the shared-model store back to an older schema, so that an
+    /// older release's daemon can open it. Refuses while a daemon runs.
+    DowngradeStore {
+        /// The schema to convert to, such as one `daemon store-schema` printed
+        /// before an update.
+        schema: u32,
+    },
     /// Stop any development daemon without relying on its wire protocol.
     #[command(hide = true)]
     StopForRebuild {
@@ -2456,7 +2466,8 @@ where
                 | DaemonCommand::PrepareUpgrade { .. }
                 | DaemonCommand::Upgrade { .. }
                 | DaemonCommand::AbandonUpgrade { .. }
-                | DaemonCommand::StopForRebuild { .. },
+                | DaemonCommand::StopForRebuild { .. }
+                | DaemonCommand::DowngradeStore { .. },
         } => Some(crate::daemon::hosting::LIFECYCLE_REFUSAL.into()),
         TopCommand::CoordinateInstall { .. } | TopCommand::RestartWindows { .. } => {
             Some("Installation and window restart commands require your own terminal".into())
@@ -2492,7 +2503,9 @@ where
                 command: DaemonCommand::Bridge
                     | DaemonCommand::Upgrade { .. }
                     | DaemonCommand::AbandonUpgrade { .. }
-                    | DaemonCommand::StopForRebuild { .. },
+                    | DaemonCommand::StopForRebuild { .. }
+                    | DaemonCommand::StoreSchema
+                    | DaemonCommand::DowngradeStore { .. },
             } | TopCommand::CoordinateInstall { .. }
                 | TopCommand::RestartWindows { .. }
         )
@@ -2741,6 +2754,8 @@ fn routes_to_staged_owner(command: &TopCommand) -> bool {
                 command: DaemonCommand::ProtocolVersion
                     | DaemonCommand::StopForRebuild { .. }
                     | DaemonCommand::Upgrade { .. }
+                    | DaemonCommand::StoreSchema
+                    | DaemonCommand::DowngradeStore { .. }
             }
     )
 }
@@ -3349,6 +3364,32 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                 human,
             })
         }
+        DaemonCommand::StoreSchema => {
+            let printed = run_store_maintenance(&["--stored-schema"])?;
+            let schema = if printed.is_empty() {
+                None
+            } else {
+                Some(printed.parse::<u32>().map_err(|_| {
+                    AppError::new(
+                        "store",
+                        format!("the daemon printed an unreadable store schema: {printed}"),
+                    )
+                })?)
+            };
+            Ok(CommandOutput {
+                command: "daemon.store_schema",
+                data: json!({ "schema": schema }),
+                human: schema.map(|schema| schema.to_string()).unwrap_or_default(),
+            })
+        }
+        DaemonCommand::DowngradeStore { schema } => {
+            let printed = run_store_maintenance(&["--downgrade-store", &schema.to_string()])?;
+            Ok(CommandOutput {
+                command: "daemon.downgrade_store",
+                data: json!({ "schema": schema, "converted": !printed.is_empty() }),
+                human: printed,
+            })
+        }
         DaemonCommand::ProtocolVersion => Ok(CommandOutput {
             command: "daemon.protocol_version",
             data: json!({ "protocol_version": PROTOCOL_VERSION, "shutdown_version": SHUTDOWN_VERSION }),
@@ -3519,6 +3560,37 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
             })
         }
     }
+}
+
+/// Runs the matched daemon's store maintenance flag. The store belongs to
+/// the host build, which this command-line build does not link.
+fn run_store_maintenance(arguments: &[&str]) -> Result<String, AppError> {
+    let daemon = crate::companion::Product::Daemon
+        .beside_current()
+        .map_err(|error| AppError::new("daemon_executable", error.to_string()))?;
+    let output = Command::new(&daemon)
+        .args(arguments)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| {
+            AppError::new(
+                "daemon_executable",
+                format!("cannot run {}: {error}", daemon.display()),
+            )
+        })?;
+    if !output.status.success() {
+        let message = String::from_utf8_lossy(&output.stderr);
+        let message = message.trim().trim_start_matches("cagentsd: ");
+        return Err(AppError::new(
+            "store",
+            if message.is_empty() {
+                format!("{} failed with {}", daemon.display(), output.status)
+            } else {
+                message.to_owned()
+            },
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
 fn shutdown_output(outcome: ShutdownOutcome) -> Result<CommandOutput, AppError> {
@@ -4625,6 +4697,9 @@ mod tests {
         assert!(routed(&["cagents", "daemon", "prepare-upgrade", "--yes"]));
         assert!(routed(&["cagents", "daemon", "abandon-upgrade", "--yes"]));
         assert!(routed(&["cagents", "daemon", "start"]));
+        // The installer asks the replacement it names, never a staged owner.
+        assert!(!routed(&["cagents", "daemon", "store-schema"]));
+        assert!(!routed(&["cagents", "daemon", "downgrade-store", "22"]));
     }
 
     /// A hosted session stops a development daemon with a runtime of its own,
@@ -4832,7 +4907,7 @@ mod tests {
                     .lines()
                     .filter_map(|line| serde_json::from_str::<Value>(line).ok())
                     .collect::<Vec<_>>();
-                assert_eq!(errors.len(), if case == "user" { 6 } else { 26 });
+                assert_eq!(errors.len(), if case == "user" { 6 } else { 28 });
                 assert!(errors.iter().all(|error| {
                     error["ok"] == false
                         && error["error"]["kind"]
@@ -4929,8 +5004,9 @@ mod tests {
         }
 
         if case != "user" {
-            let commands: [&[&str]; 13] = [
+            let commands: [&[&str]; 14] = [
                 &["daemon", "start"],
+                &["daemon", "downgrade-store", "22"],
                 &["daemon", "stop", "--require-empty"],
                 &["daemon", "preflight"],
                 &["daemon", "prepare-upgrade", "--yes", "--no-relaunch-agents"],
