@@ -191,7 +191,12 @@ launches and automation prechecks must settle first. Changed ownership or impact
 requires a fresh confirmation. The final check also waits behind previously
 accepted provider commands, so a queued prompt cannot masquerade as idle.
 
-`daemon upgrade` uses this same worker and confirmation. `--yes` skips the
+`daemon upgrade` uses the served candidate's worker and this same confirmation.
+The candidate drives supported source daemons through a frozen lifecycle subset:
+the current protocol, historical current-wire protocols 128 and 156, and bespoke
+protocols 68 and 77. Other source protocols are refused with the build to update
+to first, or, for a newer service, the newer build to install;
+the update is never handed to an older build's worker. `--yes` skips the
 interactive prompt; `--interrupt` additionally permits native turn interruption.
 `--accept-unreopenable` carries saved panes whose ended actor never recorded
 its conversation; they stay in their windows without reopening it.
