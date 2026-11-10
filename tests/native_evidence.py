@@ -7,6 +7,7 @@ import fcntl
 import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -1031,6 +1032,23 @@ class Evidence(unittest.TestCase):
         result = self.run_tool("start", "after", "--portal", "xdg", check=False)
         self.assertEqual(result.returncode, 2)
         self.assertIn("unknown portal backend: xdg; use gtk, kde, gnome or cosmic", result.stderr)
+        self.assertTrue(self.lock_is_free(self.native_lock))
+
+    def test_zero_wait_takes_a_free_lock_without_waiter_scheduling(self) -> None:
+        self.built()
+        real_flock = shutil.which("flock", path=self.env["PATH"])
+        self.assertIsNotNone(real_flock)
+        # Starting a helper is not instantaneous. A zero-wait request must
+        # still try the idle lock before deciding its budget expired.
+        write_executable(self.bin / "flock", f"""
+            #!/bin/sh
+            sleep 0.05
+            exec {shlex.quote(real_flock)} "$@"
+        """)
+        self.run_tool("start", "after", "--wait-lock", "0")
+        self.assertFalse(self.lock_is_free(self.native_lock))
+        self.assertNotIn(str(self.native_lock), (self.logs / "kwin-fds").read_text())
+        self.run_tool("stop")
         self.assertTrue(self.lock_is_free(self.native_lock))
 
     def test_start_reports_a_busy_lock_without_starting(self) -> None:
