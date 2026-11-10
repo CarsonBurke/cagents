@@ -2015,6 +2015,7 @@ impl ControlClient {
             ServerMessage::ChatChanged { chat_id }
             | ServerMessage::ChatObserved { chat_id, .. }
             | ServerMessage::ChatActivity { chat_id, .. }
+            | ServerMessage::ChatAccountUsage { chat_id, .. }
             | ServerMessage::ChatLimit { chat_id, .. }
                 if self.attached_chats.contains(&chat_id) => {}
             ServerMessage::Redraw { terminal_id, .. }
