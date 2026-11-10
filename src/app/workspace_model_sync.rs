@@ -973,6 +973,17 @@ impl Cagents {
     /// emptiness is not a registry's emptiness. Publishing against it would be
     /// premature and retiring against it would be destruction.
     pub(super) fn reconcile_workspace_model(&mut self) -> Task<Message> {
+        self.reconcile_workspace_model_in(None)
+    }
+
+    pub(super) fn reconcile_workspace_model_for_repository(
+        &mut self,
+        repository: &Path,
+    ) -> Task<Message> {
+        self.reconcile_workspace_model_in(Some(repository))
+    }
+
+    fn reconcile_workspace_model_in(&mut self, repository: Option<&Path>) -> Task<Message> {
         if self.workspace_model.identity == NO_REGISTRY {
             return Task::none();
         }
@@ -1104,7 +1115,10 @@ impl Cagents {
         // Fence canonical evidence and finish projecting authoritative pane
         // sources before reconciliation persists. Publishing earlier would mix
         // old descriptors with newly received pending-start flags.
-        tasks.push(self.reconcile_shared_views());
+        tasks.push(match repository {
+            Some(repository) => self.reconcile_shared_views_for_repository(repository),
+            None => self.reconcile_shared_views(),
+        });
         if changed {
             self.refresh_sidebar_channels();
             tasks.push(self.sync_chrome());

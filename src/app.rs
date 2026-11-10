@@ -15784,7 +15784,7 @@ impl Application for Cagents {
                             pending,
                             pr_enrichment,
                             self.project_avatar_task(project_id),
-                            self.reconcile_workspace_model(),
+                            self.reconcile_workspace_model_for_repository(&loaded.project.repository),
                         ]);
                     }
                     Err(error) => {
