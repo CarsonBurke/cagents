@@ -26,6 +26,34 @@ pub(crate) enum Client {
     Legacy(v77::Client),
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PrepareError {
+    #[error("{0}")]
+    Refused(UpdateError),
+    #[error(
+        "The source preparation was not confirmed: {0}. Its checkpoint and owners require inspection; preparation was not retried and automatic recovery was not authorized"
+    )]
+    Unconfirmed(UpdateError),
+    #[error("{0}")]
+    Invalid(UpdateError),
+}
+
+impl From<PrepareError> for UpdateError {
+    fn from(error: PrepareError) -> Self {
+        invalid(error.to_string())
+    }
+}
+
+fn prepare_reply(reply: Result<(u64, u64), ControlError>) -> Result<(u64, u64), PrepareError> {
+    reply.map_err(|error| {
+        if matches!(error, ControlError::Remote { .. }) {
+            PrepareError::Refused(invalid(error.to_string()))
+        } else {
+            PrepareError::Unconfirmed(invalid(error.to_string()))
+        }
+    })
+}
+
 pub(crate) struct Peer {
     pid: u32,
     start: String,
@@ -206,20 +234,20 @@ impl Client {
         &mut self,
         impact: impact::DaemonImpact,
         relaunch_agents: bool,
-    ) -> Result<(u64, u64), UpdateError> {
+    ) -> Result<(u64, u64), PrepareError> {
         if impact.capability.proof != *self.proof() || !impact.ready() {
-            return Err(invalid(
+            return Err(PrepareError::Invalid(invalid(
                 "The source migration capability no longer matches its reviewed ownership",
-            ));
+            )));
         }
         match self {
             Self::Current { client, peer } => {
-                peer.verify(client.proof())?;
-                client
-                    .prepare_confirmed_upgrade(impact, relaunch_agents)
-                    .map_err(|error| invalid(error.to_string()))
+                peer.verify(client.proof()).map_err(PrepareError::Invalid)?;
+                prepare_reply(client.prepare_confirmed_upgrade(impact, relaunch_agents))
             }
-            Self::Legacy(client) => client.prepare_confirmed_upgrade(impact, relaunch_agents),
+            Self::Legacy(client) => client
+                .prepare_confirmed_upgrade(impact, relaunch_agents)
+                .map_err(PrepareError::Unconfirmed),
         }
     }
 }
@@ -449,8 +477,15 @@ pub(crate) const LIFECYCLE_VARIANTS: &[(&str, &[&str])] = &[
         ],
     ),
     ("cagents::chat::Command", &["Interrupt", "StopSubagent"]),
-    ("cagents::agent_execution::Operation", &["Directory"]),
-    ("cagents::agent_execution::Reply", &["Directory"]),
+    (
+        "cagents::agent_execution::Operation",
+        &["Directory", "Control"],
+    ),
+    ("cagents::agent_execution::Control", &["Interrupt"]),
+    (
+        "cagents::agent_execution::Reply",
+        &["Directory", "Requests"],
+    ),
     (
         "ServerMessage",
         &[
@@ -600,6 +635,115 @@ fn absent_source(expected: Option<&HostSessionProof>) -> Result<(), UpdateError>
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod prepare_receipt_tests {
+    use super::*;
+    use crate::{
+        model::{BootId, HostIncarnation, HostSessionId},
+        terminal_ipc::{
+            ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode,
+            ServerEnvelope, ServerMessage, ServerResponse, ShutdownCapability, read_frame,
+            write_frame,
+        },
+    };
+
+    #[test]
+    fn only_an_explicit_prepare_refusal_allows_destructive_fallback() {
+        for outcome in [
+            "accepted",
+            "refused",
+            "accepted-with-lost-ack",
+            "foreign-ack",
+        ] {
+            let proof = HostSessionProof {
+                host_session_id: HostSessionId::new("prepare-source"),
+                boot_id: BootId::new("boot"),
+                host_incarnation: HostIncarnation::new("daemon"),
+            };
+            let daemon = impact::DaemonImpact {
+                capability: ShutdownCapability {
+                    proof: proof.clone(),
+                    token: "confirmed-prepare".into(),
+                    inventory_generation: 1,
+                    live_terminals: 0,
+                    background_subagents: 0,
+                    background_identity: String::new(),
+                    expires_at_unix_ms: i64::MAX,
+                },
+                policy: impact::Policy::WhenIdle,
+                sessions: Vec::new(),
+                blockers: Vec::new(),
+            };
+            let (stream, mut peer) = UnixStream::pair().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let server = std::thread::spawn(move || {
+                let connect: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+                assert!(matches!(connect.request, ClientRequest::Connect { .. }));
+                write_frame(
+                    &mut peer,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(connect.request_id),
+                        proof: proof.clone(),
+                        message: ServerMessage::Response {
+                            response: ServerResponse::Connected {
+                                proof: proof.clone(),
+                                resumed: Vec::new(),
+                            },
+                        },
+                    },
+                )
+                .unwrap();
+                let prepare: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+                assert!(matches!(
+                    prepare.request,
+                    ClientRequest::PrepareConfirmedUpgrade {
+                        relaunch_agents: false,
+                        ..
+                    }
+                ));
+                if outcome == "accepted-with-lost-ack" {
+                    // The old daemon accepted preparation and could have
+                    // written Prepared, but its acknowledgement never arrives.
+                    return;
+                }
+                let message = if outcome == "refused" {
+                    ServerMessage::Error(ProtocolError::new(
+                        ProtocolErrorCode::InvalidRequest,
+                        "Cannot checkpoint this conversation",
+                        false,
+                    ))
+                } else {
+                    ServerMessage::Response {
+                        response: ServerResponse::UpgradePrepared {
+                            terminals: 0,
+                            chats: 0,
+                        },
+                    }
+                };
+                let mut response = ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(prepare.request_id),
+                    proof,
+                    message,
+                };
+                if outcome == "foreign-ack" {
+                    response.proof.host_incarnation = HostIncarnation::new("another-daemon");
+                }
+                write_frame(&mut peer, &response).unwrap();
+            });
+            let mut client = ControlClient::from_stream(stream).unwrap();
+            let reply = prepare_reply(client.prepare_confirmed_upgrade(daemon, false));
+            match outcome {
+                "accepted" => assert_eq!(reply.unwrap(), (0, 0)),
+                "refused" => assert!(matches!(reply, Err(PrepareError::Refused(_)))),
+                _ => assert!(matches!(reply, Err(PrepareError::Unconfirmed(_)))),
+            }
+            server.join().unwrap();
+        }
+    }
 }
 
 #[cfg(test)]

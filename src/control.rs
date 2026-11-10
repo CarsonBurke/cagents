@@ -1167,6 +1167,15 @@ impl ControlClient {
                     ),
                     ..
                 }
+                | ClientRequest::Agent {
+                    operation: crate::agent_execution::Operation::Control {
+                        command: crate::agent_execution::Control::Interrupt {
+                            including_subagents: false
+                        },
+                        ..
+                    },
+                    ..
+                }
         ) {
             return Err(ControlError::Configure(io::Error::other(
                 "Unqualified update quiescence operation",

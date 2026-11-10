@@ -263,6 +263,9 @@ pub(crate) struct HostState {
     /// Actual parent-owned records installed before an adoption commit. They
     /// remain listed and explicitly closeable if confirmation is unavailable.
     startup_custody: BTreeSet<TerminalId>,
+    /// Missing original owners after an acknowledged incomplete update. Their
+    /// saved pane recipes are evidence, never automatic execution authority.
+    paused_update_terminals: BTreeSet<TerminalId>,
     startup_recovery: Option<String>,
     /// Immutable accepted inventory survives a failed final unlink/fsync as
     /// well as its Store handle. This is live custody, not a durable retry or
@@ -440,6 +443,7 @@ impl HostState {
             terminal_retirements: BTreeMap::new(),
             spawning: BTreeSet::new(),
             startup_custody: BTreeSet::new(),
+            paused_update_terminals: BTreeSet::new(),
             startup_recovery: None,
             retained_startup_checkpoint: None,
             #[cfg(test)]
@@ -2011,6 +2015,10 @@ impl HostState {
         })
     }
 
+    pub(in crate::host) fn pause_update_terminals(&mut self, ids: &[TerminalId]) {
+        self.paused_update_terminals.extend(ids.iter().copied());
+    }
+
     /// A retained failure outranks custody still awaiting its outcome: it is
     /// never cleared, so waiting on the remaining custody cannot finish startup.
     pub(super) fn startup_state(&self) -> StartupState {
@@ -2958,6 +2966,21 @@ pub(super) fn restore_upgrade(host: &SharedHost) -> Result<Vec<TerminalId>, Stri
         crate::upgrade::handoff::Store::discover()?,
         std::path::Path::new("/proc"),
         holder_directory().ok().as_deref(),
+    )
+}
+
+/// An acknowledged incomplete update authorizes attaching its original holder
+/// only. In particular, missing holders never fall back to a launch recipe.
+pub(in crate::host) fn adopt_prepared_terminal(
+    host: &SharedHost,
+    terminal: &crate::upgrade::handoff::Carried,
+) -> bool {
+    adopt_carried_terminal(
+        host,
+        terminal,
+        holder_directory().ok().as_deref(),
+        std::path::Path::new("/proc"),
+        false,
     )
 }
 
@@ -4124,6 +4147,18 @@ fn start_terminal_view_owned_reserved(
     execution_recipe: Option<crate::model::LaunchRecipe>,
     transition: Option<&super::chat::TerminalViewReservation<'_>>,
 ) -> Result<(TerminalDescriptor, TerminalHandle), ProtocolError> {
+    if shared
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .paused_update_terminals
+        .contains(&session.id)
+    {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::TerminalUnavailable,
+            "This terminal is paused after an incomplete update; its original process could not be authenticated. Open a new terminal to continue without replaying its saved command.",
+            false,
+        ));
+    }
     let recovery = shared
         .lock()
         .unwrap_or_else(|p| p.into_inner())

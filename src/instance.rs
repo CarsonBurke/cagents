@@ -1171,6 +1171,17 @@ pub struct UiUpdateGuard {
 }
 
 impl UiUpdateGuard {
+    /// Retain this exact exclusive fence through an authenticated recovery.
+    /// A plain File duplicate closes without explicitly unlocking its parent.
+    pub(crate) fn duplicate_for_recovery(&self) -> io::Result<(File, File)> {
+        let fence = self
+            .lock
+            .as_ref()
+            .ok_or_else(|| io::Error::other("update launch fence was released"))?
+            .try_clone()?;
+        Ok((fence, self._legacy_fence.try_clone()?))
+    }
+
     /// The authenticated windows while this guard is held. Its shared legacy
     /// fence already excludes a legacy exclusive UI owner, so absence of
     /// window leases means no windows; probing legacy exclusivity again would
@@ -1381,6 +1392,13 @@ pub(crate) fn relaunch_failure(windows: usize, errors: &[(&str, String)]) -> Str
 }
 
 pub(crate) const INSTALL_GUARD_ENV: &str = "CAGENTS_UI_UPDATE_GUARD_FD";
+pub(crate) fn update_recovery_fences() -> io::Result<(PathBuf, PathBuf)> {
+    let runtime = runtime_directory()?;
+    Ok((
+        runtime.join(format!("{APPLICATION_LOCK_FILE}.update")),
+        runtime.join(APPLICATION_LOCK_FILE),
+    ))
+}
 const INSTALL_GUARD_FD: i32 = 197;
 
 /// Verify the inherited open-file description owns the active exclusive fence.

@@ -49,6 +49,7 @@ struct Activity {
     settled: bool,
     completion: bool,
     separate_children: BTreeSet<String>,
+    atomic_parent: bool,
 }
 
 impl Observation {
@@ -86,13 +87,20 @@ impl Observation {
                 "The conversation has new running background agents; review the update again",
             ));
         }
-        if !background.is_empty()
-            && !snapshot.capabilities.stop_subagent
-            && !(snapshot.capabilities.interrupt_stops_background
-                && (snapshot.busy || self.interrupted_generation.is_some()))
+        let atomic_parent = snapshot.capabilities.interrupt_stops_background;
+        if atomic_parent
+            && !self
+                .run
+                .as_ref()
+                .is_some_and(|run| run.owner == directory::Owner::User && run.run.is_some())
         {
             return Err(invalid(
-                "This source cannot stop its running background agents before checkpointing",
+                "This source cannot safely interrupt this conversation without also stopping unreviewed background agents; finish its turn before updating",
+            ));
+        }
+        if !background.is_empty() && !snapshot.capabilities.stop_subagent {
+            return Err(invalid(
+                "This source cannot stop the reviewed background agents individually; finish them before updating",
             ));
         }
         let separate_children = if snapshot.capabilities.stop_subagent {
@@ -114,6 +122,7 @@ impl Observation {
                 && children.is_empty(),
             completion: snapshot.finished_at.is_some(),
             separate_children,
+            atomic_parent,
         };
         Ok(())
     }
@@ -386,6 +395,7 @@ fn begin_with(
                 settled: false,
                 completion: false,
                 separate_children: BTreeSet::new(),
+                atomic_parent: false,
             },
             interrupted_generation: None,
             stopped_children: BTreeSet::new(),
@@ -423,6 +433,8 @@ fn issue(
             .map(|id| Command::StopSubagent { id: id.clone() })
             .chain(
                 (observed.activity.busy
+                    && (!observed.activity.atomic_parent
+                        || observed.activity.separate_children.is_empty())
                     && observed.interrupted_generation != Some(observed.turn_generation))
                 .then_some(Command::Interrupt),
             )
@@ -430,15 +442,30 @@ fn issue(
         for command in commands {
             fence(client, consent, deadline)?;
             observed.observe_run(&directory(client, deadline)?)?;
-            match request(
-                client,
+            let guarded = matches!(command, Command::Interrupt) && observed.activity.atomic_parent;
+            let operation = if guarded {
+                let run = observed
+                    .run
+                    .as_ref()
+                    .ok_or_else(|| invalid("This source has no guarded interruption owner"))?;
+                ClientRequest::Agent {
+                    authority: agent_execution::Authority::default(),
+                    operation: agent_execution::Operation::Control {
+                        agent: run.agent,
+                        command: agent_execution::Control::Interrupt {
+                            including_subagents: false,
+                        },
+                    },
+                }
+            } else {
                 ClientRequest::ChatCommand {
                     chat_id: *id,
                     command: command.clone(),
-                },
-                deadline,
-            )? {
-                ServerResponse::Accepted => (),
+                }
+            };
+            match request(client, operation, deadline)? {
+                ServerResponse::Accepted if !guarded => (),
+                ServerResponse::Agent(agent_execution::Reply::Requests(_)) if guarded => (),
                 _ => {
                     return Err(invalid(
                         "The source did not accept the reviewed interruption",
@@ -508,22 +535,26 @@ fn poll_with(
             }
         }
         check_scope(consent, &compared)?;
-        if !idle.ready() {
-            for item in &idle.sessions {
-                if item.disposition == impact::Disposition::WaitsForIdle
-                    && item.kind == impact::SessionKind::NativeChat
-                    && let Some(observed) = observations.get_mut(&item.id)
-                {
-                    observed.late_turn = true;
-                    pending.push(item.id);
-                }
+        for item in &idle.sessions {
+            if item.disposition == impact::Disposition::WaitsForIdle
+                && item.kind == impact::SessionKind::NativeChat
+                && let Some(observed) = observations.get_mut(&item.id)
+            {
+                observed.late_turn = true;
+                pending.push(item.id);
             }
-            if pending.is_empty() {
-                return Err(invalid(
-                    "The source cannot confirm an idle preparation boundary; inspect its conversations before updating",
-                ));
-            }
+        }
+        if !pending.is_empty() {
             return Ok((pending, None));
+        }
+        // This observer settles only the approved interruptions. Unchanged
+        // blocked owners and blockers still need the floor's explicit stop
+        // review; they are not evidence that these target turns remain busy.
+        // check_scope above rejects any new blocker or unrelated work.
+        if !idle.ready() && !consent.blocked() {
+            return Err(invalid(
+                "The source cannot confirm an idle preparation boundary; inspect its conversations before updating",
+            ));
         }
         Some(idle)
     } else {
@@ -645,6 +676,7 @@ mod tests {
                 settled: false,
                 completion: false,
                 separate_children: BTreeSet::new(),
+                atomic_parent: false,
             },
             interrupted_generation: None,
             stopped_children: BTreeSet::new(),
@@ -656,7 +688,30 @@ mod tests {
 
     #[test]
     fn protocol_156_acceptance_is_not_settlement_and_registry_must_commit_the_outcome() {
-        let (session, daemon, entry) = fixture();
+        assert_quiescence(false);
+    }
+
+    #[test]
+    fn settled_target_keeps_previously_reviewed_blocked_owners_for_floor_review() {
+        assert_quiescence(true);
+    }
+
+    fn assert_quiescence(known_blocked: bool) {
+        let (session, mut daemon, entry) = fixture();
+        if known_blocked {
+            daemon.sessions.push(impact::SessionImpact {
+                id: TerminalId::new(),
+                kind: impact::SessionKind::Terminal,
+                title: "Previously reviewed terminal".into(),
+                identity: "exact-blocked-owner".into(),
+                disposition: impact::Disposition::Blocked,
+                reason: "Needs the floor's explicit stop review".into(),
+                interrupted_subagents: Vec::new(),
+            });
+            daemon
+                .blockers
+                .push("Previously reviewed source blocker".into());
+        }
         let (stream, mut server_stream) = UnixStream::pair().unwrap();
         let phase = Arc::new(AtomicUsize::new(0));
         let commands = Arc::new(AtomicUsize::new(0));
@@ -791,14 +846,24 @@ mod tests {
         phase.store(4, Ordering::SeqCst);
         let (pending, idle) = poll_with(&mut client, &daemon, &mut observations, deadline).unwrap();
         assert!(pending.is_empty());
-        assert_eq!(idle.unwrap().policy, impact::Policy::WhenIdle);
+        let idle = idle.unwrap();
+        assert_eq!(idle.policy, impact::Policy::WhenIdle);
+        assert_eq!(idle.blocked(), known_blocked);
+        if known_blocked {
+            assert!(
+                !idle.ready(),
+                "settlement must preserve the outstanding floor review"
+            );
+            assert_eq!(idle.blockers, daemon.blockers);
+            assert_eq!(idle.sessions[1], daemon.sessions[1]);
+        }
 
         drop(client);
         server.join().unwrap();
     }
 
     #[test]
-    fn parent_idle_still_waits_for_children_affected_by_its_accepted_interrupt() {
+    fn parent_idle_still_waits_for_individually_stopped_children() {
         let (session, _, entry) = fixture();
         let mut observed = observation(&session, &entry);
         observed.permitted_children.insert("reviewed-child".into());
@@ -815,11 +880,13 @@ mod tests {
         };
         let mut running = snapshot(&session, 0);
         running.capabilities.interrupt_stops_background = true;
+        running.capabilities.stop_subagent = true;
         running.subagents.push(child.clone());
         observed.project(running, true).unwrap();
-        observed.interrupted_generation = Some(3);
+        observed.stopped_children.insert("reviewed-child".into());
         let mut parent_idle = snapshot(&session, 1);
         parent_idle.capabilities.interrupt_stops_background = true;
+        parent_idle.capabilities.stop_subagent = true;
         parent_idle.subagents.push(child.clone());
         observed.project(parent_idle, false).unwrap();
         assert!(
@@ -831,6 +898,189 @@ mod tests {
         completed.subagents.push(child);
         observed.project(completed, false).unwrap();
         assert!(observed.activity.settled);
+    }
+
+    #[test]
+    fn guarded_parent_waits_for_reviewed_children_and_refuses_a_new_child_at_dispatch() {
+        let (session, mut consent, entry) = fixture();
+        consent.sessions[0]
+            .interrupted_subagents
+            .push("reviewed-child".into());
+        let mut observed = observation(&session, &entry);
+        observed.permitted_children.insert("reviewed-child".into());
+        let mut running = snapshot(&session, 0);
+        running.capabilities.interrupt_stops_background = true;
+        running.capabilities.stop_subagent = true;
+        running.subagents.push(crate::chat::Subagent {
+            id: "reviewed-child".into(),
+            status: ToolStatus::Running,
+            background: true,
+            kind: String::new(),
+            description: String::new(),
+            model: None,
+            waiting: false,
+            detail: String::new(),
+            items: Vec::new(),
+        });
+        observed.project(running, true).unwrap();
+        let mut observations = BTreeMap::from([(session.id, observed)]);
+        let (stream, mut server_stream) = UnixStream::pair().unwrap();
+        let child_stops = Arc::new(AtomicUsize::new(0));
+        let guarded_refusals = Arc::new(AtomicUsize::new(0));
+        let received_children = child_stops.clone();
+        let received_guards = guarded_refusals.clone();
+        let proof = consent.capability.proof.clone();
+        let impact = consent.clone();
+        let source = session.clone();
+        let server = thread::spawn(move || {
+            while let Some(envelope) = read_frame::<ClientEnvelope>(&mut server_stream).unwrap() {
+                let response = match envelope.request {
+                    ClientRequest::Connect { .. } => ServerResponse::Connected {
+                        proof: proof.clone(),
+                        resumed: Vec::new(),
+                    },
+                    ClientRequest::UpgradeImpact {
+                        policy: impact::Policy::Interrupt,
+                    } => ServerResponse::UpgradeImpact(impact.clone()),
+                    ClientRequest::Agent {
+                        operation: agent_execution::Operation::Directory(directory::Scope::All),
+                        ..
+                    } => ServerResponse::Agent(agent_execution::Reply::Directory(
+                        directory::Directory {
+                            caller: None,
+                            scope: directory::Scope::All,
+                            sessions: vec![entry.clone()],
+                        },
+                    )),
+                    ClientRequest::ChatCommand {
+                        chat_id,
+                        command: Command::StopSubagent { id },
+                    } if chat_id == source.id && id == "reviewed-child" => {
+                        received_children.fetch_add(1, Ordering::SeqCst);
+                        ServerResponse::Accepted
+                    }
+                    ClientRequest::Agent {
+                        authority,
+                        operation:
+                            agent_execution::Operation::Control {
+                                agent,
+                                command:
+                                    agent_execution::Control::Interrupt {
+                                        including_subagents: false,
+                                    },
+                            },
+                    } if agent == entry.delegation.as_ref().unwrap().agent => {
+                        assert!(authority.token().is_none());
+                        // The frozen actor examines child ownership when it
+                        // executes this request, after the client's last read.
+                        // A child created in that interval must refuse the
+                        // interruption instead of becoming collateral work.
+                        received_guards.fetch_add(1, Ordering::SeqCst);
+                        write_frame(
+                            &mut server_stream,
+                            &ServerEnvelope {
+                                version: 156,
+                                request_id: Some(envelope.request_id),
+                                proof: proof.clone(),
+                                message: ServerMessage::Error(
+                                    crate::terminal_ipc::ProtocolError::new(
+                                        crate::terminal_ipc::ProtocolErrorCode::InvalidRequest,
+                                        "Interrupt would stop an unreviewed background agent",
+                                        false,
+                                    ),
+                                ),
+                            },
+                        )
+                        .unwrap();
+                        continue;
+                    }
+                    other => panic!("unguarded or unreviewed interruption: {other:?}"),
+                };
+                write_frame(
+                    &mut server_stream,
+                    &ServerEnvelope {
+                        version: 156,
+                        request_id: Some(envelope.request_id),
+                        proof: proof.clone(),
+                        message: ServerMessage::Response { response },
+                    },
+                )
+                .unwrap();
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut client =
+            ControlClient::from_stream_at_source_protocol(stream, deadline, 156).unwrap();
+        issue(&mut client, &consent, &mut observations, deadline).unwrap();
+        assert_eq!(child_stops.load(Ordering::SeqCst), 1);
+        issue(&mut client, &consent, &mut observations, deadline).unwrap();
+        assert_eq!(
+            guarded_refusals.load(Ordering::SeqCst),
+            0,
+            "the child's Stop ACK does not permit the parent interrupt yet"
+        );
+        let mut child_settled = snapshot(&session, 0);
+        child_settled.generation = 2;
+        child_settled.capabilities.interrupt_stops_background = true;
+        child_settled.capabilities.stop_subagent = true;
+        observations
+            .get_mut(&session.id)
+            .unwrap()
+            .project(child_settled, false)
+            .unwrap();
+        let error = issue(&mut client, &consent, &mut observations, deadline).unwrap_err();
+        assert!(error.to_string().contains("unreviewed background"));
+        assert_eq!(guarded_refusals.load(Ordering::SeqCst), 1);
+        assert!(observations[&session.id].interrupted_generation.is_none());
+        drop(client);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn sources_without_an_atomic_background_guard_fail_before_actions() {
+        let (session, _, entry) = fixture();
+        for missing_guard in 0..3 {
+            let mut observed = observation(&session, &entry);
+            match missing_guard {
+                0 => observed.run = None,
+                1 => {
+                    observed.run.as_mut().unwrap().owner =
+                        directory::Owner::Session(agent_execution::Lineage(TerminalId::new()))
+                }
+                _ => observed.run.as_mut().unwrap().run = None,
+            }
+            let mut publication = snapshot(&session, 0);
+            publication.capabilities.interrupt_stops_background = true;
+            assert!(
+                observed
+                    .project(publication, true)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("safely interrupt")
+            );
+        }
+        let mut observed = observation(&session, &entry);
+        observed.permitted_children.insert("reviewed-child".into());
+        let mut publication = snapshot(&session, 0);
+        publication.capabilities.interrupt_stops_background = true;
+        publication.subagents.push(crate::chat::Subagent {
+            id: "reviewed-child".into(),
+            status: ToolStatus::Running,
+            background: true,
+            kind: String::new(),
+            description: String::new(),
+            model: None,
+            waiting: false,
+            detail: String::new(),
+            items: Vec::new(),
+        });
+        assert!(
+            observed
+                .project(publication, true)
+                .unwrap_err()
+                .to_string()
+                .contains("individually")
+        );
     }
 
     #[test]

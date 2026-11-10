@@ -22,6 +22,7 @@ mod service;
 #[cfg(all(test, target_os = "linux"))]
 mod shutdown_tests;
 mod state;
+mod update_recovery;
 mod work;
 mod workspace;
 mod worktree_removal;
@@ -366,8 +367,13 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     // can discard the holder's replay copy. It observes no process until the
     // same HostState publishes one; it initiates no execution.
     let _agent_activity = activity::Monitor::start(&host)?;
+    let mut recovered_prepared = false;
     let listener = listener_before_restore(&paths, || {
         let restored = (|| -> io::Result<()> {
+            if update_recovery::restore(&host).map_err(io::Error::other)? {
+                recovered_prepared = true;
+                return Ok(());
+            }
             chat::retained_actor::reconcile_previous_boot_history(&host)
                 .map_err(io::Error::other)?;
             let unattached = state::restore_upgrade(&host).map_err(io::Error::other)?;
@@ -433,11 +439,12 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
         Some(state.agent_tally())
     });
 
-    let recovery_only = host
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .startup_recovery()
-        .is_some();
+    let recovery_only = recovered_prepared
+        || host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .startup_recovery()
+            .is_some();
     if !recovery_only {
         let restore_host = Arc::downgrade(&host);
         if let Err(error) = std::thread::Builder::new()
