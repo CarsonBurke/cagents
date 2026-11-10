@@ -218,6 +218,7 @@ prune_versions() {
 if [[ $PREFIX/current -ef $PREFIX/versions/$VERSION ]]; then
     printf '%s is already current; skipping the build.\n' "$VERSION"
 elif [[ -e $PREFIX/versions/$VERSION ]]; then
+    ((INITIAL_INSTALL == 0)) || fail "$PREFIX/versions/$VERSION exists without an active installation; remove that incomplete candidate and retry"
     for binary in cagents cagentsd cagents-ui; do
         [[ -x $PREFIX/versions/$VERSION/bin/$binary ]] || fail "$VERSION is incomplete; missing executable $binary"
     done

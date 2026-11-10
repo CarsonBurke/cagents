@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Check which checkout states scripts/install-local agrees to build.
 
-A fixture repository carries the real script and a packaging stub that records
-the build and stops it, so nothing is compiled, staged or installed.
+A fixture repository carries the real script and fake packaging and installed
+executables. No Rust is compiled and no real installation or daemon is used.
 """
+import json
 import os
 from pathlib import Path
 import shutil
@@ -19,14 +20,14 @@ MISE_STUB = '#!/bin/sh\nwhile [ "$1" != -- ]; do [ "$#" -gt 0 ] || exit 0; shift
 
 
 @unittest.skipUnless(shutil.which("git") and shutil.which("bash"), "git and bash are required")
-class InstallLocalHead(unittest.TestCase):
+class InstallLocalFixture(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="cagents-install-local-", dir="/var/tmp")
         self.addCleanup(temporary.cleanup)
         self.directory = Path(temporary.name)
         self.home = self.directory / "home"
         self.home.mkdir()
-        tools = self.directory / "tools"
+        tools = self.tools = self.directory / "tools"
         tools.mkdir()
         (tools / "mise").write_text(MISE_STUB)
         (tools / "mise").chmod(0o755)
@@ -100,6 +101,7 @@ class InstallLocalHead(unittest.TestCase):
         self.assertIn(f"To build {self.short()} anyway, add --this-commit.\n", result.stderr)
         self.assertFalse(self.builds.exists(), "a refused head was built")
 
+class InstallLocalHead(InstallLocalFixture):
     def test_current_main_is_built(self):
         result = self.run_script()
         self.assert_built(result)
@@ -191,6 +193,186 @@ class InstallLocalHead(unittest.TestCase):
         self.assert_built(result)
         self.assertIn(f"Building branch integration/candidate at {self.short()}, not main.\n",
                       result.stdout)
+
+
+PACKAGE_ARCHIVE_STUB = r'''
+#!/usr/bin/python3
+import io, os, pathlib, tarfile
+version = os.environ['VERSION']
+with open(os.environ['FIXTURE_BUILDS'], 'a') as output:
+    output.write(version + '\n')
+archive = pathlib.Path(os.environ['CAGENTS_DIST_DIR']) / f'cagents-{version}-x86_64-unknown-linux-gnu.tar.gz'
+cli = pathlib.Path(os.environ['FIXTURE_CLI']).read_bytes()
+with tarfile.open(archive, 'w:gz') as output:
+    for name in ('cagents', 'cagentsd', 'cagents-ui'):
+        member = tarfile.TarInfo(f'cagents-{version}/bin/{name}')
+        member.mode = 0o755
+        payload = cli if name == 'cagents' else b'#!/bin/sh\nexit 95\n'
+        member.size = len(payload)
+        output.addfile(member, io.BytesIO(payload))
+(archive.parent / 'SHA256SUMS').write_text('fixture-only\n')
+'''
+
+INSTALL_ARCHIVE_STUB = r'''
+#!/usr/bin/python3
+import json, os, pathlib, sys, tarfile
+args = sys.argv[1:]
+version = args[args.index('--version') + 1]
+prefix = pathlib.Path(os.environ['XDG_DATA_HOME']) / 'cagents-install'
+with open(os.environ['FIXTURE_INSTALLS'], 'a') as output:
+    output.write(json.dumps(args) + '\n')
+with tarfile.open(os.environ['CAGENTS_ARCHIVE']) as archive:
+    archive.extractall(path=prefix / '.fixture-extract', filter='data')
+version_root = prefix / 'versions' / version
+version_root.parent.mkdir(parents=True, exist_ok=True)
+(prefix / '.fixture-extract' / f'cagents-{version}').rename(version_root)
+# Equal archive directory timestamps reproduce ls -t's filename tie breaker.
+os.utime(version_root, (946684800, 946684800))
+if '--stage-only' not in args:
+    (prefix / 'current').symlink_to(f'versions/{version}')
+'''
+
+INSTALLED_CLI_STUB = r'''
+#!/usr/bin/python3
+import json, os, pathlib, sys
+prefix = pathlib.Path(os.environ['XDG_DATA_HOME']) / 'cagents-install'
+with open(os.environ['FIXTURE_UPGRADES'], 'a') as output:
+    output.write(json.dumps({'executable': sys.argv[0], 'arguments': sys.argv[1:],
+                             'current': os.readlink(prefix / 'current')}) + '\n')
+'''
+
+
+class InstallLocalStaging(InstallLocalFixture):
+    """Exercise the complete local script using archives and fake executables."""
+
+    def setUp(self):
+        super().setUp()
+        self.prefix = self.home / 'data/cagents-install'
+        self.upgrades = self.directory / 'upgrades.jsonl'
+        self.installs = self.directory / 'installs.jsonl'
+        self.cli = self.directory / 'fixture-cli'
+        self.executable(self.cli, INSTALLED_CLI_STUB)
+        self.environment.update(FIXTURE_UPGRADES=str(self.upgrades),
+                                FIXTURE_INSTALLS=str(self.installs), FIXTURE_CLI=str(self.cli))
+
+    @staticmethod
+    def executable(path, body):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body.lstrip())
+        path.chmod(0o755)
+
+    def selected_version(self):
+        return f'1.2.3+local.{self.short()}'
+
+    def stage(self, version):
+        root = self.prefix / 'versions' / version
+        for name in ('cagents', 'cagentsd', 'cagents-ui'):
+            self.executable(root / 'bin' / name, INSTALLED_CLI_STUB)
+        return root
+
+    def install_previous(self):
+        root = self.stage('1.2.3+local.previous')
+        (self.prefix / 'current').symlink_to(f'versions/{root.name}')
+        return root
+
+    def package_successfully(self):
+        # These committed stubs travel into install-local's detached build tree.
+        self.executable(self.checkout / 'scripts/package-linux.sh', PACKAGE_ARCHIVE_STUB)
+        self.executable(self.checkout / 'install.sh',
+                        '#!/bin/sh\nexec /usr/bin/python3 - "$@" <<\'PY\'\n'
+                        + INSTALL_ARCHIVE_STUB + '\nPY\n')
+        self.git(self.checkout, 'add', 'scripts/package-linux.sh', 'install.sh')
+        self.git(self.checkout, 'commit', '--quiet', '-m', 'fixture packaging')
+        self.executable(self.tools / 'readelf', '#!/bin/sh\nprintf "GLIBC_2.1\\n"\n')
+
+    def upgrade_events(self):
+        return [json.loads(line) for line in self.upgrades.read_text().splitlines()]
+
+    def install_events(self):
+        return [json.loads(line) for line in self.installs.read_text().splitlines()]
+
+    def test_staged_version_runs_its_cli_without_building_or_switching_current(self):
+        previous = self.install_previous()
+        candidate = self.stage(self.selected_version())
+        result = self.run_script('--yes', '--interrupt')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('already staged; skipping the build.', result.stdout)
+        self.assertFalse(self.builds.exists())
+        self.assertFalse(self.installs.exists())
+        self.assertEqual(self.upgrade_events(), [{
+            'executable': str(candidate / 'bin/cagents'),
+            'arguments': ['daemon', 'upgrade', '--yes', '--interrupt'],
+            'current': f'versions/{previous.name}',
+        }])
+        self.assertEqual(os.readlink(self.prefix / 'current'), f'versions/{previous.name}')
+
+    def test_stage_only_prints_staged_path_without_starting_upgrade(self):
+        previous = self.install_previous()
+        candidate = self.stage(self.selected_version())
+        result = self.run_script('--stage-only')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f'{candidate}/bin/cagents daemon upgrade', result.stdout)
+        self.assertFalse(self.upgrades.exists())
+        self.assertFalse(self.builds.exists())
+        self.assertEqual(os.readlink(self.prefix / 'current'), f'versions/{previous.name}')
+
+    def test_incomplete_staged_version_is_refused_before_upgrade_or_build(self):
+        self.install_previous()
+        candidate = self.stage(self.selected_version())
+        (candidate / 'bin/cagentsd').unlink()
+        result = self.run_script()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('incomplete; missing executable cagentsd', result.stderr)
+        self.assertFalse(self.upgrades.exists())
+        self.assertFalse(self.builds.exists())
+        self.assertFalse(self.installs.exists())
+        self.assertEqual(os.readlink(self.prefix / 'current'), 'versions/1.2.3+local.previous')
+
+    def test_staging_new_archive_preserves_candidate_when_directory_times_tie(self):
+        self.package_successfully()
+        previous = self.install_previous()
+        old = [self.stage(f'1.2.2+local.{index}') for index in range(4)]
+        for root in [previous, *old]:
+            os.utime(root, (946684800, 946684800))
+        version = self.selected_version()
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.builds.read_text(), version + '\n')
+        self.assertEqual(self.install_events(), [['--version', version, '--stage-only']])
+        candidate = self.prefix / 'versions' / version
+        self.assertTrue(candidate.is_dir(), result.stdout)
+        self.assertEqual(candidate.stat().st_mtime, old[0].stat().st_mtime)
+        self.assertEqual(self.upgrade_events()[0]['executable'], str(candidate / 'bin/cagents'))
+        self.assertEqual(os.readlink(self.prefix / 'current'), f'versions/{previous.name}')
+        self.assertEqual([root.name for root in old if root.exists()],
+                         ['1.2.2+local.0', '1.2.2+local.1'])
+
+    def test_first_install_uses_ordinary_installer_and_does_not_upgrade(self):
+        self.package_successfully()
+        version = self.selected_version()
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.install_events(), [['--version', version]])
+        self.assertEqual(os.readlink(self.prefix / 'current'), f'versions/{version}')
+        self.assertFalse(self.upgrades.exists())
+
+    def test_stage_only_requires_existing_installation_before_building(self):
+        result = self.run_script('--stage-only')
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('--stage-only requires an existing installation', result.stderr)
+        self.assertFalse(self.builds.exists())
+        self.assertFalse(self.installs.exists())
+        self.assertFalse(self.prefix.exists())
+
+    def test_existing_version_without_current_requires_reinstall(self):
+        self.stage(self.selected_version())
+        result = self.run_script()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('remove', result.stderr)
+        self.assertFalse(self.builds.exists())
+        self.assertFalse(self.installs.exists())
+        self.assertFalse(self.upgrades.exists())
+        self.assertFalse((self.prefix / 'current').exists())
 
 
 if __name__ == "__main__":

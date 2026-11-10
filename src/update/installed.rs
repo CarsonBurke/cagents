@@ -593,6 +593,28 @@ mod tests {
     }
 
     #[test]
+    fn overdue_successful_start_publishes_serving_candidate_and_retains_timeout() {
+        let directory = tempfile::tempdir().unwrap();
+        let prefix = directory.path();
+        super::super::tests::install_tree(prefix, &["old", "new"], "old");
+        let layout = locate(&prefix.join("versions/new/bin/cagents")).unwrap();
+        let previous = served_version_root(&layout).unwrap();
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 0.05; exit 0"]);
+        let started =
+            crate::install_guard::wait_daemon_start(&mut command, Duration::from_millis(5));
+        assert_eq!(
+            started.as_ref().unwrap_err().error.kind(),
+            io::ErrorKind::TimedOut
+        );
+        let result = settle_startup(started, None, Ok(()), || {
+            publish_current(&layout, &previous, &layout.version_root)
+        });
+        assert!(result.unwrap_err().to_string().contains("startup budget"));
+        assert_eq!(served_version_root(&layout).unwrap(), layout.version_root);
+    }
+
+    #[test]
     fn publication_preserves_an_independent_current_change() {
         let directory = tempfile::tempdir().unwrap();
         let prefix = directory.path();
