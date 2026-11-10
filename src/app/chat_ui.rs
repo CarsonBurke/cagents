@@ -4848,6 +4848,19 @@ impl Runtime {
             // connection ended), so this presentation can no longer follow it.
             self.cool();
         }
+        if self.warm.is_some()
+            && !self.visible.load(Ordering::Relaxed)
+            && self.handle().is_some_and(|handle| {
+                handle
+                    .resident_snapshot_with_clock()
+                    .is_some_and(|(snapshot, _)| snapshot.generation != self.snapshot.generation)
+            })
+        {
+            // A warm chat with queued work reads while hidden. Rather than
+            // prepare what it reads where nobody sees it, it goes cold and
+            // follows its hidden metadata as any other hidden chat does.
+            self.cool();
+        }
         if !self.presents() {
             if let Some((snapshot, clock)) = self
                 .handle()
@@ -4871,14 +4884,6 @@ impl Runtime {
             return;
         };
         self.install_snapshot(snapshot, source_clock);
-        if self.warm.is_some() && !self.visible.load(Ordering::Relaxed) {
-            // A warm chat with queued work reads while hidden, so it can grow.
-            if self.warm_bytes() > warm::CHAT_BYTES {
-                self.cool();
-            } else {
-                warm::grew();
-            }
-        }
     }
 
     /// Install an authoritative hydrated publication without replacing reader

@@ -50,11 +50,6 @@ pub(super) fn stamp() -> u64 {
     NEXT.with(Cell::get)
 }
 
-/// A warm chat's retained bytes changed, so the budget is applied again.
-pub(super) fn grew() {
-    DIRTY.with(|dirty| dirty.set(true));
-}
-
 /// Whether a chat went warm since the budget was last applied. Taking it
 /// closes the current hide, so chats hidden after it are newer.
 pub(super) fn take_dirty() -> bool {
@@ -331,6 +326,32 @@ mod tests {
         runtime.refresh();
         assert!(runtime.warm_stamp().is_none());
         assert!(runtime.cache.is_empty());
+    }
+
+    #[test]
+    fn a_warm_chat_that_reads_while_hidden_goes_cold_instead_of_preparing() {
+        let (mut runtime, handle) = shown(items());
+        // A local follow-up keeps the client reading while the chat is hidden.
+        runtime.followups.push(Followup {
+            id: 0,
+            text: "Then this".into(),
+            preview: "Then this".into(),
+            attachments: Vec::new(),
+        });
+        runtime.set_visible(false).unwrap();
+        assert!(runtime.warm_stamp().is_some());
+        runtime.refresh();
+        assert!(runtime.warm_stamp().is_some(), "nothing new, so still warm");
+
+        let mut next = handle.snapshot().as_ref().clone();
+        next.generation = 2;
+        next.items.push(answer("new", "A new answer.".into()));
+        handle.deliver_snapshot_for_test(next);
+        runtime.refresh();
+        assert!(runtime.warm_stamp().is_none());
+        assert!(runtime.cache.is_empty(), "nothing is prepared while hidden");
+        assert!(!runtime.preparation.waiting());
+        assert_eq!(runtime.snapshot.generation, 2, "its metadata still follows");
     }
 
     #[test]
