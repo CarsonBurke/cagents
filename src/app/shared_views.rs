@@ -157,6 +157,8 @@ pub(super) struct State {
     #[cfg(test)]
     selected_projection_count: std::cell::Cell<usize>,
     #[cfg(test)]
+    scope_discovery_count: std::cell::Cell<usize>,
+    #[cfg(test)]
     pane_attachment_count: usize,
     #[cfg(test)]
     pub(super) structural_tail_count: usize,
@@ -588,10 +590,6 @@ impl Cagents {
             return Task::none();
         }
         self.retire_startup_registry_waits();
-        // An unopened terminal is not asking to start, so it can wait until
-        // the view that may yet list it has been admitted.
-        let views_settled =
-            self.shared_views.registry_unavailable || self.shared_views_ready_for_startup();
         let held = self
             .durable
             .cards
@@ -600,8 +598,6 @@ impl Cagents {
                 CardKind::Terminal(session)
                     if !terminal_ended(session)
                         && card.existence.is_open()
-                        && (views_settled
-                            || matches!(self.residency(card.id), Residency::Hydrating { .. }))
                         && matches!(self.cards.get(&card.id), Some(CardRuntime::Loading))
                         && self.shared_views.attached.contains(&card.id)
                         && !self.shared_views.defaults.contains_key(&card.id)
@@ -620,10 +616,25 @@ impl Cagents {
                 _ => None,
             })
             .collect::<Vec<_>>();
+        if held.is_empty() {
+            return Task::none();
+        }
+        // Discovering every local scope is only useful when an unopened held
+        // candidate needs that admission proof. Opening panes already bypass
+        // this barrier. Resolve it before releases mutate attached custody.
+        let needs_scope_admission = held.iter().any(|(_, _, opening, _)| !opening);
+        let views_settled = !needs_scope_admission
+            || self.shared_views.registry_unavailable
+            || self.shared_views_ready_for_startup();
         let confirmed = self.workspace_model.identity != crate::workspace_model::NO_REGISTRY;
         let mut tasks = Vec::new();
         let mut hydrate = false;
         for (card, exposure, opening, session) in held {
+            // An unopened terminal waits until the view that may yet list it
+            // has been admitted, exactly as before candidate collection.
+            if !views_settled && !opening {
+                continue;
+            }
             if !self.listed_in_registry(card) {
                 self.shared_views.attached.remove(&card);
                 if self.prepare_saved_terminal(card, &session) {
@@ -778,6 +789,10 @@ impl Cagents {
     /// historical worktrees, so each card and path is resolved by lookup
     /// rather than by comparing it with every root or project worktree.
     fn discover_view_scopes(&self) -> ScopeDiscovery<'_> {
+        #[cfg(test)]
+        self.shared_views
+            .scope_discovery_count
+            .set(self.shared_views.scope_discovery_count.get() + 1);
         let roots = self.indexed_worktree_roots();
         let channel_cards = self
             .durable
@@ -5005,6 +5020,7 @@ mod tests {
         let history = app.durable.cards[1..].to_vec();
         let views = app.workspace_model.views[2..].to_vec();
         let update = presentation_edge(&app, Scope::Channel(source), 21, "Remote label", 0.72);
+        app.shared_views.scope_discovery_count.set(0);
         app.shared_views.local_projection_count.set(0);
         app.shared_views.selected_projection_count.set(0);
         app.shared_views.structural_tail_count = 0;
@@ -5012,6 +5028,11 @@ mod tests {
         let (tx, rx) = async_channel::unbounded();
         app.workspace_model_tx = tx;
         drop(app.update(Message::WorkspaceModelObserved(update)));
+        assert_eq!(
+            app.shared_views.scope_discovery_count.get(),
+            0,
+            "settled presentation does not rediscover historical scopes in a release tail"
+        );
         assert_eq!(app.shared_views.local_projection_count.get(), 0);
         assert_eq!(app.shared_views.selected_projection_count.get(), 1);
         assert_eq!(app.shared_views.structural_tail_count, 0);
@@ -5031,6 +5052,115 @@ mod tests {
         assert_eq!(app.exposure(pane.id), exposure);
         assert_eq!(app.shared_views.pane_attachment_count, 0);
         assert!(!app.terminal_start_in_flight(pane.id));
+    }
+
+    #[test]
+    fn presentation_release_of_a_held_terminal_still_requires_scope_admission() {
+        let (mut app, channel, _, mut pane) = fixture();
+        pane.kind = moving_terminal_kind();
+        Arc::make_mut(&mut app.durable).cards.push(CardState {
+            id: pane.id,
+            generation: 0,
+            title: pane.title.clone(),
+            width_fraction: pane.width_fraction,
+            existence: Existence::Open,
+            kind: pane.kind.clone(),
+        });
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .iter_mut()
+            .find(|row| row.id == channel)
+            .unwrap()
+            .cards
+            .push(pane.id);
+        app.cards.insert(pane.id, CardRuntime::Loading);
+        app.register_presence(pane.id, Exposure::Offscreen, Residency::Cold);
+        app.shared_views.attached.insert(pane.id);
+        app.shared_views
+            .initialized
+            .remove(&Scope::Channel(channel));
+        app.shared_views.scope_discovery_count.set(0);
+        drop(app.release_held_terminals());
+        assert_eq!(app.shared_views.scope_discovery_count.get(), 1);
+        assert!(app.shared_views.attached.contains(&pane.id));
+        assert!(!app.saved_terminals.entries.contains_key(&pane.id));
+        assert!(!app.terminal_start_in_flight(pane.id));
+        assert_eq!(app.residency(pane.id), &Residency::Cold);
+
+        app.shared_views.initialized.insert(Scope::Channel(channel));
+        app.shared_views.scope_discovery_count.set(0);
+        drop(app.release_held_terminals());
+        assert_eq!(app.shared_views.scope_discovery_count.get(), 1);
+        assert!(!app.shared_views.attached.contains(&pane.id));
+        assert!(
+            app.saved_terminals.entries.contains_key(&pane.id),
+            "admitted absence releases the existing read-only saved-terminal inspection"
+        );
+        assert_eq!(app.residency(pane.id), &Residency::Hibernated);
+        assert!(
+            app.durable.pending_terminal_creations.is_empty(),
+            "passive release never creates a new terminal launch intention"
+        );
+        assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
+    }
+
+    #[test]
+    fn presentation_release_of_an_opening_terminal_keeps_its_admission_bypass() {
+        let (mut app, channel, _, mut pane) = fixture();
+        pane.kind = moving_terminal_kind();
+        Arc::make_mut(&mut app.durable).cards.push(CardState {
+            id: pane.id,
+            generation: 0,
+            title: pane.title.clone(),
+            width_fraction: pane.width_fraction,
+            existence: Existence::Open,
+            kind: pane.kind.clone(),
+        });
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .iter_mut()
+            .find(|row| row.id == channel)
+            .unwrap()
+            .cards
+            .push(pane.id);
+        app.workspace_model.views.push(View {
+            scope: Scope::Channel(channel),
+            revision: 1,
+            panes: vec![pane.clone()],
+            retired: vec![],
+        });
+        app.cards.insert(pane.id, CardRuntime::Loading);
+        app.register_presence(
+            pane.id,
+            Exposure::Visible,
+            Residency::Hydrating { epoch: 1 },
+        );
+        app.shared_views.attached.insert(pane.id);
+        app.shared_views
+            .initialized
+            .remove(&Scope::Channel(channel));
+        app.shared_views.scope_discovery_count.set(0);
+        drop(app.release_held_terminals());
+        assert_eq!(
+            app.shared_views.scope_discovery_count.get(),
+            0,
+            "opening already bypasses global scope admission"
+        );
+        assert!(
+            !app.shared_views
+                .initialized
+                .contains(&Scope::Channel(channel))
+        );
+        assert_eq!(app.residency(pane.id), &Residency::Cold);
+        assert!(matches!(
+            app.cards.get(&pane.id),
+            Some(CardRuntime::Loading)
+        ));
+        assert!(app.shared_views.attached.contains(&pane.id));
+        assert!(!app.saved_terminals.entries.contains_key(&pane.id));
+        assert!(!app.terminal_start_in_flight(pane.id));
+        assert!(app.durable.pending_terminal_creations.is_empty());
+        assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
     }
 
     #[test]
