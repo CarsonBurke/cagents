@@ -606,10 +606,17 @@ fn long_stale_shared_endpoint_waits_for_writer(name: &str, missing_row: bool) {
     .unwrap() else {
         panic!("expected preparation after the writer exited")
     };
+    // An ended owner's successor has a new presentation identity; its saved
+    // Codex thread, recipe and account selection remain the same.
+    assert_ne!(prepared.id, requested.id);
+    assert_eq!(prepared.launch, requested.launch);
+    assert_eq!(prepared.proof, requested.proof);
+    assert_eq!(prepared.terminal, requested.terminal);
     assert_eq!(
-        prepared, requested,
-        "preparation must preserve the saved source"
+        prepared.owned_codex_listener,
+        requested.owned_codex_listener
     );
+    assert_eq!(prepared.native_continuity, requested.native_continuity);
     let (methods, received) = mpsc::channel();
     let (server_root, server_home) = (root.clone(), home);
     let server = thread::spawn(move || {
