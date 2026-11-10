@@ -108,6 +108,9 @@ fn restart(mut app: Cagents, database: &Path, legacy_view: bool) -> Cagents {
     .unwrap();
     let mut restored = context_inspector_test_app(false);
     restored.sidebar_model = app.sidebar_model.clone();
+    // Startup seeds these boundaries from all catalog records, including
+    // retired worktrees whose panes must stay separate from the parent.
+    restored.known_worktree_roots = app.known_worktree_roots.clone();
     restored.durable = Arc::new(state.unwrap());
     restored.workspace = Cagents::rebuild_workspace(&restored.durable);
     restored.workspace.resize_viewport(300.0);
@@ -338,5 +341,80 @@ fn sidebar_disclosures_restore_after_initial_source_control_binding() {
     );
     assert_eq!(restored.worktree_offsets[&root], 137.0);
     assert_eq!(restored.workspace.camera().offset(), 137.0);
+    assert_eq!(restored.workspace.focused(), Some(card.id));
+}
+
+#[test]
+fn removed_saved_worktree_restores_a_live_project_or_home_from_store() {
+    let directory = tempfile::tempdir().unwrap();
+    for (name, nested, lingering) in [
+        ("removed-nested", true, false),
+        ("retired-nested-directory", true, true),
+        ("removed-external", false, false),
+        ("retired-external-directory", false, true),
+    ] {
+        let mut app = fixture(directory.path());
+        let primary = app.sidebar_model.projects[0].worktrees[0].path.clone();
+        let missing = if nested {
+            primary.join("worktrees/removed")
+        } else {
+            directory.path().join("removed-external")
+        };
+        if lingering {
+            std::fs::create_dir_all(&missing).unwrap();
+        }
+        // The retired record seeds ownership but isn't a navigable row. Git
+        // may have removed only its worktree metadata, leaving the folder.
+        app.known_worktree_roots.insert(missing.clone());
+        let hidden = terminal(&missing);
+        let main = terminal(&primary);
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.cards = vec![hidden.clone(), main.clone()];
+        durable.focused = Some(hidden.id);
+        durable.active_worktree = Some(missing.clone());
+        durable.card_scopes.insert(hidden.id, missing.clone());
+        durable.card_scopes.insert(main.id, primary.clone());
+        durable.worktree_focus.insert(primary.clone(), main.id);
+        let database = directory.path().join(format!("{name}.sqlite3"));
+        let restored = restart(app, &database, false);
+        let expected = nested.then_some(primary);
+        assert_eq!(restored.active_workspace, expected, "{name}");
+        assert_eq!(restored.durable.active_worktree, expected, "{name}");
+        assert_eq!(restored.durable.active_channel, None, "{name}");
+        assert_eq!(
+            restored.workspace.focused(),
+            nested.then_some(main.id),
+            "{name}"
+        );
+        assert_eq!(
+            restored.workspace.order().collect::<Vec<_>>(),
+            if nested { vec![main.id] } else { Vec::new() },
+            "{name}"
+        );
+        assert!(
+            restored.card_state(hidden.id).unwrap().existence.is_open(),
+            "retain removed worktree's pane"
+        );
+        assert_eq!(restored.durable.card_scopes[&hidden.id], missing, "{name}");
+        if lingering {
+            std::fs::remove_dir_all(&missing).unwrap();
+        }
+    }
+}
+
+#[test]
+fn saved_unregistered_directory_still_restores_when_it_exists() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = fixture(directory.path());
+    let outside = directory.path().join("outside-catalog");
+    std::fs::create_dir_all(&outside).unwrap();
+    let card = terminal(&outside);
+    let durable = Arc::make_mut(&mut app.durable);
+    durable.cards = vec![card.clone()];
+    durable.focused = Some(card.id);
+    durable.active_worktree = Some(outside.clone());
+    durable.worktree_focus.insert(outside.clone(), card.id);
+    let restored = restart(app, &directory.path().join("unregistered.sqlite3"), false);
+    assert_eq!(restored.active_workspace, Some(outside));
     assert_eq!(restored.workspace.focused(), Some(card.id));
 }
