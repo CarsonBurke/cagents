@@ -2424,6 +2424,39 @@ mod tests {
     }
 
     #[test]
+    fn a_contending_tail_yields_the_head_to_history_that_arrives() {
+        current_thread().block_on(async {
+            let pool = Arc::new(Pool::new(2));
+            let (granted, mut order) = tokio::sync::mpsc::unbounded_channel();
+            let (_first, first_release) = waiter(&pool, TAIL, None, &granted);
+            settle().await;
+            assert_eq!(order.recv().await, Some(TAIL));
+            let held = pool.permits.clone().try_acquire_owned().unwrap();
+            // Alone, another tail is the head and contends for the last
+            // parser.
+            let (_second, second_release) = waiter(&pool, TAIL, None, &granted);
+            settle().await;
+            assert_eq!(pool.lock().head.map(|key| key.0), Some(TAIL));
+            // History arriving behind it takes the head from it.
+            let (_history, history_release) = waiter(&pool, 9, None, &granted);
+            settle().await;
+            assert_eq!(pool.lock().head.map(|key| key.0), Some(9));
+            drop(held);
+            assert_eq!(
+                order.recv().await,
+                Some(9),
+                "the tail that was contending leaves the last parser to history"
+            );
+            settle().await;
+            assert!(order.try_recv().is_err(), "the tail still waits");
+            let _ = history_release.send(());
+            assert_eq!(order.recv().await, Some(TAIL));
+            let _ = first_release.send(());
+            let _ = second_release.send(());
+        });
+    }
+
+    #[test]
     fn waiters_behind_the_head_are_not_woken_by_others_coming_and_going() {
         current_thread().block_on(async {
             let pool = Arc::new(Pool::new(1));
@@ -2498,6 +2531,85 @@ mod tests {
         assert!(
             ranks.windows(2).all(|pair| pair[0] > pair[1]),
             "older messages wait behind newer ones: {ranks:?}"
+        );
+    }
+
+    #[test]
+    fn a_saved_window_at_the_old_end_is_in_the_first_staged_wave() {
+        let session = fresh_chat_session(
+            Provider::Claude,
+            TerminalId::new(),
+            "/project".into(),
+            &Account::system(Provider::Claude),
+            false,
+        )
+        .unwrap();
+        let handle = Arc::new(ClientHandle::fixture(
+            session.clone(),
+            Snapshot {
+                ready: true,
+                ..Snapshot::default()
+            },
+        ));
+        let mut runtime = Runtime::new(
+            target(),
+            session,
+            Connection::Live(handle.clone()),
+            true,
+            crate::settings::EditorSyntaxTheme::Auto,
+        );
+        let total = 3 * QUEUED_ITEMS;
+        let items: Vec<_> = (0..total)
+            .map(|index| {
+                Arc::new(chat::Item {
+                    id: format!("answer-{index}"),
+                    role: chat::Role::Assistant,
+                    content: ItemContent::Text {
+                        text: format!("Answer **{index}**"),
+                        thinking: false,
+                        phase: chat::Phase::Final,
+                    },
+                    started_at: None,
+                    at: None,
+                })
+            })
+            .collect();
+        // The reader left the main transcript near its oldest messages,
+        // far beyond the newest-back reach of one wave.
+        let window = ["answer-2", "answer-3", "answer-4"];
+        runtime.scroll_memory.save_window(None, &window);
+        handle.replace_snapshot_for_test(Snapshot {
+            generation: 1,
+            ready: true,
+            items,
+            ..Snapshot::default()
+        });
+        runtime.refresh();
+        assert!(
+            runtime.preparation.waiting(),
+            "the wave is bounded and the rest waits"
+        );
+        assert!(runtime.preparation.entries.len() <= QUEUED_ITEMS);
+        for id in window {
+            let rank = runtime
+                .preparation
+                .entries
+                .get(id)
+                .unwrap_or_else(|| panic!("{id} from the saved window is staged in the first wave"))
+                .shared
+                .priority
+                .load(Ordering::Relaxed);
+            assert_eq!(rank, 1, "{id} ranks as a reading row");
+        }
+        assert!(
+            runtime
+                .preparation
+                .contains(&format!("answer-{}", total - 1)),
+            "the newest message still follows the saved window"
+        );
+        assert!(
+            !runtime.preparation.contains("answer-1"),
+            "history next to the saved window waits its newest-back turn"
         );
     }
 

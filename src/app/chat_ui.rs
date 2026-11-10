@@ -4516,11 +4516,22 @@ impl Runtime {
         let start = resume.unwrap_or(0).min(items.len());
         let end = resume.map_or(items.len(), |_| start.saturating_add(128).min(items.len()));
         let mut stopped = false;
-        // Admit from the newest item back: the streaming answer and the rows
-        // a reader at the latest edge sees come first, and admission that
-        // runs out leaves the oldest history waiting. The cursor stores this
-        // order's position.
-        for position in start..end {
+        // Admit the rows a returning reader's saved window showed first, then
+        // from the newest item back: the streaming answer and the rows a
+        // reader at the latest edge sees come next, and admission that runs
+        // out leaves the oldest history waiting. The cursor stores the
+        // newest-back position; the saved window's rows lead every pass, and
+        // are cheap to pass over once staged.
+        let reading = self.scroll_memory.reading_rows(context.as_deref());
+        let returning: Vec<usize> = (0..items.len())
+            .rev()
+            .filter(|&index| reading.contains(&items[index].id))
+            .map(|index| newest - index)
+            .collect();
+        let walk = returning.iter().copied().chain(
+            (start..end).filter(|&position| !reading.contains(&items[newest - position].id)),
+        );
+        for position in walk {
             let index = newest - position;
             let item = &items[index];
             let report = matches!(
@@ -4669,7 +4680,7 @@ impl Runtime {
                         &item.id,
                         if growing {
                             0
-                        } else if self.scroll_memory.was_reading(context.as_deref(), &item.id) {
+                        } else if reading.contains(&item.id) {
                             1
                         } else {
                             2 + position as u64
@@ -4711,7 +4722,14 @@ impl Runtime {
                     cached.reader_memory = self.scroll_memory.clone();
                     cached.reader_context.clone_from(&context);
                     if self.preparation.was_deferred() {
-                        self.preparation.defer(position);
+                        // A saved row that waits is met again at the head of
+                        // the next pass; the newest-back walk resumes where
+                        // this pass's own range starts.
+                        self.preparation.defer(if reading.contains(&item.id) {
+                            start
+                        } else {
+                            position
+                        });
                         if resume.is_some() {
                             stopped = true;
                             break;
@@ -4790,7 +4808,7 @@ impl Runtime {
             presentation_changed = true;
         }
         let today = chat::now_ms().and_then(|now| chat::local_time((now / 1000) as i64));
-        for position in start..end {
+        for position in returning.iter().copied().chain(start..end) {
             let index = newest - position;
             let item = &items[index];
             if let Some(cached) = cache.get_mut(&item.id)

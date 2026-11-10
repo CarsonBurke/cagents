@@ -271,16 +271,43 @@ impl Memory {
         saved.shown_rows().any(|row| pending(&row.id))
     }
 
-    /// Whether `id` is one of the rows the saved reading window showed,
-    /// which a returning reader sees first. None are without saved geometry,
-    /// such as at the latest edge.
-    pub(super) fn was_reading(&self, context: Option<&str>, id: &str) -> bool {
+    /// The rows the saved reading window showed, which a returning reader
+    /// sees first. There are none without saved geometry, such as at the
+    /// latest edge.
+    pub(super) fn reading_rows(&self, context: Option<&str>) -> std::collections::HashSet<String> {
         self.0
             .borrow()
             .contexts
             .iter()
             .find(|saved| saved.subagent.as_deref() == context)
-            .is_some_and(|saved| saved.shown_rows().any(|row| row.id == id))
+            .map(|saved| saved.shown_rows().map(|row| row.id.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// A reader left `context` with `rows` stacked in its viewport.
+    #[cfg(test)]
+    pub(super) fn save_window(&self, context: Option<&str>, rows: &[&str]) {
+        const HEIGHT: f32 = 100.0;
+        let mut anchor = self.0.borrow_mut();
+        let index = anchor.context_index(context);
+        let saved = &mut anchor.contexts[index];
+        saved.geometry = Some(Geometry {
+            viewport: Size::new(720.0, HEIGHT * rows.len() as f32),
+            content: Size::new(720.0, HEIGHT * (rows.len() + 10) as f32),
+        });
+        saved.top = Some(0.0);
+        saved.rows = rows
+            .iter()
+            .enumerate()
+            .map(|(index, id)| Row {
+                id: (*id).to_owned(),
+                bounds: Rectangle::new(
+                    iced::Point::new(0.0, HEIGHT * index as f32),
+                    Size::new(720.0, HEIGHT),
+                ),
+                placeholder: false,
+            })
+            .collect();
     }
 
     pub fn retained_rows(&self) -> usize {
