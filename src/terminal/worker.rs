@@ -8156,8 +8156,10 @@ mod tests {
             ];
             let script = format!(
                 r#"
-import os, select, time, tty
+import os, select, signal, time, tty
 tty.setraw(0)
+# The session leader's exit must leave this fixture's PTY reader alive.
+signal.signal(signal.SIGHUP, signal.SIG_IGN)
 if os.fork(): os._exit(7)
 os.write(1, b'\x1b[6n' * 64 + b'QUERY_FLOOD_END')
 remaining = {size}
