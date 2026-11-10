@@ -23,6 +23,48 @@ use crate::{
 const PERSIST_DEBOUNCE: Duration = Duration::from_millis(250);
 // A busy window must keep saving even when changes never leave a debounce gap.
 const PERSIST_MAX_DELAY: Duration = Duration::from_secs(1);
+/// Original changes represented by a prepared snapshot, before capture waited
+/// out the ordinary autosave debounce. These times never imply a manual retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotChanges {
+    pub first: Instant,
+    pub latest: Instant,
+}
+
+impl SnapshotChanges {
+    pub fn at(now: Instant) -> Self {
+        Self {
+            first: now,
+            latest: now,
+        }
+    }
+    pub fn merge(self, other: Self) -> Self {
+        Self {
+            first: self.first.min(other.first),
+            latest: self.latest.max(other.latest),
+        }
+    }
+    pub fn deadline(self) -> Instant {
+        (self.latest + PERSIST_DEBOUNCE).min(self.first + PERSIST_MAX_DELAY)
+    }
+}
+
+/// A complete immutable snapshot and the original autosave debt it carries.
+/// Constructing this value does not acknowledge or enqueue the snapshot.
+pub struct SnapshotOffer {
+    pub state: Arc<WorkspaceState>,
+    pub changes: Option<SnapshotChanges>,
+}
+
+impl From<Arc<WorkspaceState>> for SnapshotOffer {
+    fn from(state: Arc<WorkspaceState>) -> Self {
+        Self {
+            state,
+            changes: None,
+        }
+    }
+}
+
 const PERSIST_RETRY_INITIAL: Duration = Duration::from_millis(100);
 const PERSIST_RETRY_MAX: Duration = Duration::from_secs(2);
 const PERSIST_MAX_AUTOMATIC_ATTEMPTS: u32 = 4;
@@ -483,6 +525,7 @@ struct QueueState {
     /// change costs one `Arc` bump on this lane rather than a second deep clone
     /// of every card, title, and browser history.
     latest: Option<Arc<WorkspaceState>>,
+    snapshot_changes: Option<SnapshotChanges>,
     conversions: VecDeque<ConversionCheckpoint>,
     ordered_identities: bool,
     projects: HashMap<ProjectId, ProjectState>,
@@ -500,6 +543,13 @@ struct QueueState {
 }
 
 impl QueueState {
+    fn record_snapshot_changes(&mut self, changes: Option<SnapshotChanges>) {
+        let changes = changes.unwrap_or_else(|| SnapshotChanges::at(Instant::now()));
+        self.snapshot_changes = Some(
+            self.snapshot_changes
+                .map_or(changes, |pending| pending.merge(changes)),
+        );
+    }
     /// Queues `replacement` behind everything already offered: after the
     /// pending snapshot while conversions are kept in order, merged with the
     /// other pending replacements otherwise.
@@ -541,6 +591,10 @@ impl QueueState {
     }
 }
 
+/// Opaque queue incarnation, independent of a potentially reused StateStore.
+#[derive(Debug, Clone)]
+pub struct WriterIdentity(std::sync::Weak<(Mutex<QueueState>, Condvar)>);
+
 pub struct SessionRuntime {
     queue: Arc<(Mutex<QueueState>, Condvar)>,
     last_error: Arc<Mutex<Option<String>>>,
@@ -566,6 +620,22 @@ impl std::fmt::Debug for SessionRuntime {
 }
 
 impl SessionRuntime {
+    #[cfg(test)]
+    pub(crate) fn poison_queue_for_test(&self) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = self.queue.0.lock().unwrap();
+            panic!("test poisoned session queue");
+        }));
+        self.queue.1.notify_all();
+    }
+
+    pub fn writer_identity(&self) -> WriterIdentity {
+        WriterIdentity(Arc::downgrade(&self.queue))
+    }
+    pub fn owns_writer(&self, identity: &WriterIdentity) -> bool {
+        identity.0.ptr_eq(&Arc::downgrade(&self.queue))
+    }
+
     pub fn default_database_path() -> Result<PathBuf, SessionError> {
         instance::window_database_path(instance::window_slot())
             .map_err(|error| SessionError::Store(StoreError::Io(error)))
@@ -677,30 +747,50 @@ impl SessionRuntime {
     /// Navigation-only changes are complete snapshots too: card fingerprints
     /// may skip card writes, but must never skip the workspace metadata update.
     pub fn snapshot(&self, state: Arc<WorkspaceState>) {
+        let _ = self.offer_snapshot(state.into());
+    }
+
+    pub fn offer_snapshot(&self, offer: SnapshotOffer) -> Result<(), String> {
+        let changes = offer
+            .changes
+            .or_else(|| Some(SnapshotChanges::at(Instant::now())));
         let (lock, changed) = &*self.queue;
-        if let Ok(mut queue) = lock.lock()
-            && !queue.shutdown
-        {
-            queue.admit_staged_adoptions();
-            queue.latest = Some(state);
-            changed.notify_one();
+        let mut queue = lock.lock().map_err(|_| "Session writer is unavailable")?;
+        if queue.shutdown {
+            return Err("Session writer is shutting down".into());
         }
+        queue.admit_staged_adoptions();
+        queue.record_snapshot_changes(changes);
+        let previous = queue.latest.replace(offer.state);
+        changed.notify_one();
+        drop(queue);
+        drop(previous);
+        Ok(())
     }
 
     /// Preserve a kind transition and all preceding metadata on the writer
     /// lane. Unlike autosave, conversions cannot coalesce: a fast return to a
     /// terminal still needs the exact chat identity committed before it.
     pub fn snapshot_conversion(&self, state: Arc<WorkspaceState>) {
+        let _ = self.offer_conversion(state.into());
+    }
+
+    pub fn offer_conversion(&self, offer: SnapshotOffer) -> Result<(), String> {
+        let changes = offer
+            .changes
+            .or_else(|| Some(SnapshotChanges::at(Instant::now())));
         let (lock, changed) = &*self.queue;
-        if let Ok(mut queue) = lock.lock()
-            && !queue.shutdown
-        {
-            queue.keep_writes_in_order();
-            queue
-                .conversions
-                .push_back(ConversionCheckpoint::Snapshot(state));
-            changed.notify_one();
+        let mut queue = lock.lock().map_err(|_| "Session writer is unavailable")?;
+        if queue.shutdown {
+            return Err("Session writer is shutting down".into());
         }
+        queue.keep_writes_in_order();
+        queue.record_snapshot_changes(changes);
+        queue
+            .conversions
+            .push_back(ConversionCheckpoint::Snapshot(offer.state));
+        changed.notify_one();
+        Ok(())
     }
 
     pub fn snapshot_terminal_adoptions(
@@ -717,20 +807,34 @@ impl SessionRuntime {
         adoptions: Vec<crate::persistence::TerminalPaneAdoption>,
         restorations: Vec<crate::persistence::TerminalPaneRestoration>,
     ) {
+        let _ = self.offer_terminal_panes(state.into(), adoptions, restorations);
+    }
+
+    pub fn offer_terminal_panes(
+        &self,
+        offer: SnapshotOffer,
+        adoptions: Vec<crate::persistence::TerminalPaneAdoption>,
+        restorations: Vec<crate::persistence::TerminalPaneRestoration>,
+    ) -> Result<(), String> {
+        let changes = offer
+            .changes
+            .or_else(|| Some(SnapshotChanges::at(Instant::now())));
         let (lock, changed) = &*self.queue;
-        if let Ok(mut queue) = lock.lock()
-            && !queue.shutdown
-        {
-            queue.keep_writes_in_order();
-            queue
-                .conversions
-                .push_back(ConversionCheckpoint::PaneAdoptions {
-                    snapshot: state,
-                    adoptions,
-                    restorations,
-                });
-            changed.notify_one();
+        let mut queue = lock.lock().map_err(|_| "Session writer is unavailable")?;
+        if queue.shutdown {
+            return Err("Session writer is shutting down".into());
         }
+        queue.keep_writes_in_order();
+        queue.record_snapshot_changes(changes);
+        queue
+            .conversions
+            .push_back(ConversionCheckpoint::PaneAdoptions {
+                snapshot: offer.state,
+                adoptions,
+                restorations,
+            });
+        changed.notify_one();
+        Ok(())
     }
 
     /// Queue a reviewed ownership repair after every already-offered write.
@@ -738,10 +842,14 @@ impl SessionRuntime {
     /// enqueueing nor a failed attempt retires its save quarantine.
     pub fn recover_terminal_ownership(
         &self,
-        snapshot: Arc<WorkspaceState>,
+        snapshot: impl Into<SnapshotOffer>,
         recovery: crate::persistence::TerminalPaneAdoption,
     ) -> std::result::Result<std::sync::mpsc::Receiver<std::result::Result<(), String>>, String>
     {
+        let offer = snapshot.into();
+        let changes = offer
+            .changes
+            .or_else(|| Some(SnapshotChanges::at(Instant::now())));
         let (reply, receiver) = std::sync::mpsc::sync_channel(1);
         let (lock, changed) = &*self.queue;
         let mut queue = lock.lock().map_err(|_| "Session writer is unavailable")?;
@@ -749,10 +857,11 @@ impl SessionRuntime {
             return Err("Session writer is shutting down".into());
         }
         queue.keep_writes_in_order();
+        queue.record_snapshot_changes(changes);
         queue
             .conversions
             .push_back(ConversionCheckpoint::TerminalOwnershipRecovery {
-                snapshot,
+                snapshot: offer.state,
                 recovery,
                 reply,
             });
@@ -761,22 +870,30 @@ impl SessionRuntime {
     }
 
     pub fn save_project(&self, project: ProjectState) {
+        let change_time = SnapshotChanges::at(Instant::now());
         let (lock, changed) = &*self.queue;
         if let Ok(mut queue) = lock.lock()
             && !queue.shutdown
         {
             queue.projects.insert(project.id, project);
+            queue.record_snapshot_changes(Some(change_time));
             changed.notify_one();
         }
     }
 
     pub fn save_worktrees(&self, worktrees: impl IntoIterator<Item = WorktreeState>) {
+        let change_time = SnapshotChanges::at(Instant::now());
         let (lock, changed) = &*self.queue;
         if let Ok(mut queue) = lock.lock()
             && !queue.shutdown
         {
+            let mut inserted = false;
             for worktree in worktrees {
+                inserted = true;
                 queue.worktrees.insert(worktree.id, worktree);
+            }
+            if inserted {
+                queue.record_snapshot_changes(Some(change_time));
             }
             changed.notify_one();
         }
@@ -815,14 +932,36 @@ impl SessionRuntime {
         replacement: crate::chat::Session,
         state: Arc<WorkspaceState>,
     ) {
-        self.replace_identity(
-            IdentityReplacement {
-                card_id,
-                expected_terminal_id: expected_id,
-                replacement: Replacement::Chat(replacement),
-            },
-            Some(state),
-        );
+        let _ = self.offer_chat_identity(card_id, expected_id, replacement, state.into());
+    }
+
+    pub fn offer_chat_identity(
+        &self,
+        card_id: CardId,
+        expected_id: TerminalId,
+        replacement: crate::chat::Session,
+        offer: SnapshotOffer,
+    ) -> Result<(), String> {
+        let changes = offer
+            .changes
+            .or_else(|| Some(SnapshotChanges::at(Instant::now())));
+        let (lock, changed) = &*self.queue;
+        let mut queue = lock.lock().map_err(|_| "Session writer is unavailable")?;
+        if queue.shutdown {
+            return Err("Session writer is shutting down".into());
+        }
+        queue.admit_staged_adoptions();
+        queue.queue_identity_replacement(IdentityReplacement {
+            card_id,
+            expected_terminal_id: expected_id,
+            replacement: Replacement::Chat(replacement),
+        });
+        queue.record_snapshot_changes(changes);
+        let previous = queue.latest.replace(offer.state);
+        changed.notify_one();
+        drop(queue);
+        drop(previous);
+        Ok(())
     }
 
     /// Records the conversations chat cards' shared views now hold in place
@@ -889,6 +1028,7 @@ impl SessionRuntime {
     ) -> std::result::Result<std::sync::mpsc::Receiver<std::result::Result<(), String>>, String>
     {
         let (reply, receiver) = std::sync::mpsc::sync_channel(1);
+        let change_time = SnapshotChanges::at(Instant::now());
         let (lock, changed) = &*self.queue;
         let mut queue = lock.lock().map_err(|_| "Session writer is unavailable")?;
         if queue.shutdown {
@@ -901,6 +1041,7 @@ impl SessionRuntime {
                 copy,
                 reply: Some(reply),
             });
+        queue.record_snapshot_changes(Some(change_time));
         changed.notify_one();
         Ok(receiver)
     }
@@ -933,6 +1074,7 @@ impl SessionRuntime {
     ) -> std::result::Result<std::sync::mpsc::Receiver<std::result::Result<(), String>>, String>
     {
         let (reply, receiver) = std::sync::mpsc::sync_channel(1);
+        let change_time = SnapshotChanges::at(Instant::now());
         let (lock, changed) = &*self.queue;
         let mut queue = lock.lock().map_err(|_| "Session writer is unavailable")?;
         if queue.shutdown {
@@ -948,6 +1090,7 @@ impl SessionRuntime {
                 replacement,
                 reply,
             }));
+        queue.record_snapshot_changes(Some(change_time));
         changed.notify_one();
         Ok(receiver)
     }
@@ -968,18 +1111,21 @@ impl SessionRuntime {
         replacements: impl IntoIterator<Item = IdentityReplacement>,
         state: Option<Arc<WorkspaceState>>,
     ) {
+        let change_time = SnapshotChanges::at(Instant::now());
         let (lock, changed) = &*self.queue;
         if let Ok(mut queue) = lock.lock()
             && !queue.shutdown
         {
             queue.admit_staged_adoptions();
+
             for replacement in replacements {
                 queue.queue_identity_replacement(replacement);
             }
-            if let Some(state) = state {
-                queue.latest = Some(state);
-            }
+            let previous = state.and_then(|state| queue.latest.replace(state));
+            queue.record_snapshot_changes(Some(change_time));
             changed.notify_one();
+            drop(queue);
+            drop(previous);
         }
     }
 
@@ -2785,6 +2931,12 @@ fn persistence_loop(
             || !state.projects.is_empty()
             || !state.worktrees.is_empty()
             || !state.identity_replacements.is_empty();
+        // Producers preserve their enqueue times. Drain time is not new
+        // activity; using it would add a second debounce to a prepared offer.
+        let incoming_changes = state
+            .snapshot_changes
+            .take()
+            .or_else(|| received_changes.then(|| SnapshotChanges::at(Instant::now())));
         if !state.conversions.is_empty() {
             if let Some(previous) = writes.workspace.take() {
                 writes
@@ -2793,9 +2945,10 @@ fn persistence_loop(
             }
             writes.conversions.append(&mut state.conversions);
         }
-        if let Some(latest) = state.latest.take() {
-            writes.workspace = Some(latest);
-        }
+        let retired_workspace = state
+            .latest
+            .take()
+            .and_then(|latest| writes.workspace.replace(latest));
         writes.projects.extend(std::mem::take(&mut state.projects));
         writes
             .worktrees
@@ -2817,12 +2970,11 @@ fn persistence_loop(
             retry_delay = config.retry_initial;
             due = Some(Instant::now());
         } else {
-            due = schedule_flush_after_changes(
+            due = schedule_flush_after_interval(
                 due,
-                received_changes,
+                incoming_changes,
                 retry_exhausted,
                 attempts_this_cycle,
-                Instant::now(),
                 config,
                 &mut oldest_change,
             );
@@ -2833,6 +2985,7 @@ fn persistence_loop(
             || !checkpoints.is_empty()
             || due.is_some_and(|deadline| Instant::now() >= deadline);
         drop(state);
+        drop(retired_workspace);
 
         // A refusal has to name a cause, and the raw store error may not leave
         // this thread: it retains the connection string a failing SQLite call
@@ -3067,12 +3220,33 @@ fn schedule_flush_after_changes(
     config: PersistenceConfig,
     oldest_change: &mut Option<Instant>,
 ) -> Option<Instant> {
-    if received_changes && !retry_exhausted && attempts_this_cycle == 0 {
-        // Preserve the trailing debounce for short bursts, but never move the
-        // oldest pending batch's cap, even if this arrival is already overdue.
-        // A failed flush keeps its existing retry deadline and backoff instead.
-        let first = oldest_change.get_or_insert(now);
-        Some((now + config.debounce).min(*first + config.max_delay))
+    schedule_flush_after_interval(
+        current_due,
+        received_changes.then_some(SnapshotChanges::at(now)),
+        retry_exhausted,
+        attempts_this_cycle,
+        config,
+        oldest_change,
+    )
+}
+
+fn schedule_flush_after_interval(
+    current_due: Option<Instant>,
+    incoming: Option<SnapshotChanges>,
+    retry_exhausted: bool,
+    attempts_this_cycle: u32,
+    config: PersistenceConfig,
+    oldest_change: &mut Option<Instant>,
+) -> Option<Instant> {
+    if let Some(incoming) = incoming.filter(|_| !retry_exhausted && attempts_this_cycle == 0) {
+        let first = oldest_change.get_or_insert(incoming.first);
+        *first = (*first).min(incoming.first);
+        let trailing = incoming.latest + config.debounce;
+        Some(
+            current_due
+                .map_or(trailing, |due| due.max(trailing))
+                .min(*first + config.max_delay),
+        )
     } else {
         current_due
     }
@@ -3460,6 +3634,281 @@ mod tests {
             schedule_flush_after_changes(None, true, true, 4, now, config, &mut oldest_change,),
             None,
             "new changes must not restart an exhausted retry cycle"
+        );
+    }
+
+    #[test]
+    fn replica_capture_original_times_do_not_wait_out_a_second_debounce() {
+        let first = Instant::now();
+        let changes = SnapshotChanges {
+            first,
+            latest: first + Duration::from_millis(100),
+        };
+        assert_eq!(changes.deadline(), first + Duration::from_millis(350));
+        let mut oldest = None;
+        let due = schedule_flush_after_interval(
+            None,
+            Some(changes),
+            false,
+            0,
+            PersistenceConfig::default(),
+            &mut oldest,
+        )
+        .unwrap();
+        assert_eq!(due, changes.deadline());
+        assert!(
+            due <= first + Duration::from_millis(400),
+            "late preparation is already due"
+        );
+        let continuous = changes.merge(SnapshotChanges::at(first + Duration::from_millis(950)));
+        assert_eq!(continuous.deadline(), first + Duration::from_secs(1));
+    }
+
+    #[test]
+    fn replica_capture_late_times_merge_with_other_activity_and_preserve_retry_policy() {
+        let start = Instant::now();
+        let config = PersistenceConfig::default();
+        let mut oldest = None;
+        // A project/worktree change reached the writer before an older
+        // replica snapshot finished preparing. Keep the later activity too.
+        let normal = start + Duration::from_millis(400);
+        let due = schedule_flush_after_changes(None, true, false, 0, normal, config, &mut oldest);
+        let due = schedule_flush_after_interval(
+            due,
+            Some(SnapshotChanges {
+                first: start,
+                latest: start + Duration::from_millis(100),
+            }),
+            false,
+            0,
+            config,
+            &mut oldest,
+        );
+        assert_eq!(oldest, Some(start));
+        assert_eq!(due, Some(normal + config.debounce));
+        let continuous = SnapshotChanges::at(start + Duration::from_millis(1_200));
+        assert_eq!(
+            schedule_flush_after_interval(due, Some(continuous), false, 0, config, &mut oldest),
+            Some(start + config.max_delay)
+        );
+        let retry = Some(start + Duration::from_secs(2));
+        for (exhausted, attempts, deadline) in [(false, 1, retry), (true, 4, None)] {
+            let before = oldest;
+            assert_eq!(
+                schedule_flush_after_interval(
+                    deadline,
+                    Some(continuous),
+                    exhausted,
+                    attempts,
+                    config,
+                    &mut oldest
+                ),
+                deadline
+            );
+            assert_eq!(
+                oldest, before,
+                "snapshot offers cannot rearm a failed batch"
+            );
+        }
+    }
+
+    #[test]
+    fn replica_capture_old_normal_queue_activity_does_not_become_new_drain_activity() {
+        let start = Instant::now();
+        let mut queue = QueueState::default();
+        queue.record_snapshot_changes(Some(SnapshotChanges::at(
+            start + Duration::from_millis(400),
+        )));
+        queue.record_snapshot_changes(Some(SnapshotChanges {
+            first: start + Duration::from_millis(700),
+            latest: start + Duration::from_millis(800),
+        }));
+        let drained_at = start + Duration::from_millis(1_070);
+        let mut oldest = None;
+        let due = schedule_flush_after_interval(
+            None,
+            queue.snapshot_changes.take(),
+            false,
+            0,
+            PersistenceConfig::default(),
+            &mut oldest,
+        )
+        .unwrap();
+        assert_eq!(due, start + Duration::from_millis(1_050));
+        assert!(
+            due < drained_at,
+            "old queue metadata cannot create a second debounce"
+        );
+    }
+
+    #[test]
+    fn replica_capture_empty_worktree_offer_cannot_postpone_a_prepared_snapshot() {
+        let directory = tempdir().unwrap();
+        let state = Arc::new(workspace());
+        let runtime = queue_only_runtime(&directory, &state, false);
+        runtime.queue.0.lock().unwrap().latest = None;
+        runtime.save_worktrees(std::iter::empty());
+        assert_eq!(runtime.queue.0.lock().unwrap().snapshot_changes, None);
+        let old = SnapshotChanges::at(Instant::now() - Duration::from_secs(2));
+        runtime
+            .offer_snapshot(SnapshotOffer {
+                state,
+                changes: Some(old),
+            })
+            .unwrap();
+        runtime.save_worktrees(std::iter::empty());
+        assert_eq!(runtime.queue.0.lock().unwrap().snapshot_changes, Some(old));
+        let mut first = None;
+        assert_eq!(
+            schedule_flush_after_interval(
+                None,
+                Some(old),
+                false,
+                0,
+                PersistenceConfig::default(),
+                &mut first
+            ),
+            Some(old.deadline())
+        );
+        let before = Instant::now();
+        runtime.save_worktrees([worktree(&project("queued"), "feature")]);
+        let recorded = runtime.queue.0.lock().unwrap().snapshot_changes.unwrap();
+        assert_eq!(recorded.first, old.first);
+        assert!(recorded.latest >= before);
+    }
+
+    #[test]
+    fn replica_capture_offers_acknowledge_only_an_accepted_queue() {
+        let directory = tempdir().unwrap();
+        let state = Arc::new(workspace());
+        let runtime = queue_only_runtime(&directory, &state, false);
+        let changes = SnapshotChanges::at(Instant::now());
+        runtime
+            .offer_snapshot(SnapshotOffer {
+                state: state.clone(),
+                changes: Some(changes),
+            })
+            .unwrap();
+        {
+            let mut queue = runtime.queue.0.lock().unwrap();
+            assert_eq!(queue.snapshot_changes, Some(changes));
+            queue.shutdown = true;
+        }
+        let later = SnapshotChanges::at(changes.latest + Duration::from_secs(1));
+        assert!(
+            runtime
+                .offer_snapshot(SnapshotOffer {
+                    state: state.clone(),
+                    changes: Some(later)
+                })
+                .is_err()
+        );
+        assert_eq!(
+            runtime.queue.0.lock().unwrap().snapshot_changes,
+            Some(changes)
+        );
+        runtime.queue.0.lock().unwrap().shutdown = false;
+    }
+
+    #[test]
+    fn replica_capture_writer_fence_distinguishes_new_queue_with_the_same_store() {
+        let directory = tempdir().unwrap();
+        let state = Arc::new(workspace());
+        let old = queue_only_runtime(&directory, &state, false);
+        let mut new = queue_only_runtime(&directory, &state, false);
+        new.operation_store = old.operation_store.clone();
+        assert!(Arc::ptr_eq(&old.operation_store, &new.operation_store));
+        let token = old.writer_identity();
+        assert!(old.owns_writer(&token));
+        assert!(!new.owns_writer(&token));
+    }
+
+    #[test]
+    fn replica_capture_timed_replacement_keeps_authority_ahead_of_its_snapshot() {
+        let directory = tempdir().unwrap();
+        let mut state = workspace();
+        let source = staged_chat(&state);
+        state.cards[0].kind = CardKind::Chat(source.clone());
+        let older = Arc::new(state.clone());
+        let runtime = queue_only_runtime(&directory, &older, false);
+        let mut replacement = source.clone();
+        replacement.id = TerminalId::new();
+        state.cards[0].kind = CardKind::Chat(replacement.clone());
+        let changes = SnapshotChanges::at(Instant::now());
+        runtime
+            .offer_chat_identity(
+                state.cards[0].id,
+                source.id,
+                replacement.clone(),
+                SnapshotOffer {
+                    state: Arc::new(state),
+                    changes: Some(changes),
+                },
+            )
+            .unwrap();
+        let queue = runtime.queue.0.lock().unwrap();
+        assert!(
+            queue.conversions.is_empty(),
+            "no extra candidate snapshot precedes replacement authority"
+        );
+        assert_eq!(
+            queue.identity_replacements[&older.cards[0].id].expected_terminal_id,
+            source.id
+        );
+        assert_eq!(
+            queue.latest.as_ref().unwrap().cards[0].kind,
+            CardKind::Chat(replacement)
+        );
+        assert_eq!(queue.snapshot_changes, Some(changes));
+    }
+
+    #[test]
+    fn replica_capture_writer_loop_does_not_debounce_an_already_prepared_offer_again() {
+        let directory = tempdir().unwrap();
+        let state = Arc::new(workspace());
+        let runtime = queue_only_runtime(&directory, &state, false);
+        {
+            runtime.queue.0.lock().unwrap().latest = None;
+        }
+        let store = FakeStore::new([]);
+        let attempts = store.attempts.clone();
+        let queue = runtime.queue.clone();
+        let (health_tx, _health) = async_channel::unbounded();
+        let worker = thread::spawn(move || {
+            persistence_loop(
+                store,
+                PendingWrites::restored(0, BTreeMap::new(), HashMap::new(), HashMap::new()),
+                queue,
+                Arc::new(Mutex::new(None)),
+                &mut HealthPublisher::new(health_tx),
+                PersistenceConfig {
+                    debounce: Duration::from_secs(60),
+                    max_delay: Duration::from_secs(120),
+                    ..PersistenceConfig::default()
+                },
+            )
+        });
+        runtime
+            .offer_snapshot(SnapshotOffer {
+                state,
+                changes: Some(SnapshotChanges::at(
+                    Instant::now() - Duration::from_secs(180),
+                )),
+            })
+            .unwrap();
+        // This ample bound is far shorter than a fabricated second60s wait;
+        // it makes no assertion about sub-frame or250ms scheduling latency.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while attempts.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let wrote_without_a_barrier = attempts.load(Ordering::Relaxed) > 0;
+        runtime.queue.0.lock().unwrap().shutdown = true;
+        runtime.queue.1.notify_one();
+        assert!(matches!(worker.join().unwrap(), WriterExit::Shutdown(_)));
+        assert!(
+            wrote_without_a_barrier,
+            "prepared offer waited out a second debounce"
         );
     }
 

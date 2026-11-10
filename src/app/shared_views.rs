@@ -2264,7 +2264,7 @@ impl Cagents {
         // and local/default intentions still use the ordinary publisher.
         // Held reported titles stay held: publishing them on every view
         // acknowledgment would publish each title again as its own echo.
-        self.save_workspace_with_view_publication(|app| {
+        self.save_projected_workspace(!all, |app| {
             let projected = app.local_views_for(projection);
             for scope in projected_scopes {
                 app.shared_views.baseline.insert(
@@ -3308,6 +3308,8 @@ fn same_attention_update_source(left: &CardKind, right: &CardKind) -> bool {
 mod tests {
     mod history_start;
     mod published_card_edits;
+    #[cfg(not(feature = "integrated-browser"))]
+    mod replica_capture;
     mod startup_admission;
     mod startup_terminals;
 
@@ -5533,6 +5535,11 @@ mod tests {
     #[cfg(not(feature = "integrated-browser"))]
     fn presentation_settings_blur_keeps_the_complete_common_tail() {
         let (mut app, source, _, _) = presentation_fixture();
+        let _directory = replica_capture::writer_fixture(&mut app);
+        let earlier = presentation_edge(&app, Scope::Channel(source), 21, "Earlier replica", 0.59);
+        drop(app.update(Message::WorkspaceModelObserved(earlier)));
+        assert!(app.replica_capture.pending.is_some());
+        let captures = app.replica_capture.captures;
         drop(app.sync_chrome());
         let update = presentation_edge(&app, Scope::Channel(source), 24, "After blur", 0.61);
         // Focus has already left Settings, while its debounced draft still
@@ -5544,6 +5551,8 @@ mod tests {
         app.shared_views.local_projection_count.set(0);
         drop(app.update(Message::WorkspaceModelObserved(update)));
         assert_eq!(app.settings.terminal_font_size, 18.0);
+        assert!(app.replica_capture.pending.is_none());
+        assert!(app.replica_capture.captures > captures);
         assert!(app.settings_pending.is_empty());
         assert_eq!(app.shared_views.selected_projection_count.get(), 0);
         assert_eq!(app.shared_views.local_projection_count.get(), 1);
@@ -5551,6 +5560,7 @@ mod tests {
             app.shared_views.structural_tail_count, 1,
             "a committed settings draft invalidates the scoped chrome proof"
         );
+        drop(app);
     }
 
     #[test]
@@ -5615,6 +5625,8 @@ mod tests {
         app.shared_views
             .initialize(Scope::Channel(destination), vec![other_pane]);
         app.cards.insert(other.id, CardRuntime::Completed);
+        let _directory = replica_capture::writer_fixture(&mut app);
+        let captures = app.replica_capture.captures;
         app.remember_channel_name_for_test(destination, "Retained channel name".into());
         drop(app.sync_chrome());
         app.shared_views.chrome_cards_visited.set(0);
@@ -5624,6 +5636,8 @@ mod tests {
         app.workspace_model_tx = tx;
         drop(app.update(Message::WorkspaceModelObserved(update)));
         assert_eq!(app.shared_views.selected_projection_count.get(), 1);
+        assert!(app.replica_capture.pending.is_none());
+        assert_eq!(app.replica_capture.captures, captures + 1);
         assert_eq!(
             app.durable
                 .channels
@@ -5639,38 +5653,14 @@ mod tests {
         );
         assert!(std::iter::from_fn(|| rx.try_recv().ok()).any(|edit| matches!(edit,
             ModelEdit::SuggestChannelTitle { id, title, .. } if id == destination && title == "Retained channel name")));
+        drop(app);
     }
 
     #[test]
     #[cfg(not(feature = "integrated-browser"))]
     fn presentation_inactive_scope_refreshes_changed_active_primary_chrome() {
         let (mut app, source, destination, pane) = presentation_fixture();
-        let make_chat = |title: &str| {
-            let CardKind::Terminal(terminal) = moving_terminal_kind() else {
-                unreachable!()
-            };
-            CardState {
-                id: CardId::new(),
-                generation: 0,
-                title: title.into(),
-                width_fraction: 0.5,
-                existence: Existence::Open,
-                kind: CardKind::Chat(crate::chat::Session {
-                    id: TerminalId::new(),
-                    proof: terminal.continuity.live_proof(),
-                    terminal: None,
-                    owned_codex_listener: None,
-                    native_continuity: crate::chat::NativeContinuity::Durable {
-                        provider_version: "fixture".into(),
-                    },
-                    launch: crate::chat::Launch {
-                        provider: crate::agent::Provider::Claude,
-                        recipe: terminal.launch,
-                        session_id: Some(title.into()),
-                    },
-                }),
-            }
-        };
+        let make_chat = replica_capture::retained_chat;
         let first = make_chat("First chat");
         let second = make_chat("Second chat");
         let chats = vec![
@@ -5709,6 +5699,8 @@ mod tests {
         app.shared_views.attached.extend([first.id, second.id]);
         app.cards.insert(first.id, CardRuntime::Completed);
         app.cards.insert(second.id, CardRuntime::Completed);
+        let _directory = replica_capture::writer_fixture(&mut app);
+        let captures = app.replica_capture.captures;
         let mut strip = (*app.durable).clone();
         strip.cards = vec![second.clone(), first.clone()];
         app.workspace = Cagents::rebuild_workspace(&strip);
@@ -5717,16 +5709,21 @@ mod tests {
         assert_eq!(app.card_chrome[&second.id].title, "Second chat");
         app.shared_views.chrome_cards_visited.set(0);
         app.shared_views.selected_projection_count.set(0);
+        app.reported_title_save.cards.insert(pane.id);
+        app.card_state_mut(pane.id).unwrap().title = "Held local title".into();
         let update = presentation_edge(&app, Scope::Channel(source), 24, "Inactive browser", 0.61);
         drop(app.update(Message::WorkspaceModelObserved(update)));
         assert_eq!(app.shared_views.selected_projection_count.get(), 1);
+        assert!(app.replica_capture.pending.is_none());
+        assert_eq!(app.replica_capture.captures, captures + 1);
+        assert!(app.reported_title_save.cards.contains(&pane.id));
         assert_eq!(app.shared_views.chrome_cards_visited.get(), 3);
         assert_eq!(app.card_chrome[&first.id].title, "First chat");
         assert_eq!(
             app.card_chrome[&second.id].title,
             "Manual conversation name"
         );
-        assert_eq!(app.card_state(pane.id).unwrap().title, "Inactive browser");
+        assert_eq!(app.card_state(pane.id).unwrap().title, "Held local title");
         assert_eq!(app.card_chrome[&pane.id].title, browser_host::TITLE);
         let observed = (
             app.card_chrome[&first.id].title.clone(),
@@ -5742,6 +5739,7 @@ mod tests {
                 app.core.window.header_title.clone()
             )
         );
+        drop(app);
     }
 
     #[test]

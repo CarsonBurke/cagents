@@ -1124,6 +1124,13 @@ impl Cagents {
             // the same chrome refresh as the complete projection.
             Projection::Chrome
         };
+        if !matches!(projection, Projection::ScopedChrome(_))
+            || !self.shared_views.adoptions.is_empty()
+            || !self.shared_views.restorations.is_empty()
+            || !self.shared_views.chat_adoptions.is_empty()
+        {
+            self.materialize_replica_snapshot();
+        }
         (Task::batch([installed, projected]), projection)
     }
 
@@ -1829,6 +1836,7 @@ impl Cagents {
         if self.durable.workspace_model_identity == Some(identity) {
             return;
         }
+        self.materialize_replica_snapshot();
         self.shared_views = super::shared_views::State::for_workspace(&self.durable);
         self.clear_closed_chat_drafts();
         let durable = Arc::make_mut(&mut self.durable);

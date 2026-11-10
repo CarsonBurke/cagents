@@ -8508,8 +8508,12 @@ impl Cagents {
         }
         let snapshot = self.persistent_workspace();
         self.record_shared_chat_identities();
+        let offer = self.snapshot_offer(snapshot, true);
         if let Some(writer) = self.session.as_ref() {
-            writer.replace_chat_identity(card, pending.candidate.id, current, snapshot);
+            let accepted = writer
+                .offer_chat_identity(card, pending.candidate.id, current, offer)
+                .is_ok();
+            self.snapshot_offer_answered(accepted);
         }
     }
     /// Forgets a chat runtime whose card is going away for good.
@@ -9600,12 +9604,20 @@ impl Cagents {
         // contains the exact candidate B and the still-editable text/images.
         let snapshot = self.persistent_workspace();
         self.record_shared_chat_identities();
-        let writer = self.session.as_ref().expect("writer was checked above");
         // Exact replacement equality is idempotent when B already landed;
         // otherwise the original A identity must still match. This explicit
         // Send never re-arms unrelated quarantined workspace writes.
-        writer.replace_chat_identity(target.card, source.id, candidate, snapshot);
-        let receipt = writer.request_flush();
+        let offer = self.snapshot_offer(snapshot, true);
+        let writer = self.session.as_ref().expect("writer was checked above");
+        let accepted = writer
+            .offer_chat_identity(target.card, source.id, candidate, offer)
+            .is_ok();
+        self.snapshot_offer_answered(accepted);
+        let receipt = self
+            .session
+            .as_ref()
+            .expect("writer was checked above")
+            .request_flush();
         cosmic::task::future(async move {
             let result = match receipt {
                 Ok(receipt) => tokio::task::spawn_blocking(move || {
@@ -10888,6 +10900,14 @@ impl Cagents {
                     // start is still checked against the inventory, because a
                     // lost reply is not proof the daemon started nothing.
                     return self.retire_chat(target.card, result.ok(), Some(session));
+                }
+                // Drain replica-only debt while the current start phase still
+                // supplies the snapshot's admission projection. Recovery below
+                // can commit identity authority without a complete snapshot.
+                if matches!(self.chat_ui.phases.get(&target.card),
+                    Some(Phase::Starting(attempt)) if attempt.target == target)
+                {
+                    self.materialize_replica_snapshot();
                 }
                 let Some(Phase::Starting(mut attempt)) = self
                     .chat_ui

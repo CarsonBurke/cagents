@@ -403,6 +403,7 @@ impl Cagents {
                 _ => Task::none(),
             };
         }
+        self.materialize_replica_snapshot();
         self.snapshot_workspace_scope();
         let discarded = if self.durable.active_channel != Some(id) {
             self.discard_unused_default_chats()
@@ -816,6 +817,7 @@ impl Cagents {
             }
         }
         drop(roots);
+        self.materialize_replica_snapshot();
         if was_channel {
             self.snapshot_workspace_scope();
         }

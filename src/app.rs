@@ -1164,13 +1164,41 @@ impl std::hash::Hash for HostedTerminalSource {
 
 /// Inclusive UI-thread wall time for a shared-model notification, including
 /// dispatch and projection. This does not measure rendering or presentation.
-struct WorkspaceUpdateTiming(std::time::Instant);
+struct WorkspaceUpdateTiming(std::time::Instant, &'static str);
+
+thread_local! {
+    static SNAPSHOT_CAPTURE_PARENT: std::cell::Cell<&'static str> = const { std::cell::Cell::new("outside_update") };
+}
+
+struct SnapshotCaptureParent(Option<&'static str>);
+impl SnapshotCaptureParent {
+    fn enter(message: &Message) -> Self {
+        if !tracing::enabled!(target: "cagents::workspace_pipeline", tracing::Level::DEBUG) {
+            return Self(None);
+        }
+        let parent = match message {
+            Message::WorkspaceModelObserved(_) => "observer",
+            Message::ReplicaCaptureDue(_) => "replica_timer",
+            _ => "other_update",
+        };
+        Self(Some(
+            SNAPSHOT_CAPTURE_PARENT.with(|active| active.replace(parent)),
+        ))
+    }
+}
+impl Drop for SnapshotCaptureParent {
+    fn drop(&mut self) {
+        if let Some(previous) = self.0 {
+            SNAPSHOT_CAPTURE_PARENT.with(|active| active.set(previous));
+        }
+    }
+}
 
 impl Drop for WorkspaceUpdateTiming {
     fn drop(&mut self) {
         tracing::debug!(
             target: "cagents::workspace_pipeline",
-            stage = "ui_update",
+            stage = self.1,
             elapsed_ns = self.0.elapsed().as_nanos().min(u64::MAX as u128) as u64,
             "Applied a shared workspace notification"
         );
@@ -1478,6 +1506,25 @@ impl Default for PanePresence {
 /// move plus this delay. Any other save in between carries it along, and
 /// nothing outside this window reads it before then.
 const NAVIGATION_SAVE_DELAY: Duration = Duration::from_secs(1);
+
+#[derive(Default)]
+struct ReplicaCapture {
+    pending: Option<ReplicaSnapshotDebt>,
+    generation: u64,
+    timer_armed: bool,
+    rejected: bool,
+    #[cfg(test)]
+    captures: usize,
+    #[cfg(test)]
+    offers: usize,
+}
+
+struct ReplicaSnapshotDebt {
+    changes: crate::session::SnapshotChanges,
+    registry: uuid::Uuid,
+    workspace: crate::model::WorkspaceId,
+    writer: crate::session::WriterIdentity,
+}
 
 /// What an update changed in the durable workspace beside focus, which decides
 /// when [`Cagents::apply_viewport`] hands the workspace to the writer.
@@ -4504,6 +4551,7 @@ pub enum Message {
     /// The delay on saving a change of navigation alone has passed, for the
     /// save armed with this generation; a superseded one is discarded.
     NavigationSaveDue(u64),
+    ReplicaCaptureDue(u64),
     /// The delay on saving runtime-reported card titles has passed.
     ReportedTitleSaveDue,
     /// The hold that began at this instant has lasted long enough to draw the
@@ -5240,6 +5288,7 @@ pub struct Cagents {
     lifecycle_sweep_generation: u64,
     /// A save of navigation alone is scheduled; see [`NAVIGATION_SAVE_DELAY`].
     navigation_save_pending: bool,
+    replica_capture: ReplicaCapture,
     /// Which timer is the scheduled save's: one armed for a burst that a save
     /// already wrote must not cut the next burst short.
     navigation_save_generation: u64,
@@ -7674,6 +7723,10 @@ impl Cagents {
     /// Snapshot the active strip before publishing its exact pane projection.
     /// Shared reconciliation supplies an already projected publication pass.
     fn save_workspace_with_view_publication(&mut self, publish: impl FnOnce(&mut Self)) {
+        self.save_projected_workspace(false, publish);
+    }
+
+    fn save_projected_workspace(&mut self, replica: bool, publish: impl FnOnce(&mut Self)) {
         self.shared_views.prune_restoration_requests(&self.durable);
         if !self.durable.pending_terminal_creations.is_empty() {
             let open = self
@@ -7689,20 +7742,183 @@ impl Cagents {
                 .pending_terminal_creations
                 .retain(|id| open.contains(id));
         }
-        self.navigation_save_pending = false;
         #[cfg(test)]
         terminal_output_tests::record_persist();
-        let saved = self.shared_window_snapshot_with(publish);
-        if let Some(session) = &self.session {
-            let adoptions = std::mem::take(&mut self.shared_views.adoptions);
-            let restorations = std::mem::take(&mut self.shared_views.restorations);
-            if adoptions.is_empty() && restorations.is_empty() {
-                session.snapshot(saved);
-            } else {
-                session.snapshot_terminal_panes(saved, adoptions, restorations);
-            }
+        self.snapshot_workspace_scope();
+        publish(self);
+        // Ordered identity work needs its exact complete snapshot now. Scope
+        // projection alone is not authority to coalesce these checkpoints.
+        tracing::debug!(target: "cagents::workspace_pipeline", stage = "replica_snapshot_policy",
+            replica, has_writer = self.session.is_some(),
+            adoptions = self.shared_views.adoptions.len(), restorations = self.shared_views.restorations.len(),
+            chat_adoptions = self.shared_views.chat_adoptions.len(), "Considered replica snapshot capture");
+        if replica
+            && self.session.is_some()
+            && self.shared_views.adoptions.is_empty()
+            && self.shared_views.restorations.is_empty()
+            && self.shared_views.chat_adoptions.is_empty()
+        {
+            self.mark_replica_snapshot(Instant::now());
+        } else {
+            self.capture_prepared_workspace(true);
         }
     }
+
+    fn mark_replica_snapshot(&mut self, now: Instant) {
+        let Some(writer) = &self.session else {
+            return;
+        };
+        if let Some(pending) = &mut self.replica_capture.pending {
+            pending.changes = pending
+                .changes
+                .merge(crate::session::SnapshotChanges::at(now));
+        } else {
+            self.replica_capture.generation = self.replica_capture.generation.wrapping_add(1);
+            self.replica_capture.pending = Some(ReplicaSnapshotDebt {
+                changes: crate::session::SnapshotChanges::at(now),
+                registry: self.workspace_model.identity,
+                workspace: self.durable.id,
+                writer: writer.writer_identity(),
+            });
+            self.replica_capture.rejected = false;
+        }
+    }
+
+    fn snapshot_offer(
+        &self,
+        state: Arc<WorkspaceState>,
+        ordinary: bool,
+    ) -> crate::session::SnapshotOffer {
+        let changes = self.replica_capture.pending.as_ref().map(|pending| {
+            if ordinary {
+                pending
+                    .changes
+                    .merge(crate::session::SnapshotChanges::at(Instant::now()))
+            } else {
+                pending.changes
+            }
+        });
+        crate::session::SnapshotOffer { state, changes }
+    }
+
+    fn snapshot_offer_answered(&mut self, accepted: bool) {
+        if accepted {
+            #[cfg(test)]
+            {
+                self.replica_capture.offers += 1;
+            }
+            self.replica_capture.pending = None;
+            self.replica_capture.generation = self.replica_capture.generation.wrapping_add(1);
+            self.replica_capture.timer_armed = false;
+            self.replica_capture.rejected = false;
+            self.navigation_save_pending = false;
+        } else if self.replica_capture.pending.is_some() {
+            // A poisoned or closed queue cannot recover by spinning timers.
+            // Retain the debt for an explicit save/recovery or replacement.
+            self.replica_capture.rejected = true;
+            self.replica_capture.timer_armed = false;
+        }
+    }
+
+    fn capture_prepared_workspace(&mut self, ordinary: bool) {
+        let started =
+            tracing::enabled!(target: "cagents::workspace_pipeline", tracing::Level::DEBUG)
+                .then(Instant::now);
+        let had_replica_debt = self.replica_capture.pending.is_some();
+        let mut accepted = false;
+        #[cfg(test)]
+        {
+            self.replica_capture.captures += 1;
+        }
+        let saved = self.persistent_workspace();
+        self.record_shared_chat_identities();
+        let offer = self.snapshot_offer(saved, ordinary);
+        if let Some(writer) = &self.session {
+            let result = if self.shared_views.adoptions.is_empty()
+                && self.shared_views.restorations.is_empty()
+            {
+                writer.offer_snapshot(offer)
+            } else {
+                writer.offer_terminal_panes(
+                    offer,
+                    self.shared_views.adoptions.clone(),
+                    self.shared_views.restorations.clone(),
+                )
+            };
+            if result.is_ok() {
+                self.shared_views.adoptions.clear();
+                self.shared_views.restorations.clear();
+            }
+            accepted = result.is_ok();
+            self.snapshot_offer_answered(accepted);
+        } else if self.replica_capture.pending.is_none() {
+            // Memory-only windows retain their existing navigation bookkeeping;
+            // this is not an accepted offer and acknowledges no replica debt.
+            self.navigation_save_pending = false;
+        }
+        if let Some(started) = started {
+            let parent = SNAPSHOT_CAPTURE_PARENT.with(std::cell::Cell::get);
+            tracing::debug!(target: "cagents::workspace_pipeline", stage = "window_snapshot_capture",
+                elapsed_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                parent, had_replica_debt, accepted, "Prepared a local window snapshot");
+        }
+    }
+
+    fn materialize_replica_snapshot(&mut self) {
+        if self.replica_capture.pending.is_some() {
+            self.capture_prepared_workspace(false);
+        }
+    }
+
+    fn arm_replica_capture(&mut self) -> Task<Message> {
+        if self.replica_capture.timer_armed || self.replica_capture.rejected {
+            return Task::none();
+        }
+        let Some(pending) = &self.replica_capture.pending else {
+            return Task::none();
+        };
+        let delay = pending
+            .changes
+            .deadline()
+            .saturating_duration_since(Instant::now());
+        let generation = self.replica_capture.generation;
+        self.replica_capture.timer_armed = true;
+        cosmic::task::future(async move {
+            tokio::time::sleep(delay).await;
+            Message::ReplicaCaptureDue(generation)
+        })
+    }
+
+    fn replica_capture_due(&mut self, generation: u64, now: Instant) -> Task<Message> {
+        if generation != self.replica_capture.generation || !self.replica_capture.timer_armed {
+            tracing::debug!(target: "cagents::workspace_pipeline", stage = "replica_snapshot_wake", outcome = "stale", "Handled replica snapshot timer");
+            return Task::none();
+        }
+        self.replica_capture.timer_armed = false;
+        let Some(pending) = &self.replica_capture.pending else {
+            tracing::debug!(target: "cagents::workspace_pipeline", stage = "replica_snapshot_wake", outcome = "stale", "Handled replica snapshot timer");
+            return Task::none();
+        };
+        if pending.registry != self.workspace_model.identity
+            || pending.workspace != self.durable.id
+            || !self
+                .session
+                .as_ref()
+                .is_some_and(|writer| writer.owns_writer(&pending.writer))
+        {
+            tracing::debug!(target: "cagents::workspace_pipeline", stage = "replica_snapshot_wake", outcome = "owner_changed", "Handled replica snapshot timer");
+            self.replica_capture.rejected = true;
+            return Task::none();
+        }
+        if now < pending.changes.deadline() {
+            tracing::debug!(target: "cagents::workspace_pipeline", stage = "replica_snapshot_wake", outcome = "early", "Handled replica snapshot timer");
+            return self.arm_replica_capture();
+        }
+        tracing::debug!(target: "cagents::workspace_pipeline", stage = "replica_snapshot_wake", outcome = "capture", "Handled replica snapshot timer");
+        self.materialize_replica_snapshot();
+        Task::none()
+    }
+
     /// The window to save, after publishing this window's own edits to the
     /// shared views it shows. An edit saved but not published is undone by
     /// the next shared projection, and storage refuses the snapshot that
@@ -7744,8 +7960,10 @@ impl Cagents {
         match self.install_chat_session(card, session) {
             Some(true) => {
                 let saved = self.shared_window_snapshot();
+                let offer = self.snapshot_offer(saved, true);
                 if let Some(writer) = &self.session {
-                    writer.snapshot_conversion(saved);
+                    let accepted = writer.offer_conversion(offer).is_ok();
+                    self.snapshot_offer_answered(accepted);
                 }
             }
             Some(false) => self.persist(),
@@ -7816,8 +8034,12 @@ impl Cagents {
             return;
         }
         let saved = self.shared_window_snapshot();
+        let offer = self.snapshot_offer(saved, true);
         if let Some(writer) = &self.session {
-            writer.replace_chat_identity(card, expected, session, saved);
+            let accepted = writer
+                .offer_chat_identity(card, expected, session, offer)
+                .is_ok();
+            self.snapshot_offer_answered(accepted);
         }
     }
 
@@ -7845,8 +8067,10 @@ impl Cagents {
         self.cards.insert(card, CardRuntime::Loading);
         self.card_chrome.remove(&card);
         let saved = self.shared_window_snapshot();
+        let offer = self.snapshot_offer(saved, true);
         if let Some(writer) = &self.session {
-            writer.snapshot_conversion(saved);
+            let accepted = writer.offer_conversion(offer).is_ok();
+            self.snapshot_offer_answered(accepted);
         }
         self.pending_terminal_handoffs
             .insert(session.id, session.clone());
@@ -7883,6 +8107,7 @@ impl Cagents {
         {
             return Task::none();
         }
+        self.materialize_replica_snapshot();
         let Some(writer) = &self.session else {
             return Task::none();
         };
@@ -14206,6 +14431,7 @@ impl Cagents {
     }
 
     fn capture_workspace_save(&mut self) -> Result<WorkspaceSave, String> {
+        self.materialize_replica_snapshot();
         let flush = self
             .session
             .as_ref()
@@ -15089,6 +15315,7 @@ impl Application for Cagents {
             lifecycle_sweep_deadline: None,
             lifecycle_sweep_generation: 0,
             navigation_save_pending: false,
+            replica_capture: ReplicaCapture::default(),
             navigation_save_generation: 0,
             keyboard_owed: None,
             reported_title_save: ReportedTitleSave::default(),
@@ -15213,9 +15440,21 @@ impl Application for Cagents {
     fn update(&mut self, message: Message) -> Task<Message> {
         // Include dispatch and the shared projection tail. The trace is opt-in;
         // an ordinary update does not read the clock or allocate.
-        let _workspace_timing = (matches!(&message, Message::WorkspaceModelObserved(_))
+        let _capture_parent = SnapshotCaptureParent::enter(&message);
+        let timer_update = matches!(&message, Message::ReplicaCaptureDue(_));
+        let _workspace_timing = ((matches!(&message, Message::WorkspaceModelObserved(_))
+            || timer_update)
             && tracing::enabled!(target: "cagents::workspace_pipeline", tracing::Level::DEBUG))
-        .then(|| WorkspaceUpdateTiming(std::time::Instant::now()));
+        .then(|| {
+            WorkspaceUpdateTiming(
+                std::time::Instant::now(),
+                if timer_update {
+                    "replica_snapshot_timer"
+                } else {
+                    "ui_update"
+                },
+            )
+        });
         if let Some(settled) = self.settle_chat_close_confirm() {
             // An answer to the question that just ended must not answer the
             // next one, which the reader has not seen.
@@ -15364,9 +15603,8 @@ impl Application for Cagents {
                 | Message::FocusAdjacent(_)
                 | Message::WindowResized(..)
         );
-        #[cfg(test)]
         let model_update = matches!(&message, Message::WorkspaceModelObserved(_));
-        let mut projection = if repaint_tick(&message) || self.navigation_save_is_stale(&message) {
+        let mut projection = if repaint_tick(&message) || matches!(message, Message::ReplicaCaptureDue(_)) || self.navigation_save_is_stale(&message) {
             Projection::Unchanged
         } else {
             Projection::Full
@@ -17445,6 +17683,7 @@ impl Application for Cagents {
                 self.chrome_ui.workspace_switcher_shown = true;
                 self.reveal_workspace_selection()
             }
+            Message::ReplicaCaptureDue(generation) => self.replica_capture_due(generation, Instant::now()),
             Message::NavigationSaveDue(generation) => {
                 if self.navigation_save_due(generation) {
                     self.persist();
@@ -18598,6 +18837,7 @@ impl Application for Cagents {
                 Task::none()
             }
             Message::RetrySessionSave => {
+                self.materialize_replica_snapshot();
                 if let (Some(session), Some(health)) = (&self.session, &mut self.save_health) {
                     health.request_retry(session);
                 }
@@ -18846,6 +19086,9 @@ impl Application for Cagents {
         if scoped_source.is_some_and(|source| source.as_ptr() != Arc::as_ptr(&self.durable)) {
             projection = Projection::Full;
         }
+        if model_update && matches!(projection, Projection::Full | Projection::Chrome) {
+            self.materialize_replica_snapshot();
+        }
         if projection == Projection::Full {
             self.sync_worktree_protections();
         }
@@ -18883,10 +19126,9 @@ impl Application for Cagents {
                     _ => self.sync_chrome(),
                 };
                 phase.mark("selected_chrome");
+                let snapshot = if matches!(projection, Projection::ScopedChrome(_)) { self.arm_replica_capture() } else { Task::none() };
                 return Task::batch([
-                    task,
-                    chrome,
-                    notices,
+                    task, chrome, notices, snapshot,
                     self.release_deferred_navigation_if_unblocked(),
                 ]);
             }
@@ -30860,6 +31102,7 @@ mod tests {
             lifecycle_sweep_deadline: None,
             lifecycle_sweep_generation: 0,
             navigation_save_pending: false,
+            replica_capture: ReplicaCapture::default(),
             navigation_save_generation: 0,
             keyboard_owed: None,
             reported_title_save: ReportedTitleSave::default(),
