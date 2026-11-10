@@ -2376,7 +2376,7 @@ mod tests {
                         output.extend(text.chars().map(|ch| (ch, link.clone())));
                     }
                 }
-                Item::Image { alt: text, .. } | Item::Image { alt: text, .. } => {
+                Item::Image { alt: text, .. } => {
                     for span in text.spans.iter() {
                         let Span::Standard { text, link, .. } = span;
                         output.extend(text.chars().map(|ch| (ch, link.clone())));
