@@ -91,6 +91,8 @@ pub mod latency_fixture;
 pub mod layout_metrics;
 #[cfg(feature = "ui")]
 pub mod lifecycle;
+#[cfg(any(feature = "ui", feature = "host"))]
+pub(crate) mod lineage_birth;
 pub mod linear;
 pub mod location;
 #[cfg(feature = "ui")]
