@@ -85,29 +85,48 @@ pub(crate) fn embedded_protocol_frame(line: &[u8]) -> bool {
 /// where it starts. Claude Code appends to a file a crash left mid-record,
 /// so the next record shares that record's line.
 fn trailing_record(line: &[u8]) -> Option<(usize, Value)> {
-    // Inspect a bounded number of objects, however many braces a line has.
-    const CANDIDATES: usize = 256;
     let end = line.len()
         - line
             .iter()
             .rev()
             .take_while(|byte| byte.is_ascii_whitespace())
             .count();
-    let mut start = 1;
-    for _ in 0..CANDIDATES {
-        let at = start
-            + line
-                .get(start..end)?
-                .iter()
-                .position(|byte| *byte == b'{')?;
-        let mut values = serde_json::Deserializer::from_slice(&line[at..end]).into_iter::<Value>();
-        match values.next() {
-            Some(Ok(value)) if at + values.byte_offset() == end => {
-                return (value.is_object() && value["type"].is_string()).then_some((at, value));
+    if line.get(end.checked_sub(1)?) != Some(&b'}') {
+        return None;
+    }
+    // A valid trailing object has balanced braces and quoted strings even
+    // when everything before it is damaged. Match its opening brace from the
+    // end, then parse that candidate once. No prefix can make us repeatedly
+    // parse the same large suffix.
+    let mut position = end;
+    let mut depth = 0usize;
+    let mut quoted = false;
+    while position > 0 {
+        position -= 1;
+        match line[position] {
+            b'"' => {
+                let mut escapes = position;
+                while escapes > 0 && line[escapes - 1] == b'\\' {
+                    escapes -= 1;
+                }
+                if (position - escapes) % 2 == 0 {
+                    quoted = !quoted;
+                }
+                // Count every escape run only once during the reverse scan.
+                position = escapes;
             }
-            // An object nested in the damaged record ends before the line.
-            Some(Ok(_)) => start = at + values.byte_offset(),
-            _ => start = at + 1,
+            b'}' if !quoted => depth += 1,
+            b'{' if !quoted => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    if position == 0 {
+                        return None;
+                    }
+                    let value: Value = serde_json::from_slice(&line[position..end]).ok()?;
+                    return value["type"].is_string().then_some((position, value));
+                }
+            }
+            _ => {}
         }
     }
     None
