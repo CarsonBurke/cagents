@@ -856,27 +856,49 @@ pub(super) fn find_anchor(
     })
 }
 
+/// Row bounds for anchoring, and which of them only a placeholder reported.
 struct ItemBounds<'a> {
     ids: std::collections::HashMap<Id, Vec<&'a str>>,
     rows: std::collections::HashMap<&'a str, Rectangle>,
     wanted: HashSet<u64>,
-    virtual_rows: Vec<(String, Rectangle)>,
+    /// Each fine-grained anchor, and whether its row is mounted.
+    virtual_rows: Vec<(String, Rectangle, bool)>,
+    /// Items whose bounds came from a virtual column's placeholder rather
+    /// than their laid-out widget: an unmounted row's estimate, or the whole
+    /// virtual row for each item it aliases.
+    placeholders: HashSet<&'a str>,
+    /// A virtual column reports its placeholder aliases between its
+    /// [`virtualized::PlaceholderPolicy`] and its traversal of mounted rows.
+    in_placeholders: bool,
 }
 impl Operation for ItemBounds<'_> {
     fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+        self.in_placeholders = false;
         visit(self);
+        self.in_placeholders = false;
     }
     fn custom(&mut self, _: Option<&Id>, bounds: Rectangle, state: &mut dyn std::any::Any) {
+        if state.is::<virtualized::PlaceholderPolicy>() {
+            self.in_placeholders = true;
+            return;
+        }
         self.virtual_rows.extend(
             virtualized::anchor_points(state, bounds, &self.wanted)
                 .into_iter()
-                .map(|(key, bounds)| (format!("virtual-chunk-{key:016x}"), bounds)),
+                .map(|(key, bounds, mounted)| {
+                    (format!("virtual-chunk-{key:016x}"), bounds, mounted)
+                }),
         );
     }
     fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
         if let Some(id) = id.and_then(|id| self.ids.get(id)) {
             for id in id {
                 self.rows.insert(*id, bounds);
+                if self.in_placeholders {
+                    self.placeholders.insert(id);
+                } else {
+                    self.placeholders.remove(id);
+                }
             }
         }
     }
@@ -916,6 +938,35 @@ impl Geometry {
 struct Row {
     id: String,
     bounds: Rectangle,
+    /// Only a virtual column's placeholder reported these bounds.
+    placeholder: bool,
+}
+
+/// Where one layout pass puts the reader's top.
+struct Position {
+    top: f32,
+    /// The row this was anchored to has only placeholder bounds in the new
+    /// layout, while it was measured where the reader left it. Once the
+    /// viewport moves there, the row is mounted and the place can be exact.
+    estimated: bool,
+}
+
+impl Position {
+    fn exact(top: f32) -> Self {
+        Self {
+            top,
+            estimated: false,
+        }
+    }
+}
+
+/// What a layout pass asks of the native offset, as a distance from the end.
+enum Placement {
+    /// The reader's place is decided, and the offset moves only if given.
+    Settled(Option<f32>),
+    /// The reader's saved place is kept, and the offset moves to an estimate
+    /// of it so the rows it is anchored to are mounted for the next pass.
+    Estimated(f32),
 }
 
 #[derive(Default)]
@@ -931,13 +982,19 @@ struct Context {
 }
 
 impl Context {
-    fn position(&self, next: Geometry, rows: &[(&str, Rectangle)], follow_end: bool) -> f32 {
+    fn position(
+        &self,
+        next: Geometry,
+        rows: &[(&str, Rectangle)],
+        placeholders: &HashSet<&str>,
+        follow_end: bool,
+    ) -> Position {
         let Some((previous, top)) = self.geometry.zip(self.top) else {
-            return if self.subagent.is_some() {
+            return Position::exact(if self.subagent.is_some() {
                 0.0
             } else {
                 next.travel()
-            };
+            });
         };
         // Fitting live content normally follows its end. But an earlier page
         // can prepend surviving rows to that same short transcript: preserve
@@ -959,12 +1016,12 @@ impl Context {
             && previous.travel() - top <= 0.5
             && (previous.travel() > 0.0 || self.subagent.is_none())
         {
-            return next.travel();
+            return Position::exact(next.travel());
         }
         // A recreated widget can restore authoritative native geometry from
         // the Runtime before it has any measured row anchors.
         if self.rows.is_empty() {
-            return top.clamp(0.0, next.travel());
+            return Position::exact(top.clamp(0.0, next.travel()));
         }
         // Most relayouts only refresh a timer or hover state. Avoid building
         // a lookup table when every measured row is unchanged.
@@ -975,7 +1032,7 @@ impl Context {
                 .zip(rows)
                 .all(|(old, (id, bounds))| old.id == *id && old.bounds == *bounds)
         {
-            return top.clamp(0.0, next.travel());
+            return Position::exact(top.clamp(0.0, next.travel()));
         }
         let next_rows: std::collections::HashMap<_, _> = rows.iter().copied().collect();
         // Preserve the first visible surviving exchange, not the transcript's
@@ -986,33 +1043,60 @@ impl Context {
                     && row.bounds.y < top + previous.viewport.height
             })
         };
+        // A row measured where the reader left it, but only a placeholder
+        // now, gives an estimated place.
+        fn surviving<'r>(
+            row: &'r Row,
+            next_rows: &std::collections::HashMap<&str, Rectangle>,
+            placeholders: &HashSet<&str>,
+        ) -> Option<(&'r Row, Rectangle, bool)> {
+            let bounds = *next_rows.get(row.id.as_str())?;
+            Some((
+                row,
+                bounds,
+                !row.placeholder && placeholders.contains(row.id.as_str()),
+            ))
+        }
+        let surviving = |row| surviving(row, &next_rows, placeholders);
+        let chunk = |row: &&Row| row.id.starts_with("virtual-chunk-");
+        // A placeholder's bounds are an estimate, or the whole virtual row for
+        // each item it aliases, so an offset within them lands somewhere else.
+        // Anchor to a row measured in both layouts when one is visible.
+        let measured = |row: &&Row| !row.placeholder;
         let overlap = visible()
-            .filter(|row| row.id.starts_with("virtual-chunk-"))
-            .filter_map(|row| next_rows.get(row.id.as_str()).map(|bounds| (row, bounds)))
-            .next()
+            .filter(chunk)
+            .filter(measured)
+            .filter_map(surviving)
+            .find(|(.., estimated)| !estimated)
             .or_else(|| {
                 visible()
-                    .filter_map(|row| next_rows.get(row.id.as_str()).map(|bounds| (row, bounds)))
-                    .next()
+                    .filter(measured)
+                    .filter_map(surviving)
+                    .find(|(.., estimated)| !estimated)
             })
+            .or_else(|| visible().filter(chunk).filter_map(surviving).next())
+            .or_else(|| visible().filter_map(surviving).next())
             .or_else(|| {
                 // Front eviction can remove every visible exchange. Keep the
                 // nearest surviving boundary instead of jumping to live output.
+                // Its row was not in view, so mounting it would not refine
+                // the reader's place.
                 self.rows
                     .iter()
-                    .filter_map(|row| next_rows.get(row.id.as_str()).map(|bounds| (row, bounds)))
-                    .min_by(|(a, _), (b, _)| {
+                    .filter_map(surviving)
+                    .min_by(|(a, ..), (b, ..)| {
                         (a.bounds.y - top)
                             .abs()
                             .total_cmp(&(b.bounds.y - top).abs())
                     })
+                    .map(|(row, bounds, _)| (row, bounds, false))
             });
         let fallback = if self.preserve.is_some_and(|preserve| preserve.arrived) {
             top.clamp(0.0, next.travel())
         } else {
             next.travel()
         };
-        overlap.map_or(fallback, |(old, new)| {
+        overlap.map_or(Position::exact(fallback), |(old, new, estimated)| {
             let within = top - old.bounds.y;
             // A disclosure or reflow may shorten the anchored exchange itself.
             // Do not carry an offset past its new end into an unrelated turn.
@@ -1021,21 +1105,33 @@ impl Context {
             } else {
                 within
             };
-            (new.y + within).clamp(0.0, next.travel())
+            Position {
+                top: (new.y + within).clamp(0.0, next.travel()),
+                estimated,
+            }
         })
     }
 
-    fn remember(&mut self, next: Geometry, rows: &[(&str, Rectangle)], top: f32) {
+    fn remember(
+        &mut self,
+        next: Geometry,
+        rows: &[(&str, Rectangle)],
+        placeholders: &HashSet<&str>,
+        top: f32,
+    ) {
         for (index, (id, bounds)) in rows.iter().enumerate() {
+            let placeholder = placeholders.contains(*id);
             if let Some(row) = self.rows.get_mut(index) {
                 if row.id != *id {
                     row.id = (*id).to_owned();
                 }
                 row.bounds = *bounds;
+                row.placeholder = placeholder;
             } else {
                 self.rows.push(Row {
                     id: (*id).to_owned(),
                     bounds: *bounds,
+                    placeholder,
                 });
             }
         }
@@ -1113,10 +1209,12 @@ impl Anchor {
         next: Geometry,
         current_top: Option<f32>,
     ) -> Option<f32> {
-        self.layout_following(subagent, rows, next, current_top, true)
+        self.layout_measured(subagent, rows, next, current_top, true)
     }
 
-    fn layout_following(
+    /// A pass over `rows` that were all measured.
+    #[cfg(test)]
+    fn layout_measured(
         &mut self,
         subagent: Option<&str>,
         rows: &[(&str, Rectangle)],
@@ -1124,6 +1222,34 @@ impl Anchor {
         current_top: Option<f32>,
         follow_end: bool,
     ) -> Option<f32> {
+        match self.layout_following(
+            subagent,
+            rows,
+            &HashSet::new(),
+            next,
+            current_top,
+            follow_end,
+            true,
+        ) {
+            Placement::Settled(bottom) => bottom,
+            Placement::Estimated(_) => unreachable!("a settling pass decides"),
+        }
+    }
+
+    /// `placeholders` names the `rows` only a placeholder reported. Unless
+    /// `settle` is set, a pass that could anchor the reader only to such a
+    /// row keeps the saved place and returns [`Placement::Estimated`].
+    #[allow(clippy::too_many_arguments)]
+    fn layout_following(
+        &mut self,
+        subagent: Option<&str>,
+        rows: &[(&str, Rectangle)],
+        placeholders: &HashSet<&str>,
+        next: Geometry,
+        current_top: Option<f32>,
+        follow_end: bool,
+        settle: bool,
+    ) -> Placement {
         if let Some(index) = self.active
             && let Some(top) = current_top
         {
@@ -1154,11 +1280,21 @@ impl Anchor {
         let freeze_reading = old_bottom.is_some_and(|bottom| bottom > 0.5)
             && context.geometry.is_some_and(|previous| previous != next);
         let edge = context.edge;
-        let top = match edge {
-            Some(Edge::Start) => 0.0,
-            Some(Edge::End | Edge::Latest) => next.travel(),
-            None => context.position(next, rows, follow_end),
+        let position = match edge {
+            Some(Edge::Start) => Position::exact(0.0),
+            Some(Edge::End | Edge::Latest) => Position::exact(next.travel()),
+            None => context.position(next, rows, placeholders, follow_end),
         };
+        if position.estimated && !settle {
+            // Remembering this pass would replace the measured place with the
+            // estimate, and the next pass would faithfully keep the estimate.
+            self.active = Some(index);
+            if switched {
+                self.pending_input = false;
+            }
+            return Placement::Estimated(next.travel() - position.top);
+        }
+        let top = position.top;
         // Either explicit edge remains deliberate while a nonempty prepared
         // source fits, including a child that would otherwise start on growth.
         // A genuine empty reset consumes it.
@@ -1168,7 +1304,7 @@ impl Anchor {
         context.follow_end = follow_end && (rows.is_empty() || edge != Some(Edge::Start));
         let bottom = next.travel() - top;
         context.used = self.clock;
-        context.remember(next, rows, top);
+        context.remember(next, rows, placeholders, top);
         if let Some(preserve) = &mut context.preserve
             && preserve.arrived
         {
@@ -1182,11 +1318,13 @@ impl Anchor {
         if switched {
             self.pending_input = false;
         }
-        (edge.is_some()
-            || switched
-            || freeze_reading
-            || old_bottom.is_none_or(|old| (old - bottom).abs() > 0.5))
-        .then_some(bottom)
+        Placement::Settled(
+            (edge.is_some()
+                || switched
+                || freeze_reading
+                || old_bottom.is_none_or(|old| (old - bottom).abs() > 0.5))
+            .then_some(bottom),
+        )
     }
 }
 
@@ -1460,7 +1598,9 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
             );
         }
         let mut node = self.content.as_widget_mut().layout(child, renderer, limits);
-        for _ in 0..4 {
+        const PASSES: usize = 4;
+        let mut settle = false;
+        for pass in 0..PASSES {
             let next = Geometry {
                 viewport: node.size(),
                 content: node.children()[0].size(),
@@ -1494,6 +1634,8 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 rows: Default::default(),
                 wanted,
                 virtual_rows: vec![],
+                placeholders: HashSet::new(),
+                in_placeholders: false,
             };
             self.content.as_widget_mut().operate(
                 child,
@@ -1506,7 +1648,15 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 measured
                     .virtual_rows
                     .iter()
-                    .map(|(key, bounds)| (key.as_str(), *bounds)),
+                    .map(|(key, bounds, _)| (key.as_str(), *bounds)),
+            );
+            let mut placeholders = measured.placeholders;
+            placeholders.extend(
+                measured
+                    .virtual_rows
+                    .iter()
+                    .filter(|(.., mounted)| !mounted)
+                    .map(|(key, ..)| key.as_str()),
             );
             rows.sort_by(|a, b| a.1.y.total_cmp(&b.1.y));
             // A superseded Latest fetch may replace every old row. Wait for
@@ -1520,7 +1670,11 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                     context.edge.is_none()
                         && context.preserve.is_some_and(|preserve| preserve.arrived)
                 })
-                .map(|context| context.position(next, &rows, self.follow_end))
+                .map(|context| {
+                    context
+                        .position(next, &rows, &placeholders, self.follow_end)
+                        .top
+                })
                 .filter(|top| {
                     rows.iter().any(|(id, bounds)| {
                         self.preparing.contains(id)
@@ -1553,9 +1707,23 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
             }
             self.restoration_pending = source_pending;
             state.restore = false;
-            let offset = anchor
-                .layout_following(self.subagent, &rows, next, top.0, self.follow_end)
-                .or_else(|| {
+            // A returning tree mounts only rows near the end, so the rows the
+            // reader left are placeholders in its first pass. That pass only
+            // moves the native offset toward them; the next one, with them
+            // mounted, places the reader from the saved measurements.
+            let placement = anchor.layout_following(
+                self.subagent,
+                &rows,
+                &placeholders,
+                next,
+                top.0,
+                self.follow_end,
+                settle || pass + 1 == PASSES,
+            );
+            let estimated = matches!(placement, Placement::Estimated(_));
+            let offset = match placement {
+                Placement::Estimated(bottom) => Some(bottom),
+                Placement::Settled(bottom) => bottom.or_else(|| {
                     restore.then(|| {
                         next.travel()
                             - anchor
@@ -1563,7 +1731,8 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                                 .and_then(|index| anchor.contexts[index].top)
                                 .unwrap_or_default()
                     })
-                });
+                }),
+            };
             if let Some(offset) = offset {
                 self.content.as_widget_mut().operate(
                     child,
@@ -1571,7 +1740,9 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                     renderer,
                     &mut SetBottom(offset),
                 );
-                top.0 = Some((next.travel() - offset).max(0.0));
+                // An estimate is not where the reader is: the next pass starts
+                // from the saved place, and must apply whatever it settles on.
+                top.0 = (!estimated).then(|| (next.travel() - offset).max(0.0));
             } else if top.0.is_some() {
                 // The native offset kept its distance from the end, which is
                 // where this pass decided the reader is. A later pass in this
@@ -1580,7 +1751,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 // makes a reader following the end look scrolled away.
                 top.0 = anchor.active.and_then(|index| anchor.contexts[index].top);
             }
-            restore = false;
+            restore = estimated;
             let mut virtual_viewport = virtualized::UpdateViewport::default();
             self.content.as_widget_mut().operate(
                 child,
@@ -1589,6 +1760,12 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 &mut virtual_viewport,
             );
             if !virtual_viewport.changed {
+                if estimated {
+                    // Moving there mounts nothing more, so these rows are as
+                    // measured as this layout gets: settle on them.
+                    settle = true;
+                    continue;
+                }
                 state.revealing &= self.restoration_pending;
                 state.needs_layout = false;
                 break;
@@ -5408,10 +5585,10 @@ mod tests {
     fn forward_history_preserves_boundary_instead_of_following_new_page_end() {
         let mut anchor = Anchor::default();
         let previous = rows(&[("older", 0.0, 800.0), ("boundary", 800.0, 500.0)]);
-        anchor.layout_following(None, &previous, geometry(1300.0), None, false);
+        anchor.layout_measured(None, &previous, geometry(1300.0), None, false);
         let next = rows(&[("boundary", 0.0, 500.0), ("newer", 500.0, 1200.0)]);
         assert_eq!(
-            anchor.layout_following(None, &next, geometry(1700.0), Some(900.0), true),
+            anchor.layout_measured(None, &next, geometry(1700.0), Some(900.0), true),
             Some(1200.0)
         );
         assert_eq!(anchor.contexts[0].top, Some(100.0));
@@ -5421,10 +5598,10 @@ mod tests {
     fn backward_history_from_live_bottom_preserves_overlapping_exchange() {
         let mut anchor = Anchor::default();
         let previous = rows(&[("boundary", 0.0, 500.0), ("live", 500.0, 700.0)]);
-        anchor.layout_following(None, &previous, geometry(1200.0), None, true);
+        anchor.layout_measured(None, &previous, geometry(1200.0), None, true);
         let next = rows(&[("older", 0.0, 700.0), ("boundary", 700.0, 500.0)]);
         assert_eq!(
-            anchor.layout_following(None, &next, geometry(1200.0), Some(0.0), false),
+            anchor.layout_measured(None, &next, geometry(1200.0), Some(0.0), false),
             Some(100.0)
         );
         assert_eq!(anchor.contexts[0].top, Some(700.0));

@@ -5,6 +5,7 @@
 - [Development runner](#development-runner)
 - [Build and test resource usage](#build-and-test-resource-usage)
 - [Testing](#testing)
+- [Shared GitHub traffic](#shared-github-traffic)
 - [Native evidence](#native-evidence)
 - [Installer and package checks](#installer-and-package-checks)
 - [Troubleshooting](#troubleshooting)
@@ -1264,8 +1265,7 @@ A bare `cargo test` runs only the shared CLI lane: under the default `full`
 feature, the `ui` and `host` unit tests are compiled out. Cargo skips integration
 targets whose required features are absent, rather than compiling and linking
 empty harnesses. The host-only terminal workload example is also skipped outside
-its lane. Cover the boundaries a change touches; prepare the HOST prerequisites
-below before running that lane:
+its lane. Cover the boundaries a change touches:
 
 ```sh
 scripts/cargo-gate test --locked --no-default-features --all-targets
@@ -1277,15 +1277,14 @@ An SSH login has a soft limit of 1024 open files, and whatever it starts, with
 `nohup` or `setsid` included, inherits that. A UI test run can exceed it and fail
 with `Too many open files`, so run `ulimit -n 65536` first.
 
-HOST fixtures that exec retained actors require
-`CAGENTS_TEST_RETAINED_ACTOR_HELPER` to name a `cagentsd` built from the same
-checkout and source state as the tests. Build it immediately before testing,
-keeping sources, Cargo environment, target, configuration and any explicit
-profile overrides fixed. Ordinary build and test profile defaults differ as
-expected.
-The existing artifact helper reads Cargo's exact executable path, including
-configured target directories/triples. A matching version alone does not prove
-that two dirty source trees match.
+The gate prepares HOST fixtures automatically. Before running HOST tests it
+builds `cagentsd` in the same admitted build slot, from the same source copy and
+Cargo environment, then sets `CAGENTS_TEST_RETAINED_ACTOR_HELPER` to Cargo's exact
+executable path. It keeps the test command's profile, target, feature and config
+options; with no profile option, the helper uses the test profile. A failed helper
+build stops the command before the tests run. CLI and UI lanes do not build it.
+This also works for narrow HOST library tests. An explicitly supplied helper
+variable is preserved, for qualifications that prepare their own matched binary.
 
 Through the gate, which is how a hosted agent runs it, there is no base to
 choose. The build host gives each slot a short, private `TMPDIR` such as
@@ -1297,21 +1296,11 @@ directory isn't private to you, the slot falls back to its own `tmp` under
 `~/.cache`, which is too long for the socket budget and inside the home, where
 the bundled-skill tests below refuse to install.
 
-```sh
-(
-    CAGENTS_TEST_RETAINED_ACTOR_HELPER=$(
-        scripts/cargo-gate exec python3 scripts/build-ceditor-product cagentsd --locked \
-            --no-default-features --features host --bin cagentsd
-    ) || exit
-    export CAGENTS_TEST_RETAINED_ACTOR_HELPER
-    scripts/cargo-gate test --locked --no-default-features --features host --all-targets
-)
-```
+The ordinary HOST command needs no environment setup:
 
-The gate sends the helper, which is in the target, to the build host and points
-the variable at its copy there. It refuses a `CAGENTS_` setting that names a
-path outside the checkout and its target, which the build host doesn't have;
-`CAGENTS_BUILD_*` settings and the gate's own are exempt.
+```sh
+scripts/cargo-gate test --locked --no-default-features --features host --all-targets
+```
 
 For a local HOST run, with `CAGENTS_BUILD_REMOTE=local`, select an existing
 private **disk-backed** base with a short, physical absolute path. Verify its
@@ -1338,18 +1327,12 @@ mkdir -p -m 700 /var/tmp/ct
     TMPDIR=$(mktemp -d /var/tmp/ct/tXXXXXX) || exit
     export TMPDIR
     printf 'Fixture root (retain until children settle): %s\n' "$TMPDIR"
-    CAGENTS_TEST_RETAINED_ACTOR_HELPER=$(
-        scripts/cargo-gate exec python3 scripts/build-ceditor-product cagentsd --locked \
-            --no-default-features --features host --bin cagentsd
-    ) || exit
-    export CAGENTS_TEST_RETAINED_ACTOR_HELPER
     scripts/cargo-gate test --locked --no-default-features --features host --all-targets
 )
 ```
 
-A helper build failure prevents the test command. Use the same preparation for
-narrow HOST targets that need retained actors. Keep the temporary root and any
-separately retained fixture evidence until their original children have settled;
+Keep the temporary root and any separately retained fixture evidence until their
+original children have settled;
 this recipe deliberately installs no automatic deletion trap. Do not change
 socket limits, remove enclosing Git markers or silently select another fixture
 root to make a failed preparation pass.
@@ -1373,11 +1356,32 @@ scripts/cargo-gate test --locked --no-default-features --features ui --test sess
 ```
 
 For focused root library tests, compile one isolated test harness and run the
-Cargo-reported executable directly, after its build admission has ended:
+Cargo-reported executable directly, after its build admission has ended.
+
+`--no-run` only compiles tests. A later direct harness launch, including
+`scripts/test-lib host`, must receive its own matched helper, because it runs
+outside the gate. Prepare it immediately before that launch, without changing
+sources, Cargo environment, target or profile:
+
+```sh
+(
+    CAGENTS_TEST_RETAINED_ACTOR_HELPER=$(
+        scripts/cargo-gate exec /usr/bin/python3 scripts/build-ceditor-product cagentsd --locked \
+            --no-default-features --features host --profile test --bin cagentsd
+    ) || exit
+    export CAGENTS_TEST_RETAINED_ACTOR_HELPER
+    scripts/test-lib host --prefix terminal:: --test-threads 1
+)
+```
+
+Use the same profile option in both commands when overriding it. The gate
+translates a supplied helper path inside the checkout or target to its build-host
+copy; a path outside both is refused. A matching version alone does not prove
+that binaries from two dirty source trees match. CLI and UI focused runs need no
+helper:
 
 ```sh
 scripts/test-lib cli search_match::tests::overlapping_occurrences_keep_the_best_boundary_rank
-scripts/test-lib host --prefix terminal:: --test-threads 1
 scripts/test-lib ui --profile dev-runtime --prefix app::chat_ui::
 ```
 
@@ -1505,6 +1509,109 @@ the runner and exercise the changed path. For browser or feature-boundary
 changes, verify both the browserless and integrated lanes. Performance
 workloads are described in [Performance](performance.md).
 
+## Shared GitHub traffic
+
+Use the shared, on-demand status cache instead of a watcher per agent:
+
+```sh
+cagents gh pr-status 1234 -R CarsonBurke/cagents --json
+```
+
+The command requires an explicit repository, needs no daemon, and reads PR,
+head, CI, review and merge state in one GraphQL request. Local callers with
+the same gh credential context share one refresh per PR every 120 seconds;
+when nobody reads it, it makes no requests. Check `data.stale`, `data.error`,
+`data.retry_at` and `data.snapshot.pull_request.headRefOid` before acting.
+A failed refresh exits nonzero and labels any retained snapshot stale.
+Exit zero confirms a readable snapshot; inspect `checks_state` to decide
+whether CI passed, failed or is pending.
+The aggregate check state covers all contexts; `checks_complete=false` means
+the displayed context list stops at 100. No reported checks means unknown,
+not passing. Enterprise repositories also accept `--hostname HOST`.
+
+The app and Ceditor share a resumable review-request scan per repository and
+credential context. A settled scan waits 60 seconds, and continuation pages
+wait at least six seconds. Background monitoring still serves desktop review
+alerts; hidden inspector and review panes retain their existing visibility
+guards. Private snapshots and resource-aware cooldowns live under
+`${XDG_STATE_HOME:-~/.local/state}/cagents/github-status`. Token environment
+and gh account/configuration changes select another cache. Rotating a keyring
+secret without changing its account/configuration is not detected locally.
+
+To measure a repository agent shell without generating additional requests,
+opt that shell into observation explicitly:
+
+```sh
+scripts/gh-observe run --real /usr/bin/gh -- bash
+# Optional HTTP header/cost profiling for supported JSON operations:
+scripts/gh-observe run --http --real /usr/bin/gh -- bash
+# Exit that child shell to end observation; the parent PATH is unchanged.
+scripts/gh-observe report --since 2026-11-09T23:31:00+00:00 \
+    --until 2026-11-10T00:01:00+00:00 > github-traffic.json
+```
+
+The observer is measurement only. It never admits, queues, retries or defers
+GitHub commands, even when legacy coordination files or environment settings
+exist. Request headers are logged as evidence, not used to delay another
+request. Do not install it into `~/.local/bin`, change a login shell's PATH,
+or route the running app or other projects through it. A child process outside
+the selected repository/worktrees executes the real gh without observation.
+The passive runtime stays under that repository's Git common directory so
+background descendants can keep resolving gh after the launcher exits; only
+the opted-in child environment places it on PATH.
+
+The daily JSONL logs are private files under
+`${XDG_STATE_HOME:-~/.local/state}/cagents/gh-observe`. They record timestamps,
+caller process ancestry/session IDs, subcommands, GraphQL operation shapes,
+invocation metadata and, when `--http` supports the operation, HTTP status,
+duration and allowlisted rate-limit headers. Credentials,
+arguments, GraphQL variables and response bodies are discarded. Operation
+names and endpoint paths can identify private repositories; keep raw logs
+local and publish only the needed aggregates. Remove old daily logs when the
+measurement no longer needs them.
+
+Normal observation execs the real gh with its original arguments, environment,
+stdin, stdout, stderr and exit status; it does not enable HTTP debug or filter
+output. Logging/setup failures pass through to the real command.
+
+`--http` explicitly enables HTTP metadata profiling only for supported JSON
+operations. Raw REST API bodies, diffs, logs, downloads and unknown operations
+remain invocation-only and do not enable debug output. The profiler filters
+injected debug and never prints request/response bodies. Unexpected opaque or
+unframed responses are conservatively suppressed, including ambiguous stderr
+inside such dumps, rather than exposed as diagnostics; treat them as coverage
+gaps. Explicit debug and interactive stderr retain their original behavior and
+also log invocations only. Absolute gh paths, other hosts, connectors and Git's
+own HTTPS traffic bypass observation.
+
+Exact GraphQL primary cost is reported only when the original query asks
+`rateLimit { cost }`; quota headers are cumulative, so their deltas cannot be
+attributed to one concurrent caller. Secondary point estimates use GitHub's
+published defaults and are separate from primary cost. Set
+`CAGENTS_GH_OBSERVE=0` to bypass observation inside an opted-in shell.
+
+Content serialization is separate from observation. Invoke it only when
+intentionally serializing selected writes; it never installs a wrapper or
+activates global state:
+
+```sh
+scripts/gh-coordinate.py --real /usr/bin/gh --wait 30 -- \
+    pr comment 1234 -R CarsonBurke/cagents --body-file comment.txt
+```
+
+Only the documented allowlist of PR/issue content commands acquires a slot.
+Reads, local helpers and unsupported commands execute immediately. Selected
+writes must identify their repository explicitly, share state only through
+that repository's Git common directory, and start at least eight seconds apart.
+Waiting is bounded; `--wait 0` refuses a busy slot immediately with exit 75 and
+`cagents-gh: deferred`, before starting gh. Callers setting
+`CAGENTS_GH_NONBLOCKING=1` always use immediate refusal, including when a
+positive `--wait` was supplied. A started mutation is never retried
+or timed out by the helper. It does not read response headers, transfer
+cooldowns between requests, or apply a GraphQL reset to REST. One gh command
+may create multiple contents, and independent repositories do not share this
+slot; this is not enforcement of an account-wide GitHub quota.
+
 ## Native evidence
 
 For which fixture to use, how they fit together and how to extend or repair
@@ -1581,6 +1688,16 @@ harness, it provides:
   directory is removed or for a seed saved by an older tool, every `start` says
   the seed's chats won't reopen. Recreate them and save the seed again.
   Extended attributes and ACLs are not restored.
+- **UI-only restart.** To measure restored chats while their providers keep
+  running, close the app window normally, then run `relaunch` in the same
+  session. It reuses the recorded executables through the development runner
+  and refuses compilation under the native lock. `relaunch` stays in the
+  foreground until that UI exits; run measurements from another shell and
+  finish with `stop`. This preserves the daemon and live providers, whereas
+  `stop` ends them. Add `--chat-stages` to record UI-thread chat stage timings
+  under `logs/` on normal close; these measure synchronous work rather than
+  compositor presentation. Recreate the same workload on each revision when comparing
+  startup; a saved descriptor whose provider was killed is not a live chat.
 - **Matching evidence.** `start` refuses a checkout that changed since its build.
   `shots/manifest.tsv` records each image's revision, source state, requested
   width and size, so a pair can be compared and named in the PR.
@@ -1793,10 +1910,13 @@ scripts/rehearse-update --root /var/tmp/cr/u1 run \
 The scenario installs OLD, starts a KWin virtual desktop with nested niri,
 opens the main and `second` windows, seeds offline work, records and captures
 both windows, stages NEW, and invokes the staged CLI's `daemon upgrade` on a
-controlling pseudo-terminal. `--answer` responds to each observed confirmation;
-`--yes` instead passes the updater's approval flag. Extra upgrade flags use
-`--upgrade-arg=--interrupt` or `--upgrade-arg=--accept-unreopenable`. The harness
-does not add either policy automatically. Refusals are measured outcomes: even
+controlling pseudo-terminal. `--answer` responds to each observed `[Y/n]`
+confirmation; `--yes` instead passes the updater's approval flag. `--working`
+is typed at the choice offered while agents are mid-turn (empty presses Enter,
+which waits for them; `i` interrupts them). `--stop` is typed at the destructive
+stop list; it defaults to empty, which cancels, so a rehearsal stops panes only
+with `--stop stop`, as a person would type. Extra upgrade flags use
+`--upgrade-arg=--interrupt`; the harness adds no policy automatically. Refusals are measured outcomes: even
 a deliberately expected refusal, such as `--uncarryable`, reports `Outcome: FAIL`.
 
 Add `--ceditor /var/tmp/cagents-rehearsal/builds/ceditor-07e7efc/bin` to launch

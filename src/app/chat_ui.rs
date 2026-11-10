@@ -109,6 +109,7 @@ mod trailing;
 mod turn;
 mod view;
 mod virtualized;
+mod warm;
 
 pub(super) fn invalidate_copy_intent() {
     text_copy::invalidate();
@@ -904,6 +905,14 @@ impl State {
 }
 
 impl State {
+    /// Give parked chats a changed syntax theme: one can still be warm, and is
+    /// shown again as it is.
+    pub(super) fn set_parked_syntax_theme(&mut self, theme: crate::settings::EditorSyntaxTheme) {
+        for runtime in self.parked.values_mut() {
+            runtime.set_syntax_theme(theme);
+        }
+    }
+
     pub(super) fn transition_pending(&self) -> bool {
         !self.phases.is_empty() || !self.abandoned.is_empty() || !self.retiring.is_empty()
     }
@@ -2589,6 +2598,9 @@ pub(super) struct Runtime {
     /// catalog, which takes each list once rather than on every change.
     listed_models: u64,
     visible: AtomicBool,
+    /// While hidden, the order this chat was hidden in if it keeps its
+    /// presentation and its client's transcript; see [`warm`].
+    warm: Option<u64>,
     error: Option<String>,
     /// A typed admission refusal, independent of provider/account failures.
     capacity_refused: bool,
@@ -3678,6 +3690,7 @@ impl Runtime {
             disconnected: false,
             listed_models: 0,
             visible: AtomicBool::new(visible),
+            warm: None,
             error: None,
             capacity_refused: false,
             close_refusal: None,
@@ -4787,7 +4800,7 @@ impl Runtime {
     }
 
     fn markdown_prepared(&mut self, target: Target, id: &str, run: u64, ready: preparation::Ready) {
-        if !self.visible.load(Ordering::Relaxed) {
+        if !self.presents() {
             return;
         }
         // Observe any replacement already published by the client before
@@ -4855,7 +4868,29 @@ impl Runtime {
     }
 
     fn refresh_snapshot(&mut self) {
-        if !self.visible.load(Ordering::Relaxed) {
+        if self.warm.is_some()
+            && self
+                .handle()
+                .is_some_and(|handle| handle.resident_snapshot_with_clock().is_none())
+        {
+            // The client gave up the body it was keeping (a resync, or the
+            // connection ended), so this presentation can no longer follow it.
+            self.cool();
+        }
+        if self.warm.is_some()
+            && !self.visible.load(Ordering::Relaxed)
+            && self.handle().is_some_and(|handle| {
+                handle
+                    .resident_snapshot_with_clock()
+                    .is_some_and(|(snapshot, _)| snapshot.generation != self.snapshot.generation)
+            })
+        {
+            // A warm chat with queued work reads while hidden. Rather than
+            // prepare what it reads where nobody sees it, it goes cold and
+            // follows its hidden metadata as any other hidden chat does.
+            self.cool();
+        }
+        if !self.presents() {
             if let Some((snapshot, clock)) = self
                 .handle()
                 .and_then(|handle| handle.hidden_snapshot_with_clock())
@@ -4890,7 +4925,7 @@ impl Runtime {
         // Hidden publications number new children too, so a child keeps the
         // number it first appeared with for as long as it stays listed.
         self.child_ordinals.observe(&snapshot.subagents);
-        if !self.visible.load(Ordering::Relaxed) {
+        if !self.presents() {
             self.release_transcript_presentation();
             Arc::make_mut(&mut snapshot).evict_transcript();
             self.snapshot = snapshot;
@@ -5411,13 +5446,93 @@ impl Runtime {
             }
         }
         let changed = self.visible.swap(visible, Ordering::Relaxed) != visible;
+        let rewarmed = visible && self.warm.take().is_some();
+        if !visible && changed && self.warm.is_none() && self.keeps_warm() {
+            self.warm = Some(warm::stamp());
+        }
         images::sync(self);
         let result = self.present();
         if visible {
             if changed {
                 self.refresh();
             }
-        } else if result.is_ok()
+            if rewarmed {
+                // Work that waited while hidden: items still loading when the
+                // chat hid, and a syntax theme changed meanwhile. Everything
+                // else is already prepared, so this only revisits the window.
+                let snapshot = self.snapshot.clone();
+                drop(self.prepare_transcript_cache(&snapshot));
+            }
+        } else if result.is_err() {
+            // The client could not be told to keep the body, so this chat is
+            // not warm whatever it was before.
+            self.warm = None;
+            self.release_hidden(changed, false);
+        } else if self.warm.is_none() {
+            self.release_hidden(changed, true);
+        }
+        result
+    }
+
+    /// Whether this chat's presentation stays in place while it is hidden.
+    fn presents(&self) -> bool {
+        self.visible.load(Ordering::Relaxed) || self.warm.is_some()
+    }
+
+    /// Whether hiding this chat now may keep it warm: its client still holds
+    /// the transcript the presentation was built from, and it is small enough
+    /// to keep beside others.
+    fn keeps_warm(&self) -> bool {
+        !self.presentation_evicted
+            && self.handle().is_some_and(|handle| {
+                handle.is_connected() && handle.resident_snapshot_with_clock().is_some()
+            })
+            && self.warm_bytes() <= warm::CHAT_BYTES
+    }
+
+    /// The heap this chat holds while warm: its transcript, and what was
+    /// prepared from it, with parsed documents estimated from their size
+    /// (see [`warm::NODE_BYTES`]). Constant work per item.
+    pub(super) fn warm_bytes(&self) -> usize {
+        let prepared = |cached: &CachedItem| {
+            let [text, nodes, _] = cached
+                .document
+                .as_ref()
+                .map_or([0; 3], prose_document::Document::census);
+            cached.retained_bytes() + text + nodes * warm::NODE_BYTES + warm::ITEM_BYTES
+        };
+        self.snapshot.transcript_bytes()
+            + self
+                .cache
+                .values()
+                .chain(self.child_cache.values())
+                .map(prepared)
+                .sum::<usize>()
+    }
+
+    /// The order this chat was hidden in, while it is warm.
+    pub(super) fn warm_stamp(&self) -> Option<u64> {
+        self.warm
+    }
+
+    /// Release a warm hidden chat's presentation and its client's transcript,
+    /// as hiding did before it was kept. A visible or cold chat is unchanged.
+    pub(super) fn cool(&mut self) {
+        if self.warm.take().is_none() || self.visible.load(Ordering::Relaxed) {
+            return;
+        }
+        let told = self.present();
+        self.release_hidden(true, told.is_ok());
+        if let Err(error) = told {
+            self.error = Some(error);
+        }
+    }
+
+    /// Shed a cold hidden chat's presentation: all of it when the daemon can
+    /// hydrate it again, or only its render caches when it cannot, including
+    /// when the client was not `told` it is hidden.
+    fn release_hidden(&mut self, changed: bool, told: bool) {
+        if told
             && self.handle().is_some_and(|handle| {
                 // Notice suppression is not permission to discard the last
                 // body: a lost client may already have installed metadata.
@@ -5436,8 +5551,7 @@ impl Runtime {
                     .any(|child| !child.items.is_empty()))
         {
             self.release_transcript_presentation();
-        } else if !visible
-            && self.handle().is_some()
+        } else if self.handle().is_some()
             && (!self.cache.is_empty()
                 || !self.child_cache.is_empty()
                 || self.selection_document.borrow().is_some())
@@ -5449,7 +5563,6 @@ impl Runtime {
                 resident_bytes = self.snapshot.transcript_bytes(), cache_entries = 0usize,
                 exposed_presentation_bytes = 0usize);
         }
-        result
     }
     fn release_transcript_caches(&mut self) {
         // Diagnostic metadata retains exact source Arcs. Release these while
@@ -5500,9 +5613,14 @@ impl Runtime {
     /// A connection already lost has nothing to tell: the pane reports the
     /// disconnection itself, and the handle that replaces it is shown with the
     /// visibility recorded here.
+    ///
+    /// A warm hidden chat keeps its body without reading further: what it
+    /// missed arrives as one change, or nothing, when it is shown again.
     fn present(&self) -> Result<(), String> {
-        let retain_body = self.visible.load(Ordering::Relaxed);
-        let interested = retain_body || self.queued.is_some() || !self.followups.is_empty();
+        let retain_body = self.presents();
+        let interested = self.visible.load(Ordering::Relaxed)
+            || self.queued.is_some()
+            || !self.followups.is_empty();
         match self.handle() {
             Some(handle) if handle.is_connected() => {
                 match handle.set_interest(interested, retain_body) {
@@ -8020,6 +8138,31 @@ impl Cagents {
         self.cards
             .insert(card, CardRuntime::Chat(Box::new(runtime)));
         self.load_draft_skills(target)
+    }
+
+    /// Keep the warm hidden chats within [`warm`]'s budget, releasing the
+    /// least recently hidden. Cheap unless a chat went warm since last time.
+    pub(super) fn trim_warm_chats(&mut self) {
+        if !warm::take_dirty() {
+            return;
+        }
+        let mut runtimes: Vec<&mut Runtime> = self
+            .cards
+            .values_mut()
+            .filter_map(|card| match card {
+                CardRuntime::Chat(runtime) => Some(runtime.as_mut()),
+                _ => None,
+            })
+            .chain(self.chat_ui.parked.values_mut().map(Box::as_mut))
+            .filter(|runtime| runtime.warm_stamp().is_some())
+            .collect();
+        let warm: Vec<_> = runtimes
+            .iter()
+            .map(|runtime| (runtime.warm_stamp().unwrap_or(0), runtime.warm_bytes()))
+            .collect();
+        for index in warm::over_budget(&warm) {
+            runtimes[index].cool();
+        }
     }
 
     pub(super) fn chat_subscription(&self) -> Subscription<Message> {
@@ -11446,6 +11589,7 @@ impl Cagents {
                         self.observe_agent_activity_for_card(target.card, Some(activity));
                         self.sidebar_state.set_card_limited(target.card, limited);
                         self.commit_chat_session(target.card, session);
+                        self.trim_warm_chats();
                         if title.is_some_and(|title| self.apply_reported_title(target.card, title))
                             || queue_changed
                         {
@@ -13764,6 +13908,7 @@ impl Cagents {
                         .map(|message| message.id.clone())
                         .collect();
                     self.chat_ui.parked.insert(target.card, runtime);
+                    self.trim_warm_chats();
                 }
                 // Enqueue the returned live proof checkpoint. The host retains
                 // the transition receipt independently of this UI attachment.
@@ -18467,6 +18612,7 @@ mod tests {
         let old_answer = Arc::downgrade(&runtime.snapshot.subagents[0].items[0]);
         runtime.set_visible(false).unwrap();
         runtime.set_visible(false).unwrap();
+        runtime.cool();
         preparation::retirement_barrier();
         assert!(runtime.cache.is_empty() && runtime.child_cache.is_empty());
         assert_eq!(runtime.snapshot.transcript_bytes(), 0);
@@ -20477,6 +20623,7 @@ mod tests {
             let history = runtime.history.clone();
             let history_images = runtime.history_images.clone();
             runtime.set_visible(false).unwrap();
+            runtime.cool();
             assert_eq!(runtime.history_cursor, Some(0));
             assert_eq!(runtime.history, history);
             assert_eq!(runtime.history_images, history_images);
@@ -20494,6 +20641,7 @@ mod tests {
             assert!(runtime.history_attachment_stash.is_none());
 
             runtime.set_visible(false).unwrap();
+            runtime.cool();
             assert!(runtime.history.is_empty());
             assert!(runtime.history_images.is_empty());
             assert_eq!(runtime.composer.text(), "Unsent image draft");
@@ -22235,6 +22383,7 @@ mod tests {
             "History keeps its daemon IPC connection"
         );
         runtime.set_visible(false).unwrap();
+        runtime.cool();
         preparation::retirement_barrier();
         assert_eq!(runtime.snapshot.transcript_bytes(), 0);
         assert_eq!(handle.snapshot().transcript_bytes(), 0);
@@ -25384,7 +25533,7 @@ mod tests {
     }
 
     /// `/resume` sends nothing: it opens the picker on the conversation's
-    /// provider and project, searching for what follows it, and an untouched
+    /// project, searching for what follows it, and an untouched
     /// draft gives its place to the conversation chosen there.
     #[test]
     fn resume_command_opens_the_picker_for_this_conversation() {
@@ -25396,7 +25545,7 @@ mod tests {
         assert!(app.resume_ui.open);
         assert_eq!(app.resume_ui.query, "flaky tests");
         let scope = app.resume_ui.scope.as_ref().expect("a narrowed search");
-        assert_eq!(scope.provider, Provider::Codex);
+        assert_eq!(scope.reach, crate::app::resume_ui::Reach::Project);
         assert!(
             scope
                 .roots
@@ -25407,6 +25556,7 @@ mod tests {
         assert!(runtime.composer.is_empty());
         assert!(runtime.is_draft() && !app.chat_start_pending(card));
         assert_eq!(app.resume_ui.replace, Some(card));
+        assert_eq!(app.resume_ui.asked_from, Some(card), "not offered");
 
         let _ = app.resume_saved_conversation(earlier(&app, card));
         let resumed = app.workspace.focused().unwrap();
@@ -28541,6 +28691,7 @@ mod tests {
         };
         drop(catalog);
         runtime.set_visible(false).unwrap();
+        runtime.cool();
         preparation::retirement_barrier();
         assert!(runtime.cache.is_empty());
         assert!(runtime.child_cache.is_empty());
@@ -28675,6 +28826,7 @@ mod tests {
         runtime.opened.insert("kept turn".into(), true);
         runtime.set_visible(false).unwrap();
         runtime.set_visible(false).unwrap();
+        runtime.cool();
         preparation::retirement_barrier();
         // A live hidden presentation releases the graph and its parser scratch;
         // a draft has no provider transcript to suspend.
@@ -30990,6 +31142,7 @@ mod tests {
         assert!(runtime.logical_prose.request().is_none());
         // Hiding the pane releases the complete text with the presentation.
         app.chat_runtime_mut(target).unwrap().show(false);
+        app.chat_runtime_mut(target).unwrap().cool();
         app.chat_runtime_mut(target).unwrap().refresh();
         assert!(chat_runtime(&app, card).logical_prose.raw().is_none());
     }
@@ -32486,6 +32639,7 @@ mod tests {
                             .unwrap()
                             .set_visible(false)
                             .unwrap();
+                        app.chat_runtime_mut(target).unwrap().cool();
                         preparation::retirement_barrier();
                         assert!(
                             app.chat_runtime_mut(target)
@@ -32684,6 +32838,7 @@ mod tests {
         runtime.unseen_activity = false;
         assert!(!runtime.cache.is_empty());
         runtime.set_visible(false).unwrap();
+        runtime.cool();
         preparation::retirement_barrier();
         // Client publications retire on a separate worker. Waiting for UI
         // presentation disposal alone does not establish body reclamation.

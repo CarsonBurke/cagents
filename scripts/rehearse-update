@@ -27,6 +27,7 @@ DIR holds one private user. Its path must be short (sockets live below it).
       --new-dir DIR --new-version V --new-installer FILE [OPTIONS]
                        Fresh-root scenario; always saves report.txt and stops.
                        --ceditor BIN_DIR, --answer TEXT (default yes), --yes,
+                       --working TEXT, --stop TEXT,
                        --upgrade-arg=--interrupt, --untitled 0|1|2, --no-codex,
                        --no-child, --ignore-term, --no-init, --exit-mid-turn,
                        --uncarryable, --unreachable. See run --help.
@@ -38,11 +39,15 @@ DIR holds one private user. Its path must be short (sockets live below it).
   seed [OPTIONS]       Open two projects and create channels, agents (chat and
                        console, named and untitled) and terminals through the
                        installed CLI.
-  update DIR VERSION INSTALLER [--answer TEXT] [UPGRADE-ARGS...]
+  update DIR VERSION INSTALLER [--answer TEXT] [--working TEXT] [--stop TEXT]
+         [UPGRADE-ARGS...]
                        What scripts/install-local does after its build: stage
                        the archive with --stage-only, then run the staged
                        `cagents daemon upgrade` in a terminal (inside the
-                       desktop when it runs). TEXT answers its prompt.
+                       desktop when it runs). --answer is typed at each
+                       [Y/n] confirmation, --working at the working-agents
+                       choice (empty waits for them) and --stop at the stop
+                       list (empty cancels it).
   desktop start [--limit SECONDS]
                        Start a headless desktop (KWin virtual + nested niri)
                        under the native lock. Windows open there.
@@ -200,15 +205,18 @@ cmd_seed() {
 
 # What scripts/install-local does once its archive is built: stage it, then run
 # the staged build's `daemon upgrade` in a terminal, as a person would. ANSWER
-# is typed at each prompt; without one the prompt gets end of input.
+# is typed at each confirmation, WORKING at the working-agents choice and STOP
+# at the destructive stop list; empty WORKING waits and empty STOP cancels.
 cmd_update() {
     require_init
     local archive_dir=${1:?update needs the archive directory} version=${2:?update needs a version} installer=${3:?update needs an install.sh}
     shift 3
-    local answer= upgrade_args=()
+    local answer= working= stop= upgrade_args=()
     while [ "$#" -gt 0 ]; do
         case $1 in
             --answer) answer=${2?}; shift 2 ;;
+            --working) working=${2?}; shift 2 ;;
+            --stop) stop=${2?}; shift 2 ;;
             *) upgrade_args+=("$1"); shift ;;
         esac
     done
@@ -225,7 +233,7 @@ cmd_update() {
         [ "$stage_status" -eq 0 ] || return "$stage_status"
     fi
     printf 'staged after %ss\n' "$((SECONDS - started))" | tee -a "$transcript"
-    cmd_app_or_env /usr/bin/python3 "$tool_root/scripts/rehearse_update_pty.py" --answer "$answer" -- \
+    cmd_app_or_env /usr/bin/python3 "$tool_root/scripts/rehearse_update_pty.py" --answer "$answer" --working "$working" --stop "$stop" -- \
         "$user_home/.local/share/cagents-install/current/bin/cagents" daemon upgrade "${upgrade_args[@]}" \
         2>&1 | tee -a "$transcript" || status=${PIPESTATUS[0]}
     printf 'daemon upgrade exited %s after %ss total\n' "$status" "$((SECONDS - started))" | tee -a "$transcript"

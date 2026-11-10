@@ -76,6 +76,8 @@ pub(crate) mod git_watch;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod github;
 pub mod github_identity;
+pub(crate) mod github_rate_limit;
+pub mod github_status;
 #[cfg(feature = "host")]
 pub mod host;
 #[cfg(feature = "ui")]
@@ -91,6 +93,8 @@ pub mod latency_fixture;
 pub mod layout_metrics;
 #[cfg(feature = "ui")]
 pub mod lifecycle;
+#[cfg(any(feature = "ui", feature = "host"))]
+pub(crate) mod lineage_birth;
 pub mod linear;
 pub mod location;
 #[cfg(feature = "ui")]
