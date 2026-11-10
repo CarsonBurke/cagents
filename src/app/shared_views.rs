@@ -1681,6 +1681,9 @@ impl Cagents {
     /// migrate. Its snapshot already supplies authority; sending an empty seed
     /// would only generate another complete-model receipt and reconciliation.
     fn admit_existing_empty_views(&mut self) {
+        if self.workspace_model.identity == crate::workspace_model::NO_REGISTRY {
+            return;
+        }
         let candidates = self
             .workspace_model
             .views
@@ -4567,6 +4570,57 @@ mod tests {
             !app.shared_views.initialized.contains(&destination),
             "an in-flight seed still owns its barrier"
         );
+    }
+
+    #[test]
+    fn an_unprojected_worktree_default_remains_a_local_migration_intention() {
+        let (mut app, _, _, pane) = channel_move_fixture_with_kind(Some(moving_terminal_kind()));
+        let repository = PathBuf::from("/repo/.git");
+        let path = PathBuf::from("/repo/default-worktree");
+        let scope = Scope::Worktree {
+            repository: repository.clone(),
+            path: path.clone(),
+        };
+        app.sidebar_model.projects.push(SidebarProject::new(
+            ProjectId::new(),
+            RepositoryId::new(),
+            "repo".into(),
+            repository,
+            vec![],
+            vec![],
+        ));
+        app.known_worktree_roots.insert(path.clone());
+        let durable = Arc::make_mut(&mut app.durable);
+        for channel in &mut durable.channels {
+            channel.cards.retain(|id| *id != pane.id);
+        }
+        durable.card_scopes.insert(pane.id, path);
+        let CardKind::Terminal(session) = pane.kind else {
+            panic!("terminal fixture")
+        };
+        app.shared_views.defaults.insert(pane.id, session);
+        app.workspace_model.views.push(View::empty(scope.clone()));
+        assert_eq!(app.local_view_cards(&scope), [pane.id]);
+        assert!(
+            app.local_view_panes(&scope).is_empty(),
+            "default is withheld from pane publication"
+        );
+        app.admit_existing_empty_views();
+        assert!(
+            !app.shared_views.initialized.contains(&scope),
+            "membership preserves the default's seed barrier"
+        );
+    }
+
+    #[test]
+    fn empty_view_admission_requires_registry_authority() {
+        let (mut app, existing, _, _) = fixture();
+        let scope = Scope::Channel(existing);
+        app.shared_views.initialized.clear();
+        app.workspace_model.identity = crate::workspace_model::NO_REGISTRY;
+        app.workspace_model.views = vec![View::empty(scope.clone())];
+        app.admit_existing_empty_views();
+        assert!(!app.shared_views.initialized.contains(&scope));
     }
 
     #[test]
