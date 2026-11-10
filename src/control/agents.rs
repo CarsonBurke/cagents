@@ -426,7 +426,11 @@ impl ControlClient {
         // budget than an ordinary reply; a caller's own deadline still bounds it.
         let budget = match &operation {
             Operation::Close(_) => Some(CHAT_CLOSE_TIMEOUT + Duration::from_secs(35)),
-            Operation::Submit(_) => Some(AGENT_SUBMIT_TIMEOUT),
+            Operation::Submit(_)
+            | Operation::Console {
+                command: crate::agent_execution::ConsoleCommand::Submit { .. },
+                ..
+            } => Some(AGENT_SUBMIT_TIMEOUT),
             _ => None,
         }
         .map(|budget| Instant::now() + budget);
@@ -2082,6 +2086,67 @@ mod tests {
 
     #[test]
     fn a_submission_answered_after_a_slow_durable_commit_is_still_accepted() {
+        slow_durable_submission(false);
+    }
+
+    #[test]
+    fn a_console_submission_answered_after_a_slow_durable_commit_is_still_accepted() {
+        slow_durable_submission(true);
+    }
+
+    #[test]
+    fn console_reads_and_controls_keep_ordinary_reply_budget() {
+        use crate::agent_execution::ConsoleCommand;
+        for command in [
+            ConsoleCommand::Read {
+                after_generation: None,
+                after_run: None,
+            },
+            ConsoleCommand::Interrupt {
+                including_subagents: false,
+            },
+            ConsoleCommand::Control(crate::chat::Command::Refresh),
+        ] {
+            let expected = command.clone();
+            let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+            let server = thread::spawn(move || {
+                answer(&mut server_stream, |_| true, connected());
+                let request: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                assert!(matches!(request.request, ClientRequest::Agent {
+                operation: Operation::Console { command, .. }, ..
+            } if command == expected));
+                thread::sleep(IO_TIMEOUT + Duration::from_millis(500));
+                let _ = write_frame(
+                    &mut server_stream,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(request.request_id),
+                        proof: proof(),
+                        message: ServerMessage::Response {
+                            response: ServerResponse::Agent(Reply::Console(None)),
+                        },
+                    },
+                );
+            });
+            let mut client = ControlClient::from_stream(client_stream).unwrap();
+            let read = client.agent(
+                Authority::default(),
+                Operation::Console {
+                    agent: crate::model::AgentId::new(),
+                    command,
+                },
+            );
+            drop(client);
+            server.join().unwrap();
+            assert!(
+                read.is_err(),
+                "a stalled console poll must keep the ordinary timeout: {read:?}"
+            );
+        }
+    }
+
+    fn slow_durable_submission(console: bool) {
+        use crate::agent_execution::ConsoleCommand;
         let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
         let (_, reply) = running();
         let (agent, run) = status_reply(reply).unwrap();
@@ -2090,25 +2155,33 @@ mod tests {
             run,
             created: true,
         };
+        let operation = if console {
+            Operation::Console {
+                agent: accepted.agent.id,
+                command: ConsoleCommand::Submit {
+                    prompt: "durable work".into(),
+                    idempotency_key: "slow-commit".into(),
+                },
+            }
+        } else {
+            Operation::Submit(Submit {
+                name: None,
+                destination: Destination::New(accepted.agent.spec.clone()),
+                prompt: "durable work".into(),
+                idempotency_key: "slow-commit".into(),
+            })
+        };
+        let expected = operation.clone();
         let answered = accepted.clone();
         let server = thread::spawn(move || {
             answer(&mut server_stream, |_| true, connected());
             let request: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
-            assert!(
-                matches!(
-                    request.request,
-                    ClientRequest::Agent {
-                        operation: Operation::Submit(_),
-                        ..
-                    }
-                ),
-                "{:?}",
-                request.request
-            );
+            assert!(matches!(request.request,
+                ClientRequest::Agent { operation, .. } if operation == expected));
             // The acceptance's commit waits on a loaded disk for longer than
             // an ordinary reply may take.
             thread::sleep(IO_TIMEOUT + Duration::from_millis(500));
-            write_frame(
+            let sent = write_frame(
                 &mut server_stream,
                 &ServerEnvelope {
                     version: PROTOCOL_VERSION,
@@ -2118,23 +2191,54 @@ mod tests {
                         response: ServerResponse::Agent(Reply::Accepted(answered)),
                     },
                 },
-            )
-            .unwrap();
+            );
+            if sent.is_err() {
+                return;
+            }
+            // The next read uses this same connection: a late acceptance must
+            // not be mistaken for a later console response or cause a resend.
+            answer(
+                &mut server_stream,
+                |request| {
+                    matches!(
+                        request,
+                        ClientRequest::Agent {
+                            operation: Operation::Console {
+                                command: ConsoleCommand::Read { .. },
+                                ..
+                            },
+                            ..
+                        }
+                    )
+                },
+                ServerResponse::Agent(Reply::Console(None)),
+            );
         });
         let mut client = ControlClient::from_stream(client_stream).unwrap();
-        let request = Submit {
-            name: None,
-            destination: Destination::New(accepted.agent.spec.clone()),
-            prompt: "durable work".into(),
-            idempotency_key: "slow-commit".into(),
-        };
-        let reply = client
-            .agent(Authority::default(), Operation::Submit(request))
-            .unwrap();
-        assert_eq!(reply, Reply::Accepted(accepted));
-        assert_eq!(client.stream.read_timeout().unwrap(), Some(IO_TIMEOUT));
+        let reply = client.agent(Authority::default(), operation);
+        if reply.is_ok() {
+            assert_eq!(client.stream.read_timeout().unwrap(), Some(IO_TIMEOUT));
+            let read = client
+                .agent(
+                    Authority::default(),
+                    Operation::Console {
+                        agent: accepted.agent.id,
+                        command: ConsoleCommand::Read {
+                            after_generation: None,
+                            after_run: None,
+                        },
+                    },
+                )
+                .unwrap();
+            assert_eq!(read, Reply::Console(None));
+        }
+        let timeout = client.stream.read_timeout().unwrap();
+        // Close even a timed-out connection before joining the peer: a late
+        // acceptance may have been written successfully but never read.
         drop(client);
         server.join().unwrap();
+        assert_eq!(reply.unwrap(), Reply::Accepted(accepted));
+        assert_eq!(timeout, Some(IO_TIMEOUT));
     }
 
     #[test]

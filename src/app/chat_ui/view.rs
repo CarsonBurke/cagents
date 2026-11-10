@@ -3205,14 +3205,17 @@ impl Runtime {
         content.push(crate::interaction::composer_popover(
             widget::container(
                 widget::column::with_children(vec![
-                    widget::column::with_children(self.queue_view().into_iter().chain(
-                        (!attachment_chips.is_empty()).then(|| {
-                            widget::column::with_children(attachment_chips)
-                                .spacing(step::GAP_XS)
-                                .padding([0, step::GAP_M as u16])
-                                .into()
-                        }),
-                    ))
+                    widget::column::with_children(
+                        self.queue_view()
+                            .into_iter()
+                            .chain(self.restored_waiting_notice())
+                            .chain((!attachment_chips.is_empty()).then(|| {
+                                widget::column::with_children(attachment_chips)
+                                    .spacing(step::GAP_XS)
+                                    .padding([0, step::GAP_M as u16])
+                                    .into()
+                            })),
+                    )
                     .spacing(step::GAP_XS)
                     .into(),
                     widget::row::with_children(row)
@@ -4709,6 +4712,36 @@ impl Runtime {
         } else {
             description
         }
+    }
+
+    /// Says, where the queue was, that what a provider which did not come
+    /// back was holding is now the reader's draft, and was not sent again.
+    fn restored_waiting_notice(&self) -> Option<Element<'_, Message>> {
+        let restored = self.restored_waiting?;
+        let text = restored.caption();
+        Some(
+            widget::container(
+                widget::row::with_children(vec![
+                    crate::ui_controls::passive_icon(Icon::History, design::COMPACT_ICON_SIZE),
+                    design::caption(text).width(Length::Fill).into(),
+                    small_icon(
+                        Icon::Close,
+                        "Dismiss",
+                        Action::DismissRestoredWaiting(self.target),
+                    ),
+                ])
+                .spacing(step::GAP_S)
+                .align_y(Alignment::Center),
+            )
+            .width(Length::Fill)
+            .padding(step::GAP_S)
+            .class(design::surface(
+                Some(design::sunken),
+                [design::RADIUS_M, design::RADIUS_M, 0.0, 0.0],
+                false,
+            ))
+            .into(),
+        )
     }
 
     /// The messages waiting to be sent, docked on the composer.

@@ -93,6 +93,13 @@ optional fixture behaviors are switched on by files in
 reply and error files are read for every prompt; the others take effect from
 the provider's next start.
 
+To reproduce resume branching, write an earlier main record's UUID to
+`fixture-resume-parent`. Each resumed provider then continues from that record,
+keeping the existing transcript and its full turn counter. Remove the file to
+resume from the last record again. A missing or private record is refused.
+This exercises transcript history and reopening; it does not reproduce why a
+live Claude Code process chooses an earlier parent.
+
 To check how an answer renders, copy a Markdown file to `fixture-reply.md`.
 Each later turn answers with that file's contents instead of the default
 sentence, so replacing the file changes the next answer. A few turns with a

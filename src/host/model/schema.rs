@@ -181,6 +181,67 @@ fn open_existing(path: &Path) -> Result<Connection, String> {
     Ok(db)
 }
 
+/// The oldest schema this version can convert a store back to.
+pub(super) const OLDEST_DOWNGRADE: u32 = 22;
+
+/// The schema of the store at `path`, or `None` when there is no store, which
+/// includes a file whose creation never reached schema 1. Reads only; a store
+/// from a newer release is reported, not refused. The caller must hold the
+/// daemon lease, so that no daemon converts it meanwhile.
+pub(super) fn stored_version(path: &Path) -> Result<Option<u32>, String> {
+    if !path.try_exists().map_err(|e| e.to_string())? {
+        return Ok(None);
+    }
+    let db = connect(path, false)?;
+    let version: u32 = db
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    Ok((version != 0).then_some(version))
+}
+
+/// Converts the store at `path` back to schema `target`, for a daemon that
+/// predates the current schema. One transaction: a failure leaves the store as
+/// it was. Returns the schema it converted from, or `None` when the store is
+/// absent or already at or below `target`. The caller must hold the daemon
+/// lease, so that no daemon has the store open.
+pub(super) fn downgrade(path: &Path, target: u32) -> Result<Option<u32>, String> {
+    if !path.try_exists().map_err(|e| e.to_string())? {
+        return Ok(None);
+    }
+    let mut db = connect(path, false)?;
+    db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")
+        .map_err(|e| e.to_string())?;
+    let tx = db
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
+    let version = inspect(&tx)?.version;
+    if version <= target {
+        return Ok(None);
+    }
+    if target < OLDEST_DOWNGRADE {
+        return Err(format!(
+            "workspace registry schema {version} can be converted back only as far as schema \
+             {OLDEST_DOWNGRADE}, not {target}"
+        ));
+    }
+    require_open_layout(&tx, version)?;
+    for step in (target + 1..=version).rev() {
+        match step {
+            23 => super::views::store::downgrade(&tx)?,
+            _ => {
+                return Err(format!(
+                    "no conversion back from workspace registry schema {step}"
+                ));
+            }
+        }
+        tx.pragma_update(None, "user_version", step - 1)
+            .map_err(|e| e.to_string())?;
+    }
+    require_open_layout(&tx, target)?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(Some(version))
+}
+
 fn reject_unjournaled_layout(path: &Path) -> Result<(), String> {
     // Even a read-only WAL connection can create empty journal sidecars before
     // rejecting an unsupported layout. When no journal exists, inspect only
@@ -278,6 +339,7 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
     static TWENTY: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static TWENTY_ONE: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static TWENTY_TWO: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
+    static TWENTY_THREE: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     let published = match version {
         12 => &TWELVE,
         13 => &THIRTEEN,
@@ -290,6 +352,7 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
         20 => &TWENTY,
         21 => &TWENTY_ONE,
         22 => &TWENTY_TWO,
+        23 => &TWENTY_THREE,
         _ => return Err(format!("unsupported published registry layout {version}")),
     };
     published
@@ -1022,7 +1085,26 @@ mod tests {
         )
         .unwrap();
         tx.commit().unwrap();
-        let old_layout = inspect(&db).unwrap().objects;
+        // Schema 23 replaces the view tables and repoints the terminal sources
+        // at `panes`; `require_current` already holds those objects to the
+        // published 23 layout, so this comparison covers everything else.
+        let replaced_views = [
+            "shared_view_scopes",
+            "shared_views",
+            "shared_view_panes",
+            "shared_view_edits",
+            "shared_view_terminal_sources",
+        ];
+        let normalized_views = [
+            "view_scopes",
+            "view_revision_clock",
+            "panes",
+            "retired_panes",
+            "view_operations",
+            "shared_view_terminal_sources",
+        ];
+        let mut old_layout = inspect(&db).unwrap().objects;
+        old_layout.retain(|object| !replaced_views.contains(&object.2.as_str()));
         let audit_rows = |db: &Connection| {
             db.prepare("SELECT sequence,automation,repository,record FROM automation_lifecycle ORDER BY sequence")
                 .unwrap()
@@ -1044,6 +1126,7 @@ mod tests {
             require_current(&registry.db).unwrap();
             assert_eq!(inspect(&registry.db).unwrap().version, SCHEMA_VERSION);
             let mut inventory = inspect(&registry.db).unwrap().objects;
+            inventory.retain(|object| !normalized_views.contains(&object.2.as_str()));
             let outbox = inventory
                 .iter()
                 .position(|object| object.1 == "automation_notifications")
@@ -1291,39 +1374,38 @@ mod tests {
             "converted legacy rows must roll back with the failed migration"
         );
         let registry = Registry::at(&path).unwrap();
-        let scope = serde_json::json!({"Channel":channel}).to_string();
-        let view: (i64, String, String) = registry
-            .db
-            .query_row(
-                "SELECT revision,panes,retired FROM shared_views WHERE scope=?1",
-                [&scope],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .unwrap();
+        let view = super::super::views::read(
+            &registry.db,
+            &crate::workspace_model::views::Scope::Channel(channel),
+        )
+        .unwrap();
+        assert_eq!(view.revision, 9);
+        assert!(view.panes.is_empty());
         assert_eq!(
-            view,
-            (
-                9,
-                "[]".into(),
-                "[\"00000000-0000-4000-8000-000000000071\"]".into()
-            )
+            view.retired,
+            vec!["00000000-0000-4000-8000-000000000071".parse().unwrap()]
         );
-        for (table, column, value) in [
-            ("shared_view_panes", "id", "pane"),
-            ("shared_view_edits", "operation", "edit"),
-        ] {
-            assert_eq!(
-                registry
-                    .db
-                    .query_row(
-                        &format!("SELECT scope FROM {table} WHERE {column}=?1"),
-                        [value],
-                        |r| r.get::<_, String>(0)
-                    )
-                    .unwrap(),
-                scope
-            );
-        }
+        assert_eq!(
+            registry
+                .db
+                .query_row(
+                    "SELECT s.channel FROM view_operations o JOIN view_scopes s ON s.id = o.scope
+                     WHERE o.operation = 'edit'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            channel.to_string()
+        );
+        // The legacy index named a pane no view held; nothing open is lost
+        // when the converted store forgets it.
+        assert_eq!(
+            registry
+                .db
+                .query_row("SELECT count(*) FROM panes", [], |r| r.get::<_, u32>(0))
+                .unwrap(),
+            0
+        );
         assert!(
             !inspect(&registry.db)
                 .unwrap()

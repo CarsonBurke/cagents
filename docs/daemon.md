@@ -96,6 +96,8 @@ cagents daemon stop --confirm
 | `daemon prepare-upgrade --yes` | Checkpoint resumable sessions and stop for a full upgrade |
 | `daemon abandon-upgrade --yes` | Archive an interrupted upgrade checkpoint without resuming it |
 | `daemon protocol-version` | Print this executable's wire protocol version without contacting a daemon |
+| `daemon store-schema` | Print the shared workspace store's schema on disk, or nothing if there is none; refuses while a daemon runs |
+| `daemon downgrade-store SCHEMA` | Convert the shared workspace store back to an older schema for an older release; refuses while a daemon runs |
 | `terminal list`, `spawn`, `write`, `close`, `snapshot`, `wait` | Inspect and drive daemon-hosted terminals |
 | `project open`, `list`, `close` | Manage the projects every window shares, with or without a window running |
 | `channel spawn`, `list`, `close` | Manage the channels every window shares |
@@ -339,6 +341,33 @@ version and starts its daemon against the durable handoff. A replacement startup
 failure rolls back only when its status proves it stopped; if startup state is
 ambiguous, the installer keeps the new installation and recovery state rather
 than risk a second writer. Inspect `cagents daemon status` before retrying.
+
+A replacement daemon that started may already have converted the shared
+workspace store (`workspace-model.sqlite3`) to a newer schema, which the
+previous daemon refuses to open. Once the previous daemon has stopped and
+before the replacement starts, the installer records the store's schema with
+the replacement's `cagents daemon store-schema`; that is the schema the
+previous daemon reads. A rollback then runs the replacement's
+`cagents daemon downgrade-store <schema>` (schema 22 for a store the
+replacement created), which converts the store back in one transaction,
+keeping every view, pane, retired id and applied pane change. Both commands
+run the matched `cagentsd --stored-schema` or `--downgrade-store`, and both
+refuse while a daemon runs.
+
+The installer only asks through the replacement's command line, and only when
+its `--help` shows these commands. It never gives a daemon an option it may
+not know: released daemons through v0.1.3 ignore their arguments and would start
+serving. A replacement without the commands predates every store downgrade a
+release ships, so the installer neither records the schema nor converts
+anything back.
+
+Installing an older release on purpose is not a rollback: its daemon cannot
+open a store a newer release converted, and runs without the shared model
+until the newer release is back. To keep it, stop the daemon and run the
+newer release's `cagents daemon downgrade-store SCHEMA` first, with the
+schema the older release reads (22 for releases before the conversion). If the schema cannot be read, the installation is not changed; if the
+conversion fails, the installer keeps the new installation, which reads the
+store, rather than restore a daemon that cannot.
 
 A retained native conversation that its provider refuses to reattach, for
 example because Codex no longer finds the thread's rollout in its account

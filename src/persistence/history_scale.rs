@@ -186,6 +186,7 @@ pub(super) fn long_lived_workspace() -> WorkspaceState {
         card_scopes,
         chat_drafts,
         chat_draft_attachments: HashMap::new(),
+        chat_waiting_messages: HashMap::new(),
         agent_updates: BTreeMap::new(),
         workspace_history: Vec::new(),
         repository_navigation: HashMap::new(),
@@ -459,5 +460,89 @@ fn time_store_paths_at_long_lived_size() {
         median(loads),
         median(conversations),
         median(navigable),
+    );
+}
+
+/// Times the flushes a running window makes over a copy of a real window
+/// store, named by `CAGENTS_HISTORY_SCALE_STORE`. The named file is copied
+/// again before it is opened, because opening runs startup reconciliation,
+/// which writes; the file itself is only read.
+///
+/// ```sh
+/// CAGENTS_HISTORY_SCALE_STORE=/path/to/copy/sessions.sqlite3 \
+///     <ui lib test binary> persistence::history_scale::time_flushes_on_a_store_copy \
+///     --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "timing over a real store copy; run explicitly"]
+fn time_flushes_on_a_store_copy() {
+    fn median(mut samples: Vec<f64>) -> f64 {
+        samples.sort_by(f64::total_cmp);
+        samples[samples.len() / 2]
+    }
+    fn wal_len(path: &std::path::Path) -> u64 {
+        std::fs::metadata(sqlite_sidecar_path(path, "-wal"))
+            .map(|metadata| metadata.len())
+            .unwrap_or(0)
+    }
+    let Some(source) = std::env::var_os("CAGENTS_HISTORY_SCALE_STORE") else {
+        eprintln!("CAGENTS_HISTORY_SCALE_STORE is not set; nothing to time");
+        return;
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("sessions.sqlite3");
+    StateStore::copy_snapshot(std::path::Path::new(&source), &path).unwrap();
+    let store = StateStore::open(&path, BootId::new("scale")).unwrap();
+    let workspace = store
+        .list_workspaces()
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("the store holds a workspace");
+    let state = store
+        .load_workspace_restored(workspace.id, None)
+        .unwrap()
+        .unwrap()
+        .state;
+    let mut lane = Lane {
+        workspace: state.generation,
+        cards: state
+            .cards
+            .iter()
+            .map(|card| (card.id, card.generation))
+            .collect(),
+    };
+    let closed = state
+        .cards
+        .iter()
+        .filter(|card| !card.existence.is_open())
+        .count();
+
+    // The first flush after a restart has nothing to compare against.
+    let started = Instant::now();
+    lane.save(&store, &state);
+    let first_ms = started.elapsed().as_secs_f64() * 1e3;
+
+    let flushes = 25;
+    store
+        .lock_inner()
+        .unwrap()
+        .connection
+        .pragma_update(None, "wal_checkpoint", "TRUNCATE")
+        .unwrap();
+    let before = changes(&store);
+    let unchanged = (0..flushes)
+        .map(|_| {
+            let started = Instant::now();
+            lane.save(&store, &state);
+            started.elapsed().as_secs_f64() * 1e3
+        })
+        .collect();
+    let rows = (changes(&store) - before) / flushes;
+    let wal = wal_len(&path) / flushes;
+    eprintln!(
+        "cards={} closed={closed} first_flush_ms={first_ms:.2} unchanged_flush_ms={:.2} rows_per_unchanged_flush={rows} wal_bytes_per_unchanged_flush={wal}",
+        state.cards.len(),
+        median(unchanged),
     );
 }

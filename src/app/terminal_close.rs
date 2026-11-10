@@ -1,5 +1,8 @@
+use super::daemon_recovery::KeptPane;
 use super::*;
-use crate::{control::ControlClient, terminal::ipc::TerminalCloseResult};
+use crate::{
+    control::ControlClient, terminal::ipc::TerminalCloseResult, upgrade::UnreadableProcess,
+};
 
 #[derive(Debug, Clone)]
 pub(super) struct CloseIntent {
@@ -19,8 +22,28 @@ pub(super) struct CloseIntent {
     pub active: bool,
     pub dont_ask_again: bool,
     pub detail: Option<String>,
+    /// Processes Close couldn't read, which kept the pane: the person may
+    /// close it anyway and leave them running.
+    unreadable: Vec<UnreadableProcess>,
+    /// Processes the person chose to leave running. Close passes over these
+    /// and signals nothing.
+    leave: Vec<UnreadableProcess>,
     focus: usize,
     restore_keyboard_nav: bool,
+}
+
+impl CloseIntent {
+    /// Whether the dialog is on screen: asking about active processes,
+    /// reporting why the pane was kept, or closing beside processes left
+    /// running at the person's word.
+    fn shows_dialog(&self) -> bool {
+        self.active || self.detail.is_some() || !self.leave.is_empty()
+    }
+
+    /// The report can offer to close beside what it names.
+    fn offers_leaving(&self) -> bool {
+        self.detail.is_some() && !self.unreadable.is_empty()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -32,7 +55,7 @@ pub enum CloseOutcome {
     /// stopped: there is nothing left to stop.
     NotHosted,
     /// Not proven gone, for the reason given. Nothing was sent to the terminal.
-    Kept(String),
+    Kept(KeptPane),
     Unreachable(String),
 }
 
@@ -255,7 +278,7 @@ impl Cagents {
     pub(super) fn terminal_close_dialog_visible(&self) -> bool {
         self.terminal_close
             .as_ref()
-            .is_some_and(|intent| intent.active || intent.detail.is_some())
+            .is_some_and(CloseIntent::shows_dialog)
     }
 
     /// Gives a visible close dialog the keyboard traversal to restore when it
@@ -263,7 +286,7 @@ impl Cagents {
     /// it. Returns whether a dialog took it.
     pub(super) fn adopt_terminal_close_keyboard_nav(&mut self, restore: bool) -> bool {
         match self.terminal_close.as_mut() {
-            Some(intent) if intent.active || intent.detail.is_some() => {
+            Some(intent) if intent.shows_dialog() => {
                 intent.restore_keyboard_nav = restore;
                 true
             }
@@ -429,6 +452,8 @@ impl Cagents {
                 pending: false,
                 active: false,
                 dont_ask_again: false,
+                unreadable: Vec::new(),
+                leave: Vec::new(),
                 detail: (uncertain && !probe_only).then(|| {
                     "Cagents lost contact with its daemon, so this terminal may still be running. The pane was kept. Use Retry or Reconnect on the pane if it offers them, then close it again.".into()
                 }),
@@ -482,6 +507,8 @@ impl Cagents {
                     active: true,
                     dont_ask_again: false,
                     detail: None,
+                    unreadable: Vec::new(),
+                    leave: Vec::new(),
                     focus: 0,
                 });
                 self.core.set_keyboard_nav(false);
@@ -727,6 +754,9 @@ impl Cagents {
         let Some(intent) = self.terminal_close.as_ref() else {
             return Task::none();
         };
+        if !intent.pending && intent.offers_leaving() {
+            return self.close_leaving_unreadable();
+        }
         if intent.pending || !intent.active || intent.detail.is_some() {
             return Task::none();
         }
@@ -741,6 +771,21 @@ impl Cagents {
             Task::none()
         };
         Task::batch([save, self.start_terminal_close(true)])
+    }
+
+    /// "Close anyway" on a pane kept only by processes Close couldn't read.
+    /// Close proves everything else again, and passes over exactly the
+    /// processes the dialog named. It sends nothing to them, or to anything.
+    fn close_leaving_unreadable(&mut self) -> Task<Message> {
+        let Some(intent) = self.terminal_close.as_mut() else {
+            return Task::none();
+        };
+        let named = std::mem::take(&mut intent.unreadable);
+        intent.leave.extend(named);
+        intent.detail = None;
+        intent.focus = 0;
+        // An active terminal still asks, as any Close does.
+        self.start_terminal_close(false)
     }
 
     fn start_terminal_close(&mut self, allow_active: bool) -> Task<Message> {
@@ -823,7 +868,7 @@ impl Cagents {
         let starting = self.terminal_start_in_flight(card);
         match outcome {
             CloseOutcome::NotHosted if identity_matches && still_saved && !starting => {
-                if intent.active || intent.detail.is_some() {
+                if intent.shows_dialog() {
                     self.core.set_keyboard_nav(intent.restore_keyboard_nav);
                 }
                 self.terminal_close = None;
@@ -834,7 +879,7 @@ impl Cagents {
                 self.request_card_removal(card)
             }
             CloseOutcome::Closed if identity_matches => {
-                if intent.active || intent.detail.is_some() {
+                if intent.shows_dialog() {
                     self.core.set_keyboard_nav(intent.restore_keyboard_nav);
                 }
                 self.terminal_close = None;
@@ -869,6 +914,10 @@ impl Cagents {
                 intent.restore_keyboard_nav = self.core.keyboard_nav();
                 intent.pending = false;
                 intent.focus = 0;
+                intent.unreadable = match &outcome {
+                    CloseOutcome::Kept(kept) => kept.unreadable.clone(),
+                    _ => Vec::new(),
+                };
                 intent.detail = Some(match outcome {
                     CloseOutcome::NotHosted if starting => {
                         "This terminal is starting, so the pane was kept. Close it again when it finishes.".into()
@@ -879,7 +928,7 @@ impl Cagents {
                     | CloseOutcome::NotHosted => {
                         "This terminal changed before it could close, so the pane was kept. Try closing it again.".into()
                     }
-                    CloseOutcome::Kept(reason) => reason,
+                    CloseOutcome::Kept(kept) => kept.reason,
                     CloseOutcome::Unreachable(error) => {
                         tracing::warn!(%error, "terminal close was not confirmed");
                         "Cagents couldn't confirm this terminal closed, so it may still be running. The pane was kept and Cagents won't retry on its own. Try Close again in a moment. If this keeps happening, leave the pane in place.".into()
@@ -898,7 +947,9 @@ impl Cagents {
         if intent.pending {
             return Task::none();
         }
-        intent.focus = if intent.detail.is_some() || !intent.active {
+        intent.focus = if intent.offers_leaving() {
+            (intent.focus + 1) % 2
+        } else if intent.detail.is_some() || !intent.active {
             0
         } else {
             (intent.focus + if backwards { 2 } else { 1 }) % 3
@@ -913,10 +964,16 @@ impl Cagents {
             return None;
         }
         let mut rows: Vec<Element<'_, Message>> = vec![
-            crate::design::title(if intent.detail.is_some() {
-                "Pane kept"
+            crate::design::title(if intent.offers_leaving() {
+                leave_running_title(&intent.unreadable)
+            } else if intent.detail.is_some() {
+                "Pane kept".into()
+            } else if intent.active || intent.leave.is_empty() {
+                // Close anyway can meet a terminal the daemon hosts after all,
+                // which asks about its active processes as any Close does.
+                "Close active processes?".into()
             } else {
-                "Close active processes?"
+                "Closing pane".into()
             })
             .into(),
             // Panes can share a title's first words, and a group close asks
@@ -962,7 +1019,18 @@ impl Cagents {
         // asking: it offers one way out rather than a refusal beside a
         // destructive button that can never be pressed. The dismissal keeps
         // the cancel id so focus traversal stays one rule for both shapes.
-        let buttons = if intent.detail.is_some() {
+        // Keeping the pane stays the focused, first choice; closing beside
+        // processes Close couldn't rule out is the deliberate one.
+        let buttons = if intent.offers_leaving() {
+            vec![super::dialog_ui::confirmation_actions(
+                crate::ui_controls::button::secondary("Keep pane")
+                    .id(widget::Id::new("dialog.terminal-close.cancel"))
+                    .on_press_maybe((!intent.pending).then_some(Message::CancelTerminalClose)),
+                crate::ui_controls::button::destructive("Close anyway")
+                    .id(widget::Id::new("dialog.terminal-close.confirm"))
+                    .on_press_maybe((!intent.pending).then_some(Message::ConfirmTerminalClose)),
+            )]
+        } else if intent.detail.is_some() {
             vec![
                 crate::ui_controls::button::primary("Dismiss")
                     .id(widget::Id::new("dialog.terminal-close.cancel"))
@@ -989,6 +1057,21 @@ impl Cagents {
     }
 }
 
+/// The question Close anyway answers: "Close pane and leave ssh-agent
+/// running?", or "…leave 3 processes running?".
+fn leave_running_title(processes: &[UnreadableProcess]) -> String {
+    match processes {
+        [process] => format!(
+            "Close pane and leave {} running?",
+            process.name.as_deref().unwrap_or("a process")
+        ),
+        _ => format!(
+            "Close pane and leave {} processes running?",
+            processes.len()
+        ),
+    }
+}
+
 fn close_focus(index: usize) -> Task<Message> {
     iced::widget::operation::focus(widget::Id::new(match index {
         1 => "dialog.terminal-close.confirm",
@@ -1002,6 +1085,20 @@ fn close_focus(index: usize) -> Task<Message> {
 mod tests {
     use super::*;
     use crate::model::{BootId, HostIncarnation, HostSessionId};
+
+    /// The dialog asks the question its destructive button answers.
+    #[test]
+    fn leaving_processes_running_is_asked_by_name() {
+        let agent = UnreadableProcess::fixture(1, 10, "ssh-agent");
+        assert_eq!(
+            leave_running_title(std::slice::from_ref(&agent)),
+            "Close pane and leave ssh-agent running?"
+        );
+        assert_eq!(
+            leave_running_title(&[agent, UnreadableProcess::fixture(2, 10, "sshd-session")]),
+            "Close pane and leave 2 processes running?"
+        );
+    }
 
     fn routing_intent(probe_only: bool, saved: Option<TerminalSession>) -> CloseIntent {
         CloseIntent {
@@ -1021,6 +1118,8 @@ mod tests {
             active: false,
             dont_ask_again: false,
             detail: None,
+            unreadable: Vec::new(),
+            leave: Vec::new(),
             focus: 0,
             restore_keyboard_nav: false,
         }
@@ -1032,7 +1131,7 @@ mod tests {
         let card = app.workspace.focused().unwrap();
         let session = terminal_source(&app, card);
         let saved = routing_intent(false, Some(session.clone()));
-        let no_proof = |_: &TerminalSession| -> Result<(), String> {
+        let no_proof = |_: &TerminalSession, _: &[UnreadableProcess]| -> Result<(), KeptPane> {
             panic!("the daemon answered, so no proof is needed")
         };
         assert!(matches!(
@@ -1048,12 +1147,12 @@ mod tests {
             CloseOutcome::Unreachable(_)
         ));
         assert!(matches!(
-            close_or_prove_gone(&saved, || CloseOutcome::Stale, |_| Ok(())),
+            close_or_prove_gone(&saved, || CloseOutcome::Stale, |_, _| Ok(())),
             CloseOutcome::NotHosted
         ));
         assert!(matches!(
-            close_or_prove_gone(&saved, || CloseOutcome::Stale, |_| Err("why".into())),
-            CloseOutcome::Kept(reason) if reason == "why"
+            close_or_prove_gone(&saved, || CloseOutcome::Stale, |_, _| Err("why".into())),
+            CloseOutcome::Kept(kept) if kept.reason == "why"
         ));
         assert!(matches!(
             close_or_prove_gone(
@@ -1073,11 +1172,11 @@ mod tests {
         let probe = routing_intent(true, Some(session));
         let never = || -> CloseOutcome { panic!("a probe must not send a close") };
         assert!(matches!(
-            close_or_prove_gone(&probe, never, |_| Ok(())),
+            close_or_prove_gone(&probe, never, |_, _| Ok(())),
             CloseOutcome::NotHosted
         ));
         assert!(matches!(
-            close_or_prove_gone(&probe, never, |_| Err("still there".into())),
+            close_or_prove_gone(&probe, never, |_, _| Err("still there".into())),
             CloseOutcome::Kept(_)
         ));
     }
@@ -1152,7 +1251,7 @@ mod tests {
                 .is_empty(),
             "persist prunes closed membership after the original Home was captured"
         );
-        assert!(app.channel_work.retire_candidates.contains(&home));
+        assert!(app.channel_ui.retire_candidates.contains(&home));
         let (send, received) = async_channel::unbounded();
         app.workspace_model_tx = send;
         app.retire_settled_empty_channels();
@@ -2267,7 +2366,7 @@ fn revalidate_and_close(intent: &CloseIntent, allow_active: bool) -> CloseOutcom
 fn close_or_prove_gone(
     intent: &CloseIntent,
     close: impl FnOnce() -> CloseOutcome,
-    prove: impl FnOnce(&TerminalSession) -> Result<(), String>,
+    prove: impl FnOnce(&TerminalSession, &[UnreadableProcess]) -> Result<(), KeptPane>,
 ) -> CloseOutcome {
     if !intent.probe_only {
         match close() {
@@ -2278,9 +2377,9 @@ fn close_or_prove_gone(
     let Some(saved) = &intent.saved_source else {
         return CloseOutcome::Stale;
     };
-    match prove(saved) {
+    match prove(saved, &intent.leave) {
         Ok(()) => CloseOutcome::NotHosted,
-        Err(reason) => CloseOutcome::Kept(reason),
+        Err(kept) => CloseOutcome::Kept(kept),
     }
 }
 

@@ -18,7 +18,11 @@ file.
   local overwide-blank correction. The final shape.rs is byte-identical to
   that peer: after an ordinary word-wrap break the final ellipsized line
   starts at the next word; an overflowing blank advances past that blank.
-  Authored text and indentation are not trimmed or normalized.
+  Authored text and indentation are not trimmed or normalized. PR535's
+  updated tests/images/ellipsize_ltr_end_two_lines.png (SHA256
+  1dcd10ab7524150bdb2d0142985bd9f1e94b06753e71ecce58e2b53d15174bba) is
+  taken with it: the crates.io archive's older image predates PR535 and
+  failed against the backported shape.rs (cagents#2472).
 - lib.rs adds the compile-time CAGENTS_CHECKOUT_ROOT identity anchor. The
   cache qualifier adds only the matching cosmic source-hook name, preserving
   PR1316's historical unanchored-producer/package-bootstrap and unrelated
