@@ -1330,6 +1330,9 @@ impl WorkspaceState {
 }
 
 #[cfg(test)]
+mod durable_save_workload;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
