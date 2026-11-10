@@ -397,7 +397,7 @@ mod tests {
             }
             for value in [
                 "model=\"o3\"",
-                "model_reasoning_effort=unsupported",
+                "model_reasoning_effort=invalid token",
                 "model_reasoning_effort=\"high",
             ] {
                 let source = session(Provider::Codex, &[flag, value]);

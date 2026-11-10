@@ -9984,7 +9984,7 @@ mod fresh_recipe_constructor_tests {
         for flag in ["-c", "--config"] {
             for value in [
                 "model=\"o3\"",
-                "model_reasoning_effort=unsupported",
+                "model_reasoning_effort=invalid token",
                 "model_reasoning_effort=\"high",
             ] {
                 let saved = source(root.path(), vec![flag.into(), value.into()]);
