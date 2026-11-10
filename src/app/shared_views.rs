@@ -4538,6 +4538,154 @@ mod tests {
     }
 
     #[test]
+    fn committed_pending_view_edit_projects_once_after_acknowledgment() {
+        use super::super::workspace_model_sync::{EdgeChanges, ModelUpdate};
+        use crate::workspace_model::{
+            ModelProject,
+            delta::{EditEffects, EditReceipt, ViewChanges, ViewRevision},
+        };
+        let (mut app, source, _, pane) = channel_move_fixture();
+        let repository = PathBuf::from("/repo/.git");
+        let project = app
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == source)
+            .unwrap()
+            .project_id;
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "repo".into(),
+            repository.clone(),
+            vec![],
+            vec![],
+        ));
+        app.workspace_model.projects.push(ModelProject {
+            repository,
+            name: "repo".into(),
+            kind: ProjectKind::Git,
+            ordinal: 0,
+        });
+        let scope = Scope::Channel(source);
+        let operation = uuid::Uuid::new_v4();
+        let mut changed = pane.clone();
+        changed.title = "Accepted title".into();
+        changed.width_fraction = 0.68;
+        let change = Change::Update {
+            before: pane,
+            pane: changed.clone(),
+        };
+        app.shared_views
+            .pending
+            .push((operation, scope.clone(), change.clone()));
+        app.card_state_mut(changed.id).unwrap().title = changed.title.clone();
+        app.card_state_mut(changed.id).unwrap().width_fraction = changed.width_fraction;
+        let _ = app
+            .workspace
+            .set_card_width(changed.id, CardWidth::Fraction(changed.width_fraction));
+        let mut accepted = app
+            .workspace_model
+            .views
+            .iter()
+            .find(|view| view.scope == scope)
+            .unwrap()
+            .clone();
+        accepted.apply(&change).unwrap();
+        accepted.revision = 18;
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        app.shared_views.local_projection_count.set(0);
+        drop(app.apply_workspace_model_update(ModelUpdate::Committed {
+            receipt: EditReceipt {
+                identity: app.workspace_model.identity,
+                sequence: 18,
+                effects: EditEffects {
+                    views: vec![ViewRevision {
+                        scope: scope.clone(),
+                        before: Some(17),
+                        after: Some(18),
+                    }],
+                    ..Default::default()
+                },
+            },
+            edit: ModelEdit::ChangeView {
+                scope: scope.clone(),
+                expected_revision: 17,
+                operation,
+                change,
+            },
+            views: ViewChanges {
+                sequence: 18,
+                views: vec![accepted.clone()],
+                ..Default::default()
+            },
+        }));
+        assert_eq!(
+            app.shared_views.local_projection_count.get(),
+            1,
+            "the receipt installs canonical state, acknowledges its overlay, then takes one real local projection"
+        );
+        assert!(
+            !app.shared_views
+                .pending
+                .iter()
+                .any(|(id, _, _)| *id == operation)
+        );
+        assert_eq!(
+            app.workspace_model
+                .views
+                .iter()
+                .find(|view| view.scope == scope),
+            Some(&accepted)
+        );
+        assert_eq!(app.card_state(changed.id).unwrap().title, changed.title);
+        assert!(
+            !std::iter::from_fn(|| rx.try_recv().ok())
+                .any(|edit| matches!(edit, ModelEdit::ChangeView { .. })),
+            "acknowledged metadata is not published again"
+        );
+
+        accepted.revision = 19;
+        accepted.panes[0].title = "Peer title".into();
+        app.shared_views.local_projection_count.set(0);
+        drop(app.apply_workspace_model_update(ModelUpdate::Changed {
+            sequence: 19,
+            edit: ModelEdit::AgentsChanged,
+            changes: EdgeChanges {
+                identity: Some(app.workspace_model.identity),
+                views: ViewChanges {
+                    sequence: 19,
+                    views: vec![accepted],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        }));
+        assert_eq!(
+            app.shared_views.local_projection_count.get(),
+            1,
+            "an observer change still projects once"
+        );
+        assert_eq!(app.card_state(changed.id).unwrap().title, "Peer title");
+        app.shared_views.local_projection_count.set(0);
+        drop(app.apply_workspace_model_update(ModelUpdate::Committed {
+            receipt: EditReceipt {
+                identity: uuid::Uuid::new_v4(),
+                sequence: 900,
+                effects: EditEffects::default(),
+            },
+            edit: ModelEdit::AgentsChanged,
+            views: ViewChanges::default(),
+        }));
+        assert_eq!(
+            app.shared_views.local_projection_count.get(),
+            0,
+            "a foreign registry receipt never projects"
+        );
+    }
+
+    #[test]
     fn reconciliation_settles_an_unsaved_strip_order_before_taking_its_baseline() {
         let (mut app, source, _, pane) = channel_move_fixture();
         let mut next = pane.clone();

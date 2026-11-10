@@ -956,7 +956,7 @@ impl Cagents {
                 };
                 let transferred =
                     operation.and_then(|id| self.shared_views.requested_transfer_card(id));
-                let result = self.apply_changed_edge(
+                let Some(result) = self.install_changed_edge(
                     receipt.sequence,
                     &edit,
                     EdgeChanges {
@@ -964,7 +964,9 @@ impl Cagents {
                         views,
                         effects: receipt.effects,
                     },
-                );
+                ) else {
+                    return Task::none();
+                };
                 match &edit {
                     ModelEdit::ChangeView { scope, .. } => {
                         self.acknowledge_view_edit(scope.clone(), operation);
@@ -1307,20 +1309,34 @@ impl Cagents {
         Task::batch([removed, retired, self.reconcile_workspace_model()])
     }
 
-    /// Installs a canonical partial update without treating its sequence as a
-    /// complete-model watermark. Receipts and the observer can arrive in either
-    /// order; rows from unrelated edits must all survive.
+    /// Installs one observed change and projects it once. A publishing window
+    /// uses the same installation before acknowledging its pending operation,
+    /// then performs its one projection after that overlay has been removed.
     fn apply_changed_edge(
         &mut self,
         sequence: u64,
         edit: &ModelEdit,
         changes: EdgeChanges,
     ) -> Task<Message> {
+        let Some(installed) = self.install_changed_edge(sequence, edit, changes) else {
+            return Task::none();
+        };
+        Task::batch([installed, self.reconcile_workspace_model()])
+    }
+
+    /// Installs canonical rows and scope authority, preserving lifecycle tasks
+    /// without projecting the workspace or advancing a complete-model watermark.
+    fn install_changed_edge(
+        &mut self,
+        sequence: u64,
+        edit: &ModelEdit,
+        changes: EdgeChanges,
+    ) -> Option<Task<Message>> {
         if changes
             .identity
             .is_some_and(|identity| identity != self.workspace_model.identity)
         {
-            return Task::none();
+            return None;
         }
         self.shared_views
             .closed
@@ -1330,7 +1346,7 @@ impl Cagents {
             sequence > self.shared_views.snapshot_sequence,
         );
         if sequence < self.shared_views.snapshot_sequence {
-            return self.reconcile_workspace_model();
+            return Some(Task::none());
         }
         let floor = self.shared_views.snapshot_sequence;
         let (protected_channels, protected_projects) =
@@ -1450,8 +1466,7 @@ impl Cagents {
             self.cancel_shared_project_close(repository);
             self.project_ui.closed.remove(repository);
         }
-        tasks.push(self.reconcile_workspace_model());
-        Task::batch(tasks)
+        Some(Task::batch(tasks))
     }
 
     /// Installs complete views by revision, adding a scope the window lacks
@@ -4838,6 +4853,155 @@ mod tests {
             !app.shared_views.closed.contains(&card),
             "closed identities belong to one registry"
         );
+    }
+
+    #[test]
+    fn absent_close_survives_scope_deletion_and_blocks_a_delayed_agent_arrival() {
+        use crate::workspace_model::{
+            delta::ViewRevision,
+            views::{Change, Scope, View},
+        };
+        for seed_closed in [false, true] {
+            let (mut app, mut agent, pane, destination) = managed_display_fixture();
+            let source = agent.placement.clone();
+            let Scope::Channel(source_channel) = source.clone() else {
+                unreachable!()
+            };
+            agent.placement = Scope::Channel(destination);
+            agent.spec.target.placement = Some(agent.placement.clone());
+            let identity = app.workspace_model.identity;
+            let mut baseline = app.workspace_model.clone();
+            baseline.sequence = 10;
+            baseline.agents.clear();
+            for view in &mut baseline.views {
+                view.revision = 10;
+                view.panes.clear();
+                view.retired.clear();
+            }
+            let (sent, requests) = async_channel::unbounded();
+            app.workspace_model_tx = sent;
+            drop(
+                app.apply_workspace_model_update(ModelUpdate::ConnectedClosed {
+                    model: baseline,
+                    closed: vec![],
+                }),
+            );
+            assert!(!app.durable.cards.iter().any(|card| card.id == pane.id));
+            let edit = if seed_closed {
+                ModelEdit::SeedView {
+                    scope: source.clone(),
+                    panes: vec![],
+                    closed: vec![pane.id],
+                }
+            } else {
+                ModelEdit::ChangeView {
+                    scope: source.clone(),
+                    expected_revision: 10,
+                    operation: uuid::Uuid::new_v4(),
+                    change: Change::Remove { id: pane.id },
+                }
+            };
+            drop(app.apply_workspace_model_update(ModelUpdate::Changed {
+                sequence: 11,
+                edit,
+                changes: EdgeChanges {
+                    identity: Some(identity),
+                    views: ViewChanges {
+                        sequence: 11,
+                        views: vec![View {
+                            scope: source.clone(),
+                            revision: 11,
+                            panes: vec![],
+                            retired: vec![pane.id],
+                        }],
+                        ..Default::default()
+                    },
+                    effects: EditEffects {
+                        views: vec![ViewRevision {
+                            scope: source.clone(),
+                            before: Some(10),
+                            after: Some(11),
+                        }],
+                        closed: vec![pane.id],
+                        ..Default::default()
+                    },
+                },
+            }));
+            drop(app.apply_workspace_model_update(ModelUpdate::Changed {
+                sequence: 12,
+                edit: ModelEdit::DeleteChannel { id: source_channel },
+                changes: EdgeChanges {
+                    identity: Some(identity),
+                    views: ViewChanges {
+                        sequence: 12,
+                        removed: vec![(source.clone(), 11)],
+                        ..Default::default()
+                    },
+                    effects: EditEffects {
+                        views: vec![ViewRevision {
+                            scope: source.clone(),
+                            before: Some(11),
+                            after: None,
+                        }],
+                        removed_channels: vec![source_channel],
+                        ..Default::default()
+                    },
+                },
+            }));
+            assert!(
+                !app.workspace_model
+                    .views
+                    .iter()
+                    .any(|view| view.retired.contains(&pane.id)),
+                "scope deletion erased the only view tombstone"
+            );
+            drop(app.apply_workspace_model_update(ModelUpdate::Changed {
+                sequence: 13,
+                edit: ModelEdit::AgentsChanged,
+                changes: EdgeChanges {
+                    identity: Some(identity),
+                    effects: EditEffects {
+                        agents: vec![agent.clone()],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            }));
+            assert!(
+                crate::workspace_model::views::managed_display(&app.workspace_model, &agent)
+                    .is_some(),
+                "without the retained closed-identity fence, this otherwise valid delayed agent would be adopted"
+            );
+            assert_eq!(app.workspace_model.agents, vec![agent]);
+            assert!(
+                app.shared_views.closed.contains(&pane.id),
+                "the close is retained without a reconnect after its scope disappears"
+            );
+            assert!(
+                !app.durable.cards.iter().any(|card| card.id == pane.id),
+                "a delayed agent row must not adopt the explicitly closed pane in another channel"
+            );
+            assert!(
+                !app.cards.contains_key(&pane.id),
+                "no runtime or attachment may be admitted for that pane"
+            );
+            assert!(
+                !std::iter::from_fn(|| requests.try_recv().ok()).any(|edit| match edit {
+                    ModelEdit::SeedView { panes, .. } =>
+                        panes.iter().any(|candidate| candidate.id == pane.id),
+                    ModelEdit::ChangeView {
+                        change:
+                            Change::Insert {
+                                pane: candidate, ..
+                            }
+                            | Change::InsertIfEmpty { pane: candidate },
+                        ..
+                    } => candidate.id == pane.id,
+                    _ => false,
+                }),
+                "the delayed agent must not publish a replacement membership"
+            );
+        }
     }
 
     #[test]

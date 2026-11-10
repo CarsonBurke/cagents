@@ -37,6 +37,23 @@ impl Recorder {
     /// Reads the channel rows and agent records as the edit left them, inside
     /// its transaction.
     pub(super) fn finish(self, db: &Connection) -> Result<EditEffects, String> {
+        // A tombstone also closes an identity the daemon had never held.
+        // Resolve after all row changes: a transfer or stale seed mentioning
+        // a pane still owned elsewhere must not close that live identity.
+        let mut closed = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for id in self.closed {
+            if !seen.insert(id) {
+                continue;
+            }
+            let active: bool = db
+                .prepare_cached("SELECT EXISTS(SELECT 1 FROM panes WHERE id = ?1)")
+                .and_then(|mut statement| statement.query_row([id.to_string()], |row| row.get(0)))
+                .map_err(|error| error.to_string())?;
+            if !active {
+                closed.push(id);
+            }
+        }
         let channels = self
             .channels
             .into_iter()
@@ -61,7 +78,7 @@ impl Recorder {
             .collect::<Result<_, _>>()?;
         Ok(EditEffects {
             views: self.views,
-            closed: self.closed,
+            closed,
             channels,
             agents,
             ..Default::default()
@@ -733,6 +750,12 @@ pub(super) fn apply_recorded(
             .extend(stored.panes.iter().map(|pane| pane.id).filter(|id| {
                 !transferred.contains(id) && !view.panes.iter().any(|pane| pane.id == *id)
             }));
+        recorder.closed.extend(
+            view.retired
+                .iter()
+                .copied()
+                .filter(|id| !stored.retired.contains(id)),
+        );
         write_from(transaction, &stored, &view, recorder)?;
     }
     if let Some((before, target, existed)) = deferred_target {

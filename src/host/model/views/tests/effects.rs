@@ -332,3 +332,67 @@ fn an_unchanged_edit_carries_no_effects() {
     assert!(!replay.changed);
     assert!(replay.effects.is_empty());
 }
+
+#[test]
+fn absent_closes_announce_new_identities_without_closing_a_live_transferred_owner() {
+    let (mut registry, _directory, a, b) = setup();
+    let live = pane();
+    seed(&mut registry, b, vec![live.clone()]);
+    let absent = crate::model::CardId::new();
+    let receipt = registry
+        .apply_delta(&ModelEdit::SeedView {
+            scope: Scope::Channel(a),
+            panes: vec![],
+            closed: vec![absent, live.id],
+        })
+        .unwrap()
+        .receipt;
+    assert_eq!(receipt.effects.closed, vec![absent]);
+    assert!(
+        registry
+            .view_snapshot(&Scope::Channel(a))
+            .unwrap()
+            .0
+            .unwrap()
+            .retired
+            .contains(&live.id)
+    );
+    assert_eq!(
+        registry
+            .view_snapshot(&Scope::Channel(b))
+            .unwrap()
+            .0
+            .unwrap()
+            .panes,
+        vec![live]
+    );
+    // A connected subscriber retains these identities even after the scope
+    // holding their tombstones is removed. No history read is needed.
+    let mut closed: std::collections::HashSet<_> = receipt.effects.closed.into_iter().collect();
+    let removed = registry
+        .apply_delta(&ModelEdit::DeleteChannel { id: a })
+        .unwrap();
+    closed.extend(removed.receipt.effects.closed);
+    assert!(closed.contains(&absent));
+    assert!(
+        registry
+            .view_snapshot(&Scope::Channel(a))
+            .unwrap()
+            .0
+            .is_none()
+    );
+    // A new Remove of an absent identity travels too; a replay is a no-op.
+    let absent = crate::model::CardId::new();
+    let remove = edit(&mut registry, b, Change::Remove { id: absent });
+    let first = registry.apply_delta(&remove).unwrap();
+    assert_eq!(first.receipt.effects.closed, vec![absent]);
+    assert!(
+        registry
+            .apply_delta(&remove)
+            .unwrap()
+            .receipt
+            .effects
+            .closed
+            .is_empty()
+    );
+}
