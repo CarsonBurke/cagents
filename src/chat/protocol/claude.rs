@@ -527,6 +527,9 @@ struct SendNowRequest {
 /// command gets one; it matters here from when it leaves the turn's path.
 struct CommandTask {
     id: String,
+    /// The call that started it, which stands for it in the transcript.
+    /// Claude Code names it only when the task starts and ends.
+    call: Option<String>,
     description: String,
     background: bool,
     stopping: bool,
@@ -1052,6 +1055,7 @@ impl Claude {
                         .is_some_and(|input| input["run_in_background"] == true);
                 self.main_commands.push_back(CommandTask {
                     id: task.into(),
+                    call: tool.map(str::to_owned),
                     description: string(frame, "description").into(),
                     background,
                     stopping: false,
@@ -6342,12 +6346,21 @@ impl Claude {
                 // delivered to that subagent rather than to this conversation.
                 let subagent = self.subagent_tasks.iter().any(|known| known == task);
                 // The call that started a task other than an agent, such as a
-                // background command or a Monitor, is already its row.
+                // background command or a Monitor, is already its row. An
+                // update between a command's start and end, such as Send now
+                // moving it aside, doesn't name the call, but it is the same one.
                 let call = known_tool
                     .is_none()
-                    .then(|| frame["tool_use_id"].as_str())
+                    .then(|| {
+                        frame["tool_use_id"].as_str().or_else(|| {
+                            self.main_commands
+                                .iter()
+                                .find(|known| known.id == task)
+                                .and_then(|known| known.call.as_deref())
+                        })
+                    })
                     .flatten()
-                    .filter(|tool| self.task_call(tool).is_some());
+                    .is_some_and(|tool| self.task_call(tool).is_some());
                 let id = format!("claude-task:{task}");
                 let previous = self
                     .tools
@@ -6507,7 +6520,7 @@ impl Claude {
                 // A subagent's command is shown in its transcript when Claude
                 // Code forwards the call; until then this row is all that
                 // shows it ran, or how it failed.
-                let represented = call.is_some()
+                let represented = call
                     || known_tool
                         .as_deref()
                         .or_else(|| frame["tool_use_id"].as_str())
@@ -20309,7 +20322,8 @@ mod tests {
             assert!(trace!("sn_then_interrupt").commands().is_empty());
         }
 
-        /// The moved call's last state, and any row beside it for its task.
+        /// The moved call's last state, and any row beside it for its task,
+        /// whether it shows as a command or as a task.
         fn moved_command(replay: &Replay, tool: &str, task: &str) -> (ToolStatus, usize) {
             let status = replay
                 .events
@@ -20328,8 +20342,7 @@ mod tests {
                 .events
                 .iter()
                 .filter(|event| {
-                    matches!(event, Event::Item(Item { id, content: ItemContent::Tool { .. }, .. })
-                        if id.contains(task))
+                    matches!(event, Event::Item(Item { id, .. }) if *id == format!("claude-task:{task}"))
                 })
                 .count();
             (status, rows)
