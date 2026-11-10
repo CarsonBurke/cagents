@@ -1527,6 +1527,15 @@ enum SharedCodexService {
     Unknown,
 }
 
+fn shared_codex_failure(failure: chat::protocol::SetupError) -> ProtocolError {
+    match failure {
+        chat::protocol::SetupError::Invalid(message) => error(message),
+        chat::protocol::SetupError::Unavailable(message) => {
+            ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true)
+        }
+    }
+}
+
 /// Probe the exact shared transport both preparation and fallback would use.
 /// The adapter owns any verified short alias until the probe has completed.
 /// Only an absent entry or ConnectionRefused proves this endpoint unserved;
@@ -1547,7 +1556,7 @@ fn shared_codex_service(
         _ => return Ok(SharedCodexService::Unknown),
     };
     before_probe()?;
-    let (spec, _adapter) = match chat::protocol::codex::create(launch) {
+    let (spec, _adapter) = match chat::protocol::codex::create_for_start(launch) {
         Ok(created) => created,
         Err(failure) => {
             if !std::fs::metadata(&shared).is_ok_and(|now| {
@@ -1557,7 +1566,7 @@ fn shared_codex_service(
             }) {
                 return Ok(SharedCodexService::Unknown);
             }
-            return Err(error(failure));
+            return Err(shared_codex_failure(failure));
         }
     };
     let service = match &spec.transport {

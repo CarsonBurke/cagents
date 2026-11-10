@@ -638,6 +638,52 @@ fn an_unknown_shared_endpoint_never_grants_a_private_server() {
 }
 
 #[test]
+fn codex_constructor_io_is_retryable_but_recipe_conflicts_remain_blocked() {
+    const NAME: &str = "host::chat::unserved_resume_tests::codex_constructor_io_is_retryable_but_recipe_conflicts_remain_blocked";
+    if isolated(NAME).is_some() {
+        return;
+    }
+    let (_host, _, path) = fixture();
+    let root = path.parent().unwrap();
+    let mut source = reopened(root);
+    let home = root.join("missing-codex-home");
+    source
+        .launch
+        .recipe
+        .environment
+        .insert("CODEX_HOME".into(), home.to_str().unwrap().into());
+    let failure = chat::protocol::codex::create_for_start(&source.launch)
+        .err()
+        .expect("the actual home is absent");
+    let failure = shared_codex_failure(failure);
+    assert_eq!(failure.code, ProtocolErrorCode::TerminalUnavailable);
+    assert!(failure.retryable, "{failure:?}");
+    assert!(
+        failure
+            .message
+            .contains("Cannot verify Codex account directory")
+    );
+    let control = home.join("app-server-control");
+    std::fs::create_dir_all(&control).unwrap();
+    let _listener = UnixListener::bind(control.join("app-server-control.sock")).unwrap();
+    assert!(
+        chat::protocol::codex::create_for_start(&source.launch).is_ok(),
+        "repairing the same home/endpoint permits the same constructor"
+    );
+    source.launch.recipe.arguments[1] = "another-thread".into();
+    let conflict = chat::protocol::codex::create_for_start(&source.launch)
+        .err()
+        .expect("the exact recipe no longer matches");
+    let conflict = shared_codex_failure(conflict);
+    assert_eq!(conflict.code, ProtocolErrorCode::InvalidRequest);
+    assert!(!conflict.retryable, "{conflict:?}");
+    assert_eq!(
+        conflict.message,
+        "Codex recipe resume ID does not match the selected thread"
+    );
+}
+
+#[test]
 fn a_replaced_shared_endpoint_remains_unknown() {
     const NAME: &str =
         "host::chat::unserved_resume_tests::a_replaced_shared_endpoint_remains_unknown";
