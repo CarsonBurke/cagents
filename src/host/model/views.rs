@@ -615,7 +615,10 @@ pub(super) fn apply_recorded(
             // Migration is additive, including old independent windows. Closed
             // IDs are applied first and prevent stale caches from resurrecting.
             for id in closed {
-                changed |= view.apply(&Change::Remove { id: *id })?;
+                if view.apply(&Change::Remove { id: *id })? {
+                    changed = true;
+                    recorder.closed.push(*id);
+                }
             }
             for pane in panes {
                 if view.panes.iter().any(|existing| {
@@ -727,6 +730,13 @@ pub(super) fn apply_recorded(
                         changed
                     }
                 }
+                Change::Remove { id } => {
+                    let changed = view.apply(change)?;
+                    if changed {
+                        recorder.closed.push(*id);
+                    }
+                    changed
+                }
                 _ => view.apply(change)?,
             };
             store::record_operation(transaction, *operation, scope_row)?;
@@ -740,22 +750,8 @@ pub(super) fn apply_recorded(
             existed.then_some(stored.revision),
             Some(view.revision),
         );
-        // A transferred pane leaves this view without closing.
-        let transferred = match &deferred_target {
-            Some((_, target, _)) => target.panes.iter().map(|pane| pane.id).collect(),
-            None => Vec::new(),
-        };
-        recorder
-            .closed
-            .extend(stored.panes.iter().map(|pane| pane.id).filter(|id| {
-                !transferred.contains(id) && !view.panes.iter().any(|pane| pane.id == *id)
-            }));
-        recorder.closed.extend(
-            view.retired
-                .iter()
-                .copied()
-                .filter(|id| !stored.retired.contains(id)),
-        );
+        // Remove/SeedView record closure intent while applying it. Transfers
+        // retire their source placement without closing its identity.
         write_from(transaction, &stored, &view, recorder)?;
     }
     if let Some((before, target, existed)) = deferred_target {
