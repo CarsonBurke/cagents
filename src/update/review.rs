@@ -21,6 +21,18 @@ pub fn render_review(preview: &Preview) -> String {
         )
         .unwrap();
     }
+    for editor in &preview.editors {
+        if editor.protocol != Some(preview.candidate.protocol) {
+            writeln!(
+                output,
+                "{} ({}) keeps running; its agent features need {} to be updated as well.",
+                editor.name,
+                editor.version.as_deref().unwrap_or("version unknown"),
+                editor.name
+            )
+            .unwrap();
+        }
+    }
 
     let stopped_ids: BTreeSet<_> = preview.stopped.iter().map(|pane| pane.pane).collect();
     let impact_titles: BTreeMap<_, _> = preview

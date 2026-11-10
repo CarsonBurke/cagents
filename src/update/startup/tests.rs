@@ -173,6 +173,7 @@ fn private_status_projection_never_exposes_capability_error_or_path_content() {
                 stopped: Vec::new(),
                 stopped_windows: Vec::new(),
                 labels: Default::default(),
+                editors: Vec::new(),
                 candidate: super::super::impact::Candidate {
                     version: "1.2.4".into(),
                     protocol: crate::terminal_ipc::PROTOCOL_VERSION,

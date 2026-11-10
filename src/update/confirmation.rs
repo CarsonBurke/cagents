@@ -190,6 +190,7 @@ mod tests {
             stopped: Vec::new(),
             stopped_windows: Vec::new(),
             labels: Default::default(),
+            editors: Vec::new(),
             candidate: impact::Candidate {
                 version: "9.8.7".into(),
                 protocol: 32,

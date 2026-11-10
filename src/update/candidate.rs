@@ -24,6 +24,7 @@ impl Staged {
                         stopped: Vec::new(),
                         stopped_windows: Vec::new(),
                         labels: Default::default(),
+                        editors: crate::install_guard::editor_companions(),
                         candidate: self.identity.clone(),
                         replaces_daemon: false,
                         daemon: None,

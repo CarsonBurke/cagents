@@ -3303,8 +3303,13 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                         io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
                     ) =>
                 {
-                    crate::daemon::HostLease::is_held(&paths)
+                    // A reviewed worker can reserve the lease after the
+                    // serving process has exited. Only its validated inherited
+                    // description distinguishes that reservation from startup.
+                    !crate::daemon::lease_handoff::has_inherited_lease()
                         .map_err(|error| AppError::new("daemon_status", error))?
+                        && crate::daemon::HostLease::is_held(&paths)
+                            .map_err(|error| AppError::new("daemon_status", error))?
                 }
                 Err(error) => return Err(AppError::new("protocol", error)),
             };

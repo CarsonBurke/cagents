@@ -1036,20 +1036,29 @@ if [ "$STAGE_ONLY" -eq 1 ]; then
     DAEMON_DEFERRED=1
 elif [ "$HAD_CURRENT" -eq 1 ]; then
     if [ "$RESTART_DAEMON" -eq 1 ]; then
-        read_daemon_status "$OWNER_CLI"
-        case $DAEMON_STATUS in
-            running)
-                OLD_DAEMON_WAS_RUNNING=1
-                if [ "$REQUIRE_EMPTY_DAEMON" -eq 1 ]; then
-                    stop_daemon_and_wait "$OWNER_CLI"
-                    DAEMON_STOPPED_FOR_SWITCH=1
-                else
-                    prepare_daemon_upgrade "$OWNER_CLI"
-                fi
-                ;;
-            stopped) ;;
-            *) fail 'cannot verify the installed daemon status; installation was not changed' ;;
-        esac
+        if [ -n "${CAGENTS_DAEMON_LEASE_FD:-}" ]; then
+            # The reviewed worker already checkpointed the source and holds
+            # its lease. The candidate validates the exact inherited lock;
+            # an environment marker alone cannot authorize skipping prepare.
+            read_daemon_status "$NEW_VERSION_DIR/bin/cagents"
+            [ "$DAEMON_STATUS" = stopped ] \
+                || fail 'cannot verify the transferred daemon lease; installation was not changed'
+        else
+            read_daemon_status "$OWNER_CLI"
+            case $DAEMON_STATUS in
+                running)
+                    OLD_DAEMON_WAS_RUNNING=1
+                    if [ "$REQUIRE_EMPTY_DAEMON" -eq 1 ]; then
+                        stop_daemon_and_wait "$OWNER_CLI"
+                        DAEMON_STOPPED_FOR_SWITCH=1
+                    else
+                        prepare_daemon_upgrade "$OWNER_CLI"
+                    fi
+                    ;;
+                stopped) ;;
+                *) fail 'cannot verify the installed daemon status; installation was not changed' ;;
+            esac
+        fi
     else
         # The candidate handshake proves protocol compatibility without changing
         # the running process. Compatible updates never replace live PTYs.

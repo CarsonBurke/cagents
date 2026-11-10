@@ -1254,6 +1254,7 @@ mod tests {
                 stopped: Vec::new(),
                 stopped_windows: Vec::new(),
                 labels: Default::default(),
+                editors: Vec::new(),
                 candidate: crate::update::impact::Candidate {
                     version: "new".into(),
                     protocol: 32,
@@ -1377,6 +1378,7 @@ mod tests {
                 stopped: Vec::new(),
                 stopped_windows: Vec::new(),
                 labels: Default::default(),
+                editors: Vec::new(),
                 candidate: crate::update::impact::Candidate {
                     version: "9.8.7".into(),
                     protocol: 32,
@@ -1426,6 +1428,7 @@ mod tests {
                 stopped: Vec::new(),
                 stopped_windows: Vec::new(),
                 labels: Default::default(),
+                editors: Vec::new(),
                 candidate: crate::update::impact::Candidate {
                     version: "9.8.7".into(),
                     protocol: 32,

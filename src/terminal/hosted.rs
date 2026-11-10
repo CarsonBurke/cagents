@@ -1457,7 +1457,9 @@ fn ensure_daemon_ready_at(
         return Err(HostedTerminalStartError::HostBinaryMissing(daemon_binary));
     }
 
-    let scoped = systemd_user_manager_available()
+    let scoped = !crate::daemon::lease_handoff::has_inherited_lease()
+        .map_err(|error| HostedTerminalStartError::HostStartup(error.to_string()))?
+        && systemd_user_manager_available()
         && !crate::instance::has_inherited_daemon_fence()
             .map_err(|error| HostedTerminalStartError::HostStartup(error.to_string()))?;
     start_and_verify_daemon_at(socket, timeout, &daemon_binary, scoped, |scoped| {
@@ -1617,6 +1619,7 @@ fn spawn_daemon(
         command.pre_exec(crate::daemon::seal_inherited_descriptors);
     }
     crate::instance::inherit_daemon_fence(&mut command)?;
+    crate::daemon::lease_handoff::inherit_daemon_lease(&mut command)?;
     command.spawn()
 }
 
@@ -1643,8 +1646,10 @@ fn daemon_startup_ready(
     if let Some(status) = child_status {
         // A concurrent launch can win the lease while our child exits. Its
         // listener may not be bound yet; the lease proves its ownership.
-        if !crate::daemon::HostLease::is_held_at(socket)
+        if crate::daemon::lease_handoff::has_inherited_lease()
             .map_err(|error| HostedTerminalStartError::HostStartup(error.to_string()))?
+            || !crate::daemon::HostLease::is_held_at(socket)
+                .map_err(|error| HostedTerminalStartError::HostStartup(error.to_string()))?
         {
             return Err(HostedTerminalStartError::HostExited {
                 path: socket.to_owned(),

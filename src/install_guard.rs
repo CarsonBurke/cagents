@@ -22,7 +22,8 @@ use std::{
 use crate::instance::UiUpdateGuard;
 
 mod companions;
-pub(crate) use companions::{preflight_editor_companions, trusted_executable_owner};
+pub use companions::EditorCompanion;
+pub(crate) use companions::{editor_companions, trusted_executable_owner};
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -136,6 +137,7 @@ pub(crate) fn sanitize_child_environment(command: &mut Command) {
     for name in [
         crate::instance::INSTALL_GUARD_ENV,
         crate::instance::DAEMON_FENCE_ENV,
+        crate::daemon::lease_handoff::DAEMON_LEASE_ENV,
         RESULT_FD_ENV,
         OWNER_CLI_ENV,
         "CAGENTS_ARCHIVE",
@@ -227,12 +229,6 @@ pub(crate) fn run(
     let slots = if stage_only {
         Vec::new()
     } else {
-        if arguments
-            .iter()
-            .any(|argument| argument == "--restart-daemon")
-        {
-            preflight_editor_companions(None)?;
-        }
         guard.prepare_and_close_windows_with_preflight(Duration::from_secs(45), |guard| {
             preflight_source_panes(
                 guard,
@@ -431,6 +427,12 @@ pub(crate) fn staged_owner_bin(
     executable: &Path,
     recover: bool,
 ) -> io::Result<Option<std::path::PathBuf>> {
+    // This is the confirmed successor, holding the exact runtime lease. The
+    // old PID in its metadata is expected until HostLease adopts it; routing
+    // back through that stopped source would prevent the handoff itself.
+    if crate::daemon::lease_handoff::has_inherited_lease()? {
+        return Ok(None);
+    }
     use std::os::unix::fs::OpenOptionsExt;
     // Sealed update probes execute from anonymous FDs. Their kernel exe path
     // has no filesystem entry to canonicalize and carries no install routing.

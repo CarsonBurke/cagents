@@ -4,6 +4,7 @@ pub(crate) mod adopted_orphans;
 pub(crate) mod child_reaper;
 pub(crate) mod holder_registry;
 pub(crate) mod hosting;
+pub(crate) mod lease_handoff;
 #[cfg(feature = "host")]
 pub(crate) mod owned_children;
 #[cfg(feature = "host")]
@@ -339,6 +340,7 @@ impl Drop for RecoveryLease {
 pub(crate) struct HostLease {
     socket_path: PathBuf,
     lock: File,
+    shared_handoff: bool,
 }
 
 impl HostLease {
@@ -347,19 +349,38 @@ impl HostLease {
         paths: &RuntimePaths,
         proof: &HostSessionProof,
     ) -> Result<Self, PlatformError> {
-        prepare_runtime_directory(&paths.directory)?;
+        Self::acquire_with_handoff(paths, proof, None)
+    }
 
-        let mut lock = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            // Do not erase a live daemon's metadata before the lock is acquired.
-            // `write_lock_metadata` truncates after exclusive ownership is proven.
-            .truncate(false)
-            .mode(PRIVATE_FILE_MODE)
-            .custom_flags(LOCK_OPEN_FLAGS)
-            .open(&paths.lock)?;
+    #[cfg(feature = "host")]
+    pub(crate) fn acquire_with_handoff(
+        paths: &RuntimePaths,
+        proof: &HostSessionProof,
+        inherited: Option<File>,
+    ) -> Result<Self, PlatformError> {
+        prepare_runtime_directory(&paths.directory)?;
+        let shared_handoff = inherited.is_some();
+        let mut lock = if let Some(lock) = inherited {
+            lease_handoff::validate_inherited(&lock, paths)?;
+            lock
+        } else {
+            OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                // Do not erase a live daemon's metadata before the lock is acquired.
+                // `write_lock_metadata` truncates after exclusive ownership is proven.
+                .truncate(false)
+                .mode(PRIVATE_FILE_MODE)
+                .custom_flags(LOCK_OPEN_FLAGS)
+                .open(&paths.lock)?
+        };
         validate_lock_file(&paths.lock, &lock.metadata()?, current_uid())?;
+        // Adoption must not let the inventory lease escape into providers or
+        // terminals even when a caller supplies a descriptor without CLOEXEC.
+        if unsafe { libc::fcntl(lock.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+            return Err(io::Error::last_os_error().into());
+        }
         lock.set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
         // SAFETY: flock receives a live file descriptor and no pointer data.
         if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
@@ -373,6 +394,7 @@ impl HostLease {
         Ok(Self {
             socket_path: paths.socket.clone(),
             lock,
+            shared_handoff,
         })
     }
 
@@ -433,6 +455,7 @@ impl HostLease {
         Ok(Self {
             socket_path: paths.socket.clone(),
             lock,
+            shared_handoff: false,
         })
     }
 }
@@ -444,8 +467,12 @@ impl Drop for HostLease {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(_) => {}
         }
+        // An adopted description is also the worker's failure reservation;
+        // only closing our copy preserves it until failure has been recorded.
         // SAFETY: the file descriptor remains live for the duration of Drop.
-        let _ = unsafe { libc::flock(self.lock.as_raw_fd(), libc::LOCK_UN) };
+        if !self.shared_handoff {
+            let _ = unsafe { libc::flock(self.lock.as_raw_fd(), libc::LOCK_UN) };
+        }
     }
 }
 
@@ -1864,5 +1891,212 @@ while True: time.sleep(1)
             .is_err()
         );
         assert_eq!(fs::read(&target).unwrap(), b"untouched");
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn handoff_rejects_mismatched_inode_and_unheld_descriptors() {
+        let root = tempdir().unwrap();
+        let expected = paths(root.path().join("expected"));
+        let original = HostLease::acquire(&expected, &proof()).unwrap();
+        drop(original);
+        let unrelated = paths(root.path().join("unrelated"));
+        let unrelated_lease = HostLease::acquire(&unrelated, &proof()).unwrap();
+        let error = HostLease::acquire_with_handoff(
+            &expected,
+            &proof(),
+            Some(unrelated_lease.lock.try_clone().unwrap()),
+        )
+        .err()
+        .expect("a held lease for another inode cannot be adopted");
+        assert!(
+            error.to_string().contains("different lease inode"),
+            "{error}"
+        );
+        let unheld = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&expected.lock)
+            .unwrap();
+        let error = HostLease::acquire_with_handoff(&expected, &proof(), Some(unheld))
+            .err()
+            .expect("an unlocked descriptor is not a handoff");
+        assert!(error.to_string().contains("unheld lease"), "{error}");
+        assert!(HostLease::is_held(&unrelated).unwrap());
+        assert!(!HostLease::is_held(&expected).unwrap());
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn blocking_handoff_excludes_companion_autostart_until_worker_releases() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let root = tempdir().unwrap();
+        let paths = paths(root.path().join("runtime"));
+        let original = HostLease::acquire(&paths, &proof()).unwrap();
+        let waiting_paths = paths.clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let waiter = std::thread::spawn(move || {
+            sender
+                .send(lease_handoff::LeaseHandoff::wait(
+                    &waiting_paths,
+                    std::process::id(),
+                ))
+                .unwrap();
+        });
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(30)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(matches!(
+            HostLease::acquire(&paths, &proof()),
+            Err(PlatformError::AlreadyRunning { .. })
+        ));
+        drop(original);
+        let handoff = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        waiter.join().unwrap();
+        // Model an older companion's nonblocking autostart during the interval
+        // after checkpointing and before the successor process is launched.
+        assert!(matches!(
+            HostLease::acquire(&paths, &proof()),
+            Err(PlatformError::AlreadyRunning { .. })
+        ));
+        drop(handoff);
+        let _manual_restart = HostLease::acquire(&paths, &proof()).unwrap();
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn handoff_survives_cli_forwarding_and_successor_exit_without_leaking_to_children() {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+        use std::process::{Child, Command, Stdio};
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        const TEST: &str = "daemon::tests::handoff_survives_cli_forwarding_and_successor_exit_without_leaking_to_children";
+        const MODE: &str = "CAGENTS_TEST_LEASE_HANDOFF_MODE";
+        const EXIT: &str = "CAGENTS_TEST_LEASE_HANDOFF_EXIT";
+        if let Ok(mode) = env::var(MODE) {
+            assert!(lease_handoff::has_inherited_lease().unwrap());
+            if mode == "cli" {
+                let mut command = Command::new(env::current_exe().unwrap());
+                command
+                    .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                    .env(MODE, "daemon")
+                    .stdin(Stdio::inherit());
+                crate::install_guard::sanitize_child_environment(&mut command);
+                // Follow the real CLI spawn order: seal everything, then
+                // explicitly restore only the daemon's inherited authority.
+                unsafe { command.pre_exec(seal_inherited_descriptors) };
+                lease_handoff::inherit_daemon_lease(&mut command).unwrap();
+                let status = command.status().unwrap();
+                std::process::exit(status.code().unwrap_or(99));
+            }
+            assert_eq!(mode, "daemon");
+            // Only this exact test runs in the fixture. No concurrent test or
+            // other fixture thread reads the environment while it is consumed.
+            let inherited = unsafe { lease_handoff::take_inherited_lease() }
+                .unwrap()
+                .unwrap();
+            assert!(env::var_os(lease_handoff::DAEMON_LEASE_ENV).is_none());
+            assert_ne!(
+                unsafe { libc::fcntl(inherited.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+                0
+            );
+            let paths = RuntimePaths::discover().unwrap();
+            let successor =
+                HostLease::acquire_with_handoff(&paths, &proof(), Some(inherited)).unwrap();
+            let metadata: StoredLockMetadata =
+                serde_json::from_slice(&fs::read(&paths.lock).unwrap()).unwrap();
+            assert_eq!(metadata.pid, std::process::id());
+            let mut provider = Command::new("/bin/sh");
+            provider
+                .args([
+                    "-c",
+                    "test -z \"${CAGENTS_DAEMON_LEASE_FD+x}\" && test ! -e /proc/self/fd/199 && test ! -e \"/proc/self/fd/$1\"",
+                    "ordinary-child",
+                    &successor.lock.as_raw_fd().to_string(),
+                ])
+                .env(lease_handoff::DAEMON_LEASE_ENV, "199");
+            crate::install_guard::sanitize_child_environment(&mut provider);
+            unsafe { provider.pre_exec(seal_inherited_descriptors) };
+            assert!(provider.status().unwrap().success());
+            println!("lease-adopted-and-child-sealed");
+            io::stdout().flush().unwrap();
+            io::stdin().read_exact(&mut [0_u8]).unwrap();
+            drop(successor);
+            std::process::exit(env::var(EXIT).unwrap().parse().unwrap());
+        }
+
+        struct FixtureChild(Child);
+        impl Drop for FixtureChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        for exit in [0, 17] {
+            let runtime = tempdir().unwrap();
+            let paths = paths(runtime.path().join(instance::runtime_subdirectory()));
+            let original = HostLease::acquire(&paths, &proof()).unwrap();
+            drop(original);
+            let handoff = lease_handoff::LeaseHandoff::wait(&paths, std::process::id()).unwrap();
+            let mut command = Command::new(env::current_exe().unwrap());
+            command
+                .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                .env(MODE, "cli")
+                .env(EXIT, exit.to_string())
+                .env("XDG_RUNTIME_DIR", runtime.path())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit());
+            unsafe { command.pre_exec(seal_inherited_descriptors) };
+            handoff.inherit(&mut command).unwrap();
+            let mut child = FixtureChild(command.spawn().unwrap());
+            // A Command retains its forwarding hook and therefore a duplicate
+            // of the lease; release it before testing the worker guard's lifetime.
+            drop(command);
+            let stdout = child.0.stdout.take().unwrap();
+            let (sender, receiver) = mpsc::sync_channel(1);
+            let output = std::thread::spawn(move || {
+                for line in io::BufReader::new(stdout).lines() {
+                    if line.unwrap().contains("lease-adopted-and-child-sealed") {
+                        sender.send(()).unwrap();
+                        break;
+                    }
+                }
+            });
+            receiver
+                .recv_timeout(Duration::from_secs(10))
+                .expect("forwarded daemon never adopted the lease");
+            output.join().unwrap();
+            assert!(matches!(
+                HostLease::acquire(&paths, &proof()),
+                Err(PlatformError::AlreadyRunning { .. })
+            ));
+            child.0.stdin.take().unwrap().write_all(b"x").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let status = loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    break status;
+                }
+                assert!(Instant::now() < deadline, "forwarded daemon did not exit");
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            assert_eq!(status.code(), Some(exit));
+            // Even the failed daemon's destructor cannot explicitly unlock
+            // the worker's shared open-file description before failure recording.
+            assert!(matches!(
+                HostLease::acquire(&paths, &proof()),
+                Err(PlatformError::AlreadyRunning { .. })
+            ));
+            drop(handoff);
+            let _manual_restart = HostLease::acquire(&paths, &proof()).unwrap();
+        }
     }
 }
