@@ -599,6 +599,8 @@ scene_deliver_waiting() {
 }
 scene_send_now() {
     if [ -e "$config/fixture-send-now-abort" ]; then
+        # The reply being stopped can be held, so its state can be seen.
+        if [ -s "$config/fixture-send-now-stop-delay" ]; then sleep "$(cat "$config/fixture-send-now-stop-delay")"; fi
         emit_record "$(jq -cn '{type:"assistant",uuid:"scene-cut-off",message:{id:"scene-cut-off",role:"assistant",content:[{type:"text",text:"Here is the plan so f"}]}}')"
         jq -cn '{type:"user",uuid:"scene-interrupted",parent_tool_use_id:null,message:{role:"user",content:[{type:"text",text:"[Request interrupted by user]"}]}}'
         jq -cn --arg session "$session" \

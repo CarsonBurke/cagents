@@ -95,7 +95,9 @@ writing a reply instead, so Send now stops the reply and starts a new turn. A
 `fixture-subagent-idle` file ends the first turn right after the launch, leaving
 the conversation idle with subagents working. `fixture-admission-delay` and
 `fixture-send-now-delay` hold a number of seconds: how late a message's queued
-notice and the answer to Send now arrive. A `fixture-send-now-decline` file has
+notice and the answer to Send now arrive, and `fixture-send-now-stop-delay`
+how long a reply that Send now stops is held before it ends; the provider
+answers nothing else meanwhile. A `fixture-send-now-decline` file has
 Send now answered with nothing waiting and the messages left queued, as a CLI
 declining to send early answers.
 The frames follow `tests/fixtures/claude-send-now/`, recorded from Claude Code
