@@ -113,14 +113,14 @@ impl RecoveryTransportFixture {
         }
     }
 
-    fn assert_shared_offsets(&self, forwarded: bool) {
+    fn assert_shared_offsets(&self, forwarded: bool, output: &std::process::Output) {
         use std::os::fd::AsRawFd;
         for (target, file) in &self.descriptors {
             let expected = if forwarded { 9000 + *target } else { 0 };
             assert_eq!(
                 unsafe { libc::lseek(file.as_raw_fd(), 0, libc::SEEK_CUR) },
                 i64::from(expected),
-                "transport fd {target} lost its open-file description or reached an unintended process"
+                "transport fd {target} lost its open-file description or reached an unintended process; installer output: {output:?}"
             );
         }
     }
@@ -391,6 +391,7 @@ fn coordinated_release_mode(
     let bundle_forwarded = handoff && publish_failure.is_none() && !orphan_bundle;
     let maintenance = restart == Some("handoff-maintenance-failure");
     let bootstrap = restart == Some("handoff-bootstrap");
+    let direct_bash = restart == Some("handoff-bash");
     let home = tempfile::tempdir().unwrap();
     let coordinator_bin = home.path().join("coordinator-bin");
     fs::create_dir(&coordinator_bin).unwrap();
@@ -922,10 +923,26 @@ os.execv(target, [target, *sys.argv[1:]])
 "#,
         );
         shell
+    } else if direct_bash {
+        std::path::PathBuf::from("/bin/bash")
     } else {
         std::path::PathBuf::from("sh")
     };
     let mut command = Command::new(shell);
+    if direct_bash {
+        // Enter ordinary noninteractive Bash with alias expansion initially
+        // off; this path does not take the interpreter-inode reexec branch.
+        command.args(["--noprofile", "--norc"]);
+        for key in [
+            "ENV",
+            "BASH_ENV",
+            "POSIXLY_CORRECT",
+            "SHELLOPTS",
+            "BASHOPTS",
+        ] {
+            command.env_remove(key);
+        }
+    }
     if bootstrap {
         command
             .env("BASH_ENV", &bootstrap_hook)
@@ -1171,7 +1188,7 @@ with open(os.environ['FIXTURE_LEASE_PATH'], 'r+') as contender:
     let outer_pid = output.id();
     let output = output.wait_with_output().unwrap();
     if let Some(transport) = &transport {
-        transport.assert_shared_offsets(bundle_forwarded);
+        transport.assert_shared_offsets(bundle_forwarded, &output);
     }
     assert!(
         !bootstrap_poison.exists(),
@@ -1234,7 +1251,10 @@ with open(os.environ['FIXTURE_LEASE_PATH'], 'r+') as contender:
     }
     if handoff && publish_failure != Some("external-recovery") {
         use std::os::fd::AsRawFd;
-        let success = matches!(restart, Some("handoff-success" | "handoff-bootstrap"));
+        let success = matches!(
+            restart,
+            Some("handoff-success" | "handoff-bootstrap" | "handoff-bash")
+        );
         let starting = restart == Some("handoff-starting");
         assert_eq!(output.status.success(), success, "{output:?}");
         assert_eq!(
@@ -2091,5 +2111,13 @@ fn recovery_bundle_does_not_restart_or_rewind_an_already_serving_recovery() {
     isolated_handoff_fixture(
         "recovery_bundle_does_not_restart_or_rewind_an_already_serving_recovery",
         &["handoff-external"],
+    );
+}
+
+#[test]
+fn recovery_bundle_direct_bash_enables_alias_isolation_before_any_utility() {
+    isolated_handoff_fixture(
+        "recovery_bundle_direct_bash_enables_alias_isolation_before_any_utility",
+        &["handoff-bash"],
     );
 }

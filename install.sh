@@ -23,7 +23,7 @@ if [ -n "${CAGENTS_UPDATE_RECOVERY_FD:-}" ]; then
             exit 1
         fi
         unset BASH_ENV ENV
-        exec /bin/bash --noprofile --norc "$0" "$@"
+        exec /bin/bash --noprofile --norc --posix "$0" "$@"
     fi
 fi
 
@@ -62,6 +62,9 @@ installer_start_candidate() (
 )
 if [ "${CAGENTS_DAEMON_LEASE_FD:-}" = 3 ] \
     || [ "${CAGENTS_UPDATE_RECOVERY_FD:-}" = 193 ]; then
+    # Noninteractive Bash expands these aliases only in POSIX mode. Other
+    # POSIX shells already expand them and may not offer the posix option.
+    if (set -o posix) 2>/dev/null; then set -o posix; fi
     # Preserve command -v detection for optional and missing tools. Aliases
     # apply inside functions and command substitutions too.
     for installer_utility in awk cat chmod cp curl find getconf gh \
