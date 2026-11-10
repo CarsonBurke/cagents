@@ -290,18 +290,9 @@ fn forward(command: &mut Command, lock: File, target: i32, inherited_slot: bool)
 /// Kernel lock ownership, including contenders that have not written metadata.
 pub(crate) fn holder_pid(paths: &RuntimePaths) -> io::Result<Option<i32>> {
     let metadata = fs::symlink_metadata(&paths.lock)?;
-    let device = metadata.dev();
-    Ok(fs::read_to_string("/proc/locks")?.lines().find_map(|line| {
-        let fields: Vec<_> = line.split_whitespace().collect();
-        if fields.len() != 8 || fields[1..4] != ["FLOCK", "ADVISORY", "WRITE"] {
-            return None;
-        }
-        let mut key = fields[5].split(':');
-        let major = u32::from_str_radix(key.next()?, 16).ok()?;
-        let minor = u32::from_str_radix(key.next()?, 16).ok()?;
-        let inode = key.next()?.parse::<u64>().ok()?;
-        (major == libc::major(device) && minor == libc::minor(device) && inode == metadata.ino())
-            .then(|| fields[4].parse().ok())
-            .flatten()
-    }))
+    crate::flock::holder_pid(Path::new("/proc"), &metadata)?
+        .map(|pid| {
+            i32::try_from(pid).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        })
+        .transpose()
 }

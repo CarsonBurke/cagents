@@ -242,10 +242,11 @@ mod tests {
             boot_id: crate::daemon::read_boot_id().unwrap(),
             host_incarnation: crate::model::HostIncarnation::new("handoff-fixture"),
         };
-        let mut child = Command::new("python3")
-            .args([
-                "-c",
-                r#"
+        let mut child = Service(
+            Command::new("python3")
+                .args([
+                    "-c",
+                    r#"
 import fcntl, json, os, sys, time
 from pathlib import Path
 lock = open(sys.argv[1], 'w+')
@@ -256,21 +257,23 @@ lock.flush()
 print('ready', flush=True)
 while not Path(sys.argv[3]).exists(): time.sleep(.005)
 "#,
-            ])
-            .arg(&paths.lock)
-            .arg(serde_json::to_string(&proof).unwrap())
-            .arg(root.join("release"))
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
+                ])
+                .arg(&paths.lock)
+                .arg(serde_json::to_string(&proof).unwrap())
+                .arg(root.join("release"))
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
         let mut ready = String::new();
-        io::BufReader::new(child.stdout.take().unwrap())
+        io::BufReader::new(child.0.stdout.take().unwrap())
             .read_line(&mut ready)
             .unwrap();
         assert_eq!(ready.trim(), "ready");
         let source = HandoffSource::pin(paths, &proof).unwrap();
-        (Service(child), source)
+        assert_eq!(source.locker_pid, Some(child.0.id() as i32));
+        (child, source)
     }
 
     fn fixture(root: &Path) -> (RuntimePaths, UpdateJob) {
@@ -316,7 +319,9 @@ while not Path(sys.argv[3]).exists(): time.sleep(.005)
     #[test]
     fn empty_rival_is_stopped_and_handoff_retried_but_live_rival_is_preserved() {
         for busy in [false, true] {
-            let root = tempfile::tempdir().unwrap();
+            // Keep the lease on the host filesystem even when the build gate
+            // puts TMPDIR in tmpfs: Btrfs must exercise holder discovery here.
+            let root = tempfile::tempdir_in("/var/tmp").unwrap();
             let (paths, mut job) = fixture(root.path());
             let source_root = root.path().join("source");
             fs::create_dir(&source_root).unwrap();
