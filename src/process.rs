@@ -78,7 +78,8 @@ pub struct CommandSpec {
     pub timeout: Option<Duration>,
     pub stdout_limit: usize,
     pub stderr_limit: usize,
-    // Borrowed only during execute; the journal service holds the owning file.
+    // Borrowed only during execute; the journal holds a scoped SH lock. The
+    // child opens its independent SH description after fork and retains it across exec.
     pub(crate) inherited_lease: Option<i32>,
     inherited_files: Vec<InheritedFile>,
 }
@@ -161,12 +162,20 @@ impl CommandSpec {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
             if let Some(lease) = self.inherited_lease {
-                // SAFETY: fcntl is async-signal-safe; only the child clears CLOEXEC
-                // on a duplicate. Descendants retain the flock across parent death.
+                let path = std::ffi::CString::new(format!("/proc/self/fd/{lease}")).unwrap();
+                // SAFETY: the path is prepared before fork. Only Linux open,
+                // flock and close syscalls run here; the child alone creates
+                // its independent, non-CLOEXEC shared lease description.
                 unsafe {
                     command.pre_exec(move || {
-                        if libc::fcntl(lease, libc::F_DUPFD, 3) == -1 {
+                        let child_lease = libc::open(path.as_ptr(), libc::O_RDWR);
+                        if child_lease == -1 {
                             return Err(io::Error::last_os_error());
+                        }
+                        if libc::flock(child_lease, libc::LOCK_SH | libc::LOCK_NB) != 0 {
+                            let error = io::Error::last_os_error();
+                            libc::close(child_lease);
+                            return Err(error);
                         }
                         Ok(())
                     });
