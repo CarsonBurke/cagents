@@ -2402,7 +2402,7 @@ struct Server {
     prompt_revision: Arc<std::sync::atomic::AtomicU64>,
     pending: Vec<(
         InputIdentity,
-        crossbeam_channel::Receiver<Result<(), String>>,
+        crossbeam_channel::Receiver<Result<(), Rejection>>,
         Option<(crate::model::RunId, Arc<std::sync::atomic::AtomicU8>)>,
     )>,
     account_reports: Arc<Mutex<Vec<Update>>>,
@@ -2875,23 +2875,42 @@ impl Server {
         let completed = self.actor.is_completed();
         let changed = self.changed.clone();
         let revision = self.revision();
-        self.pending.retain(|(identity,response,effects)| {
-            if !completed && effects.as_ref().is_some_and(|(_,state)|state.load(Ordering::Acquire)==0) {return true;}
-            let result=match response.try_recv() {Ok(result)=>Some(InputState::Acknowledged(result)),Err(crossbeam_channel::TryRecvError::Disconnected)=>Some(InputState::Unknown("The retained actor stopped before acknowledging this input; never replay it automatically".into())),Err(crossbeam_channel::TryRecvError::Empty)=>None};
-            if let Some(state)=result {
-                let mut journal=journal.lock().unwrap_or_else(|p|p.into_inner());
-                if matches!(&state,InputState::Acknowledged(Err(_))) && let Some((run,effects))=effects && effects.load(Ordering::Acquire)==1 {
-                    if let Err(error)=journal.refuse_unexecuted_run(*run) {let _=journal.record_loss(&error);}
-                }
-                if let Err(error)=journal.finish(identity,state) {let _=journal.record_loss(&format!("Cannot persist retained input outcome: {error}"));}
-                changed.fetch_add(1,Ordering::Release);
-                false
-            } else {true}
+        self.pending.retain(|(identity, response, effects)| {
+            if !completed
+                && effects
+                    .as_ref()
+                    .is_some_and(|(_, state)| state.load(Ordering::Acquire) == 0)
+            {
+                return true;
+            }
+            let state = match response.try_recv() {
+                Ok(Ok(())) => InputState::Acknowledged(Ok(())),
+                Ok(Err(Rejection::Refused(error))) => InputState::Acknowledged(Err(error)),
+                Ok(Err(Rejection::Unacknowledged(error))) => InputState::Unknown(error),
+                Err(crossbeam_channel::TryRecvError::Disconnected) => InputState::Unknown(
+                    "The retained actor stopped before acknowledging this input; never replay it automatically".into(),
+                ),
+                Err(crossbeam_channel::TryRecvError::Empty) => return true,
+            };
+            let mut journal = journal.lock().unwrap_or_else(|p| p.into_inner());
+            if matches!(&state, InputState::Acknowledged(Err(_)))
+                && let Some((run, effects)) = effects
+                && effects.load(Ordering::Acquire) == 1
+                && let Err(error) = journal.refuse_unexecuted_run(*run)
+            {
+                let _ = journal.record_loss(&error);
+            }
+            if let Err(error) = journal.finish(identity, state) {
+                let _ = journal.record_loss(&format!("Cannot persist retained input outcome: {error}"));
+            }
+            changed.fetch_add(1, Ordering::Release);
+            false
         });
         if self.revision() != revision {
             self.watcher.notify();
         }
     }
+
     fn pinned_launch_directory(
         &self,
         request: &Invocation,
@@ -5222,6 +5241,80 @@ exec /bin/sleep 60
         }
     }
     #[test]
+    fn courier_input_completion_persists_uncertainty_and_retains_affected_runs() {
+        for uncertain in [false, true] {
+            let mut fixture = resident_fixture();
+            let server = &mut fixture.server;
+            let identity = InputIdentity {
+                sequence: 1,
+                id: uuid::Uuid::new_v4(),
+                hash: [8; 32],
+            };
+            let run = crate::model::RunId::new();
+            server
+                .journal
+                .lock()
+                .unwrap()
+                .admit_with_run(&identity, Some(run))
+                .unwrap();
+            let (reply, response) = crossbeam_channel::bounded(1);
+            let error = "fixture input failure".to_owned();
+            reply
+                .send(Err(if uncertain {
+                    Rejection::Unacknowledged(error.clone())
+                } else {
+                    Rejection::Refused(error.clone())
+                }))
+                .unwrap();
+            server.pending.push((
+                identity.clone(),
+                response,
+                Some((
+                    run,
+                    Arc::new(std::sync::atomic::AtomicU8::new(if uncertain {
+                        2
+                    } else {
+                        1
+                    })),
+                )),
+            ));
+            server.finish_inputs();
+            assert!(server.pending.is_empty());
+            let journal = server.journal.lock().unwrap();
+            let receipt = journal.input(&identity).unwrap().unwrap();
+            assert_eq!(
+                receipt.state,
+                if uncertain {
+                    InputState::Unknown(error)
+                } else {
+                    InputState::Acknowledged(Err(error))
+                }
+            );
+            assert_eq!(
+                journal.retained_runs().unwrap(),
+                if uncertain { vec![run] } else { vec![] }
+            );
+            // Helpers keep their Journal for one lifetime. An independent
+            // read-only database connection checks the committed receipt;
+            // reopening the actor Journal itself is intentionally refused.
+            let persisted = rusqlite::Connection::open_with_flags(
+                fixture._root.path().join("journal/actor-journal.sqlite"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let bytes: Vec<u8> = persisted
+                .query_row(
+                    "SELECT state FROM inputs WHERE sequence=?1",
+                    [identity.sequence],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let state: InputState = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(state, receipt.state);
+        }
+    }
+
+    #[test]
     fn input_refusal_and_storage_failure_publish_new_resident_revisions() {
         for storage_failure in [false, true] {
             let mut fixture = resident_fixture();
@@ -5242,7 +5335,9 @@ exec /bin/sleep 60
             let before = server.resident().unwrap();
             assert_eq!(before.retained_runs, vec![run]);
             let (reply, response) = crossbeam_channel::bounded(1);
-            reply.send(Err("fixture refusal".to_owned())).unwrap();
+            reply
+                .send(Err(Rejection::Refused("fixture refusal".to_owned())))
+                .unwrap();
             server.pending.push((
                 identity,
                 response,

@@ -15,6 +15,7 @@ fi
 
 session=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa
 resumed=
+launch_model=
 # The app's account check starts the provider without keeping a session. It
 # is not a conversation, so the launch and stop switches leave it alone.
 probe=false
@@ -25,6 +26,8 @@ while [ "$#" -gt 0 ]; do
         --session-id=*) session=${1#*=} ;;
         --resume) shift; session=$1; resumed=$1 ;;
         --resume=*) session=${1#*=}; resumed=$session ;;
+        --model) shift; launch_model=$1 ;;
+        --model=*) launch_model=${1#*=} ;;
     esac
     shift
 done
@@ -65,6 +68,7 @@ history=$config/projects/$project/$session.jsonl
 mkdir -p "$(dirname "$history")"
 parent=null
 turn=0
+records='[]'
 if [ -f "$history" ]; then
     # As Claude Code does, skip a line that isn't a record, such as one a
     # crash cut short, rather than refusing the whole transcript.
@@ -81,6 +85,17 @@ if [ -f "$history" ]; then
     if [ -s "$history" ] && [ "$(tail -c 1 -- "$history" | wc -l)" -eq 0 ]; then
         printf '\n' >>"$history"
     fi
+fi
+# Resume from an earlier main record to reproduce a provider branch without
+# removing anything the person previously saw. Keep the full turn counter so
+# later generated record IDs remain distinct on every branch.
+if [ "$probe" = false ] && [ -n "$resumed" ] && [ -f "$config/fixture-resume-parent" ]; then
+    resume_parent=$(cat "$config/fixture-resume-parent")
+    if ! printf '%s' "$records" | jq -e --arg uuid "$resume_parent"         'any(.[]; .uuid == $uuid and (.isSidechain // false) != true and (.teamName // "") == "")' >/dev/null; then
+        printf '%s\n' 'Invalid fixture-resume-parent: expected an existing main record UUID' >&2
+        exit 2
+    fi
+    parent=$resume_parent
 fi
 persist_record() {
     record=$(printf '%s' "$1" | jq -c --arg session "$session" --arg parent "$parent" \
@@ -364,6 +379,27 @@ busy=false
 fast=off
 model=haiku
 if [ "$fast_fixture" = 1 ]; then model=opus; fi
+# Optional model list: fixture-models.json holds an initialize response's
+# models, such as fixtures/accounts/claude-initialize-models.json, which
+# Claude Code 2.1.296 listed. It replaces the default list, a launch without
+# --model starts on its `default` entry as Claude Code's does, and each turn's
+# init names the full ID the chosen model resolves to.
+models_file=$config/fixture-models.json
+if [ -f "$models_file" ] && jq -e 'any(.models[]; .value == "default")' "$models_file" >/dev/null; then
+    model=default
+fi
+if [ -n "$launch_model" ]; then model=$launch_model; fi
+resolved_model() {
+    if [ -f "$models_file" ]; then
+        jq -r --arg model "$model" \
+            'first(.models[] | select(.value == $model) | .resolvedModel // empty) // $model' "$models_file"
+    else
+        printf '%s\n' "$model"
+    fi
+}
+# Optional usage report: fixture-usage.json is the get_usage control
+# response's inner response, as Claude Code answers the account check.
+usage_file=$config/fixture-usage.json
 while IFS= read -r frame; do
     kind=$(printf '%s' "$frame" | jq -r '.type')
     case $kind in
@@ -376,11 +412,18 @@ while IFS= read -r frame; do
                 if [ "$fast_fixture" = 1 ]; then
                     metadata=$(jq -cn --arg fast "$fast" '{claude_code_version:"2.1.286",current_permission_mode:"default",model:"opus",fast_mode_state:$fast,models:[{value:"opus",displayName:"Claude Opus",supportedEffortLevels:["high"]}]}')
                 fi
+                if [ -f "$models_file" ]; then
+                    metadata=$(jq -cn --argjson metadata "$metadata" --slurpfile listed "$models_file" '$metadata + {models: $listed[0].models}')
+                fi
                 # Optional advertised commands and skills: a JSON object with
                 # `commands` ([{name, description}]) and `skills` ([name]).
                 if [ -f "$config/fixture-commands.json" ]; then
                     metadata=$(jq -cn --argjson metadata "$metadata" --slurpfile extra "$config/fixture-commands.json" '$metadata + $extra[0]')
                 fi
+            elif [ "$subtype" = get_usage ] && [ -f "$usage_file" ]; then
+                metadata=$(jq -c . "$usage_file")
+            elif [ "$subtype" = set_model ]; then
+                model=$(printf '%s' "$frame" | jq -r '.request.model // "haiku"')
             elif [ "$subtype" = apply_flag_settings ] && [ "$fast_fixture" = 1 ]; then
                 requested=$(printf '%s' "$frame" | jq -r '.request.settings.fastMode // false')
                 if [ "$requested" = true ]; then fast=on; else fast=off; fi
@@ -422,7 +465,7 @@ while IFS= read -r frame; do
                 printf '%s\n' "$frame"
                 jq -cn --arg uuid "$uuid" \
                     '{type:"command_lifecycle",command_uuid:$uuid,state:"started"}'
-                jq -cn --arg session "$session" --arg model "$model" \
+                jq -cn --arg session "$session" --arg model "$(resolved_model)" \
                     '{type:"system",subtype:"init",session_id:$session,claude_code_version:"2.1.286",model:$model}'
                 if [ -n "$task_scene" ]; then
                     task_receipt_turn

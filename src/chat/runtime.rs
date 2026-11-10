@@ -117,15 +117,18 @@ impl Drop for InputEffects {
     }
 }
 
-type CommandRequest = (ActorCommand, crossbeam_channel::Sender<Result<(), String>>);
+type CommandRequest = (
+    ActorCommand,
+    crossbeam_channel::Sender<Result<(), Rejection>>,
+);
 
 /// Why a provider command may not have taken effect.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Rejection {
-    /// The actor never took the command, or refused it.
+    /// The actor never took the command, or refused it before effects were possible.
     Refused(String),
-    /// The actor took the command but did not answer in time; the provider
-    /// may still receive it.
+    /// The actor did not answer in time, or failed after effects became possible;
+    /// the provider may still receive it. Never replay automatically.
     Unacknowledged(String),
 }
 
@@ -794,7 +797,7 @@ impl LocalHandle {
     pub(super) fn enqueue_actor(
         &self,
         command: ActorCommand,
-    ) -> Result<crossbeam_channel::Receiver<Result<(), String>>, QueueRefusal> {
+    ) -> Result<crossbeam_channel::Receiver<Result<(), Rejection>>, QueueRefusal> {
         if self.is_completed()
             || self.0.draining.load(Ordering::Acquire)
             || self.0.stop.load(Ordering::Acquire)
@@ -911,7 +914,6 @@ impl LocalHandle {
                     "Provider command acknowledgement timed out; do not retry blindly".into(),
                 )
             })?
-            .map_err(Rejection::Refused)
     }
     fn ownership_command(&self, command: ActorCommand) -> Result<(), String> {
         if self.is_completed()
@@ -929,6 +931,7 @@ impl LocalHandle {
         response
             .recv_timeout(Duration::from_secs(10))
             .map_err(|_| "Provider ownership command acknowledgement timed out".to_string())?
+            .map_err(String::from)
     }
 
     fn claim_idle_close(&self, generation: u64) -> Result<bool, String> {
@@ -1028,6 +1031,7 @@ impl LocalHandle {
                 "Native ownership acknowledgement timed out; retain the previous descriptor"
                     .to_string()
             })?
+            .map_err(String::from)
     }
     pub fn set_visible(&self, visible: bool) {
         self.0.visible.store(visible, Ordering::Release);
@@ -2746,8 +2750,9 @@ impl Actor {
                 command => (command, None),
             };
             let effects = InputEffects(effects);
+            let refuse = |error| reply.send(Err(Rejection::Refused(error)));
             if closing || self.stop.load(Ordering::Acquire) {
-                let _ = reply.send(Err("Chat is closing".into()));
+                let _ = refuse("Chat is closing".into());
                 continue;
             }
             let (run, command) = match command {
@@ -2809,9 +2814,9 @@ impl Actor {
                             _ => false,
                         };
                         if !valid {
-                            let _ = reply.send(Err(
+                            let _ = refuse(
                                 "A settled run may only decline a current pending request".into(),
-                            ));
+                            );
                             continue;
                         }
                     }
@@ -2819,9 +2824,9 @@ impl Actor {
                 }
                 ActorCommand::IdlePrompt(text) => {
                     if !accepts_prompt(&self.state.lock().unwrap_or_else(|p| p.into_inner())) {
-                        let _ = reply.send(Err(
+                        let _ = refuse(
                             "The conversation is no longer idle for courier delivery".into(),
-                        ));
+                        );
                         continue;
                     }
                     (
@@ -2842,7 +2847,7 @@ impl Actor {
                             holder.update_source(source, execution_console, paired_holder)
                         });
                     let failed = result.is_err();
-                    let _ = reply.send(result);
+                    let _ = reply.send(result.map_err(Rejection::Unacknowledged));
                     // A partial control reply must never be reused.
                     if failed {
                         return Err("Native ownership update was not acknowledged".into());
@@ -2854,9 +2859,9 @@ impl Actor {
                     including_subagents,
                 } => {
                     if run.is_some_and(|run| self.execution.active() != Some(run)) {
-                        let _ = reply.send(Err(
+                        let _ = refuse(
                             "The requested run is no longer the provider's active turn".into(),
-                        ));
+                        );
                         continue;
                     }
                     if !including_subagents {
@@ -2873,9 +2878,10 @@ impl Actor {
                                 .map(|agent| agent.id.as_str())
                                 .collect::<Vec<_>>()
                                 .join(", ");
-                            let _ = reply.send(Err(format!(
-                                "Interrupt would stop {} running background subagent(s): {names}. Use --including-subagents to permit this, or stop one subagent separately.", affected.len()
-                            )));
+                            let _ = refuse(format!(
+                                "Interrupt would stop {} running background subagent(s): {names}. Use --including-subagents to permit this, or stop one subagent separately.",
+                                affected.len()
+                            ));
                             continue;
                         }
                     }
@@ -2887,9 +2893,8 @@ impl Actor {
                     // work or pending transport. Only a proved idle actor can
                     // return the retryable generation-change receipt.
                     if self.update_readiness(&state) != UpdateReadiness::Idle {
-                        let _ = reply.send(Err(
-                            "Provider state changed before conditional idle close".into(),
-                        ));
+                        let _ =
+                            refuse("Provider state changed before conditional idle close".into());
                         continue;
                     }
                     let unchanged = state.generation == generation;
@@ -2921,7 +2926,7 @@ impl Actor {
                         }
                     }
                     Err(error) => {
-                        let _ = reply.send(Err(error));
+                        let _ = refuse(error);
                         continue;
                     }
                 }
@@ -2936,9 +2941,9 @@ impl Actor {
                     || state.exited
                     || !state.ready
                 {
-                    let _ = reply.send(Err(
+                    let _ = refuse(
                         "The sign-in failure changed or the conversation is no longer idle".into(),
-                    ));
+                    );
                     continue;
                 }
                 Some(failure.clone())
@@ -2949,9 +2954,7 @@ impl Actor {
             if run.is_some() && starts_turn {
                 let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
                 if !state.ready || state.busy || state.waiting || !state.requests.is_empty() {
-                    let _ = reply.send(Err(
-                        "The provider is no longer idle for the accepted run".into()
-                    ));
+                    let _ = refuse("The provider is no longer idle for the accepted run".into());
                     continue;
                 }
             }
@@ -2972,14 +2975,14 @@ impl Actor {
                 && let Some(context) = &self.launch_context
                 && let Err(error) = context.verify_directory(&self.working_directory)
             {
-                let _ = reply.send(Err(error));
+                let _ = refuse(error);
                 continue;
             }
             if authorizes_work
                 && let Some(scope) = &self.launch_account_scope
                 && let Err(error) = scope.revalidate()
             {
-                let _ = reply.send(Err(error));
+                let _ = refuse(error);
                 continue;
             }
             let prepared = match run {
@@ -3002,7 +3005,7 @@ impl Actor {
                             detail: "Waiting for provider turn".into(),
                         });
                     }
-                    let _ = reply.send(result.clone());
+                    let _ = reply.send(result.clone().map_err(Rejection::Unacknowledged));
                     result?;
                     if started {
                         self.publish_activity();
@@ -3013,7 +3016,7 @@ impl Actor {
                         message: message.clone(),
                         fatal: false,
                     });
-                    let _ = reply.send(Err(message));
+                    let _ = refuse(message);
                 }
             }
         }
@@ -5854,10 +5857,12 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .unwrap()
             .unwrap();
-        let refused = interrupt
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap()
-            .unwrap_err();
+        let refused = String::from(
+            interrupt
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap_err(),
+        );
         assert!(
             refused.contains("40 running background")
                 && refused.contains("late-background-0")

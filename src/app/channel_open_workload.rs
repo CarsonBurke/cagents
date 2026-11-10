@@ -17,7 +17,7 @@
 //! frame built after it (view, layout and draw on the headless renderer), and
 //! the steady frame cost once nothing has changed.
 use super::*;
-use crate::model::ProjectChannel;
+use crate::model::{ChannelId, ProjectChannel};
 use crate::workspace_model::views::{Pane, Scope, View};
 use std::collections::BTreeMap;
 
