@@ -1523,9 +1523,16 @@ impl Cagents {
         } else {
             self.shared_views.seeding.remove(&scope);
             self.shared_views.initialized.insert(scope.clone());
-            self.rebase_seeded_attachments(&scope);
-            // Preserve edits made while the seed snapshot was in flight.
-            self.publish_view_changes();
+            // The receipt admits only this scope. Other scopes retain their
+            // own seed/baseline and pending edits until their receipts arrive.
+            let cards = self.local_view_cards(&scope);
+            let panes = self.local_view_panes(&scope);
+            self.rebase_seeded_attachments(&scope, &panes);
+            self.publish_projected_view_changes(LocalViews {
+                scopes: vec![scope.clone()],
+                cards: HashMap::from([(scope.clone(), cards)]),
+                panes: HashMap::from([(scope, panes)]),
+            });
         }
     }
 
@@ -1534,8 +1541,7 @@ impl Cagents {
     /// has proved its same session under the running daemon, so that update is
     /// based on the registry's record. Based on the saved one it is refused, and
     /// the record then stays behind the attachment until another window writes.
-    fn rebase_seeded_attachments(&mut self, scope: &Scope) {
-        let local = self.local_views().panes.remove(scope).unwrap_or_default();
+    fn rebase_seeded_attachments(&mut self, scope: &Scope, local: &[Pane]) {
         let Some(view) = self
             .workspace_model
             .views
@@ -1733,11 +1739,21 @@ impl Cagents {
                 let _ = views::transfer(&mut views, source, *id, destination, *before);
             }
         }
+        // Snapshot each scope's ordered overlay once. Projection below mutates
+        // local state, so this pass owns its changes rather than borrowing the
+        // pending queue across those mutations.
+        let mut pending_by_scope = HashMap::<Scope, Vec<Change>>::new();
+        for (_, scope, change) in &self.shared_views.pending {
+            if !matches!(change, Change::Transfer { .. }) {
+                pending_by_scope
+                    .entry(scope.clone())
+                    .or_default()
+                    .push(change.clone());
+            }
+        }
         for view in &mut views {
-            for (_, scope, change) in &self.shared_views.pending {
-                if *scope == view.scope && !matches!(change, Change::Transfer { .. }) {
-                    let _ = view.apply(change);
-                }
+            for change in pending_by_scope.get(&view.scope).into_iter().flatten() {
+                let _ = view.apply(change);
             }
         }
         let owned = views
@@ -1772,11 +1788,9 @@ impl Cagents {
             {
                 continue;
             }
-            for (_, scope, change) in &self.shared_views.pending {
-                if *scope == view.scope && !matches!(change, Change::Transfer { .. }) {
-                    if let Err(error) = view.apply(change) {
-                        self.status = Some(TransientNotice::error(error));
-                    }
+            for change in pending_by_scope.get(&view.scope).into_iter().flatten() {
+                if let Err(error) = view.apply(change) {
+                    self.status = Some(TransientNotice::error(error));
                 }
             }
             let current = match &view.scope {
@@ -4423,6 +4437,46 @@ mod tests {
         drop(app.apply_workspace_model_update(ModelUpdate::Read(model)));
         assert_eq!(app.card_state(id).unwrap().title, "Remote title");
         assert_eq!(app.durable.cards.len(), 555);
+    }
+
+    #[test]
+    fn seed_ack_projects_only_its_scope_and_preserves_unrelated_pending_edits() {
+        let (mut app, source, destination, pane) = channel_move_fixture();
+        let source = Scope::Channel(source);
+        let destination = Scope::Channel(destination);
+        let unrelated = uuid::Uuid::new_v4();
+        let change = Change::Remove { id: CardId::new() };
+        app.shared_views
+            .pending
+            .push((unrelated, destination.clone(), change.clone()));
+        app.shared_views.seeding.insert(source.clone());
+        app.shared_views.initialized.remove(&source);
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        app.shared_views.local_projection_count.set(0);
+        app.acknowledge_view_edit(source.clone(), None);
+        assert_eq!(
+            app.shared_views.local_projection_count.get(),
+            0,
+            "a seed receipt must not reconstruct unrelated scopes"
+        );
+        assert!(app.shared_views.initialized.contains(&source));
+        assert!(!app.shared_views.seeding.contains(&source));
+        assert!(
+            app.shared_views
+                .pending
+                .contains(&(unrelated, destination.clone(), change))
+        );
+        assert!(
+            app.shared_views.baseline[&source]
+                .iter()
+                .any(|item| item.id == pane.id)
+        );
+        assert!(
+            !std::iter::from_fn(|| rx.try_recv().ok()).any(|edit| matches!(edit,
+            ModelEdit::ChangeView { scope, .. } | ModelEdit::SeedView { scope, .. }
+            if scope == destination))
+        );
     }
 
     #[test]
