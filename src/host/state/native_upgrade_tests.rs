@@ -415,16 +415,56 @@ fn committed_upgrade_shutdown_preserves_real_native_owner_even_if_final_save_fai
                     .is_none(),
                 "old-alias retry must retire the exact current adopted authority too"
             );
-            let mut unrelated = source;
+            let current_proof = restarted.lock().unwrap().proof().clone();
+            let original_receipt =
+                crate::chat::native_holder::closed_source(&source, &current_proof)
+                    .unwrap()
+                    .expect("the exact closed source retains its receipt");
+            assert!(original_receipt.1, "the paired close is confirmed");
+            wait_until(
+                || !original_receipt.0.holder.is_current() && !original_receipt.0.root.is_current(),
+                "the closed native owner did not exit",
+            );
+            assert!(registry::evidence(&socket, Kind::Native).unwrap().is_none());
+            let mut unrelated = source.clone();
             unrelated.launch.session_id = Some("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".into());
-            assert!(
+            assert_eq!(
+                crate::chat::native_holder::closed_source(&unrelated, &current_proof).unwrap(),
+                None,
+                "a close receipt must not authenticate a changed conversation"
+            );
+            // The foreign receipt supplies no proof for this descriptor. Its
+            // Close instead follows independent owner absence, as it would
+            // without that receipt, and must leave the exact receipt intact.
+            assert!(matches!(
                 super::super::client::process_request(
                     &restarted,
                     0,
-                    crate::terminal::ipc::ClientRequest::ChatCloseRetained { session: unrelated }
+                    crate::terminal::ipc::ClientRequest::ChatCloseRetained {
+                        session: unrelated.clone()
+                    }
                 )
-                .is_err(),
-                "a close receipt must not authorize a changed conversation"
+                .unwrap()
+                .0,
+                crate::terminal::ipc::ServerResponse::Accepted
+            ));
+            assert_eq!(
+                crate::chat::native_holder::closed_source(&unrelated, &current_proof).unwrap(),
+                None,
+                "independent owner absence must not create an exact close receipt"
+            );
+            assert_eq!(
+                crate::chat::native_holder::closed_source(&source, &current_proof).unwrap(),
+                Some(original_receipt)
+            );
+            assert!(
+                execution
+                    .lock()
+                    .unwrap()
+                    .retained_agent_authority_source(id)
+                    .unwrap()
+                    .is_none(),
+                "the completed authority stays retired after independent loss settlement"
             );
         } else {
             // Model the already-published failed local adapter from an older
