@@ -2728,9 +2728,8 @@ fn staged_command_requires_daemon(command: &TopCommand) -> bool {
 }
 
 fn routes_to_staged_owner(command: &TopCommand) -> bool {
-    // `daemon upgrade` selects its own worker: an older owner's updater would
-    // apply that owner's preflight, which cannot qualify panes this release
-    // knows how to carry (`update::installed_update_worker`).
+    // `daemon upgrade` enters the served candidate's updater. An older owner's
+    // preflight cannot qualify the panes this candidate knows how to carry.
     !matches!(
         command,
         TopCommand::Completions { .. }
