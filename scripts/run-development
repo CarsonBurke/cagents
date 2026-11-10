@@ -513,7 +513,7 @@ list_development_instances() {
     found=false
     hosts=$(caller_host_runtimes)
     harness=false
-    ! command -v niri-harness >/dev/null 2>&1 || harness=true
+    [ "$harness_compatible" != true ] || harness=true
     for status in /proc/[0-9]*/status; do
         process=${status#/proc/}
         process=${process%/status}
@@ -582,6 +582,28 @@ list_development_instances() {
     [ "$found" = true ] || printf '%s\n' 'No development daemons are running.'
 }
 
+# Listing, collection and the detached watcher are separate invocations too.
+# Keep missing-harness listing/collection behavior, but never feed their current
+# commands to a legacy CLI when the isolated runtime is available.
+harness_compatible=false
+harness_error=
+if [ -n "$instance" ] || [ "$list_instances" = true ] ||
+    [ "$collect_garbage" = true ] || [ "$watch_instance" = true ]; then
+    if harness_directory=$("$root/scripts/require-niri-harness" 2>&1); then
+        PATH=$harness_directory:$PATH
+        export PATH
+        harness_compatible=true
+    else
+        harness_error=$harness_directory
+    fi
+fi
+
+if [ "$collect_garbage" = true ] && [ "$harness_compatible" != true ]; then
+    printf '%s\n' "$harness_error" >&2
+    printf '%s\n' 'no instances or storage were removed because harness liveness cannot be checked' >&2
+    exit 1
+fi
+
 if [ "$watch_instance" = true ]; then
     watch_instance_lifetime "$@"
     exit 0
@@ -594,7 +616,7 @@ fi
 # started by a runner too old to watch. Never one that hosts this caller.
 collect_instances() {
     explicit=$1
-    command -v niri-harness >/dev/null 2>&1 || return 0
+    [ "$harness_compatible" = true ] || return 0
     hosts=$(caller_host_runtimes)
     if hosts_unknown "$hosts"; then
         [ "$explicit" = false ] ||
@@ -650,7 +672,7 @@ SESSIONS
 collect_storage() {
     days=$1 removed=false
     live=
-    if command -v niri-harness >/dev/null 2>&1; then
+    if [ "$harness_compatible" = true ]; then
         listing=$(niri-harness list 2>/dev/null) || {
             printf '%s\n' "niri-harness list failed, so no storage was removed, since which instances run can't be told" >&2
             return 1
@@ -711,10 +733,10 @@ if [ -n "$instance" ]; then
         printf '%s\n' "--instance runs in niri-harness, which keeps the UI log; it cannot be combined with --hot or --log-file" >&2
         exit 2
     fi
-    command -v niri-harness >/dev/null 2>&1 || {
-        printf '%s\n' 'required command not found: niri-harness' >&2
+    if [ "$harness_compatible" != true ]; then
+        printf '%s\n' "$harness_error" >&2
         exit 1
-    }
+    fi
     harness_session=cagents-$instance
     if [ "$stop_instance" = false ]; then
         # What earlier sessions left: this name's dead session, which would
@@ -1279,7 +1301,7 @@ if [ -n "$instance" ]; then
     # Without the caller's display variables, nothing in the session can fall
     # back to the caller's desktop.
     env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET -u NIRI_SOCKET -u DISPLAY -u XAUTHORITY \
-        niri-harness start --backend headless --name "$harness_session" --timeout 180 -- \
+        niri-harness start --backend headless --renderer auto --name "$harness_session" --timeout 180 -- \
         ${capped:+"$capped" --name cagents-ui} "$products/cagents-ui" "$@"
     instance_runtime=$(session_runtime "$harness_session") || instance_runtime=
     if [ -n "$instance_runtime" ] && record_owner "$instance_runtime" &&
@@ -1306,10 +1328,13 @@ os.execv(sys.argv[1], sys.argv[1:])' "$@"
         lifetime_note="stops $(instance_grace) seconds after the session that started it ends (--keep keeps it)"
     fi
     [ -z "$instance_ttl" ] || lifetime_note="$lifetime_note, or $instance_ttl seconds after it started"
+    # The selected runtime may be absent from the caller's PATH. Keep these
+    # copyable commands bound to it, including prefixes with shell characters.
+    harness_command=$(printf '%s' "$harness_directory/niri-harness" | sed "s/'/'\\\\''/g")
     printf '%s\n' \
         "Instance $instance is running in niri-harness session $harness_session; it $lifetime_note." \
-        "  observe: niri-harness --session $harness_session observe" \
-        "  logs:    niri-harness --session $harness_session logs" \
+        "  observe: '$harness_command' --session $harness_session observe" \
+        "  logs:    '$harness_command' --session $harness_session logs" \
         "  stop:    scripts/run-development --stop-instance $instance"
     exit 0
 fi

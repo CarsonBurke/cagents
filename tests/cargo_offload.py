@@ -16,6 +16,7 @@ import json
 import os
 import pwd
 import resource
+import select
 from pathlib import Path
 import shlex
 import shutil
@@ -1890,12 +1891,53 @@ fn bounded_allocation() {
             self.assertIn(expected, result.stdout)
 
     def test_the_admission_budget_does_not_time_the_build(self):
-        (self.crate / "build.rs").write_text(
-            "fn main() { std::thread::sleep(std::time::Duration::from_secs(3)); }\n")
-        env = self.remote_env() | {"CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS": "1"}
-        result = self.gate_run("check", env=env)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn("timed out", result.stderr)
+        started, release, deadline_file = (self.root / name for name in
+                                           ("build-started", "release-build", "admission-deadline"))
+        self.addCleanup(release.touch)
+        (self.crate / "build.rs").write_text(textwrap.dedent(f"""
+            fn main() {{
+                std::fs::write({json.dumps(str(started) + '.tmp')}, "ready").unwrap();
+                std::fs::rename({json.dumps(str(started) + '.tmp')}, {json.dumps(str(started))}).unwrap();
+                while !std::path::Path::new({json.dumps(str(release))}).exists() {{
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }}
+            }}
+        """))
+        # Capture the gate's actual deadline during metadata, before admission.
+        # The generous startup budget is not the assertion: the barrier proves
+        # that an admitted build stays alive across that exact deadline.
+        wrapper = self.root / "record-cargo"
+        cargo = str(Path(self.env["CARGO_HOME"], "bin/cargo"))
+        wrapper.write_text(
+            "#!/usr/bin/python3\nimport os,pathlib,sys\n"
+            "deadline = os.environ.get('CAGENTS_BUILD_ADMISSION_DEADLINE')\n"
+            f"path = pathlib.Path({str(deadline_file)!r})\n"
+            "if deadline:\n"
+            "    temporary = path.with_suffix('.tmp')\n"
+            "    temporary.write_text(deadline)\n"
+            "    temporary.replace(path)\n"
+            f"os.execv({cargo!r}, [{cargo!r}, *sys.argv[1:]])\n"
+        )
+        wrapper.chmod(0o755)
+        env = self.remote_env() | {"CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS": "30",
+                                  "CAGENTS_BUILD_CARGO": str(wrapper)}
+        client = self.scope.popen([str(self.gate), "check"], cwd=self.crate, env=env,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(client.stdout.close)
+        self.addCleanup(client.stderr.close)
+        try:
+            wait_until(lambda: started.exists() or client.poll() is not None, timeout=120)
+            self.assertTrue(started.exists(), client.communicate(timeout=5) if client.poll() is not None else "build never started")
+            deadline = int(deadline_file.read_text())
+            while time.monotonic_ns() <= deadline:
+                self.assertIsNone(client.poll(), "admitted build ended before release")
+                time.sleep(0.05)
+            self.assertIsNone(client.poll(), "admission deadline also timed the build")
+        finally:
+            release.touch()
+        stdout, stderr = client.communicate(timeout=120)
+        self.assertEqual(client.returncode, 0, stdout + stderr)
+        self.assertNotIn("timed out", stderr)
 
     def test_cancelling_the_gate_ends_the_remote_command(self):
         marker = self.root / "running"
@@ -1922,6 +1964,136 @@ fn bounded_allocation() {
                 break
             self.assertLess(time.monotonic(), deadline, "the remote build script outlived the gate")
             time.sleep(0.1)
+
+
+class HeldOffload(unittest.TestCase):
+    """Cancellation of the offload client owns descendants, not the caller's group."""
+
+    def setUp(self):
+        self.host = StandInHost()
+        self.addCleanup(self.host.doCleanups)
+        self.host.setUp()
+        self.handles = []
+        self.addCleanup(self.cleanup_owned)
+
+    def cleanup_owned(self):
+        (self.host.root / "release").touch()
+        for pid, descriptor in self.handles:
+            with contextlib.suppress(ProcessLookupError):
+                signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+            with contextlib.suppress(ChildProcessError):
+                os.waitpid(pid, 0)
+            os.close(descriptor)
+
+    def free_slot(self):
+        lock = self.host.host_home / ".cache/cagents-offload/crate/slot-0/lock"
+        with lock.open("a") as stream:
+            try:
+                fcntl.flock(stream, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                return True
+            except BlockingIOError:
+                return False
+
+    def launch(self, *, loopback=False, nested=False, background=False, resistant=False):
+        root = self.host.root
+        worker = root / "worker.py"
+        worker.write_text("""
+import os, pathlib, signal, sys, time
+root = pathlib.Path(sys.argv[1])
+os.setsid()
+def stop(_number, _frame):
+    (root / 'terminated').touch()
+    while not (root / 'release').exists():
+        time.sleep(0.01)
+    sys.exit(0)
+signal.signal(signal.SIGTERM, signal.SIG_IGN if sys.argv[2] == 'resistant' else stop)
+(root / 'ready.tmp').write_text(str(os.getpid()))
+(root / 'ready.tmp').rename(root / 'ready')
+while True: time.sleep(0.05)
+""")
+        offload = str(root / "tools/cargo-offload")
+        command = ["sh", "-c", '"$@" & ' + ('while [ ! -f "$3/ready" ]; do sleep 0.01; done' if background else "wait"), "worker",
+                   sys.executable, str(worker), str(root), "resistant" if resistant else "graceful"]
+        if nested:
+            command = [offload, "--hold", *command]
+        environment = self.host.loopback_env() if loopback else self.host.remote_env()
+        environment["CAGENTS_BUILD_REMOTE_SLOTS"] = "1"
+        self.output = (root / "output").open("w+")
+        self.addCleanup(self.output.close)
+        client = self.host.scope.popen([offload, "--hold", *command], cwd=self.host.crate,
+                                      env=environment, stdout=self.output, stderr=self.output)
+        wait_until(lambda: (root / "ready").exists() or client.poll() is not None)
+        self.output.flush()
+        self.assertTrue((root / "ready").exists(), (root / "output").read_text())
+        pid = int((root / "ready").read_text())
+        descriptor = os.pidfd_open(pid)
+        self.handles.append((pid, descriptor))
+        return client, descriptor
+
+    def assert_drained(self, client, descriptor):
+        self.assertEqual(client.wait(timeout=10), 143)
+        self.assertTrue(select.select([descriptor], [], [], 0)[0], "held child survived cancellation")
+        pid = next(pid for pid, handle in self.handles if handle == descriptor)
+        with self.assertRaises(ChildProcessError, msg="supervisor did not reap its child"):
+            os.waitpid(pid, os.WNOHANG)
+        wait_until(self.free_slot)
+        self.assertFalse(list((self.host.root / "runtime").glob("cagents-hold-*")))
+
+    def test_cancel_client_drains_detached_children_before_releasing_lease(self):
+        client, descriptor = self.launch()
+        sibling = self.host.scope.popen(["sleep", "30"])
+        self.assertFalse(self.free_slot())
+        client.send_signal(signal.SIGTERM)
+        wait_until(lambda: (self.host.root / "terminated").exists() or client.poll() is not None)
+        self.assertIsNone(client.poll(), "client released lease before its child finished")
+        self.assertFalse(self.free_slot())
+        (self.host.root / "release").touch()
+        self.assert_drained(client, descriptor)
+        self.assertIsNone(sibling.poll(), "cancellation signalled an unrelated process")
+
+    def test_loopback_cancel_kills_term_resistant_descendants(self):
+        client, descriptor = self.launch(loopback=True, resistant=True)
+        client.send_signal(signal.SIGTERM)
+        self.assert_drained(client, descriptor)
+
+    def test_nested_hold_also_drains_its_descendants(self):
+        client, descriptor = self.launch(nested=True, resistant=True)
+        client.send_signal(signal.SIGTERM)
+        self.assert_drained(client, descriptor)
+
+    def test_cancellation_around_supervisor_spawn_prevents_command_launch(self):
+        original = subprocess.Popen
+        for moment in ("before", "after"):
+            with self.subTest(moment=moment):
+                launched = self.host.root / ("launched-" + moment)
+                hold = offload.Hold("stand-in", ["touch", str(launched)], self.host.env)
+
+                def spawn(*arguments, **options):
+                    if moment == "before":
+                        hold.cancel(signal.SIGTERM, None)
+                    if moment == "after":
+                        barrier = self.host.root / "start-supervisor"
+                        # Hold the helper before it can read the receipt, even
+                        # when the child is scheduled before this parent.
+                        wrapped = ["sh", "-c",
+                                   'while [ ! -f "$1" ]; do sleep 0.01; done; shift; exec "$@"',
+                                   "barrier", str(barrier), *arguments[0]]
+                        process = original(wrapped, **options)
+                        hold.cancel(signal.SIGTERM, None)
+                        barrier.touch()
+                    else:
+                        process = original(*arguments, **options)
+                    return process
+
+                with patch.object(offload.subprocess, "Popen", side_effect=spawn):
+                    self.assertEqual(hold.execute(self.host.env), 143)
+                self.assertFalse(launched.exists())
+
+    def test_successful_command_preserves_intentional_background_service(self):
+        client, descriptor = self.launch(background=True)
+        self.assertEqual(client.wait(timeout=10), 0)
+        self.assertFalse(select.select([descriptor], [], [], 0)[0])
+        wait_until(self.free_slot)
 
 
 class StandInHostPython(unittest.TestCase):

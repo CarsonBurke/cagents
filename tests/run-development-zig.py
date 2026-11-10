@@ -16,7 +16,23 @@ SOURCE = Path(__file__).resolve().parents[1] / "scripts/run-development"
 GATE = SOURCE.with_name("cargo-gate")
 
 
+def write_harness(harness, source):
+    # Lifecycle fixtures implement the current start capability contract.
+    shebang, body = source.split("\n", 1)
+    help = 'if [ "$1" = --help ]; then echo "start stop list env exec gc"; exit 0; fi\nif [ "$1 $2" = "start --help" ]; then echo "--root --width --portal --backend --host-bus --renderer"; exit 0; fi\n'
+    harness.write_text(shebang + "\n" + help + body)
+
+
 class ZigDiscovery(unittest.TestCase):
+    def test_an_instance_rejects_the_legacy_harness_before_building(self):
+        harness = self.root / "bin/niri-harness"
+        harness.write_text("#!/bin/sh\necho 'usage: niri-harness session start' >&2\nexit 2\n")
+        harness.chmod(0o755)
+        result = subprocess.run([str(self.runner), "--browserless", "--instance", "legacy"],
+                                cwd=self.root, env=self.env, capture_output=True, text=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("requires a compatible niri-harness CLI", result.stderr)
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="cagents-zig-runner-")
         self.addCleanup(self.temporary.cleanup)
@@ -25,6 +41,7 @@ class ZigDiscovery(unittest.TestCase):
         (checkout / "scripts").mkdir(parents=True)
         self.runner = checkout / "scripts/run-development"
         shutil.copy2(SOURCE, self.runner)
+        shutil.copy2(SOURCE.with_name("require-niri-harness"), self.runner.with_name("require-niri-harness"))
         shutil.copy2(GATE, checkout / "scripts/cargo-gate")
         shutil.copy2(GATE.with_name("cargo-gate-command.py"), checkout / "scripts/cargo-gate-command.py")
         (checkout / "mise.toml").write_text('[tools]\nzig = "0.15.2"\n')
@@ -583,13 +600,56 @@ exit 83
         self.assertEqual(name, "cagents-ui")
         self.assertTrue(program.endswith("/cagents-ui"))
 
+    def test_headless_instances_preserve_runtime_renderer_selection(self):
+        started = self.root / "renderer-settings"
+        harness = self.root / "bin/niri-harness"
+        write_harness(harness, f'''#!/bin/sh
+case " $* " in
+ *" start "*) printf '%s %s\\n' "$LIBGL_ALWAYS_SOFTWARE" "$WGPU_BACKEND" >"{started}" ;;
+ *) exit 1 ;;
+esac
+''')
+        harness.chmod(0o755)
+        for key in ("LIBGL_ALWAYS_SOFTWARE", "WGPU_BACKEND"):
+            self.env.pop(key, None)
+        self.launch("--browserless", "--instance", "software")
+        self.assertEqual(started.read_text().strip(), "")
+        self.launch("--browserless", "--instance", "explicit", LIBGL_ALWAYS_SOFTWARE="0", WGPU_BACKEND="vulkan")
+        self.assertEqual(started.read_text().strip(), "0 vulkan")
+
+    def test_the_printed_commands_use_the_selected_runtime_on_the_callers_path(self):
+        harness = self.root / "bin/niri-harness"
+        harness.write_text("#!/bin/sh\nexit 2\n")
+        harness.chmod(0o755)
+        pinned = self.home / ".local/lib/cagents/niri-harness/release space's/bin/niri-harness"
+        pinned.parent.mkdir(parents=True)
+        calls = self.root / "printed-command-calls"
+        write_harness(pinned, f"""#!/bin/sh
+case " $* " in
+ *" start "*) exit 0 ;;
+ *" observe "*|*" logs "*) printf '%s\\n' "$*" >>"{calls}" ;;
+ *) exit 1 ;;
+esac
+""")
+        pinned.chmod(0o755)
+        (self.home / ".local/lib/cagents/niri-harness/current").symlink_to(pinned.parent.parent)
+        result, _ = self.launch("--browserless", "--instance", "selected", "--keep")
+        for label in ("observe:", "logs:"):
+            command = next(line.split(label, 1)[1].strip() for line in result.stdout.splitlines()
+                           if line.strip().startswith(label))
+            ran = subprocess.run(["/bin/sh", "-c", command], env=self.env, text=True,
+                                 capture_output=True, timeout=10)
+            self.assertEqual(ran.returncode, 0, ran.stderr)
+        self.assertEqual(calls.read_text().splitlines(), [
+            "--session cagents-selected observe", "--session cagents-selected logs"])
+
     def test_an_instance_runs_under_a_memory_limit(self):
         limit = self.runner.with_name("memory-capped")
         limit.write_text('#!/bin/sh\nshift 2\nexec "$@"\n')
         limit.chmod(0o755)
         started = self.root / "started"
         harness = self.root / "bin/niri-harness"
-        harness.write_text(f'#!/bin/sh\ncase " $* " in *" start "*) printf "%s\\n" "$@" >"{started}" ;; *) exit 1 ;; esac\n')
+        write_harness(harness, f'#!/bin/sh\ncase " $* " in *" start "*) printf "%s\\n" "$@" >"{started}" ;; *) exit 1 ;; esac\n')
         harness.chmod(0o755)
         self.launch("--browserless", "--instance", "capped")
         words = started.read_text().splitlines()
@@ -600,7 +660,7 @@ exit 83
     def test_an_instance_daemon_log_is_chosen_by_the_flag_alone(self):
         started = self.root / "started"
         harness = self.root / "bin/niri-harness"
-        harness.write_text(
+        write_harness(harness,
             '#!/bin/sh\ncase " $* " in *" start "*) printf "%s|%s\\n" '
             f'"${{CAGENTS_DEVELOPMENT_DAEMON_LOG-unset}}" "${{CAGENTS_LOCAL_DEBUG-unset}}" >"{started}" ;;'
             ' *) exit 1 ;; esac\n'
@@ -830,7 +890,7 @@ exit 83
             f"  stop:       scripts/run-development --stop-instance fx1, once niri-harness is installed; or kill {process.pid}")
         # A harness that knows no such session.
         harness = Path(self.env["PATH"].split(":")[0]) / "niri-harness"
-        harness.write_text("#!/bin/sh\nexit 1\n")
+        write_harness(harness, "#!/bin/sh\nexit 1\n")
         harness.chmod(0o755)
         block = listing()
         self.assertTrue(block[0].startswith(f"fx1, pid {process.pid}, running "), block)
@@ -893,7 +953,7 @@ exit 83
         runtime = self.root / "harness-runtime/nh-fixture"
         runtime.mkdir(parents=True)
         harness = Path(self.env["PATH"].split(":")[0]) / "niri-harness"
-        harness.write_text(f"""#!/bin/sh
+        write_harness(harness, f"""#!/bin/sh
 for argument do
     case $argument in
         env) printf "XDG_RUNTIME_DIR='%s'\\n" '{runtime}'; exit 0 ;;
@@ -1085,7 +1145,7 @@ class InstanceLifetime(unittest.TestCase):
         # A harness that knows the sessions described in self.sessions: one file
         # per session, holding its state and runtime directory.
         harness = self.root / "bin/niri-harness"
-        harness.write_text(f"""#!/bin/sh
+        write_harness(harness, f"""#!/bin/sh
 sessions='{self.sessions}'
 printf '%s\\n' "$*" >>'{self.harness_calls}'
 session=
@@ -1166,6 +1226,52 @@ exit 1
             self.assertLess(time.monotonic(), deadline, "the runtime was not swept")
             time.sleep(0.1)
 
+    def test_gc_with_an_incompatible_harness_keeps_instances_and_storage(self):
+        (self.root / "bin/niri-harness").write_text("#!/bin/sh\necho legacy-global-harness >&2\nexit 2\n")
+        runtime, process = self.session("kept", record=self.living_owner() | {
+            "lifetime": "kept", "grace": 0, "started_at": int(time.time())})
+        storage = self.root / "config/cagents-development-kept"
+        storage.mkdir(parents=True)
+        marker = storage / "preserve"
+        marker.write_text("fixture storage")
+        result = self.run_runner("--gc", "--storage", "1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("requires a compatible niri-harness CLI", result.stderr)
+        self.assertEqual(marker.read_text(), "fixture storage")
+        self.assertIsNone(process.poll())
+        self.assertTrue(runtime.exists())
+
+    def test_separate_lifecycle_commands_resolve_a_pinned_harness_with_legacy_path(self):
+        pinned = Path(self.env["HOME"]) / ".local/lib/cagents/niri-harness/current/bin/niri-harness"
+        pinned.parent.mkdir(parents=True)
+        shutil.copy2(self.root / "bin/niri-harness", pinned)
+        (self.root / "bin/niri-harness").write_text("#!/bin/sh\necho legacy-global-harness >&2\nexit 2\n")
+        runtime, process = self.session("kept", record=self.living_owner() | {
+            "lifetime": "kept", "grace": 0, "started_at": int(time.time())})
+        process.terminate()
+        process.wait()
+        daemon = self.root / "cagentsd"
+        shutil.copy2("/bin/sleep", daemon)
+        lock = runtime / "cagents-development-kept/cagentsd.lock"
+        lock.parent.mkdir()
+        process = subprocess.Popen(["sh", "-c", 'exec 9>>"$1" && exec "$2" 60',
+                                    "sh", str(lock), str(daemon)],
+                                   env={"PATH": "/usr/bin:/bin", "XDG_RUNTIME_DIR": str(runtime),
+                                        "CAGENTS_DEVELOPMENT_INSTANCE": "kept"})
+        self.addCleanup(process.wait)
+        self.addCleanup(process.kill)
+        self.assertTrue(wait_for(lambda: Path(f"/proc/{process.pid}/comm").read_text().strip() == "cagentsd"))
+        listed = self.run_runner("--list-instances")
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertNotIn("legacy-global-harness", listed.stderr)
+        self.assertTrue(self.harness_calls.exists(), "listing did not use the pinned CLI")
+        self.harness_calls.unlink()
+        collected = self.run_runner("--gc")
+        self.assertEqual(collected.returncode, 0, collected.stderr)
+        self.assertIn("list", self.harness_calls.read_text())
+        self.assertIsNone(process.poll())
+        self.assertTrue(runtime.exists())
+
     def test_gc_stops_an_instance_whose_starter_ended_past_its_grace(self):
         old = int(time.time()) - 100
         runtime, process = self.session("ended", record=self.ended_owner() | {
@@ -1228,7 +1334,7 @@ exit 1
         limit.chmod(0o755)
         result = self.run_runner("--browserless", "--instance", "again")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("start --backend headless --name cagents-again", self.harness_calls.read_text())
+        self.assertIn("start --backend headless --renderer auto --name cagents-again", self.harness_calls.read_text())
         self.assertIn("instance again: its session had ended without being stopped", result.stderr)
         self.assert_stopped(runtime, process)
 
@@ -1320,7 +1426,7 @@ exit 1
 
     def test_gc_says_so_and_fails_when_the_harness_cannot_list(self):
         harness = self.root / "bin/niri-harness"
-        harness.write_text("#!/bin/sh\necho 'state directory is locked' >&2\nexit 3\n")
+        write_harness(harness, "#!/bin/sh\necho 'state directory is locked' >&2\nexit 3\n")
         harness.chmod(0o755)
         result = self.run_runner("--gc", "--storage", "7")
         self.assertEqual(result.returncode, 1, result.stderr)

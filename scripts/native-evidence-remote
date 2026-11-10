@@ -35,7 +35,7 @@ or underscores, names the task on HOST: ~/.local/state/cev/NAME there.
                   shot channel-prs`. A session that FILE leaves running is
                   stopped. START OPTIONS, such as --width PX or --portal gtk,
                   go to each side's start.
-  build SIDE SOURCE
+  build SIDE SOURCE [--integrated-browser]
                   Copy SOURCE to HOST and build it there. SOURCE is a checkout
                   directory, whose uncommitted and untracked files are
                   included, or a revision such as origin/main.
@@ -323,6 +323,7 @@ cmd_build() {
     local side=${1:-} source=${2:-} checkout
     case $side in before | after) ;; *) die 'side must be before or after' 2 ;; esac
     [ -n "$source" ] || die 'build needs a checkout or revision' 2
+    shift 2
     resolve_source "$source"
     # Take the task's name on the host, or be refused, before anything is
     # sent there; and not while a session runs from what would be rewritten.
@@ -346,7 +347,7 @@ $remote_prelude"'
     if [ "$source_commit" != "$source_head" ]; then
         printf 'copied %s with its uncommitted changes as %s\n' "$source_checkout" "$source_commit"
     fi
-    forward build "$side" "$checkout"
+    forward build "$side" "$checkout" "$@"
     record_source "$side"
 }
 

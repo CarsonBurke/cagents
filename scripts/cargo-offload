@@ -3214,6 +3214,7 @@ class Hold(Offload):
     def __init__(self, host, command, environment, loopback=False):
         super().__init__(host, None, environment, loopback)
         self.program = command
+        self.cancellation_receipt = None
 
     def build_identity(self, directory):
         return ""
@@ -3223,13 +3224,12 @@ class Hold(Offload):
         return False
 
     def cancel(self, number, frame):
-        if self.command is not None and self.command.poll() is None:
-            # The command ends its builds, which end before the lease does.
+        if self.cancellation_receipt is not None:
             self.cancelled = self.cancelled or number
-            try:
-                self.command.send_signal(number)
-            except ProcessLookupError:
-                pass
+            # The supervisor handles cancellation before, during and after
+            # spawn, and drains even detached descendants before releasing
+            # this hold. A receipt also closes the startup signal race.
+            self.cancellation_receipt.write_text(str(self.cancelled))
             return
         super().cancel(number, frame)
 
@@ -3279,13 +3279,28 @@ class Hold(Offload):
             self.close_connection()
 
     def execute(self, environment):
-        try:
-            self.command = subprocess.Popen(self.program, env=environment)
-        except OSError as error:
-            say(f"could not run {self.program[0]}: {error}")
-            return 127
-        status = self.command.wait()
-        return 128 - status if status < 0 else status
+        helper = Path(__file__).resolve().with_name("cargo-gate-command.py")
+        if not helper.is_file():
+            say(f"cannot supervise held command: missing {helper}")
+            return REFUSED
+        runtime = environment.get("XDG_RUNTIME_DIR") or ""
+        with tempfile.TemporaryDirectory(prefix="cagents-held-command-",
+                                         dir=runtime if os.path.isdir(runtime) else None) as directory:
+            receipt = Path(directory, "cancelled")
+            self.cancellation_receipt = receipt
+            try:
+                if self.cancelled:
+                    return 128 + self.cancelled
+                try:
+                    self.command = subprocess.Popen(
+                        [sys.executable, str(helper), str(receipt), *self.program], env=environment)
+                except OSError as error:
+                    say(f"could not run {self.program[0]}: {error}")
+                    return 127
+                status = self.command.wait()
+                return 128 - status if status < 0 else status
+            finally:
+                self.cancellation_receipt = None
 
 
 # The runner `cargo run` gets on the build host: it reports the program and

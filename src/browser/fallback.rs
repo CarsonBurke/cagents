@@ -55,7 +55,9 @@ pub trait WaylandSubsurfaceLease: HasDisplayHandle + HasWindowHandle {
 
     /// Latches viewport state that must be applied atomically with the buffer
     /// the rendering context is about to attach. `buffer` is that buffer's
-    /// physical size: a `wp_viewport` source rectangle may never leave the
+    /// physical size, queried from the current draw surface after painting
+    /// rather than inferred from a requested resize: a `wp_viewport` source
+    /// rectangle may never leave the
     /// attached buffer, so a grown source rectangle can only be committed
     /// together with the grown buffer.
     fn before_present(&self, buffer: PhysicalViewport) -> Result<(), BrowserError>;
@@ -790,8 +792,8 @@ impl WaylandSubsurfaceLease for WaylandLease {
     }
 
     fn before_present(&self, buffer: PhysicalViewport) -> Result<(), BrowserError> {
-        // The rendering context is already at `buffer`, and the buffer it is
-        // about to attach applies atomically with any viewport state pending
+        // The current EGL draw buffer, rather than the requested context size,
+        // is about to attach atomically with any viewport state pending
         // here, so this is the only point at which a grown source rectangle can
         // be latched without risking `out_of_buffer`. No commit: the rendering
         // context's present issues the attach and the commit.
@@ -861,10 +863,25 @@ unsafe extern "C" {
 }
 
 const EGL_CONFIG_ID: i32 = 0x3028;
+const EGL_WIDTH: i32 = 0x3057;
+const EGL_HEIGHT: i32 = 0x3056;
 const EGL_MIN_SWAP_INTERVAL: i32 = 0x303b;
 const EGL_MAX_SWAP_INTERVAL: i32 = 0x303c;
 const EGL_NONE: i32 = 0x3038;
 const EGL_DRAW: i32 = 0x3059;
+
+fn query_draw_buffer_size(
+    mut query: impl FnMut(i32) -> Result<i32, BrowserError>,
+) -> Result<PhysicalViewport, BrowserError> {
+    let width = query(EGL_WIDTH)?;
+    let height = query(EGL_HEIGHT)?;
+    if width <= 0 || height <= 0 {
+        return Err(BrowserError::Wayland(format!(
+            "Servo EGL draw surface has invalid dimensions {width}x{height}"
+        )));
+    }
+    Ok(PhysicalViewport::new(width as u32, height as u32))
+}
 
 fn require_zero_swap_interval(minimum: i32, maximum: i32) -> Result<(), BrowserError> {
     if minimum <= 0 && maximum >= 0 {
@@ -902,6 +919,34 @@ impl FallbackSurface {
         rendering.prepare_for_paint()?;
         rendering.validate_swap_interval()?;
         Ok(rendering)
+    }
+
+    /// The requested window size can advance while EGL retains an older
+    /// backbuffer. Query after painting, before setting the viewport source:
+    /// these are the dimensions of the buffer the next swap will attach.
+    pub(crate) fn draw_buffer_size(&self) -> Result<PhysicalViewport, BrowserError> {
+        // SAFETY: paint runs on this context's owning browser thread with its
+        // EGL draw surface current. No opaque handle is dereferenced; each
+        // query writes to a live local integer.
+        unsafe {
+            let display = eglGetCurrentDisplay();
+            let surface = eglGetCurrentSurface(EGL_DRAW);
+            if display.is_null() || surface.is_null() {
+                return Err(BrowserError::Wayland(
+                    "no current Servo EGL draw surface".into(),
+                ));
+            }
+            query_draw_buffer_size(|attribute| {
+                let mut value = 0;
+                if eglQuerySurface(display, surface, attribute, &mut value) == 0 {
+                    return Err(BrowserError::Wayland(format!(
+                        "query Servo EGL draw-surface dimensions: {:#x}",
+                        eglGetError()
+                    )));
+                }
+                Ok(value)
+            })
+        }
     }
 
     /// EGL silently clamps a requested swap interval to the selected config's
@@ -1015,6 +1060,65 @@ mod tests {
             source_width,
             source_height,
         }
+    }
+
+    fn observed_draw_size(width: i32, height: i32) -> PhysicalViewport {
+        query_draw_buffer_size(|attribute| match attribute {
+            EGL_WIDTH => Ok(width),
+            EGL_HEIGHT => Ok(height),
+            _ => panic!("unexpected EGL attribute"),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn an_egl_backbuffer_can_lag_a_requested_resize() {
+        // Captured native sequence: the requested 950x895 viewport is ready,
+        // but Mesa's next swap still attaches its existing 1280x800 buffer.
+        let requested = clipped(0, 0, 950, 895);
+        let draw = observed_draw_size(1280, 800);
+        let pending = placement_delta(requested, (draw.width, draw.height), None, None, None);
+        assert_eq!(pending.source, Some((0, 0, 950, 800)));
+        let resized = observed_draw_size(950, 895);
+        let next = placement_delta(
+            requested,
+            (resized.width, resized.height),
+            pending.position,
+            pending.destination,
+            pending.source,
+        );
+        assert_eq!(next.source, Some((0, 0, 950, 895)));
+    }
+
+    #[test]
+    fn a_shrunk_draw_buffer_clamps_nonzero_clip_origins() {
+        let draw = observed_draw_size(640, 480);
+        assert_eq!(
+            clamp_source(clipped(600, 450, 200, 300), (draw.width, draw.height)),
+            (600, 450, 40, 30)
+        );
+    }
+
+    #[test]
+    fn invalid_egl_draw_sizes_are_not_normalized_into_a_presentable_pixel() {
+        for (width, height) in [(0, 800), (1280, 0), (-1, 800), (1280, -1)] {
+            assert!(
+                query_draw_buffer_size(|attribute| Ok(if attribute == EGL_WIDTH {
+                    width
+                } else {
+                    height
+                }))
+                .is_err()
+            );
+        }
+        let mut queries = 0;
+        let error = query_draw_buffer_size(|_| {
+            queries += 1;
+            Err(BrowserError::Wayland("query failed".into()))
+        })
+        .unwrap_err();
+        assert_eq!(queries, 1);
+        assert!(error.to_string().contains("query failed"));
     }
 
     #[test]

@@ -1,0 +1,41 @@
+#!/bin/sh
+# Resolve a compatible CLI without creating, inspecting or stopping a session.
+set -eu
+# A probe is already a harness invocation. Avoid mise shims under fixture HOME,
+# just as the eventual compositor/session does.
+remaining=$PATH:
+clean_path=
+separator=
+while [ -n "$remaining" ]; do
+    entry=${remaining%%:*}
+    remaining=${remaining#*:}
+    case $entry in
+        */mise/shims) ;;
+        *) clean_path=$clean_path$separator$entry; separator=: ;;
+    esac
+done
+PATH=$clean_path
+export PATH
+required='a compatible niri-harness CLI (top-level start/stop/env/exec and start --root/--width/--portal/--backend/--host-bus/--renderer)'
+pinned=$HOME/.local/lib/cagents/niri-harness/current/bin/niri-harness
+compatible() {
+    [ -x "$1" ] || return 1
+    commands=$(timeout -k 2 10 "$1" --help 2>/dev/null) || return 1
+    for verb in start stop list env exec gc; do
+        printf '%s\n' "$commands" | grep -Eq "(^|[[:space:],{])$verb([[:space:],}]|$)" || return 1
+    done
+    help=$(timeout -k 2 10 "$1" start --help 2>/dev/null) || return 1
+    for option in --root --width --portal --backend --host-bus --renderer; do
+        case $help in *"$option"*) ;; *) return 1 ;; esac
+    done
+}
+found=$(command -v niri-harness) || found=
+for candidate in "$found" "$pinned"; do
+    if [ -n "$candidate" ] && compatible "$candidate"; then
+        CDPATH= cd -- "$(dirname -- "$candidate")" && pwd -P
+        exit 0
+    fi
+done
+printf 'requires %s; incompatible or missing CLI at %s and %s. Install the compatible runtime; see docs/development.md.\n' \
+    "$required" "${found:-PATH}" "$pinned" >&2
+exit 1

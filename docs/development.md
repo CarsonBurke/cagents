@@ -212,6 +212,95 @@ real decision. The check never runs Cargo's build, so nothing compiles outside
 a slot. Launching the other lane rebuilds the UI and invalidates this lane's
 record. Delete the record to force the next launch through the gate.
 
+Native evidence defaults to browserless matched executables. To qualify embedded
+browser behavior, use `build SIDE CHECKOUT --integrated-browser` (also supported
+through `--remote`); the recorded lane controls both the three builds and the
+session runner. Older build records remain browserless. `start SIDE
+--trace-wayland --limit 120` enables client protocol logging in the private
+`logs/ui-SIDE.log` for a bounded diagnosis. The next start disables that trace
+unless requested again. `--software-rendering` similarly opts into software GL
+clients for a renderer comparison; it never changes ordinary capture defaults.
+
+### Harness runtime
+
+Named instances and native evidence require top-level `start`, `stop`, `list`,
+`env`, `exec` and `gc`, plus the start options `--root`, `--width`, `--portal`,
+`--backend`, `--host-bus` and `--renderer`. Both runners check these capabilities
+before using an installation. A compatible PATH installation wins; otherwise they use
+`~/.local/lib/cagents/niri-harness/current/bin`. The `current` symlink selects
+an isolated versioned prefix. Capability checks, rather than a particular
+source revision, define compatibility.
+
+Install a qualified source checkout into a new prefix with `make install
+PREFIX="$prefix"`, then atomically point `current` at it:
+
+```sh
+runtime_base="$HOME/.local/lib/cagents/niri-harness"
+# Set prefix to the new, qualified versioned install beneath runtime_base.
+ln -s "$prefix" "$runtime_base/.current-$$"
+mv -Tf "$runtime_base/.current-$$" "$runtime_base/current"
+```
+
+Keep the previous prefix while its sessions run. Do not install over a running
+runtime or replace the global legacy CLI: older checkouts may still need it.
+The versioned prefix must contain its launcher, helpers and resources. Its
+launcher should invoke `/usr/bin/python3` directly to avoid mise shims recursing
+under fixture HOME or waiting for checkout trust. `make install` builds the
+harness's small C input helpers; Rust application builds still use cargo-gate.
+
+The fw16 runtime used for #2451 is source tree
+`70822fa2420e0e861aee98e6c0cd779c57d07827`, retained at
+`~/.local/state/cagents-harness-2451/70822fa2420e0e861aee98e6c0cd779c57d07827/source`.
+It combines the existing local API snapshot `5ab6ba0a0b5b2f3c83c8d45d7f7493727d181d46`
+(based on harness commit `41f75699cdef1aed76aeee876a6738ee8496b2c6` plus its working
+changes) with the compositor renderer helpers from published commit
+`1aec557ca9ef3aab0fde76647166b1984176710d`. Renderer validation runs before Xvfb
+starts, including a regression that rejects an invalid node without allocating
+a session. Its observer groups OCR words into rows from their original vertical
+geometry before ordering them left to right. Arbitrary pixel bands had reversed
+words across a one-pixel boundary; retained regressions cover that captured
+case, translations, mixed glyph heights and neighboring rows without letting a
+tall box or merged height join them. Fine tiles retain small controls; two
+coarse full-frame readings cover both themes and words wider than tile overlap.
+Crop fragments yield to complete words, and clearly ordered tokens may have
+overlapping OCR bounds. Tests retain the captured heading and counter cases.
+This is local installation provenance, not a published dependency;
+none of that checkout's unpublished work is part of this PR. A future compatible
+published runtime can replace the prefix through `current` without cagents edits.
+
+Each separate start, drive, capture and lifecycle invocation resolves its
+harness. Listing still works without one; garbage collection refuses to remove
+instances or storage when harness liveness cannot be checked. Native evidence
+uses the window backend inside its private KWin compositor. With no portal it
+shares that private bus; with `--portal` the harness owns the portal's private
+bus. Named development instances use the headless backend.
+
+Headless runtime prerequisites and renderer selection belong to that runtime.
+The qualified fw16 snapshot needs `Xvfb`; its signed Fedora
+`xorg-x11-server-Xvfb` RPM is extracted under the isolated prefix's `tools/`,
+with `bin/Xvfb` pointing to `../tools/usr/bin/Xvfb`. No system package is changed.
+Named instances request `--renderer auto`: this runtime selects a Mesa-supported
+GPU for the compositor through Zink and restores the caller's renderer variables
+for the application. The cagents runner leaves `LIBGL_ALWAYS_SOFTWARE` and
+`WGPU_BACKEND` alone. It does not force every client onto a software backend.
+
+For a native browser regression, build with `--integrated-browser`, start a fresh
+fixture at 1600x1000 and scale 1, then run
+`tests/fixtures/integrated-browser-smoke.sh` in an `evidence` steps shell. It
+selects the observed browser menu control and Skip in the first-run import dialog, serves a synthetic page over
+loopback HTTP, and checks typing, button focus, scrolling and a narrower window.
+`--software-rendering` exercises the delayed Mesa backbuffer case. This geometry
+uses the independent viewport dimensions introduced by #2527. The test starts
+no model/provider; its server has the fixture's HOME and runtime and is ended by
+normal fixture teardown. Steps receive the recorded build lane and explicit
+fixture root; the server requires that root's private HOME, independent of where
+Cargo keeps its build output. The same step interface can drive an isolated
+named instance. `env --side after CMD...` selects its recorded environment
+before the first window, retains helper ownership for `stop`, and refuses to
+change scope while fixture processes remain. Use short instance names when the
+fixture's runtime is already deep enough to approach Unix socket path limits. `BROWSER_SMOKE_OPEN_ONLY=1` opens only the animated
+page for a controlled resource/presentation sample.
+
 ### Parallel instances
 
 Several people or agents can each validate a change in the native app at once
