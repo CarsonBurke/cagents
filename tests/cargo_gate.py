@@ -1841,12 +1841,49 @@ class AdmissionTimeout(unittest.TestCase):
                 self.fixture.assert_preflight_unslotted(self.fixture.calls())
 
     def test_one_budget_covers_cumulative_hooks_and_seed_is_not_fail_soft_on_expiry(self):
-        # Two seconds, so a loaded host still reaches the seed hook within the budget.
-        self.reset(delays={"metadata":0.7, "guard":0.7, "seed":1.2})
+        # Advance only admission time, not cleanup's real monotonic clock. The
+        # contract is one deadline across hooks, regardless of host scheduling.
+        root = self.fixture.root
+        clock = root / "admission-clock"
+        temporary = clock.with_suffix(".tmp")
+        temporary.write_text("0")
+        temporary.replace(clock)
+        helper = root / "cargo-gate-command.py"
+        source = helper.read_text().replace(
+            "import time\n",
+            "import time\nfrom pathlib import Path\n"
+            f"time.monotonic_ns = lambda: int(Path({str(clock)!r}).read_text())\n",
+            1,
+        )
+        parsed = "        admission_deadline = positive_integer(arguments[1])\n"
+        self.assertEqual(source.count(parsed), 1)
+        source = source.replace(parsed, parsed +
+            '        os.environ["FIXTURE_ADMISSION_DEADLINE"] = str(admission_deadline)\n')
+        helper.write_text(source)
+        for name in ("bin/cargo", "build-disk-guard", "seed-build-dir"):
+            tool = root / name
+            source = tool.read_text()
+            self.assertEqual(source.count("record(event)\n"), 1)
+            source = source.replace("record(event)\n",
+                'event["admission_deadline"] = os.environ.get("FIXTURE_ADMISSION_DEADLINE")\n'
+                'record(event)\n'
+                'advance = config.get("clock_ns", {}).get(phase)\n'
+                'if advance is not None:\n'
+                '    clock = root / "admission-clock"\n'
+                '    temporary = clock.with_suffix(".tmp")\n'
+                '    temporary.write_text(str(advance))\n'
+                '    temporary.replace(clock)\n'
+                '    if phase == "seed":\n'
+                '        while True: time.sleep(0.01)\n')
+            tool.write_text(source)
+        self.reset(clock_ns={"metadata":700_000_000, "guard":1_400_000_000,
+                             "seed":2_600_000_000})
         process = self.fixture.start(environment=self.fixture.env | {self.setting:"2"})
         _stdout, stderr = process.communicate("", timeout=8)
         self.assert_timeout(process, stderr)
-        self.assertEqual([event["phase"] for event in self.fixture.calls()], ["metadata", "guard", "seed"])
+        calls = self.fixture.calls()
+        self.assertEqual([event["phase"] for event in calls], ["metadata", "guard", "seed"])
+        self.assertEqual({event["admission_deadline"] for event in calls}, {"2000000000"})
 
     def test_queue_base_and_no_fit_expiry_withdraws_owned_waiter_and_preserves_holder(self):
         for kind in ("queue", "base", "memory", "cpu-pressure", "cpu-settle"):
