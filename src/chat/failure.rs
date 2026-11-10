@@ -444,7 +444,7 @@ fn is_version(word: &str) -> bool {
 fn limit_action(limit: &str) -> &'static str {
     let model = limit.split(' ').next().unwrap_or_default();
     if model.eq_ignore_ascii_case("fable") {
-        "Choose another model or account, or wait for the reported reset. If this account has a Fable reset, /limit-reset in Claude Code clears the Fable limit now."
+        "Choose another model or account, or wait for the reported reset. If this account has a Fable reset, /limit-reset in a Claude Code terminal clears the Fable limit now."
     } else if model.starts_with(|c: char| c.is_ascii_uppercase()) {
         "Choose another model or account, or wait for the reported reset."
     } else {

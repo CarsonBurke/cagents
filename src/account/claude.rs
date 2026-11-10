@@ -592,10 +592,10 @@ pub fn parse_rate_limit_event(info: &Value) -> Option<LiveUpdate> {
     {
         windows.push(window(live, used, info["resetsAt"].as_i64(), true));
     }
+    // A report names the limit its status is about; only the account's own
+    // windows decide the account's status.
     let account_wide = match named {
         None => true,
-        // Claude Code's own credit pool covers the whole account.
-        Some("overage") => true,
         Some(_) => live.is_some_and(|live| live.kind != WindowKind::Scoped),
     };
     let status = match info["status"].as_str() {
@@ -1193,6 +1193,12 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(weekly.status, Some(UsageStatus::Limited));
+        // A rejection of a limit with no figures here, such as extra usage,
+        // waits for an account-wide report, as it did before.
+        assert!(
+            parse_rate_limit_event(&json!({"status": "rejected", "rateLimitType": "overage"}))
+                .is_none()
+        );
     }
 
     #[test]

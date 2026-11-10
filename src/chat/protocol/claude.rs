@@ -183,9 +183,26 @@ fn create_inner(
             cwd: launch.recipe.working_directory.clone(),
             history,
             titles: super::claude_titles::ClaudeTitles::new(launch),
+            selected: launch_model(&launch.recipe.arguments),
             ..Claude::default()
         }),
     ))
+}
+
+/// The model a launch asks for with `--model`, the last one where it repeats,
+/// as Claude Code reads it: until a turn reports what runs, this is the
+/// conversation's model.
+fn launch_model(arguments: &[String]) -> Option<String> {
+    let mut model = None;
+    let mut args = arguments.iter();
+    while let Some(arg) = args.next() {
+        if let Some(value) = arg.strip_prefix("--model=") {
+            model = Some(value);
+        } else if arg == "--model" {
+            model = args.next().map(String::as_str);
+        }
+    }
+    model.filter(|model| !model.is_empty()).map(str::to_owned)
 }
 
 /// Record a provider-confirmed rotation in the recipe: after an
@@ -624,7 +641,12 @@ struct Claude {
     /// The full model ID each listed model resolves to, where Claude Code
     /// said: `opus` to `claude-opus-5-5`, `fable` to `claude-fable-5-1`.
     resolved: HashMap<String, String>,
+    /// The listed model the conversation is on: the one launched with,
+    /// chosen since, or the listed model the latest turn's full ID stands for.
     selected: Option<String>,
+    /// The full model ID the latest turn reported running on, which keys the
+    /// result's per-model usage.
+    running: Option<String>,
     cache_read_tokens: u64,
     cache_write_tokens: u64,
     reasoning: Option<String>,
@@ -1375,6 +1397,7 @@ impl Claude {
         });
         if let Some(model) = data["model"].as_str() {
             self.selected = Some(self.listed(model).to_owned());
+            self.running = Some(model.to_owned());
         }
         step.events.extend([
             Event::Models {
@@ -3422,7 +3445,7 @@ impl Adapter for Claude {
                 }
                 if let Some(models) = frame["modelUsage"].as_object() {
                     let data = self
-                        .selected
+                        .running
                         .as_ref()
                         .and_then(|m| models.get(m))
                         .or_else(|| {
@@ -14771,6 +14794,71 @@ mod tests {
         assert_eq!(turn(&mut adapter, "claude-fable-5-1"), "fable");
         // A model the list does not name is shown as it is.
         assert_eq!(turn(&mut adapter, "claude-mythos-5-2"), "claude-mythos-5-2");
+    }
+
+    #[test]
+    fn a_conversation_launched_on_an_alias_shows_that_alias_and_its_context() {
+        let catalog: Value = serde_json::from_slice(
+            &std::fs::read(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("fixtures/accounts/claude-initialize-models.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        // As an agent spawned with `--model opus` launches, and as its
+        // recovery relaunches it: `opus` and `default` both run Opus 5.5.
+        for arguments in [
+            vec!["--model".to_owned(), "opus".to_owned()],
+            vec!["--model=opus".to_owned()],
+        ] {
+            let launch = Launch {
+                provider: Provider::Claude,
+                session_id: None,
+                recipe: crate::model::LaunchRecipe {
+                    program: "claude".into(),
+                    arguments,
+                    working_directory: PathBuf::from("/tmp"),
+                    environment: Default::default(),
+                    unset_environment: Default::default(),
+                },
+            };
+            let (spec, mut adapter) = create(&launch).unwrap();
+            let session = spec
+                .arguments
+                .iter()
+                .find_map(|arg| arg.strip_prefix("--session-id="))
+                .unwrap()
+                .to_owned();
+            let initialize = adapter.initialize().unwrap();
+            let request = initialize.writes[0]["request_id"].as_str().unwrap();
+            let listed = adapter.receive(reply(request, catalog.clone())).unwrap();
+            let selected = |step: &Step| {
+                step.events.iter().find_map(|event| match event {
+                    Event::Models { selected, .. } => Some(selected.clone()),
+                    _ => None,
+                })
+            };
+            assert_eq!(selected(&listed), Some(Some("opus".into())));
+            let turn = adapter
+                .receive(json!({"type":"system","subtype":"init","session_id":session,"model":"claude-opus-5-5"}))
+                .unwrap();
+            assert_eq!(selected(&turn), Some(Some("opus".into())));
+            // The result's per-model usage is keyed by full ID; a Haiku
+            // helper call beside the turn does not stand for its context.
+            let result = adapter
+                .receive(json!({"type":"result","subtype":"success","is_error":false,"session_id":session,
+                    "modelUsage":{
+                        "claude-haiku-5-5":{"contextWindow":200000},
+                        "claude-opus-5-5":{"contextWindow":1000000}
+                    }}))
+                .unwrap();
+            let context = result.events.iter().find_map(|event| match event {
+                Event::Usage(usage) => Some(usage.context_limit),
+                _ => None,
+            });
+            assert_eq!(context, Some(1_000_000));
+        }
     }
 
     #[test]

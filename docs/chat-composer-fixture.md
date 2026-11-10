@@ -200,9 +200,9 @@ default list, and from the provider's next start each turn's `init` names the
 full ID the chosen model resolves to, as Claude Code's does: `opus` runs
 `claude-opus-5-5`. The model chosen with `--model` or in the picker is the one
 resolved; without either, the conversation starts on the list's `default`
-entry, as Claude Code's does. To give the account check figures, write a `get_usage` control
-response's inner `response` to `fixture-usage.json`; the account check and
-each conversation read it whenever they ask. A live usage change is a
+entry, as Claude Code's does. To give the account check figures, write a
+`get_usage` control response's inner `response` to `fixture-usage.json`; the
+account check and each conversation read it whenever they ask. A live usage change is a
 `rate_limit_event` frame in `fixture-frames.jsonl`, such as
 `fixtures/accounts/claude-rate-limit-event-fable.json`, which a Fable turn
 reported.
