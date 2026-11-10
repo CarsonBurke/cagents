@@ -1276,6 +1276,14 @@ this recipe deliberately installs no automatic deletion trap. Do not change
 socket limits, remove enclosing Git markers or silently select another fixture
 root to make a failed preparation pass.
 
+The Codex reconnect-only upgrade fixture also needs `/usr/bin/unshare` and
+permission to create Linux user and PID namespaces with a private procfs mount.
+Its recovery scan then sees real fixture processes without depending on
+unrelated same-user services whose `/proc` data may be unreadable. The fixture
+proves the namespace and procfs identities, and namespace teardown removes any
+remaining providers. Production process scans and their refusal tests are
+unchanged.
+
 Tests that spawn the retained helper call `retained_fixture::run_isolated()`
 first. The helper calls `setsid` and enters its own systemd scope, so killing a
 process group or cgroup misses it. `run_isolated()` reruns the exact test as a
