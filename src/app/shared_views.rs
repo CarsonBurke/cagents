@@ -1173,6 +1173,17 @@ impl Cagents {
         {
             return Err("channel metadata is unsettled");
         }
+        // Canonical ownership alone cannot prove that an older local
+        // placement has already been cleared. The complete projector repairs
+        // that inconsistency before persisting; a selected pass must defer.
+        if self
+            .durable
+            .channels
+            .iter()
+            .any(|other| other.id != *channel && other.cards.iter().any(|id| selected.contains(id)))
+        {
+            return Err("local pane placement is ambiguous");
+        }
         let current: Vec<_> = local
             .cards
             .iter()
@@ -5335,6 +5346,110 @@ mod tests {
                 Err("scope structure or source changed")
             );
         }
+    }
+
+    #[test]
+    #[cfg(not(feature = "integrated-browser"))]
+    fn presentation_duplicate_local_placement_uses_full_recovery_and_keeps_active_draft() {
+        let (mut app, source, destination, pane) = presentation_fixture();
+        Arc::make_mut(&mut app.durable).active_channel = Some(destination);
+        app.active_workspace = Some(PathBuf::from("/repo"));
+        drop(app.add_default_pane(PathBuf::from("/repo"), settings::DefaultPane::NativeChat));
+        let draft = app.workspace.focused().unwrap();
+        app.retain_local_pane(draft);
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get(&draft) else {
+            panic!("draft runtime")
+        };
+        let target = runtime.target;
+        compose_default_chat(&mut app, target);
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get(&draft) else {
+            panic!("draft runtime")
+        };
+        let draft_address = runtime.as_ref() as *const super::super::chat_ui::Runtime;
+        let draft_text = runtime.unsent_text();
+        let draft_state = app.card_state(draft).unwrap().clone();
+        let failure = match app.cards.get(&pane.id) {
+            Some(CardRuntime::Failed(error)) => format!("{error:?}"),
+            _ => panic!("unavailable browser surface"),
+        };
+        let surface_address = app.cards.get(&pane.id).unwrap() as *const CardRuntime;
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .iter_mut()
+            .find(|row| row.id == destination)
+            .unwrap()
+            .cards
+            .push(pane.id);
+        let held = app
+            .workspace_model
+            .views
+            .iter()
+            .find(|view| view.scope == Scope::Channel(source))
+            .unwrap()
+            .clone();
+        let mut next = held.clone();
+        next.revision += 1;
+        assert_eq!(
+            app.presentation_projection_ready(&held, &next, None),
+            Err("local pane placement is ambiguous")
+        );
+        let update = presentation_edge(
+            &app,
+            Scope::Channel(source),
+            28,
+            "Recovered placement",
+            0.67,
+        );
+        app.shared_views.local_projection_count.set(0);
+        app.shared_views.selected_projection_count.set(0);
+        app.shared_views.pane_attachment_count = 0;
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        drop(app.update(Message::WorkspaceModelObserved(update)));
+        assert_eq!(app.shared_views.local_projection_count.get(), 1);
+        assert_eq!(app.shared_views.selected_projection_count.get(), 0);
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .find(|row| row.id == source)
+                .unwrap()
+                .cards
+                .contains(&pane.id)
+        );
+        assert_eq!(
+            app.durable
+                .channels
+                .iter()
+                .find(|row| row.id == destination)
+                .unwrap()
+                .cards,
+            vec![draft]
+        );
+        assert_eq!(app.durable.active_channel, Some(destination));
+        assert_eq!(app.workspace.focused(), Some(draft));
+        assert_eq!(
+            app.card_state(pane.id).unwrap().title,
+            "Recovered placement"
+        );
+        assert!(
+            matches!(app.cards.get(&pane.id), Some(CardRuntime::Failed(error)) if format!("{error:?}") == failure)
+        );
+        assert_eq!(
+            app.cards.get(&pane.id).unwrap() as *const CardRuntime,
+            surface_address
+        );
+        assert_eq!(app.shared_views.pane_attachment_count, 0);
+        assert_eq!(app.card_state(draft), Some(&draft_state));
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get(&draft) else {
+            panic!("draft runtime")
+        };
+        assert_eq!(
+            runtime.as_ref() as *const super::super::chat_ui::Runtime,
+            draft_address
+        );
+        assert_eq!(runtime.unsent_text(), draft_text);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
