@@ -1510,6 +1510,14 @@ workloads are described in [Performance](performance.md).
 For which fixture to use, how they fit together and how to extend or repair
 one, see [Fixtures](fixtures.md).
 
+`start SIDE --width W --height H` requests both logical viewport dimensions;
+the default is 1500x900. The task's private KWin rules size its nested compositor
+framebuffer before niri applies width fitting, so a narrow width no longer
+reduces the height with it. `pair` forwards `--height` to both starts. A capture
+refuses a window larger than its observed logical viewport (allowing two pixels
+for scaling round-off); request a larger width/height instead of accepting a
+cropped image. This changes the capture viewport, not application layouts.
+
 `scripts/native-evidence` captures before/after screenshots of the actual native
 app, from a shell where the desktop session or `DISPLAY` is unavailable, such as
 plain SSH. It runs headless: KWin's virtual backend hosts a nested niri session,
