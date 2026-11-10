@@ -3211,6 +3211,7 @@ fn flush_rebasing_stale_bases(
     writes.flush(store)
 }
 
+#[cfg(test)]
 fn schedule_flush_after_changes(
     current_due: Option<Instant>,
     received_changes: bool,
