@@ -2914,10 +2914,9 @@ fn validate_live_chat(session: &Session, require_resumable: bool) -> Result<(), 
 /// never through process arguments. Capture precedes any old-daemon close.
 fn retain_floor_entry() -> Option<Result<(), String>> {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
-    if arguments
-        .first()
-        .is_none_or(|argument| argument != "--retain-update-floor")
-    {
+    if arguments.first().is_none_or(|argument| {
+        argument != "--retain-update-floor" && argument != "--capture-update-floor"
+    }) {
         return None;
     }
     Some((|| {
@@ -2938,13 +2937,30 @@ fn retain_floor_entry() -> Option<Result<(), String>> {
         }
         let mut record: crate::upgrade::floor::Record =
             serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-        if !record.presentations.is_empty() {
-            return Err(
-                "Stopped pane capture cannot import a caller's managed presentation".into(),
-            );
+        let capturing = arguments[0] == "--capture-update-floor";
+        if !capturing {
+            if record
+                .snapshots
+                .iter()
+                .any(|saved| !record.chats.contains(&saved.source))
+                || record
+                    .presentations
+                    .iter()
+                    .any(|pane| !record.contains_capture_source(&pane.session))
+                || record
+                    .aliases
+                    .iter()
+                    .any(|alias| !record.contains_capture_source(alias))
+            {
+                return Err("Stopped pane evidence does not match its acknowledged source".into());
+            }
+            return record.save();
         }
-        if !record.snapshots.is_empty() || !record.aliases.is_empty() {
-            return Err("Stopped pane capture cannot import caller transcript evidence".into());
+        if !record.presentations.is_empty()
+            || !record.snapshots.is_empty()
+            || !record.aliases.is_empty()
+        {
+            return Err("Stopped pane capture cannot import caller evidence".into());
         }
         let mut budget = crate::persistence::MigrationInspectionBudget::new(
             Instant::now() + Duration::from_secs(30),
@@ -2955,12 +2971,6 @@ fn retain_floor_entry() -> Option<Result<(), String>> {
             {
                 for pane in panes {
                     if let CardKind::Chat(saved) = pane.kind {
-                        if record.service_stopped
-                            && saved.proof.as_ref() == Some(&record.source)
-                            && !record.chats.iter().any(|source| source.id == saved.id)
-                        {
-                            record.chats.push(saved.clone());
-                        }
                         if record
                             .chats
                             .iter()
@@ -2973,27 +2983,40 @@ fn retain_floor_entry() -> Option<Result<(), String>> {
                 }
             }
         }
-        if !record.chats.is_empty() {
+        super::model::Registry::open()?.capture_update_floor(&mut record)?;
+        // ChatClose returns its final snapshot itself. A service shutdown has
+        // no per-chat acknowledgement, so capture that page immediately before
+        // stopping it. No capture is durable until an action is acknowledged.
+        if record.service_stopped && !record.chats.is_empty() {
             let socket = crate::terminal_ipc::daemon_socket_path().map_err(|e| e.to_string())?;
-            let mut client = current::Client::connect(
-                &socket,
-                &record.source,
-                Instant::now() + Duration::from_secs(30),
-                record.protocol,
-            )
-            .ok();
-            for source in &record.chats {
+            let mut client = crate::update::source::Client::connect(&socket).ok();
+            if let Some(client) = &client
+                && (client.proof() != &record.source || client.protocol() != record.protocol)
+            {
+                return Err("The source changed before its transcript capture".into());
+            }
+            for source in record.chats.clone() {
                 let captured = client
                     .as_mut()
                     .ok_or_else(|| {
                         "The old service could not provide its transcript preview".to_owned()
                     })
-                    .and_then(|client| client.snapshot(source));
-                record.snapshots.push(stopped_snapshot(source, captured));
+                    .and_then(|client| {
+                        client
+                            .capture_chat_snapshot(source.clone())
+                            .map_err(|error| error.to_string())
+                    });
+                match captured {
+                    Ok(snapshot) => record.acknowledge_snapshot(&source, snapshot)?,
+                    Err(error) => record.snapshots.push(stopped_snapshot(&source, Err(error))),
+                }
             }
         }
-        super::model::Registry::open()?.capture_update_floor(&mut record)?;
-        record.save()
+        let bytes = record.encode_capture()?;
+        io::stdout()
+            .lock()
+            .write_all(&bytes)
+            .map_err(|error| error.to_string())
     })())
 }
 
@@ -3002,8 +3025,20 @@ fn stopped_snapshot(
     captured: Result<crate::chat::Snapshot, String>,
 ) -> crate::upgrade::floor::StoppedSnapshot {
     match captured {
-        Ok(snapshot) => crate::upgrade::floor::StoppedSnapshot {source:source.clone(),snapshot,limitation:None},
-        Err(_) => crate::upgrade::floor::StoppedSnapshot {source:source.clone(),snapshot:crate::chat::Snapshot {session_id:source.launch.session_id.clone(),exited:true,..Default::default()},limitation:Some("The old service could not provide a transcript preview. The saved conversation is kept; Resume loads its full history.".into())},
+        Ok(snapshot) => crate::upgrade::floor::StoppedSnapshot {
+            source: source.clone(), snapshot, limitation: None,
+        },
+        Err(_) => crate::upgrade::floor::StoppedSnapshot {
+            source: source.clone(),
+            snapshot: crate::chat::Snapshot {
+                session_id: source.launch.session_id.clone(), exited: true, ..Default::default()
+            },
+            limitation: Some(if source.launch.session_id.is_some() {
+                "The old service could not provide a transcript preview. The saved conversation is kept; Resume loads its full history."
+            } else {
+                "The old service could not provide a transcript preview, and no conversation was recorded. Start a new conversation to continue."
+            }.into()),
+        },
     }
 }
 
@@ -3032,6 +3067,23 @@ mod floor_capture_tests {
         let saved = super::stopped_snapshot(&source, Err("attachment refused".into()));
         assert_eq!(saved.source, source);
         assert!(saved.snapshot.exited);
-        assert!(saved.limitation.is_some());
+        assert!(
+            saved
+                .limitation
+                .as_ref()
+                .unwrap()
+                .contains("no conversation was recorded")
+        );
+        assert!(!saved.limitation.as_ref().unwrap().contains("Resume loads"));
+        let mut recorded = source;
+        recorded.launch.session_id = Some("recorded".into());
+        let saved = super::stopped_snapshot(&recorded, Err("attachment refused".into()));
+        assert!(
+            saved
+                .limitation
+                .as_ref()
+                .unwrap()
+                .contains("Resume loads its full history")
+        );
     }
 }

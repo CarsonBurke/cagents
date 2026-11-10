@@ -1,6 +1,13 @@
 //! The separate, explicitly destructive part of an update review.
 
-use std::{fmt::Write as _, io, path::Path};
+use std::{
+    collections::BTreeMap,
+    fmt::Write as _,
+    fs,
+    io::{self, Read as _},
+    os::unix::fs::MetadataExt as _,
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -25,17 +32,36 @@ pub struct StopList {
 }
 
 impl StopList {
-    /// The listed identities and words are the authority, never their count.
-    /// Inventory ordering can change without changing that authority.
+    /// Consent binds owners, source descriptors and recovery, never a count.
+    /// Working/idle text is display-only; foreground jobs are in the identity.
     pub fn digest(&self) -> String {
         let mut items: Vec<_> = self.items.iter().collect();
         items.sort_by_key(|item| (item.kind, item.id));
-        let encoded = serde_json::to_vec(&(&self.from_version, items))
+        let identities: Vec<_> = items
+            .into_iter()
+            .map(|item| {
+                (
+                    item.id,
+                    item.kind,
+                    &item.label,
+                    &item.identity,
+                    &item.recovery,
+                )
+            })
+            .collect();
+        let encoded = serde_json::to_vec(&(&self.from_version, identities))
             .expect("stop lists contain only serializable values");
         format!("{:x}", Sha256::digest(encoded))
     }
 
     pub fn render(&self) -> String {
+        let mut output = self.render_preview();
+        output.push_str("\nType \"stop\" to stop these and update. Anything else cancels.\n");
+        output
+    }
+
+    /// A preview is also shown where typing cannot authorize destruction.
+    pub fn render_preview(&self) -> String {
         let mut output = format!(
             "The running terminal service ({}) cannot hand these over.\nUpdating stops them:\n\n",
             inline(&self.from_version)
@@ -45,7 +71,6 @@ impl StopList {
             writeln!(output, "      {}", inline(&item.running)).unwrap();
             writeln!(output, "      after the update: {}", inline(&item.recovery)).unwrap();
         }
-        output.push_str("\nType \"stop\" to stop these and update. Anything else cancels.\n");
         output
     }
 }
@@ -78,7 +103,7 @@ pub(super) fn chat_item_with_state(
         id: impact.id,
         kind: impact::SessionKind::NativeChat,
         label: label.into(),
-        identity: impact.identity.clone(),
+        identity: identity(&(&impact.identity, chat)),
         running: format!(
             "{} chat, {state}{}",
             match chat.launch.provider {
@@ -90,27 +115,34 @@ pub(super) fn chat_item_with_state(
         recovery: if recorded {
             "press Resume in the pane"
         } else {
-            "the transcript stays visible; Start fresh in the pane"
+            "the transcript stays visible; start a new conversation"
         }
         .into(),
     }
 }
 
 pub(super) fn terminal_item(
-    _terminal: &crate::terminal_ipc::TerminalDescriptor,
+    terminal: &crate::terminal_ipc::TerminalDescriptor,
     impact: &impact::SessionImpact,
     label: &str,
+    processes: &TerminalProcesses,
 ) -> StopItem {
+    let foreground = processes.foreground(terminal);
     StopItem {
         id: impact.id,
         kind: impact::SessionKind::Terminal,
         label: label.into(),
-        identity: impact.identity.clone(),
-        // The frozen List descriptor has no child PID. Do not substitute a
-        // launch recipe: that would name the shell rather than its live job.
-        running: terminal_running(None),
+        identity: identity(&(&impact.identity, &terminal.session, &foreground)),
+        running: foreground
+            .map(|job| job.description)
+            .unwrap_or_else(|| "terminal process unavailable".into()),
         recovery: "screen and directory kept; press Restart in the pane".into(),
     }
+}
+
+fn identity(value: &impl Serialize) -> String {
+    let encoded = serde_json::to_vec(value).expect("source descriptors are serializable");
+    format!("{:x}", Sha256::digest(encoded))
 }
 
 /// `--yes` accepts only the ordinary review. A person at a terminal must type
@@ -118,7 +150,6 @@ pub(super) fn terminal_item(
 pub(super) fn read_stop_choice(
     input: &mut impl io::BufRead,
     is_terminal: bool,
-    _yes: bool,
     list: &StopList,
 ) -> io::Result<UpdateChoice> {
     if !is_terminal {
@@ -134,13 +165,100 @@ pub(super) fn read_stop_choice(
     }
 }
 
-pub(super) fn terminal_running(pid: Option<u32>) -> String {
-    pid.and_then(|pid| foreground(Path::new("/proc"), pid))
-        .unwrap_or_else(|| "terminal session".into())
+/// A single same-user census serves the entire stop list. A terminal's marker
+/// is inherited by its shell and jobs; never match another user's /proc data.
+pub(super) struct TerminalProcesses {
+    root: PathBuf,
+    rows: BTreeMap<u32, ProcessRow>,
 }
 
-#[derive(PartialEq, Eq)]
+struct ProcessRow {
+    stat: Stat,
+    terminal: Option<TerminalId>,
+}
+
+impl TerminalProcesses {
+    pub(super) fn observe() -> Self {
+        Self::at(Path::new("/proc"), crate::daemon::current_uid())
+    }
+
+    fn at(root: &Path, uid: u32) -> Self {
+        let mut rows = BTreeMap::new();
+        if let Ok(entries) = fs::read_dir(root) {
+            for entry in entries.flatten() {
+                let Some(pid) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.parse().ok())
+                else {
+                    continue;
+                };
+                if !entry.metadata().is_ok_and(|metadata| metadata.uid() == uid) {
+                    continue;
+                }
+                let Some(stat) = read_stat(root, pid) else {
+                    continue;
+                };
+                let terminal = bounded_file(&entry.path().join("environ"))
+                    .split(|byte| *byte == 0)
+                    .find_map(|entry| {
+                        let value = entry.strip_prefix(b"CAGENTS_TERMINAL_ID=")?;
+                        std::str::from_utf8(value).ok()?.parse().ok()
+                    });
+                rows.insert(pid, ProcessRow { stat, terminal });
+            }
+        }
+        Self {
+            root: root.to_owned(),
+            rows,
+        }
+    }
+
+    fn foreground(&self, terminal: &crate::terminal_ipc::TerminalDescriptor) -> Option<Foreground> {
+        let id = terminal.session.id;
+        let origin = terminal.session.recovery_origin.unwrap_or(id);
+        let matches = |row: &ProcessRow| {
+            row.terminal
+                .is_some_and(|marker| marker == id || marker == origin)
+        };
+        // The session leader is the shell even when it has exec'd a command.
+        // Older holders may put it in an existing session; its parent then has
+        // no terminal marker, unlike the jobs descended from that shell.
+        let (&pid, row) = self
+            .rows
+            .iter()
+            .filter(|(_, row)| matches(row))
+            .filter(|(pid, row)| {
+                **pid == row.stat.session
+                    || self
+                        .rows
+                        .get(&row.stat.parent)
+                        .is_none_or(|parent| !matches(parent))
+            })
+            .min_by_key(|(pid, row)| (**pid != row.stat.session, row.stat.start, **pid))?;
+        if read_stat(&self.root, pid)? != row.stat {
+            return None;
+        }
+        foreground(&self.root, pid)
+    }
+}
+
+fn bounded_file(path: &Path) -> Vec<u8> {
+    let Ok(file) = fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut bytes = Vec::new();
+    const LIMIT: u64 = 1024 * 1024;
+    if file.take(LIMIT + 1).read_to_end(&mut bytes).is_err() || bytes.len() as u64 > LIMIT {
+        return Vec::new();
+    }
+    bytes
+}
+
+#[derive(Clone, PartialEq, Eq)]
 struct Stat {
+    parent: u32,
+    session: u32,
     group: u32,
     foreground: u32,
     start: u64,
@@ -150,33 +268,52 @@ fn stat(bytes: &str) -> Option<Stat> {
     // comm can contain whitespace and parentheses; the closing delimiter is
     // the last one before the remaining numeric fields.
     let fields: Vec<_> = bytes.rsplit_once(") ")?.1.split_whitespace().collect();
+    if matches!(fields.first(), Some(&"Z" | &"X")) {
+        return None;
+    }
     Some(Stat {
+        parent: fields.get(1)?.parse().ok()?,
+        session: fields.get(3)?.parse().ok()?,
         group: fields.get(2)?.parse().ok()?,
         foreground: fields.get(5)?.parse().ok()?,
         start: fields.get(19)?.parse().ok()?,
     })
 }
 
-fn command(root: &Path, pid: u32) -> Option<Vec<String>> {
-    let bytes = std::fs::read(root.join(pid.to_string()).join("cmdline")).ok()?;
+fn read_stat(root: &Path, pid: u32) -> Option<Stat> {
+    stat(std::str::from_utf8(&bounded_file(&root.join(pid.to_string()).join("stat"))).ok()?)
+}
+
+fn command(root: &Path, pid: u32) -> Option<Vec<Vec<u8>>> {
+    let bytes = bounded_file(&root.join(pid.to_string()).join("cmdline"));
     let arguments: Vec<_> = bytes
         .split(|byte| *byte == 0)
         .filter(|argument| !argument.is_empty())
-        .map(|argument| inline(&String::from_utf8_lossy(argument)))
+        .map(<[u8]>::to_vec)
         .collect();
     (!arguments.is_empty()).then_some(arguments)
 }
 
-fn foreground(root: &Path, pid: u32) -> Option<String> {
-    let child_path = root.join(pid.to_string()).join("stat");
-    let child = stat(&std::fs::read_to_string(&child_path).ok()?)?;
+#[derive(Serialize)]
+struct Foreground {
+    shell_pid: u32,
+    shell_start: u64,
+    pid: u32,
+    start: u64,
+    argv: Vec<Vec<u8>>,
+    #[serde(skip)]
+    description: String,
+}
+
+fn foreground(root: &Path, pid: u32) -> Option<Foreground> {
+    let child = read_stat(root, pid)?;
     if child.foreground == 0 {
         return None;
     }
-    let leader_path = root.join(child.foreground.to_string()).join("stat");
-    let leader = stat(&std::fs::read_to_string(&leader_path).ok()?)?;
+    let leader = read_stat(root, child.foreground)?;
     let arguments = command(root, child.foreground)?;
-    let program = Path::new(&arguments[0])
+    let executable = String::from_utf8_lossy(&arguments[0]);
+    let program = Path::new(executable.as_ref())
         .file_name()?
         .to_str()?
         .trim_start_matches('-');
@@ -185,17 +322,24 @@ fn foreground(root: &Path, pid: u32) -> Option<String> {
             program,
             "sh" | "bash" | "zsh" | "fish" | "dash" | "ksh" | "nu"
         )
-        && arguments[1..]
-            .iter()
-            .all(|argument| matches!(argument.as_str(), "-l" | "--login" | "-i" | "--interactive"));
+        && arguments[1..].iter().all(|argument| {
+            matches!(
+                argument.as_slice(),
+                b"-l" | b"--login" | b"-i" | b"--interactive"
+            )
+        });
     let mut description = if idle {
         "idle shell".into()
     } else {
-        format!("shell running `{}`", arguments.join(" "))
+        let command = arguments
+            .iter()
+            .map(|argument| String::from_utf8_lossy(argument))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("shell running `{}`", inline(&command))
     };
-    // btime is a recorded boot epoch; process starttime is in clock ticks
-    // since boot. Neither a transcript mtime nor a guessed launch time is used.
-    let started = std::fs::read_to_string(root.join("stat"))
+    // btime is the boot epoch; starttime is in clock ticks since boot.
+    let started = fs::read_to_string(root.join("stat"))
         .ok()
         .and_then(|contents| {
             contents
@@ -214,12 +358,20 @@ fn foreground(root: &Path, pid: u32) -> Option<String> {
     if let Some(started) = started {
         write!(description, " (since {})", started.clock()).unwrap();
     }
-    if stat(&std::fs::read_to_string(child_path).ok()?)? != child
-        || stat(&std::fs::read_to_string(leader_path).ok()?)? != leader
+    if read_stat(root, pid)? != child
+        || read_stat(root, child.foreground)? != leader
+        || command(root, child.foreground)? != arguments
     {
         return None;
     }
-    Some(description)
+    Some(Foreground {
+        shell_pid: pid,
+        shell_start: child.start,
+        pid: child.foreground,
+        start: leader.start,
+        argv: arguments,
+        description,
+    })
 }
 
 #[cfg(test)]
@@ -245,14 +397,26 @@ mod tests {
                 item(
                     impact::SessionKind::Terminal,
                     "build · Release Details: rollout · alpha",
-                    "shell running `cargo test --workspace` (since 13:40)",
+                    "shell running `cargo test` (since 13:40)",
+                    "screen and directory kept; press Restart in the pane",
+                ),
+                item(
+                    impact::SessionKind::Terminal,
+                    "console · General · alpha",
+                    "idle shell (since 13:35)",
                     "screen and directory kept; press Restart in the pane",
                 ),
                 item(
                     impact::SessionKind::NativeChat,
                     "Untitled conversation in beta, started 9 Nov 14:02",
                     "Claude chat, working (can't be resumed)",
-                    "the transcript stays visible; Start fresh in the pane",
+                    "the transcript stays visible; start a new conversation",
+                ),
+                item(
+                    impact::SessionKind::NativeChat,
+                    "review · General · alpha",
+                    "Claude chat, idle",
+                    "press Resume in the pane",
                 ),
             ],
         }
@@ -266,53 +430,56 @@ mod tests {
                 "The running terminal service (0.1.3+local.991daa43e) cannot hand these over.\n",
                 "Updating stops them:\n\n",
                 "  build · Release Details: rollout · alpha\n",
-                "      shell running `cargo test --workspace` (since 13:40)\n",
+                "      shell running `cargo test` (since 13:40)\n",
+                "      after the update: screen and directory kept; press Restart in the pane\n",
+                "  console · General · alpha\n",
+                "      idle shell (since 13:35)\n",
                 "      after the update: screen and directory kept; press Restart in the pane\n",
                 "  Untitled conversation in beta, started 9 Nov 14:02\n",
                 "      Claude chat, working (can't be resumed)\n",
-                "      after the update: the transcript stays visible; Start fresh in the pane\n\n",
+                "      after the update: the transcript stays visible; start a new conversation\n",
+                "  review · General · alpha\n",
+                "      Claude chat, idle\n",
+                "      after the update: press Resume in the pane\n\n",
                 "Type \"stop\" to stop these and update. Anything else cancels.\n"
             )
         );
     }
 
     #[test]
-    fn only_a_persons_stop_authorizes_the_list_even_with_yes() {
+    fn only_a_persons_exact_stop_authorizes_the_list() {
         let list = representative();
-        for yes in [false, true] {
+        assert!(matches!(
+            read_stop_choice(&mut b"stop\n".as_slice(), true, &list).unwrap(),
+            UpdateChoice::StopListed { items_digest } if items_digest == list.digest()
+        ));
+        for answer in ["", "\n", "yes\n", "y\n", "STOP\n", "stop these\n", "n\n"] {
             assert!(matches!(
-                read_stop_choice(&mut b"stop\n".as_slice(), true, yes, &list).unwrap(),
-                UpdateChoice::StopListed { items_digest } if items_digest == list.digest()
-            ));
-            for answer in ["", "\n", "yes\n", "y\n", "STOP\n", "stop these\n", "n\n"] {
-                assert!(matches!(
-                    read_stop_choice(&mut answer.as_bytes(), true, yes, &list).unwrap(),
-                    UpdateChoice::Cancel
-                ));
-            }
-            assert!(matches!(
-                read_stop_choice(&mut b"stop\n".as_slice(), false, yes, &list).unwrap(),
+                read_stop_choice(&mut answer.as_bytes(), true, &list).unwrap(),
                 UpdateChoice::Cancel
             ));
         }
+        assert!(matches!(
+            read_stop_choice(&mut b"stop\n".as_slice(), false, &list).unwrap(),
+            UpdateChoice::Cancel
+        ));
     }
 
     #[test]
-    fn consent_digest_covers_every_displayed_and_owned_fact() {
+    fn consent_digest_binds_descriptors_but_not_display_only_activity() {
         let original = representative();
         let mut reordered = original.clone();
         reordered.items.reverse();
         assert_eq!(original.digest(), reordered.digest());
-        for change in 0..8 {
+        for change in 0..7 {
             let mut changed = original.clone();
             match change {
                 0 => changed.items[0].id = TerminalId::new(),
                 1 => changed.items[0].identity.push('x'),
                 2 => changed.items[0].label.push('x'),
-                3 => changed.items[0].running.push('x'),
-                4 => changed.items[0].recovery.push('x'),
-                5 => changed.items[0].kind = impact::SessionKind::NativeChat,
-                6 => changed.from_version.push('x'),
+                3 => changed.items[0].recovery.push('x'),
+                4 => changed.items[0].kind = impact::SessionKind::NativeChat,
+                5 => changed.from_version.push('x'),
                 _ => changed.items.push(changed.items[0].clone()),
             }
             assert_ne!(original.digest(), changed.digest());
@@ -368,9 +535,34 @@ mod tests {
         );
         assert_eq!(
             unrecorded.recovery,
-            "the transcript stays visible; Start fresh in the pane"
+            "the transcript stays visible; start a new conversation"
         );
-        assert_eq!(terminal_running(None), "terminal session");
+        let mut idle = recorded.clone();
+        idle.running = "Claude chat, idle".into();
+        let list = |item| StopList {
+            from_version: "old".into(),
+            items: vec![item],
+        };
+        assert_eq!(list(recorded).digest(), list(idle).digest());
+    }
+
+    #[test]
+    fn chat_digest_binds_source_descriptor_and_ignores_work_state() {
+        let (mut source, impact) = chat(false);
+        let list = |item| StopList {
+            from_version: "old".into(),
+            items: vec![item],
+        };
+        let working = list(chat_item_with_state(&source, &impact, "chat", "working")).digest();
+        assert_eq!(
+            working,
+            list(chat_item_with_state(&source, &impact, "chat", "idle")).digest()
+        );
+        source.launch.recipe.arguments.push("--resume".into());
+        assert_ne!(
+            working,
+            list(chat_item_with_state(&source, &impact, "chat", "working")).digest()
+        );
     }
 
     fn proc_stat(pid: u32, group: u32, foreground: u32) -> String {
@@ -399,12 +591,12 @@ mod tests {
         std::fs::write(proc.path().join("stat"), b"btime 1794258000\n").unwrap();
         let clock = crate::chat::local_time(1_794_258_000).unwrap().clock();
         assert_eq!(
-            foreground(proc.path(), 10).unwrap(),
+            foreground(proc.path(), 10).unwrap().description,
             format!("shell running `cargo test --workspace` (since {clock})")
         );
         std::fs::write(proc.path().join("10/stat"), proc_stat(10, 10, 10)).unwrap();
         assert_eq!(
-            foreground(proc.path(), 10).unwrap(),
+            foreground(proc.path(), 10).unwrap().description,
             format!("idle shell (since {clock})")
         );
         std::fs::write(
@@ -413,11 +605,178 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            foreground(proc.path(), 10).unwrap(),
+            foreground(proc.path(), 10).unwrap().description,
             format!("shell running `/bin/bash -c cargo test` (since {clock})")
         );
         std::fs::write(proc.path().join("10/cmdline"), b"/bin/bash\0").unwrap();
         std::fs::remove_file(proc.path().join("stat")).unwrap();
-        assert_eq!(foreground(proc.path(), 10).unwrap(), "idle shell");
+        assert_eq!(
+            foreground(proc.path(), 10).unwrap().description,
+            "idle shell"
+        );
+    }
+    #[test]
+    fn preview_has_no_unusable_typed_prompt() {
+        let preview = representative().render_preview();
+        assert!(preview.contains("shell running `cargo test`"));
+        assert!(!preview.contains("Type"));
+        assert!(!preview.contains("Anything else cancels"));
+    }
+
+    fn terminal() -> (
+        crate::terminal_ipc::TerminalDescriptor,
+        impact::SessionImpact,
+    ) {
+        let (chat, mut impact) = chat(true);
+        impact.kind = impact::SessionKind::Terminal;
+        (
+            crate::terminal_ipc::TerminalDescriptor::relaunchable(
+                chat.id,
+                chat.launch.recipe,
+                None,
+            ),
+            impact,
+        )
+    }
+
+    fn process(
+        root: &Path,
+        pid: u32,
+        parent: u32,
+        session: u32,
+        group: u32,
+        foreground: u32,
+        start: u64,
+        marker: Option<TerminalId>,
+        argv: &[u8],
+    ) {
+        let directory = root.join(pid.to_string());
+        fs::create_dir_all(&directory).unwrap();
+        let mut fields = vec!["0".to_owned(); 50];
+        fields[0] = "S".into();
+        fields[1] = parent.to_string();
+        fields[2] = group.to_string();
+        fields[3] = session.to_string();
+        fields[5] = foreground.to_string();
+        fields[19] = start.to_string();
+        fs::write(
+            directory.join("stat"),
+            format!("{pid} (shell ) with spaces) {}", fields.join(" ")),
+        )
+        .unwrap();
+        fs::write(
+            directory.join("environ"),
+            marker
+                .map(|id| format!("CAGENTS_TERMINAL_ID={id}\0"))
+                .unwrap_or_default(),
+        )
+        .unwrap();
+        fs::write(directory.join("cmdline"), argv).unwrap();
+    }
+
+    #[test]
+    fn terminal_marker_finds_shell_and_binds_foreground_epoch_and_arguments() {
+        let root = tempfile::tempdir().unwrap();
+        let (terminal, impact) = terminal();
+        let id = terminal.session.id;
+        let write_job = |pid, start, argv: &[u8]| {
+            process(
+                root.path(),
+                10,
+                1,
+                10,
+                10,
+                pid,
+                50,
+                Some(id),
+                b"/bin/bash\0",
+            );
+            process(root.path(), pid, 10, 10, pid, pid, start, Some(id), argv);
+        };
+        write_job(20, 100, b"cargo\0test\0");
+        // This unrelated session would win a naive oldest-shell search.
+        process(
+            root.path(),
+            2,
+            1,
+            2,
+            2,
+            2,
+            1,
+            Some(TerminalId::new()),
+            b"/bin/bash\0",
+        );
+        let observed = || TerminalProcesses::at(root.path(), crate::daemon::current_uid());
+        let before = terminal_item(&terminal, &impact, "build", &observed());
+        assert_eq!(before.running, "shell running `cargo test`");
+        let list = |item| StopList {
+            from_version: "old".into(),
+            items: vec![item],
+        };
+        let digest = list(before).digest();
+        for (pid, start, argv) in [
+            (21, 100, b"cargo\0test\0".as_slice()),
+            (20, 101, b"cargo\0test\0".as_slice()),
+            (20, 100, b"cargo\0build\0".as_slice()),
+        ] {
+            write_job(pid, start, argv);
+            assert_ne!(
+                digest,
+                list(terminal_item(&terminal, &impact, "build", &observed())).digest()
+            );
+        }
+        write_job(20, 100, b"cargo\0test\0");
+        let mut changed = terminal.clone();
+        changed.session.launch.arguments.push("-l".into());
+        assert_ne!(
+            digest,
+            list(terminal_item(&changed, &impact, "build", &observed())).digest()
+        );
+        assert!(
+            TerminalProcesses::at(root.path(), crate::daemon::current_uid().wrapping_add(1))
+                .rows
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn terminal_marker_finds_shell_beneath_holder_and_recovery_origin() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut terminal, impact) = terminal();
+        let origin = TerminalId::new();
+        terminal.session.recovery_origin = Some(origin);
+        process(
+            root.path(),
+            10,
+            3,
+            2,
+            10,
+            10,
+            100,
+            Some(origin),
+            b"/bin/bash\0",
+        );
+        process(root.path(), 3, 1, 2, 3, 0, 50, None, b"holder\0");
+        process(
+            root.path(),
+            20,
+            10,
+            2,
+            20,
+            20,
+            200,
+            Some(origin),
+            b"sleep\0100\0",
+        );
+        let processes = TerminalProcesses::at(root.path(), crate::daemon::current_uid());
+        assert_eq!(
+            terminal_item(&terminal, &impact, "console", &processes).running,
+            "idle shell"
+        );
+        fs::write(root.path().join("10/stat"), proc_stat(10, 10, 20)).unwrap();
+        assert!(
+            processes.foreground(&terminal).is_none(),
+            "a shell that changed after the census is not identified by stale evidence"
+        );
     }
 }

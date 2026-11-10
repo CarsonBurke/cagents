@@ -43,7 +43,7 @@ impl Adapter for StoppedAdapter {
     }
     fn command(&mut self, _command: chat::Command) -> Result<Step, String> {
         Err(
-            "This conversation was stopped for the update; press Resume to start its provider"
+            "This transcript is read-only. Start a new conversation to continue, or use Resume if a conversation was recorded."
                 .into(),
         )
     }
@@ -57,19 +57,8 @@ pub(super) fn recover(host: &SharedHost, requested: &Session) -> Result<(), Stri
     let original = ledger
         .resume_source(requested)
         .ok_or("The stopped update source changed its saved conversation")?;
-    let saved = ledger
-        .records
-        .iter()
-        .flat_map(|record| &record.snapshots)
-        .find(|saved| saved.source == *original)
-        .ok_or("The stopped update transcript is unavailable")?;
-    if saved.source.launch.session_id.is_none() {
-        return Err(
-            "This conversation stopped before it recorded a conversation; Start fresh in its pane"
-                .into(),
-        );
-    }
-    install(host, saved, requested)
+    let saved = crate::upgrade::floor::snapshot(original)?;
+    install(host, &saved, requested)
 }
 
 fn install(
@@ -109,12 +98,20 @@ fn install(
                 .collect(),
             has_earlier: false,
         }];
-        events.push(chat::Event::Session {
-            id: session.launch.session_id.clone().unwrap(),
-            title: saved.snapshot.title.clone(),
-        });
+        if let Some(id) = &session.launch.session_id {
+            events.push(chat::Event::Session {
+                id: id.clone(),
+                title: saved.snapshot.title.clone(),
+            });
+        }
         events.push(chat::Event::ReadOnlyHistory {
-            reason: saved.limitation.clone().unwrap_or_else(|| "Stopped for the update. This saved page is a transcript preview; Resume loads the full conversation. Your draft is kept.".into()),
+            reason: saved.limitation.clone().unwrap_or_else(|| {
+                if session.launch.session_id.is_some() {
+                    "Stopped for the update. This saved page is a transcript preview; Resume loads the full conversation. Your draft is kept."
+                } else {
+                    "Stopped for the update before a conversation was recorded. The captured transcript stays visible; start a new conversation to continue. Your draft is kept."
+                }.into()
+            }),
         });
         events.push(chat::Event::Exited { code: None });
         let mut initial = Step {
@@ -187,7 +184,7 @@ pub(super) fn prepare_resume(
         .launch
         .session_id
         .as_deref()
-        .ok_or("This pane has no recorded conversation; Start fresh instead")?;
+        .ok_or("This pane has no recorded conversation; start a new conversation instead")?;
     let proof = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -424,7 +421,10 @@ mod flow_tests {
         let old = proof("old", boot.as_str());
         let new = proof("new", boot.as_str());
         let mut record = crate::upgrade::floor::Record::new(old.clone(), vec![], vec![]);
-        for provider in [Provider::Claude, Provider::Codex, Provider::Omp] {
+        for (provider, recorded) in [Provider::Claude, Provider::Codex, Provider::Omp]
+            .into_iter()
+            .flat_map(|provider| [(provider, true), (provider, false)])
+        {
             let source = Session {
                 id: TerminalId::new(),
                 launch: chat::Launch {
@@ -436,7 +436,7 @@ mod flow_tests {
                         environment: Default::default(),
                         unset_environment: Default::default(),
                     },
-                    session_id: Some(uuid::Uuid::new_v4().to_string()),
+                    session_id: recorded.then(|| uuid::Uuid::new_v4().to_string()),
                 },
                 proof: Some(old.clone()),
                 terminal: None,
@@ -525,6 +525,26 @@ mod flow_tests {
             assert!(!handle.owns_work());
             let snapshot = handle.snapshot(None).unwrap();
             assert!(snapshot.items.iter().any(|item|matches!(&item.content,chat::ItemContent::Text {text,..} if text == "Final source answer remains visible")));
+            if original.launch.session_id.is_none() {
+                assert!(
+                    snapshot
+                        .read_only_reason
+                        .as_ref()
+                        .unwrap()
+                        .contains("start a new conversation")
+                );
+                assert!(
+                    super::super::process(
+                        &host,
+                        1,
+                        ClientRequest::ChatPrepareResume { source: reader }
+                    )
+                    .unwrap_err()
+                    .message
+                    .contains("no recorded conversation")
+                );
+                continue;
+            }
             let ServerResponse::ChatResumePrepared { session: successor } = super::super::process(
                 &host,
                 1,

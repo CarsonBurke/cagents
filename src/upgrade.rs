@@ -91,7 +91,7 @@ pub(crate) fn recovery_plan(
     if recoverable_shell(&session.launch) {
         return Ok((session.launch.clone(), RecoveryKind::Shell));
     }
-    Err("This command has no agent identity and cannot safely be replayed; the updater can restore it stopped after confirmation".into())
+    Err("This command cannot restart automatically; after you confirm, its pane reopens stopped with the saved screen".into())
 }
 
 /// A shell cagents made can carry the selected provider homes. Other
@@ -659,9 +659,10 @@ pub(crate) fn process_error(error: io::Error) -> String {
 
 pub(crate) mod handoff {
     use super::*;
+    use crate::chat;
     use crate::fs_safety;
     #[cfg(any(feature = "host", test))]
-    use crate::{chat, terminal_ipc::TerminalSpawnOptions};
+    use crate::terminal_ipc::TerminalSpawnOptions;
     use serde::Deserialize;
     #[cfg(any(feature = "host", test))]
     use serde::Serialize;
@@ -1161,7 +1162,6 @@ pub(crate) mod handoff {
         Ok(issued)
     }
 
-    #[cfg(any(feature = "host", test))]
     /// Check the immutable descriptor against the separate effective restart.
     /// Call while the old provider and windows are still usable, before handoff.
     pub(crate) fn validate_chat_source(
@@ -1414,6 +1414,28 @@ pub(crate) mod handoff {
                 #[cfg(any(feature = "host", test))]
                 unattached: Default::default(),
             })
+        }
+
+        /// Predict the source prepare's refusal to overwrite another update.
+        /// This reads the existing checkpoint without granting replay authority.
+        pub(crate) fn conflicts_with_source(
+            &self,
+            proof: &crate::model::HostSessionProof,
+        ) -> Result<bool, String> {
+            #[derive(Deserialize)]
+            struct Header {
+                version: u16,
+                proof: crate::model::HostSessionProof,
+                phase: String,
+            }
+            let Some(bytes) = self.read_bytes()? else {
+                return Ok(false);
+            };
+            let header: Header =
+                serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+            Ok(!VERSIONS.contains(&header.version)
+                || header.proof != *proof
+                || header.phase != "Prepared")
         }
 
         fn read_bytes(&self) -> Result<Option<Vec<u8>>, String> {

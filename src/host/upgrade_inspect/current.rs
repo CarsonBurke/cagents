@@ -186,55 +186,6 @@ impl Client {
         }
     }
 
-    pub(super) fn snapshot(&mut self, source: &Session) -> Result<crate::chat::Snapshot, String> {
-        let response = self.request(
-            ClientRequest::ChatAttach {
-                session: source.clone(),
-            },
-            true,
-        )?;
-        let captured = (|| {
-            let ServerResponse::ChatAttached { session, snapshot } = response else {
-                return Err("Source did not attach its reviewed conversation".into());
-            };
-            if session != *source {
-                return Err(
-                    "Source conversation changed before its transcript was retained".into(),
-                );
-            }
-            self.request(
-                ClientRequest::ChatVisibility {
-                    chat_id: source.id,
-                    visible: true,
-                },
-                true,
-            )?;
-            match self.request(
-                ClientRequest::ChatRead {
-                    chat_id: source.id,
-                    after_generation: None,
-                },
-                true,
-            )? {
-                ServerResponse::ChatSnapshot {
-                    chat_id,
-                    snapshot: Some(snapshot),
-                } if chat_id == source.id => Ok(snapshot),
-                ServerResponse::ChatSnapshot {
-                    chat_id,
-                    snapshot: None,
-                } if chat_id == source.id => Ok(snapshot),
-                _ => Err("Source did not return its reviewed transcript".into()),
-            }
-        })();
-        let detached = self.request(ClientRequest::ChatDetach { chat_id: source.id }, true);
-        captured.and_then(|snapshot| match detached {
-            Ok(ServerResponse::Detached) => Ok(snapshot),
-            Ok(_) => Err("Source did not detach its transcript reader".into()),
-            Err(error) => Err(error),
-        })
-    }
-
     pub(super) fn terminals(&mut self) -> Result<Vec<super::v77::Terminal>, String> {
         match self.request(ClientRequest::List, true)? {
             ServerResponse::Listed { terminals } if terminals.len() <= 1024 => {

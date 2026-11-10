@@ -46,7 +46,7 @@ pub fn render_review(preview: &Preview) -> String {
     let mut working = Vec::new();
     let mut interrupted = Vec::new();
     let mut stopped = Vec::new();
-    let mut attention = Vec::new();
+    let mut stops = Vec::new();
     for pane in &preview.stopped {
         let label = preview
             .labels
@@ -59,6 +59,7 @@ pub fn render_review(preview: &Preview) -> String {
         stopped.push(with_recovery("", &window.reason, &window.recovery));
     }
     if let Some(daemon) = &preview.daemon {
+        let stops_service = super::floor::needs_service_stop(daemon);
         for session in &daemon.sessions {
             let label = preview.labels.get(&session.id).unwrap_or(&session.title);
             // A stopped result supersedes routine continuity. A source that
@@ -72,6 +73,10 @@ pub fn render_review(preview: &Preview) -> String {
             {
                 continue;
             }
+            if stops_service && session.disposition != Disposition::WaitsForIdle {
+                stops.push(label.clone());
+                continue;
+            }
             match session.disposition {
                 Disposition::Continues => continues += 1,
                 Disposition::Resumes => resumes += 1,
@@ -82,10 +87,9 @@ pub fn render_review(preview: &Preview) -> String {
                     &session.reason,
                     "Pick its conversation from Resume in the pane",
                 )),
-                Disposition::Blocked => attention.push(format!("{label}: {}", session.reason)),
+                Disposition::Blocked => stops.push(label.clone()),
             }
         }
-        attention.extend(daemon.blockers.iter().cloned());
     }
 
     let mut groups = String::new();
@@ -126,10 +130,10 @@ pub fn render_review(preview: &Preview) -> String {
     );
     group(
         &mut groups,
-        "Needs attention",
-        attention.len(),
-        "",
-        &attention,
+        "Stops",
+        stops.len(),
+        "you will confirm these next",
+        &stops,
     );
     if !groups.is_empty() {
         output.push('\n');
@@ -291,8 +295,8 @@ mod tests {
                 "    console-alpha · General · alpha: ended before it recorded its conversation. Start fresh in the pane; anything it began can be reopened from Resume\n",
                 "    Window 3's saved panes could not be read. The saved file is kept unchanged\n",
                 "    Notes · General · beta: its conversation needs to be selected. Pick its conversation from Resume in the pane\n",
-                "  Needs attention (1)\n",
-                "    Build · Release · alpha: its running work needs to finish\n",
+                "  Stops (1)            you will confirm these next\n",
+                "    Build · Release · alpha\n",
             )
         );
     }
@@ -407,10 +411,74 @@ mod tests {
         let review = render_review(&preview);
         assert!(review.contains("Working now (1)"), "{review}");
         assert!(review.contains("Reopens stopped (2)"), "{review}");
-        assert!(review.contains("Needs attention (2)"), "{review}");
+        assert!(review.contains("Stops (1)"), "{review}");
+        assert!(!review.contains("Needs attention"), "{review}");
         assert!(
-            review.contains("The terminal service needs attention"),
+            !review.contains("The terminal service needs attention"),
             "{review}"
+        );
+    }
+
+    #[test]
+    fn the_floor_replaces_old_refusal_instructions_with_sidebar_names() {
+        let mut preview = preview();
+        let blocked = session(
+            "Claude",
+            Disposition::Blocked,
+            "Close this conversation to release it; finish or close it before upgrading",
+        );
+        preview
+            .labels
+            .insert(blocked.id, "Release details · General · alpha".into());
+        preview.daemon.as_mut().unwrap().sessions.push(blocked);
+        let review = render_review(&preview);
+        assert!(review.contains("Stops (1)            you will confirm these next\n    Release details · General · alpha\n"), "{review}");
+        assert!(!review.contains("Needs attention"), "{review}");
+        assert!(!review.contains("Close this conversation"), "{review}");
+        assert!(!review.contains("before upgrading"), "{review}");
+    }
+
+    #[test]
+    fn representative_service_floor_review_names_every_affected_pane() {
+        let mut preview = preview();
+        let mut build = session(
+            "build · Release Details: rollout · alpha",
+            Disposition::Blocked,
+            "Close this terminal before upgrading",
+        );
+        build.kind = SessionKind::Terminal;
+        let mut shell = session(
+            "console · General · alpha",
+            Disposition::Continues,
+            "Keeps running",
+        );
+        shell.kind = SessionKind::Terminal;
+        preview.daemon.as_mut().unwrap().sessions = vec![
+            build,
+            shell,
+            session(
+                "Untitled conversation in beta, started 9 Nov 14:02",
+                Disposition::WaitsForIdle,
+                "Finishing its turn",
+            ),
+            session(
+                "review · General · alpha",
+                Disposition::Resumes,
+                "Restarts on its recorded conversation",
+            ),
+        ];
+        assert_eq!(
+            render_review(&preview),
+            concat!(
+                "Update cagents 0.1.3+local.991daa43e -> 0.1.3+local.d2509365\n",
+                "2 windows close and reopen with the same panes.\n\n",
+                "  Working now (1)      finishing a turn\n",
+                "    Untitled conversation in beta, started 9 Nov 14:02\n",
+                "  Stops (3)            you will confirm these next\n",
+                "    build · Release Details: rollout · alpha\n",
+                "    console · General · alpha\n",
+                "    review · General · alpha\n",
+            )
         );
     }
 }

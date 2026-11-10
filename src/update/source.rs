@@ -251,7 +251,7 @@ impl Client {
     pub(crate) fn confirm_shutdown(
         &mut self,
         capability: crate::terminal_ipc::ShutdownCapability,
-    ) -> Result<(), UpdateError> {
+    ) -> Result<crate::terminal_ipc::ShutdownOutcome, UpdateError> {
         if &capability.proof != self.proof() {
             return Err(invalid("The source changed before its confirmed stop"));
         }
@@ -260,7 +260,6 @@ impl Client {
                 peer.verify(client.proof())?;
                 client
                     .confirm_shutdown(capability)
-                    .map(|_| ())
                     .map_err(|error| invalid(error.to_string()))
             }
             Self::Legacy(_) => Err(invalid(
@@ -284,19 +283,21 @@ impl Client {
         }
     }
 
-    pub(crate) fn chat_state(
+    /// Capture history once, immediately before a confirmed service stop. The
+    /// returned snapshot is not evidence that shutdown was accepted.
+    pub(crate) fn capture_chat_snapshot(
         &mut self,
         session: crate::chat::Session,
-    ) -> Result<&'static str, UpdateError> {
+    ) -> Result<crate::chat::Snapshot, UpdateError> {
         match self {
             Self::Current { client, peer } => {
                 peer.verify(client.proof())?;
                 client
-                    .inspect_chat_state(session)
+                    .capture_chat_snapshot(session)
                     .map_err(|error| invalid(error.to_string()))
             }
             Self::Legacy(_) => Err(invalid(
-                "The source cannot report this conversation's state",
+                "The source cannot capture this conversation's history",
             )),
         }
     }

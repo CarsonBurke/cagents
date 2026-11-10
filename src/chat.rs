@@ -963,13 +963,16 @@ impl Session {
                 .proof
                 .as_ref()
                 .is_some_and(crate::model::HostSessionProof::is_complete)
-            && self.launch.session_id.as_ref().is_some_and(|id| {
-                (id.len() == 36 && uuid::Uuid::parse_str(id).is_ok())
-                    || (!id.is_empty()
-                        && id.len() <= 1024
-                        && crate::upgrade::floor::cached()
-                            .is_ok_and(|ledger| ledger.source(self.id).is_some()))
-            })
+            && (self
+                .launch
+                .session_id
+                .as_ref()
+                .is_some_and(|id| id.len() == 36 && uuid::Uuid::parse_str(id).is_ok())
+                || crate::upgrade::floor::cached().is_ok_and(|ledger| {
+                    ledger
+                        .resume_source(self)
+                        .is_some_and(|source| source.launch.session_id == self.launch.session_id)
+                }))
     }
 
     /// Import an installed capability observed on this exact authenticated

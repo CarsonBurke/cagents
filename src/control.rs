@@ -279,8 +279,11 @@ pub enum DaemonCommand {
     Start,
     /// Report whether the daemon is running.
     Status,
-    /// Finish a staged installation through the same reviewed update flow as the app.
+    /// Update to a release or finish a staged installation through the app's reviewed flow.
     Upgrade {
+        /// Download and update to this release instead of a staged installation.
+        #[arg(long, value_name = "VERSION")]
+        version: Option<String>,
         /// Approve the displayed impact without an interactive prompt.
         #[arg(long)]
         yes: bool,
@@ -1056,12 +1059,12 @@ impl ControlClient {
         }
     }
 
-    /// Read the source's current state without starting or interrupting work.
-    /// ChatAttach is authenticated against the exact listed descriptor.
-    pub(crate) fn inspect_chat_state(
+    /// Capture a listed chat's transcript immediately before acting on it.
+    /// This can recover source history, so it must never be used for polling.
+    pub(crate) fn capture_chat_snapshot(
         &mut self,
         session: crate::chat::Session,
-    ) -> Result<&'static str, ControlError> {
+    ) -> Result<crate::chat::Snapshot, ControlError> {
         let id = session.id;
         self.attached_chats.insert(id);
         let result = match self.request_strict(ClientRequest::ChatAttach {
@@ -1070,30 +1073,24 @@ impl ControlClient {
             Ok(ServerResponse::ChatAttached {
                 session: attached,
                 snapshot,
-            }) if attached == session => Ok(if snapshot.exited {
-                "stopped"
-            } else if !snapshot.ready {
-                "starting"
-            } else {
-                match snapshot.activity() {
-                    crate::agent::ActivityState::Working => "working",
-                    crate::agent::ActivityState::Waiting => "waiting for input",
-                    crate::agent::ActivityState::Idle => "idle",
-                    crate::agent::ActivityState::Unknown => "state unavailable",
-                }
-            }),
-            Ok(response) => Err(unexpected_response("the reviewed chat's state", &response)),
-            Err(error) => Err(error),
+            }) if attached == session => Ok(snapshot),
+            Ok(response) => Err(unexpected_response(
+                "the reviewed chat's history",
+                &response,
+            )),
+            Err(error @ ControlError::Remote { .. }) => {
+                self.attached_chats.remove(&id);
+                return Err(error);
+            }
+            Err(error) => return Err(error),
         };
-        // A failed or stale read grants no close authority. Finish its read-only
-        // subscription before the source client is reused for another pane.
         let detached = self.request_strict(ClientRequest::ChatDetach { chat_id: id });
         if matches!(detached, Ok(ServerResponse::Detached)) {
             self.attached_chats.remove(&id);
         }
         match detached {
             Ok(ServerResponse::Detached) => result,
-            Ok(response) => Err(unexpected_response("chat state detachment", &response)),
+            Ok(response) => Err(unexpected_response("chat history detachment", &response)),
             Err(error) => Err(error),
         }
     }
@@ -1111,7 +1108,7 @@ impl ControlClient {
     /// close removes it - the interrupt the close delivers is itself reported
     /// as activity - so they are expected between the requests' responses.
     pub fn close_chat(&mut self, session: crate::chat::Session) -> Result<(), ControlError> {
-        self.close_chat_with_snapshot(session).map(|_| ())
+        self.close_attached_chat(session, |_| true).map(|_| ())
     }
 
     /// The updater keeps the source's final transcript page after its own
@@ -1120,13 +1117,24 @@ impl ControlClient {
         &mut self,
         session: crate::chat::Session,
     ) -> Result<crate::chat::Snapshot, ControlError> {
+        let reviewed = session.clone();
+        self.close_attached_chat(session, |attached| attached == &reviewed)
+    }
+
+    fn close_attached_chat(
+        &mut self,
+        session: crate::chat::Session,
+        accepts_attachment: impl Fn(&crate::chat::Session) -> bool,
+    ) -> Result<crate::chat::Snapshot, ControlError> {
         let chat_id = session.id;
         // The daemon subscribes this connection before it answers the
         // attachment, so the chat's notifications can arrive ahead of that
         // answer.
         self.attached_chats.insert(chat_id);
         let closed = match self.request_strict(ClientRequest::ChatAttach { session }) {
-            Ok(ServerResponse::ChatAttached { .. }) => self
+            Ok(ServerResponse::ChatAttached {
+                session: attached, ..
+            }) if accepts_attachment(&attached) => self
                 .request_with_deadline(
                     ClientRequest::ChatClose { chat_id },
                     Instant::now() + CHAT_CLOSE_TIMEOUT,
@@ -3306,9 +3314,16 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
             "bridge",
             "stdio bridge must run before command output",
         )),
-        DaemonCommand::Upgrade { yes, interrupt } => {
-            let job = crate::update::upgrade_installed(yes, interrupt)
-                .map_err(|error| AppError::new("update", error))?;
+        DaemonCommand::Upgrade {
+            version,
+            yes,
+            interrupt,
+        } => {
+            let job = match version {
+                Some(version) => crate::update::upgrade_release(&version, yes, interrupt),
+                None => crate::update::upgrade_installed(yes, interrupt),
+            }
+            .map_err(|error| AppError::new("update", error))?;
             Ok(CommandOutput {
                 command: "daemon.upgrade",
                 human: job.message.clone(),
@@ -4675,6 +4690,28 @@ mod tests {
         assert!(routed(&["cagents", "daemon", "start"]));
     }
 
+    #[test]
+    fn release_upgrade_preserves_the_selected_version_and_review_options() {
+        use clap::Parser;
+        let command = super::Cli::try_parse_from([
+            "cagents",
+            "daemon",
+            "upgrade",
+            "--version",
+            "0.2.3",
+            "--yes",
+            "--interrupt",
+        ])
+        .unwrap()
+        .command;
+        assert!(!super::routes_to_staged_owner(&command));
+        assert!(
+            matches!(command, super::TopCommand::Daemon { command: super::DaemonCommand::Upgrade {
+            version: Some(version), yes: true, interrupt: true,
+        }} if version == "0.2.3")
+        );
+    }
+
     /// A hosted session stops a development daemon with a runtime of its own,
     /// as `scripts/run-development --stop-instance` does, unless that daemon
     /// hosts it. The daemon here is a process holding the instance's lock.
@@ -5408,6 +5445,83 @@ mod tests {
         );
         drop(client);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn update_source_confirm_preserves_every_shutdown_outcome() {
+        for &protocol in crate::update::source::CURRENT_CLIENT_PROTOCOLS {
+            let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+            let pinned = proof("source", "boot", "incarnation");
+            let capability = ShutdownCapability {
+                proof: pinned.clone(),
+                token: "reviewed-inventory".into(),
+                inventory_generation: 9,
+                live_terminals: 2,
+                background_subagents: 0,
+                background_identity: String::new(),
+                expires_at_unix_ms: i64::MAX,
+            };
+            let outcomes = vec![
+                ShutdownOutcome::InventoryChanged { current_count: 3 },
+                ShutdownOutcome::Expired,
+                ShutdownOutcome::InvalidCapability,
+                ShutdownOutcome::AlreadyShuttingDown,
+                ShutdownOutcome::DaemonRestarted,
+                ShutdownOutcome::EmptyRequired { current_count: 2 },
+                ShutdownOutcome::ConfirmationRequired { current_count: 2 },
+                ShutdownOutcome::Accepted {
+                    live_terminals_before: 2,
+                    termination_requested: true,
+                },
+            ];
+            let responses = outcomes.clone();
+            let expected_capability = capability.clone();
+            let server = thread::spawn(move || {
+                let connect: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                assert_eq!(connect.version, protocol);
+                let mut connected = connected_envelope(1, pinned.clone(), pinned.clone());
+                connected.version = protocol;
+                write_frame(&mut server_stream, &connected).unwrap();
+                for outcome in responses {
+                    let request: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                    assert_eq!(request.version, protocol);
+                    assert_eq!(
+                        request.request,
+                        ClientRequest::ShutdownV1 {
+                            version: SHUTDOWN_VERSION,
+                            operation: ShutdownOperation::Confirm {
+                                capability: expected_capability.clone(),
+                            },
+                        }
+                    );
+                    write_frame(
+                        &mut server_stream,
+                        &ServerEnvelope {
+                            version: protocol,
+                            request_id: Some(request.request_id),
+                            proof: pinned.clone(),
+                            message: ServerMessage::Response {
+                                response: ServerResponse::ShutdownOutcome(outcome),
+                            },
+                        },
+                    )
+                    .unwrap();
+                }
+            });
+            let mut client = ControlClient::from_stream_at_source_protocol(
+                client_stream,
+                Instant::now() + Duration::from_secs(5),
+                protocol,
+            )
+            .unwrap();
+            for outcome in outcomes {
+                assert_eq!(
+                    client.confirm_shutdown(capability.clone()).unwrap(),
+                    outcome
+                );
+            }
+            server.join().unwrap();
+        }
     }
 
     fn parsed_confirm<const N: usize>(arguments: [&str; N]) -> Option<Option<String>> {
@@ -6825,7 +6939,7 @@ mod tests {
     }
 
     #[test]
-    fn update_chat_state_reads_and_detaches_without_starting_or_closing_work() {
+    fn update_captures_chat_history_once_and_detaches_before_the_stop() {
         let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
         let pinned = proof("session", "boot", "incarnation");
         let session = crate::chat::Session {
@@ -6866,13 +6980,7 @@ mod tests {
                 )
                 .unwrap();
             };
-            for (ready, busy, waiting, exited) in [
-                (true, true, false, false),
-                (true, false, true, false),
-                (true, false, false, false),
-                (false, false, false, false),
-                (true, false, false, true),
-            ] {
+            {
                 let attach: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
                 assert_eq!(
                     attach.request,
@@ -6886,10 +6994,8 @@ mod tests {
                     ServerResponse::ChatAttached {
                         session: peer_session.clone(),
                         snapshot: crate::chat::Snapshot {
-                            ready,
-                            busy,
-                            waiting,
-                            exited,
+                            ready: true,
+                            busy: true,
                             ..Default::default()
                         },
                     },
@@ -6909,20 +7015,112 @@ mod tests {
             }
         });
         let mut client = ControlClient::from_stream(client_stream).unwrap();
-        for expected in [
-            "working",
-            "waiting for input",
-            "idle",
-            "starting",
-            "stopped",
-        ] {
-            assert_eq!(
-                client.inspect_chat_state(session.clone()).unwrap(),
-                expected
-            );
-            assert!(!client.attached_chats.contains(&session.id));
-        }
+        let snapshot = client.capture_chat_snapshot(session.clone()).unwrap();
+        assert!(snapshot.ready);
+        assert!(snapshot.busy);
+        assert!(!client.attached_chats.contains(&session.id));
         server.join().unwrap();
+    }
+
+    #[test]
+    fn update_never_closes_a_replaced_chat_descriptor() {
+        for exact_review in [false, true] {
+            let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+            let pinned = proof("session", "boot", "incarnation");
+            let source = crate::chat::Session {
+                id: TerminalId::new(),
+                launch: crate::chat::Launch {
+                    provider: crate::agent::Provider::Claude,
+                    recipe: LaunchRecipe {
+                        program: "fake-claude".into(),
+                        arguments: vec![],
+                        working_directory: "/work".into(),
+                        environment: Default::default(),
+                        unset_environment: Default::default(),
+                    },
+                    session_id: Some("reviewed".into()),
+                },
+                proof: Some(pinned.clone()),
+                terminal: None,
+                owned_codex_listener: None,
+                native_continuity: Default::default(),
+            };
+            let mut replaced = source.clone();
+            replaced.launch.session_id = Some("replacement".into());
+            let chat_id = source.id;
+            let server = thread::spawn(move || {
+                let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                write_frame(
+                    &mut server_stream,
+                    &connected_envelope(1, pinned.clone(), pinned.clone()),
+                )
+                .unwrap();
+                let attach: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                assert!(matches!(attach.request, ClientRequest::ChatAttach { .. }));
+                write_frame(
+                    &mut server_stream,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(attach.request_id),
+                        proof: pinned.clone(),
+                        message: ServerMessage::Response {
+                            response: ServerResponse::ChatAttached {
+                                session: replaced,
+                                snapshot: Default::default(),
+                            },
+                        },
+                    },
+                )
+                .unwrap();
+                let detach: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                assert_eq!(
+                    detach.request,
+                    if exact_review {
+                        ClientRequest::ChatDetach { chat_id }
+                    } else {
+                        ClientRequest::ChatClose { chat_id }
+                    }
+                );
+                write_frame(
+                    &mut server_stream,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(detach.request_id),
+                        proof: pinned,
+                        message: ServerMessage::Response {
+                            response: if exact_review {
+                                ServerResponse::Detached
+                            } else {
+                                ServerResponse::ChatClosed {
+                                    chat_id,
+                                    snapshot: Default::default(),
+                                }
+                            },
+                        },
+                    },
+                )
+                .unwrap();
+                assert!(
+                    read_frame::<ClientEnvelope>(&mut server_stream)
+                        .unwrap()
+                        .is_none()
+                );
+            });
+            let mut client = ControlClient::from_stream(client_stream).unwrap();
+            if exact_review {
+                assert!(matches!(
+                    client.close_chat_with_snapshot(source),
+                    Err(ControlError::UnexpectedResponse { .. })
+                ));
+            } else {
+                client
+                    .close_chat(source)
+                    .expect("ordinary pane close accepts an authenticated resolved alias");
+            }
+            assert!(client.attached_chats.is_empty());
+            drop(client);
+            server.join().unwrap();
+        }
     }
 
     /// Closing a chat attaches this connection to it, and the interrupt the

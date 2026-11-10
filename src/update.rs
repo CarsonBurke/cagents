@@ -4,6 +4,7 @@ mod candidate;
 mod confirmation;
 mod floor;
 mod floor_display;
+mod floor_prediction;
 mod installed;
 pub(crate) mod source;
 pub use confirmation::{Choice as UpdateChoice, Confirmation as UpdateConfirmation, decide};
@@ -401,6 +402,7 @@ fn applicable_release(release: GitHubRelease) -> Result<Release, UpdateError> {
 #[derive(Serialize, Deserialize)]
 enum UpdateRequest {
     Release(Release),
+    ReleaseFromTerminal(Release),
     Installed { root: PathBuf },
     InstalledFromTerminal { root: PathBuf },
 }
@@ -513,10 +515,45 @@ fn installed_daemon_owner(layout: &InstallLayout) -> Result<Option<InstallLayout
 /// CLI entry point for the same leased worker, exact preview and window fence
 /// used by the application. The served candidate always supplies the worker.
 pub fn upgrade_installed(yes: bool, interrupt: bool) -> Result<UpdateJob, UpdateError> {
-    use std::io::IsTerminal;
     let layout = locate(&std::env::current_exe()?)?;
     let candidate = served_version_root(&layout)?.join("bin/cagents-ui");
     let initial = apply_installed_from(&candidate, true)?;
+    drive_terminal_review(initial, yes, interrupt)
+}
+
+pub fn upgrade_release(
+    version: &str,
+    yes: bool,
+    interrupt: bool,
+) -> Result<UpdateJob, UpdateError> {
+    let installation = Installation::detect()?;
+    let parsed = stable_version(version)?;
+    let tag = format!("v{parsed}");
+    let selected = applicable_release(serde_json::from_slice(&metadata(
+        &format!("repos/{REPOSITORY}/releases/tags/{tag}"),
+        &CancellationToken::new(),
+    )?)?)?;
+    if stable_version(&selected.version)? != parsed
+        || parsed <= installed_version(&installation.version)?
+    {
+        return Err(invalid(
+            "selected release is not newer than the running installation",
+        ));
+    }
+    let initial = start_job(
+        &installation,
+        &selected.version,
+        &UpdateRequest::ReleaseFromTerminal(selected.clone()),
+    )?;
+    drive_terminal_review(initial, yes, interrupt)
+}
+
+fn drive_terminal_review(
+    initial: UpdateJob,
+    yes: bool,
+    interrupt: bool,
+) -> Result<UpdateJob, UpdateError> {
+    use std::io::IsTerminal;
     let mut policy = if interrupt {
         impact::Policy::Interrupt
     } else {
@@ -551,11 +588,22 @@ pub fn upgrade_installed(yes: bool, interrupt: bool) -> Result<UpdateJob, Update
                 }
             } else if submitted.as_ref() != Some(&confirmation.nonce) {
                 if let Some(list) = &confirmation.stop {
-                    eprint!("{}", list.render());
+                    eprint!(
+                        "{}",
+                        if io::stdin().is_terminal() {
+                            list.render()
+                        } else {
+                            list.render_preview()
+                        }
+                    );
+                    if !io::stdin().is_terminal() {
+                        eprintln!(
+                            "Stopping live work needs a terminal. Rerun this command in a terminal."
+                        );
+                    }
                     let choice = match floor_display::read_stop_choice(
                         &mut io::stdin().lock(),
                         io::stdin().is_terminal(),
-                        yes,
                         list,
                     ) {
                         Ok(choice) => choice,
@@ -576,15 +624,22 @@ pub fn upgrade_installed(yes: bool, interrupt: bool) -> Result<UpdateJob, Update
                     continue;
                 }
                 eprint!("{}", render_review(&confirmation.preview));
-                let needs_floor = confirmation
-                    .preview
-                    .daemon
-                    .as_ref()
-                    .is_some_and(impact::DaemonImpact::blocked);
-                let choice = if yes || (!io::stdin().is_terminal() && needs_floor) {
-                    UpdateChoice::Confirm
-                } else if !io::stdin().is_terminal() {
-                    UpdateChoice::Cancel
+                let choice = if ordinary_approval(yes, io::stdin().is_terminal())
+                    == Some(OrdinaryChoice::Cancel)
+                {
+                    let stopped_preview = floor::preview_stop_list(&confirmation.preview);
+                    if let Err(error) = &stopped_preview {
+                        eprintln!("Stop preview unavailable: {error}");
+                    }
+                    if let Some(list) = stopped_preview.ok().flatten() {
+                        eprint!("{}", list.render_preview());
+                    }
+                    eprintln!(
+                        "Rerun this command in a terminal, or with --yes for the ordinary review. Stopping live work always needs a terminal."
+                    );
+                    OrdinaryChoice::Cancel
+                } else if let Some(choice) = ordinary_approval(yes, io::stdin().is_terminal()) {
+                    choice
                 } else {
                     match prompt_review(&confirmation.preview) {
                         Ok(choice) => choice,
@@ -595,19 +650,18 @@ pub fn upgrade_installed(yes: bool, interrupt: bool) -> Result<UpdateJob, Update
                     }
                 };
                 match choice {
-                    UpdateChoice::Cancel => {
-                        decide(&job.id, &confirmation.nonce, choice)?;
+                    OrdinaryChoice::Cancel => {
+                        decide(&job.id, &confirmation.nonce, choice.into())?;
                         return Err(UpdateError::Cancelled);
                     }
-                    UpdateChoice::Policy(next) => {
+                    OrdinaryChoice::Policy(next) => {
                         policy = next;
-                        decide(&job.id, &confirmation.nonce, choice)?;
+                        decide(&job.id, &confirmation.nonce, choice.into())?;
                         policy_requested = Some(confirmation.nonce.clone());
                         submitted = None;
                     }
-                    UpdateChoice::StopListed { .. } => unreachable!("stop has its own prompt"),
-                    UpdateChoice::Confirm => {
-                        if submit_current_choice(&job.id, &confirmation.nonce, choice)? {
+                    OrdinaryChoice::Confirm => {
+                        if submit_current_choice(&job.id, &confirmation.nonce, choice.into())? {
                             submitted = Some(confirmation.nonce.clone());
                         }
                     }
@@ -655,16 +709,42 @@ fn cancel_current_review(id: &str) {
     }
 }
 
-fn review_answer(answer: &str, working: bool) -> Option<UpdateChoice> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OrdinaryChoice {
+    Confirm,
+    Policy(impact::Policy),
+    Cancel,
+}
+impl From<OrdinaryChoice> for UpdateChoice {
+    fn from(choice: OrdinaryChoice) -> Self {
+        match choice {
+            OrdinaryChoice::Confirm => Self::Confirm,
+            OrdinaryChoice::Policy(policy) => Self::Policy(policy),
+            OrdinaryChoice::Cancel => Self::Cancel,
+        }
+    }
+}
+
+fn ordinary_approval(yes: bool, terminal: bool) -> Option<OrdinaryChoice> {
+    if yes {
+        Some(OrdinaryChoice::Confirm)
+    } else if !terminal {
+        Some(OrdinaryChoice::Cancel)
+    } else {
+        None
+    }
+}
+
+fn review_answer(answer: &str, working: bool) -> Option<OrdinaryChoice> {
     match answer.trim().to_ascii_lowercase().as_str() {
-        "" | "y" | "yes" => Some(UpdateChoice::Confirm),
-        "i" if working => Some(UpdateChoice::Policy(impact::Policy::Interrupt)),
-        "n" | "no" => Some(UpdateChoice::Cancel),
+        "" | "y" | "yes" => Some(OrdinaryChoice::Confirm),
+        "i" if working => Some(OrdinaryChoice::Policy(impact::Policy::Interrupt)),
+        "n" | "no" => Some(OrdinaryChoice::Cancel),
         _ => None,
     }
 }
 
-fn prompt_review(preview: &impact::Preview) -> io::Result<UpdateChoice> {
+fn prompt_review(preview: &impact::Preview) -> io::Result<OrdinaryChoice> {
     let working = preview.daemon.as_ref().is_some_and(|daemon| {
         daemon.policy == impact::Policy::WhenIdle
             && daemon
@@ -672,20 +752,34 @@ fn prompt_review(preview: &impact::Preview) -> io::Result<UpdateChoice> {
                 .iter()
                 .any(|session| session.disposition == impact::Disposition::WaitsForIdle)
     });
-    read_review_choice(&mut io::stdin().lock(), &mut io::stderr().lock(), working)
+    let stops = preview
+        .daemon
+        .as_ref()
+        .is_some_and(impact::DaemonImpact::blocked);
+    read_review_choice(
+        &mut io::stdin().lock(),
+        &mut io::stderr().lock(),
+        working,
+        stops,
+    )
 }
 
 fn read_review_choice(
     input: &mut impl io::BufRead,
     output: &mut impl Write,
     working: bool,
-) -> io::Result<UpdateChoice> {
+    stops: bool,
+) -> io::Result<OrdinaryChoice> {
     loop {
         write!(
             output,
             "{}",
-            if working {
+            if working && stops {
+                "Enter: review stops when they finish   i: interrupt them now   n: cancel\n"
+            } else if working {
                 "Enter: update when they finish   i: interrupt them now   n: cancel\n"
+            } else if stops {
+                "Enter: review what stops   n: cancel\n"
             } else {
                 "Update now? [Y/n] "
             }
@@ -693,46 +787,12 @@ fn read_review_choice(
         output.flush()?;
         let mut answer = String::new();
         if input.read_line(&mut answer)? == 0 {
-            return Ok(UpdateChoice::Cancel);
+            return Ok(OrdinaryChoice::Cancel);
         }
         if let Some(choice) = review_answer(&answer, working) {
             return Ok(choice);
         }
     }
-}
-
-/// End only the exact source descriptors selected by a later destructive
-/// confirmation. Kept separate from the non-destructive update review.
-fn end_source_chats(
-    daemon: &impact::DaemonImpact,
-    ending: Vec<crate::chat::Session>,
-) -> Result<Vec<crate::model::TerminalId>, UpdateError> {
-    let mut client = source_client_for(daemon)?;
-    let listed = client.list_chats()?;
-    if ending.iter().any(|session| !listed.contains(session)) {
-        return Err(invalid(
-            "The source conversations changed before they could be ended",
-        ));
-    }
-    // One the source cannot end does not keep the rest: each was approved
-    // on its own, and ending it releases what it held either way.
-    let mut ended = Vec::new();
-    for session in ending {
-        let title = session.launch.provider.label().to_owned();
-        let id = session.id;
-        match client.close_chat(session.clone()) {
-            Ok(snapshot) => {
-                crate::upgrade::floor::retain_final_snapshot(&session, snapshot)
-                    .map_err(invalid)?;
-                eprintln!("  Ended {title}");
-                ended.push(id);
-            }
-            Err(error) => {
-                eprintln!("  Could not end {title}: {error}");
-            }
-        }
-    }
-    Ok(ended)
 }
 
 /// The reviewed source, authenticated again: a preview never authorizes
@@ -1116,6 +1176,9 @@ pub fn run_worker(job_id: &str) -> Result<(), UpdateError> {
         Ok(()) => "Update installed; saved windows reopened".into(),
         Err(error) => error.to_string(),
     };
+    if result.is_err() && !job.message.contains("Ended or stopped:") {
+        job.message.push_str(&survivors.recovery_report());
+    }
     let (remaining, unchecked) = survivors.report();
     if !remaining.is_empty() {
         job.message.push_str("\nStill running, not attached:\n");
@@ -1141,8 +1204,9 @@ fn perform_update(
         &state.join(format!("{}.request", job.id)),
         SMALL_ASSET_LIMIT,
     )?)?;
+    let terminal = matches!(request, UpdateRequest::ReleaseFromTerminal(_));
     let selected = match request {
-        UpdateRequest::Release(release) => {
+        UpdateRequest::Release(release) | UpdateRequest::ReleaseFromTerminal(release) => {
             Installation::detect()?;
             release
         }
@@ -1194,7 +1258,7 @@ fn perform_update(
     }
     let inspection = reconcile_saved_sources(staged.identity.protocol)?;
     let context = ReviewContext::capture(installation)?;
-    let confirmed = confirmation::wait(state, job, false, |policy| {
+    let confirmed = confirmation::wait(state, job, |policy| {
         Installation::detect()?;
         Ok(context.apply(observe_impact(&staged.identity, policy)?.with_inspection(&inspection)))
     })?;
@@ -1234,7 +1298,7 @@ fn perform_update(
         state,
         job,
         &confirmed,
-        false,
+        terminal,
         |policy| {
             Installation::detect()?;
             Ok(context
@@ -2201,51 +2265,98 @@ mod tests {
     fn review_prompt_defaults_to_update_but_eof_cancels() {
         let mut output = Vec::new();
         assert!(matches!(
-            read_review_choice(&mut &b"\n"[..], &mut output, false).unwrap(),
-            UpdateChoice::Confirm
+            read_review_choice(&mut &b"\n"[..], &mut output, false, false).unwrap(),
+            OrdinaryChoice::Confirm
         ));
         assert_eq!(String::from_utf8(output).unwrap(), "Update now? [Y/n] ");
         let mut output = Vec::new();
         assert!(matches!(
-            read_review_choice(&mut &b"i\n"[..], &mut output, true).unwrap(),
-            UpdateChoice::Policy(impact::Policy::Interrupt)
+            read_review_choice(&mut &b"i\n"[..], &mut output, true, false).unwrap(),
+            OrdinaryChoice::Policy(impact::Policy::Interrupt)
         ));
         assert_eq!(
             String::from_utf8(output).unwrap(),
             "Enter: update when they finish   i: interrupt them now   n: cancel\n"
         );
         assert!(matches!(
-            read_review_choice(&mut &b""[..], &mut Vec::new(), false).unwrap(),
-            UpdateChoice::Cancel
+            read_review_choice(&mut &b""[..], &mut Vec::new(), false, false).unwrap(),
+            OrdinaryChoice::Cancel
         ));
         assert!(matches!(
-            read_review_choice(&mut &b"n\n"[..], &mut Vec::new(), true).unwrap(),
-            UpdateChoice::Cancel
+            read_review_choice(&mut &b"n\n"[..], &mut Vec::new(), true, false).unwrap(),
+            OrdinaryChoice::Cancel
         ));
         assert!(matches!(
-            read_review_choice(&mut &b"maybe\ny\n"[..], &mut Vec::new(), false).unwrap(),
-            UpdateChoice::Confirm
+            read_review_choice(&mut &b"maybe\ny\n"[..], &mut Vec::new(), false, false).unwrap(),
+            OrdinaryChoice::Confirm
         ));
+    }
+
+    #[test]
+    fn unattended_ordinary_review_cannot_approve_without_yes() {
+        assert_eq!(
+            ordinary_approval(false, false),
+            Some(OrdinaryChoice::Cancel)
+        );
+        assert_eq!(
+            ordinary_approval(true, false),
+            Some(OrdinaryChoice::Confirm)
+        );
+        assert_eq!(ordinary_approval(false, true), None);
+        assert_eq!(ordinary_approval(true, true), Some(OrdinaryChoice::Confirm));
+    }
+
+    #[test]
+    fn app_release_stop_instructions_select_the_same_release_without_staging() {
+        let directory = tempfile::tempdir().unwrap();
+        let release = applicable_release(release("9.8.7")).unwrap();
+        let job = UpdateJob {
+            id: uuid::Uuid::new_v4().to_string(),
+            version: release.version.clone(),
+            phase: UpdatePhase::AwaitingConfirmation,
+            message: String::new(),
+            log_path: directory.path().join("worker.log"),
+            confirmation: None,
+        };
+        let file = private_create(&directory.path().join(format!("{}.request", job.id))).unwrap();
+        serde_json::to_writer(file, &UpdateRequest::Release(release)).unwrap();
+        assert_eq!(
+            floor::terminal_confirmation(directory.path(), &job).unwrap(),
+            "Stopping live work needs confirmation in a terminal. Run `cagents daemon upgrade --version 9.8.7` from a system terminal outside cagents."
+        );
+    }
+
+    #[test]
+    fn working_floor_review_waits_before_the_destructive_list() {
+        let mut output = Vec::new();
+        assert_eq!(
+            read_review_choice(&mut b"n\n".as_slice(), &mut output, true, true).unwrap(),
+            OrdinaryChoice::Cancel
+        );
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "Enter: review stops when they finish   i: interrupt them now   n: cancel\n"
+        );
     }
 
     #[test]
     fn review_enter_proceeds_and_interrupt_requires_working_review() {
         assert!(matches!(
             review_answer("\n", false),
-            Some(UpdateChoice::Confirm)
+            Some(OrdinaryChoice::Confirm)
         ));
         assert!(matches!(
             review_answer("", true),
-            Some(UpdateChoice::Confirm)
+            Some(OrdinaryChoice::Confirm)
         ));
         assert!(matches!(
             review_answer("i", true),
-            Some(UpdateChoice::Policy(impact::Policy::Interrupt))
+            Some(OrdinaryChoice::Policy(impact::Policy::Interrupt))
         ));
         assert!(review_answer("i", false).is_none());
         assert!(matches!(
             review_answer("n", true),
-            Some(UpdateChoice::Cancel)
+            Some(OrdinaryChoice::Cancel)
         ));
         assert!(review_answer("maybe", true).is_none());
     }

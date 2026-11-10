@@ -375,6 +375,18 @@ impl Preview {
         self
     }
 
+    /// Stop consent binds the candidate and exact listed owners. Activity is
+    /// display-only here; the ordinary review has already settled the wait.
+    pub(super) fn preserves_stop_consent(&self, observed: &Self) -> bool {
+        self.candidate == observed.candidate
+            && self.replaces_daemon == observed.replaces_daemon
+            && self.daemon.as_ref().map(|daemon| &daemon.capability.proof)
+                == observed
+                    .daemon
+                    .as_ref()
+                    .map(|daemon| &daemon.capability.proof)
+    }
+
     pub fn preserves_consent(&self, observed: &Self) -> bool {
         super::source_inspection::SourceInspection::same_outcomes(
             &self.stopped,

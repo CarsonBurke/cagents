@@ -152,6 +152,20 @@ fn preview_summary(preview: &crate::update::impact::Preview) -> &'static str {
     }
 }
 
+fn confirmation_message<'a>(
+    confirmation: &crate::update::UpdateConfirmation,
+    job: Option<&'a UpdateJob>,
+) -> &'a str {
+    if confirmation.stop.is_some() {
+        job.map_or(
+            "Stopping live work needs confirmation in a terminal.",
+            |job| job.message.as_str(),
+        )
+    } else {
+        preview_summary(&confirmation.preview)
+    }
+}
+
 /// Why the update cannot be confirmed yet, counted so the reader knows how
 /// much stands in the way before reading any of it.
 fn attention_summary(daemon: &crate::update::impact::DaemonImpact) -> Option<String> {
@@ -300,11 +314,9 @@ impl Cagents {
                 .into(),
             None => title,
         };
-        let blocked = preview
-            .daemon
-            .as_ref()
-            .is_some_and(|daemon| daemon.blocked());
-        let mut body = vec![heading, notice_body(preview_summary(preview))];
+        let terminal_confirmation = confirmation.stop.is_some();
+        let message = confirmation_message(confirmation, self.update_ui.job.as_ref());
+        let mut body = vec![heading, notice_body(message)];
         if let Some(daemon) = &preview.daemon {
             if let Some(attention) = attention_summary(daemon) {
                 body.push(
@@ -357,22 +369,22 @@ impl Cagents {
                     .id(widget::Id::new("update.cancel"))
                     .on_press(Message::UpdateUi(Action::CancelApply))
                     .into(),
-                crate::ui_controls::button::primary(
-                    if preview.daemon.as_ref().is_some_and(|daemon| {
-                        daemon
-                            .sessions
-                            .iter()
-                            .any(|session| session.disposition == Disposition::WaitsForIdle)
-                    }) {
-                        "Update when idle"
-                    } else {
-                        "Update and reopen"
-                    },
-                )
+                crate::ui_controls::button::primary(if terminal_confirmation {
+                    "Continue in terminal"
+                } else if preview.daemon.as_ref().is_some_and(|daemon| {
+                    daemon
+                        .sessions
+                        .iter()
+                        .any(|session| session.disposition == Disposition::WaitsForIdle)
+                }) {
+                    "Update when idle"
+                } else {
+                    "Update and reopen"
+                })
                 .id(widget::Id::new("update.confirm"))
-                .on_press_maybe((!blocked).then_some(Message::UpdateUi(Action::ConfirmApply(
-                    confirmation.nonce.clone(),
-                ))))
+                .on_press_maybe((!terminal_confirmation).then_some(Message::UpdateUi(
+                    Action::ConfirmApply(confirmation.nonce.clone()),
+                )))
                 .into(),
             ])
             .align_y(Alignment::Center)
@@ -822,7 +834,9 @@ impl Cagents {
                     .update_ui
                     .confirmation
                     .as_ref()
-                    .is_none_or(|confirmation| confirmation.nonce != nonce)
+                    .is_none_or(|confirmation| {
+                        confirmation.nonce != nonce || confirmation.stop.is_some()
+                    })
                 {
                     return Task::none();
                 }
@@ -1416,6 +1430,36 @@ mod tests {
         assert!(app.update_ui.confirmation.is_none());
         assert!(!app.modal_is_open());
         assert_eq!(app.update_ui.error.as_deref(), Some("Helper exited"));
+    }
+
+    #[test]
+    fn a_stop_preview_keeps_its_terminal_instructions_and_cannot_submit_confirm() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let mut confirmation = daemon_preview(Vec::new());
+        confirmation.stop = Some(
+            serde_json::from_value(serde_json::json!({
+                "from_version": "old",
+                "items": [],
+            }))
+            .unwrap(),
+        );
+        let mut job = awaiting(&confirmation);
+        job.message =
+            "To update to 9.8.7, run `cagents daemon upgrade --version 9.8.7` in a terminal."
+                .into();
+        assert_eq!(confirmation_message(&confirmation, Some(&job)), job.message);
+        assert_eq!(
+            confirmation_message(&confirmation, None),
+            "Stopping live work needs confirmation in a terminal."
+        );
+        app.update_ui.job = Some(job.clone());
+        app.update_ui.confirmation = Some(confirmation.clone());
+        let ids = custom_widget_ids(&mut app.update_dialog().expect("instructions are shown"));
+        assert!(ids.iter().any(|id| id == "update.cancel"));
+        drop(app.update_update_ui(Action::ConfirmApply(confirmation.nonce)));
+        assert!(app.update_ui.confirmation.is_some());
+        assert!(app.update_ui.submitted_confirmation.is_none());
+        assert_eq!(app.update_ui.job.as_ref().unwrap().message, job.message);
     }
 
     fn daemon_preview(

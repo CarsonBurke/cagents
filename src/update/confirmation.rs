@@ -94,26 +94,23 @@ fn publish_decision(
 pub(super) fn wait(
     state: &Path,
     job: &mut UpdateJob,
-    terminal: bool,
     observe: impl FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>,
 ) -> Result<impact::Preview, UpdateError> {
-    wait_with(state, job, terminal, None, observe)
+    wait_with(state, job, None, observe)
 }
 
 pub(super) fn wait_approved(
     state: &Path,
     job: &mut UpdateJob,
-    terminal: bool,
     reviewed: impact::Preview,
     observe: impl FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>,
 ) -> Result<impact::Preview, UpdateError> {
-    wait_with(state, job, terminal, Some(reviewed), observe)
+    wait_with(state, job, Some(reviewed), observe)
 }
 
 fn wait_with(
     state: &Path,
     job: &mut UpdateJob,
-    terminal: bool,
     reviewed: Option<impact::Preview>,
     mut observe: impl FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>,
 ) -> Result<impact::Preview, UpdateError> {
@@ -130,14 +127,6 @@ fn wait_with(
     };
     let mut nonce = uuid::Uuid::new_v4().to_string();
     loop {
-        if !terminal
-            && preview
-                .daemon
-                .as_ref()
-                .is_some_and(impact::DaemonImpact::blocked)
-        {
-            return Err(invalid(floor::TERMINAL_CONFIRMATION));
-        }
         if Instant::now() >= deadline {
             return Err(invalid(
                 "Update preview expired without installation; review the update again",
@@ -197,11 +186,10 @@ fn wait_with(
         preview = current;
         if approved
             && preview.daemon.as_ref().is_none_or(|daemon| {
-                daemon.blocked()
-                    || !daemon
-                        .sessions
-                        .iter()
-                        .any(|session| session.disposition == impact::Disposition::WaitsForIdle)
+                !daemon
+                    .sessions
+                    .iter()
+                    .any(|session| session.disposition == impact::Disposition::WaitsForIdle)
             })
         {
             job.confirmation = None;
@@ -217,11 +205,19 @@ fn wait_with(
 pub(super) fn wait_stop(
     state: &Path,
     job: &mut UpdateJob,
+    terminal: bool,
     mut observe: impl FnMut() -> Result<(impact::Preview, floor_display::StopList), UpdateError>,
 ) -> Result<(impact::Preview, floor_display::StopList), UpdateError> {
     let deadline = Instant::now() + CONFIRMATION_LIFETIME;
     let expires = now_ms().saturating_add(CONFIRMATION_LIFETIME.as_millis() as u64);
     let (mut preview, mut list) = observe()?;
+    if !terminal {
+        return Err(invalid(format!(
+            "{}\n{}",
+            list.render_preview(),
+            floor::terminal_confirmation(state, job)?
+        )));
+    }
     let mut nonce = uuid::Uuid::new_v4().to_string();
     loop {
         if Instant::now() >= deadline {
@@ -239,7 +235,11 @@ pub(super) fn wait_stop(
             state,
             job,
             UpdatePhase::AwaitingConfirmation,
-            "The terminal service needs confirmation before stopping live work",
+            &format!(
+                "{}\n{}",
+                list.render_preview(),
+                floor::terminal_confirmation(state, job)?
+            ),
         )?;
         let path = state.join(format!("{}.{}.decision", job.id, nonce));
         let decision = match read_private(&path, SMALL_ASSET_LIMIT) {
@@ -259,7 +259,7 @@ pub(super) fn wait_stop(
         }
         let (current, current_list) = observe()?;
         let unchanged =
-            preview.preserves_consent(&current) && list.digest() == current_list.digest();
+            preview.preserves_stop_consent(&current) && list.digest() == current_list.digest();
         if unchanged
             && matches!(decision, Some(Choice::StopListed { items_digest }) if items_digest == current_list.digest())
         {
@@ -281,8 +281,14 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     fn job(directory: &Path) -> UpdateJob {
+        let id = uuid::Uuid::new_v4().to_string();
+        let request = UpdateRequest::InstalledFromTerminal {
+            root: "/fake".into(),
+        };
+        let file = private_create(&directory.join(format!("{id}.request"))).unwrap();
+        serde_json::to_writer(file, &request).unwrap();
         UpdateJob {
-            id: uuid::Uuid::new_v4().to_string(),
+            id,
             version: "9.8.7".into(),
             phase: UpdatePhase::Verifying,
             message: String::new(),
@@ -337,7 +343,7 @@ mod tests {
         let path = directory.path().to_owned();
         let worker = thread::spawn(move || {
             let mut job = job(&path);
-            wait(&path, &mut job, true, |_| {
+            wait(&path, &mut job, |_| {
                 Ok(preview(worker_changed.load(Ordering::Acquire)))
             })
         });
@@ -373,7 +379,7 @@ mod tests {
         let path = directory.path().to_owned();
         let worker = thread::spawn(move || {
             let mut job = job(&path);
-            wait(&path, &mut job, true, |_| Ok(preview(false)))
+            wait(&path, &mut job, |_| Ok(preview(false)))
         });
         let current = published(directory.path(), None);
         publish_decision(
@@ -437,7 +443,7 @@ mod tests {
         let list = stop_list();
         let worker = thread::spawn(move || {
             let mut job = job(&path);
-            wait_stop(&path, &mut job, || {
+            wait_stop(&path, &mut job, true, || {
                 worker_observations.fetch_add(1, Ordering::Release);
                 Ok((preview(false), list.clone()))
             })
@@ -481,7 +487,7 @@ mod tests {
         let expected = list.clone();
         let worker = thread::spawn(move || {
             let mut job = job(&path);
-            let result = wait_stop(&path, &mut job, || Ok((preview(false), list.clone())));
+            let result = wait_stop(&path, &mut job, true, || Ok((preview(false), list.clone())));
             assert!(job.confirmation.is_none());
             result
         });
@@ -519,7 +525,7 @@ mod tests {
         let list = stop_list();
         let worker = thread::spawn(move || {
             let mut job = job(&path);
-            wait_stop(&path, &mut job, || {
+            wait_stop(&path, &mut job, true, || {
                 worker_observations.fetch_add(1, Ordering::Release);
                 let mut current = list.clone();
                 if worker_changed.load(Ordering::Acquire) {

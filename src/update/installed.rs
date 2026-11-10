@@ -121,7 +121,7 @@ pub(super) fn perform(
     }
     let inspection = reconcile_saved_sources(staged.identity.protocol)?;
     let context = ReviewContext::capture(installation)?;
-    let confirmed = confirmation::wait(state, job, terminal, |policy| {
+    let confirmed = confirmation::wait(state, job, |policy| {
         Ok(context.apply(observe(policy)?.with_inspection(&inspection)))
     })?;
     set_phase(

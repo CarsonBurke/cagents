@@ -147,6 +147,7 @@ impl Registry {
 }
 
 pub(in crate::host) fn restore_presentations() -> Result<(), String> {
+    prune_history();
     let mut ledger = crate::upgrade::floor::load()?;
     if ledger
         .records
@@ -160,6 +161,50 @@ pub(in crate::host) fn restore_presentations() -> Result<(), String> {
         registry.restore_update_floor(record)?;
     }
     Ok(())
+}
+
+/// Pruning is maintenance, never a condition for opening the app. If a saved
+/// store cannot be inspected, keep the evidence until its next successful read.
+fn prune_history() {
+    let result = (|| -> Result<(), String> {
+        let mut referenced = std::collections::BTreeSet::new();
+        let mut remember = |kind: &crate::model::CardKind| match kind {
+            crate::model::CardKind::Chat(session) => {
+                referenced.insert(session.id);
+                if let Some(terminal) = &session.terminal {
+                    referenced.insert(terminal.id);
+                }
+            }
+            crate::model::CardKind::Terminal(session) => {
+                referenced.insert(session.id);
+            }
+            _ => (),
+        };
+        let registry = Registry::open()?;
+        for view in super::views::occupied(&registry.db)? {
+            for pane in &view.panes {
+                remember(&pane.kind);
+            }
+        }
+        let mut budget = crate::persistence::MigrationInspectionBudget::new(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+        );
+        for path in crate::instance::window_database_paths().map_err(|error| error.to_string())? {
+            if !path.exists() {
+                continue;
+            }
+            for pane in
+                crate::persistence::read_labeled_migration_sessions_with_budget(&path, &mut budget)
+                    .map_err(|error| error.to_string())?
+            {
+                remember(&pane.kind);
+            }
+        }
+        crate::upgrade::floor::prune_unreferenced(&referenced)
+    })();
+    if let Err(error) = result {
+        tracing::warn!(%error, "Stopped update history was kept until its panes can be inspected");
+    }
 }
 
 #[cfg(test)]
