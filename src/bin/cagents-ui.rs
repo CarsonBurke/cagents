@@ -1,4 +1,5 @@
 use std::io::IsTerminal;
+use std::os::unix::process::CommandExt;
 
 use cagents::design::space;
 use cagents::instance::{
