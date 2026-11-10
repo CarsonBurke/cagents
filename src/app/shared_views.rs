@@ -6848,6 +6848,88 @@ mod tests {
     }
 
     #[test]
+    fn repository_refresh_adopts_cross_repository_alias_without_losing_its_draft() {
+        let (mut app, source, destination, _) = fixture();
+        let source_project = app.durable.channels[0].project_id;
+        let destination_project = ProjectId::new();
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == destination)
+            .unwrap()
+            .project_id = destination_project;
+        let source_repository = PathBuf::from("/repo/.git");
+        let destination_repository = PathBuf::from("/other/.git");
+        for (id, repository) in [
+            (source_project, source_repository),
+            (destination_project, destination_repository.clone()),
+        ] {
+            app.sidebar_model.projects.push(SidebarProject::new(
+                id,
+                RepositoryId::new(),
+                "repo".into(),
+                repository,
+                vec![],
+                vec![],
+            ));
+        }
+        app.active_workspace = Some(PathBuf::from("/repo"));
+        Arc::make_mut(&mut app.durable).active_channel = Some(source);
+        let session = fresh_terminal_session(LaunchRecipe::shell(PathBuf::from("/repo")).unwrap());
+        drop(app.insert_terminal_card(session, None));
+        let alias = app.workspace.focused().unwrap();
+        app.chat_ui = chat_ui::State::with_drafts(HashMap::from([(
+            alias,
+            "saved cross-repository draft  ".into(),
+        )]));
+        let mut canonical = Pane::from_card(app.card_state(alias).unwrap(), None).unwrap();
+        canonical.id = CardId::new();
+        app.shared_views.pending.clear();
+        let mut view = View::empty(destination);
+        view.panes.push(canonical.clone());
+        app.workspace_model.views = vec![View::empty(source), view];
+        drop(app.reconcile_shared_views_for_repository(&destination_repository, &HashSet::new()));
+        assert!(!app.card_state(alias).unwrap().existence.is_open());
+        assert!(app.card_state(canonical.id).unwrap().existence.is_open());
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .find(|channel| channel.id == source)
+                .unwrap()
+                .cards
+                .iter()
+                .all(|id| *id != alias)
+        );
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .find(|channel| channel.id == destination)
+                .unwrap()
+                .cards
+                .contains(&canonical.id)
+        );
+        assert!(
+            app.shared_views.baseline[&Scope::Channel(source)]
+                .iter()
+                .all(|pane| pane.id != alias)
+        );
+        assert!(
+            app.shared_views.baseline[&Scope::Channel(destination)]
+                .iter()
+                .any(|pane| pane.id == canonical.id)
+        );
+        assert_eq!(
+            app.persistent_workspace()
+                .chat_drafts
+                .get(&canonical.id)
+                .map(String::as_str),
+            Some("saved cross-repository draft  ")
+        );
+    }
+
+    #[test]
     fn terminal_inventory_alias_is_adopted_before_scope_removal_and_keeps_draft() {
         let (mut app, a, _, _) = fixture();
         app.active_workspace = Some(PathBuf::from("/repo"));
