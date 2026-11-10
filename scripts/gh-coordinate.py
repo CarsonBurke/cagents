@@ -157,9 +157,9 @@ def git_common_dir():
     return path
 
 
-def waiting_notice(wait):
+def diagnostic(message):
     """Best effort only: a full stderr pipe must not become another queue."""
-    message = f"cagents-gh: waiting for content admission (at most {wait:g}s total).\n".encode()
+    message = (message + "\n").encode("utf-8", "backslashreplace")
     fd = None
     try:
         # Reopening gives pipes/terminals independent NONBLOCK flags. dup()
@@ -178,6 +178,10 @@ def waiting_notice(wait):
                 os.close(fd)
             except OSError:
                 pass
+
+
+def waiting_notice(wait):
+    diagnostic(f"cagents-gh: waiting for content admission (at most {wait:g}s total).")
 
 
 def admit(target, wait):
@@ -264,8 +268,11 @@ def main():
         os.execv(str(options.real), [str(options.real), *args])
     except (Deferred, OSError, ValueError, subprocess.SubprocessError) as error:
         if lease is not None:
-            os.close(lease)
-        print(f"cagents-gh: deferred {error}", file=sys.stderr)
+            try:
+                os.close(lease)
+            except OSError:
+                pass
+        diagnostic(f"cagents-gh: deferred {error}")
         return 75
 
 

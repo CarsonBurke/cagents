@@ -270,6 +270,36 @@ class CoordinationTests(unittest.TestCase):
             os.close(read_fd)
             os.close(write_fd)
 
+    def test_full_stderr_pipe_cannot_block_a_wait_zero_refusal(self):
+        writer, release = self.held_writer()
+        read_fd, write_fd = os.pipe()
+        try:
+            flags = fcntl.fcntl(write_fd, fcntl.F_GETFL)
+            fcntl.fcntl(write_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+            while True:
+                try:
+                    os.write(write_fd, b"x" * 4096)
+                except BlockingIOError:
+                    break
+            fcntl.fcntl(write_fd, fcntl.F_SETFL, flags)
+            started = time.monotonic()
+            result = subprocess.run(
+                self.command(["pr", "comment", "2", "-R", "owner/repo"], wait=0),
+                cwd=self.repo, env=self.environment, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=write_fd, timeout=2,
+            )
+            # Do not drain stderr: refusal must finish with that pipe still full.
+            self.assertEqual((result.returncode, result.stdout), (75, b""))
+            self.assertLess(time.monotonic() - started, 0.7)
+            self.assertEqual(len(self.calls()), 1)
+            self.assertEqual(fcntl.fcntl(write_fd, fcntl.F_GETFL), flags)
+            self.assertIsNone(writer.poll())
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+            release.touch()
+            writer.communicate(timeout=3)
+
     def test_stdio_exit_status_and_arguments_are_unchanged(self):
         args = ["pr", "review", "https://github.com/Owner/Repo/pull/42", "--repo", "owner/repo",
                 "--comment", "--body-file", "-", "--body", "--help"]
