@@ -660,6 +660,17 @@ class Evidence(unittest.TestCase):
         self.assertNotIn("development,ui --bin cagents-ui", cargo)
         self.assertEqual((self.task / "target-after/evidence-source").read_text().splitlines()[-1], "integrated")
 
+    def test_fixture_steps_receive_the_recorded_lane_instead_of_the_callers(self):
+        checkout = self.checkout("after")
+        for options, expected in (((), "browserless"), (("--integrated-browser",), "integrated")):
+            with self.subTest(lane=expected):
+                self.run_tool("build", "after", str(checkout), *options)
+                self.run_tool("start", "after")
+                result = self.run_tool("env", "sh", "-c", 'printf "%s" "$CAGENTS_EVIDENCE_BUILD_LANE"',
+                                       extra={"CAGENTS_EVIDENCE_BUILD_LANE": "caller-is-untrusted"})
+                self.assertEqual(result.stdout, expected)
+                self.run_tool("stop")
+
     def test_a_refusals_next_step_works_straight_away(self) -> None:
         path = self.built()
         (self.logs / "runner-checks").touch()

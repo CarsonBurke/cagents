@@ -17,7 +17,7 @@ smoke_finished() {
 }
 trap smoke_finished EXIT
 
-evidence env sh -c '[ "$(tail -n 1 "$CARGO_TARGET_DIR/evidence-source")" = integrated ]'
+evidence env sh -c '[ "$CAGENTS_EVIDENCE_BUILD_LANE" = integrated ]'
 
 document=$(cat <<'HTML'
 <!doctype html><meta charset="utf-8"><title>Native browser regression</title>
@@ -32,7 +32,9 @@ HTML
 url=$(evidence env /usr/bin/python3 -c "$(cat <<'PY'
 from pathlib import Path
 import os, subprocess, sys, time
-fixture = Path(os.environ['CARGO_TARGET_DIR']).parent / 'fixture'
+fixture = Path(os.environ['CAGENTS_EVIDENCE_FIXTURE'])
+if Path(os.environ['HOME']) != fixture / 'home':
+    raise RuntimeError('the browser fixture requires its own HOME')
 page = fixture / 'browser-page'
 page.mkdir(parents=True, exist_ok=True)
 (page / 'index.html').write_text(sys.argv[1])
@@ -68,7 +70,20 @@ PY
 )" "$document")
 
 evidence drive click 291,22
-evidence drive click Browser
+# The menu's accessible name is "New Browser tab"; its painted label is
+# "Browser". Select the observed control, excluding the workspace's separate
+# "New browser" action, before asking the harness to click its reference.
+menu=$(evidence drive observe --json | /usr/bin/python3 -c '
+import json, sys
+runs = [run for run in json.load(sys.stdin)["runs"]
+        if run["text"].casefold() in ("browser", "new browser tab")]
+declared = [run for run in runs if run.get("role") != "ocr"]
+runs = declared or runs
+if len(runs) != 1:
+    raise RuntimeError("expected one browser menu control: " + repr(runs))
+print(runs[0]["ref"])
+')
+evidence drive click "$menu"
 evidence drive wait 'Import browser logins' --timeout 15
 evidence drive click Skip
 evidence drive key ctrl+l

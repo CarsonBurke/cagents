@@ -617,6 +617,32 @@ esac
         self.launch("--browserless", "--instance", "explicit", LIBGL_ALWAYS_SOFTWARE="0", WGPU_BACKEND="vulkan")
         self.assertEqual(started.read_text().strip(), "0 vulkan")
 
+    def test_the_printed_commands_use_the_selected_runtime_on_the_callers_path(self):
+        harness = self.root / "bin/niri-harness"
+        harness.write_text("#!/bin/sh\nexit 2\n")
+        harness.chmod(0o755)
+        pinned = self.home / ".local/lib/cagents/niri-harness/release space's/bin/niri-harness"
+        pinned.parent.mkdir(parents=True)
+        calls = self.root / "printed-command-calls"
+        write_harness(pinned, f"""#!/bin/sh
+case " $* " in
+ *" start "*) exit 0 ;;
+ *" observe "*|*" logs "*) printf '%s\\n' "$*" >>"{calls}" ;;
+ *) exit 1 ;;
+esac
+""")
+        pinned.chmod(0o755)
+        (self.home / ".local/lib/cagents/niri-harness/current").symlink_to(pinned.parent.parent)
+        result, _ = self.launch("--browserless", "--instance", "selected", "--keep")
+        for label in ("observe:", "logs:"):
+            command = next(line.split(label, 1)[1].strip() for line in result.stdout.splitlines()
+                           if line.strip().startswith(label))
+            ran = subprocess.run(["/bin/sh", "-c", command], env=self.env, text=True,
+                                 capture_output=True, timeout=10)
+            self.assertEqual(ran.returncode, 0, ran.stderr)
+        self.assertEqual(calls.read_text().splitlines(), [
+            "--session cagents-selected observe", "--session cagents-selected logs"])
+
     def test_an_instance_runs_under_a_memory_limit(self):
         limit = self.runner.with_name("memory-capped")
         limit.write_text('#!/bin/sh\nshift 2\nexec "$@"\n')

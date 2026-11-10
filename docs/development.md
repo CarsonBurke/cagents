@@ -282,12 +282,15 @@ for the application. The cagents runner leaves `LIBGL_ALWAYS_SOFTWARE` and
 For a native browser regression, build with `--integrated-browser`, start a fresh
 fixture at 1600x1000 and scale 1, then run
 `tests/fixtures/integrated-browser-smoke.sh` in an `evidence` steps shell. It
-selects Skip in the first-run import dialog, serves a synthetic page over
+selects the observed browser menu control and Skip in the first-run import dialog, serves a synthetic page over
 loopback HTTP, and checks typing, button focus, scrolling and a narrower window.
 `--software-rendering` exercises the delayed Mesa backbuffer case. This geometry
 uses the independent viewport dimensions introduced by #2527. The test starts
 no model/provider; its server has the fixture's HOME and runtime and is ended by
-normal fixture teardown. `BROWSER_SMOKE_OPEN_ONLY=1` opens only the animated
+normal fixture teardown. Steps receive the recorded build lane and explicit
+fixture root; the server requires that root's private HOME, independent of where
+Cargo keeps its build output. The same step interface can drive an isolated
+named instance. `BROWSER_SMOKE_OPEN_ONLY=1` opens only the animated
 page for a controlled resource/presentation sample.
 
 ### Parallel instances

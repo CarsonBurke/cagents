@@ -369,7 +369,7 @@ fixture_env() {
         XDG_CACHE_HOME="$fixture/cache" XDG_STATE_HOME="$fixture/state" \
         CARGO_HOME="${CARGO_HOME:-$real_home/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$real_home/.rustup}" \
         CARGO_TARGET_DIR="$target" CAGENTS_ZIG="$zig" \
-        CAGENTS_EVIDENCE_FIXTURE="$fixture" GIT_ALLOW_PROTOCOL=file \
+        CAGENTS_EVIDENCE_FIXTURE="$fixture" CAGENTS_EVIDENCE_BUILD_LANE="$built_lane" GIT_ALLOW_PROTOCOL=file \
         PATH="$session_path$fixture/bin:$cargo_bin:${zig%/*}:/usr/local/bin:/usr/bin" \
         "$@"
 }

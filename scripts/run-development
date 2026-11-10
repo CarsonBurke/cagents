@@ -1328,10 +1328,13 @@ os.execv(sys.argv[1], sys.argv[1:])' "$@"
         lifetime_note="stops $(instance_grace) seconds after the session that started it ends (--keep keeps it)"
     fi
     [ -z "$instance_ttl" ] || lifetime_note="$lifetime_note, or $instance_ttl seconds after it started"
+    # The selected runtime may be absent from the caller's PATH. Keep these
+    # copyable commands bound to it, including prefixes with shell characters.
+    harness_command=$(printf '%s' "$harness_directory/niri-harness" | sed "s/'/'\\\\''/g")
     printf '%s\n' \
         "Instance $instance is running in niri-harness session $harness_session; it $lifetime_note." \
-        "  observe: niri-harness --session $harness_session observe" \
-        "  logs:    niri-harness --session $harness_session logs" \
+        "  observe: '$harness_command' --session $harness_session observe" \
+        "  logs:    '$harness_command' --session $harness_session logs" \
         "  stop:    scripts/run-development --stop-instance $instance"
     exit 0
 fi
