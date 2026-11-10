@@ -95,6 +95,10 @@ fn status_indicator<'a>(status: ToolStatus) -> (Element<'a, Message>, Option<des
             Icon::Cancel,
             Some(design::Tone::Themed(design::muted_color)),
         ),
+        ToolStatus::Waiting => glyph(
+            Icon::AgentBackground,
+            Some(design::Tone::Themed(design::muted_color)),
+        ),
     }
 }
 
