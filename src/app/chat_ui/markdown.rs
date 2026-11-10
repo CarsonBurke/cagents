@@ -1253,7 +1253,7 @@ impl SpanBuffer {
     }
 
     fn finish(&mut self, linkify: bool) -> Text {
-        let mut text = mem::take(&mut self.text);
+        let text = mem::take(&mut self.text);
         let mut runs = mem::take(&mut self.runs);
         if linkify {
             // Match the existing bare-reference rule: only adjacent unlinked,
@@ -1270,46 +1270,61 @@ impl SpanBuffer {
                     false
                 }
             });
-            let mut linked = Vec::with_capacity(runs.len());
             let mut start = 0;
-            for mut run in runs {
-                let end = run.end;
-                let fragment = &text[start..end];
+            let first_split = runs.iter_mut().enumerate().find_map(|(index, run)| {
+                let fragment = &text[start..run.end];
+                start = run.end;
                 if run.link.is_none() && run.attributes.code {
                     run.link = destination(fragment);
-                    linked.push(run);
-                } else if run.link.is_none() {
-                    let mut copied = 0;
-                    for (from, to, destination) in references(fragment) {
-                        if copied < from {
+                    None
+                } else if run.link.is_none() && references(fragment).next().is_some() {
+                    Some(index)
+                } else {
+                    None
+                }
+            });
+            if let Some(first_split) = first_split {
+                let mut linked = Vec::with_capacity(runs.len());
+                linked.extend(runs.drain(..first_split));
+                let mut start = linked.last().map_or(0, |run| run.end);
+                for mut run in runs {
+                    let end = run.end;
+                    let fragment = &text[start..end];
+                    if run.link.is_none() && run.attributes.code {
+                        run.link = destination(fragment);
+                        linked.push(run);
+                    } else if run.link.is_none() {
+                        let mut copied = 0;
+                        for (from, to, destination) in references(fragment) {
+                            if copied < from {
+                                linked.push(Run {
+                                    end: start + from,
+                                    link: None,
+                                    attributes: run.attributes,
+                                });
+                            }
                             linked.push(Run {
-                                end: start + from,
+                                end: start + to,
+                                link: Some(destination),
+                                attributes: run.attributes,
+                            });
+                            copied = to;
+                        }
+                        if copied == 0 || copied < fragment.len() {
+                            linked.push(Run {
+                                end,
                                 link: None,
                                 attributes: run.attributes,
                             });
                         }
-                        linked.push(Run {
-                            end: start + to,
-                            link: Some(destination),
-                            attributes: run.attributes,
-                        });
-                        copied = to;
+                    } else {
+                        linked.push(run);
                     }
-                    if copied == 0 || copied < fragment.len() {
-                        linked.push(Run {
-                            end,
-                            link: None,
-                            attributes: run.attributes,
-                        });
-                    }
-                } else {
-                    linked.push(run);
+                    start = end;
                 }
-                start = end;
+                runs = linked;
             }
-            runs = linked;
         }
-        text.shrink_to_fit();
         Text::from_spans(Spans {
             text,
             runs: runs.into_boxed_slice(),
