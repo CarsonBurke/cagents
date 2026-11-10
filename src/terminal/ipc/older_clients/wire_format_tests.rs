@@ -135,7 +135,11 @@ impl Comparison<'_> {
                     }
                     let path = format!("{path}::{name}");
                     let Some((next, next_fields)) = new.get(index) else {
-                        self.differ(&path, "variant removed".into());
+                        // Compared the other way round, an appended variant
+                        // the daemon restates is one that side never sends.
+                        if !self.restated.contains(&(current, name.as_str())) {
+                            self.differ(&path, "variant removed".into());
+                        }
                         continue;
                     };
                     if name != next {
@@ -352,11 +356,7 @@ fn every_older_client_is_proven_against_its_recorded_format() {
             } else {
                 Vec::new()
             },
-            RESTATED_VARIANTS
-                .iter()
-                .filter(|(.., since)| client.protocol < *since)
-                .map(|(container, variant, _)| (*container, *variant))
-                .collect(),
+            restated_for(client.protocol),
         );
         assert!(
             differences.is_empty(),
@@ -368,10 +368,25 @@ fn every_older_client_is_proven_against_its_recorded_format() {
     }
 }
 
+/// Appended variants a client of `protocol` is sent as ones it knows.
+fn restated_for(protocol: u16) -> Vec<(&'static str, &'static str)> {
+    RESTATED_VARIANTS
+        .iter()
+        .filter(|(.., since)| protocol < *since)
+        .map(|(container, variant, _)| (*container, *variant))
+        .collect()
+}
+
 /// Compare lifecycle and inspection in both directions: unlike general older
 /// clients, nested enums may neither add nor remove variants. Both envelope
 /// headers are included, so proof fields and request correlation stay frozen.
-fn lifecycle_differences(older: &Shapes, current: &Shapes) -> Vec<String> {
+/// A variant in `restated` is sent to that older side as one it knows, so it
+/// is neither an addition it can't decode nor a removal.
+fn lifecycle_differences(
+    older: &Shapes,
+    current: &Shapes,
+    restated: &[(&'static str, &'static str)],
+) -> Vec<String> {
     let mut changed = Vec::new();
     for (older, current) in [(older, current), (current, older)] {
         let mut comparison = Comparison {
@@ -379,7 +394,7 @@ fn lifecycle_differences(older: &Shapes, current: &Shapes) -> Vec<String> {
             current,
             gated: Vec::new(),
             refused: Vec::new(),
-            restated: Vec::new(),
+            restated: restated.to_vec(),
             selected: crate::update::source::LIFECYCLE_VARIANTS,
             visited: BTreeSet::new(),
             differences: Vec::new(),
@@ -407,10 +422,11 @@ fn every_current_client_update_source_preserves_the_frozen_lifecycle_and_inspect
     let current_recording = recorded(PROTOCOL_VERSION);
     for protocol in crate::update::source::current_client_protocols() {
         let older = recorded(protocol);
-        let mut changed = lifecycle_differences(&older, &current_recording);
+        let restated = restated_for(protocol);
+        let mut changed = lifecycle_differences(&older, &current_recording, &restated);
         // Also compare actual Rust types: regenerating the current fixture
         // cannot bless an incompatible change to an admitted source's subset.
-        changed.extend(lifecycle_differences(&older, &current));
+        changed.extend(lifecycle_differences(&older, &current, &restated));
         assert!(
             changed.is_empty(),
             "update source protocol {protocol} no longer has this build's frozen lifecycle and inspector wire format:\n{}",
@@ -456,7 +472,7 @@ fn inspector_proof_detects_each_request_response_and_reachable_history_change() 
                     .unwrap();
                 variants.swap(index, index - 1);
                 assert!(
-                    !lifecycle_differences(&baseline, &changed).is_empty(),
+                    !lifecycle_differences(&baseline, &changed, &[]).is_empty(),
                     "protocol {protocol}: inspector variant {name} must be frozen"
                 );
             }
@@ -471,7 +487,7 @@ fn inspector_proof_detects_each_request_response_and_reachable_history_change() 
             panic!()
         };
         fields.push(("future_history_field".into(), Shape::Bool));
-        assert!(!lifecycle_differences(&baseline, &changed).is_empty());
+        assert!(!lifecycle_differences(&baseline, &changed, &[]).is_empty());
     }
 }
 
@@ -492,7 +508,7 @@ fn lifecycle_proof_detects_variant_positions_and_reachable_payload_changes() {
         panic!()
     };
     variants.swap(0, 1);
-    assert!(!lifecycle_differences(&baseline, &changed).is_empty());
+    assert!(!lifecycle_differences(&baseline, &changed, &[]).is_empty());
 
     let mut changed = baseline.clone();
     let Container::Struct(fields) = changed.containers.get_mut(&key("DaemonImpact")).unwrap()
@@ -500,14 +516,14 @@ fn lifecycle_proof_detects_variant_positions_and_reachable_payload_changes() {
         panic!()
     };
     fields.push(("future_field".into(), Shape::Bool));
-    assert!(!lifecycle_differences(&baseline, &changed).is_empty());
+    assert!(!lifecycle_differences(&baseline, &changed, &[]).is_empty());
 
     let mut changed = baseline.clone();
     let Container::Enum(variants) = changed.containers.get_mut(&key("Disposition")).unwrap() else {
         panic!()
     };
     variants.push(("future_variant".into(), Some(Fields::Unit)));
-    assert!(!lifecycle_differences(&baseline, &changed).is_empty());
+    assert!(!lifecycle_differences(&baseline, &changed, &[]).is_empty());
 
     // The newer daemon can evolve unrelated agent operations independently.
     let mut changed = baseline.clone();
@@ -515,5 +531,5 @@ fn lifecycle_proof_detects_variant_positions_and_reachable_payload_changes() {
         panic!()
     };
     variants.push(("unrelated_variant".into(), Some(Fields::Unit)));
-    assert!(lifecycle_differences(&baseline, &changed).is_empty());
+    assert!(lifecycle_differences(&baseline, &changed, &[]).is_empty());
 }
