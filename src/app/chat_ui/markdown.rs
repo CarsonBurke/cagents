@@ -701,7 +701,7 @@ impl Spans {
         }) = spans.next()
         {
             text = first;
-            text.reserve(bytes - text.len());
+            text.reserve_exact(bytes - text.len());
             runs.push(Run {
                 end: text.len(),
                 link,

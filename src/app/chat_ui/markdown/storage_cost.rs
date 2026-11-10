@@ -59,3 +59,74 @@ fn paragraph_storage_throughput() {
         );
     }
 }
+
+#[test]
+fn clipped_runs_keep_unicode_empty_boundaries_and_rendered_attributes() {
+    let run = |text: &str, strong, emphasis, code, link: Option<Uri>| Span::Standard {
+        text: text.into(),
+        strikethrough: false,
+        link,
+        strong,
+        emphasis,
+        code,
+    };
+    let link: Uri = "https://example.test/λ".into();
+    let text = Text::new(vec![
+        run("", false, false, true, None),
+        run("aλ", true, false, false, Some(link.clone())),
+        run("", false, true, false, None),
+        run("éz", false, true, false, None),
+        run("", true, false, false, Some(link.clone())),
+    ]);
+    let style = crate::design::markdown_settings(&cosmic::Theme::dark(), 14.0).style;
+    assert_eq!(text.plain().as_ref(), "aλéz");
+    let clipped = text.spans_range(style, 1..5);
+    assert_eq!(clipped.len(), 2);
+    assert_eq!(clipped[0].text.as_ref(), "λ");
+    assert_eq!(
+        clipped[0].font,
+        Some(Font {
+            weight: font::Weight::Bold,
+            ..style.font
+        })
+    );
+    assert_eq!(clipped[0].link.as_deref(), Some(link.as_ref()));
+    assert_eq!(clipped[0].color, Some(style.link_color));
+    assert_eq!(clipped[1].text.as_ref(), "é");
+    assert_eq!(
+        clipped[1].font,
+        Some(Font {
+            style: font::Style::Italic,
+            ..style.font
+        })
+    );
+    assert!(clipped[1].link.is_none());
+    assert!(text.spans_range(style, 3..3).is_empty());
+    assert_eq!(
+        text.spans(style).len(),
+        5,
+        "empty styled runs remain semantic input"
+    );
+
+    let mut extended = Text::new(vec![
+        run("", false, false, true, None),
+        run("aλ", true, false, false, Some(link.clone())),
+        run("", false, true, false, None),
+        run("éz", false, true, false, None),
+        run("!", true, false, false, Some(link.clone())),
+    ]);
+    extended.record_prefix(&text);
+    assert!(extended.append_proven(&text));
+    let mut rewritten = Text::new(vec![
+        run("", false, false, true, None),
+        run("aλ", true, false, false, Some(link.clone())),
+        run("", true, false, false, None),
+        run("éz", false, true, false, None),
+        run("!", true, false, false, Some(link)),
+    ]);
+    rewritten.record_prefix(&text);
+    assert!(
+        !rewritten.append_proven(&text),
+        "a changed empty run invalidates the prefix proof"
+    );
+}
