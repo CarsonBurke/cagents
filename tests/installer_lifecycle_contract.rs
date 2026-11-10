@@ -282,6 +282,21 @@ fn coordinated_release_mode(
     }
     let status = r#"#!/bin/sh
 CLI=old
+fixture_recovery_receipt() {
+  printf '{"version":1,"transaction":"00000000-0000-4000-8000-000000000001","census_digest":"0000000000000000000000000000000000000000000000000000000000000000","outcome":{"state":"%s"' "$2" > "$1"
+  # These are mocked helper observations; the native proof is tested through
+  # the real helper and daemon lanes. Keep their envelope schema exact.
+  case "$2" in
+    usable)
+      printf ',"serving":{"host_session_id":"fixture-service","boot_id":"fixture-boot","host_incarnation":"fixture-incarnation"},"terminals":%s,"chats":0' "$FIXTURE_TERMINALS" >> "$1" ;;
+    unverified)
+      printf ',"serving":null,"readiness":null,"surviving_terminals":0,"expected_terminals":%s,"missing":[],"unexpected":[],"changed":[],"detail":"%s"' "$FIXTURE_TERMINALS" "${3:-unverified fixture}" >> "$1" ;;
+    needs_target_recovery)
+      printf ',"checkpoint_digest":"0000000000000000000000000000000000000000000000000000000000000000","source":{"host_session_id":"fixture-source","boot_id":"fixture-boot","host_incarnation":"fixture-source-incarnation"}' >> "$1" ;;
+  esac
+  printf '},"checkpoint_before":null}\n' >> "$1"
+  if [ "$1" != "$FIXTURE_OUTCOME_OBSERVED" ]; then cp "$1" "$FIXTURE_OUTCOME_OBSERVED"; fi
+}
 if [ "$FIXTURE_HANDOFF" = true ]; then
   case "$CLI:$*" in
     'new:daemon verify-update-lease'|'new:daemon start')
@@ -307,6 +322,67 @@ if [ "$FIXTURE_HANDOFF" = true ]; then
   esac
 fi
 case "$*" in
+  'daemon capture-update-census --output '*)
+    [ "$CLI" = new ] && [ "$#" -eq 4 ] || exit 98
+    if [ "$FIXTURE_RESTART" = census-capture-failure ]; then
+      printf 'The source did not provide an authenticated terminal census.\n' >&2
+      exit 1
+    fi
+    cp "$FIXTURE_TERMINAL_INVENTORY" "$4"
+    printf 'capture\n' >> "$FIXTURE_CENSUS_LOG"
+    ;;
+  'daemon verify-update-census --census '*' --outcome '*)
+    [ "$CLI" = new ] || exit 98
+    case "$#:$7:$8" in
+      6::|7:--allow-absent:|7:--require-original:|7:--validate-only:|8:--require-original:--allow-absent) ;;
+      *) exit 98 ;;
+    esac
+    printf 'verify\n' >> "$FIXTURE_CENSUS_LOG"
+    if [ ! -f "$4" ] || [ "$FIXTURE_RESTART" = provided-census-malformed ]; then
+      fixture_recovery_receipt "$6" "unverified" "invalid_census"
+      printf 'The supplied private census is invalid.\n' >&2
+      exit 1
+    fi
+    if [ "$#" -eq 7 ] && [ "$7" = --validate-only ]; then
+      fixture_recovery_receipt "$6" "unverified" "census_validated"
+      exit 0
+    fi
+    if [ "$#" -ge 7 ] && [ "$7" = --require-original ] && [ "$(cat "$FIXTURE_RUNNING" 2>/dev/null)" != old ]; then
+      if [ "$#" -ne 8 ] || [ -e "$FIXTURE_RUNNING" ] || [ -s "$4" ]; then
+        fixture_recovery_receipt "$6" "unverified" "not_original_source"
+        exit 1
+      fi
+    fi
+    if [ ! -e "$FIXTURE_RUNNING" ] && { [ "$7" = --allow-absent ] || [ "$8" = --allow-absent ]; } && [ ! -s "$4" ]; then
+      fixture_recovery_receipt "$6" "no_source" ""
+      exit 0
+    fi
+    if [ ! -e "$FIXTURE_RUNNING" ] || { [ "$FIXTURE_RESTART" = handoff-starting ] && [ "$(cat "$FIXTURE_RUNNING" 2>/dev/null)" = new ]; }; then
+      fixture_recovery_receipt "$6" "unverified" "socket_not_ready"
+      printf 'The terminal service is not ready. Inspect with --no-start daemon status and --no-start terminal list.\n' >&2
+      exit 1
+    fi
+    if ! cmp -s "$4" "$FIXTURE_TERMINAL_INVENTORY"; then
+      fixture_recovery_receipt "$6" "unverified" "terminal_inventory_mismatch"
+      printf 'The terminal inventory does not match the pre-update census. Inspect with --no-start daemon status and --no-start terminal list.\n' >&2
+      exit 1
+    fi
+    fixture_recovery_receipt "$6" "usable" ""
+    ;;
+  'daemon inspect-update-recovery --census '*' --outcome '*)
+    [ "$CLI" = new ] && [ "$#" -eq 6 ] || exit 98
+    printf 'inspect\n' >> "$FIXTURE_CENSUS_LOG"
+    if [ -e "$FIXTURE_CHECKPOINT" ]; then
+      fixture_recovery_receipt "$6" "needs_target_recovery" "Prepared"
+      printf 'Prepared sessions require target recovery. Inspect with --no-start daemon status and --no-start terminal list.\n' >&2
+      exit 1
+    fi
+    fixture_recovery_receipt "$6" "restart_permitted" ""
+    ;;
+  'verify-install-guard')
+    case "$FIXTURE_RESTART" in provided-census-*) exit 0 ;; esac
+    exec "$FIXTURE_REAL_CLI" "$@"
+    ;;
   'coordinate-install '*|'verify-install-guard'*|'record-deferred-install'*)
     case "$FIXTURE_COORDINATOR:$CLI" in
       installed:new) [ "$FIXTURE_STAGE_ONLY" = true ] || exit 64 ;;
@@ -378,6 +454,7 @@ case "$*" in
     else
       [ "$#" -eq 4 ] || exit 98
     fi
+    [ -s "$FIXTURE_CENSUS_LOG" ] || exit 98
     printf '%s:prepare\n' "$CLI" >> "$FIXTURE_ACTIONS"
     [ "$CLI" = old ] || exit 98
     [ "$FIXTURE_RESTART" != prepare-failure ] || exit 3
@@ -388,6 +465,7 @@ case "$*" in
     ;;
   'daemon stop --require-empty')
     [ "$#" -eq 3 ] || exit 98
+    [ -s "$FIXTURE_CENSUS_LOG" ] || exit 98
     printf '%s\n' require-empty >> "$FIXTURE_ACTIONS"
     [ "$FIXTURE_TERMINALS" = 0 ] || exit 3
     rm "$FIXTURE_RUNNING"
@@ -395,7 +473,7 @@ case "$*" in
   'daemon start')
     [ "$#" -eq 2 ] || exit 98
     printf '%s:start\n' "$CLI" >> "$FIXTURE_ACTIONS"
-    if [ "$CLI" = new ] && { [ "$FIXTURE_RESTART" = start-failure ] || [ "$FIXTURE_RESTART" = empty-start-failure ] || [ "$FIXTURE_RESTART" = handoff-start-failure ]; }; then exit 4; fi
+    if [ "$CLI" = new ] && { [ "$FIXTURE_RESTART" = start-failure ] || [ "$FIXTURE_RESTART" = empty-start-failure ] || [ "$FIXTURE_RESTART" = handoff-start-failure ] || [ "$FIXTURE_RESTART" = empty-recovery-unready ]; }; then exit 4; fi
     if [ -e "$FIXTURE_CHECKPOINT" ]; then
       [ ! -e "$FIXTURE_RUNNING" ] && [ ! -e "$FIXTURE_PENDING" ] || exit 98
       expected=versions/old
@@ -403,7 +481,11 @@ case "$*" in
       [ "$(readlink "$FIXTURE_PREFIX/current")" = "$expected" ] || exit 98
       cp "$FIXTURE_CHECKPOINT" "$FIXTURE_RESTORED"
     fi
+    if [ "$CLI:$FIXTURE_RESTART" = new:census-unready ] || [ "$CLI:$FIXTURE_RESTART" = old:empty-recovery-unready ]; then exit 0; fi
     if [ ! -e "$FIXTURE_RUNNING" ]; then printf '%s\n' "$CLI" > "$FIXTURE_RUNNING"; fi
+    if [ "$CLI:$FIXTURE_RESTART" = new:census-missing ]; then
+      printf 'terminal-0\n' > "$FIXTURE_TERMINAL_INVENTORY"
+    fi
     if [ "$CLI" = new ] && { [ "$FIXTURE_RESTART" = start-unknown ] || [ "$FIXTURE_RESTART" = empty-start-unknown ]; }; then exit 4; fi
     if [ "$CLI" = new ] && [ "$FIXTURE_RESTART" = handoff-starting ]; then exit 4; fi
     if [ "$CLI" = new ] && [ "$FIXTURE_RESTART" = start-signal ]; then
@@ -486,6 +568,8 @@ trap - TERM
 # A lost outer cancellation must allow publication to succeed. An unrelated
 # exit failure here would also roll back and hide broken signal forwarding.
 sleep 1"#
+        } else if failure == "external-recovery" {
+            r#"printf 'new\n' > "$FIXTURE_RUNNING"; printf 'external:ready\n' >> "$FIXTURE_ACTIONS"; exit 8"#
         } else if failure == "signal" {
             "kill -TERM \"$PPID\"; exit 8"
         } else {
@@ -632,6 +716,22 @@ os.execv(target, [target, *sys.argv[1:]])
             );
         }
     }
+    let census_log = home.path().join("census-actions");
+    let terminal_inventory = home.path().join("terminal-inventory");
+    let census = home.path().join("update-census.json");
+    let outcome = home.path().join("update-outcome.json");
+    let inventory = (0..terminals)
+        .map(|id| format!("terminal-{id}\n"))
+        .collect::<String>();
+    fs::write(&terminal_inventory, &inventory).unwrap();
+    fs::write(&census, &inventory).unwrap();
+    if restart == Some("provided-census-missing") {
+        fs::remove_file(&census).unwrap();
+    } else if restart == Some("provided-census-malformed") {
+        fs::write(&census, "{invalid json").unwrap();
+    } else if restart == Some("provided-census-mismatch") {
+        fs::write(&census, "terminal-unrelated\n").unwrap();
+    }
     let actions = home.path().join("actions");
     let running = home.path().join("running");
     let checkpoint = home.path().join("checkpoint");
@@ -640,7 +740,7 @@ os.execv(target, [target, *sys.argv[1:]])
         // Prepare/checkpoint already completed in the worker; the installer
         // receives a held lock and no running service, just as after shutdown.
         fs::write(&checkpoint, "exact-conversation-and-shells\n").unwrap();
-    } else {
+    } else if coordinator != "stage-no-source" {
         fs::write(&running, "old\n").unwrap();
     }
     let runtime = home.path().join("runtime");
@@ -670,7 +770,7 @@ exec sh "$@""#,
     }
     if matches!(
         restart,
-        Some("empty" | "empty-start-failure" | "empty-start-unknown")
+        Some("empty" | "empty-start-failure" | "empty-start-unknown" | "empty-recovery-unready")
     ) {
         command.arg("--require-empty-daemon");
     }
@@ -737,10 +837,21 @@ with open(os.environ['FIXTURE_LEASE_PATH'], 'r+') as contender:
                 Ok(())
             });
         }
+    } else if restart.is_some_and(|mode| mode.starts_with("provided-census-")) {
+        command.env("CAGENTS_UI_UPDATE_GUARD_FD", "198");
     } else {
         command.env_remove("CAGENTS_UI_UPDATE_GUARD_FD");
     }
+    if handoff || restart.is_some_and(|mode| mode.starts_with("provided-census-")) {
+        command.env("CAGENTS_INSTALL_CENSUS_PATH", &census);
+    } else {
+        command.env_remove("CAGENTS_INSTALL_CENSUS_PATH");
+    }
     let output = command
+        .env("CAGENTS_INSTALL_OUTCOME_PATH", &outcome)
+        .env("FIXTURE_TERMINAL_INVENTORY", &terminal_inventory)
+        .env("FIXTURE_CENSUS_LOG", &census_log)
+        .env("FIXTURE_OUTCOME_OBSERVED", &outcome)
         .env("HOME", home.path())
         .env("XDG_DATA_HOME", &data)
         .env("XDG_CONFIG_HOME", home.path().join("config"))
@@ -834,11 +945,7 @@ with open(os.environ['FIXTURE_LEASE_PATH'], 'r+') as contender:
         assert_eq!(output.status.success(), success, "{output:?}");
         assert_eq!(
             fs::read_link(prefix.join("current")).unwrap(),
-            Path::new(if success || starting {
-                "versions/9.9.9"
-            } else {
-                "versions/old"
-            })
+            Path::new("versions/9.9.9")
         );
         let actions = fs::read_to_string(&actions).unwrap();
         assert_eq!(
@@ -860,7 +967,7 @@ with open(os.environ['FIXTURE_LEASE_PATH'], 'r+') as contender:
             );
         }
         assert!(
-            !actions.contains("old:"),
+            !actions.contains("old:start") && !actions.contains("old:prepare"),
             "the stopped source must not be prepared or restarted: {actions}"
         );
         assert_eq!(
@@ -875,22 +982,34 @@ with open(os.environ['FIXTURE_LEASE_PATH'], 'r+') as contender:
             assert!(prefix.join("versions/9.9.9/bin/cagents").exists());
             assert!(
                 String::from_utf8_lossy(&output.stderr)
-                    .contains("replacement daemon shutdown is not proven"),
+                    .contains("original terminal service could not be verified"),
                 "{output:?}"
             );
         } else {
             assert!(!running.exists());
-            assert!(!prefix.join("versions/9.9.9").exists());
+            assert!(prefix.join("versions/9.9.9").exists());
             assert!(
                 String::from_utf8_lossy(&output.stderr)
                     .contains("replacement daemon startup failed")
             );
             assert!(
                 !String::from_utf8_lossy(&output.stderr)
-                    .contains("replacement daemon shutdown is not proven"),
+                    .contains("original terminal service could not be verified"),
                 "{output:?}"
             );
         }
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&fs::read(&outcome).unwrap()).unwrap();
+        assert_eq!(
+            receipt["outcome"]["state"],
+            if success {
+                "usable"
+            } else if starting {
+                "unverified"
+            } else {
+                "needs_target_recovery"
+            }
+        );
         let contender = fs::File::open(&lease_path).unwrap();
         assert_ne!(
             unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
@@ -971,6 +1090,120 @@ with open(os.environ['FIXTURE_LEASE_PATH'], 'r+') as contender:
         );
         assert!(!prefix.join("versions/9.9.9").exists());
         assert!(fs::read_to_string(actions).unwrap_or_default().is_empty());
+        return;
+    }
+    if publish_failure == Some("external-recovery") {
+        assert!(!output.status.success(), "{output:?}");
+        assert_eq!(
+            fs::read_link(prefix.join("current")).unwrap(),
+            Path::new("versions/9.9.9")
+        );
+        assert_eq!(fs::read_to_string(&running).unwrap(), "new\n");
+        assert!(prefix.join("versions/9.9.9/bin/cagents").exists());
+        let calls = fs::read_to_string(&actions).unwrap();
+        assert_eq!(
+            calls, "external:ready\n",
+            "no installer start, old restart or stop is permitted"
+        );
+        assert!(
+            !checkpoint.exists(),
+            "the converter and checkpoint paths were not involved"
+        );
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&fs::read(&outcome).unwrap()).unwrap();
+        assert_eq!(
+            receipt["outcome"]["state"], "usable",
+            "the actual recovery writer must be verified"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("instead of rewinding its binaries")
+        );
+        assert!(
+            !fs::read_to_string(&census_log)
+                .unwrap()
+                .lines()
+                .any(|probe| probe == "inspect"),
+            "a verified live recovery writer must not enter stopped-source inspection"
+        );
+        return;
+    }
+    if restart == Some("census-capture-failure")
+        || restart.is_some_and(|mode| mode.starts_with("provided-census-"))
+    {
+        assert!(!output.status.success());
+        assert_eq!(
+            fs::read_link(prefix.join("current")).unwrap(),
+            Path::new("versions/old")
+        );
+        assert_eq!(fs::read_to_string(&running).unwrap(), "old\n");
+        assert!(fs::read_to_string(&actions).unwrap_or_default().is_empty());
+        assert!(!checkpoint.exists());
+        assert!(String::from_utf8_lossy(&output.stderr).contains(
+            if restart == Some("census-capture-failure") {
+                "cannot capture the terminal inventory"
+            } else {
+                "supplied terminal census is invalid or no longer matches"
+            }
+        ));
+        return;
+    }
+    let recovery_required = restart.is_some_and(|mode| {
+        matches!(
+            mode,
+            "census-missing" | "census-unready" | "empty-recovery-unready"
+        )
+    }) || (restart.is_some_and(|mode| matches!(mode, "start-failure"))
+        || (restart == Some("success") && publish_failure.is_some()));
+    if recovery_required {
+        assert!(!output.status.success(), "{output:?}");
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&fs::read(&outcome).unwrap()).unwrap();
+        assert!(
+            receipt["outcome"]["state"] == "unverified"
+                || receipt["outcome"]["state"] == "needs_target_recovery",
+            "{receipt}"
+        );
+        assert!(
+            prefix.join("versions/9.9.9/bin/cagents").exists(),
+            "unverified recovery must retain its target"
+        );
+        if restart != Some("empty-recovery-unready") {
+            assert_eq!(
+                fs::read_link(prefix.join("current")).unwrap(),
+                Path::new("versions/9.9.9"),
+                "Prepared recovery keeps its capable target selected"
+            );
+        }
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            diagnostic.contains("original terminal survival is unverified"),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("--no-start daemon status"),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("--no-start terminal list"),
+            "{diagnostic}"
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("your sessions are ready"));
+        assert_eq!(
+            fs::read(&checkpoint).ok(),
+            if restart == Some("empty-recovery-unready") {
+                None
+            } else {
+                Some(b"exact-conversation-and-shells\n".to_vec())
+            }
+        );
+        if restart != Some("empty-recovery-unready") {
+            assert!(
+                !fs::read_to_string(&actions)
+                    .unwrap_or_default()
+                    .contains("old:start"),
+                "a Prepared checkpoint must not be offered to the old daemon"
+            );
+        }
         return;
     }
     let success = !matches!(download, Some("gh-failure" | "auth-failure"))
@@ -1056,8 +1289,16 @@ with open(os.environ['FIXTURE_LEASE_PATH'], 'r+') as contender:
             assert_eq!(marker["version"], 1);
             assert!(
                 String::from_utf8_lossy(&output.stdout)
-                    .contains("running windows and daemon were preserved")
+                    .contains("existing windows and the previous service state were preserved")
             );
+            if coordinator == "stage-no-source" {
+                assert!(!running.exists());
+                let receipt: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&outcome).unwrap()).unwrap();
+                assert_eq!(receipt["outcome"]["state"], "no_source");
+                assert!(!String::from_utf8_lossy(&output.stdout).contains("daemon is running"));
+                return;
+            }
         }
     } else if restart == Some("empty-start-unknown") {
         assert_eq!(actions, "require-empty\nnew:start\n");
@@ -1254,17 +1495,17 @@ fn installer_passes_a_declined_relaunch_only_to_a_cli_that_would_otherwise_accep
 }
 
 #[test]
-fn checkpointed_publication_failure_restarts_previous_version_from_handoff() {
+fn checkpointed_publication_failure_requires_target_recovery() {
     upgrade_fixture(false, 7, Some("error"), Some("success"));
 }
 
 #[test]
-fn checkpointed_publication_interruption_restarts_previous_version_from_handoff() {
+fn checkpointed_publication_interruption_requires_target_recovery() {
     upgrade_fixture(true, 7, Some("signal"), Some("success"));
 }
 
 #[test]
-fn checkpointed_start_failure_restarts_previous_version_from_handoff() {
+fn checkpointed_start_failure_requires_target_recovery() {
     upgrade_fixture(false, 7, None, Some("start-failure"));
 }
 
@@ -1329,7 +1570,7 @@ fn private_authentication_failure_preserves_installation_without_anonymous_downl
 }
 
 #[test]
-fn staging_preserves_daemons_and_rolls_back_publication_without_control_calls() {
+fn staging_preserves_daemons_and_rolls_back_without_mutating_sessions() {
     for compatible in [true, false] {
         for failure in [None, Some("publish"), Some("signal"), Some("outer-signal")] {
             for coordinator in ["installed", "candidate", "legacy"] {
@@ -1437,4 +1678,41 @@ fn inherited_starting_daemon_keeps_its_new_version_on_installer_failure() {
         "inherited_starting_daemon_keeps_its_new_version_on_installer_failure",
         &["handoff-starting"],
     );
+}
+
+#[test]
+fn successful_start_requires_ready_socket_and_complete_terminal_census() {
+    upgrade_fixture(false, 7, None, Some("census-missing"));
+    upgrade_fixture(false, 7, None, Some("census-unready"));
+}
+
+#[test]
+fn zero_exit_old_restart_without_readiness_keeps_failure_and_recovery_target() {
+    upgrade_fixture(false, 0, None, Some("empty-recovery-unready"));
+}
+
+#[test]
+fn failed_census_capture_refuses_before_preparing_or_stopping_source() {
+    upgrade_fixture(false, 7, None, Some("census-capture-failure"));
+}
+
+#[test]
+fn staging_proves_absent_source_without_claiming_a_usable_daemon() {
+    coordinated_release_mode(true, 0, None, None, None, "stage-no-source", true);
+}
+
+#[test]
+fn externally_started_recovery_writer_before_installer_start_prevents_binary_rollback() {
+    upgrade_fixture(true, 7, Some("external-recovery"), None);
+}
+
+#[test]
+fn supplied_census_must_validate_and_match_before_source_shutdown() {
+    for mode in [
+        "provided-census-missing",
+        "provided-census-malformed",
+        "provided-census-mismatch",
+    ] {
+        upgrade_fixture(false, 7, None, Some(mode));
+    }
 }

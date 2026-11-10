@@ -127,6 +127,8 @@ pub(super) fn perform(
     let confirmed = confirmation::wait(state, job, |policy| {
         Ok(context.apply(observe(policy)?.with_inspection(&inspection)))
     })?;
+    let mut recovery = recovery::Context::default();
+    recovery.capture(state, job)?;
     set_phase(
         state,
         job,
@@ -148,7 +150,6 @@ pub(super) fn perform(
         Err(UpdateError::Cancelled) => UpdateError::Cancelled,
         _ => UpdateError::from(error),
     })?;
-    let mut shutdown_requested = false;
     let mut previous = None;
     let mut original_schema = None;
     let mut startup_attempted = false;
@@ -186,8 +187,15 @@ pub(super) fn perform(
                 return Err(invalid("The installed source changed before shutdown"));
             }
             previous = (owner.version_root != root).then_some(owner.version_root);
+            if recovery.census.as_ref().and_then(|c| c.source.as_ref()) != Some(client.proof())
+                || source.exited()?
+            {
+                return Err(invalid(
+                    "The census belongs to a different source; shutdown was not requested",
+                ));
+            }
             confirmation::prepared(state, job)?;
-            shutdown_requested = true;
+            recovery.shutdown_requested = true;
             client
                 .prepare_confirmed_upgrade(daemon, false)
                 .map_err(|error| invalid(error.to_string()))?;
@@ -245,7 +253,7 @@ pub(super) fn perform(
     })();
     let mut restored_previous = false;
     if result.is_err()
-        && shutdown_requested
+        && recovery.shutdown_requested
         && let Some(previous) = previous.as_ref()
     {
         match rollback_stopped_candidate(
@@ -287,15 +295,24 @@ pub(super) fn perform(
         job,
         &result,
         handoff,
-        shutdown_requested,
+        &recovery,
         &guard,
     );
+    recovery_result?;
     let reopened = guard
         .relaunch_windows(&windows, &reopen.join("bin/cagents-ui"))
         .map_err(UpdateError::from);
-    recovery_result?;
-    result?;
-    reopened
+    verify_reopened_service(&recovery, state, job)?;
+    if let Err(error) = reopened {
+        return report_recovery_failure(
+            state,
+            job,
+            invalid(format!(
+                "The daemon is ready and its original inventory was verified, but some saved windows did not reopen: {error}. Run `cagents ui` to reopen the saved workspace."
+            )),
+        );
+    }
+    result
 }
 
 /// Store maintenance receives the reservation intentionally; status probes
@@ -364,6 +381,13 @@ fn rollback_stopped_candidate(
     };
     if crate::daemon::daemon_process_alive_at(&paths).map_err(|error| invalid(error.to_string()))? {
         return Ok(false);
+    }
+    if recovery::checkpoint_status()?
+        .is_some_and(|s| s.phase != crate::upgrade::handoff::Phase::Ready)
+    {
+        return Err(invalid(
+            "The checkpoint requires capable-target recovery; the candidate and current pointer were retained. No previous executable was restarted.",
+        ));
     }
     if startup_spawned {
         let schema = schema.ok_or_else(|| invalid("The previous store schema was not captured"))?;

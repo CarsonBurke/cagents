@@ -5,6 +5,8 @@ mod candidate;
 mod confirmation;
 mod handoff;
 mod installed;
+pub(crate) mod recovery;
+pub use recovery::TargetRecoveryRequired;
 pub(crate) mod source;
 pub use confirmation::{Choice as UpdateChoice, Confirmation as UpdateConfirmation, decide};
 pub mod impact;
@@ -76,6 +78,8 @@ pub enum UpdateError {
     Invalid(String),
     #[error("another update is already running")]
     Busy,
+    #[error(transparent)]
+    TargetRecoveryRequired(#[from] recovery::TargetRecoveryRequired),
     #[error("Update cancelled")]
     Cancelled,
     #[error("{0} timed out")]
@@ -1079,6 +1083,7 @@ pub fn run_worker(job_id: &str) -> Result<(), UpdateError> {
     // the selected version. Neither close may unlock a serving successor.
     let mut handoff = None;
     let result = perform_update(&installation, &state, &mut job, &mut handoff);
+    let settled_failure = job.phase == UpdatePhase::Failed && result.is_err();
     job.phase = if matches!(result, Err(UpdateError::Cancelled)) {
         UpdatePhase::Cancelled
     } else if result.is_ok() {
@@ -1089,9 +1094,17 @@ pub fn run_worker(job_id: &str) -> Result<(), UpdateError> {
     job.confirmation = None;
     job.message = match &result {
         Ok(()) => "Update installed; saved windows reopened".into(),
+        Err(_) if settled_failure => job.message.clone(),
         Err(error) => error.to_string(),
     };
-    write_job(&state, &job)?;
+    if let Err(error) = write_job(&state, &job) {
+        if result.is_ok() {
+            return Err(error);
+        }
+        // Preserve a typed recovery request even when its human-readable job
+        // status cannot be recorded. The caller still owns handoff custody.
+        eprintln!("Could not record update result: {error}");
+    }
     result
 }
 
@@ -1159,6 +1172,8 @@ fn perform_update(
         Installation::detect()?;
         Ok(context.apply(observe_impact(&staged.identity, policy)?.with_inspection(&inspection)))
     })?;
+    let mut recovery = recovery::Context::default();
+    recovery.capture(state, job)?;
     set_phase(
         state,
         job,
@@ -1180,7 +1195,6 @@ fn perform_update(
         Err(UpdateError::Cancelled) => UpdateError::Cancelled,
         _ => UpdateError::from(error),
     })?;
-    let mut shutdown_requested = false;
     let install_result = (|| {
         Installation::detect()?;
         let current = observe_impact(
@@ -1205,8 +1219,15 @@ fn perform_update(
             let source =
                 crate::daemon::lease_handoff::HandoffSource::pin(&paths, &daemon.capability.proof)
                     .map_err(|error| invalid(error.to_string()))?;
+            if recovery.census.as_ref().and_then(|c| c.source.as_ref()) != Some(client.proof())
+                || source.exited()?
+            {
+                return Err(invalid(
+                    "The census belongs to a different source; shutdown was not requested",
+                ));
+            }
             confirmation::prepared(state, job)?;
-            shutdown_requested = true;
+            recovery.shutdown_requested = true;
             client
                 .prepare_confirmed_upgrade(daemon, false)
                 .map_err(|error| invalid(error.to_string()))?;
@@ -1228,6 +1249,7 @@ fn perform_update(
             current.replaces_daemon,
             &guard,
             handoff.as_ref(),
+            &job.id,
         )
     })();
     let recovery_result = finish_handoff(
@@ -1236,18 +1258,55 @@ fn perform_update(
         job,
         &install_result,
         handoff,
-        shutdown_requested,
+        &recovery,
         &guard,
     );
+    // Do not let a recovery UI autostart the frozen previous executable while
+    // ownership or Prepared recovery is unresolved.
+    recovery_result?;
     let reopen_result = guard
         .relaunch_windows(
             &windows,
             &installation.prefix.join("current/bin/cagents-ui"),
         )
         .map_err(UpdateError::from);
-    recovery_result?;
-    install_result?;
-    reopen_result
+    verify_reopened_service(&recovery, state, job)?;
+    if let Err(error) = reopen_result {
+        return report_recovery_failure(
+            state,
+            job,
+            invalid(format!(
+                "The daemon is ready and its original inventory was verified, but some saved windows did not reopen: {error}. Run `cagents ui` to reopen the saved workspace."
+            )),
+        );
+    }
+    install_result
+}
+
+fn verify_reopened_service(
+    recovery: &recovery::Context,
+    state: &Path,
+    job: &mut UpdateJob,
+) -> Result<(), UpdateError> {
+    let census = recovery
+        .census
+        .as_ref()
+        .ok_or_else(|| invalid("No pre-update census exists; recovery readiness is unverified"))?;
+    let receipt = census.verify_with_target(
+        &state
+            .parent()
+            .ok_or_else(|| invalid("Update state has no installation root"))?
+            .join("versions")
+            .join(&job.version),
+        state,
+        &job.id,
+    )?;
+    receipt.save(&recovery::outcome_path(state, &job.id))?;
+    if receipt.usable() {
+        Ok(())
+    } else {
+        report_recovery_failure(state, job, receipt.failure())
+    }
 }
 
 struct ReviewContext {
@@ -1568,15 +1627,74 @@ fn finish_handoff(
     job: &mut UpdateJob,
     result: &Result<(), UpdateError>,
     handoff: &mut Option<crate::daemon::lease_handoff::LeaseHandoff>,
-    shutdown_requested: bool,
+    recovery: &recovery::Context,
     guard: &crate::instance::UiUpdateGuard,
 ) -> Result<(), UpdateError> {
-    let recovery_needed = shutdown_requested || handoff.is_some();
-    let recorded = record_handoff_failure(state, job, result, handoff);
-    // Success has confirmed serving readiness. Only close our copy: LOCK_UN
-    // would also unlock the successor's shared open-file description.
-    drop(handoff.take());
-    if recovery_needed && result.is_err() && !daemon_serving() {
+    let needed = recovery.shutdown_requested || handoff.is_some();
+    let Some(census) = recovery.census.as_ref() else {
+        if needed || result.is_ok() {
+            return report_recovery_failure(
+                state,
+                job,
+                invalid(
+                    "No pre-update terminal census exists. Readiness and surviving terminals are unverified. Keep saved panes and inspect `cagents --no-start terminal list` before retrying.",
+                ),
+            );
+        }
+        record_handoff_failure(state, job, result, handoff)?;
+        return Ok(());
+    };
+    let outcome_path = recovery::outcome_path(state, &job.id);
+    let target = installation.prefix.join("versions").join(&job.version);
+    // Persistence is subordinate to restoring service. Keep recording errors
+    // separate so disk-full or an unwritable job directory cannot suppress the
+    // one permitted start after shutdown has already been requested.
+    let mut recording_errors = Vec::new();
+    let mut verified = probe_recovery(census, &target, state, &job.id, &mut recording_errors)?;
+    if verified.usable() {
+        let saved = verified.save(&outcome_path);
+        let recorded = record_handoff_failure(state, job, result, handoff);
+        drop(handoff.take());
+        recording_errors.extend(saved.err().map(|e| e.to_string()));
+        recording_errors.extend(recorded.err().map(|e| e.to_string()));
+        return finish_recording_recovery(state, job, recording_errors);
+    }
+    if needed {
+        let permission = match census.inspect_restart() {
+            Ok(p) => p,
+            Err(error) => {
+                let receipt = census.unverified(error.to_string())?;
+                if let Err(error) = receipt.save(&outcome_path) {
+                    eprintln!("Could not save recovery proof: {error}");
+                }
+                return report_recovery_failure(state, job, receipt.failure());
+            }
+        };
+        if let Some(required) = permission.target_required() {
+            if let Err(error) = permission.save(&outcome_path) {
+                eprintln!("Could not save target recovery request: {error}");
+            }
+            return report_recovery_failure(
+                state,
+                job,
+                UpdateError::TargetRecoveryRequired(required),
+            );
+        }
+    }
+    // Protocol rejection or a failed verifier is not proof that the socket is
+    // dead. Preserve any listener rather than starting a competing daemon.
+    let socket_has_listener = crate::terminal_ipc::daemon_socket_path()
+        .ok()
+        .is_some_and(|p| std::os::unix::net::UnixStream::connect(p).is_ok());
+    if result.is_ok() || verified.has_listener() || socket_has_listener {
+        if let Err(error) = verified.save(&outcome_path) {
+            eprintln!("Could not save recovery proof: {error}");
+        }
+        return report_recovery_failure(state, job, verified.failure());
+    }
+    if needed {
+        let recorded = record_handoff_failure(state, job, result, handoff);
+        drop(handoff.take());
         let mut command = Command::new(installation.prefix.join("current/bin/cagents"));
         command.args(["daemon", "start"]);
         crate::install_guard::sanitize_child_environment(&mut command);
@@ -1586,22 +1704,84 @@ fn finish_handoff(
             &mut command,
             crate::install_guard::daemon_start_timeout()?,
         );
-        if let Err(failure) = started {
-            eprintln!("Recovery daemon start failed: {}", failure.error);
-            job.message.push_str(" The terminal service could not restart. Run `cagents daemon start` to recover your saved panes.");
-            write_job(state, job)?;
-            return Err(invalid(job.message.clone()));
+        verified = probe_recovery(census, &target, state, &job.id, &mut recording_errors)?;
+        recording_errors.extend(recorded.err().map(|e| e.to_string()));
+        recording_errors.extend(verified.save(&outcome_path).err().map(|e| e.to_string()));
+        if !verified.usable() {
+            return report_recovery_failure(state, job, verified.failure());
         }
+        if let Err(error) = started {
+            return report_recovery_failure(
+                state,
+                job,
+                invalid(format!(
+                    "The daemon is Ready and its original inventory was verified, but its startup command reported failure: {error}. Run `cagents --no-start daemon status` and inspect the update log before retrying.",
+                    error = error.error,
+                )),
+            );
+        }
+        job.message.push_str(
+            " The terminal service is ready and its original terminal inventory was verified.",
+        );
+        recording_errors.extend(write_job(state, job).err().map(|e| e.to_string()));
+        finish_recording_recovery(state, job, recording_errors)
+    } else {
+        if let Err(error) = verified.save(&outcome_path) {
+            eprintln!("Could not save recovery proof: {error}");
+        }
+        report_recovery_failure(state, job, verified.failure())
     }
-    recorded
 }
 
-/// A lock reservation alone is not a serving daemon. Recovery must work even
-/// when shutdown failed before the worker acquired that reservation.
-fn daemon_serving() -> bool {
-    crate::terminal_ipc::daemon_socket_path()
-        .ok()
-        .is_some_and(|socket| source::Client::connect(&socket).is_ok())
+fn probe_recovery(
+    census: &recovery::Census,
+    target: &Path,
+    state: &Path,
+    job_id: &str,
+    errors: &mut Vec<String>,
+) -> Result<recovery::Receipt, UpdateError> {
+    match census.verify_with_target(target, state, job_id) {
+        Ok(receipt) => Ok(receipt),
+        Err(error) => {
+            errors.push(error.to_string());
+            census.verify()
+        }
+    }
+}
+
+fn finish_recording_recovery(
+    state: &Path,
+    job: &mut UpdateJob,
+    errors: Vec<String>,
+) -> Result<(), UpdateError> {
+    if errors.is_empty() {
+        return Ok(());
+    }
+    report_recovery_failure(
+        state,
+        job,
+        invalid(format!(
+            "The daemon is Ready and its original inventory was verified, but the update could not record recovery: {}. Run `cagents --no-start daemon status` and `cagents --no-start terminal list`; repair the update-state directory permissions or free disk space before retrying.",
+            errors.join("; ")
+        )),
+    )
+}
+
+fn report_recovery_failure(
+    state: &Path,
+    job: &mut UpdateJob,
+    error: UpdateError,
+) -> Result<(), UpdateError> {
+    job.phase = UpdatePhase::Failed;
+    job.confirmation = None;
+    if !job.message.is_empty() {
+        job.message.push(' ');
+    }
+    job.message.push_str(&error.to_string());
+    if let Err(record_error) = write_job(state, job) {
+        eprintln!("Could not record update failure: {record_error}. {error}");
+    }
+    Err(error)
 }
 
 fn run_installer(
@@ -1613,6 +1793,7 @@ fn run_installer(
     restart_daemon: bool,
     guard: &crate::instance::UiUpdateGuard,
     handoff: Option<&crate::daemon::lease_handoff::LeaseHandoff>,
+    job_id: &str,
 ) -> Result<(), UpdateError> {
     // Keep sources above the destinations so remapping cannot overwrite a
     // still-needed input, even in a worker with many open descriptors.
@@ -1641,6 +1822,14 @@ fn run_installer(
             format!("/proc/self/fd/{}", inherited_files[2]),
         )
         .env("CAGENTS_REPOSITORY", REPOSITORY)
+        .env(
+            recovery::CENSUS_ENV,
+            recovery::census_path(&installation.prefix.join(".update"), job_id),
+        )
+        .env(
+            recovery::OUTCOME_ENV,
+            recovery::outcome_path(&installation.prefix.join(".update"), job_id),
+        )
         .env(
             "CAGENTS_INSTALL_OWNER_CLI",
             installation
@@ -3738,6 +3927,12 @@ finally:
             for failure in [
                 "reserved-start-failure",
                 "shutdown-requested-without-reservation",
+                "start-exit-zero-without-service",
+                "ready-missing-terminal",
+                "retained-listener",
+                "prepared-target-handoff",
+                "recovery-recording-failure",
+                "start-nonzero-with-service",
             ] {
                 let output = Command::new(std::env::current_exe().unwrap())
                     .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
@@ -3760,32 +3955,105 @@ finally:
             // the update fence. Recovery has to inherit that exact authority.
             let _admission = crate::instance::DaemonAdmissionGuard::acquire().unwrap();
             let root = PathBuf::from(std::env::var_os("CAGENTS_TEST_HEADLESS_ROOT").unwrap());
+            let paths = RuntimePaths::discover().unwrap();
             let lock = OpenOptions::new()
                 .read(true)
                 .write(true)
-                .open(root.join("runtime/cagentsd.lock"))
+                .open(&paths.lock)
                 .unwrap();
             assert_eq!(
                 unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
                 0
             );
-            let socket =
-                std::os::unix::net::UnixListener::bind(root.join("runtime/cagentsd.sock")).unwrap();
-            fs::write(root.join("daemon-ready"), b"serving").unwrap();
+            let proof = crate::model::HostSessionProof {
+                host_session_id: crate::model::HostSessionId::new("recovered-fixture"),
+                boot_id: crate::daemon::read_boot_id().unwrap(),
+                host_incarnation: crate::model::HostIncarnation::new("recovered-fixture"),
+            };
+            fs::write(
+                &paths.lock,
+                serde_json::to_vec(&serde_json::json!({"pid":std::process::id(),"proof":proof}))
+                    .unwrap(),
+            )
+            .unwrap();
+            let socket = std::os::unix::net::UnixListener::bind(&paths.socket).unwrap();
+            socket.set_nonblocking(true).unwrap();
+            fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600)).unwrap();
+            fs::write(root.join("daemon-ready"), b"listener").unwrap();
+            use crate::terminal_ipc::{
+                ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage,
+                ServerResponse, StartupState, read_frame, write_frame,
+            };
             while !root.join("daemon-exit").exists() {
-                thread::sleep(Duration::from_millis(5));
+                let (mut stream, _) = match socket.accept() {
+                    Ok(c) => c,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(e) => panic!("{e}"),
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                while let Ok(Some(envelope)) = read_frame::<ClientEnvelope>(&mut stream) {
+                    let response = match envelope.request {
+                        ClientRequest::Connect { .. } => ServerResponse::Connected {
+                            proof: proof.clone(),
+                            resumed: vec![],
+                        },
+                        ClientRequest::ShutdownV1 {
+                            version: crate::terminal_ipc::SHUTDOWN_VERSION,
+                            operation: crate::terminal_ipc::ShutdownOperation::Preflight,
+                        } => ServerResponse::ShutdownPreflight(
+                            crate::terminal_ipc::ShutdownPreflight {
+                                capability: crate::terminal_ipc::ShutdownCapability {
+                                    proof: proof.clone(),
+                                    token: "fixture-inventory-fence".into(),
+                                    inventory_generation: 0,
+                                    live_terminals: 0,
+                                    background_subagents: 0,
+                                    background_identity: String::new(),
+                                    expires_at_unix_ms: i64::MAX,
+                                },
+                            },
+                        ),
+                        ClientRequest::StartupState => ServerResponse::StartupState(
+                            if std::env::var("CAGENTS_TEST_RECOVERY_FAILURE").unwrap()
+                                == "retained-listener"
+                            {
+                                StartupState::Retained {
+                                    detail: "retained test ownership".into(),
+                                }
+                            } else {
+                                StartupState::Ready
+                            },
+                        ),
+                        ClientRequest::List => ServerResponse::Listed { terminals: vec![] },
+                        ClientRequest::ChatList => ServerResponse::ChatListed { sessions: vec![] },
+                        _ => panic!("unexpected verification request"),
+                    };
+                    if write_frame(
+                        &mut stream,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id: Some(envelope.request_id),
+                            proof: proof.clone(),
+                            message: ServerMessage::Response { response },
+                        },
+                    )
+                    .is_err()
+                    {
+                        break;
+                    }
+                }
             }
             crate::daemon::shut_down_test_listener(socket);
             return;
         }
         let guard = crate::instance::UiUpdateGuard::acquire().unwrap();
         let root = tempfile::tempdir().unwrap();
-        let directory = root.path().join("runtime");
-        let paths = RuntimePaths {
-            socket: directory.join(crate::terminal_ipc::SOCKET_FILE_NAME),
-            lock: directory.join("cagentsd.lock"),
-            directory,
-        };
+        let paths = RuntimePaths::discover().unwrap();
         let proof = crate::model::HostSessionProof {
             host_session_id: crate::model::HostSessionId::new("headless-recovery"),
             boot_id: crate::daemon::read_boot_id().unwrap(),
@@ -3793,8 +4061,11 @@ finally:
         };
         drop(HostLease::acquire(&paths, &proof).unwrap());
         let failure = std::env::var("CAGENTS_TEST_RECOVERY_FAILURE").unwrap();
-        let mut lease = (failure == "reserved-start-failure")
-            .then(|| LeaseHandoff::wait(&paths, std::process::id()).unwrap());
+        let mut lease = matches!(
+            failure.as_str(),
+            "reserved-start-failure" | "prepared-target-handoff"
+        )
+        .then(|| LeaseHandoff::wait(&paths, std::process::id()).unwrap());
         let installation = Installation {
             prefix: root.path().into(),
             version: "old".into(),
@@ -3808,9 +4079,12 @@ finally:
 import json, os, pathlib, subprocess, sys, time
 root = pathlib.Path(__file__).resolve().parents[3]
 assert sys.argv[1:] == ['daemon','start']  # No second source prepare.
+with (root/'start-attempts').open('a') as f: f.write('attempt\n')
+if os.environ['CAGENTS_TEST_RECOVERY_FAILURE']=='start-exit-zero-without-service': sys.exit(0)
 assert 'CAGENTS_DAEMON_LEASE_FD' not in os.environ
 assert not pathlib.Path('/proc/self/fd/199').exists()
-assert json.loads((root/'status.json').read_text())['phase'] == 'Failed'
+if os.environ['CAGENTS_TEST_RECOVERY_FAILURE']!='recovery-recording-failure':
+    assert json.loads((root/'status.json').read_text())['phase'] == 'Failed'
 os.environ['CAGENTS_TEST_HEADLESS_RECOVERY']='daemon'
 os.environ['CAGENTS_TEST_HEADLESS_ROOT']=str(root)
 child = subprocess.Popen([os.environ['CAGENTS_TEST_HEADLESS_EXEC'], '--exact',
@@ -3821,6 +4095,7 @@ child = subprocess.Popen([os.environ['CAGENTS_TEST_HEADLESS_EXEC'], '--exact',
 while not (root/'daemon-ready').exists():
     if child.poll() is not None: sys.exit(1)
     time.sleep(.005)
+if os.environ['CAGENTS_TEST_RECOVERY_FAILURE']=='start-nonzero-with-service': sys.exit(1)
 "#;
         fs::write(bin.join("cagents"), script).unwrap();
         fs::set_permissions(bin.join("cagents"), fs::Permissions::from_mode(0o700)).unwrap();
@@ -3839,16 +4114,101 @@ while not (root/'daemon-ready').exists():
             log_path: root.path().join("worker.log"),
             confirmation: None,
         };
-        finish_handoff(
+        let census: recovery::Census=serde_json::from_value(serde_json::json!({"version":1,"transaction":job.id,"source":proof,"terminals":[],"chats":[]})).unwrap();
+        let census = if failure == "ready-missing-terminal" {
+            let missing = crate::terminal_ipc::TerminalDescriptor::relaunchable(
+                crate::model::TerminalId::new(),
+                crate::model::LaunchRecipe {
+                    program: "/bin/sh".into(),
+                    arguments: vec![],
+                    working_directory: "/private".into(),
+                    environment: Default::default(),
+                    unset_environment: Default::default(),
+                },
+                None,
+            );
+            serde_json::from_value(serde_json::json!({"version":1,"transaction":job.id,"source":proof,"terminals":[missing.session],"chats":[]})).unwrap()
+        } else {
+            census
+        };
+        let context = recovery::Context {
+            shutdown_requested: true,
+            census: Some(census),
+        };
+        let prepared = if failure == "prepared-target-handoff" {
+            let store = crate::upgrade::handoff::Store::discover().unwrap();
+            store
+                .save(&crate::upgrade::handoff::Checkpoint::new(
+                    proof.clone(),
+                    vec![],
+                    vec![],
+                    vec![],
+                ))
+                .unwrap();
+            Some((store.path.clone(), fs::read(&store.path).unwrap()))
+        } else {
+            None
+        };
+        if failure == "recovery-recording-failure" {
+            fs::create_dir(root.path().join("status.json")).unwrap();
+            fs::create_dir(recovery::outcome_path(root.path(), &job.id)).unwrap();
+        }
+        let settled = finish_handoff(
             &installation,
             root.path(),
             &mut job,
-            &Err(invalid(failure)),
+            &Err(invalid(failure.clone())),
             &mut lease,
-            true,
+            &context,
             &guard,
-        )
-        .unwrap();
+        );
+        if let Some((path, bytes)) = prepared {
+            assert!(matches!(
+                settled,
+                Err(UpdateError::TargetRecoveryRequired(_))
+            ));
+            assert_eq!(fs::read(path).unwrap(), bytes);
+            assert!(
+                lease.is_some(),
+                "handoff custody must remain for the target owner"
+            );
+            assert!(!root.path().join("start-attempts").exists());
+            return;
+        }
+        let expected_failure = matches!(
+            failure.as_str(),
+            "start-exit-zero-without-service"
+                | "ready-missing-terminal"
+                | "retained-listener"
+                | "recovery-recording-failure"
+                | "start-nonzero-with-service"
+        );
+        assert_eq!(settled.is_err(), expected_failure, "{failure}: {settled:?}");
+        assert_eq!(
+            fs::read_to_string(root.path().join("start-attempts")).unwrap(),
+            "attempt\n"
+        );
+        if expected_failure {
+            if failure == "recovery-recording-failure" {
+                assert!(root.path().join("daemon-ready").exists());
+                assert!(HostLease::is_held(&paths).unwrap());
+                assert!(job.message.contains("could not record recovery"));
+            } else if failure == "start-nonzero-with-service" {
+                assert!(root.path().join("daemon-ready").exists());
+                assert!(job.message.contains("inventory was verified"));
+                assert!(job.message.contains("startup command reported failure"));
+            } else {
+                assert!(job.message.contains("unverified"));
+            }
+            assert!(job.message.contains("--no-start daemon status"));
+            fs::write(root.path().join("daemon-exit"), b"exit").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while HostLease::is_held(&paths).unwrap() {
+                assert!(Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(5));
+            }
+            return;
+        }
         assert!(lease.is_none());
         assert!(root.path().join("daemon-ready").exists());
         assert!(std::os::unix::net::UnixStream::connect(&paths.socket).is_ok());

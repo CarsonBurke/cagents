@@ -292,6 +292,31 @@ pub enum DaemonCommand {
     /// Validate inherited updater authority without probing daemon liveness.
     #[command(hide = true)]
     VerifyUpdateLease,
+    #[command(hide = true)]
+    CaptureUpdateCensus {
+        #[arg(long)]
+        output: PathBuf,
+    },
+    #[command(hide = true)]
+    VerifyUpdateCensus {
+        #[arg(long)]
+        validate_only: bool,
+        #[arg(long)]
+        require_original: bool,
+        #[arg(long)]
+        allow_absent: bool,
+        #[arg(long)]
+        census: PathBuf,
+        #[arg(long)]
+        outcome: PathBuf,
+    },
+    #[command(hide = true)]
+    InspectUpdateRecovery {
+        #[arg(long)]
+        census: PathBuf,
+        #[arg(long)]
+        outcome: PathBuf,
+    },
     /// Finish a staged installation through the same reviewed update flow as the app.
     Upgrade {
         /// Approve the displayed impact without an interactive prompt.
@@ -2497,6 +2522,9 @@ where
                 | DaemonCommand::Start
                 | DaemonCommand::Stop { .. }
                 | DaemonCommand::Preflight
+                | DaemonCommand::CaptureUpdateCensus { .. }
+                | DaemonCommand::VerifyUpdateCensus { .. }
+                | DaemonCommand::InspectUpdateRecovery { .. }
                 | DaemonCommand::PrepareUpgrade { .. }
                 | DaemonCommand::Upgrade { .. }
                 | DaemonCommand::AbandonUpgrade { .. }
@@ -2813,6 +2841,9 @@ fn routes_to_staged_owner(command: &TopCommand) -> bool {
             | TopCommand::Daemon {
                 command: DaemonCommand::ProtocolVersion
                     | DaemonCommand::VerifyUpdateLease
+                    | DaemonCommand::CaptureUpdateCensus { .. }
+                    | DaemonCommand::VerifyUpdateCensus { .. }
+                    | DaemonCommand::InspectUpdateRecovery { .. }
                     | DaemonCommand::StopForRebuild { .. }
                     | DaemonCommand::Upgrade { .. }
                     | DaemonCommand::StoreSchema
@@ -3364,6 +3395,63 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                 command: "daemon.start",
                 data,
                 human: format!("{} daemon running ({})", instance::NAME, socket.display()),
+            })
+        }
+        DaemonCommand::CaptureUpdateCensus { output } => {
+            crate::update::recovery::capture_file(&output)
+                .map_err(|e| AppError::new("update_census", e))?;
+            Ok(CommandOutput {
+                command: "daemon.capture_update_census",
+                data: json!({"captured":true}),
+                human: "Pre-update service census saved".into(),
+            })
+        }
+        DaemonCommand::VerifyUpdateCensus {
+            census,
+            outcome,
+            allow_absent,
+            require_original,
+            validate_only,
+        } => {
+            if validate_only {
+                crate::update::recovery::validate_file(&census)
+                    .map_err(|e| AppError::new("update_census", e))?;
+                return Ok(CommandOutput {
+                    command: "daemon.verify_update_census",
+                    data: json!({"validated":true,"usable":false}),
+                    human: "Private census validated; daemon readiness has not been verified"
+                        .into(),
+                });
+            }
+            let receipt = crate::update::recovery::verify_file(
+                &census,
+                &outcome,
+                false,
+                allow_absent,
+                require_original,
+            )
+            .map_err(|e| AppError::new("update_recovery", e))?;
+            Ok(CommandOutput {
+                command: "daemon.verify_update_census",
+                data: serde_json::to_value(&receipt)
+                    .map_err(|e| AppError::new("update_recovery", e))?,
+                human: if matches!(receipt.outcome, crate::update::recovery::Outcome::NoSource) {
+                    "No source daemon was running; staging preserved that state"
+                } else {
+                    "Daemon ready; original terminal inventory verified"
+                }
+                .into(),
+            })
+        }
+        DaemonCommand::InspectUpdateRecovery { census, outcome } => {
+            let receipt =
+                crate::update::recovery::verify_file(&census, &outcome, true, false, false)
+                    .map_err(|e| AppError::new("update_recovery", e))?;
+            Ok(CommandOutput {
+                command: "daemon.inspect_update_recovery",
+                data: serde_json::to_value(receipt)
+                    .map_err(|e| AppError::new("update_recovery", e))?,
+                human: "Checkpoint permits one ordinary startup attempt".into(),
             })
         }
         DaemonCommand::VerifyUpdateLease => {

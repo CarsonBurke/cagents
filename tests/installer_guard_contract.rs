@@ -828,7 +828,7 @@ fn external_installer_saves_closes_and_reopens_windows_even_on_failure() {
         let ui = bin.join("cagents-ui");
         fs::write(
             &ui,
-            "#!/bin/sh\ntest -z \"${CAGENTS_UI_UPDATE_GUARD_FD+x}${CAGENTS_INSTALL_RESULT_FD+x}${CAGENTS_ARCHIVE+x}${CAGENTS_CHECKSUMS+x}${CAGENTS_REPOSITORY+x}\" || exit 92\nprintf 'old %s\\n' \"$*\" > \"$HOME/reopened\"\nprintf 'ready\\n'\n",
+            "#!/bin/sh\ntest -z \"${CAGENTS_UI_UPDATE_GUARD_FD+x}${CAGENTS_INSTALL_RESULT_FD+x}${CAGENTS_ARCHIVE+x}${CAGENTS_CHECKSUMS+x}${CAGENTS_REPOSITORY+x}${CAGENTS_INSTALL_CENSUS_PATH+x}${CAGENTS_INSTALL_OUTCOME_PATH+x}\" || exit 92\nprintf 'old %s\\n' \"$*\" > \"$HOME/reopened\"\nprintf 'ready\\n'\n",
         )
         .unwrap();
         fs::set_permissions(&ui, fs::Permissions::from_mode(0o700)).unwrap();
@@ -861,6 +861,8 @@ fn external_installer_saves_closes_and_reopens_windows_even_on_failure() {
             .env_remove("CAGENTS_UI_UPDATE_GUARD_FD")
             .env("CAGENTS_ARCHIVE", "/stale/installer/archive")
             .env("CAGENTS_CHECKSUMS", "/stale/installer/checksums")
+            .env("CAGENTS_INSTALL_CENSUS_PATH", "/stale/installer/census")
+            .env("CAGENTS_INSTALL_OUTCOME_PATH", "/stale/installer/outcome")
             .env("CAGENTS_REPOSITORY", "fixture/source")
             .env("FIXTURE_REAL_CLI", &cli)
             .env("FIXTURE_PREFIX", &prefix)
@@ -979,7 +981,8 @@ assert len(sys.argv) == 3 and sys.argv[1] == '--inspect-upgrade-source'
 assert json.loads(sys.argv[2]) == {'protocol':int(os.environ['FIXTURE_SOURCE_PROTOCOL']),
     'proof':None, 'require_resumable':False, 'reconcile_retained':False}
 assert not any(key in os.environ for key in ['CAGENTS_INSTALL_RESULT_FD',
-    'CAGENTS_INSTALL_OWNER_CLI', 'CAGENTS_ARCHIVE', 'CAGENTS_CHECKSUMS', 'CAGENTS_REPOSITORY'])
+    'CAGENTS_INSTALL_OWNER_CLI', 'CAGENTS_ARCHIVE', 'CAGENTS_CHECKSUMS', 'CAGENTS_REPOSITORY',
+    'CAGENTS_INSTALL_CENSUS_PATH', 'CAGENTS_INSTALL_OUTCOME_PATH'])
 fd=int(os.environ['CAGENTS_UI_UPDATE_GUARD_FD'])
 verified=subprocess.run([os.environ['FIXTURE_REAL_CLI'], 'verify-install-guard', '--stage-only'],
     pass_fds=(fd,), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -2030,4 +2033,65 @@ raise SystemExit(79)
         std::io::Error::last_os_error().kind(),
         std::io::ErrorKind::WouldBlock
     );
+}
+
+#[test]
+fn private_census_validation_refuses_bad_input_and_never_claims_usability() {
+    let _serial = OS_FIXTURE.lock().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let runtime = root.path().join("runtime");
+    fs::create_dir(&runtime).unwrap();
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+    let malformed = root.path().join("malformed-census.json");
+    fs::write(&malformed, b"{}").unwrap();
+    fs::set_permissions(&malformed, fs::Permissions::from_mode(0o600)).unwrap();
+    let missing = root.path().join("missing-census.json");
+    let validate = |census: &Path| {
+        Command::new(env!("CARGO_BIN_EXE_cagents"))
+            .env_clear()
+            .env("HOME", root.path())
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .args([
+                "--json",
+                "--no-start",
+                "daemon",
+                "verify-update-census",
+                "--validate-only",
+                "--census",
+            ])
+            .arg(census)
+            .arg("--outcome")
+            .arg(root.path().join("outcome.json"))
+            .output()
+            .unwrap()
+    };
+    for census in [&malformed, &missing] {
+        let output = validate(census);
+        assert!(
+            !output.status.success(),
+            "invalid private evidence passed validation: {output:?}"
+        );
+        if let Ok(bytes) = fs::read(root.path().join("outcome.json")) {
+            let receipt: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_ne!(receipt["outcome"]["state"], "usable");
+        }
+        assert!(
+            fs::read_dir(&runtime).unwrap().next().is_none(),
+            "validation must not start a daemon"
+        );
+    }
+    let valid = root.path().join("valid-census.json");
+    fs::write(&valid, br#"{"version":1,"transaction":"00000000-0000-4000-8000-000000000001","source":null,"terminals":[],"chats":[],"checkpoint_before":null}"#).unwrap();
+    fs::set_permissions(&valid, fs::Permissions::from_mode(0o600)).unwrap();
+    let output = validate(&valid);
+    assert!(
+        output.status.success(),
+        "valid private evidence was rejected: {output:?}"
+    );
+    let reply: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(reply["data"]["validated"], true);
+    assert_eq!(reply["data"]["usable"], false);
+    assert!(fs::read_dir(&runtime).unwrap().next().is_none());
 }

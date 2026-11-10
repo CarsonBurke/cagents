@@ -30,6 +30,10 @@ log = pathlib.Path(os.environ['FIXTURE_CALLS'])
 def record(event, **fields):
     with log.open('a') as output:
         output.write(json.dumps(dict(event=event, **fields)) + '\n')
+# Fixture-only readiness is represented by a private marker, never a native
+# serving socket. Census/receipt envelopes still use the production schema.
+fixture_proof = {'host_session_id': 'fixture-daemon', 'boot_id': 'fixture-boot',
+                 'host_incarnation': 'fixture-incarnation'}
 commands = ('coordinate-install', 'verify-install-guard', 'record-deferred-install')
 if len(args) == 2 and args[0] in commands and args[1] == '--help':
     print('Options:\n  --stage-only  Preserve the running application')
@@ -48,20 +52,67 @@ elif args[0] == 'coordinate-install':
 elif args[0] == 'verify-install-guard':
     assert os.environ['CAGENTS_UI_UPDATE_GUARD_FD'] == 'fixture-only'
     record('verify')
+elif args[:2] == ['daemon', 'capture-update-census']:
+    assert args[2] == '--output' and len(args) == 4
+    record('census-capture')
+    pathlib.Path(args[3]).write_text(json.dumps({'version': 1, 'transaction': '00000000-0000-4000-8000-000000000001',
+                                               'source': None, 'terminals': [], 'chats': [], 'checkpoint_before': None}, separators=(',', ':')))
+elif args[:2] in (['daemon', 'verify-update-census'], ['daemon', 'inspect-update-recovery']):
+    import hashlib
+    assert args[2] == '--census' and args[4] == '--outcome'
+    census_path, outcome_path = pathlib.Path(args[3]), pathlib.Path(args[5])
+    census = json.loads(census_path.read_text())
+    assert census == {'version': 1, 'transaction': '00000000-0000-4000-8000-000000000001', 'source': None, 'terminals': [], 'chats': [], 'checkpoint_before': None}
+    assert not census_path.stat().st_mode & 0o077
+    flags = set(args[6:])
+    assert flags <= {'--allow-absent', '--require-original', '--validate-only'}
+    ready = pathlib.Path(os.environ['FIXTURE_DAEMON_STATE']).exists()
+    if args[1] == 'inspect-update-recovery':
+        state, accepted = 'restart_permitted', True
+    elif '--validate-only' in flags:
+        state, accepted = 'unverified', True
+    elif '--require-original' in flags:
+        state, accepted = ('no_source', True) if not ready and '--allow-absent' in flags else ('unverified', False)
+    elif ready:
+        state, accepted = 'usable', True
+    elif '--allow-absent' in flags:
+        state, accepted = 'no_source', True
+    else:
+        state, accepted = 'unverified', False
+    record('census-inspect' if args[1] == 'inspect-update-recovery' else 'census-verify', state=state)
+    outcome = {'state': state}
+    if state == 'usable':
+        outcome.update(serving=fixture_proof, terminals=0, chats=0)
+    elif state == 'unverified':
+        outcome.update(serving=fixture_proof if ready else None,
+                       readiness='ready' if ready else None,
+                       surviving_terminals=0, expected_terminals=0,
+                       missing=[], unexpected=[], changed=[],
+                       detail='fixture-only service authorization or readiness is unverified')
+    outcome_path.write_text(json.dumps({'version': 1, 'transaction': census['transaction'],
+        'census_digest': hashlib.sha256(census_path.read_bytes()).hexdigest(),
+        'outcome': outcome, 'checkpoint_before': None}))
+    if not accepted:
+        print('Terminal readiness is unverified; inspect --no-start daemon status and --no-start terminal list.', file=sys.stderr)
+        sys.exit(1)
 elif args == ['--json', 'daemon', 'status']:
     record('status')
     rewrite = os.environ.get('FIXTURE_STATUS_REWRITES')
-    if rewrite:
-        # Something else writes the link path after the installer checked it.
+    rewritten = log.with_suffix('.status-rewritten')
+    if rewrite and not rewritten.exists():
+        # One independent write after the check, not a mutating status probe
+        # on every cleanup observation of that same path.
         path = pathlib.Path(rewrite)
         path.unlink()
         path.write_text('written during the installation\n')
-    print(json.dumps({'ok': True, 'command': 'daemon.status', 'data': {'running': False}},
+        rewritten.write_text('done\n')
+    print(json.dumps({'ok': True, 'command': 'daemon.status', 'data': {'running': pathlib.Path(os.environ['FIXTURE_DAEMON_STATE']).exists()}},
                      separators=(',', ':')))
 elif args == ['daemon', 'start']:
     record('daemon-start-fixture')
     if os.environ.get('FIXTURE_DAEMON_START_FAILS'):
         sys.exit(1)
+    pathlib.Path(os.environ['FIXTURE_DAEMON_STATE']).write_text('ready\n')
 elif args[:2] in (['daemon', 'store-schema'], ['daemon', 'downgrade-store']) \
         and not os.environ.get('FIXTURE_CLI_PREDATES_STORE_COMMANDS'):
     if args[2:] == ['--help']:
@@ -133,6 +184,7 @@ class InstallerCoordinator(unittest.TestCase):
             "XDG_RUNTIME_DIR": str(self.runtime),
             "TMPDIR": str(self.downloads),
             "FIXTURE_CALLS": str(self.calls),
+            "FIXTURE_DAEMON_STATE": str(self.directory / "daemon-ready"),
         }
         self.executable(self.tools / "getconf", '#!/bin/sh\nprintf "glibc 2.99\\n"\n')
         for name in ("curl", "wget", "gh"):
@@ -380,7 +432,8 @@ os.execv({real_tar!r}, [{real_tar!r}, *args])
         self.assertEqual(copy.stat().st_ino, before.st_ino, "the original file was not the one restored")
         self.assert_no_backups(copy)
         self.assertEqual(os.readlink(self.prefix / "current"), "versions/old")
-        self.assertFalse((self.prefix / "versions" / VERSION).exists())
+        self.assertTrue((self.prefix / "versions" / VERSION).exists(),
+                        "unverified service availability must retain its recovery target")
 
     def failed_update(self, **environment):
         self.installed_cli(guarded=True)
@@ -406,7 +459,8 @@ os.execv({real_tar!r}, [{real_tar!r}, *args])
             "the store was not converted back to the schema recorded before the replacement started",
         )
         self.assertEqual(os.readlink(self.prefix / "current"), "versions/old")
-        self.assertFalse((self.prefix / "versions" / VERSION).exists())
+        self.assertTrue((self.prefix / "versions" / VERSION).exists(),
+                        "unverified service availability must retain its recovery target")
 
     def test_failed_update_converts_a_store_the_replacement_created_back_to_the_oldest_schema(self):
         _, conversion = self.failed_update(FIXTURE_STORED_SCHEMA="")
@@ -434,7 +488,8 @@ os.execv({real_tar!r}, [{real_tar!r}, *args])
         result, conversion = self.failed_update(FIXTURE_CLI_PREDATES_STORE_COMMANDS="1")
         self.assertEqual(conversion, [("daemon-start-fixture", None, None)])
         self.assertEqual(os.readlink(self.prefix / "current"), "versions/old")
-        self.assertFalse((self.prefix / "versions" / VERSION).exists())
+        self.assertTrue((self.prefix / "versions" / VERSION).exists(),
+                        "unverified service availability must retain its recovery target")
 
     def test_unreadable_store_schema_leaves_the_installation_unchanged(self):
         self.installed_cli(guarded=True)
@@ -446,7 +501,8 @@ os.execv({real_tar!r}, [{real_tar!r}, *args])
         self.assertNotIn("daemon-start-fixture", [e['event'] for e in events])
         self.assertNotIn("downgrade-store", [e['event'] for e in events])
         self.assertEqual(os.readlink(self.prefix / "current"), "versions/old")
-        self.assertFalse((self.prefix / "versions" / VERSION).exists())
+        self.assertTrue((self.prefix / "versions" / VERSION).exists(),
+                        "unverified service availability must retain its recovery target")
 
     def test_copy_rewritten_after_the_check_is_kept_and_refused(self):
         previous = self.installed_cli(guarded=True).parent

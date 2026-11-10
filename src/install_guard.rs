@@ -139,6 +139,8 @@ pub(crate) fn sanitize_child_environment(command: &mut Command) {
         crate::instance::DAEMON_FENCE_ENV,
         crate::daemon::lease_handoff::DAEMON_LEASE_ENV,
         RESULT_FD_ENV,
+        crate::update::recovery::CENSUS_ENV,
+        crate::update::recovery::OUTCOME_ENV,
         OWNER_CLI_ENV,
         "CAGENTS_ARCHIVE",
         "CAGENTS_CHECKSUMS",

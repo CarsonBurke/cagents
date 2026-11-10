@@ -1,7 +1,6 @@
 //! Shared exact-session recovery authority and durable daemon upgrade handoff.
 #[cfg(any(feature = "host", feature = "ui"))]
 use crate::lineage_birth::LineageBirth;
-#[cfg(any(feature = "host", test))]
 use crate::model::HostSessionProof;
 #[cfg(any(feature = "host", feature = "ui", test))]
 use crate::model::{LaunchRecipe, TerminalSession};
@@ -960,9 +959,8 @@ pub(crate) mod handoff {
     use crate::fs_safety;
     #[cfg(any(feature = "host", test))]
     use crate::{chat, terminal_ipc::TerminalSpawnOptions};
-    use serde::Deserialize;
-    #[cfg(any(feature = "host", test))]
-    use serde::Serialize;
+    use serde::{Deserialize, Serialize};
+    use sha2::{Digest, Sha256};
     #[cfg(any(feature = "host", test))]
     use std::io::Write;
     use std::{ffi::OsStr, path::PathBuf};
@@ -1005,7 +1003,6 @@ pub(crate) mod handoff {
         Ok(output.bytes)
     }
 
-    #[cfg(any(feature = "host", test))]
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
     pub(crate) enum Phase {
         /// Persisted before any irreversible stop. Provider closure is unproven.
@@ -1014,6 +1011,15 @@ pub(crate) mod handoff {
         Ready,
         /// At least one new writer may have started. Never replay this blindly.
         Restoring,
+    }
+
+    /// A read-only observation of one exact private checkpoint. This grants
+    /// no authority to promote, consume, archive or replay the host payload.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct CheckpointStatus {
+        pub(crate) proof: HostSessionProof,
+        pub(crate) phase: Phase,
+        pub(crate) digest: String,
     }
 
     #[cfg(any(feature = "host", test))]
@@ -1748,6 +1754,37 @@ pub(crate) mod handoff {
             Ok(Some(bytes))
         }
 
+        /// Inspect only the common envelope, retaining the exact private-byte
+        /// identity. Readers in every feature lane share the same phase and
+        /// version contract without deserializing any host session payload.
+        pub(crate) fn checkpoint_status(&self) -> Result<Option<CheckpointStatus>, String> {
+            let Some(bytes) = self.read_bytes()? else {
+                return Ok(None);
+            };
+            #[derive(Deserialize)]
+            struct Envelope {
+                version: u16,
+                proof: HostSessionProof,
+                phase: Phase,
+            }
+            let envelope: Envelope = serde_json::from_slice(&bytes)
+                .map_err(|error| format!("Cannot read upgrade checkpoint status: {error}"))?;
+            if !VERSIONS.contains(&envelope.version) {
+                return Err("Unsupported upgrade checkpoint; checkpoint retained".into());
+            }
+            if !envelope.proof.is_complete() {
+                return Err(
+                    "Upgrade checkpoint has incomplete source ownership; checkpoint retained"
+                        .into(),
+                );
+            }
+            Ok(Some(CheckpointStatus {
+                proof: envelope.proof,
+                phase: envelope.phase,
+                digest: format!("{:x}", Sha256::digest(&bytes)),
+            }))
+        }
+
         fn startup_timeout(&self) -> Result<std::time::Duration, String> {
             let Some(bytes) = self.read_bytes()? else {
                 return Ok(STARTUP_BASE);
@@ -2189,6 +2226,134 @@ pub(crate) mod handoff {
             }
             let error = encode_bounded(&Oversized, "evidence byte budget exceeded").unwrap_err();
             assert!(error.contains("evidence byte budget exceeded"), "{error}");
+        }
+
+        const STATUS_CHECKPOINT: &[u8] = br#"{"version":5,"proof":{"host_session_id":"host","boot_id":"boot","host_incarnation":"daemon"},"phase":"Prepared","payload":{"unknown":"read only"}}"#;
+
+        fn write_status_fixture(store: &Store, bytes: &[u8]) {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&store.path)
+                .unwrap();
+            file.write_all(bytes).unwrap();
+        }
+
+        #[test]
+        fn checkpoint_status_observes_typed_phases_and_exact_bytes_without_changing_evidence() {
+            let directory = tempfile::tempdir().unwrap();
+            let store = Store::open(directory.path()).unwrap();
+            assert_eq!(store.checkpoint_status().unwrap(), None);
+            assert!(!store.path.exists());
+            write_status_fixture(&store, STATUS_CHECKPOINT);
+            let original = store.checkpoint_status().unwrap().unwrap();
+            assert_eq!(original.phase, Phase::Prepared);
+            assert!(original.proof.is_complete());
+            assert_eq!(
+                original.digest,
+                "28832b59ca25b329709f14d502030bbac3292b883df6b68550e8779150148d97"
+            );
+            assert_eq!(std::fs::read(&store.path).unwrap(), STATUS_CHECKPOINT);
+            // The digest names exact bytes, not a normalized JSON document.
+            let mut spaced = STATUS_CHECKPOINT.to_vec();
+            spaced.push(b'\n');
+            write_status_fixture(&store, &spaced);
+            let changed = store.checkpoint_status().unwrap().unwrap();
+            assert_eq!(changed.proof, original.proof);
+            assert_eq!(changed.phase, original.phase);
+            assert_ne!(changed.digest, original.digest);
+            assert_eq!(std::fs::read(&store.path).unwrap(), spaced);
+            for phase in [Phase::Prepared, Phase::Ready, Phase::Restoring] {
+                let bytes = serde_json::to_vec(&serde_json::json!({
+                    "version": VERSION, "proof": original.proof, "phase": phase,
+                    // Deliberately not a host Checkpoint payload: status must
+                    // never turn inspection into host admission or replay.
+                    "terminals": {"opaque":"ignored"}, "chats": 42,
+                }))
+                .unwrap();
+                write_status_fixture(&store, &bytes);
+                let status = store.checkpoint_status().unwrap().unwrap();
+                assert_eq!(status.phase, phase);
+                assert_eq!(std::fs::read(&store.path).unwrap(), bytes);
+            }
+            for version in VERSIONS {
+                let mut envelope: serde_json::Value =
+                    serde_json::from_slice(STATUS_CHECKPOINT).unwrap();
+                envelope["version"] = version.into();
+                write_status_fixture(&store, &serde_json::to_vec(&envelope).unwrap());
+                assert!(store.checkpoint_status().unwrap().is_some());
+            }
+        }
+
+        #[test]
+        fn checkpoint_status_refuses_unknown_or_incomplete_envelopes_without_mutation() {
+            let directory = tempfile::tempdir().unwrap();
+            let store = Store::open(directory.path()).unwrap();
+            let valid: serde_json::Value = serde_json::from_slice(STATUS_CHECKPOINT).unwrap();
+            let mut cases = vec![b"not json".to_vec(), b"{}".to_vec()];
+            for version in [0, VERSION + 1] {
+                let mut envelope = valid.clone();
+                envelope["version"] = version.into();
+                cases.push(serde_json::to_vec(&envelope).unwrap());
+            }
+            for field in ["host_session_id", "boot_id", "host_incarnation"] {
+                let mut envelope = valid.clone();
+                envelope["proof"][field] = "".into();
+                cases.push(serde_json::to_vec(&envelope).unwrap());
+            }
+            for field in ["proof", "phase"] {
+                let mut envelope = valid.clone();
+                envelope[field] = "malformed".into();
+                cases.push(serde_json::to_vec(&envelope).unwrap());
+            }
+            for bytes in cases {
+                write_status_fixture(&store, &bytes);
+                assert!(store.checkpoint_status().is_err());
+                assert_eq!(std::fs::read(&store.path).unwrap(), bytes);
+            }
+        }
+
+        #[test]
+        fn checkpoint_status_reuses_private_file_and_byte_limit_checks() {
+            use std::os::unix::fs::{PermissionsExt, symlink};
+            let directory = tempfile::tempdir().unwrap();
+            let store = Store::open(directory.path()).unwrap();
+            write_status_fixture(&store, STATUS_CHECKPOINT);
+            // Exercise a foreign owner when this test user has CAP_CHOWN;
+            // unprivileged runs still exercise every readable-file safeguard.
+            let owned = std::fs::File::open(&store.path).unwrap();
+            let uid = crate::daemon::current_uid();
+            if unsafe { libc::fchown(std::os::fd::AsRawFd::as_raw_fd(&owned), uid + 1, u32::MAX) }
+                == 0
+            {
+                assert!(store.checkpoint_status().is_err());
+                assert_eq!(
+                    unsafe { libc::fchown(std::os::fd::AsRawFd::as_raw_fd(&owned), uid, u32::MAX) },
+                    0
+                );
+            }
+            std::fs::set_permissions(&store.path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(store.checkpoint_status().is_err());
+            assert_eq!(std::fs::read(&store.path).unwrap(), STATUS_CHECKPOINT);
+            std::fs::set_permissions(&store.path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let alias = directory.path().join("alias.json");
+            std::fs::hard_link(&store.path, &alias).unwrap();
+            assert!(store.checkpoint_status().is_err());
+            std::fs::remove_file(&alias).unwrap();
+            std::fs::rename(&store.path, &alias).unwrap();
+            symlink(&alias, &store.path).unwrap();
+            assert!(store.checkpoint_status().is_err());
+            assert_eq!(std::fs::read(&alias).unwrap(), STATUS_CHECKPOINT);
+            std::fs::remove_file(&store.path).unwrap();
+            std::fs::rename(&alias, &store.path).unwrap();
+            let mut oversized = STATUS_CHECKPOINT.to_vec();
+            oversized.resize(MAX_BYTES as usize + 1, b' ');
+            write_status_fixture(&store, &oversized);
+            assert!(store.checkpoint_status().is_err());
+            assert_eq!(std::fs::metadata(&store.path).unwrap().len(), MAX_BYTES + 1);
+            assert_eq!(std::fs::read(&store.path).unwrap(), oversized);
         }
 
         #[test]

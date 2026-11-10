@@ -252,6 +252,7 @@ stop_daemon_and_wait() {
         *) fail 'cannot verify daemon status; installation was not changed' ;;
     esac
 
+    DAEMON_SHUTDOWN_REQUESTED=1
     installer_tool "$daemon_cli" daemon stop --require-empty >/dev/null \
         || fail 'daemon was not stopped: finish terminals or explicitly confirm their termination with cagents daemon stop --confirm, then retry; installation was not changed'
 
@@ -293,6 +294,7 @@ prepare_daemon_upgrade() {
             set -- "$@" --no-relaunch-agents
         fi
     fi
+    DAEMON_SHUTDOWN_REQUESTED=1
     installer_tool "$daemon_cli" --json daemon prepare-upgrade "$@" >/dev/null \
         || fail 'daemon checkpoint preparation failed; installation was not changed'
     wait_for_daemon_shutdown "$daemon_cli"
@@ -440,6 +442,13 @@ HAD_CURRENT=0
 PREVIOUS_CURRENT_TARGET=
 ROLLBACK_OK=1
 DAEMON_STOPPED_FOR_SWITCH=0
+DAEMON_SHUTDOWN_REQUESTED=0
+CENSUS_CAPTURED=0
+RETAIN_RECOVERY=0
+RECOVERY_OUTCOME_SETTLED=0
+ORIGINAL_SERVICE_VERIFIED=0
+INSTALL_CENSUS_PATH=${CAGENTS_INSTALL_CENSUS_PATH:-$DOWNLOAD_DIR/update-census.json}
+INSTALL_OUTCOME_PATH=${CAGENTS_INSTALL_OUTCOME_PATH:-$DOWNLOAD_DIR/update-outcome.json}
 DAEMON_CHECKPOINTED=0
 OLD_DAEMON_WAS_RUNNING=0
 DAEMON_STARTED=0
@@ -516,9 +525,33 @@ settle_adopted_link() {
             "$PROGRAM" "$settle_link" "$settle_backup" >&2
     fi
 }
+# These commands belong to the verified candidate, including after current
+# rolls back to a release that cannot report recovery inventory itself.
+verify_update_census() {
+    set -- daemon verify-update-census --census "$INSTALL_CENSUS_PATH" \
+        --outcome "$INSTALL_OUTCOME_PATH"
+    [ "$STAGE_ONLY" -eq 0 ] || set -- "$@" --allow-absent
+    installer_tool "$CANDIDATE_COORDINATOR" "$@" >/dev/null
+}
+verify_original_census() {
+    # A different ready daemon can be valid recovery without being the source.
+    # Only the unchanged, authenticated source permits rewinding its binaries.
+    installer_tool "$CANDIDATE_COORDINATOR" daemon verify-update-census \
+        --census "$INSTALL_CENSUS_PATH" --outcome "$INSTALL_OUTCOME_PATH" \
+        --require-original >/dev/null 2>&1
+}
+inspect_update_recovery() {
+    installer_tool "$CANDIDATE_COORDINATOR" daemon inspect-update-recovery \
+        --census "$INSTALL_CENSUS_PATH" --outcome "$INSTALL_OUTCOME_PATH" >/dev/null
+}
+retain_recovery_evidence() {
+    RETAIN_RECOVERY=1
+    recovery_executable=$(printf '%s' "$NEW_VERSION_DIR/bin/cagents" | sed "s/'/'\\\\''/g")
+    printf "%s: original terminal survival is unverified; kept the checkpoint, candidate and recovery evidence at %s and %s. Inspect with '%s' --no-start daemon status and '%s' --no-start terminal list.\n" \
+        "$PROGRAM" "$NEW_VERSION_DIR" "$INSTALL_OUTCOME_PATH" "$recovery_executable" "$recovery_executable" >&2
+}
 cleanup() {
     cleanup_status=$?
-    rm -rf "$DOWNLOAD_DIR" || :
     if [ -n "$INSTALL_STAGE" ]; then
         rm -rf "$INSTALL_STAGE" || :
     fi
@@ -526,16 +559,33 @@ cleanup() {
         rm -f "$CURRENT_TEMP" || :
     fi
 
-    if [ "$TRANSACTION_COMMITTED" -eq 0 ] \
-        && [ "$RESTART_DAEMON" -eq 1 ] \
-        && [ "$DAEMON_START_ATTEMPTED" -eq 1 ]; then
+    if [ "$TRANSACTION_COMMITTED" -eq 0 ] && [ "$CURRENT_SWITCHED" -eq 1 ]; then
         read_daemon_status "$NEW_VERSION_DIR/bin/cagents"
         if [ "$DAEMON_STATUS" != stopped ]; then
-            # This also fences interruption while daemon start is in flight.
-            # A possible replacement writer must retain its own executables.
+            if verify_original_census; then
+                ORIGINAL_SERVICE_VERIFIED=1
+            else
+                # A recovery writer can start before this shell's start call,
+                # including during launcher publication. Keep its installation.
+                TRANSACTION_COMMITTED=1
+                RETAIN_RECOVERY=1
+                if ! verify_update_census; then retain_recovery_evidence; fi
+                RECOVERY_OUTCOME_SETTLED=1
+                printf '%s: the original terminal service could not be verified; retained the selected version and recovery evidence instead of rewinding its binaries\n' \
+                    "$PROGRAM" >&2
+            fi
+        fi
+    fi
+    if [ "$TRANSACTION_COMMITTED" -eq 0 ] && [ "$CURRENT_SWITCHED" -eq 1 ] \
+        && [ "$ORIGINAL_SERVICE_VERIFIED" -eq 0 ] \
+        && { [ "$RESTART_DAEMON" -eq 1 ] || [ "$DAEMON_SHUTDOWN_REQUESTED" -eq 1 ]; }; then
+        # Keep a capable target selected while a Prepared checkpoint blocks
+        # rollback. Repointing current first could strand an older source.
+        if ! inspect_update_recovery; then
             TRANSACTION_COMMITTED=1
-            printf '%s: replacement daemon shutdown is not proven; retained the new installation and recovery state; inspect cagents daemon status before retrying\n' \
-                "$PROGRAM" >&2
+            retain_recovery_evidence
+            RECOVERY_OUTCOME_SETTLED=1
+            cleanup_status=1
         fi
     fi
 
@@ -581,12 +631,44 @@ cleanup() {
         fi
     fi
     if [ "$TRANSACTION_COMMITTED" -eq 0 ] \
-        && [ "$DAEMON_STOPPED_FOR_SWITCH" -eq 1 ] \
+        && [ "$DAEMON_SHUTDOWN_REQUESTED" -eq 1 ] \
         && [ "$OLD_DAEMON_WAS_RUNNING" -eq 1 ] \
+        && [ -z "${CAGENTS_DAEMON_LEASE_FD:-}" ] \
         && [ "$ROLLBACK_OK" -eq 1 ]; then
-        installer_tool "$PREFIX/current/bin/cagents" daemon start >/dev/null 2>&1 \
-            || printf '%s: restored the previous version but could not restart its daemon\n' \
-                "$PROGRAM" >&2
+        # Prepared checkpoints can require the target's recovery implementation.
+        # A successful old startup is never proof that its terminals returned.
+        read_daemon_status "$PREFIX/current/bin/cagents"
+        if [ "$DAEMON_STATUS" = running ]; then
+            if ! verify_update_census; then
+                retain_recovery_evidence
+                cleanup_status=1
+            fi
+        elif inspect_update_recovery; then
+            if installer_tool "$PREFIX/current/bin/cagents" daemon start >/dev/null \
+                && verify_update_census; then
+                :
+            else
+                retain_recovery_evidence
+                cleanup_status=1
+            fi
+        else
+            retain_recovery_evidence
+            cleanup_status=1
+        fi
+    elif [ "$cleanup_status" -ne 0 ] && [ "$CENSUS_CAPTURED" -eq 1 ] \
+        && [ "$RECOVERY_OUTCOME_SETTLED" -eq 0 ]; then
+        # The worker owns restart while it retains the handoff reservation.
+        # Report typed evidence about current if serving, otherwise the
+        # checkpoint's required next owner; never borrow a lock as readiness.
+        read_daemon_status "$PREFIX/current/bin/cagents"
+        if [ "$DAEMON_STATUS" = running ]; then
+            if ! verify_update_census; then retain_recovery_evidence; fi
+        else
+            inspect_update_recovery || :
+            # No Prepared blocker only permits a future start. It does not
+            # establish readiness or prove that any terminals are restored.
+            retain_recovery_evidence
+        fi
     fi
 
     if [ "$TRANSACTION_COMMITTED" -eq 0 ] \
@@ -633,8 +715,18 @@ cleanup() {
     settle_adopted_link "$AUTOSTART_LINK_ADOPTED" "$AUTOSTART_LINK" "$AUTOSTART_TARGET"
 
     if [ "$TRANSACTION_COMMITTED" -eq 0 ] \
-        && [ -n "$NEW_VERSION_DIR" ] && [ "$ROLLBACK_OK" -eq 1 ]; then
+        && [ -n "$NEW_VERSION_DIR" ] && [ "$ROLLBACK_OK" -eq 1 ] \
+        && [ "$RETAIN_RECOVERY" -eq 0 ]; then
         rm -rf "$NEW_VERSION_DIR" || :
+    fi
+    if [ "$RETAIN_RECOVERY" -eq 0 ]; then
+        rm -rf "$DOWNLOAD_DIR" || :
+    else
+        # Preserve the small census/receipt evidence. The installed candidate
+        # remains available for inspection; do not strand large archive and
+        # extracted executable copies in a possibly RAM-backed TMPDIR.
+        rm -f "$ARCHIVE_PATH" "$CHECKSUMS_PATH" \
+            "$CANDIDATE_COORDINATOR" "$CANDIDATE_INSPECTOR" || :
     fi
     exit "$cleanup_status"
 }
@@ -1094,6 +1186,28 @@ ensure_link() {
 }
 
 
+# A reviewed worker supplies its pre-shutdown census. A standalone installer
+# captures the authenticated source before it can prepare or stop that source.
+if [ -n "${CAGENTS_INSTALL_CENSUS_PATH:-}" ]; then
+    set -- daemon verify-update-census --census "$INSTALL_CENSUS_PATH" \
+        --outcome "$INSTALL_OUTCOME_PATH"
+    if [ -n "${CAGENTS_DAEMON_LEASE_FD:-}" ]; then
+        # The source may already be stopped, but its private transaction and
+        # source binding must still validate before accepting worker evidence.
+        set -- "$@" --validate-only
+    else
+        # An environment path alone cannot authorize preparing a live source.
+        set -- "$@" --require-original --allow-absent
+    fi
+    installer_tool "$CANDIDATE_COORDINATOR" "$@" >/dev/null \
+        || fail 'the supplied terminal census is invalid or no longer matches the source; the service was not changed'
+    CENSUS_CAPTURED=1
+else
+    installer_tool "$CANDIDATE_COORDINATOR" daemon capture-update-census \
+        --output "$INSTALL_CENSUS_PATH" >/dev/null \
+        || fail 'cannot capture the terminal inventory; the running service was not changed'
+    CENSUS_CAPTURED=1
+fi
 OWNER_CLI=${CAGENTS_INSTALL_OWNER_CLI:-$PREFIX/current/bin/cagents}
 if [ "$STAGE_ONLY" -eq 1 ]; then
     # Private routing is recorded in the complete candidate tree BEFORE it can
@@ -1202,20 +1316,20 @@ ensure_link "$ICON_MEMBER" "$ICON_LINK" icon
 ensure_link "$RASTER_ICON_MEMBER" "$RASTER_ICON_LINK" raster_icon
 ensure_link "$METAINFO_MEMBER" "$METAINFO_LINK" metainfo
 ensure_link "$AUTOSTART_MEMBER" "$AUTOSTART_LINK" autostart
-# A requested daemon update commits only after the replacement starts. Ordinary
-# installs retain their existing login-autostart behavior on startup failure.
-[ "$RESTART_DAEMON" -eq 1 ] || TRANSACTION_COMMITTED=1
+# Startup exit status alone says nothing about retained terminals. Commit only
+# after the candidate proves serving readiness and the captured census matches.
 if [ "$DAEMON_DEFERRED" -eq 1 ]; then
     : # The installed candidate must not try to start beside the older daemon.
 elif DAEMON_START_ATTEMPTED=1 && "$PREFIX/current/bin/cagents" daemon start >/dev/null; then
-    DAEMON_STARTED=1
+    :
 else
-    if [ "$RESTART_DAEMON" -eq 1 ]; then
-        fail 'replacement daemon startup failed; checking rollback safety while preserving durable recovery state'
-    fi
-    printf '%s: installed cagents, but its production daemon could not start now; login autostart remains enabled\n' \
-        "$PROGRAM" >&2
+    fail 'replacement daemon startup failed; checking rollback safety while preserving durable recovery state'
 fi
+if ! verify_update_census; then
+    retain_recovery_evidence
+    fail 'the installation did not prove that the terminal service and its sessions are ready'
+fi
+if [ "$DAEMON_DEFERRED" -eq 0 ]; then DAEMON_STARTED=1; fi
 TRANSACTION_COMMITTED=1
 if command -v gtk-update-icon-cache >/dev/null 2>&1; then
     gtk-update-icon-cache --force --ignore-theme-index "$DATA_HOME/icons/hicolor" >/dev/null 2>&1 || :
@@ -1226,11 +1340,11 @@ fi
 
 
 if [ "$STAGE_ONLY" -eq 1 ]; then
-    printf 'Staged cagents %s; running windows and daemon were preserved. Run cagents daemon upgrade to apply it when ready.\n' "$VERSION"
+    printf 'Staged cagents %s; existing windows and the previous service state were preserved. Run cagents daemon upgrade to apply it when ready.\n' "$VERSION"
 elif [ "$DAEMON_DEFERRED" -eq 1 ]; then
     printf 'Installed cagents %s; running sessions were preserved. Run cagents daemon upgrade to finish updating the daemon.\n' "$VERSION"
 elif [ "$DAEMON_STARTED" -eq 1 ]; then
-    printf 'Installed cagents %s; the production daemon is running and will start at login.\n' "$VERSION"
+    printf 'Installed cagents %s; the production daemon and your sessions are ready. The daemon will start at login.\n' "$VERSION"
 else
     printf 'Installed cagents %s; the production daemon will start at graphical login.\n' "$VERSION"
 fi
