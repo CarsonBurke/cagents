@@ -4,12 +4,12 @@ use std::io::Write;
 
 /// Run `test` in a child process with its own runtime directory and daemon
 /// lease, so the helper's real caller gate admits this process.
-fn isolated(variable: &str, test: impl FnOnce()) {
+pub(super) fn isolated(variable: &str, test: impl FnOnce()) {
     if std::env::var_os(variable).is_none() {
         let root = tempfile::tempdir_in("/var/tmp").unwrap();
         let name = thread::current().name().unwrap().to_owned();
         let output = ChildCommand::new(std::env::current_exe().unwrap())
-            .args(["--exact", &name, "--nocapture"])
+            .args(["--exact", &name, "--include-ignored", "--nocapture"])
             .env(variable, "1")
             .env("XDG_RUNTIME_DIR", root.path())
             .env("XDG_DATA_HOME", root.path().join("data"))
@@ -25,12 +25,13 @@ fn isolated(variable: &str, test: impl FnOnce()) {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
         return;
     }
     test();
 }
 
-fn leased_proof(proof: &mut HostSessionProof) -> crate::daemon::HostLease {
+pub(super) fn leased_proof(proof: &mut HostSessionProof) -> crate::daemon::HostLease {
     proof.boot_id = crate::daemon::read_boot_id().unwrap();
     let paths = crate::daemon::RuntimePaths::discover().unwrap();
     crate::daemon::HostLease::acquire(&paths, proof).unwrap()

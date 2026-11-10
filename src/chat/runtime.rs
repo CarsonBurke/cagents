@@ -349,7 +349,7 @@ impl LocalHandle {
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         Self::start_with_scope(
-            spec, adapter, initial, store, session_id, ownership, None, notify,
+            spec, adapter, initial, store, session_id, ownership, None, None, notify,
         )
     }
 
@@ -361,6 +361,7 @@ impl LocalHandle {
         store: Store,
         source: super::Session,
         notify: impl Fn(Update) + Send + Sync + 'static,
+        resident_changed: impl Fn() + Send + Sync + 'static,
     ) -> Result<Self, String> {
         if source.launch.provider != crate::agent::Provider::Claude {
             return Err("Retained stream actors require Claude".into());
@@ -378,6 +379,7 @@ impl LocalHandle {
             source.launch.session_id,
             None,
             Some(scope),
+            Some(Arc::new(resident_changed)),
             notify,
         )
     }
@@ -390,6 +392,7 @@ impl LocalHandle {
         session_id: Option<String>,
         ownership: Option<NativeOwnership>,
         launch_account_scope: Option<crate::account::scope::LaunchAccountScope>,
+        resident_changed: Option<Arc<dyn Fn() + Send + Sync>>,
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         spec.remove_unset_environment();
@@ -547,6 +550,8 @@ impl LocalHandle {
                     incoming,
                     wake: reader,
                     notify,
+                    resident_changed,
+                    resident_dirty: false,
                     output: Vec::new(),
                     scanned: 0,
                     pending: VecDeque::new(),
@@ -2134,6 +2139,10 @@ struct Actor {
     incoming: crossbeam_channel::Receiver<CommandRequest>,
     wake: UnixStream,
     notify: Arc<dyn Fn(Update) + Send + Sync>,
+    /// Retained helpers observe semantic metadata independently of visible
+    /// presentation and the once-per-unread-epoch output observation.
+    resident_changed: Option<Arc<dyn Fn() + Send + Sync>>,
+    resident_dirty: bool,
     output: Vec<u8>,
     /// Prefix already checked for a delimiter in the incomplete stdio frame.
     scanned: usize,
@@ -2329,6 +2338,7 @@ impl Actor {
                 self.dirty = false;
                 (self.notify)(Update::Presentation);
             }
+            self.publish_resident_metadata();
             if !self.incoming.is_empty() {
                 continue;
             }
@@ -2575,6 +2585,7 @@ impl Actor {
                 self.last_present = Instant::now();
                 (self.notify)(Update::Presentation);
             }
+            self.publish_resident_metadata();
             let mut fds = [
                 libc::pollfd {
                     fd: self.wake.as_raw_fd(),
@@ -3331,6 +3342,35 @@ impl Actor {
         content: Option<crate::notifications::Content>,
         preview_observed: bool,
     ) {
+        // The Store consumes parent bodies. Child bodies still project here,
+        // and Claude repeats the same identity on ordinary body frames.
+        // Neither should turn hidden streaming into metadata RPCs.
+        if self.resident_changed.is_some() {
+            self.resident_dirty |= match &event {
+                Event::Item(_)
+                | Event::TextDelta { .. }
+                | Event::OutputDelta { .. }
+                | Event::SubagentItem { .. }
+                | Event::SubagentTextDelta { .. }
+                | Event::SubagentOutputDelta { .. } => false,
+                Event::Session { id, title } => {
+                    let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                    let changed = state.session_id.as_deref() != Some(id.as_str())
+                        || title
+                            .as_ref()
+                            .is_some_and(|title| state.title.as_ref() != Some(title));
+                    drop(state);
+                    changed
+                        || self
+                            .confirmed_session
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .as_deref()
+                            != Some(id.as_str())
+                }
+                _ => true,
+            };
+        }
         let child_changed = matches!(
             &event,
             Event::Subagent { .. }
@@ -3400,6 +3440,7 @@ impl Actor {
         // Evaluate after the whole provider frame, including any children or
         // attention requests reported after the parent result.
         if self.attention.finish(&mut state, observed_at()) {
+            self.resident_dirty = true;
             state.generation = state.generation.saturating_add(1);
             self.dirty = true;
         }
@@ -3444,6 +3485,15 @@ impl Actor {
         }
         if became_available {
             (self.notify)(Update::PromptAvailable);
+        }
+        // apply_step has installed confirmed_session before reaching here.
+        self.publish_resident_metadata();
+    }
+    fn publish_resident_metadata(&mut self) {
+        if std::mem::take(&mut self.resident_dirty)
+            && let Some(changed) = &self.resident_changed
+        {
+            changed();
         }
     }
     fn touch(&mut self) {
