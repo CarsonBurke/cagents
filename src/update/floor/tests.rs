@@ -654,6 +654,137 @@ fn recovered_paused_conversations_name_the_manual_resume_action() {
 }
 
 #[test]
+fn zombie_source_metadata_does_not_mask_prepared_failure_or_start_another_daemon() {
+    const CHILD: &str = "CAGENTS_TEST_UPDATE_ZOMBIE_CLEANUP";
+    const TEST: &str = "update::floor::tests::zombie_source_metadata_does_not_mask_prepared_failure_or_start_another_daemon";
+    let Some(root) = std::env::var_os(CHILD) else {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = root.path().join("runtime");
+        fs::create_dir(&runtime).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+            .env(CHILD, root.path())
+            .env("HOME", root.path())
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        return;
+    };
+    let root = PathBuf::from(root);
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    fs::create_dir_all(&paths.directory).unwrap();
+    fs::set_permissions(&paths.directory, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut daemon = fixture().preview.daemon.unwrap();
+    daemon.sessions.clear();
+    daemon.capability.live_terminals = 0;
+    daemon.capability.proof.boot_id = crate::daemon::read_boot_id().unwrap();
+    let child = Command::new("/usr/bin/python3")
+        .arg("-c")
+        .arg(
+            r#"import fcntl,json,os,socket,sys
+lock=os.open(sys.argv[1],os.O_RDWR|os.O_CREAT,0o600)
+fcntl.flock(lock,fcntl.LOCK_EX)
+os.write(lock,json.dumps({'pid':os.getpid(),'proof':json.loads(sys.argv[3])}).encode())
+listener=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+listener.bind(sys.argv[2]);listener.listen()
+"#,
+        )
+        .arg(&paths.lock)
+        .arg(&paths.socket)
+        .arg(serde_json::to_string(&daemon.capability.proof).unwrap())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let mut source = StreamingChild::new(child).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while source.observed_exit_status().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "private source did not exit");
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(source.observed_exit_status().unwrap().unwrap().success());
+    // WNOWAIT pins this real exited child as a zombie through the handoff.
+    let stat = fs::read_to_string(format!("/proc/{}/stat", source.child.id())).unwrap();
+    assert_eq!(
+        stat.rsplit_once(')').unwrap().1.split_whitespace().next(),
+        Some("Z")
+    );
+    let mut handoff =
+        Some(crate::daemon::lease_handoff::LeaseHandoff::wait(&paths, source.child.id()).unwrap());
+    assert!(
+        crate::daemon::running_executable_at(&paths).is_err(),
+        "a stale source PID cannot authenticate the worker's held handoff"
+    );
+    assert!(matches!(
+        cleanup_daemon(&paths, true),
+        CleanupDaemon::Absent
+    ));
+    let store = crate::upgrade::handoff::Store::discover().unwrap();
+    let checkpoint = serde_json::to_vec(&serde_json::json!({
+        "version": 5, "proof": daemon.capability.proof, "phase": "Prepared",
+        "terminals": [], "carried": [], "chats": []
+    }))
+    .unwrap();
+    let mut file = private_create(&store.path).unwrap();
+    file.write_all(&checkpoint).unwrap();
+    file.sync_all().unwrap();
+    let survivors = Survivors {
+        source_prepared: true,
+        prepared_source: Some((daemon, crate::upgrade::recovery::Census::default())),
+        ..Default::default()
+    };
+    let state = root.join("update");
+    fs::create_dir(&state).unwrap();
+    let mut job = job(&state);
+    let guard = crate::instance::UiUpdateGuard::acquire().unwrap();
+    let installation = Installation {
+        prefix: root.join("install"),
+        version: "old".into(),
+    };
+    let marker = root.join("unexpected-daemon-start");
+    let bin = installation.prefix.join("current/bin");
+    fs::create_dir_all(&bin).unwrap();
+    let cli = bin.join("cagents");
+    fs::write(
+        &cli,
+        format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&cli, fs::Permissions::from_mode(0o700)).unwrap();
+    let original = "the original accepted preparation could not produce a recovery receipt";
+    let error = finish_handoff(
+        &installation,
+        &state,
+        &mut job,
+        &Err(invalid(original)),
+        &mut handoff,
+        &survivors,
+        &guard,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with(original), "{error}");
+    assert!(error.contains("still Prepared"), "{error}");
+    assert!(!error.contains("PID does not own"), "{error}");
+    let saved: UpdateJob =
+        serde_json::from_slice(&fs::read(state.join("status.json")).unwrap()).unwrap();
+    assert_eq!(saved.phase, UpdatePhase::Failed);
+    assert_eq!(saved.message, error);
+    assert!(
+        !marker.exists(),
+        "Prepared must never reach ordinary daemon start"
+    );
+    assert_eq!(fs::read(&store.path).unwrap(), checkpoint);
+    assert!(handoff.is_none());
+    source.finish(false).unwrap();
+}
+
+#[test]
 fn unconfirmed_interrupt_times_out_before_prepare_and_keeps_panes_running() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path();
