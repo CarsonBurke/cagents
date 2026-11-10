@@ -42,7 +42,19 @@ with (root / 'peer.lock').open('a') as lock:
         lane = args[args.index('--features') + 1] if '--features' in args else 'cli'
         head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
         tree = subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip()
-        data['lanes'].append({'lane': lane, 'head': head, 'tree': tree, 'args': args})
+        data['lanes'].append({'lane': lane, 'operation': args[0], 'head': head, 'tree': tree,
+                              'args': args, 'helper': os.environ.get('CAGENTS_TEST_RETAINED_ACTOR_HELPER'),
+                              'loopback': os.environ.get('CAGENTS_BUILD_REMOTE_LOOPBACK'),
+                              'build_remote': os.environ.get('CAGENTS_BUILD_REMOTE')})
+        if args[0] == 'exec':
+            assert args[1:5] == ['/usr/bin/python3', 'scripts/build-ceditor-product', 'cagentsd', '--locked'], args
+            product = Path.cwd() / 'target/fixture-cagentsd'
+            product.parent.mkdir(exist_ok=True)
+            product.write_text('#!/bin/sh\nexit 0\n')
+            product.chmod(0o755)
+            (root / 'peer.json').write_text(json.dumps(data))
+            print(product)
+            sys.exit(0)
         if data.get('move_main') and not data.get('moved_main'):
             git('fetch', '-q', 'origin', 'main')
             git('reset', '--hard', 'origin/main')
@@ -68,6 +80,13 @@ with (root / 'peer.lock').open('a') as lock:
                 if time.monotonic() > deadline:
                     sys.exit('fixture gate release timed out')
                 time.sleep(.02)
+        runtime_fail = (args[0] == 'test' and (
+            (lane == 'cli' and (data.get('fail_runtime_base') or Path('runtime-broken').exists()
+                               or (Path('runtime-left').exists() and Path('runtime-right').exists())))
+            or Path(f'{lane}-runtime-broken').exists()))
+        if runtime_fail:
+            print(f'error: {lane} test failed: fixture EWOULDBLOCK')
+            sys.exit(1)
         if fail and lane == 'host':
             print('error[E0001]: fixture broken change')
             sys.exit(1)
@@ -151,7 +170,7 @@ class MergeQueue(unittest.TestCase):
         gate = self.repo / "scripts/cargo-gate"
         gate.write_text('#!/bin/sh\nexec cargo-gate "$@"\n')
         gate.chmod(0o755)
-        (self.repo / ".gitignore").write_text('.worktrees/\n')
+        (self.repo / ".gitignore").write_text('.worktrees/\ntarget/\n')
         (self.repo / "shared").write_text('original\n')
         self.git("add", ".")
         self.git("commit", "-qm", "base")
@@ -174,7 +193,7 @@ fi
         self.state_path = self.repo / ".git/merge-queue/state.json"
         self.addCleanup(self.stop_runner)
 
-    def call(self, args, *, cwd=None, check=True, timeout=30):
+    def call(self, args, *, cwd=None, check=True, timeout=120):
         result = subprocess.run(args, cwd=cwd or self.repo, env=self.env,
                                 text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
         if check:
@@ -247,7 +266,7 @@ fi
                 self.queue("enqueue", number)
         return [self.queue("wait", n, check=False) for n in numbers]
 
-    def test_batch_checks_three_lanes_once_and_pins_every_write(self):
+    def test_batch_checks_three_lanes_then_cli_tests_once_and_pins_every_write(self):
         for n in range(1, 5):
             self.pr(n)
         outcomes = self.batch(range(1, 5))
@@ -255,10 +274,11 @@ fi
         data = self.data()
         self.assertEqual(data['writes'], [1, 2, 3, 4])
         self.assertEqual(data['queries'], [1, 2, 3, 4])
-        self.assertEqual([r['lane'] for r in data['lanes']], ['cli', 'host', 'ui'])
+        self.assertEqual([(r['operation'], r['lane']) for r in data['lanes']],
+                         [('check', 'cli'), ('check', 'host'), ('check', 'ui'), ('test', 'cli')])
         self.assertEqual(len({r['tree'] for r in data['lanes']}), 1)
         for lane in data['lanes']:
-            self.assertEqual(lane['args'][:4], ['check', '--locked', '--no-default-features', '--all-targets'])
+            self.assertEqual(lane['args'][1:4], ['--locked', '--no-default-features', '--all-targets'])
         self.git('fetch', '-q', 'origin', 'main')
         self.assertEqual(data['lanes'][0]['tree'], self.git('rev-parse', 'origin/main^{tree}'))
         self.assertFalse((self.repo / '.worktrees/merge-queue-batch').exists())
@@ -306,14 +326,104 @@ fi
                          '\n'.join(r.stdout for r in outcomes))
         self.assertEqual(self.data()['writes'], [1, 3, 4])
 
+    def test_cli_runtime_failure_bisects_after_all_checks_pass(self):
+        for number in range(1, 5):
+            self.pr(number, 'runtime-broken' if number == 2 else None)
+        outcomes = self.batch([1, 2, 3, 4])
+        self.assertEqual([r.returncode for r in outcomes], [0, 3, 0, 0],
+                         '\n'.join(r.stdout for r in outcomes))
+        self.assertIn('test-cli failed', outcomes[1].stdout)
+        self.assertIn('EWOULDBLOCK', outcomes[1].stdout)
+        data = self.data()
+        self.assertEqual(data['writes'], [1, 3, 4])
+        self.assertGreater(len(data['lanes']), 4)
+        for offset in range(0, len(data['lanes']), 4):
+            self.assertEqual([(r['operation'], r['lane']) for r in data['lanes'][offset:offset + 4]],
+                             [('check', 'cli'), ('check', 'host'), ('check', 'ui'), ('test', 'cli')])
+
+    def test_interacting_cli_runtime_regression_cannot_merge(self):
+        self.pr(1, 'runtime-left')
+        self.pr(2, 'runtime-right')
+        outcomes = self.batch([1, 2])
+        self.assertEqual([r.returncode for r in outcomes], [0, 3])
+        self.assertIn('test-cli failed', outcomes[1].stdout)
+        self.assertEqual(self.data()['writes'], [1])
+
+    def test_optional_tests_union_persists_through_runtime_bisection(self):
+        self.pr(1)
+        self.pr(2, 'ui-runtime-broken')
+        self.pr(3)
+        with self.held_runner():
+            self.queue('enqueue', 1, '--test-lanes', 'host')
+            self.queue('enqueue', 2, '--test-lanes', 'ui')
+            self.queue('enqueue', 3)
+        outcomes = [self.queue('wait', n, check=False) for n in (1, 2, 3)]
+        self.assertEqual([r.returncode for r in outcomes], [0, 3, 0],
+                         '\n'.join(r.stdout for r in outcomes))
+        self.assertIn('test-ui failed', outcomes[1].stdout)
+        data = self.data()
+        self.assertEqual(data['writes'], [1, 3])
+        for offset in range(0, len(data['lanes']), 7):
+            attempt = data['lanes'][offset:offset + 7]
+            self.assertEqual([(r['operation'], r['lane']) for r in attempt], [
+                ('check', 'cli'), ('check', 'host'), ('check', 'ui'), ('test', 'cli'),
+                ('exec', 'host'), ('test', 'host'), ('test', 'ui')])
+            self.assertEqual(attempt[4]['head'], attempt[5]['head'])
+            self.assertTrue(attempt[5]['helper'].endswith('/target/fixture-cagentsd'))
+        self.assertIn('tests=cli,host', self.queue('status').stdout)
+
+    def test_host_test_failure_uses_matching_helper_and_is_attributed(self):
+        self.pr(1, 'host-runtime-broken')
+        with self.held_runner():
+            self.queue('enqueue', 1, '--test-lanes', 'host')
+        outcome = self.queue('wait', 1, check=False)
+        self.assertEqual(outcome.returncode, 3, outcome.stdout)
+        self.assertIn('test-host failed', outcome.stdout)
+        self.assertEqual(self.data()['writes'], [])
+
+    def test_git_config_default_and_explicit_cli_only_override_are_saved(self):
+        self.pr(1)
+        self.pr(2)
+        self.git('config', '--local', 'mergequeue.testLanes', 'host,ui')
+        with self.held_runner():
+            self.queue('enqueue', 1)
+            self.queue('enqueue', 2, '--test-lanes', 'none')
+            records = self.state()['requests']
+            self.assertEqual([r['test_lanes'] for r in records], [['host', 'ui'], []])
+            conflict = self.queue('enqueue', 1, '--test-lanes', 'none', check=False)
+            self.assertEqual(conflict.returncode, 8, conflict.stdout)
+        self.queue('wait', 1)
+        self.queue('wait', 2)
+        self.assertEqual(len(self.data()['lanes']), 7)
+
+    def test_local_runtime_steps_use_loopback_slot_scratch(self):
+        self.pr(1)
+        self.env['CAGENTS_BUILD_REMOTE'] = 'local'
+        self.env['CAGENTS_BUILD_REMOTE_LOOPBACK'] = '0'
+        self.assertEqual(self.batch([1])[0].returncode, 0)
+        steps = self.data()['lanes']
+        self.assertEqual(len(steps), 4)
+        self.assertTrue(all(step['loopback'] == '1' for step in steps))
+        self.assertTrue(all(step['build_remote'] == os.uname().nodename for step in steps))
+
+    def test_cli_runtime_failure_on_main_is_not_blamed_on_a_pr(self):
+        self.pr(1)
+        with self.peer() as data:
+            data['fail_runtime_base'] = True
+        outcome = self.batch([1])[0]
+        self.assertEqual(outcome.returncode, 8, outcome.stdout)
+        self.assertIn('baseline fails', outcome.stdout)
+        self.assertIn('test-cli failed', outcome.stdout)
+        self.assertEqual(self.data()['writes'], [])
+
     def test_main_move_rebuilds_before_writes(self):
         self.pr(1)
         with self.peer() as data:
             data['move_main'] = True
         self.assertEqual(self.batch([1])[0].returncode, 0)
         data = self.data()
-        self.assertEqual(len(data['lanes']), 6)
-        self.assertNotEqual(data['lanes'][0]['tree'], data['lanes'][3]['tree'])
+        self.assertEqual(len(data['lanes']), 8)
+        self.assertNotEqual(data['lanes'][0]['tree'], data['lanes'][4]['tree'])
         self.assertEqual(data['writes'], [1])
 
     def test_head_moved_is_distinct_and_not_built(self):
@@ -339,14 +449,16 @@ fi
             data['block_gate'] = True
         self.queue('enqueue', 1)
         self.assertTrue(wait_for(lambda: (self.directory / 'gate-started').exists()))
-        self.queue('enqueue', 2)
+        self.queue('enqueue', 2, '--test-lanes', 'ui')
         listing = self.queue('status').stdout
         self.assertIn('checking', listing)
         self.assertIn('#2', listing)
         (self.directory / 'release-gate').touch()
         self.assertEqual(self.queue('wait', 1).returncode, 0)
         self.assertEqual(self.queue('wait', 2).returncode, 0)
-        self.assertEqual(len(self.data()['lanes']), 6)
+        self.assertEqual(len(self.data()['lanes']), 9)
+        self.assertEqual([(r['operation'], r['lane']) for r in self.data()['lanes'][-2:]],
+                         [('test', 'cli'), ('test', 'ui')])
         self.assertEqual(self.data()['writes'], [1, 2])
 
     def test_killed_runner_keeps_lease_until_its_gate_exits(self):
@@ -358,17 +470,20 @@ fi
         self.assertTrue(wait_for(lambda: (self.directory / 'gate-started').exists()))
         pid = self.state()['batch']['pid']
         os.kill(pid, signal.SIGKILL)
-        self.queue('enqueue', 2)
+        self.queue('enqueue', 2, '--test-lanes', 'ui')
         with (self.state_path.parent / 'runner.lock').open('a') as lock:
             with self.assertRaises(BlockingIOError):
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         self.assertEqual(len(self.data()['lanes']), 1)
+        self.git('config', '--local', 'mergequeue.testLanes', 'none')
         (self.directory / 'release-gate').touch()
         interrupted = self.queue('wait', 1, check=False)
         self.assertEqual(interrupted.returncode, 8, interrupted.stdout)
         self.assertIn('interrupted', interrupted.stdout)
         self.queue('wait', 2)
         self.assertEqual(self.data()['writes'], [2])
+        self.assertEqual(self.data()['lanes'][-1]['lane'], 'ui')
+        self.assertEqual(self.data()['lanes'][-1]['operation'], 'test')
 
     def test_broken_baseline_is_not_attributed_to_prs(self):
         self.pr(1)
@@ -398,7 +513,7 @@ fi
         closed = self.queue('wait', 1, check=False)
         self.assertEqual(closed.returncode, 6, closed.stdout)
         self.assertEqual(self.data()['queries'], [1])
-        self.assertEqual(len(self.data()['lanes']), 3)
+        self.assertEqual(len(self.data()['lanes']), 4)
         self.assertEqual(self.data()['writes'], [1])
 
     def test_ci_and_closed_have_distinct_outcomes(self):

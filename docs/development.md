@@ -1517,13 +1517,15 @@ before enqueueing; enqueue authorizes the runner to merge the pinned PR.
 ```sh
 scripts/merge-queue enqueue 1234                  # current PR head
 scripts/merge-queue enqueue 1235 --sha FULL_SHA   # exact reviewed head
+scripts/merge-queue enqueue 1236 --test-lanes host,ui  # also require host/UI tests
 scripts/merge-queue status
 scripts/merge-queue wait 1234
 ```
 
 `enqueue` records a durable request and returns after starting a detached
 runner if needed. Repeating an active request for the same head is idempotent;
-a different head is refused until that request finishes. `wait` follows the
+a different head or different optional test requirements are refused until
+that request finishes. `wait` follows the
 latest request that existed when it started, prints its outcome and exits.
 After resolving a rejection, enqueue again to create a new request. Already
 merged PRs report `pr-closed`. `wait` can restart an interrupted runner.
@@ -1551,20 +1553,68 @@ resource reset, with at least two minutes before retrying.
 It fetches fresh `origin/main`, creates a detached checkout under the main
 worktree's `.worktrees/merge-queue-batch`, and merges each pinned head locally.
 Textual conflicts are excluded. It checks the resulting head in three
-separate invocations, through the tested checkout's gate:
+separate invocations, then runs the CLI runtime tests on that same head,
+through the tested checkout's gate:
 
 ```sh
 scripts/cargo-gate check --locked --no-default-features --all-targets
 scripts/cargo-gate check --locked --no-default-features --all-targets --features host
 scripts/cargo-gate check --locked --no-default-features --all-targets --features ui
+scripts/cargo-gate test --locked --no-default-features --all-targets
 ```
+
+CLI tests always run: compile checks cannot detect runtime regressions between
+otherwise compatible PRs, such as scoped locks interacting with PR status
+calls. Host and UI tests are optional, selected per request with
+`--test-lanes host`, `ui`, or `host,ui`. Set a shared clone's default with
+`git config --local mergequeue.testLanes host,ui`; `--test-lanes none` overrides
+that default for a request and still runs CLI tests. The choices are saved at
+enqueue time. Each round uses the union of its requests' requirements for the
+initial gate, baseline checks, every bisection/complement test and any rebuild;
+removing a culprit never weakens the gate during that round. A request enqueued
+while the runner is busy can therefore require stronger tests in its next round.
+`status` shows the saved requirements and current round's test lanes.
+
+The optional lanes run separately after CLI tests:
+
+```sh
+scripts/cargo-gate test --locked --no-default-features --all-targets --features host
+scripts/cargo-gate test --locked --no-default-features --all-targets --features ui
+```
+
+Before each host test, the queue builds a matching `cagentsd`:
+
+```sh
+scripts/cargo-gate exec /usr/bin/python3 scripts/build-ceditor-product cagentsd \
+    --locked --no-default-features --features host --bin cagentsd
+```
+
+It sets `CAGENTS_TEST_RETAINED_ACTOR_HELPER` to that build's executable. It does
+not reuse an inherited helper from another checkout or source head. The queue enables
+`CAGENTS_BUILD_REMOTE_LOOPBACK=1`, so tests on the build host also use its
+existing slot scratch: short private paths outside Git ancestry and the account
+home. An explicit `CAGENTS_BUILD_REMOTE=local` is translated to this host's
+name with loopback enabled; it still compiles on the requested host. Runtime
+fixtures therefore receive the gate's slot TMPDIR, rather than the queue's
+repo-local scratch path. Logs and queue state remain repo-local.
+
+The default adds one CLI test invocation to each passing batch, rather than
+to every PR: admission wait, test compilation/linking and test execution are
+the added cost. A warm CLI harness is relatively cheap; a cold harness still
+needs code generation and linking that `check` skips. Optional host/UI lanes
+add their own larger harness builds and runtime suites; host also adds the
+daemon-helper build. Failure isolation repeats the same complete gate, so
+these costs also apply to baseline and subset probes. No additional fw16 wall
+time has been measured for this change. `runner.log` records elapsed seconds
+for every gate step, including admission waits, so the next real batch can
+establish that cost without estimating it from check times.
 
 A lane failure first checks the unchanged base: a failing base or build host
 reports `runner-error`, without blaming a PR. Otherwise the runner halves and
 retests the batch against a passing prefix, retaining a final group that passed
-all three lanes. If both halves fail, one bounded sweep tests the full group
-with one PR omitted at a time to preserve cooperating changes. Lane attribution
-is against the retained group; arbitrary interacting failures need not have a
+all three check lanes and every required runtime test. If both halves fail,
+one bounded sweep tests the full group with one PR omitted at a time to
+preserve cooperating changes. Lane attribution is against the retained group; arbitrary interacting failures need not have a
 unique independent culprit. Error excerpts and full lane logs are retained.
 Requests arriving during a round enter the next round of the same runner.
 
@@ -1576,8 +1626,9 @@ Writes use the pinned merge endpoint:
 gh api -X PUT repos/OWNER/REPO/pulls/N/merge -f merge_method=merge -f sha=SHA
 ```
 
-Each returned main tree must equal the corresponding prefix of the validated batch; the final tree must equal the batch's tested tree. No
-outcomes are published until the round finishes verification. A mismatch
+Each returned main tree must equal the corresponding prefix of the validated
+batch; the final tree must equal the batch's tested tree. No outcomes are
+published until the round finishes verification. A mismatch
 halts the queue, appears in `status`, and overrides every request in that
 round and every pending request with `tree-mismatch`.
 
@@ -1590,8 +1641,8 @@ queue rather than mixing it with the prototype or per-steward merge locks.
 State, locks, request history, `runner.log`, lane logs and scratch files live
 under `$(git rev-parse --path-format=absolute --git-common-dir)/merge-queue/`.
 The queue writes nothing to `/tmp`. `status` prints this directory and the
-current batch, lane, log path and tested head/tree. Keep the checkout whose
-script started the runner until the queue empties. Logs and history remain
+current batch, gate step, log path, test requirements and tested head/tree.
+Keep the checkout whose script started the runner until the queue empties. Logs and history remain
 after the detached batch checkout is removed.
 
 Only one runner holds the repo-local flock. Its active gate inherits that

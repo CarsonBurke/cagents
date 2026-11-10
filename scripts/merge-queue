@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Batch pinned pull requests through the three isolated Cargo merge checks."""
+"""Batch pinned pull requests through isolated Cargo checks and runtime tests."""
 
 import argparse
 from contextlib import contextmanager
@@ -177,7 +177,16 @@ class Queue:
         finally:
             lock.close()
 
-    def enqueue(self, number, sha):
+    def enqueue(self, number, sha, test_lanes=None):
+        if test_lanes is None:
+            configured = command(["git", "config", "--get", "mergequeue.testLanes"], self.root, check=False)
+            if configured.returncode not in (0, 1):
+                raise QueueError(configured.stdout)
+            test_lanes = configured.stdout.strip()
+        requested = [] if test_lanes in ("", "none") else test_lanes.split(",")
+        if any(lane not in ("host", "ui") for lane in requested):
+            raise QueueError("optional test lanes must be host, ui, host,ui or none; CLI tests always run")
+        requested = sorted(set(requested))
         sha = sha or self.pr(number)["headRefOid"]
         if not re.fullmatch(r"[0-9a-f]{40}", sha):
             raise QueueError("--sha must be a full 40-character lowercase commit SHA")
@@ -187,9 +196,11 @@ class Queue:
             active = next((r for r in state["requests"] if r["pr"] == number and not r.get("outcome")), None)
             if active and active["sha"] != sha:
                 raise QueueError(f"PR #{number} already has an active request at {active['sha']}")
+            if active and active.get("test_lanes", []) != requested:
+                raise QueueError(f"PR #{number} already has an active request with different optional test lanes")
             if not active:
                 active = {"id": uuid.uuid4().hex, "pr": number, "sha": sha,
-                          "queued_at": time.time(), "phase": "pending"}
+                          "queued_at": time.time(), "phase": "pending", "test_lanes": requested}
                 state["requests"].append(active)
             self.start(state)
         print(f"queued #{number} {sha} request={active['id']}")
@@ -244,7 +255,13 @@ class Queue:
         self.passed_trees = set()
         scratch = self.directory / "scratch"
         scratch.mkdir(exist_ok=True)
-        self.env = os.environ | {"TMPDIR": str(scratch), "GIT_MERGE_AUTOEDIT": "no"}
+        self.env = os.environ | {"TMPDIR": str(scratch), "GIT_MERGE_AUTOEDIT": "no",
+                                 "CAGENTS_BUILD_REMOTE_LOOPBACK": "1"}
+        # Runtime fixtures need the gate's short, private slot scratch outside
+        # Git ancestry and the account home, including on the build host itself.
+        # An explicit local build still compiles here, through its loopback slots.
+        if self.env.get("CAGENTS_BUILD_REMOTE") == "local":
+            self.env["CAGENTS_BUILD_REMOTE"] = os.uname().nodename
         try:
             with self.state() as state:
                 # A killed runner never silently retries a possibly committed PUT.
@@ -276,6 +293,9 @@ class Queue:
                         if r["id"] in state["batch"]["ids"]:
                             r["phase"] = "running"
                 self.results = {}
+                self.passed_trees = set()
+                self.test_lanes = sorted({lane for r in pending for lane in r.get("test_lanes", [])})
+                self.phase(test_lanes=["cli", *self.test_lanes])
                 try:
                     self.batch(pending)
                 except Exception as error:
@@ -326,15 +346,35 @@ class Queue:
     def lanes(self):
         self.attempt += 1
         tree = self.git("HEAD^{tree}")
-        for lane, features in (("cli", []), ("host", ["--features", "host"]), ("ui", ["--features", "ui"])):
-            log_path = self.directory / f"lane-{self.batch_id}-{self.attempt}-{lane}.log"
-            self.phase(phase="checking", lane=lane, log=str(log_path),
+        common = ["--locked", "--no-default-features", "--all-targets"]
+        gate = ["scripts/cargo-gate"]
+        steps = [(f"check-{lane}", [*gate, "check", *common, *features])
+                 for lane, features in (("cli", []), ("host", ["--features", "host"]),
+                                        ("ui", ["--features", "ui"]))]
+        steps.append(("test-cli", [*gate, "test", *common]))
+        for lane in self.test_lanes:
+            if lane == "host":
+                steps.append(("build-host-helper", [
+                    *gate, "exec", "/usr/bin/python3", "scripts/build-ceditor-product", "cagentsd",
+                    "--locked", "--no-default-features", "--features", "host", "--bin", "cagentsd"]))
+            steps.append((f"test-{lane}", [*gate, "test", *common, "--features", lane]))
+        environment = self.env.copy()
+        environment.pop("CAGENTS_TEST_RETAINED_ACTOR_HELPER", None)
+        for stage, arguments in steps:
+            log_path = self.directory / f"lane-{self.batch_id}-{self.attempt}-{stage}.log"
+            self.phase(phase="checking", lane=stage, log=str(log_path), stage_started_at=time.time(),
                        tested_head=self.git("HEAD"), tested_tree=self.git("HEAD^{tree}"))
+            started = time.monotonic()
+            helper = stage == "build-host-helper"
             with log_path.open("w") as log:
-                result = subprocess.run(["scripts/cargo-gate", "check", "--locked", "--no-default-features",
-                                         "--all-targets", *features], cwd=self.worktree, env=self.env,
-                                        stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                                        pass_fds=(self.lock_fd,))
+                result = subprocess.run(arguments, cwd=self.worktree, env=environment,
+                                        stdin=subprocess.DEVNULL,
+                                        stdout=subprocess.PIPE if helper else log, stderr=log,
+                                        text=True, errors="replace", pass_fds=(self.lock_fd,))
+                if helper:
+                    log.write(result.stdout)
+            self.log(f"gate {stage} finished in {time.monotonic() - started:.1f}s; "
+                     f"exit={result.returncode}; log={log_path}")
             if result.returncode:
                 errors, first = [], []
                 with log_path.open(errors="replace") as log:
@@ -346,7 +386,12 @@ class Queue:
                             errors.append(line)
                             if len(errors) == 12:
                                 break
-                return f"{lane} lane failed ({log_path}):\n" + "\n".join(errors or first)
+                return f"{stage} failed ({log_path}):\n" + "\n".join(errors or first)
+            if helper:
+                product = Path(result.stdout.strip())
+                if not product.is_absolute() or not product.is_file() or not os.access(product, os.X_OK):
+                    raise QueueError(f"host helper did not report a runnable absolute path: {log_path}")
+                environment["CAGENTS_TEST_RETAINED_ACTOR_HELPER"] = str(product)
         if self.git("HEAD^{tree}") != tree or command(
                 ["git", "status", "--porcelain", "--untracked-files=normal"], self.worktree).stdout.strip():
             raise QueueError("build changed the tested checkout; refusing an untested tree")
@@ -522,7 +567,8 @@ class Queue:
                 print(state["alert"])
             print("batch: " + json.dumps(state["batch"], sort_keys=True))
             for record in state["requests"]:
-                print(f"#{record['pr']} {record['sha']} {record.get('outcome', record['phase'])} request={record['id']}")
+                print(f"#{record['pr']} {record['sha']} {record.get('outcome', record['phase'])} "
+                      f"tests={','.join(['cli', *record.get('test_lanes', [])])} request={record['id']}")
                 if record.get("detail"):
                     print(f"  {record['detail']}")
 
@@ -540,6 +586,8 @@ def main():
     enqueue = commands.add_parser("enqueue", help="enqueue and start a detached runner")
     enqueue.add_argument("pr", type=int)
     enqueue.add_argument("--sha")
+    enqueue.add_argument("--test-lanes", metavar="host,ui|none",
+                         help="additional test lanes (default: Git config mergequeue.testLanes); CLI always runs")
     wait = commands.add_parser("wait", help="wait for the latest request for a PR")
     wait.add_argument("pr", type=int)
     commands.add_parser("status", help="show requests, current batch and persistent alerts")
@@ -547,7 +595,7 @@ def main():
     try:
         queue = Queue()
         if args.command == "enqueue":
-            queue.enqueue(args.pr, args.sha)
+            queue.enqueue(args.pr, args.sha, args.test_lanes)
         elif args.command == "wait":
             return queue.wait(args.pr)
         elif args.command == "status":
