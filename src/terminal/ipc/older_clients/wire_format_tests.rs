@@ -497,3 +497,49 @@ fn lifecycle_proof_detects_variant_positions_and_reachable_payload_changes() {
     variants.push(("unrelated_variant".into(), Some(Fields::Unit)));
     assert!(lifecycle_differences(&baseline, &changed).is_empty());
 }
+
+// Protocol 56 has bespoke payload adapters rather than the current-client
+// subset. Compare every field they actually decode against the source tracer;
+// updating the current recording cannot bless a change to these old DTOs.
+#[test]
+fn protocol56_bespoke_payloads_match_the_recorded_source_graph() {
+    let older = recorded(56);
+    let payloads =
+        Shapes::trace::<crate::update::source::v56::Impact, crate::update::source::v56::Terminal>()
+            .unwrap();
+    let sessions = Shapes::trace::<crate::chat::Session, crate::chat::Session>().unwrap();
+    for (current, name, shape) in [
+        (
+            &payloads,
+            "cagents::update::impact::DaemonImpact",
+            &payloads.client,
+        ),
+        (
+            &payloads,
+            "cagents::terminal::ipc::TerminalDescriptor",
+            &payloads.server,
+        ),
+        (&sessions, "cagents::chat::Session", &sessions.client),
+    ] {
+        let mut comparison = Comparison {
+            older: &older,
+            current,
+            gated: Vec::new(),
+            refused: Vec::new(),
+            selected: &[],
+            visited: BTreeSet::new(),
+            differences: Vec::new(),
+        };
+        comparison.shape(
+            Direction::Reply,
+            &Shape::Container(name.into()),
+            shape,
+            name,
+        );
+        assert!(
+            comparison.differences.is_empty(),
+            "{}",
+            comparison.differences.join("\n")
+        );
+    }
+}

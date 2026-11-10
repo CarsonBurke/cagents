@@ -1360,7 +1360,7 @@ pub fn run_worker(job_id: &str) -> Result<(), UpdateError> {
     };
     job.confirmation = None;
     job.message = match &result {
-        Ok(()) => "Update installed; saved windows reopened".into(),
+        Ok(()) => "Update installed".into(),
         Err(error) => error.to_string(),
     };
     if !job.message.contains("Ended or stopped:") {

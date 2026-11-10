@@ -791,6 +791,32 @@ mod tests {
     }
 
     #[test]
+    fn daemon_only_review_names_live_work_without_window_claims() {
+        let mut preview = preview();
+        preview.windows = 0;
+        let daemon = preview.daemon.as_mut().unwrap();
+        daemon.sessions = vec![
+            session("Codex · alpha", Disposition::Continues, ""),
+            session("Working Codex · alpha", Disposition::WaitsForIdle, ""),
+        ];
+        let mut terminal = session("Build · alpha", Disposition::Continues, "");
+        terminal.kind = SessionKind::Terminal;
+        daemon.sessions.push(terminal);
+        let review = render_review(&preview);
+        assert!(
+            review.contains("Keep running (2)")
+                && review.contains("1 terminal, 1 agent; nothing restarts"),
+            "{review}"
+        );
+        assert!(review.contains("Working now (1)"), "{review}");
+        assert!(
+            review.contains("Working Codex · alpha: finishing its turn"),
+            "{review}"
+        );
+        assert!(!review.contains("window"), "{review}");
+    }
+
+    #[test]
     fn pane_specific_controls_only_appear_when_different_from_group_guidance() {
         let mut preview = preview();
         let mut terminal = session("terminal · beta", Disposition::Continues, "");

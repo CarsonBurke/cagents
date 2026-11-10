@@ -1,5 +1,6 @@
 //! Upgrade-only access to an authenticated source daemon. Ordinary application
 //! clients continue to require a fully matched protocol.
+pub(crate) mod v56;
 mod v77;
 
 use super::{UpdateError, impact, invalid};
@@ -19,6 +20,7 @@ use std::{
 pub(crate) enum Client {
     Current { client: ControlClient, peer: Peer },
     Legacy(v77::Client),
+    Legacy56(v56::Client),
 }
 
 pub(crate) struct Peer {
@@ -144,6 +146,9 @@ impl Client {
                 })?;
                 Ok(Self::Current { client, peer })
             }
+            Some(ClientFamily::V56) => v56::Client::connect(socket, deadline)
+                .map(Self::Legacy56)
+                .map_err(|error| ControlError::Configure(io::Error::other(error.to_string()))),
             Some(ClientFamily::V68 | ClientFamily::V77) => {
                 v77::Client::connect_at_protocol(socket, deadline, protocol)
                     .map(Self::Legacy)
@@ -161,6 +166,7 @@ impl Client {
         match self {
             Self::Current { peer, .. } => Some(peer.pid),
             Self::Legacy(_) => None,
+            Self::Legacy56(client) => Some(client.peer_pid()),
         }
     }
 
@@ -168,6 +174,7 @@ impl Client {
         match self {
             Self::Current { client, .. } => client.protocol(),
             Self::Legacy(client) => client.protocol(),
+            Self::Legacy56(client) => client.protocol(),
         }
     }
 
@@ -175,6 +182,7 @@ impl Client {
         match self {
             Self::Current { client, .. } => client.proof(),
             Self::Legacy(client) => client.proof(),
+            Self::Legacy56(client) => client.proof(),
         }
     }
 
@@ -191,6 +199,7 @@ impl Client {
                     .map_err(|error| invalid(error.to_string()))
             }
             Self::Legacy(client) => client.upgrade_impact(policy),
+            Self::Legacy56(client) => client.upgrade_impact(policy),
         }
     }
 
@@ -212,6 +221,7 @@ impl Client {
                     .map_err(|error| invalid(error.to_string()))
             }
             Self::Legacy(client) => client.prepare_confirmed_upgrade(impact, relaunch_agents),
+            Self::Legacy56(client) => client.prepare_confirmed_upgrade(impact, relaunch_agents),
         }
     }
 }
@@ -225,6 +235,7 @@ impl Client {
                 peer.verify(client.proof())?;
                 client.list().map_err(|error| invalid(error.to_string()))
             }
+            Self::Legacy56(client) => client.list(),
             Self::Legacy(_) => Err(invalid(
                 "This source cannot list terminals for a confirmed stop",
             )),
@@ -242,6 +253,7 @@ impl Client {
                     .map(|preflight| preflight.capability)
                     .map_err(|error| invalid(error.to_string()))
             }
+            Self::Legacy56(client) => client.shutdown_preflight(),
             Self::Legacy(_) => Err(invalid(
                 "This source cannot confirm a terminal service stop",
             )),
@@ -262,6 +274,7 @@ impl Client {
                     .confirm_shutdown(capability)
                     .map_err(|error| invalid(error.to_string()))
             }
+            Self::Legacy56(client) => client.confirm_shutdown(capability),
             Self::Legacy(_) => Err(invalid(
                 "This source cannot confirm a terminal service stop",
             )),
@@ -277,6 +290,7 @@ impl Client {
                     .list_chats()
                     .map_err(|error| invalid(error.to_string()))
             }
+            Self::Legacy56(client) => client.list_chats(),
             Self::Legacy(_) => Err(invalid(
                 "This source cannot end conversations for the update",
             )),
@@ -296,7 +310,7 @@ impl Client {
                     .capture_chat_snapshot(session)
                     .map_err(|error| invalid(error.to_string()))
             }
-            Self::Legacy(_) => Err(invalid(
+            Self::Legacy(_) | Self::Legacy56(_) => Err(invalid(
                 "The source cannot capture this conversation's history",
             )),
         }
@@ -316,7 +330,7 @@ impl Client {
                     .close_chat_with_snapshot(session)
                     .map_err(|error| invalid(error.to_string()))
             }
-            Self::Legacy(_) => Err(invalid(
+            Self::Legacy(_) | Self::Legacy56(_) => Err(invalid(
                 "This source cannot end conversations for the update",
             )),
         }
@@ -450,18 +464,20 @@ pub(crate) const LIFECYCLE_VARIANTS: &[(&str, &[&str])] = &[
 ];
 
 /// One source qualification for lifecycle control and migration inspection.
-/// The bespoke families share the frozen lifecycle subset but need separate
-/// inventory decoders. Their byte proofs live beside those clients.
+/// Protocol 56 has its own lifecycle payloads; 68/77 share theirs. All bespoke
+/// families need separate inventory decoders. Their byte proofs live beside those clients.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ClientFamily {
     Current,
     V77,
     V68,
+    V56,
 }
 
 /// Current-wire entries must pass the recorded lifecycle/inspector proof.
 /// Unrecorded mainline protocols 99–103 and 119 are deliberately not admitted.
 const SOURCE_CLIENTS: &[(u16, ClientFamily)] = &[
+    (56, ClientFamily::V56),
     (68, ClientFamily::V68),
     (77, ClientFamily::V77),
     (128, ClientFamily::Current),
@@ -602,8 +618,15 @@ mod admission_message_tests {
     }
 
     #[test]
+    fn protocol56_uses_its_bespoke_update_client() {
+        assert_eq!(client_family(56), Some(ClientFamily::V56));
+        assert!(is_qualified_source(56));
+        assert!(!current_client_supports(56));
+    }
+
+    #[test]
     fn older_and_between_supported_protocols_name_the_exact_intermediate_build() {
-        for protocol in [119, 56] {
+        for protocol in [55, 57, 119] {
             assert!(!is_qualified_source(protocol));
             assert_eq!(
                 unsupported_source(protocol).to_string(),

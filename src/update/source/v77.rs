@@ -1,4 +1,4 @@
-//! Frozen protocol68/77 update subset. This module deliberately does not decode
+//! Frozen protocol68/77 payloads and protocol56/68/77 update transport. This module deliberately does not decode
 //! current ServerEnvelope/Request layouts or permit ordinary session controls.
 use super::{Peer, UpdateError, impact, invalid};
 use crate::model::{BootId, HostIncarnation, HostSessionId, HostSessionProof};
@@ -251,8 +251,9 @@ pub(crate) struct Client {
     protocol: u16,
 }
 impl Client {
-    // Protocols 68 and 77 share this frozen lifecycle subset. Their inspector
-    // DTOs differ and keep separate decoders; lifecycle exchanges no snapshots.
+    // Protocol 56 shares these headers and transport, with separate lifecycle
+    // payloads in v56. Protocols 68 and 77 share the lifecycle payloads below.
+    // Their inspector DTOs keep separate decoders; no snapshots are read here.
     // No ordinary requests, spawn budgets or notification DTOs are admitted.
     pub(super) fn connect_at_protocol(
         socket: &Path,
@@ -261,7 +262,7 @@ impl Client {
     ) -> Result<Self, UpdateError> {
         if !matches!(
             super::client_family(protocol),
-            Some(super::ClientFamily::V68 | super::ClientFamily::V77)
+            Some(super::ClientFamily::V56 | super::ClientFamily::V68 | super::ClientFamily::V77)
         ) {
             return Err(invalid("Unsupported source update protocol"));
         }
@@ -282,19 +283,19 @@ impl Client {
             None::<Proof>,
             Vec::<()>::new(),
         ))
-        .map_err(|_| invalid("Cannot encode the protocol77 source handshake"))?;
+        .map_err(|_| invalid("Cannot encode the legacy source handshake"))?;
         write(&mut stream, &bytes, deadline)?;
         let bytes = read(&mut stream, deadline)?;
         let (header, body) = header_at_protocol(&bytes, 1, None, protocol)?;
         if header.response != 0 {
             return Err(invalid(
-                "The source did not complete its protocol77 upgrade handshake",
+                "The source did not complete its legacy upgrade handshake",
             ));
         }
         let (proof, rest) = postcard::take_from_bytes::<Proof>(body)
-            .map_err(|_| invalid("Malformed protocol77 source proof"))?;
+            .map_err(|_| invalid("Malformed legacy source proof"))?;
         let (resumed, rest) = postcard::take_from_bytes::<u32>(rest)
-            .map_err(|_| invalid("Malformed protocol77 source resume list"))?;
+            .map_err(|_| invalid("Malformed legacy source resume list"))?;
         let proof = HostSessionProof::from(proof);
         if resumed != 0
             || !rest.is_empty()
@@ -302,7 +303,7 @@ impl Client {
             || !proof.is_complete()
         {
             return Err(invalid(
-                "The protocol77 source handshake returned inconsistent ownership",
+                "The legacy source handshake returned inconsistent ownership",
             ));
         }
         peer.verify(&proof)?;
@@ -315,6 +316,10 @@ impl Client {
         })
     }
 
+    pub(super) fn peer_pid(&self) -> u32 {
+        self.peer.pid
+    }
+
     pub(super) fn protocol(&self) -> u16 {
         self.protocol
     }
@@ -323,7 +328,7 @@ impl Client {
         &self.proof
     }
 
-    fn request<T: Serialize>(
+    pub(super) fn request<T: Serialize>(
         &mut self,
         tag: u32,
         fields: T,
@@ -343,7 +348,7 @@ impl Client {
             tag,
             fields,
         ))
-        .map_err(|_| invalid("Cannot encode the protocol77 source upgrade request"))?;
+        .map_err(|_| invalid("Cannot encode the legacy source upgrade request"))?;
         write(&mut self.stream, &bytes, deadline)?;
         // Never repeat a partially written or unacknowledged preparation.
         let bytes = read(&mut self.stream, deadline).map_err(|error| {
@@ -356,7 +361,7 @@ impl Client {
         let (header, body) = header_at_protocol(&bytes, id, Some(&self.proof), self.protocol)?;
         if header.response != response {
             return Err(invalid(
-                "The protocol77 source returned an unexpected upgrade response",
+                "The legacy source returned an unexpected upgrade response",
             ));
         }
         Ok(body.to_vec())
@@ -367,15 +372,15 @@ impl Client {
         policy: impact::Policy,
     ) -> Result<impact::DaemonImpact, UpdateError> {
         let bytes = self.request(36, Policy::from(policy), 9, Duration::from_secs(30))?;
-        let observed: Impact = postcard::from_bytes(&bytes)
-            .map_err(|_| invalid("Malformed protocol77 upgrade impact"))?;
+        let observed: Impact =
+            postcard::from_bytes(&bytes).map_err(|_| invalid("Malformed legacy upgrade impact"))?;
         let observed = impact::DaemonImpact::from(observed);
         if observed.capability.proof != self.proof
             || observed.policy != policy
             || observed.sessions.len() > 1152
         {
             return Err(invalid(
-                "The protocol77 source impact does not match its authenticated inventory",
+                "The legacy source impact does not match its authenticated inventory",
             ));
         }
         Ok(observed)
@@ -393,7 +398,7 @@ impl Client {
             Duration::from_secs(60),
         )?;
         let counts: (u64, u64) = postcard::from_bytes(&bytes)
-            .map_err(|_| invalid("Malformed protocol77 checkpoint receipt"))?;
+            .map_err(|_| invalid("Malformed legacy checkpoint receipt"))?;
         if counts.0 > 1024 || counts.1 > 128 {
             return Err(invalid(
                 "The source checkpoint receipt exceeds its declared inventory limits",
@@ -410,7 +415,7 @@ fn header_at_protocol<'a>(
     protocol: u16,
 ) -> Result<(ReplyHeader, &'a [u8]), UpdateError> {
     let (header, body) = postcard::take_from_bytes::<ReplyHeader>(bytes)
-        .map_err(|_| invalid("Malformed protocol77 source upgrade response"))?;
+        .map_err(|_| invalid("Malformed legacy source upgrade response"))?;
     if header.version != protocol || header.request_id != Some(id) || header.message != 0 {
         return Err(invalid(
             "The source upgrade response changed its protocol or request identity",
@@ -419,7 +424,7 @@ fn header_at_protocol<'a>(
     let actual = HostSessionProof::from(header.proof.clone());
     if !actual.is_complete() || proof.is_some_and(|proof| *proof != actual) {
         return Err(invalid(
-            "The protocol77 source ownership changed during upgrade",
+            "The legacy source ownership changed during upgrade",
         ));
     }
     Ok((header, body))
@@ -470,7 +475,7 @@ impl Write for DeadlineStream<'_> {
 fn write(stream: &mut UnixStream, bytes: &[u8], deadline: Instant) -> Result<(), UpdateError> {
     if bytes.len() > 2 * 1024 * 1024 {
         return Err(invalid(
-            "The protocol77 source request exceeds its bounded frame limit",
+            "The legacy source request exceeds its bounded frame limit",
         ));
     }
     let mut stream = DeadlineStream { stream, deadline };
@@ -485,7 +490,7 @@ fn read(stream: &mut UnixStream, deadline: Instant) -> Result<Vec<u8>, UpdateErr
     let length = u32::from_be_bytes(prefix) as usize;
     if length == 0 || length > 8 * 1024 * 1024 {
         return Err(invalid(
-            "The protocol77 source exceeded its bounded frame limit",
+            "The legacy source exceeded its bounded frame limit",
         ));
     }
     let mut bytes = vec![0; length];
@@ -682,9 +687,12 @@ mod tests {
                 impact::DaemonImpact::from(postcard::from_bytes::<Impact>(&body).unwrap()),
                 expected
             );
-            for protocol in super::super::protocols()
-                .filter(|&protocol| !super::super::current_client_supports(protocol))
-            {
+            for protocol in super::super::protocols().filter(|&protocol| {
+                matches!(
+                    super::super::client_family(protocol),
+                    Some(super::super::ClientFamily::V68 | super::super::ClientFamily::V77)
+                )
+            }) {
                 let bytes = frozen_response(protocol, 2, &proof(), 9, &body);
                 let (header, decoded) =
                     header_at_protocol(&bytes, 2, Some(&proof()), protocol).unwrap();
@@ -720,9 +728,12 @@ mod tests {
     #[cfg(feature = "host")]
     #[test]
     fn authenticated_legacy_preview_keeps_consent_and_preparation_separate() {
-        for protocol in super::super::protocols()
-            .filter(|&protocol| !super::super::current_client_supports(protocol))
-        {
+        for protocol in super::super::protocols().filter(|&protocol| {
+            matches!(
+                super::super::client_family(protocol),
+                Some(super::super::ClientFamily::V68 | super::super::ClientFamily::V77)
+            )
+        }) {
             for (ready, fail_preview) in [(false, false), (true, false), (false, true)] {
                 authenticated_legacy_preview(protocol, ready, fail_preview);
             }

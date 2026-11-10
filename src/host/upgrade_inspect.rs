@@ -2,6 +2,7 @@
 //! Stores remain read-only. Exact retained providers missing from startup
 //! discovery may be authenticated through Resolve; no launch recipe is run.
 mod current;
+mod v56;
 mod v68;
 mod v77;
 #[cfg(test)]
@@ -68,6 +69,7 @@ enum Reader {
     Current(current::Client),
     Legacy(v77::Client),
     Legacy68(v68::Client),
+    Legacy56(v56::Client),
 }
 
 impl Reader {
@@ -76,6 +78,7 @@ impl Reader {
             Self::Current(client) => client.list(),
             Self::Legacy(client) => client.list(),
             Self::Legacy68(client) => client.list(),
+            Self::Legacy56(client) => client.list(),
         }
     }
     fn terminals(&mut self) -> Result<Vec<v77::Terminal>, String> {
@@ -83,6 +86,7 @@ impl Reader {
             Self::Current(client) => client.terminals(),
             Self::Legacy(client) => client.terminals(),
             Self::Legacy68(client) => client.terminals(),
+            Self::Legacy56(client) => client.terminals(),
         }
     }
     fn reconcile_retained(&mut self, source: &Session) -> Result<(), String> {
@@ -96,6 +100,7 @@ impl Reader {
             Self::Current(client) => client.resolve(source),
             Self::Legacy(client) => client.resolve(source),
             Self::Legacy68(client) => client.resolve(source),
+            Self::Legacy56(client) => client.resolve(source),
         }
     }
     fn inspect_saved_history(&mut self, source: &Session) -> Result<(), String> {
@@ -123,6 +128,7 @@ fn connect(request: &Request, deadline: Instant) -> Result<Reader, String> {
             current::Client::connect(&socket, proof, deadline, request.protocol)
                 .map(Reader::Current)
         }
+        ClientFamily::V56 => v56::Client::connect(&socket, proof, deadline).map(Reader::Legacy56),
         ClientFamily::V68 => v68::Client::connect(&socket, proof, deadline).map(Reader::Legacy68),
         ClientFamily::V77 => v77::Client::connect(&socket, proof, deadline).map(Reader::Legacy),
     }
@@ -1548,7 +1554,7 @@ mod tests {
         assert!(current::supports_protocol(156));
         assert_eq!(
             source::protocols().collect::<Vec<_>>(),
-            [68, 77, 128, 156, crate::terminal_ipc::PROTOCOL_VERSION]
+            [56, 68, 77, 128, 156, crate::terminal_ipc::PROTOCOL_VERSION]
         );
     }
 
