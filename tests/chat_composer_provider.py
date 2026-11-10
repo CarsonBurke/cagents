@@ -177,6 +177,28 @@ class Provider(unittest.TestCase):
         rearmed, _, _ = self.run_provider()
         self.assertEqual(rearmed.returncode, 1)
 
+    def test_a_pause_answers_meanwhile_and_an_interrupt_ends_the_turn_there(self):
+        self.frames({"_sleep": 30},
+                    {"type": "assistant", "uuid": "late-@TURN@", "message": {
+                        "id": "late-@TURN@", "role": "assistant",
+                        "content": [{"type": "text", "text": "After the pause."}]}})
+        interrupt = {"type": "control_request", "request_id": "stop-1",
+                     "request": {"subtype": "interrupt"}}
+        result, output, elapsed = self.run_provider(frames=(prompt(1), prompt(2), interrupt))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(elapsed, 20)
+        kinds = [(frame.get("type"), frame.get("command_uuid") or frame.get("response", {})
+                  .get("request_id")) for frame in output
+                 if frame.get("type") in ("command_lifecycle", "control_response", "result")]
+        # The prompt sent during the pause waits in the turn's queue, and the
+        # interrupt is answered and ends the turn before the frames go on.
+        self.assertEqual(kinds[:4], [("command_lifecycle", "prompt-1"),
+                                     ("command_lifecycle", "prompt-2"),
+                                     ("control_response", "stop-1"), ("result", None)])
+        self.assertEqual(output[[f.get("command_uuid") for f in output].index("prompt-2")]["state"],
+                         "queued")
+        self.assertNotIn("After the pause.", self.texts(output))
+
     def test_a_stop_for_a_task_the_frames_started_patches_it_killed_without_a_notice(self):
         # As Claude Code 2.1.296 answers a stop for an agent that already sent
         # its notice and is waiting on its own background work.
