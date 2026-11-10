@@ -349,8 +349,8 @@ fn every_older_client_is_proven_against_its_recorded_format() {
     }
 }
 
-/// Compare the lifecycle in both directions: unlike general older clients,
-/// nested lifecycle enums may neither add nor remove variants. Both envelope
+/// Compare lifecycle and inspection in both directions: unlike general older
+/// clients, nested enums may neither add nor remove variants. Both envelope
 /// headers are included, so proof fields and request correlation stay frozen.
 fn lifecycle_differences(older: &Shapes, current: &Shapes) -> Vec<String> {
     let mut changed = Vec::new();
@@ -382,10 +382,10 @@ fn lifecycle_differences(older: &Shapes, current: &Shapes) -> Vec<String> {
 }
 
 #[test]
-fn every_current_client_update_source_preserves_the_frozen_lifecycle_wire_format() {
+fn every_current_client_update_source_preserves_the_frozen_lifecycle_and_inspector_wire_format() {
     let current = traced();
     let current_recording = recorded(PROTOCOL_VERSION);
-    for &protocol in crate::update::source::CURRENT_CLIENT_PROTOCOLS {
+    for protocol in crate::update::source::current_client_protocols() {
         let older = recorded(protocol);
         let mut changed = lifecycle_differences(&older, &current_recording);
         // Also compare actual Rust types: regenerating the current fixture
@@ -393,9 +393,65 @@ fn every_current_client_update_source_preserves_the_frozen_lifecycle_wire_format
         changed.extend(lifecycle_differences(&older, &current));
         assert!(
             changed.is_empty(),
-            "update source protocol {protocol} no longer has this build's frozen lifecycle wire format:\n{}",
+            "update source protocol {protocol} no longer has this build's frozen lifecycle and inspector wire format:\n{}",
             changed.join("\n")
         );
+    }
+}
+
+#[test]
+fn inspector_proof_detects_each_request_response_and_reachable_history_change() {
+    // Both recorded source lines must prove the inspector as well as lifecycle
+    // control. These mutations also catch accidentally narrowing the subset.
+    for protocol in [128, 156] {
+        let baseline = recorded(protocol);
+        for (container, names) in [
+            (
+                "ClientRequest",
+                &[
+                    "ChatStart",
+                    "ResolveUpgradeChat",
+                    "ChatVisibility",
+                    "ChatRead",
+                ][..],
+            ),
+            (
+                "ServerResponse",
+                &["accepted", "chat_snapshot", "upgrade_chat_resolved"][..],
+            ),
+        ] {
+            let key = baseline
+                .containers
+                .keys()
+                .find(|key| short(key) == container)
+                .unwrap();
+            for name in names {
+                let mut changed = baseline.clone();
+                let Container::Enum(variants) = changed.containers.get_mut(key).unwrap() else {
+                    panic!()
+                };
+                let index = variants
+                    .iter()
+                    .position(|(variant, _)| variant == name)
+                    .unwrap();
+                variants.swap(index, index - 1);
+                assert!(
+                    !lifecycle_differences(&baseline, &changed).is_empty(),
+                    "protocol {protocol}: inspector variant {name} must be frozen"
+                );
+            }
+        }
+
+        let mut changed = baseline.clone();
+        let Container::Struct(fields) = changed
+            .containers
+            .get_mut("cagents::chat::Snapshot")
+            .unwrap()
+        else {
+            panic!()
+        };
+        fields.push(("future_history_field".into(), Shape::Bool));
+        assert!(!lifecycle_differences(&baseline, &changed).is_empty());
     }
 }
 

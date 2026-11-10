@@ -3177,10 +3177,7 @@ finally:
             boot_id: "boot".into(),
             host_incarnation: "incarnation".into(),
         };
-        for &protocol in source::CURRENT_CLIENT_PROTOCOLS
-            .iter()
-            .chain(source::LEGACY_PROTOCOLS)
-        {
+        for protocol in source::protocols() {
             for window in [&old, &new] {
                 for owner in [&old, &third] {
                     assert_eq!(
