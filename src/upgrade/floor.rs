@@ -153,7 +153,8 @@ impl Record {
         {
             return Err("Stopped update panes have no exact source proof".into());
         }
-        record.write_to(&root)
+        record.write_to(&root)?;
+        refresh_cached()
     }
 
     fn file_name(&self) -> Result<String, String> {
@@ -719,11 +720,30 @@ mod tests {
     }
 }
 
-/// Each daemon/window reads its stopped inventory once. The updater writes it
-/// before starting those processes; old processes keep their existing behavior.
-pub(crate) fn cached() -> Result<&'static Ledger, &'static str> {
-    static LEDGER: std::sync::OnceLock<Result<Ledger, String>> = std::sync::OnceLock::new();
-    LEDGER.get_or_init(load).as_ref().map_err(String::as_str)
+type CachedLedger = std::sync::RwLock<Result<std::sync::Arc<Ledger>, String>>;
+
+fn ledger_cache() -> &'static CachedLedger {
+    static LEDGER: std::sync::OnceLock<CachedLedger> = std::sync::OnceLock::new();
+    LEDGER.get_or_init(|| std::sync::RwLock::new(load().map(std::sync::Arc::new)))
+}
+
+/// Processes retain their startup inventory across external writes. Prepared
+/// recovery can publish another record during startup, so successful local
+/// saves refresh the index before serving the new stopped readers.
+pub(crate) fn cached() -> Result<std::sync::Arc<Ledger>, String> {
+    ledger_cache()
+        .read()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone()
+}
+
+fn refresh_cached() -> Result<(), String> {
+    let mut ledger = ledger_cache()
+        .write()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let updated = load()?;
+    *ledger = Ok(std::sync::Arc::new(updated));
+    Ok(())
 }
 
 pub(crate) fn same_allocation(source: &Session, saved: &Session) -> bool {

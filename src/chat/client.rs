@@ -2095,14 +2095,10 @@ impl ClientHandle {
                 )?
             }
         } else if intent == Intent::Start
-            && crate::upgrade::floor::cached()
-                .is_ok_and(|ledger| ledger.resume_source(&session).is_some())
+            && let Some(original) = crate::upgrade::floor::cached()
+                .ok()
+                .and_then(|ledger| ledger.resume_source(&session).cloned())
         {
-            let original = crate::upgrade::floor::cached()
-                .map_err(str::to_owned)?
-                .resume_source(&session)
-                .unwrap()
-                .clone();
             let request_id = attach_request;
             attach_request += 1;
             codec

@@ -53,7 +53,7 @@ impl Adapter for StoppedAdapter {
 }
 
 pub(super) fn recover(host: &SharedHost, requested: &Session) -> Result<(), String> {
-    let ledger = crate::upgrade::floor::cached().map_err(str::to_owned)?;
+    let ledger = crate::upgrade::floor::cached()?;
     let original = ledger
         .resume_source(requested)
         .ok_or("The stopped update source changed its saved conversation")?;
@@ -176,7 +176,7 @@ pub(super) fn prepare_resume(
     host: &SharedHost,
     requested: &Session,
 ) -> Result<Option<Session>, String> {
-    let ledger = crate::upgrade::floor::cached().map_err(str::to_owned)?;
+    let ledger = crate::upgrade::floor::cached()?;
     let Some(source) = ledger.resume_source(requested) else {
         return Ok(None);
     };
@@ -482,7 +482,30 @@ mod flow_tests {
         let mut stale = record.chats[0].clone();
         stale.launch.session_id = None;
         record.aliases.push(stale.clone());
+        // Retained adoption can consult this index before Prepared recovery
+        // publishes its paused record in the same daemon process.
+        let before_publication = crate::upgrade::floor::cached().unwrap();
+        assert!(before_publication.resume_source(&stale).is_none());
         record.save().unwrap();
+        assert!(before_publication.resume_source(&stale).is_none());
+        assert!(
+            crate::upgrade::floor::cached()
+                .unwrap()
+                .resume_source(&stale)
+                .is_some()
+        );
+        let published = crate::upgrade::floor::cached().unwrap();
+        let invalid = crate::instance::project_dirs()
+            .unwrap()
+            .data_local_dir()
+            .join("daemon-upgrade/update-floor/invalid.json");
+        std::fs::write(&invalid, b"{").unwrap();
+        assert!(record.save().is_err());
+        assert!(Arc::ptr_eq(
+            &published,
+            &crate::upgrade::floor::cached().unwrap()
+        ));
+        std::fs::remove_file(invalid).unwrap();
         let mut state = HostState::new(new.clone());
         state.install_model(
             crate::host::model::Registry::at(&root.join("registry.sqlite3")).unwrap(),
