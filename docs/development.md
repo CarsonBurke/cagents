@@ -1629,8 +1629,12 @@ cropped image. This changes the capture viewport, not application layouts.
 app, from a shell where the desktop session or `DISPLAY` is unavailable, such as
 plain SSH. It runs headless: KWin's virtual backend hosts a nested niri session,
 driven by `niri-harness`, running `scripts/run-development --browserless`.
-The runner uses a task-specific `--instance NAME --in-session` inside that
-private compositor; its CLI and cleanup use the same named daemon.
+Add `start SIDE --instance NAME` to opt a new task into a named instance.
+It stays in the existing private compositor through the runner's `--in-session`
+mode; CLI and cleanup use the same name. The task keeps that selection across
+starts and refuses a different name. This needs a source runner supporting
+`--in-session`; default unnamed tasks retain compatibility with older runners
+and saved seeds.
 Each task keeps everything in one directory outside Git ancestry. Avoid `/tmp`,
 `/var/tmp` and `~/.cache`, where Codex sandboxes can leave an empty `.git` that
 fixtures refuse.

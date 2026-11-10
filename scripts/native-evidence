@@ -39,7 +39,7 @@ both use the same fixture data and synthetic provider.
                   once no build or session has used them for 12 hours, or 1
                   hour while the disk is low.
   start SIDE [--width PX] [--height PX] [--keep-state] [--wait-lock SECONDS] [--limit SECONDS]
-        [--portal gtk|kde|gnome|cosmic]
+        [--portal gtk|kde|gnome|cosmic] [--instance NAME]
                   Take the native lock and start a headless session at the
                   requested logical width and height (default 1500x900). The lock is
                   released by stop, or after --limit seconds (default 2700).
@@ -111,7 +111,6 @@ select_task() {
         ancestor=${ancestor:-/}
     done
     mkdir -p -- "$task"
-    instance_name=e$(printf %s "$task" | sha256sum | cut -c1-8)
     fixture=$task/fixture
     seed=$task/fixture-seed
     seed_home=$task/fixture-seed.home
@@ -128,6 +127,7 @@ select_task() {
         touch -- "$task/.native-evidence"
     fi
     mkdir -p -- "$logs" "$state" "$shots"
+    instance_name=$(cat "$state/instance" 2>/dev/null) || instance_name=
 }
 
 require_side() {
@@ -740,11 +740,12 @@ run_app() {
     # pruner, under this private HOME, beside the app being captured, and
     # sync the file system for each one while the disk is low. Builds run
     # inside the session once it is ready are not disk-guarded either.
-    local status=0 stage_environment=()
+    local status=0 stage_environment=() runner_instance=()
+    [ -z "$instance_name" ] || runner_instance=(--instance "$instance_name" --in-session)
     [ -z "${chat_stage_output:-}" ] || stage_environment+=("CAGENTS_CHAT_STAGE_OUTPUT=$chat_stage_output")
     fixture_env env "${stage_environment[@]}" CAGENTS_BUILD_LOCK="$state/session-build.lock" CAGENTS_BUILD_SLOTS=1 CAGENTS_BUILD_SEED=0 \
         CAGENTS_BUILD_REMOTE=local CAGENTS_BUILD_FREE_FLOOR_GIB=0 \
-        scripts/run-development --browserless --instance "$instance_name" --in-session \
+        scripts/run-development --browserless "${runner_instance[@]}" \
             --debug --log-file "$logs/ui-$side.log" || status=$?
     # Don't leave the lock held until the harness gives up on a window.
     if [ ! -e "$state/ready" ] && [ ! -e "$state/failed" ]; then
@@ -834,6 +835,7 @@ cmd_start() {
             --width) width=${2:?--width needs pixels}; shift 2 ;;
             --height) height=${2:?--height needs pixels}; shift 2 ;;
             --keep-state) keep_state=true; shift ;;
+            --instance) instance_name=${2:?--instance needs a name}; shift 2 ;;
             --wait-lock) wait_lock=${2:?--wait-lock needs seconds}; shift 2 ;;
             --limit) limit=${2:?--limit needs seconds}; shift 2 ;;
             --portal) portal=${2:?--portal needs a backend: gtk, kde, gnome or cosmic}; shift 2 ;;
@@ -845,6 +847,11 @@ cmd_start() {
     [[ -z $portal || $portal =~ ^(gtk|kde|gnome|cosmic)$ ]] ||
         die "unknown portal backend: $portal; use gtk, kde, gnome or cosmic" 2
     [[ $self =~ ^/[A-Za-z0-9._/-]+$ ]] || die "the tool's path has unsupported characters: $self" 2
+    [[ -z $instance_name || $instance_name =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,23}$ ]] ||
+        die 'instance names must be 1-24 ASCII letters, digits or hyphens, starting with a letter or digit' 2
+    if [ -f "$state/instance" ] && [ "$(cat "$state/instance")" != "$instance_name" ]; then
+        die 'this task already selected another instance; use a new task to change it' 2
+    fi
     live_session && die 'a session is already running for this task; stop it first'
     if [ "$keep_state" = false ] && [ -d "$seed" ] && [ -d "$fixture" ] && ! command -v rsync >/dev/null 2>&1; then
         die 'restoring the seed needs rsync, which keeps the directories its chats recorded; install rsync'
@@ -857,6 +864,7 @@ cmd_start() {
     # Fix what this session runs: everything it reports reads this copy.
     cp -- "$(target_of "$side")/evidence-source" "$state/source" 2>/dev/null ||
         die "$(not_built "$side" "$checkout")"
+    printf '%s\n' "$instance_name" >"$state/instance"
     printf '%s\n' "$side" >"$state/side"
     printf '%s\n' "$width" >"$state/width"
     printf '%s\n' "$height" >"$state/height"
