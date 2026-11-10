@@ -415,16 +415,41 @@ fn committed_upgrade_shutdown_preserves_real_native_owner_even_if_final_save_fai
                     .is_none(),
                 "old-alias retry must retire the exact current adopted authority too"
             );
-            let mut unrelated = source;
+            let proof = restarted.lock().unwrap().proof().clone();
+            let receipt = crate::chat::native_holder::closed_source(&source, &proof).unwrap();
+            assert!(receipt.as_ref().is_some_and(|(_, paired)| *paired));
+            assert!(!record.root.is_current());
+            let mut unrelated = source.clone();
             unrelated.launch.session_id = Some("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".into());
             assert!(
+                crate::chat::native_holder::closed_source(&unrelated, &proof)
+                    .unwrap()
+                    .is_none()
+            );
+            // An unrelated receipt grants no close authority. Once nothing
+            // can still run, the lost-execution route settles this descriptor
+            // independently and preserves the original exact close receipt.
+            assert!(matches!(
                 super::super::client::process_request(
                     &restarted,
                     0,
-                    crate::terminal::ipc::ClientRequest::ChatCloseRetained { session: unrelated }
+                    crate::terminal::ipc::ClientRequest::ChatCloseRetained {
+                        session: unrelated.clone()
+                    }
                 )
-                .is_err(),
-                "a close receipt must not authorize a changed conversation"
+                .unwrap()
+                .0,
+                crate::terminal::ipc::ServerResponse::Accepted
+            ));
+            assert!(
+                crate::chat::native_holder::closed_source(&unrelated, &proof)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                crate::chat::native_holder::closed_source(&source, &proof).unwrap(),
+                receipt,
+                "settling an ended descriptor must preserve the unrelated receipt"
             );
         } else {
             // Model the already-published failed local adapter from an older
