@@ -2642,3 +2642,6 @@ fn completed_source_discards_parser_scratch_without_discarding_rendered_content(
     assert_eq!(format!("{:?}", content.items()), before);
     assert_eq!(content.images(), &images);
 }
+
+#[cfg(test)]
+mod heap_cost;

@@ -28,6 +28,8 @@ use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
 use cosmic::iced::{Size, mouse};
 use std::time::{Duration, Instant};
 
+mod heap_cost;
+
 const FRAMES: usize = 240;
 /// Frames a recorded workload discards while caches and allocations settle.
 const WARMUP: usize = 8;
