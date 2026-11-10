@@ -15242,6 +15242,8 @@ impl Application for Cagents {
                 | Message::FocusAdjacent(_)
                 | Message::WindowResized(..)
         );
+        #[cfg(test)]
+        let model_update = matches!(&message, Message::WorkspaceModelObserved(_));
         let mut projection = if repaint_tick(&message) || self.navigation_save_is_stale(&message) {
             Projection::Unchanged
         } else {
@@ -15306,10 +15308,8 @@ impl Application for Cagents {
                 self.observe_hosted_descriptors(terminals)
             }
             Message::WorkspaceModelObserved(update) => {
-                let (task, changed) = self.apply_workspace_model_update_effect(update);
-                if !changed {
-                    projection = Projection::Unchanged;
-                }
+                let (task, model_projection) = self.apply_workspace_model_update_projection(update);
+                projection = model_projection;
                 task
             }
             Message::TerminalStarted {
@@ -18739,6 +18739,8 @@ impl Application for Cagents {
             // A reported title reaches the tabs and window title; nothing in
             // the sidebar, worktree ownership or protections reads it.
             Projection::Chrome => {
+                #[cfg(test)]
+                if model_update { self.shared_views.chrome_tail_count += 1; }
                 let notices = self.reconcile_notice_popup();
                 let chrome = self.sync_chrome();
                 return Task::batch([
@@ -18755,6 +18757,8 @@ impl Application for Cagents {
         }
         #[cfg(test)]
         terminal_output_tests::record_projection();
+        #[cfg(test)]
+        if model_update { self.shared_views.structural_tail_count += 1; }
         let notices = self.reconcile_notice_popup();
         self.synchronize_sidebar_selection();
         self.refresh_sidebar_channels();

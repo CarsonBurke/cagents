@@ -21172,6 +21172,142 @@ mod tests {
     }
 
     #[test]
+    fn presentation_projection_retries_a_deferred_title_with_the_ahead_scope_proof() {
+        use super::super::workspace_model_sync::{EdgeChanges, ModelUpdate};
+        use crate::model::{
+            ChannelId, ChannelTitleSource, ProjectChannel, ProjectId, RepositoryId,
+        };
+        use crate::workspace_model::{
+            ModelChannel, ModelEdit, ModelProject,
+            delta::{EditEffects, ViewChanges, ViewRevision},
+            views::{Pane, Scope, View},
+        };
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let handle = chat_runtime(&app, card).handle().unwrap().clone();
+        let channel = ChannelId::new();
+        let project = ProjectId::new();
+        let repository = PathBuf::from("/repo/.git");
+        Arc::make_mut(&mut app.durable).channels = vec![ProjectChannel {
+            id: channel,
+            project_id: project,
+            title: "Old automatic title".into(),
+            title_source: ChannelTitleSource::Prompt,
+            ordinal: 1,
+            shared: true,
+            cards: vec![card],
+            focused: Some(card),
+        }];
+        Arc::make_mut(&mut app.durable).active_channel = Some(channel);
+        app.sidebar_model
+            .projects
+            .push(crate::sidebar::SidebarProject::new(
+                project,
+                RepositoryId::new(),
+                "repo".into(),
+                repository.clone(),
+                vec![],
+                vec![],
+            ));
+        app.workspace_model.identity = uuid::Uuid::new_v4();
+        app.workspace_model.projects = vec![ModelProject {
+            repository: repository.clone(),
+            name: "repo".into(),
+            kind: crate::model::ProjectKind::Git,
+            ordinal: 0,
+        }];
+        app.workspace_model.channels = vec![ModelChannel {
+            id: channel,
+            repository,
+            title: "Old automatic title".into(),
+            title_source: ChannelTitleSource::Prompt,
+            ordinal: 1,
+        }];
+        let pane = Pane::from_card(
+            app.card_state(card).unwrap(),
+            app.durable.card_scopes.get(&card).cloned(),
+        )
+        .unwrap();
+        let scope = Scope::Channel(channel);
+        let before = View {
+            scope: scope.clone(),
+            revision: 17,
+            panes: vec![pane.clone()],
+            retired: vec![],
+        };
+        app.workspace_model.views = vec![before.clone()];
+        app.shared_views = super::super::shared_views::State::for_workspace(&app.durable);
+        app.shared_views
+            .initialize(scope.clone(), vec![pane.clone()]);
+        app.shared_views.attached.insert(card);
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.title = Some("Current provider title".into());
+        handle.publish_snapshot_for_test(snapshot);
+        app.chat_ui.channel_names.insert(
+            target,
+            ChannelNameObservation {
+                session: Some(KNOWN_THREAD.into()),
+                title: Some((
+                    "Current provider title".into(),
+                    ChannelTitleSource::Provider,
+                )),
+                last_view: Some((channel, 17)),
+                pending: true,
+                ..Default::default()
+            },
+        );
+        let mut accepted = before.clone();
+        accepted.revision = 21;
+        accepted.panes[0].width_fraction = 0.68;
+        assert_eq!(
+            app.presentation_projection_ready(&before, &accepted, None),
+            Ok(())
+        );
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        let update = ModelUpdate::Changed {
+            sequence: 18,
+            edit: ModelEdit::ChangeView {
+                scope: scope.clone(),
+                expected_revision: 17,
+                operation: uuid::Uuid::new_v4(),
+                change: crate::workspace_model::views::Change::Update {
+                    before: pane,
+                    pane: accepted.panes[0].clone(),
+                },
+            },
+            changes: EdgeChanges {
+                identity: Some(app.workspace_model.identity),
+                views: ViewChanges {
+                    sequence: 21,
+                    views: vec![accepted],
+                    ..Default::default()
+                },
+                effects: EditEffects {
+                    views: vec![ViewRevision {
+                        scope,
+                        before: Some(17),
+                        after: Some(18),
+                    }],
+                    ..Default::default()
+                },
+            },
+        };
+        let (_, projection) = app.apply_workspace_model_update_projection(update);
+        assert!(matches!(projection, super::super::Projection::Chrome));
+        assert_eq!(app.durable.channels[0].title, "Current provider title");
+        assert!(std::iter::from_fn(|| rx.try_recv().ok()).any(|edit| matches!(edit,
+            ModelEdit::SuggestConversationTitle { id, card: candidate, expected_revision: 21, title, .. }
+                if id == channel && candidate == card && title == "Current provider title")));
+        assert_eq!(
+            app.chat_ui.channel_names[&target].last_view,
+            Some((channel, 21))
+        );
+    }
+
+    #[test]
     fn a_secondary_title_wake_is_used_when_it_becomes_primary_without_another_wake() {
         use crate::model::{ChannelId, ChannelTitleSource, ProjectChannel, ProjectId};
         use crate::workspace_model::views::{Pane, Scope, View};

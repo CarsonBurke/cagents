@@ -878,10 +878,228 @@ impl Cagents {
         self.apply_workspace_model_update_effect(update).0
     }
 
+    /// Gives the application an explicit tail budget. Only a proven
+    /// presentation change may avoid structural sidebar/ownership work.
+    pub(super) fn apply_workspace_model_update_projection(
+        &mut self,
+        update: ModelUpdate,
+    ) -> (Task<Message>, Projection) {
+        let foreign = match &update {
+            ModelUpdate::Committed { receipt, .. } => {
+                receipt.identity != self.workspace_model.identity
+            }
+            ModelUpdate::Changed { changes, .. } => changes
+                .identity
+                .is_some_and(|identity| identity != self.workspace_model.identity),
+            _ => false,
+        };
+        if foreign {
+            return (Task::none(), Projection::Unchanged);
+        }
+        match self.presentation_scope_for_update(&update) {
+            Ok(scope) => {
+                tracing::trace!(target: "cagents::workspace_projection", selected = true, "Projecting shared presentation");
+                return (
+                    self.apply_presentation_model_update(update, scope),
+                    Projection::Chrome,
+                );
+            }
+            Err(reason) => {
+                tracing::trace!(target: "cagents::workspace_projection", selected = false, reason, "Projecting shared model")
+            }
+        }
+        let (task, changed) = self.apply_workspace_model_update_full_effect(update);
+        (
+            task,
+            if changed {
+                Projection::Full
+            } else {
+                Projection::Unchanged
+            },
+        )
+    }
+
+    pub(super) fn apply_workspace_model_update_effect(
+        &mut self,
+        update: ModelUpdate,
+    ) -> (Task<Message>, bool) {
+        let (task, projection) = self.apply_workspace_model_update_projection(update);
+        (task, projection != Projection::Unchanged)
+    }
+
+    fn presentation_scope_for_update(
+        &self,
+        update: &ModelUpdate,
+    ) -> Result<crate::workspace_model::views::Scope, &'static str> {
+        use crate::workspace_model::views::Change;
+        let (edit, effects, changes, pending, identity) = match update {
+            ModelUpdate::Committed {
+                receipt,
+                edit,
+                views,
+            } => {
+                let ModelEdit::ChangeView { operation, .. } = edit else {
+                    return Err("not a view update");
+                };
+                (
+                    edit,
+                    &receipt.effects,
+                    views,
+                    Some(*operation),
+                    Some(receipt.identity),
+                )
+            }
+            ModelUpdate::Changed { edit, changes, .. } => {
+                // The observer can win the race against our receipt. Its exact
+                // operation may project through the held overlay, but only
+                // the publisher receipt below acknowledges that intent.
+                let pending = match edit {
+                    ModelEdit::ChangeView {
+                        operation,
+                        scope,
+                        change,
+                        ..
+                    } if self
+                        .shared_views
+                        .pending
+                        .iter()
+                        .any(|(id, owner, captured)| {
+                            id == operation && owner == scope && captured == change
+                        }) =>
+                    {
+                        Some(*operation)
+                    }
+                    _ => None,
+                };
+                (
+                    edit,
+                    &changes.effects,
+                    &changes.views,
+                    pending,
+                    changes.identity,
+                )
+            }
+            _ => return Err("not a scoped edge"),
+        };
+        if identity != Some(self.workspace_model.identity) {
+            return Err("no matching registry authority");
+        }
+        let ModelEdit::ChangeView { scope, change, .. } = edit else {
+            return Err("not a presentation update");
+        };
+        let Change::Update { before, pane } = change else {
+            return Err("not a presentation update");
+        };
+        if before.id != pane.id
+            || before.kind != pane.kind
+            || before.scope != pane.scope
+            || before.pending_terminal_start != pane.pending_terminal_start
+        {
+            return Err("requested source changed");
+        }
+        if !effects.closed.is_empty()
+            || !effects.channels.is_empty()
+            || !effects.projects.is_empty()
+            || !effects.removed_channels.is_empty()
+            || !effects.removed_projects.is_empty()
+            || !effects.navigation_orders.is_empty()
+            || !effects.agents.is_empty()
+            || !effects.removed_agents.is_empty()
+            || effects.views.len() > 1
+            || effects
+                .views
+                .iter()
+                .any(|revision| &revision.scope != scope || revision.after.is_none())
+        {
+            return Err("canonical metadata or lifecycle changed");
+        }
+        if changes.views.len() != 1
+            || !changes.removed.is_empty()
+            || !changes.absent.is_empty()
+            || changes.views[0].scope != *scope
+        {
+            return Err("not one complete scope");
+        }
+        let mut held = self
+            .workspace_model
+            .views
+            .iter()
+            .filter(|view| &view.scope == scope);
+        let Some(held_view) = held.next() else {
+            return Err("scope is not held");
+        };
+        if held.next().is_some() {
+            return Err("scope identity is ambiguous");
+        }
+        if let Some(operation) = pending
+            && !self
+                .shared_views
+                .pending
+                .iter()
+                .any(|(id, owner, captured)| {
+                    *id == operation && owner == scope && captured == change
+                })
+        {
+            return Err("receipt does not acknowledge the held intent");
+        }
+        self.presentation_projection_ready(held_view, &changes.views[0], pending)?;
+        Ok(scope.clone())
+    }
+
+    fn apply_presentation_model_update(
+        &mut self,
+        update: ModelUpdate,
+        scope: crate::workspace_model::views::Scope,
+    ) -> Task<Message> {
+        let (sequence, edit, changes, operation) = match update {
+            ModelUpdate::Committed {
+                receipt,
+                edit,
+                views,
+            } => {
+                let operation = match &edit {
+                    ModelEdit::ChangeView { operation, .. } => Some(*operation),
+                    _ => None,
+                };
+                (
+                    receipt.sequence,
+                    edit,
+                    EdgeChanges {
+                        identity: Some(receipt.identity),
+                        views,
+                        effects: receipt.effects,
+                    },
+                    operation,
+                )
+            }
+            ModelUpdate::Changed {
+                sequence,
+                edit,
+                changes,
+            } => (sequence, edit, changes, None),
+            _ => unreachable!("only a proven scoped edge selects presentation projection"),
+        };
+        let Some(installed) = self.install_changed_edge(sequence, &edit, changes) else {
+            return Task::none();
+        };
+        if let Some(operation) = operation {
+            self.acknowledge_view_edit(scope.clone(), Some(operation));
+            self.retire_settled_empty_channels();
+            self.retarget_transferred_pane_updates(None);
+        }
+        let projected = self.reconcile_shared_presentation(std::slice::from_ref(&scope));
+        // A new view proof also wakes retained automatic names. These tails
+        // inspect canonical open views and must run even for presentation-only
+        // changes, just as they do after a complete reconciliation.
+        self.refresh_channel_title_suggestions();
+        self.restore_channel_names();
+        Task::batch([installed, projected])
+    }
+
     /// Only stale complete snapshots skip projection. Even an equal model can
     /// restore optimistic local state after refusal (for example channel titles).
     /// Newer metadata edges may still lack an older snapshot's full inventory.
-    pub(super) fn apply_workspace_model_update_effect(
+    fn apply_workspace_model_update_full_effect(
         &mut self,
         update: ModelUpdate,
     ) -> (Task<Message>, bool) {
