@@ -91,7 +91,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut pane = Pane {
         id: CardId::new(),
         title: "Edit measurement".into(),
-        user_title: None,
+        user_title: Some("Edit measurement".into()),
         pending_terminal_start: false,
         width_fraction: 0.5,
         scope: None,
@@ -158,6 +158,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
         let mut next = pane.clone();
         next.title = format!("Measurement {index}");
+        next.user_title = Some(next.title.clone());
         let edit = ModelEdit::ChangeView {
             scope: scope.clone(),
             expected_revision: revision,
