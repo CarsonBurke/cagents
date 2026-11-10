@@ -1258,7 +1258,9 @@ class Evidence(unittest.TestCase):
         self.fixture_shell("gh repo view --json nameWithOwner,url")
 
         # The path avatar.rs reads under the development storage name, owner lower-cased.
-        cached = fixture / "cache" / "cagents-development" / "github-avatars" / "github.com-octo-org.image"
+        instance = self.fixture_shell('printf %s "$CAGENTS_DEVELOPMENT_INSTANCE"').stdout
+        self.assertTrue(instance)
+        cached = fixture / "cache" / f"cagents-development-{instance}" / "github-avatars" / "github.com-octo-org.image"
         self.assertEqual(cached.read_bytes(), seed.read_bytes())
         # Under its seven-day freshness, so the app does not try to download it.
         self.assertLess(time.time() - cached.stat().st_mtime, 60)
