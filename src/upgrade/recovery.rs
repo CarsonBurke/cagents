@@ -468,15 +468,17 @@ impl Receipt {
             || chats.len() != live_chats.len()
             || terminals != record.adopted_terminals.iter().copied().collect()
             || chats != record.adopted_chats.iter().copied().collect()
-            || live_terminals
-                .iter()
-                .any(|item| !verified_terminal(&record.census, item, serving))
+            || live_terminals.iter().any(|item| {
+                !verified_terminal(&record.census, item, serving, &self.authority.target)
+            })
             || live_chats.iter().any(|item| {
-                !record
-                    .census
-                    .chats
-                    .iter()
-                    .any(|known| recovered_chat(known, item, serving))
+                !verified_chat(
+                    &record.census,
+                    item,
+                    serving,
+                    live_terminals,
+                    &self.authority.target,
+                )
             })
         {
             return Err(
@@ -502,6 +504,7 @@ fn verified_terminal(
     census: &Census,
     actual: &crate::terminal_ipc::TerminalDescriptor,
     serving: &HostSessionProof,
+    target_daemon: &Path,
 ) -> bool {
     census
         .terminals
@@ -513,7 +516,8 @@ fn verified_terminal(
                 .filter_map(|chat| chat.terminal.as_ref()),
         )
         .any(|known| {
-            recovered_terminal(known, &actual.session)
+            (recovered_terminal(known, &actual.session)
+                || verified_console_terminal(census, known, actual, target_daemon))
                 && actual
                     .upgrade_sources
                     .iter()
@@ -526,6 +530,66 @@ fn verified_terminal(
                     ),
                 }
         })
+}
+
+fn verified_console_terminal(
+    census: &Census,
+    known: &TerminalSession,
+    actual: &crate::terminal_ipc::TerminalDescriptor,
+    target_daemon: &Path,
+) -> bool {
+    let paired = census.chats.iter().any(|chat| {
+        chat.id == known.id
+            && chat.launch.provider == crate::agent::Provider::Claude
+            && matches!(
+                chat.native_continuity,
+                crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 }
+            )
+            && chat
+                .terminal
+                .as_ref()
+                .is_some_and(|terminal| same_terminal(known, terminal))
+    });
+    if !paired
+        || crate::agent_execution::console_agent(&known.launch).is_none()
+        || Path::new(&actual.session.launch.program)
+            != target_daemon.with_file_name(crate::companion::Product::Cli.file_name())
+        || !actual.upgrade_relaunches.iter().any(|accepted| {
+            same_terminal(known, &accepted.source) && accepted.recipe == actual.session.launch
+        })
+    {
+        return false;
+    }
+    // The authenticated retained actor records the old view and its exact
+    // replacement recipe. Only this installation's thin CLI may change.
+    let mut normalized = actual.session.clone();
+    normalized.launch.program.clone_from(&known.launch.program);
+    recovered_terminal(known, &normalized)
+}
+
+fn verified_chat(
+    census: &Census,
+    actual: &Session,
+    serving: &HostSessionProof,
+    live_terminals: &[crate::terminal_ipc::TerminalDescriptor],
+    target_daemon: &Path,
+) -> bool {
+    census.chats.iter().any(|known| {
+        let mut normalized = actual.clone();
+        if let (Some(before), Some(after)) = (&known.terminal, &mut normalized.terminal)
+            && !recovered_terminal(before, after)
+        {
+            let verified_pair = live_terminals.iter().any(|terminal| {
+                recovered_terminal(after, &terminal.session)
+                    && verified_terminal(census, terminal, serving, target_daemon)
+            });
+            if !verified_pair {
+                return false;
+            }
+            after.launch.program.clone_from(&before.launch.program);
+        }
+        recovered_chat(known, &normalized, serving)
+    })
 }
 
 fn recovered_chat(known: &Session, actual: &Session, serving: &HostSessionProof) -> bool {
@@ -1846,13 +1910,15 @@ mod tests {
         assert!(verified_terminal(
             &preparation.authority.census,
             &actual,
-            &serving
+            &serving,
+            Path::new("/candidate/bin/cagentsd")
         ));
         actual.session.launch.arguments.push("unrelated".into());
         assert!(!verified_terminal(
             &preparation.authority.census,
             &actual,
-            &serving
+            &serving,
+            Path::new("/candidate/bin/cagentsd")
         ));
         let before = Session {
             id: known.id,
@@ -1876,6 +1942,131 @@ mod tests {
         after.launch.session_id = before.launch.session_id.clone();
         after.launch.provider = crate::agent::Provider::Claude;
         assert!(!recovered_chat(&before, &after, &serving));
+    }
+
+    #[test]
+    fn prepared_recovery_verifies_the_exact_retained_console_replacement_lineage() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let preparation = preparation(root.path());
+        let mut known = preparation.authority.census.terminals[0].clone();
+        let agent = crate::model::AgentId::new();
+        known.launch.program = "/original/bin/cagents".into();
+        known.launch.arguments = vec!["agent".into(), "console".into(), agent.to_string()];
+        let source = Session {
+            id: known.id,
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Claude,
+                recipe: LaunchRecipe {
+                    program: "claude".into(),
+                    arguments: Vec::new(),
+                    ..known.launch.clone()
+                },
+                session_id: Some("retained-conversation".into()),
+            },
+            proof: Some(preparation.authority.source.clone()),
+            terminal: Some(known.clone()),
+            owned_codex_listener: None,
+            native_continuity: crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 },
+        };
+        let census = Census {
+            terminals: vec![known.clone()],
+            chats: vec![source.clone()],
+            snapshots: Vec::new(),
+        };
+        let mut serving = preparation.authority.source.clone();
+        serving.host_incarnation = HostIncarnation::new("successor");
+        let target = Path::new("/candidate/bin/cagentsd");
+        let mut actual = crate::terminal_ipc::TerminalDescriptor::relaunchable(
+            known.id,
+            known.launch.clone(),
+            None,
+        );
+        actual.session = known.clone();
+        actual.session.launch.program = "/candidate/bin/cagents".into();
+        actual.session.continuity = TerminalContinuity::DetachedSameBoot {
+            host_session_id: serving.host_session_id.clone(),
+            boot_id: serving.boot_id.clone(),
+            host_incarnation: serving.host_incarnation.clone(),
+        };
+        actual.upgrade_sources.push(known.clone());
+        actual
+            .upgrade_relaunches
+            .push(crate::terminal_ipc::UpgradeRelaunch {
+                source: known.clone(),
+                recipe: actual.session.launch.clone(),
+            });
+        let mut chat = source.clone();
+        chat.proof = Some(serving.clone());
+        chat.terminal = Some(actual.session.clone());
+        assert!(verified_terminal(&census, &actual, &serving, target));
+        assert!(verified_chat(
+            &census,
+            &chat,
+            &serving,
+            &[actual.clone()],
+            target
+        ));
+        assert!(!verified_chat(&census, &chat, &serving, &[], target));
+
+        let mut changed = actual.clone();
+        changed.upgrade_relaunches.clear();
+        assert!(!verified_terminal(&census, &changed, &serving, target));
+        changed = actual.clone();
+        changed.upgrade_sources.clear();
+        assert!(!verified_terminal(&census, &changed, &serving, target));
+        changed = actual.clone();
+        changed.upgrade_relaunches[0].source.id = TerminalId::new();
+        assert!(!verified_terminal(&census, &changed, &serving, target));
+        changed = actual.clone();
+        changed.upgrade_relaunches[0]
+            .recipe
+            .arguments
+            .push("another-command".into());
+        assert!(!verified_terminal(&census, &changed, &serving, target));
+        assert!(!verified_terminal(
+            &census,
+            &actual,
+            &serving,
+            Path::new("/unrelated/bin/cagentsd")
+        ));
+        let mutations: [fn(&mut LaunchRecipe); 4] = [
+            |recipe: &mut LaunchRecipe| recipe.arguments.push("another-command".into()),
+            |recipe: &mut LaunchRecipe| recipe.working_directory.push("another-directory"),
+            |recipe: &mut LaunchRecipe| {
+                recipe.environment.insert("OTHER".into(), "value".into());
+            },
+            |recipe: &mut LaunchRecipe| {
+                recipe.unset_environment.insert("OTHER".into());
+            },
+        ];
+        for mutate in mutations {
+            changed = actual.clone();
+            mutate(&mut changed.session.launch);
+            changed.upgrade_relaunches[0].recipe = changed.session.launch.clone();
+            assert!(!verified_terminal(&census, &changed, &serving, target));
+        }
+        let mut unpaired = census.clone();
+        unpaired.chats.clear();
+        assert!(!verified_terminal(&unpaired, &actual, &serving, target));
+        unpaired = census.clone();
+        unpaired.chats[0].native_continuity = Default::default();
+        assert!(!verified_terminal(&unpaired, &actual, &serving, target));
+        chat.terminal
+            .as_mut()
+            .unwrap()
+            .launch
+            .environment
+            .insert("OTHER".into(), "value".into());
+        assert!(!verified_chat(
+            &census,
+            &chat,
+            &serving,
+            &[actual.clone()],
+            target
+        ));
+        chat.terminal = Some(actual.session.clone());
+        chat.launch.session_id = Some("different-conversation".into());
+        assert!(!verified_chat(&census, &chat, &serving, &[actual], target));
     }
 
     #[test]
