@@ -646,6 +646,80 @@ such as `build-dir = "/var/tmp/cargo-build{workspace-root}/target"` in
 a cold check took 35 s for the CLI, 53 s for the host, 62 s for the UI and
 126 s for the integrated UI; the single `cagents` crate is most of each.
 
+### Watching main after merges
+
+GitHub's script checks do not compile Rust. On fw16,
+`scripts/main-build-sentinel --repository /absolute/path/to/cagents` fetches main
+at most once every two minutes and checks every new first-parent commit in
+order. Its first run checks the current tip. Each commit gets three separate
+`scripts/cargo-gate check --locked --no-default-features --all-targets` commands:
+CLI, `--features host`, and `--features ui`. These use the ordinary shared queue
+and the persistent sentinel worktree cache, without an urgent admission or a
+held slot between lanes.
+The sentinel neither merges nor modifies another checkout or native session.
+
+After this change merges, install **one** user timer on fw16, from an updated
+main checkout. Put this in `~/.config/systemd/user/cagents-main-sentinel.service`,
+replacing `/absolute/path/to/cagents` in both places:
+
+```ini
+[Unit]
+Description=Compile cagents main after merges
+
+[Service]
+Type=oneshot
+ExecStart=/absolute/path/to/cagents/scripts/main-build-sentinel --repository /absolute/path/to/cagents
+TimeoutStartSec=infinity
+```
+
+Put this in `~/.config/systemd/user/cagents-main-sentinel.timer`:
+
+```ini
+[Unit]
+Description=Watch cagents main every two minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=2min
+
+[Install]
+WantedBy=timers.target
+```
+
+Before enabling the timer, create its checkout with
+`git worktree add --detach .worktrees/main-build-sentinel origin/main` and run
+`mise trust .worktrees/main-build-sentinel/mise.toml` from the repository, as well
+as trusting the main checkout's `mise.toml` if needed. The noninteractive service
+cannot answer a mise trust prompt.
+
+Then run `systemctl --user daemon-reload` and
+`systemctl --user enable --now cagents-main-sentinel.timer`. The user manager
+must stay running, and `git fetch origin main` and `gh` must already be signed
+in as the repository account. Inspect it with
+`journalctl --user -u cagents-main-sentinel.service`; stop future runs with
+`systemctl --user disable --now cagents-main-sentinel.timer`. Stopping the
+service also cancels its current gate command; it does not stop other builds.
+
+The detached `.worktrees/main-build-sentinel` checkout belongs to the sentinel.
+A repository lock prevents simultaneous runs from changing it during a check.
+State and full per-commit lane logs live in
+`~/.local/state/cagents-main-sentinel` (`--state` overrides it). On failure it
+creates or updates one issue titled **Main Rust build sentinel: compilation
+failure**, reopens it if closed, and includes the SHA, parents, last passing SHA,
+lane statuses and diagnostic tails. A later passing commit adds a recovery
+comment; a person closes the issue. Successful commits need no GitHub API call.
+Notification failures retain the completed result for retry without rebuilding;
+rate limits defer attempts until the reset from `gh api rate_limit`. Other
+notification attempts wait at least two minutes. A main force-push resets the
+baseline to its new tip. This detects failures after merge; it does not replace
+checking an up-to-date branch before merge.
+
+The offline regression uses disposable Git history and stand-ins for the gate
+and GitHub: `python3 -I -B tests/main_build_sentinel.py -v`. It does not compile
+Rust or change real issues. Remove old logs under the sentinel's state directory
+when their evidence is no longer needed; leave `state.json` in place to preserve
+its checked cursor and issue number.
+
 ### Building on another host
 
 Rust compiles on the build host named by `CAGENTS_BUILD_REMOTE` (default
@@ -1071,8 +1145,12 @@ and a `scripts/native-evidence` session. A command already under any memory limi
 keeps that one, even a looser one, and `CAGENTS_MEMORY_MAX` then has no effect. A
 capped command leaves the caller's cgroup, so a caller's CPU quota stops applying
 to it. It doesn't cover outer `cargo-gate test --doc`, `cargo-gate run`, `--hot`,
-tests run on a build host through `cargo-offload`, or a harness that runs Cargo or a
-test binary itself.
+or a harness that runs Cargo or a test binary itself. Test and bench commands
+sent to a build host through `cargo-offload`, including loopback and commands
+inside `exec --hold`, carry the same helper and memory/swap settings to the
+host. The whole remote Cargo test/bench command, including any compilation and
+doctests, runs inside the limit; `--no-run` only compiles and is not capped.
+A missing helper refuses the offloaded test rather than silently losing its cap.
 
 A script's `cargo test` under `cargo-gate exec` reaches the gate's `cargo`, so it is
 covered, and so is its compile, which runs inside the limit there. A UI test rebuild
@@ -1431,6 +1509,14 @@ workloads are described in [Performance](performance.md).
 
 For which fixture to use, how they fit together and how to extend or repair
 one, see [Fixtures](fixtures.md).
+
+`start SIDE --width W --height H` requests both logical viewport dimensions;
+the default is 1500x900. The task's private KWin rules size its nested compositor
+framebuffer before niri applies width fitting, so a narrow width no longer
+reduces the height with it. `pair` forwards `--height` to both starts. A capture
+refuses a window larger than its observed logical viewport (allowing two pixels
+for scaling round-off); request a larger width/height instead of accepting a
+cropped image. This changes the capture viewport, not application layouts.
 
 `scripts/native-evidence` captures before/after screenshots of the actual native
 app, from a shell where the desktop session or `DISPLAY` is unavailable, such as

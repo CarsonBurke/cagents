@@ -32,6 +32,7 @@ STUBS = {
         printf '%s\\n' "$*" >> "$STUB_LOG/kwin"
         ls -l /proc/self/fd > "$STUB_LOG/kwin-fds" 2>&1
         env > "$STUB_LOG/kwin-env"
+        [ ! -f "$XDG_CONFIG_HOME/kwinrulesrc" ] || cp "$XDG_CONFIG_HOME/kwinrulesrc" "$STUB_LOG/kwinrules"
         while [ "$#" -gt 0 ]; do
             if [ "$1" = --exit-with-session ]; then session=$2; fi
             shift
@@ -63,12 +64,16 @@ STUBS = {
                 shot) shot=${args[i + 1]} ;;
                 env) printf 'export NESTED_MARKER=nested\\n'; exit 0 ;;
                 observe)
-                    printf 'window=1\\n'
-                    # Output a reader stops at: its pipe closes under the harness.
+                    if [ -e "$STUB_LOG/cropped" ]; then
+                        printf '{"window":{"size":[900,600]},"output":{"logical":{"width":900,"height":561}},"text":"'
+                    else
+                        printf '{"window":{"size":[900,600]},"output":{"logical":{"width":1500,"height":900}},"text":"'
+                    fi
                     if [ -e "$STUB_LOG/observe-large" ]; then
                         head -c 1000000 /dev/zero | tr '\\0' x
                         [ "${PIPESTATUS[1]}" = 0 ] || exit 1
                     fi
+                    printf '"}\\n'
                     exit 0
                     ;;
             esac
@@ -267,6 +272,25 @@ class Evidence(unittest.TestCase):
                 return False
             fcntl.flock(lock, fcntl.LOCK_UN)
             return True
+
+    def test_narrow_viewport_keeps_its_explicit_height(self):
+        self.built("after")
+        self.run_tool("start", "after", "--width", "900", "--height", "800")
+        rules = (self.logs / "kwinrules").read_text()
+        self.assertIn("size=900,800", rules)
+        self.assertIn("sizerule=2", rules)
+        self.assertIn("--width 900 --height 800", (self.logs / "kwin").read_text())
+        self.run_tool("stop")
+
+    def test_shot_refuses_a_window_cropped_by_its_viewport(self):
+        self.built("after")
+        self.run_tool("start", "after", "--width", "900")
+        (self.logs / "cropped").touch()
+        result = self.run_tool("shot", "cropped", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("900x600 exceeds viewport 900x561", result.stderr)
+        self.assertFalse((self.task / "shots/after-cropped.webp").exists())
+        self.run_tool("stop")
 
     def test_a_session_has_a_memory_limit_made_before_its_private_environment(self):
         source = (REPOSITORY / "scripts/native-evidence").read_text()
@@ -1456,11 +1480,11 @@ class RemoteEvidence(unittest.TestCase):
         steps = self.root / "steps.sh"
         steps.write_text('evidence drive click "Open repository"\nevidence shot "home-$SIDE"\n')
         self.run_tool("pair", "--before", str(before), "--after", str(after),
-                      "--steps", str(steps), "--width", "1200", "--portal", "gtk")
+                      "--steps", str(steps), "--width", "1200", "--height", "800", "--portal", "gtk")
         self.assertTrue((self.task / "shots" / "before-home-before.webp").exists())
         self.assertTrue((self.task / "shots" / "after-home-after.webp").exists())
         calls = self.tool_calls()
-        self.assertIn("start before --width 1200 --portal gtk", calls)
+        self.assertIn("start before --width 1200 --height 800 --portal gtk", calls)
         self.assertIn("drive click Open repository", calls)
         self.assertEqual(calls.count("stop"), 2)
 
