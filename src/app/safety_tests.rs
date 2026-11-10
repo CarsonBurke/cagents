@@ -978,6 +978,60 @@ fn a_kept_terminal_says_why_and_allows_a_fresh_explicit_close() {
     assert!(app.terminal_close.as_ref().unwrap().pending);
 }
 
+/// #2365: a pane kept only by processes Close couldn't read offers to close
+/// anyway. Keeping it stays the focused choice; closing proves everything again
+/// and passes over exactly the processes the dialog named.
+#[test]
+fn a_pane_kept_by_unreadable_processes_can_be_closed_beside_them() {
+    use crate::upgrade::UnreadableProcess;
+    let (mut app, card, terminal, _) = live_app();
+    let _ = app.update(Message::CloseCard(card));
+    let agent = UnreadableProcess::fixture(4242, 100, "ssh-agent");
+    report_close(
+        &mut app,
+        terminal_close::CloseOutcome::Kept(super::daemon_recovery::KeptPane {
+            reason: "ssh-agent (PID 4242) can't be read".into(),
+            unreadable: vec![agent.clone()],
+        }),
+    );
+    assert!(app.terminal_close_dialog_visible());
+    assert!(app.card_state(card).unwrap().existence.is_open());
+
+    let _ = app.update(Message::ConfirmTerminalClose);
+    let intent = app.terminal_close.as_ref().unwrap();
+    assert!(intent.pending, "Close anyway starts a fresh close");
+    assert!(intent.detail.is_none());
+    assert!(
+        app.terminal_close_dialog_visible(),
+        "the dialog shows the check"
+    );
+    assert!(app.terminal_close_attempts.contains(&terminal));
+    // A second press while it checks does nothing.
+    let _ = app.update(Message::ConfirmTerminalClose);
+
+    // Something else turns up: that is reported, and nothing else is offered.
+    report_close(
+        &mut app,
+        terminal_close::CloseOutcome::Kept("A process started by this terminal".into()),
+    );
+    let intent = app.terminal_close.as_ref().unwrap();
+    assert!(!intent.pending);
+    assert_eq!(
+        intent.detail.as_deref(),
+        Some("A process started by this terminal")
+    );
+    let _ = app.update(Message::ConfirmTerminalClose);
+    assert!(
+        !app.terminal_close.as_ref().unwrap().pending,
+        "a refusal that names no unreadable process can't be closed anyway"
+    );
+
+    // Without the choice, a kept pane is only dismissed.
+    let _ = app.update(Message::CancelTerminalClose);
+    assert!(app.terminal_close.is_none());
+    assert!(app.card_state(card).unwrap().existence.is_open());
+}
+
 /// A refusal takes over from the wait, and the pane can be closed again.
 #[test]
 fn a_pane_says_its_close_is_being_checked_only_until_the_answer() {

@@ -1,6 +1,9 @@
 use super::*;
 use crate::workspace_model::views::{Change, Scope, View};
 
+pub(in crate::host::model) mod store;
+pub(super) use store::{all, occupied, operation_seen, read};
+
 pub(super) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
     let current: u32 = tx
         .pragma_query_value(None, "user_version", |row| row.get(0))
@@ -18,27 +21,8 @@ pub(super) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
     if legacy {
         schema::require_legacy_views(tx)?;
     }
-    tx.execute_batch(
-        "CREATE TABLE IF NOT EXISTS shared_view_scopes(
-            scope TEXT PRIMARY KEY,
-            channel TEXT REFERENCES channels(id) ON DELETE CASCADE,
-            repository TEXT REFERENCES projects(repository) ON DELETE CASCADE,
-            CHECK((channel IS NULL) != (repository IS NULL))
-        ) STRICT;
-        CREATE TABLE IF NOT EXISTS shared_views(
-            scope TEXT PRIMARY KEY REFERENCES shared_view_scopes(scope) ON DELETE CASCADE,
-            revision INTEGER NOT NULL, panes TEXT NOT NULL, retired TEXT NOT NULL
-        ) STRICT;
-        CREATE TABLE IF NOT EXISTS shared_view_panes(
-            id TEXT PRIMARY KEY,
-            scope TEXT NOT NULL REFERENCES shared_view_scopes(scope) ON DELETE CASCADE
-        ) STRICT;
-        CREATE TABLE IF NOT EXISTS shared_view_edits(
-            operation TEXT PRIMARY KEY,
-            scope TEXT NOT NULL REFERENCES shared_view_scopes(scope) ON DELETE CASCADE
-        ) STRICT;",
-    )
-    .map_err(|error| error.to_string())?;
+    tx.execute_batch(store::V22_VIEW_TABLES)
+        .map_err(|error| error.to_string())?;
     if legacy {
         tx.execute_batch("INSERT INTO shared_view_scopes(scope,channel) SELECT json_object('Channel',channel), channel FROM workspace_views;
             INSERT INTO shared_views SELECT json_object('Channel',channel),revision,panes,retired FROM workspace_views;
@@ -52,13 +36,8 @@ pub(super) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
 /// presentation intentionally no longer contains a live attachment proof.
 /// Older ended panes are never backfilled from a terminal ID or launch recipe.
 pub(super) fn migrate_terminal_sources(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
-    tx.execute_batch(
-        "CREATE TABLE IF NOT EXISTS shared_view_terminal_sources(
-            pane TEXT PRIMARY KEY REFERENCES shared_view_panes(id) ON DELETE CASCADE,
-            source TEXT NOT NULL, ended TEXT NOT NULL
-        ) STRICT;",
-    )
-    .map_err(|error| error.to_string())?;
+    tx.execute_batch(store::V22_TERMINAL_SOURCES)
+        .map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -166,12 +145,6 @@ fn update_terminal_source(
     Ok(())
 }
 
-fn key(scope: &Scope) -> Result<String, String> {
-    serde_json::to_string(scope).map_err(|error| error.to_string())
-}
-fn parse_scope(key: &str) -> Result<Scope, String> {
-    serde_json::from_str(key).map_err(|error| error.to_string())
-}
 fn exists(db: &Connection, scope: &Scope) -> Result<bool, String> {
     match scope {
         Scope::Channel(id) => db.query_row(
@@ -327,76 +300,6 @@ fn transfer_agent(
     }
     Ok(())
 }
-fn register(db: &Connection, scope: &Scope) -> Result<(), String> {
-    let (channel, repository) = match scope {
-        Scope::Channel(id) => (Some(id.to_string()), None),
-        Scope::Worktree { repository, .. } => (None, Some(repository_key(repository)?.to_owned())),
-    };
-    db.execute("INSERT INTO shared_view_scopes(scope,channel,repository) VALUES (?1,?2,?3) ON CONFLICT DO NOTHING",params![key(scope)?,channel,repository]).map_err(|error|error.to_string())?;
-    Ok(())
-}
-
-pub(super) fn read(db: &Connection, scope: &Scope) -> Result<View, String> {
-    let row: Option<(u64, String, String)> = db
-        .query_row(
-            "SELECT revision, panes, retired FROM shared_views WHERE scope = ?1",
-            [key(scope)?],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .optional()
-        .map_err(|error| error.to_string())?;
-    match row {
-        Some((revision, panes, retired)) => Ok(View {
-            scope: scope.clone(),
-            revision,
-            panes: serde_json::from_str(&panes).map_err(|error| error.to_string())?,
-            retired: serde_json::from_str(&retired).map_err(|error| error.to_string())?,
-        }),
-        None => Ok(View::empty(scope.clone())),
-    }
-}
-
-pub(super) fn all(db: &Connection) -> Result<Vec<View>, String> {
-    collect(
-        db,
-        "SELECT scope, revision, panes, retired FROM shared_views ORDER BY scope",
-    )
-}
-
-/// The views holding at least one pane. Nearly every scope a long-lived store
-/// knows is an emptied worktree, so a search for a pane reads only these.
-pub(super) fn occupied(db: &Connection) -> Result<Vec<View>, String> {
-    collect(
-        db,
-        "SELECT scope, revision, panes, retired FROM shared_views
-         WHERE panes <> '[]' ORDER BY scope",
-    )
-}
-
-fn collect(db: &Connection, sql: &str) -> Result<Vec<View>, String> {
-    let mut statement = db.prepare_cached(sql).map_err(|error| error.to_string())?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, u64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })
-        .map_err(|error| error.to_string())?;
-    rows.map(|row| {
-        let (scope, revision, panes, retired) = row.map_err(|error| error.to_string())?;
-        Ok(View {
-            scope: parse_scope(&scope)?,
-            revision,
-            panes: serde_json::from_str(&panes).map_err(|error| error.to_string())?,
-            retired: serde_json::from_str(&retired).map_err(|error| error.to_string())?,
-        })
-    })
-    .collect()
-}
-
 /// A channel whose view was emptied by closing its only pane, as nearly every
 /// view in a long-lived store is.
 #[cfg(test)]
@@ -464,32 +367,33 @@ impl EmptiedView {
         registry: &mut Registry,
         search: impl FnOnce(&mut Registry) -> T,
     ) -> T {
-        let scope = key(&self.0).unwrap();
-        let set = |registry: &Registry, retired: &str| {
+        let scope = store::scope_id(&registry.db, &self.0).unwrap().unwrap();
+        let readable: String = registry
+            .db
+            .query_row(
+                "SELECT pane FROM retired_panes WHERE scope = ?1",
+                [scope],
+                |row| row.get(0),
+            )
+            .expect("the emptied view keeps exactly the tombstone of its closed pane");
+        let set = |registry: &Registry, from: &str, to: &str| {
             assert_eq!(
                 registry
                     .db
                     .execute(
-                        "UPDATE shared_views SET retired = ?2 WHERE scope = ?1 AND panes = '[]'",
-                        params![scope, retired],
+                        "UPDATE retired_panes SET pane = ?3 WHERE scope = ?1 AND pane = ?2
+                         AND NOT EXISTS(SELECT 1 FROM panes WHERE panes.scope = ?1)",
+                        params![scope, from, to],
                     )
                     .unwrap(),
                 1,
-                "the emptied view is stored as an empty pane list"
+                "the emptied view holds no pane rows"
             );
         };
-        let readable: String = registry
-            .db
-            .query_row(
-                "SELECT retired FROM shared_views WHERE scope = ?1",
-                [&scope],
-                |row| row.get(0),
-            )
-            .unwrap();
-        set(registry, "unreadable");
+        set(registry, &readable, "unreadable");
         assert!(all(&registry.db).is_err(), "reading every view now fails");
         let found = search(registry);
-        set(registry, &readable);
+        set(registry, "unreadable", &readable);
         found
     }
 }
@@ -581,26 +485,9 @@ pub(super) fn retire_agent(
     };
     let id = crate::model::CardId::from_uuid(agent.id.as_uuid());
     view.apply(&Change::Remove { id })?;
-    view.revision = view
-        .revision
-        .checked_add(1)
-        .ok_or("view revision exhausted")?;
-    db.execute(
-        "DELETE FROM shared_view_panes WHERE id=?1",
-        [id.to_string()],
-    )
-    .map_err(|error| error.to_string())?;
+    view.revision = store::next_revision(db)?;
     write(db, &view)?;
     Ok(true)
-}
-
-pub(super) fn operation_seen(db: &Connection, operation: Uuid) -> Result<bool, String> {
-    db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM shared_view_edits WHERE operation = ?1)",
-        [operation.to_string()],
-        |row| row.get(0),
-    )
-    .map_err(|error| error.to_string())
 }
 
 pub(super) fn apply(
@@ -623,8 +510,12 @@ pub(super) fn apply(
         }
         return Ok(false);
     }
-    register(transaction, scope)?;
+    // Even an empty seed creates an authoritative view, so another client sees
+    // emptiness rather than an uninitialized migration.
+    let existed = store::scope_id(transaction, scope)?.is_some();
+    let scope_row = store::register(transaction, scope)?;
     let mut view = read(transaction, scope)?;
+    let stored = view.clone();
     let mut changed = false;
     let mut deferred_target = None;
     match edit {
@@ -633,12 +524,6 @@ pub(super) fn apply(
             // IDs are applied first and prevent stale caches from resurrecting.
             for id in closed {
                 changed |= view.apply(&Change::Remove { id: *id })?;
-                transaction
-                    .execute(
-                        "DELETE FROM shared_view_panes WHERE id=?1 AND scope=?2",
-                        params![id.to_string(), key(scope)?],
-                    )
-                    .map_err(|error| error.to_string())?;
             }
             for pane in panes {
                 if view.panes.iter().any(|existing| {
@@ -686,27 +571,21 @@ pub(super) fn apply(
                     if destination == scope {
                         false
                     } else {
-                        register(transaction, destination)?;
+                        let destination_row = store::register(transaction, destination)?;
                         let mut target = read(transaction, destination)?;
+                        let target_before = target.clone();
                         target.retired.retain(|retired| retired != id);
                         target.apply(&Change::Insert {
                             pane: pane.clone(),
                             before: *before,
                         })?;
-                        target.revision = target
-                            .revision
-                            .checked_add(1)
-                            .ok_or("view revision exhausted")?;
+                        target.revision = store::next_revision(transaction)?;
                         // Publish only after the source relinquishes its
                         // active placement, inside this same transaction.
-                        deferred_target = Some(target);
+                        deferred_target = Some((target_before, target));
                         transfer_agent(transaction, &pane, destination, &repository)?;
-                        transaction
-                            .execute(
-                                "UPDATE shared_view_panes SET scope=?1 WHERE id=?2",
-                                params![key(destination)?, id.to_string()],
-                            )
-                            .map_err(|error| error.to_string())?;
+                        // The row moves, so what hangs off the pane moves with it.
+                        store::move_pane(transaction, *id, destination_row)?;
                         view.apply(&Change::Remove { id: *id })?
                     }
                 }
@@ -754,47 +633,18 @@ pub(super) fn apply(
                         changed
                     }
                 }
-                Change::Remove { id } => {
-                    transaction
-                        .execute(
-                            "DELETE FROM shared_view_panes WHERE id=?1 AND scope=?2",
-                            params![id.to_string(), key(scope)?],
-                        )
-                        .map_err(|error| error.to_string())?;
-                    view.apply(change)?
-                }
                 _ => view.apply(change)?,
             };
-            transaction
-                .execute(
-                    "INSERT INTO shared_view_edits(operation, scope) VALUES (?1, ?2)",
-                    params![operation.to_string(), key(scope)?],
-                )
-                .map_err(|error| error.to_string())?;
+            store::record_operation(transaction, *operation, scope_row)?;
         }
         _ => unreachable!(),
     }
-    for pane in &view.panes {
-        transaction.execute("INSERT INTO shared_view_panes(id, scope) VALUES (?1, ?2) ON CONFLICT(id) DO NOTHING", params![pane.id.to_string(), key(scope)?]).map_err(|error| error.to_string())?;
-    }
-    // Even an empty seed creates an authoritative view, so another client sees
-    // emptiness rather than an uninitialized migration.
-    let existed: bool = transaction
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM shared_views WHERE scope = ?1)",
-            [key(scope)?],
-            |row| row.get(0),
-        )
-        .map_err(|error| error.to_string())?;
     if changed || !existed {
-        view.revision = view
-            .revision
-            .checked_add(1)
-            .ok_or("view revision exhausted")?;
-        write(transaction, &view)?;
+        view.revision = store::next_revision(transaction)?;
+        write_from(transaction, &stored, &view)?;
     }
-    if let Some(target) = deferred_target {
-        write(transaction, &target)?;
+    if let Some((before, target)) = deferred_target {
+        write_from(transaction, &before, &target)?;
     }
     Ok(changed || !existed)
 }
@@ -844,32 +694,39 @@ impl Registry {
     pub(crate) fn view_operation_seen(&self, operation: Uuid) -> Result<bool, String> {
         operation_seen(&self.db, operation)
     }
+
+    /// Forgets one batch of view operations applied more than
+    /// [`store::OPERATION_RETENTION`] ago. Returns how many it forgot. One
+    /// bounded batch per call keeps the writer lock short; the collector's
+    /// interval drains a backlog well inside the retention period.
+    pub(crate) fn collect_view_operations(&self) -> Result<usize, String> {
+        self.collect_view_operations_before(
+            store::now_unix_ms().saturating_sub(store::OPERATION_RETENTION.as_millis() as i64),
+        )
+    }
+
+    fn collect_view_operations_before(&self, horizon_unix_ms: i64) -> Result<usize, String> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(|error| error.to_string())?;
+        schema::require_current(&tx)?;
+        let forgotten = store::prune_operations(&tx, horizon_unix_ms)?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(forgotten)
+    }
 }
 
 fn resource_owner(
     db: &Connection,
     pane: &crate::workspace_model::views::Pane,
 ) -> Result<Option<crate::model::CardId>, String> {
-    Ok(occupied(db)?
-        .iter()
-        .flat_map(|view| &view.panes)
-        .find(|other| {
-            other.id != pane.id
-                && crate::workspace_model::views::same_resource(&other.kind, &pane.kind)
-        })
-        .map(|other| other.id))
+    store::resource_holder(db, pane)
 }
 
 fn owner(db: &Connection, id: crate::model::CardId) -> Result<Option<Scope>, String> {
-    db.query_row(
-        "SELECT scope FROM shared_view_panes WHERE id=?1",
-        [id.to_string()],
-        |row| row.get::<_, String>(0),
-    )
-    .optional()
-    .map_err(|error| error.to_string())?
-    .map(|id| parse_scope(&id))
-    .transpose()
+    store::owner(db, id)
 }
 
 /// Rotate an existing canonical pane with its authenticated holder, before the
@@ -936,25 +793,23 @@ pub(super) fn adopt_authenticated_agent_pane(
     if pane.kind == replacement {
         return Ok(false);
     }
-    pane.kind = replacement;
-    view.revision = view
-        .revision
-        .checked_add(1)
-        .ok_or("view revision exhausted")?;
+    // Another pane already presenting the successor keeps it, as an insert
+    // of a second pane for one resource would leave it.
+    let adopted = crate::workspace_model::views::Pane {
+        kind: replacement,
+        ..pane.clone()
+    };
+    if store::resource_holder(db, &adopted)?.is_some() {
+        return Ok(false);
+    }
+    *pane = adopted;
+    view.revision = store::next_revision(db)?;
     channel_work::placement::observe_view_transition(db, &before, &view)?;
     // Holder continuity does not start a new channel naming choice, including
     // learning a previously unobserved provider thread. Preserve all placement,
     // presentation, retirement and naming state outside the descriptor itself.
     terminal_retention::sync_view_pins(db, &view.panes)?;
-    db.execute(
-        "UPDATE shared_views SET revision=?2, panes=?3 WHERE scope=?1",
-        params![
-            key(&scope)?,
-            view.revision,
-            serde_json::to_string(&view.panes).map_err(|error| error.to_string())?
-        ],
-    )
-    .map_err(|error| error.to_string())?;
+    store::store(db, &view)?;
     Ok(true)
 }
 
@@ -989,21 +844,17 @@ pub(super) fn rebind_agent_pane(
             if HostedSession::Chat(current.clone()).same_process(predecessor) => {}
         _ => return Ok(false),
     }
-    pane.kind = CardKind::Chat(next.clone());
-    view.revision = view
-        .revision
-        .checked_add(1)
-        .ok_or("view revision exhausted")?;
+    let rebound = crate::workspace_model::views::Pane {
+        kind: CardKind::Chat(next.clone()),
+        ..pane.clone()
+    };
+    if store::resource_holder(db, &rebound)?.is_some() {
+        return Ok(false);
+    }
+    *pane = rebound;
+    view.revision = store::next_revision(db)?;
     channel_work::placement::observe_view_transition(db, &before, &view)?;
-    db.execute(
-        "UPDATE shared_views SET revision=?2, panes=?3 WHERE scope=?1",
-        params![
-            key(&scope)?,
-            view.revision,
-            serde_json::to_string(&view.panes).map_err(|error| error.to_string())?
-        ],
-    )
-    .map_err(|error| error.to_string())?;
+    store::store(db, &view)?;
     Ok(true)
 }
 
@@ -1017,23 +868,7 @@ pub(super) fn retire_project_placements(db: &Connection, repository: &Path) -> R
     if db.is_autocommit() {
         return Err("Placement removal requires the canonical view transaction".into());
     }
-    let repository = repository_key(repository)?;
-    let scopes = {
-        let mut statement = db
-            .prepare(
-                "SELECT s.scope FROM shared_view_scopes s
-             LEFT JOIN channels c ON c.id=s.channel
-             WHERE s.repository=?1 OR c.repository=?1",
-            )
-            .map_err(|error| error.to_string())?;
-        statement
-            .query_map([repository], |row| row.get::<_, String>(0))
-            .map_err(|error| error.to_string())?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(|error| error.to_string())?
-    };
-    for raw in scopes {
-        let scope = parse_scope(&raw)?;
+    for scope in store::project_scopes(db, repository_key(repository)?)? {
         retire_scope_placements(db, &scope)?;
     }
     Ok(())
@@ -1048,7 +883,14 @@ fn retire_scope_placements(db: &Connection, scope: &Scope) -> Result<(), String>
 
 fn write(db: &Connection, view: &View) -> Result<(), String> {
     let before = read(db, &view.scope)?;
-    channel_work::placement::observe_view_transition(db, &before, view)?;
+    write_from(db, &before, view)
+}
+
+/// [`write`] from a `before` read earlier in the transaction, for a transfer:
+/// its pane row has already moved, but each view's derived state must still
+/// observe the transition from what the view held.
+fn write_from(db: &Connection, before: &View, view: &View) -> Result<(), String> {
+    channel_work::placement::observe_view_transition(db, before, view)?;
     if let Scope::Channel(id) = &view.scope {
         let primary = |view: &View| {
             view.panes.iter().find_map(|pane| match &pane.kind {
@@ -1061,7 +903,7 @@ fn write(db: &Connection, view: &View) -> Result<(), String> {
                 _ => None,
             })
         };
-        if primary(&before) != primary(view) {
+        if primary(before) != primary(view) {
             // A new primary conversation starts a new automatic naming choice.
             // Manual/legacy names describe the channel and survive all moves.
             db.execute(
@@ -1072,13 +914,9 @@ fn write(db: &Connection, view: &View) -> Result<(), String> {
             channel_work::renamed_in(db, *id)?;
         }
     }
-    terminal_retention::sync_view_pins(db, &view.panes)?;
-    db.execute("INSERT INTO shared_views(scope, revision, panes, retired) VALUES (?1, ?2, ?3, ?4)
-        ON CONFLICT(scope) DO UPDATE SET revision=excluded.revision, panes=excluded.panes, retired=excluded.retired",
-        params![key(&view.scope)?, view.revision,
-            serde_json::to_string(&view.panes).map_err(|error| error.to_string())?,
-            serde_json::to_string(&view.retired).map_err(|error| error.to_string())?]).map_err(|error| error.to_string())?;
-    Ok(())
+    // Pins hang off pane rows, so the rows come first.
+    store::store(db, view)?;
+    terminal_retention::sync_view_pins(db, &view.panes)
 }
 
 #[cfg(test)]
@@ -2350,7 +2188,7 @@ mod tests {
             }
             if !changed_launch && matches!(evidence, "exact" | "learn-thread") {
                 // A failed pane write must roll back Agent ownership as well.
-                r.db.execute_batch("CREATE TRIGGER reject_pane_adoption BEFORE UPDATE ON shared_views BEGIN SELECT RAISE(ABORT, 'fixture failed pane commit'); END;").unwrap();
+                r.db.execute_batch("CREATE TRIGGER reject_pane_adoption BEFORE UPDATE ON view_scopes BEGIN SELECT RAISE(ABORT, 'fixture failed pane commit'); END;").unwrap();
                 assert!(
                     r.adopt_authenticated_agent_session(std::slice::from_ref(&source), &successor)
                         .is_err()
@@ -2405,14 +2243,7 @@ mod tests {
                 // Recreate a genuinely stale source after the atomic adoption.
                 // This simulates replacement/corrupt old evidence, rather than
                 // requiring normal holder recovery to publish an inert pane.
-                r.db.execute(
-                    "UPDATE shared_views SET panes=?2 WHERE scope=?1",
-                    params![
-                        key(&Scope::Channel(a)).unwrap(),
-                        serde_json::to_string(&vec![p.clone()]).unwrap()
-                    ],
-                )
-                .unwrap();
+                store::overwrite_panes(&r.db, &Scope::Channel(a), std::slice::from_ref(&p));
                 let stale_sequence = r.model().unwrap().sequence;
                 assert!(
                     r.adopt_authenticated_agent_session(std::slice::from_ref(&source), &successor)
@@ -2427,14 +2258,7 @@ mod tests {
                     !r.adopt_authenticated_agent_session(std::slice::from_ref(&source), &successor)
                         .unwrap()
                 );
-                r.db.execute(
-                    "UPDATE shared_views SET panes=?2 WHERE scope=?1",
-                    params![
-                        key(&Scope::Channel(a)).unwrap(),
-                        serde_json::to_string(&vec![p.clone()]).unwrap()
-                    ],
-                )
-                .unwrap();
+                store::overwrite_panes(&r.db, &Scope::Channel(a), std::slice::from_ref(&p));
             } else {
                 assert_eq!(
                     current_view, before_view,
