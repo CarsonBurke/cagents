@@ -470,8 +470,16 @@ try:
         byte_order = "little" if header[5] == 1 else "big"
         if int.from_bytes(header[16:18], byte_order) not in (2, 3):
             raise ValueError("--codex-executable must name an executable or PIE ELF")
-        expected = json.loads(expected_receipt.read_text()) if expected_receipt else None
-        if expected and identity(before) != expected["snapshot_identity"]:
+        expected = None
+        if expected_receipt is not None:
+            expected = json.loads(expected_receipt.read_text())
+            if (not isinstance(expected, dict)
+                    or not isinstance(expected.get("snapshot_identity"), dict)
+                    or not isinstance(expected.get("sha256"), str)
+                    or len(expected["sha256"]) != 64
+                    or any(character not in "0123456789abcdef" for character in expected["sha256"])):
+                raise ValueError("the selected Codex snapshot receipt is invalid")
+        if expected is not None and identity(before) != expected["snapshot_identity"]:
             raise ValueError("the selected Codex snapshot changed before installation")
         original.seek(0)
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -486,14 +494,14 @@ try:
             if identity(before) != identity(os.fstat(original.fileno())) or size != before.st_size:
                 raise ValueError("the selected Codex executable changed while copying")
             sha256 = digest.hexdigest()
-            if expected and sha256 != expected["sha256"]:
+            if expected is not None and sha256 != expected["sha256"]:
                 raise ValueError("the selected Codex snapshot's contents changed")
             # A new inode with explicit permissions imports no set-id bits,
             # extended attributes or capabilities from the original binary.
             os.fchmod(copied.fileno(), 0o755)
         temporary.replace(destination)
         temporary = None
-        if expected:
+        if expected is not None:
             record = {**expected, "installed_path": str(destination),
                       "installed_identity": identity(destination.stat()),
                       "installed_sha256": sha256}

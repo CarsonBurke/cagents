@@ -1423,6 +1423,45 @@ exec(compile(code, "native-evidence copy helper", "exec"))
         self.assertFalse((self.task / "fixture/bin/codex").exists())
         self.assertFalse((self.task / "fixture/libexec/codex").exists())
 
+    def test_a_malformed_queued_codex_receipt_cannot_disable_verification(self) -> None:
+        self.built()
+        source = self.codex_elf()
+        for malformed in ({}, [], None,
+                          {"snapshot_identity": [], "sha256": "0" * 64},
+                          {"snapshot_identity": {}, "sha256": 64},
+                          {"snapshot_identity": {}, "sha256": "g" * 64},
+                          {"snapshot_identity": {}, "sha256": "0" * 63}):
+            with self.subTest(receipt=malformed):
+                with self.native_lock.open("a") as held:
+                    fcntl.flock(held, fcntl.LOCK_EX)
+                    child = subprocess.Popen(
+                        [str(SCRIPT), "start", "after", "--wait-lock", "30",
+                         "--codex-executable", str(source)], env=self.env,
+                        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE, text=True,
+                    )
+                    self.addCleanup(lambda: child.poll() is not None or child.terminate())
+                    receipt = self.task / "session/codex-executable.json"
+                    for _ in range(100):
+                        if receipt.exists() or child.poll() is not None:
+                            break
+                        time.sleep(0.05)
+                    self.assertTrue(receipt.exists())
+                    receipt.write_text(json.dumps(malformed))
+                    fcntl.flock(held, fcntl.LOCK_UN)
+                try:
+                    stdout, stderr = child.communicate(timeout=30)
+                    self.assertNotEqual(child.returncode, 0, stdout + stderr)
+                    self.assertIn("Codex snapshot receipt is invalid",
+                                  (self.task / "logs/session-after.log").read_text())
+                    self.assertFalse((self.logs / "kwin").exists())
+                    self.assertFalse((self.task / "fixture/bin/codex").exists())
+                    self.assertFalse((self.task / "fixture/libexec/codex").exists())
+                finally:
+                    self.run_tool("stop", check=False)
+                    receipt.unlink(missing_ok=True)
+                    (self.task / "logs/session-after.log").unlink(missing_ok=True)
+
     def test_the_fixture_has_no_forge_or_network_until_switched_on(self) -> None:
         self.built()
         self.run_tool("start", "after")
