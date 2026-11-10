@@ -232,7 +232,7 @@ pub(crate) fn socket_fits(path: &Path) -> bool {
     path.as_os_str().as_bytes().len() < capacity
 }
 
-fn with_socket_address<T>(
+pub(crate) fn with_socket_address<T>(
     path: &Path,
     operation: impl FnOnce(&Path) -> io::Result<T>,
 ) -> io::Result<T> {
@@ -484,6 +484,21 @@ pub(crate) fn evidence(socket: &Path, kind: Kind) -> Result<Option<Record>, Stri
 /// discovery stays application-exact; no caller may infer adoption from this.
 pub(crate) fn recovery_candidate(socket: &Path, kind: Kind) -> Result<Option<Record>, String> {
     evidence_inner(socket, kind, true)
+}
+
+/// Read execution evidence without granting discovery or adoption authority.
+/// Old boots and foreign holders still describe execution; callers must check
+/// the boot before interpreting process identities that the kernel can reuse.
+pub(crate) fn execution_record(socket: &Path) -> io::Result<Option<Record>> {
+    let record = match read(&socket.with_extension("json")) {
+        Ok(record) => record,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if socket.file_name() != Some(std::ffi::OsStr::new(&record.terminal.to_string())) {
+        return Err(io::Error::other("Holder record names another pane"));
+    }
+    Ok(Some(record))
 }
 
 fn evidence_inner(socket: &Path, kind: Kind, recovery: bool) -> Result<Option<Record>, String> {
