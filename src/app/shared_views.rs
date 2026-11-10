@@ -157,6 +157,8 @@ pub(super) struct State {
     #[cfg(test)]
     selected_projection_count: std::cell::Cell<usize>,
     #[cfg(test)]
+    pane_attachment_count: usize,
+    #[cfg(test)]
     pub(super) structural_tail_count: usize,
     #[cfg(test)]
     pub(super) chrome_tail_count: usize,
@@ -1197,10 +1199,13 @@ impl Cagents {
                 || self.chat_awaiting_admission(pane.id)
                 || self.saved_terminals.entries.contains_key(&pane.id)
                 || !self.cards.contains_key(&pane.id)
-                || matches!(
-                    self.cards.get(&pane.id),
-                    Some(CardRuntime::Loading | CardRuntime::Failed(_))
-                )
+                || matches!(self.cards.get(&pane.id), Some(CardRuntime::Loading))
+                // A retained browser failure is a settled presentation: the
+                // existing reducer preserves it while this exact source and
+                // runtime remain present. Other failed surfaces may still owe
+                // admission or recovery work.
+                || (matches!(self.cards.get(&pane.id), Some(CardRuntime::Failed(_)))
+                    && !matches!(pane.kind, CardKind::Browser(_)))
             {
                 return Err("pane source or runtime is unsettled");
             }
@@ -2830,6 +2835,10 @@ impl Cagents {
     }
 
     fn attach_shared_pane(&mut self, pane: &Pane) -> Task<Message> {
+        #[cfg(test)]
+        {
+            self.shared_views.pane_attachment_count += 1;
+        }
         // Saved terminal outcomes are presentation, never a hydration request.
         // In particular, RelaunchAvailable retains an explicit restart action.
         if matches!(&pane.kind, CardKind::Terminal(session) if terminal_ended(session)) {
@@ -4848,6 +4857,7 @@ mod tests {
 
     /// Settled metadata and a ready browser are ordinary presentation state;
     /// history and unrelated default drafts are deliberately not required.
+    #[cfg(not(feature = "integrated-browser"))]
     fn presentation_fixture() -> (Cagents, ChannelId, ChannelId, Pane) {
         let (mut app, source, destination, pane) = channel_move_fixture();
         let repository = PathBuf::from("/repo/.git");
@@ -4881,6 +4891,7 @@ mod tests {
         (app, source, destination, pane)
     }
 
+    #[cfg(not(feature = "integrated-browser"))]
     fn presentation_edge(
         app: &Cagents,
         scope: Scope,
@@ -4934,6 +4945,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "integrated-browser"))]
     fn presentation_edge_uses_the_selected_projector_and_chrome_update_tail() {
         let (mut app, source, _, pane) = presentation_fixture();
         // Match the native bounded workload's saved history. Only 83 panes
@@ -4972,6 +4984,13 @@ mod tests {
                 path: PathBuf::from(format!("/repo/closed-{}", app.workspace_model.views.len())),
             }));
         }
+        let failure = match app.cards.get(&pane.id) {
+            Some(CardRuntime::Failed(error)) => format!("{error:?}"),
+            _ => panic!("browserless unavailable surface"),
+        };
+        let residency = app.residency(pane.id).clone();
+        let exposure = app.exposure(pane.id);
+        app.shared_views.pane_attachment_count = 0;
         let history = app.durable.cards[1..].to_vec();
         let views = app.workspace_model.views[2..].to_vec();
         let update = presentation_edge(&app, Scope::Channel(source), 21, "Remote label", 0.72);
@@ -4994,9 +5013,17 @@ mod tests {
         );
         assert_eq!(&app.durable.cards[1..], history.as_slice());
         assert_eq!(&app.workspace_model.views[2..], views.as_slice());
+        assert!(
+            matches!(app.cards.get(&pane.id), Some(CardRuntime::Failed(error)) if format!("{error:?}") == failure)
+        );
+        assert_eq!(app.residency(pane.id), &residency);
+        assert_eq!(app.exposure(pane.id), exposure);
+        assert_eq!(app.shared_views.pane_attachment_count, 0);
+        assert!(!app.terminal_start_in_flight(pane.id));
     }
 
     #[test]
+    #[cfg(not(feature = "integrated-browser"))]
     fn presentation_projection_rejects_ahead_structure_aliases_metadata_and_transfer() {
         use super::super::workspace_model_sync::ModelUpdate;
         let (mut app, source, destination, pane) = presentation_fixture();
@@ -5056,6 +5083,13 @@ mod tests {
             Err("a local resource alias needs reconciliation")
         );
         Arc::make_mut(&mut app.durable).cards.pop();
+        let retained_failure = app.cards.remove(&pane.id).unwrap();
+        app.cards.insert(pane.id, CardRuntime::Loading);
+        assert_eq!(
+            app.presentation_projection_ready(&before, &after, None),
+            Err("pane source or runtime is unsettled")
+        );
+        app.cards.insert(pane.id, retained_failure);
         app.shared_views
             .requested_transfers
             .insert(uuid::Uuid::new_v4(), pane.id);
@@ -5086,6 +5120,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "integrated-browser"))]
     fn presentation_projection_matches_full_projection_and_preserves_unrelated_runtime() {
         let (mut selected, source, _, pane) = presentation_fixture();
         let mut full = super::super::tests::context_inspector_test_app(false);
@@ -5099,6 +5134,13 @@ mod tests {
         selected.workspace_model_tx = selected_tx;
         let (full_tx, full_rx) = async_channel::unbounded();
         full.workspace_model_tx = full_tx;
+        let failure = match selected.cards.get(&pane.id) {
+            Some(CardRuntime::Failed(error)) => format!("{error:?}"),
+            _ => panic!("browserless unavailable surface"),
+        };
+        let residency = selected.residency(pane.id).clone();
+        selected.shared_views.pane_attachment_count = 0;
+        full.shared_views.pane_attachment_count = 0;
         let update = presentation_edge(
             &selected,
             Scope::Channel(source),
@@ -5135,9 +5177,21 @@ mod tests {
             std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>()
         };
         assert_eq!(published(selected_rx), published(full_rx));
+        assert!(
+            matches!(selected.cards.get(&pane.id), Some(CardRuntime::Failed(error)) if format!("{error:?}") == failure)
+        );
+        assert!(
+            matches!(full.cards.get(&pane.id), Some(CardRuntime::Failed(error)) if format!("{error:?}") == failure)
+        );
+        assert_eq!(selected.residency(pane.id), &residency);
+        assert_eq!(selected.residency(pane.id), full.residency(pane.id));
+        assert_eq!(selected.shared_views.pane_attachment_count, 0);
+        assert_eq!(full.shared_views.pane_attachment_count, 0);
+        assert!(!selected.terminal_start_in_flight(pane.id));
     }
 
     #[test]
+    #[cfg(not(feature = "integrated-browser"))]
     fn presentation_projection_preserves_an_unrelated_draft_and_pending_history() {
         let (mut app, source, destination, pane) = presentation_fixture();
         Arc::make_mut(&mut app.durable).active_channel = Some(destination);
@@ -5191,6 +5245,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "integrated-browser"))]
     fn presentation_receipt_and_observer_echo_are_bounded_in_either_order() {
         use super::super::workspace_model_sync::ModelUpdate;
         use crate::workspace_model::delta::EditReceipt;
@@ -5283,6 +5338,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "integrated-browser"))]
     fn presentation_remote_width_with_a_pending_local_title_uses_the_full_overlay() {
         let (mut app, source, _, pane) = presentation_fixture();
         let scope = Scope::Channel(source);
@@ -5315,6 +5371,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "integrated-browser"))]
     fn committed_pending_view_edit_projects_once_after_acknowledgment() {
         use super::super::workspace_model_sync::{EdgeChanges, ModelUpdate};
         use crate::workspace_model::delta::{EditEffects, EditReceipt, ViewChanges, ViewRevision};
