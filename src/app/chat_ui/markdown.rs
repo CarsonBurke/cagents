@@ -344,7 +344,7 @@ impl Content {
                         ..
                     },
                 ) if old_language == language => {
-                    *reader_source = super::reader_source::Source::updated(previous, old, code);
+                    **reader_source = super::reader_source::Source::updated(previous, old, code);
                 }
                 _ => {}
             }
@@ -524,7 +524,7 @@ pub enum Item {
         /// The styled lines of text in the code block.
         lines: Vec<Text>,
         /// Stable source digest and bounded append proof for nested reader geometry.
-        reader_source: super::reader_source::Source,
+        reader_source: Box<super::reader_source::Source>,
     },
     /// A list.
     List {
@@ -540,9 +540,9 @@ pub enum Item {
         /// The title of the image.
         title: String,
         /// Literal title text prepared alongside the image, never parsed as Markdown.
-        title_text: Text,
+        title_text: Box<Text>,
         /// The alternative text of the image.
-        alt: Text,
+        alt: Box<Text>,
     },
     /// A quote.
     Quote(Vec<Item>),
@@ -638,7 +638,7 @@ pub struct Text {
     spans: Arc<Spans>,
     starts: Arc<[usize]>,
     plain: std::cell::OnceCell<Arc<str>>,
-    plain_source: std::cell::OnceCell<super::reader_source::Source>,
+    plain_source: std::cell::OnceCell<Box<super::reader_source::Source>>,
     // Most parsed nodes are never styled. Keep the large Style and empty
     // Arc allocation out of every cold Text (and therefore every Item).
     styled_cache: RefCell<Option<Box<StyledCache>>>,
@@ -703,11 +703,14 @@ pub(super) struct FlowText {
     plain: std::sync::OnceLock<Arc<str>>,
     // Retain every source/cache owner until raw Flow retirement, including
     // already-primed proof state and a cached style captured from the Text.
-    _plain_source: Option<super::reader_source::Source>,
-    style: Option<Style>,
-    styled: Arc<[text::Span<'static, Uri>]>,
+    captured: Option<Box<FlowCaches>>,
     lineage: Arc<std::sync::Mutex<StyledLineage>>,
 }
+struct FlowCaches {
+    _plain_source: Option<super::reader_source::Source>,
+    styled: Option<StyledCache>,
+}
+
 impl FlowText {
     pub(super) fn len(&self) -> usize {
         self.starts.last().copied().unwrap_or_default()
@@ -730,8 +733,13 @@ impl FlowText {
             .clone()
     }
     pub(super) fn spans(&self, style: Style) -> Arc<[text::Span<'static, Uri>]> {
-        if self.style == Some(style) {
-            self.styled.clone()
+        if let Some(cached) = self
+            .captured
+            .as_ref()
+            .and_then(|capture| capture.styled.as_ref())
+            && cached.style == style
+        {
+            cached.spans.clone()
         } else {
             #[cfg(test)]
             MATERIALIZED_BYTES.with(|bytes| bytes.set(bytes.get() + self.len()));
@@ -882,17 +890,22 @@ impl Text {
         if let Some(ready) = self.plain.get() {
             let _ = plain.set(ready.clone());
         }
-        let (style, styled) = match self.styled_cache.borrow().as_ref() {
-            Some(cached) => (Some(cached.style), cached.spans.clone()),
-            None => (None, Arc::from([])),
-        };
+        let source = self
+            .plain_source
+            .get()
+            .map(|source| source.as_ref().clone());
+        let styled = self.styled_cache.borrow().as_deref().cloned();
+        let captured = (source.is_some() || styled.is_some()).then(|| {
+            Box::new(FlowCaches {
+                _plain_source: source,
+                styled,
+            })
+        });
         FlowText {
             spans: self.spans.clone(),
             starts: self.starts.clone(),
             plain,
-            _plain_source: self.plain_source.get().cloned(),
-            style,
-            styled,
+            captured,
             lineage: self.lineage.clone(),
         }
     }
@@ -922,7 +935,7 @@ impl Text {
     }
     pub fn plain_prefixes(&self) -> Arc<Vec<[u8; 32]>> {
         self.plain_source
-            .get_or_init(|| super::reader_source::Source::new(&self.plain()))
+            .get_or_init(|| Box::new(super::reader_source::Source::new(&self.plain())))
             .prefixes()
     }
     pub fn len(&self) -> usize {
@@ -1530,8 +1543,8 @@ fn parse_with<'a>(
                 RefCell::borrow_mut(&inline_items).push(Item::Image {
                     url,
                     title,
-                    title_text,
-                    alt,
+                    title_text: Box::new(title_text),
+                    alt: Box::new(alt),
                 });
                 None
             }
@@ -1545,7 +1558,7 @@ fn parse_with<'a>(
                     Item::CodeBlock {
                         language: code_language.take(),
                         source: display.clone(),
-                        reader_source: super::reader_source::Source::new(&display),
+                        reader_source: Box::new(super::reader_source::Source::new(&display)),
                         code: display,
                         lines: code_lines.drain(..).collect(),
                     },
@@ -2357,7 +2370,13 @@ mod tests {
         let mut output = Vec::new();
         for item in items {
             match item {
-                Item::Paragraph(text) | Item::Heading(_, text) | Item::Image { alt: text, .. } => {
+                Item::Paragraph(text) | Item::Heading(_, text) => {
+                    for span in text.spans.iter() {
+                        let Span::Standard { text, link, .. } = span;
+                        output.extend(text.chars().map(|ch| (ch, link.clone())));
+                    }
+                }
+                Item::Image { alt: text, .. } | Item::Image { alt: text, .. } => {
                     for span in text.spans.iter() {
                         let Span::Standard { text, link, .. } = span;
                         output.extend(text.chars().map(|ch| (ch, link.clone())));
