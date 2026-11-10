@@ -1588,7 +1588,7 @@ impl TerminalHandle {
         }
     }
 
-    /// True after teardown and either a confirmed root exit or committed carry.
+    /// True after teardown and confirmed process cleanup or committed carry.
     /// Published before the final `Completed` event when an exit is confirmed.
     /// A stopped parser or foreground-process exit alone releases no ownership.
     pub fn is_completed(&self) -> bool {
@@ -2640,8 +2640,19 @@ fn command_channel(capacity: usize) -> (Sender<Command>, Receiver<Command>) {
 
 struct WorkerCompletion {
     event: Option<TerminalEvent>,
-    /// A confirmed root exit or already-committed carry released ownership.
+    /// Natural exit/drain, checked teardown or committed carry released ownership.
     ownership_released: bool,
+    natural_close: Option<(NaturalClose, bool)>,
+}
+
+struct NaturalClose {
+    deadline: Instant,
+    reply: Sender<super::ipc::TerminalCloseResult>,
+}
+
+enum CheckedClose {
+    Finished(super::ipc::TerminalCloseResult),
+    AwaitNaturalExit,
 }
 
 struct InputHandoff {
@@ -2663,6 +2674,8 @@ struct Worker {
     display_title: String,
     agent_exited: bool,
     root_exit: Option<TerminalEvent>,
+    pty_eof: bool,
+    natural_close: Option<NaturalClose>,
     terminal: Terminal<'static, 'static>,
     theme: Rc<Cell<TerminalTheme>>,
     key_encoder: KeyEncoder<'static>,
@@ -2711,6 +2724,7 @@ struct Worker {
     child_exit_rx: Receiver<ChildExit>,
     child_identity: Option<RootIdentity>,
     checked_shutdown: bool,
+    checked_close_started: bool,
     /// The terminal was left to its holder for a successor daemon, so ending
     /// this worker must not end its processes.
     carried: bool,
@@ -3131,6 +3145,8 @@ impl Worker {
             display_title: String::new(),
             agent_exited: false,
             root_exit: None,
+            pty_eof: false,
+            natural_close: None,
             launch: execution,
             terminal,
             theme,
@@ -3167,6 +3183,7 @@ impl Worker {
             child_exit_rx,
             child_identity,
             checked_shutdown: false,
+            checked_close_started: false,
             carried: false,
             holder: held.holder,
             pty_capacity: config.pty_capacity,
@@ -3336,6 +3353,20 @@ impl Worker {
         if let Some(completion) = completion.event {
             published.emit_event(&events, completion);
         }
+        if let Some((close, drained)) = completion.natural_close {
+            use super::ipc::TerminalCloseResult;
+            let result = if drained && Instant::now() < close.deadline {
+                TerminalCloseResult::Closed
+            } else {
+                published
+                    .input_order
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .handoff = false;
+                TerminalCloseResult::Unknown("Terminal process cleanup remains unconfirmed".into())
+            };
+            let _ = close.reply.send(result);
+        }
     }
 
     fn run_to_completion(mut self) -> WorkerCompletion {
@@ -3350,7 +3381,15 @@ impl Worker {
         let mut exited = false;
         let mut shutting_down = false;
         let mut carried_command = None;
+        let deferred_commands = crossbeam_channel::never();
         while !shutting_down && (pty_open || !exited) {
+            if self
+                .natural_close
+                .as_ref()
+                .is_some_and(|close| Instant::now() >= close.deadline)
+            {
+                self.refuse_natural_close();
+            }
             if self.resume_cancelled_input_handoff() || self.resume_reader_after_refusal() {
                 pty_open = true;
             }
@@ -3382,7 +3421,12 @@ impl Worker {
                     break;
                 }
             }
-            for _ in 0..admission::CLEANUP_LIMIT {
+            let cleanup_budget = if self.natural_close.is_some() {
+                0
+            } else {
+                admission::CLEANUP_LIMIT
+            };
+            for _ in 0..cleanup_budget {
                 let Some(command) = self.published.take_cleanup_command(true) else {
                     break;
                 };
@@ -3397,7 +3441,9 @@ impl Worker {
             if shutting_down {
                 break;
             }
-            self.flush_pty_input();
+            if self.natural_close.is_none() {
+                self.flush_pty_input();
+            }
             self.drain_effects();
             self.publish_bell();
             // Output or a busy input queue must not keep resetting discovery's
@@ -3405,18 +3451,26 @@ impl Worker {
             if self.last_foreground_observation.elapsed() >= self.foreground_poll {
                 self.observe_foreground();
             }
-            let event = self
-                .retained_commands
-                .pop_front()
-                .or_else(|| carried_command.take())
+            let deferred = self.natural_close.is_some();
+            let event = (!deferred)
+                .then(|| {
+                    self.retained_commands
+                        .pop_front()
+                        .or_else(|| carried_command.take())
+                })
+                .flatten()
                 .map(|command| WorkerEvent::Command(Some(command)))
                 .unwrap_or_else(|| {
                     wait_for_worker_event(
-                        &self.commands,
+                        if deferred {
+                            &deferred_commands
+                        } else {
+                            &self.commands
+                        },
                         &self.pty_rx,
                         &self.child_exit_rx,
                         &self.published.capture_rx,
-                        pty_open && self.reader.is_some() && !self.reply_pending(),
+                        pty_open && self.reader.is_some() && (deferred || !self.reply_pending()),
                         !exited,
                         self.foreground_poll
                             .saturating_sub(self.last_foreground_observation.elapsed()),
@@ -3424,9 +3478,13 @@ impl Worker {
                             .into_iter()
                             .chain(self.bell.release_after())
                             .chain(
-                                (!self.pending_input.is_empty() || self.reply_pending())
-                                    .then_some(PTY_WRITE_RETRY),
+                                (!deferred
+                                    && (!self.pending_input.is_empty() || self.reply_pending()))
+                                .then_some(PTY_WRITE_RETRY),
                             )
+                            .chain(self.natural_close.as_ref().map(|close| {
+                                close.deadline.saturating_duration_since(Instant::now())
+                            }))
                             .min(),
                     )
                 });
@@ -3457,9 +3515,22 @@ impl Worker {
                         &mut exited,
                         message.unwrap_or_else(|| Err("child reaper closed".into())),
                     );
+                    if !matches!(self.root_exit, Some(TerminalEvent::Exited { .. })) {
+                        self.refuse_natural_close();
+                    }
                 }
             }
         }
+
+        // A readable root pidfd only selected this reconciliation route. The
+        // actual holder report and PTY EOF together prove natural completion.
+        let natural_close = self.natural_close.take().map(|close| {
+            let drained = !shutting_down
+                && !self.checked_close_started
+                && self.pty_eof
+                && matches!(self.root_exit, Some(TerminalEvent::Exited { .. }));
+            (close, drained)
+        });
 
         // A last bell may still be waiting for its cadence deadline when the
         // PTY drains. Deliver its attention before completion, without holding
@@ -3516,16 +3587,22 @@ impl Worker {
                 }
             }
         }
+        // A failed destructive close retains its original family obligation.
+        // Later root exit and EOF cannot substitute for successful family kill.
+        // The shared input seal alone is insufficient: carry also uses it.
+        let family_cleanup_confirmed = !self.checked_close_started || self.checked_shutdown;
         let completion = self.root_exit.take().and_then(|event| match event {
             TerminalEvent::Exited {
                 exit_code,
                 signal,
                 intentional,
-            } => Some(TerminalEvent::Completed {
-                exit_code,
-                signal,
-                intentional,
-            }),
+            } if family_cleanup_confirmed && (shutting_down || self.pty_eof) => {
+                Some(TerminalEvent::Completed {
+                    exit_code,
+                    signal,
+                    intentional,
+                })
+            }
             _ => None,
         });
         if !shutting_down && completion.is_some() {
@@ -3564,8 +3641,8 @@ impl Worker {
         }
         let ownership_released = completion.is_some() || self.carried;
         if !ownership_released && self.holder.registered() {
-            // A missing exit report cannot authorize a fresh replacement or
-            // erase the holder's recovery record. Retain that exact owner for
+            // A missing exit report or failed PTY drain cannot authorize a
+            // replacement or erase the holder's recovery record. Retain it for
             // a successor without claiming a successful completed handoff.
             if let Err(error) = carry::screen(&mut self.terminal, holder::MAX_SCREEN)
                 .and_then(|screen| self.holder.cache_screen(&screen))
@@ -3596,6 +3673,7 @@ impl Worker {
         WorkerCompletion {
             event: completion,
             ownership_released,
+            natural_close,
         }
     }
 
@@ -3620,6 +3698,7 @@ impl Worker {
                     match self.pty_rx.try_recv() {
                         Ok(PtyMessage::Bytes(next)) => bytes.extend_from_slice(&next),
                         Ok(PtyMessage::Eof) => {
+                            self.pty_eof = true;
                             self.process_output(bytes);
                             return false;
                         }
@@ -3638,7 +3717,11 @@ impl Worker {
                 self.process_output(bytes);
                 true
             }
-            Some(PtyMessage::Eof) | None => false,
+            Some(PtyMessage::Eof) => {
+                self.pty_eof = true;
+                false
+            }
+            None => false,
             Some(PtyMessage::Error(error)) => {
                 self.error("read PTY", error);
                 false
@@ -3881,12 +3964,16 @@ impl Worker {
                 allow_active,
                 deadline,
                 reply,
-            } => {
-                let outcome = self.checked_close(allow_active, deadline);
-                let close = outcome == super::ipc::TerminalCloseResult::Closed;
-                let _ = reply.send(outcome);
-                return close;
-            }
+            } => match self.begin_checked_close(allow_active, deadline, true) {
+                CheckedClose::Finished(outcome) => {
+                    let close = outcome == super::ipc::TerminalCloseResult::Closed;
+                    let _ = reply.send(outcome);
+                    return close;
+                }
+                CheckedClose::AwaitNaturalExit => {
+                    self.natural_close = Some(NaturalClose { deadline, reply });
+                }
+            },
             Command::PrepareInputHandoff {
                 token,
                 resumed,
@@ -4645,6 +4732,7 @@ impl Worker {
         self.reader_done = reader.done;
         self.reader_discard_pending = reader.discard_pending;
         self.pty_rx = reader.output;
+        self.pty_eof = false;
         Ok(true)
     }
 
@@ -4820,24 +4908,61 @@ impl Worker {
         allow_active: bool,
         deadline: std::time::Instant,
     ) -> super::ipc::TerminalCloseResult {
+        match self.begin_checked_close(allow_active, deadline, false) {
+            CheckedClose::Finished(result) => result,
+            CheckedClose::AwaitNaturalExit => unreachable!("startup close cannot defer its reader"),
+        }
+    }
+
+    fn refuse_natural_close(&mut self) {
+        if let Some(close) = self.natural_close.take() {
+            self.published
+                .input_order
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .handoff = false;
+            let _ = close.reply.send(super::ipc::TerminalCloseResult::Unknown(
+                "Terminal process cleanup remains unconfirmed".into(),
+            ));
+        }
+    }
+
+    fn begin_checked_close(
+        &mut self,
+        allow_active: bool,
+        deadline: Instant,
+        allow_natural_exit: bool,
+    ) -> CheckedClose {
         use super::ipc::TerminalCloseResult;
+
+        if Instant::now() >= deadline {
+            return CheckedClose::Finished(TerminalCloseResult::Unknown(
+                "Close inspection expired; stopped processes were released".into(),
+            ));
+        }
 
         // Fence new input at the shared admission lock. Reserved cleanup can
         // still balance a prior owned press while inspection is reversible;
         // it is sealed too before any destructive process signal. No mutex is
         // held during /proc inspection or process cleanup.
-        {
+        let natural_exit = {
             let mut order = self
                 .published
                 .input_order
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
             if order.handoff && !order.cleanup_sealed {
-                return TerminalCloseResult::Unknown(
+                return CheckedClose::Finished(TerminalCloseResult::Unknown(
                     "Terminal ownership is already changing".into(),
-                );
+                ));
             }
             order.handoff = true;
+            // A previous partial destructive close must retain its original
+            // family proof; root exit alone cannot replace that obligation.
+            allow_natural_exit && !order.cleanup_sealed && !self.checked_close_started
+        };
+        if natural_exit && self.child.exited_within(Duration::ZERO).unwrap_or(false) {
+            return CheckedClose::AwaitNaturalExit;
         }
         let inspection = self.inspect_close(deadline);
         #[cfg(test)]
@@ -4853,6 +4978,9 @@ impl Worker {
                 drop(family);
                 TerminalCloseResult::Active
             }
+            Err(_) if natural_exit && self.child.exited_within(Duration::ZERO).unwrap_or(false) => {
+                return CheckedClose::AwaitNaturalExit;
+            }
             Err(detail) => TerminalCloseResult::Unknown(detail),
             Ok((_, mut family)) => {
                 // Once kill is attempted, an error cannot prove the original
@@ -4863,14 +4991,15 @@ impl Worker {
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .cleanup_sealed = true;
-                return match family.kill(deadline) {
+                self.checked_close_started = true;
+                return CheckedClose::Finished(match family.kill(deadline) {
                     Ok(()) => {
                         self.checked_shutdown = true;
                         self.holder.prove_cleanup();
                         TerminalCloseResult::Closed
                     }
                     Err(detail) => TerminalCloseResult::Unknown(detail),
-                };
+                });
             }
         };
         self.published
@@ -4878,7 +5007,7 @@ impl Worker {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .handoff = false;
-        outcome
+        CheckedClose::Finished(outcome)
     }
 
     fn inspect_close(&self, deadline: std::time::Instant) -> Result<(bool, FrozenFamily), String> {
@@ -7787,6 +7916,466 @@ mod tests {
         assert!(
             matches!(closed, Ok(TerminalCloseResult::Closed)),
             "the original root's queued natural exit must be reconciled: {closed:?}"
+        );
+    }
+
+    #[test]
+    fn deferred_close_requires_the_actual_exit_report_and_pty_eof() {
+        use super::super::ipc::TerminalCloseResult;
+
+        // Withhold a real report, withhold real EOF, then lose the report
+        // channel. No case invents a process status or a PTY completion.
+        for missing in 0..3 {
+            let (mut worker, events) = capture_worker_for(LaunchRecipe {
+                program: "/bin/sh".into(),
+                arguments: vec!["-c".into(), "read line; printf 'drained'; exit 7".into()],
+                working_directory: "/".into(),
+                environment: Default::default(),
+                unset_environment: Default::default(),
+            });
+            let (commands, receiver) = command_channel(1);
+            worker.commands = receiver;
+            let handle = TerminalHandle {
+                inner: Arc::new(HandleInner {
+                    commands,
+                    events,
+                    published: worker.published.clone(),
+                    worker: joins::JoinOwner::empty(worker.published.clone()),
+                }),
+            };
+            worker.writer.write_all(b"release\n").unwrap();
+            let report = worker
+                .child_exit_rx
+                .recv_deadline(Instant::now() + Duration::from_secs(5))
+                .unwrap();
+            assert_eq!(report.as_ref().unwrap().exit_code(), 7);
+            assert!(!worker.child.unreaped());
+            let (exit_relay, exits) = crossbeam_channel::bounded(1);
+            worker.child_exit_rx = exits;
+            let mut withheld_report = Some(report);
+            if missing == 1 {
+                exit_relay.send(withheld_report.take().unwrap()).unwrap();
+            }
+            let mut messages = Vec::new();
+            loop {
+                let message = worker
+                    .pty_rx
+                    .recv_deadline(Instant::now() + Duration::from_secs(5))
+                    .unwrap();
+                let eof = matches!(message, PtyMessage::Eof);
+                assert!(
+                    eof || matches!(message, PtyMessage::Bytes(_)),
+                    "unexpected fixture PTY error"
+                );
+                messages.push(message);
+                if eof {
+                    break;
+                }
+            }
+            let (pty_relay, pty) = crossbeam_channel::bounded(messages.len() + 1);
+            let mut withheld_eof = None;
+            for message in messages {
+                if missing == 1 && matches!(message, PtyMessage::Eof) {
+                    withheld_eof = Some(message);
+                } else {
+                    pty_relay.send(message).unwrap();
+                }
+            }
+            worker.pty_rx = pty;
+            let exit_relay = (missing != 2).then_some(exit_relay);
+            // For the lost-channel case, dropping the real report sender is
+            // evidence of failure; the held successful report is not reused.
+            let withheld_report = (missing == 0).then_some(withheld_report).flatten();
+            let deadline = Instant::now() + Duration::from_millis(100);
+            let (reply, outcome) = crossbeam_channel::bounded(1);
+            handle
+                .try_command(Command::CloseChecked {
+                    allow_active: true,
+                    deadline,
+                    reply,
+                })
+                .unwrap();
+            let observer = handle.clone();
+            let (refusal, was_completed, fence_released, received_at) = thread::scope(|scope| {
+                let release = scope.spawn(move || {
+                    let refusal = outcome.recv_deadline(deadline + Duration::from_secs(5));
+                    let received_at = Instant::now();
+                    let was_completed = observer.is_completed();
+                    let fence_released =
+                        !observer.inner.published.input_order.lock().unwrap().handoff;
+                    // Always release the actual held fact before assertions,
+                    // including if an incorrect implementation replied early.
+                    if let Some(report) = withheld_report {
+                        let _ = exit_relay.unwrap().send(report);
+                    }
+                    if let Some(eof) = withheld_eof {
+                        let _ = pty_relay.send(eof);
+                    }
+                    (refusal, was_completed, fence_released, received_at)
+                });
+                worker.run();
+                release.join().unwrap()
+            });
+            let completed = handle.is_completed();
+            let events: Vec<_> = handle.events().try_iter().collect();
+            drop(handle);
+            assert!(
+                matches!(refusal, Ok(TerminalCloseResult::Unknown(_))),
+                "{refusal:?}"
+            );
+            assert!(!was_completed, "neither missing fact permits completion");
+            assert!(
+                fence_released,
+                "a refused natural close must restore its own admission fence"
+            );
+            if missing < 2 {
+                assert!(
+                    received_at >= deadline,
+                    "the request retained its original deadline"
+                );
+                assert!(
+                    completed,
+                    "releasing both actual facts permits natural completion"
+                );
+            } else {
+                assert!(
+                    !completed,
+                    "a disconnected report cannot certify the root's result"
+                );
+                assert!(
+                    !events
+                        .iter()
+                        .any(|event| matches!(event, TerminalEvent::Completed { .. }))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn natural_close_cannot_replace_a_sealed_destructive_close_obligation() {
+        let (mut worker, events) = capture_worker_for(LaunchRecipe {
+            program: "/bin/sh".into(),
+            arguments: vec!["-c".into(), "read line; exit 7".into()],
+            working_directory: "/".into(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        });
+        worker.writer.write_all(b"release\n").unwrap();
+        let report = worker
+            .child_exit_rx
+            .recv_deadline(Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(report.as_ref().unwrap().exit_code(), 7);
+        let (relay, exits) = crossbeam_channel::bounded(1);
+        relay.send(report).unwrap();
+        worker.child_exit_rx = exits;
+        // This state represents an outstanding family-kill proof. Even a
+        // readable original pidfd cannot select the reversible natural route.
+        worker.published.input_order.lock().unwrap().cleanup_sealed = true;
+        worker.checked_close_started = true;
+        let result =
+            worker.begin_checked_close(true, Instant::now() + Duration::from_secs(1), true);
+        let (_commands, inbox) = command_channel(1);
+        worker.commands = inbox;
+        let published = worker.published.clone();
+        worker.run();
+        assert!(matches!(
+            result,
+            CheckedClose::Finished(super::super::ipc::TerminalCloseResult::Unknown(_))
+        ));
+        assert!(!published.completed.load(Ordering::Acquire));
+        assert!(matches!(
+            *published.archive.lock().unwrap(),
+            ArchivePhase::Live
+        ));
+        assert!(
+            !events
+                .try_iter()
+                .any(|event| matches!(event, TerminalEvent::Completed { .. }))
+        );
+    }
+
+    #[test]
+    fn proven_checked_shutdown_does_not_require_natural_pty_eof() {
+        let (mut worker, events) = capture_worker_for(LaunchRecipe {
+            program: "/bin/sh".into(),
+            arguments: vec!["-c".into(), "read line".into()],
+            working_directory: "/".into(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        });
+        // Perform the actual frozen family kill. Neither the request nor the
+        // input seal may manufacture its successful cleanup proof.
+        let result =
+            worker.begin_checked_close(true, Instant::now() + Duration::from_secs(5), true);
+        let proved = worker.checked_shutdown && worker.checked_close_started;
+        let (_pty, messages) = crossbeam_channel::bounded(1);
+        worker.pty_rx = messages;
+        let published = worker.published.clone();
+        published.request_shutdown();
+        worker.run();
+        assert!(matches!(
+            result,
+            CheckedClose::Finished(super::super::ipc::TerminalCloseResult::Closed)
+        ));
+        assert!(proved && published.completed.load(Ordering::Acquire));
+        assert_eq!(
+            events
+                .try_iter()
+                .filter(|event| matches!(
+                    event,
+                    TerminalEvent::Completed {
+                        intentional: true,
+                        signal: Some(_),
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn deferred_close_does_not_certify_pty_failure_as_drain() {
+        use super::super::ipc::TerminalCloseResult;
+
+        for with_bytes in [false, true] {
+            for read_error in [false, true] {
+                let (mut worker, events) = capture_worker_for(LaunchRecipe {
+                    program: "/bin/sh".into(),
+                    arguments: vec!["-c".into(), "read line; exit 7".into()],
+                    working_directory: "/".into(),
+                    environment: Default::default(),
+                    unset_environment: Default::default(),
+                });
+                let (commands, receiver) = command_channel(1);
+                worker.commands = receiver;
+                let handle = TerminalHandle {
+                    inner: Arc::new(HandleInner {
+                        commands,
+                        events,
+                        published: worker.published.clone(),
+                        worker: joins::JoinOwner::empty(worker.published.clone()),
+                    }),
+                };
+                worker.writer.write_all(b"release\n").unwrap();
+                let report = worker
+                    .child_exit_rx
+                    .recv_deadline(Instant::now() + Duration::from_secs(5))
+                    .unwrap();
+                assert_eq!(report.as_ref().unwrap().exit_code(), 7);
+                let (exit_relay, exits) = crossbeam_channel::bounded(1);
+                exit_relay.send(report).unwrap();
+                worker.child_exit_rx = exits;
+                // Exercise both direct failure and Bytes coalescing into the
+                // same failure. Neither a reader error nor disconnection is EOF.
+                let (relay, messages) = crossbeam_channel::bounded(2);
+                if with_bytes {
+                    relay
+                        .send(PtyMessage::Bytes(b"FINAL_BEFORE_READ_FAILURE".to_vec()))
+                        .unwrap();
+                }
+                if read_error {
+                    relay
+                        .send(PtyMessage::Error("fixture read failure".into()))
+                        .unwrap();
+                }
+                drop(relay);
+                worker.pty_rx = messages;
+                let (reply, outcome) = crossbeam_channel::bounded(1);
+                handle
+                    .try_command(Command::CloseChecked {
+                        allow_active: true,
+                        deadline: Instant::now() + Duration::from_secs(5),
+                        reply,
+                    })
+                    .unwrap();
+                worker.run();
+                let refusal = outcome.recv_timeout(Duration::from_secs(1));
+                let completed = handle.is_completed();
+                let events: Vec<_> = handle.events().try_iter().collect();
+                let screen = handle.snapshot();
+                let fence = handle.inner.published.input_order.lock().unwrap().handoff;
+                drop(handle);
+                assert!(matches!(refusal, Ok(TerminalCloseResult::Unknown(_))));
+                assert!(!completed && !fence);
+                assert!(
+                    !events
+                        .iter()
+                        .any(|event| matches!(event, TerminalEvent::Completed { .. }))
+                );
+                if with_bytes {
+                    assert!(screen.lines.iter().any(|line| {
+                        line.cells
+                            .iter()
+                            .map(|cell| cell.text.as_str())
+                            .collect::<String>()
+                            .contains("FINAL_BEFORE_READ_FAILURE")
+                    }));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn deferred_natural_close_keeps_registered_holder_receipt_authority() {
+        if isolated_retirement_worker_case() {
+            return;
+        }
+        event_notifier().unwrap();
+        super::super::reactor::runtime().unwrap();
+        let proof = retirement_test_proof();
+        let paths = crate::daemon::RuntimePaths::discover().unwrap();
+        let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+        let mut source = shell_session("read line; printf 'REGISTERED_FINAL_OUTPUT\\n'; exit 7");
+        source.continuity = crate::model::TerminalContinuity::DetachedSameBoot {
+            host_session_id: proof.host_session_id.clone(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: proof.host_incarnation.clone(),
+        };
+        let recovery = holder::Recovery {
+            source: source.clone(),
+            previous_sources: Vec::new(),
+            relaunches: Vec::new(),
+            options: crate::terminal::TerminalSpawnOptions::default(),
+            execution_environment: None,
+            execution_recipe: None,
+        };
+        let (commands, inbox) = command_channel(1);
+        let (events, event_receiver) = crossbeam_channel::unbounded();
+        let published = Arc::new(PublishedState::new(true, Arc::new(|_| {})));
+        let owner = joins::JoinOwner::new(published.clone(), joins::reserve().unwrap());
+        let worker_owner = owner.clone();
+        let worker_published = published.clone();
+        let worker_source = source.clone();
+        let (ready, initialized) = crossbeam_channel::bounded(1);
+        let (release, start) = crossbeam_channel::bounded(1);
+        let worker = thread::spawn(move || {
+            // A genuine native join, holder release and durable receipt are
+            // required here; the raw command fixture's empty owner is insufficient.
+            let _body = joins::BodyCompletion(worker_owner);
+            let mut worker = Worker::start(
+                worker_source,
+                TerminalConfig {
+                    holder_recovery: Some(recovery),
+                    ..TerminalConfig::default()
+                },
+                None,
+                inbox,
+                events,
+                worker_published,
+            )
+            .unwrap()
+            .0;
+            worker.writer.write_all(b"release\n").unwrap();
+            let report = worker
+                .child_exit_rx
+                .recv_deadline(Instant::now() + Duration::from_secs(5))
+                .unwrap();
+            assert_eq!(report.as_ref().unwrap().exit_code(), 7);
+            assert!(!worker.child.unreaped());
+            let (relay, exits) = crossbeam_channel::bounded(1);
+            relay.send(report).unwrap();
+            worker.child_exit_rx = exits;
+            let _ = ready.send(());
+            // Disconnect also releases the actual worker on assertion unwind.
+            let _ = start.recv();
+            worker.run();
+        });
+        owner.install(worker);
+        let handle = TerminalHandle {
+            inner: Arc::new(HandleInner {
+                commands,
+                events: event_receiver,
+                published,
+                worker: owner,
+            }),
+        };
+        initialized.recv_timeout(Duration::from_secs(5)).unwrap();
+        let record = handle.holder_identity().unwrap().clone();
+        assert!(record.holder.is_current() && !record.root.is_current());
+        assert!(!handle.is_completed());
+        let mut wrong_proof = proof.clone();
+        wrong_proof.host_incarnation =
+            crate::model::HostIncarnation::new(uuid::Uuid::new_v4().to_string());
+        assert!(holder::cleanup::authorize(&wrong_proof).is_err());
+        let closed = thread::scope(|scope| {
+            let close = scope.spawn(|| handle.close_with_receipt(&source, &proof));
+            // Observe the real public request's priority admission before
+            // allowing the worker to consume its queued genuine root report.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let admitted = loop {
+                if handle
+                    .inner
+                    .published
+                    .priority_close
+                    .lock()
+                    .unwrap()
+                    .is_some()
+                {
+                    break true;
+                }
+                if handle
+                    .inner
+                    .published
+                    .capture_rx
+                    .recv_deadline(deadline)
+                    .is_err()
+                {
+                    break false;
+                }
+            };
+            let _ = release.send(());
+            let result = close.join().unwrap();
+            assert!(
+                admitted,
+                "public checked close must precede the worker loop"
+            );
+            result
+        });
+        let completed = handle.is_completed();
+        let joined = handle.worker_joined_for_test();
+        let screen = handle.snapshot();
+        let events: Vec<_> = handle.events().try_iter().collect();
+        let confirmed = holder::cleanup::confirmed(&source, &record, &proof);
+        let mut wrong_source = source.clone();
+        wrong_source
+            .launch
+            .arguments
+            .push("different source".into());
+        let wrong_source_confirmed = holder::cleanup::confirmed(&wrong_source, &record, &proof);
+        let mut wrong_record = record.clone();
+        wrong_record.holder.start += 1;
+        let wrong_holder_confirmed = holder::cleanup::confirmed(&source, &wrong_record, &proof);
+        drop(handle);
+        assert!(closed.is_ok(), "{closed:?}");
+        assert!(
+            completed && joined,
+            "public success requires actual worker teardown and join"
+        );
+        assert_eq!(confirmed, Ok(true));
+        assert_eq!(wrong_source_confirmed, Ok(false));
+        assert_eq!(wrong_holder_confirmed, Ok(false));
+        assert!(screen.lines.iter().any(|line| {
+            line.cells
+                .iter()
+                .map(|cell| cell.text.as_str())
+                .collect::<String>()
+                .contains("REGISTERED_FINAL_OUTPUT")
+        }));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    TerminalEvent::Completed {
+                        exit_code: 7,
+                        signal: None,
+                        intentional: false,
+                    }
+                ))
+                .count(),
+            1
         );
     }
 
