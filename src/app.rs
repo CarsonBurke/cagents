@@ -299,6 +299,8 @@ enum NoticeKey {
     GitCommit(ActiveWorktreeKey),
     /// Saving this chat's return to a terminal.
     ChatReturn(CardId),
+    /// Closing this chat, which the daemon refused.
+    ChatClose(CardId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12731,10 +12733,13 @@ impl Cagents {
             .entries
             .iter()
             .filter_map(|entry| match entry.notice.key.as_ref() {
-                Some(key @ (NoticeKey::ChatAttach(card) | NoticeKey::ChatReturn(card)))
-                    if self
-                        .card_state(*card)
-                        .is_none_or(|state| !state.existence.is_open()) =>
+                Some(
+                    key @ (NoticeKey::ChatAttach(card)
+                    | NoticeKey::ChatReturn(card)
+                    | NoticeKey::ChatClose(card)),
+                ) if self
+                    .card_state(*card)
+                    .is_none_or(|state| !state.existence.is_open()) =>
                 {
                     Some(key.clone())
                 }
