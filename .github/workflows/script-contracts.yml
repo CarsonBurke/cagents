@@ -228,6 +228,8 @@ jobs:
               ("workload time limit", "scripts/bounded", "tests/bounded.py"),
               ("synthetic Claude provider", "tests/fixtures/chat-composer-claude.sh", "tests/chat_composer_provider.py"),
               ("local install head check", "scripts/install-local", "tests/install_local.py"),
+              ("GitHub request telemetry", "scripts/gh-observe", "tests/gh-observe.py"),
+              ("GitHub request coordination", "scripts/gh-coordinate.py", "tests/gh-coordinate.py"),
           ):
               source_present = present(Path(source))
               fixture_present = present(Path(fixture))
