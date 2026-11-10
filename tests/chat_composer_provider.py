@@ -33,7 +33,7 @@ class LiveProvider:
             [str(copied)], cwd=case.project, stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
             env={"HOME": str(case.root / "home"), "CLAUDE_CONFIG_DIR": str(case.config),
-                 "PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"})
+                 "PATH": f"{copied.parent}:/usr/bin:/bin", "LANG": "C.UTF-8"})
         case.addCleanup(self.cleanup)
         self.selector = selectors.DefaultSelector()
         self.buffers = {"stdout": b"", "stderr": b""}
@@ -88,6 +88,12 @@ class LiveProvider:
         self.case.assertEqual(self.stderr, b"")
 
     def cleanup(self):
+        release = None
+        if (self.case.root / "cleanup-release").exists():
+            # A failed assertion may precede the rm barrier. Leave its release
+            # byte queued while TERM makes the shell run its EXIT fallback.
+            release = os.open(self.case.root / "cleanup-release", os.O_RDWR)
+            os.write(release, b"1")
         if self.process.poll() is None:
             os.killpg(self.process.pid, signal.SIGTERM)
             try:
@@ -95,6 +101,8 @@ class LiveProvider:
             except subprocess.TimeoutExpired:
                 os.killpg(self.process.pid, signal.SIGKILL)
                 self.process.wait(timeout=2)
+        if release is not None:
+            os.close(release)
         self.selector.close()
         for pipe in (self.process.stdin, self.process.stdout, self.process.stderr):
             pipe.close()
@@ -137,18 +145,126 @@ class Provider(unittest.TestCase):
         self.assertEqual(len(histories), 1)
         return [json.loads(line) for line in histories[0].read_text().splitlines()]
 
+    def cleanup_barrier(self):
+        """Delay only this private fixture's rm before it unlinks scratch."""
+        (self.root / "bin").mkdir(exist_ok=True)
+        os.mkfifo(self.root / "cleanup-release", 0o600)
+        shim = self.root / "bin/rm"
+        shim.write_text(r'''#!/usr/bin/python3
+import json, os
+from pathlib import Path
+import sys
+root = Path(__file__).resolve().parent.parent
+args = sys.argv[1:]
+if len(args) == 3 and args[:2] == ["-rf", "--"]:
+    target = Path(args[2])
+    if target.parent == root / "home/.claude" and target.name.startswith(".fixture-stream."):
+        held = os.open(root / "cleanup-release", os.O_RDWR)
+        marker = root / "cleanup-entered.tmp"
+        marker.write_text(json.dumps({"pid":os.getpid(), "target":str(target)}))
+        marker.chmod(0o600)
+        marker.replace(root / "cleanup-entered.json")
+        os.read(held, 1)
+        os.close(held)
+os.execv("/usr/bin/rm", ["/usr/bin/rm", *args])
+''')
+        shim.chmod(0o700)
+
+    def release_cleanup(self):
+        fd = os.open(self.root / "cleanup-release", os.O_RDWR)
+        try:
+            os.write(fd, b"1")
+        finally:
+            os.close(fd)
+
+    def group_close_after_settlement(self, live):
+        # Match ChildGuard::terminate: EOF, group TERM, root WNOWAIT until exit
+        # or two seconds, group KILL while its leader is still unreaped, wait.
+        leader = os.pidfd_open(live.process.pid)
+        try:
+            live.process.stdin.close()
+            try:
+                os.killpg(live.process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            end = time.monotonic() + 2
+            while os.waitid(os.P_PID, live.process.pid,
+                            os.WEXITED | os.WNOHANG | os.WNOWAIT) is None:
+                if time.monotonic() >= end:
+                    break
+                time.sleep(.01)
+            try:
+                os.killpg(live.process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            live.process.wait(timeout=2)
+        finally:
+            os.close(leader)
+        self.assertFalse(list(self.config.glob(".fixture-stream.*")))
+        with self.assertRaises(ProcessLookupError):
+            os.killpg(live.process.pid, 0)
+
+    def test_interrupt_settles_scratch_before_ack_and_group_teardown(self):
+        self.cleanup_barrier()
+        live = self.stream("Offline background update.\n" * 40000)
+        live.first_delta()
+        live.send({"type":"control_request", "request_id":"settle-interrupt",
+                   "request":{"subtype":"interrupt"}})
+        marker = self.root / "cleanup-entered.json"
+        live.read_until(lambda: marker.exists() or live.response("settle-interrupt"))
+        premature = live.response("settle-interrupt")
+        if premature:
+            # The old fixture must fail only after all its private processes
+            # have been cleaned up, not while a deliberately held rm survives.
+            live.cleanup()
+        self.assertFalse(premature, "interrupt acknowledged before scratch settlement")
+        self.assertTrue(marker.exists())
+        self.assertFalse(any(frame.get("event", {}).get("type") == "content_block_stop"
+                             or frame.get("type") == "result" for frame in live.output))
+        self.release_cleanup()
+        live.read_until(lambda: live.response("settle-interrupt") and
+                        any(frame.get("type") == "result" for frame in live.output))
+        self.assertFalse(list(self.config.glob(".fixture-stream.*")))
+        self.assertEqual(self.texts(self.history()), ["".join(live.deltas())])
+        self.group_close_after_settlement(live)
+
+    def test_uninterrupted_stream_settles_scratch_before_completion(self):
+        self.cleanup_barrier()
+        text = "A漢🙂\n" * 5000
+        live = self.stream(text, "0.02")
+        live.send(prompt(1))
+        live.process.stdin.close()
+        marker = self.root / "cleanup-entered.json"
+        stopped = lambda: any(frame.get("event", {}).get("type") == "content_block_stop"
+                              for frame in live.output)
+        live.read_until(lambda: marker.exists() or stopped())
+        premature = stopped()
+        if premature:
+            live.cleanup()
+        self.assertFalse(premature, "stream completed before scratch settlement")
+        self.assertTrue(marker.exists())
+        self.assertEqual("".join(live.deltas()), text)
+        self.assertEqual(self.texts(live.output), [])
+        self.release_cleanup()
+        live.read_until(lambda: not live.selector.get_map())
+        self.assertEqual(live.process.wait(timeout=2), 0, live.stderr)
+        self.assertEqual(self.texts(live.output), [text])
+        self.assertEqual(self.texts(self.history()), [text])
+        self.assertFalse(list(self.config.glob(".fixture-stream.*")))
+
     def test_stream_interrupt_settles_only_emitted_prefix_and_resumes_same_history(self):
         text = "Offline background update for responsiveness comparison.\n" * 40000
         live = self.stream(text)
         live.first_delta()
+        stream_root = next(self.config.glob(".fixture-stream.*"))
+        for path in stream_root.iterdir():
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
         began = time.monotonic()
         live.send({"type": "control_request", "request_id": "interrupt-stream",
                    "request": {"subtype": "interrupt"}})
         live.read_until(lambda: live.response("interrupt-stream"))
         self.assertLess(time.monotonic() - began, 2)
-        stream_root = next(self.config.glob(".fixture-stream.*"))
-        for path in stream_root.iterdir():
-            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        self.assertFalse(list(self.config.glob(".fixture-stream.*")))
         live.finish()
         ack = next(index for index, frame in enumerate(live.output)
                    if frame.get("response", {}).get("request_id") == "interrupt-stream")
@@ -223,6 +339,48 @@ class Provider(unittest.TestCase):
         self.assertEqual(records[2]["parentUuid"], records[1]["uuid"])
         self.assertEqual(self.texts(live.output)[-1], "Streaming reply.\n" * 3000)
 
+    def test_unlinked_read_ahead_keeps_current_offset_and_split_utf8_across_streams(self):
+        text = "Streaming reply.\n" * 3000
+        live = self.stream(text, "0.04")
+        live.first_delta()
+        third = prompt(3)
+        third["message"]["content"] = "Trailing UTF-8 漢🙂 input"
+        raw_third = json.dumps(third, ensure_ascii=False).encode()
+        cut = raw_third.index("漢".encode()) + 1
+        live.send({"type":"control_request", "request_id":"stop-first",
+                   "request":{"subtype":"interrupt"}}, prompt(2),
+                  {"type":"control_request", "request_id":"observe-second",
+                   "request":{"subtype":"initialize"}}, trailing=raw_third[:cut])
+        live.read_until(lambda: live.response("observe-second"))
+        # Prompt 2 was read by the shell from the unlinked queue. Its helper
+        # must see the remaining control and partial UTF-8 at that SAME offset.
+        live.process.stdin.write(raw_third[cut:] + b"\n")
+        live.process.stdin.flush()
+        live.send({"type":"control_request", "request_id":"observe-live",
+                   "request":{"subtype":"get_usage"}})
+        live.read_until(lambda: live.response("observe-live") and
+                        len([frame for frame in live.output if frame.get("type") == "result"]) == 2)
+        live.send({"type":"control_request", "request_id":"after-settlement",
+                   "request":{"subtype":"initialize"}})
+        live.read_until(lambda: live.response("after-settlement"))
+        for fd in (4, 5):
+            try:
+                target = os.readlink(f"/proc/{live.process.pid}/fd/{fd}")
+            except FileNotFoundError:
+                continue
+            self.assertNotIn(".fixture-stream.", target, "consumed queue FD remained open")
+        live.finish()
+        self.assertEqual([frame["response"]["request_id"] for frame in live.output
+                          if frame.get("type") == "control_response"],
+                         ["stop-first", "observe-second", "observe-live", "after-settlement"])
+        queued = [frame["command_uuid"] for frame in live.output
+                  if frame.get("type") == "command_lifecycle" and frame.get("state") == "queued"]
+        self.assertEqual(queued, ["prompt-3"])
+        self.assertEqual([frame["uuid"] for frame in self.history() if frame.get("type") == "user"],
+                         ["prompt-1", "prompt-2"])
+        self.assertEqual(self.texts(live.output)[-1], text)
+        self.assertFalse(list(self.config.glob(".fixture-stream.*")))
+
     def test_term_reaps_stream_helper_and_removes_private_state(self):
         live = self.stream("Streaming reply.\n" * 40000)
         live.first_delta()
@@ -259,6 +417,9 @@ fd, writer = os.pipe()
 os.close(writer)
 os.dup2(fd, 3, inheritable=True)
 os.set_inheritable(3, True)
+older = os.open(os.devnull, os.O_RDONLY)
+os.dup2(older, 4, inheritable=True)
+os.set_inheritable(4, True)
 parent = os.getpid()
 child = os.fork()
 if child == 0:

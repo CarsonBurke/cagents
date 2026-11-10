@@ -381,11 +381,16 @@ fi
 stream_directory=
 stream_pid=
 stream_active=false
+stream_pending_open=false
 cleanup_stream() {
     if [ -n "$stream_pid" ]; then
         kill -TERM "$stream_pid" 2>/dev/null || :
         wait "$stream_pid" 2>/dev/null || :
         stream_pid=
+    fi
+    if [ "$stream_pending_open" = true ]; then
+        exec 5<&-
+        stream_pending_open=false
     fi
     if [ -n "$stream_directory" ]; then
         rm -rf -- "$stream_directory"
@@ -398,6 +403,17 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 next_frame() {
+    if [ "$stream_pending_open" = true ]; then
+        if IFS= read -r frame <&5; then return 0; fi
+        exec 5<&-
+        stream_pending_open=false
+        if [ -n "$frame" ]; then
+            stream_input_prefix=$frame
+            IFS= read -r frame || return 1
+            frame=$stream_input_prefix$frame
+            return 0
+        fi
+    fi
     if [ -n "$stream_directory" ] && [ -s "$stream_directory/pending" ]; then
         if IFS= read -r frame < "$stream_directory/pending"; then
             tail -n +2 "$stream_directory/pending" > "$stream_directory/pending.next"
@@ -416,7 +432,10 @@ next_frame() {
 }
 
 stream_step() {
-    /usr/bin/python3 - "$stream_directory" "$stream_delay" "$$" 3<&0 <<'PYTHON' &
+    # A later prompt can start while older input remains in the unlinked queue.
+    # Share its current file offset with the helper before it reads live stdin.
+    if [ "$stream_pending_open" = true ]; then exec 4<&5; else exec 4</dev/null; fi
+    /usr/bin/python3 - "$stream_directory" "$stream_delay" "$$" 4<&4 3<&0 <<'PYTHON' &
 import ctypes
 import json
 import os
@@ -442,7 +461,13 @@ state = json.loads(state_file.read_text()) if state_file.exists() else {
     "offset": 0, "next_at": time.monotonic()}
 text = (root / "reply").read_text()
 pending = root / "pending"
-buffer = pending.read_bytes()
+buffer = bytearray()
+while True:
+    older = os.read(4, 65536)
+    if not older:
+        break
+    buffer.extend(older)
+buffer.extend(pending.read_bytes())
 pending.write_bytes(b"")
 selector = selectors.DefaultSelector()
 selector.register(3, selectors.EVENT_READ)
@@ -489,17 +514,37 @@ finally:
 sys.exit(status)
 PYTHON
     stream_pid=$!
+    exec 4<&-
     if wait "$stream_pid"; then stream_status=0; else stream_status=$?; fi
     stream_pid=
     return "$stream_status"
 }
 
-finish_reply() {
+prepare_reply() {
     assistant=$(jq -cn --arg turn "$turn" --rawfile text "$reply" \
         --arg default "I’m checking the submission logs and comparing the failed run with the last successful version." \
         '{type:"assistant",uuid:("fixture-message-"+$turn),message:{id:("fixture-message-"+$turn),role:"assistant",content:[{type:"text",text:(if $text == "" then $default else $text end)}],usage:{input_tokens:4200,output_tokens:180}}}')
     persist_record "$assistant"
+}
+
+emit_reply() {
     printf '%s\n' "$assistant"
+}
+
+finish_reply() {
+    prepare_reply
+    emit_reply
+}
+
+settle_stream_scratch() {
+    # Keep every unread byte, including a partial next frame, alive without a
+    # pathname. A process-group close can interrupt an EXIT-trap rm, so finish
+    # unlinking before any stopped frame, result or interrupt acknowledgement.
+    exec 5< "$stream_directory/pending"
+    stream_pending_open=true
+    rm -rf -- "$stream_directory" || return 1
+    [ ! -e "$stream_directory" ] || return 1
+    stream_directory=
 }
 
 advance_stream() {
@@ -509,16 +554,22 @@ advance_stream() {
         0|10) ;;
         *) exit "$stream_status" ;;
     esac
-    stream_active=false
-    jq -cn '{type:"stream_event",event:{type:"content_block_stop",index:0}}'
+    assistant=
     if [ "$stream_status" -eq 10 ]; then
         reply=$stream_directory/prefix
-        if [ -s "$reply" ]; then finish_reply; fi
+        if [ -s "$reply" ]; then prepare_reply; fi
+    else
+        reply=$stream_directory/reply
+        prepare_reply
+    fi
+    settle_stream_scratch || exit 1
+    stream_active=false
+    jq -cn '{type:"stream_event",event:{type:"content_block_stop",index:0}}'
+    if [ -n "$assistant" ]; then emit_reply; fi
+    if [ "$stream_status" -eq 10 ]; then
         # The pending interrupt is still handled by the unchanged dispatcher.
         return
     fi
-    reply=$stream_directory/reply
-    finish_reply
     if [ "$turn" -eq 1 ]; then
         busy=true
     else
