@@ -248,14 +248,18 @@ under fixture HOME or waiting for checkout trust. `make install` builds the
 harness's small C input helpers; Rust application builds still use cargo-gate.
 
 The fw16 runtime used for #2451 is source tree
-`c02916033be2fd816bc3ab6e70f328aad57f322a`, retained at
-`~/.local/state/cagents-harness-2451/c02916033be2fd816bc3ab6e70f328aad57f322a/source`.
+`bc999dc2ac5a200eb812442a00df6bbb7a189c25`, retained at
+`~/.local/state/cagents-harness-2451/bc999dc2ac5a200eb812442a00df6bbb7a189c25/source`.
 It combines the existing local API snapshot `5ab6ba0a0b5b2f3c83c8d45d7f7493727d181d46`
 (based on harness commit `41f75699cdef1aed76aeee876a6738ee8496b2c6` plus its working
 changes) with the compositor renderer helpers from published commit
 `1aec557ca9ef3aab0fde76647166b1984176710d`. Renderer validation runs before Xvfb
 starts, including a regression that rejects an invalid node without allocating
-a session. This is local installation provenance, not a published dependency;
+a session. Its observer groups OCR words into rows from their original vertical
+geometry before ordering them left to right. Arbitrary pixel bands had reversed
+words across a one-pixel boundary; retained regressions cover that captured
+case, translations, mixed glyph heights and neighboring rows without letting a
+tall box or merged height join them. This is local installation provenance, not a published dependency;
 none of that checkout's unpublished work is part of this PR. A future compatible
 published runtime can replace the prefix through `current` without cagents edits.
 

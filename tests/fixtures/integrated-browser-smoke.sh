@@ -4,6 +4,19 @@
 # the menu and page interactions use visible text. No provider is started.
 set -euo pipefail
 
+# Keep the actual screen and observer result when a step fails; the HTTP
+# server log alone cannot distinguish fetching a page from painting it.
+smoke_finished() {
+    status=$?
+    trap - EXIT
+    if [ "$status" != 0 ]; then
+        evidence drive observe --json || true
+        evidence shot browser-smoke-error || true
+    fi
+    exit "$status"
+}
+trap smoke_finished EXIT
+
 evidence env sh -c '[ "$(tail -n 1 "$CARGO_TARGET_DIR/evidence-source")" = integrated ]'
 
 document=$(cat <<'HTML'
