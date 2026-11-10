@@ -313,8 +313,9 @@ class Rehearsal:
                 current = self.root/'home/.local/share/cagents-install/current'
                 if current.resolve().name != args.old_version:
                     self.errors.append('failed update did not restore the old current version')
-                serving_code, serving = self.cli('daemon','status',check=False)
-                if serving_code or serving.get('data',{}).get('running') is not True:
+                serving_code, serving = self.cli('--no-start','daemon','status',check=False)
+                if (serving_code or serving.get('data',{}).get('running') is not True
+                        or serving.get('data',{}).get('daemon_version') != args.old_version):
                     self.errors.append('old daemon is not serving after failed update')
             elif code:
                 self.errors.append(f'update exited {code}')
