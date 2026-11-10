@@ -266,16 +266,25 @@ desktop_start() {
     mkdir -p -- "$desktop"/{home,config,data,cache,state}
     setsid "$self" --root "$root" __desktop "$limit" </dev/null >"$logs/desktop.log" 2>&1 &
     printf '%s\n' "$!" >"$desktop/pid"
-    local waited
-    for waited in $(seq 1 1800); do
+    # Waiting in the native lock's queue is not a failure: other agents'
+    # evidence runs may hold it for a long time. Only startup is bounded.
+    local waited=0 started=
+    while :; do
         [ -e "$desktop/ready" ] && { printf 'desktop ready\n'; return 0; }
         [ -e "$desktop/failed" ] && die "$(cat "$desktop/failed")"
         desktop_live || die "the desktop ended before it was ready; see $logs/desktop.log"
+        if [ -e "$desktop/locked" ]; then
+            started=$((${started:-0} + 1))
+            [ "$started" -le 300 ] || break
+        elif [ $((waited % 300)) -eq 0 ]; then
+            printf 'waiting for the native lock (%s min so far)\n' "$((waited / 60))"
+        fi
+        waited=$((waited + 1))
         sleep 1
     done
     touch -- "$desktop/stop"
     kill -TERM -- "-$(cat "$desktop/pid")" 2>/dev/null || :
-    die 'the desktop was not ready after 30 minutes'
+    die 'the desktop was not ready 5 minutes after it took the native lock'
 }
 
 desktop_stop() {
@@ -301,6 +310,7 @@ run_desktop() {
     done
     [ ! -e "$desktop/stop" ] || return 0
     printf 'holding the native lock\n'
+    : >"$desktop/locked"
     local runtime_desktop=$desktop/rt
     mkdir -m 700 -p -- "$runtime_desktop"
     # Expose only the desktop helpers, even when installed beside provider CLIs.
