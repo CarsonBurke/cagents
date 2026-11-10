@@ -1925,12 +1925,54 @@ fn bounded_allocation() {
             self.assertIn(expected, result.stdout)
 
     def test_the_admission_budget_does_not_time_the_build(self):
-        (self.crate / "build.rs").write_text(
-            "fn main() { std::thread::sleep(std::time::Duration::from_secs(3)); }\n")
-        env = self.remote_env() | {"CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS": "1"}
-        result = self.gate_run("check", env=env)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn("timed out", result.stderr)
+        started, release, deadline_file = (self.root / name for name in
+                                           ("build-started", "release-build", "admission-deadline"))
+        self.addCleanup(release.touch)
+        (self.crate / "build.rs").write_text(textwrap.dedent(f"""
+            fn main() {{
+                std::fs::write({json.dumps(str(started) + '.tmp')}, "ready").unwrap();
+                std::fs::rename({json.dumps(str(started) + '.tmp')}, {json.dumps(str(started))}).unwrap();
+                while !std::path::Path::new({json.dumps(str(release))}).exists() {{
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }}
+            }}
+        """))
+        # Capture the gate's actual deadline during metadata, before admission.
+        # The generous startup budget is not the assertion: the barrier proves
+        # that an admitted build stays alive across that exact deadline.
+        wrapper = self.root / "record-cargo"
+        cargo = str(Path(self.env["CARGO_HOME"], "bin/cargo"))
+        wrapper.write_text(
+            "#!/usr/bin/python3\nimport os,pathlib,sys\n"
+            "deadline = os.environ.get('CAGENTS_BUILD_ADMISSION_DEADLINE')\n"
+            f"path = pathlib.Path({str(deadline_file)!r})\n"
+            "if deadline:\n"
+            "    temporary = path.with_suffix('.tmp')\n"
+            "    temporary.write_text(deadline)\n"
+            "    temporary.replace(path)\n"
+            f"os.execv({cargo!r}, [{cargo!r}, *sys.argv[1:]])\n"
+        )
+        wrapper.chmod(0o755)
+        env = self.remote_env() | {"CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS": "30",
+                                  "CAGENTS_BUILD_CARGO": str(wrapper)}
+        client = self.scope.popen([str(self.gate), "check"], cwd=self.crate, env=env,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(client.stdout.close)
+        self.addCleanup(client.stderr.close)
+        try:
+            wait_until(lambda: started.exists() or client.poll() is not None, timeout=40)
+            self.assertTrue(started.exists(), client.communicate(timeout=5) if client.poll() is not None else "build never started")
+            deadline = int(deadline_file.read_text())
+            self.assertLess(time.monotonic_ns(), deadline, "build started after its admission budget")
+            while time.monotonic_ns() <= deadline:
+                self.assertIsNone(client.poll(), "admitted build ended before release")
+                time.sleep(0.05)
+            self.assertIsNone(client.poll(), "admission deadline also timed the build")
+        finally:
+            release.touch()
+        stdout, stderr = client.communicate(timeout=120)
+        self.assertEqual(client.returncode, 0, stdout + stderr)
+        self.assertNotIn("timed out", stderr)
 
     def test_cancelling_the_gate_ends_the_remote_command(self):
         marker = self.root / "running"
