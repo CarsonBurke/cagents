@@ -1545,14 +1545,35 @@ fn close_with_target(
                 // The resident's actor died without its retirement. As with
                 // no resident, a person's Close settles once nothing of it
                 // can still run, and then the resident goes too.
-                if ending != Ending::Closed
-                    || paired.is_some()
-                    || !chat::native_holder::retire_abandoned(&identity.record)?
-                {
+                if ending != Ending::Closed {
                     return Err(RETIREMENT_UNPROVED.into());
                 }
-                super::settle_lost_execution(host, &source, &proof)?;
-                return remove_closed_resident(host, &proof, &source, &target, None, ending);
+                if !chat::native_holder::retire_abandoned(&identity.record)? {
+                    // Its helper is gone but something of it runs on; the
+                    // pane names it and offers to end it.
+                    let holds = super::Holds::Running;
+                    return Err(super::lost_execution_refusal(&source, holds));
+                }
+                // The actor's roster cannot see a paired console, which runs
+                // outside it. That console's own worker still answers an
+                // exact close, and its receipt proves the console ended; the
+                // roster proves the rest.
+                let actor = Session {
+                    terminal: None,
+                    ..source.clone()
+                };
+                if let Some(holds) = super::what_holds(host, &actor, &proof)? {
+                    return Err(super::lost_execution_refusal(&source, holds));
+                }
+                if let Some((terminal, worker)) = &paired {
+                    target
+                        .require_current(host)
+                        .map_err(|error| error.message)?;
+                    close_paired_worker(host, terminal, worker, &proof)?;
+                }
+                super::settle_lost_execution(host, &actor, &proof)?;
+                let paired = paired.as_ref();
+                return remove_closed_resident(host, &proof, &source, &target, paired, ending);
             }
         };
     verify_close_ownership(
@@ -1597,20 +1618,7 @@ fn close_with_target(
         .require_current(host)
         .map_err(|error| error.message)?;
     if let Some((terminal, worker)) = &paired {
-        let current = {
-            let state = host.lock().unwrap_or_else(|p| p.into_inner());
-            state.terminals.get(&terminal.id).is_some_and(|current| {
-                current.handle.same_worker(worker)
-                    && super::matches_paired_terminal(&current.session, terminal, state.proof())
-            })
-        };
-        if !current {
-            return Err(
-                "The paired worker changed before retained cleanup; replacement was preserved"
-                    .into(),
-            );
-        }
-        worker.close_with_receipt(terminal, &proof)?;
+        close_paired_worker(host, terminal, worker, &proof)?;
     }
     target
         .require_current(host)
@@ -1626,6 +1634,29 @@ fn close_with_target(
     // Keep the closed record retryable until durable process retirement succeeds.
     ending.end(host, &source)?;
     remove_closed_resident(host, &proof, &source, &target, paired.as_ref(), ending)
+}
+
+/// Closes a retained actor's paired console through its own worker, unless
+/// that worker was replaced.
+fn close_paired_worker(
+    host: &SharedHost,
+    terminal: &crate::model::TerminalSession,
+    worker: &crate::terminal::TerminalHandle,
+    proof: &HostSessionProof,
+) -> Result<(), String> {
+    let current = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        state.terminals.get(&terminal.id).is_some_and(|current| {
+            current.handle.same_worker(worker)
+                && super::matches_paired_terminal(&current.session, terminal, state.proof())
+        })
+    };
+    if !current {
+        return Err(
+            "The paired worker changed before retained cleanup; replacement was preserved".into(),
+        );
+    }
+    worker.close_with_receipt(terminal, proof)
 }
 
 /// Removes a resident whose retained actor is closed or proved gone, unless
