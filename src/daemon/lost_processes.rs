@@ -4,9 +4,12 @@
 //! A helper leads its own session and starts its provider as the leader of a
 //! process group inside it. While anything is left in that session or group,
 //! the conversation can still run, so Close refuses it
-//! ([`crate::chat::runtime::retained_actor_abandoned`] asks [`census`]). The
-//! person can then end exactly what Close counted, here, rather than in a
-//! shell.
+//! ([`crate::chat::runtime::retained_actor_abandoned`] and
+//! [`crate::chat::runtime::codex_execution_abandoned`] look for the same
+//! members as [`census`]). The person can then end them here, rather than in
+//! a shell. One case differs: for a retained Claude actor whose helper or
+//! provider PID another process now holds, Close still counts that process's
+//! session or group, which this census leaves out, so ending cannot clear it.
 //!
 //! Membership is the proof that a process is the conversation's. Linux never
 //! hands out a PID while a process still uses it as a process-group or
