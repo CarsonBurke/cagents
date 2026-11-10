@@ -59,7 +59,16 @@ STUBS = {
         if [ "$1 $2" = "start --help" ]; then
             echo '--root --width --portal --backend --host-bus --renderer'; exit 0
         fi
-        [ "$1" != session ] || { echo 'legacy session command' >&2; exit 2; }
+        # Reject the legacy verb after global options as the current CLI does.
+        probe=("$@")
+        for ((at = 0; at < $#; at++)); do
+            case ${probe[at]} in
+                --session|--root) ((at++)) ;;
+                --no-heal|--json) ;;
+                session) echo 'legacy session command' >&2; exit 2 ;;
+                *) break ;;
+            esac
+        done
         if [ -e "$STUB_LOG/stop-wedges" ] && [ "$1" = stop ]; then exec sleep 300; fi
         cmd=()
         args=("$@")
@@ -952,9 +961,19 @@ class Evidence(unittest.TestCase):
                     failed.unlink()
         self.run_tool("stop")
 
+    def test_relaunch_resolves_the_pinned_runtime_after_a_legacy_path_start(self):
+        pinned = Path(self.env["HOME"]) / ".local/lib/cagents/niri-harness/current/bin/niri-harness"
+        pinned.parent.mkdir(parents=True)
+        shutil.copy2(self.bin / "niri-harness", pinned)
+        (self.bin / "niri-harness").write_text("#!/bin/sh\necho legacy-global-harness >&2\nexit 2\n")
+        self.assert_relaunch_preserves_session()
+
     def test_relaunch_keeps_the_session_and_replays_only_the_built_products(self) -> None:
+        self.assert_relaunch_preserves_session()
+
+    def assert_relaunch_preserves_session(self):
         self.built()
-        self.run_tool("start", "after")
+        self.run_tool("start", "after", "--trace-wayland", "--software-rendering")
         original_pid = int((self.logs / "ui-pid").read_text())
         refused = self.run_tool("relaunch", check=False)
         self.assertNotEqual(refused.returncode, 0)
@@ -983,6 +1002,9 @@ class Evidence(unittest.TestCase):
             self.assertEqual((self.task / "fixture" / "home" / ".claude").stat().st_ino, identity)
             self.assertEqual(len((self.logs / "runner").read_text().splitlines()), 2)
             self.assertIn(f"CAGENTS_CHAT_STAGE_OUTPUT={self.task}/logs/chat-stages/after-", (self.logs / "runner-env").read_text())
+            environment = (self.logs / "runner-env").read_text()
+            for setting in ("WAYLAND_DEBUG=client", "LIBGL_ALWAYS_SOFTWARE=1", "WGPU_BACKEND=gl"):
+                self.assertIn(setting + "\n", environment)
             self.assertEqual(stat.S_IMODE((self.task / "logs" / "chat-stages").stat().st_mode), 0o700)
             self.run_tool("stop")
             process.wait(timeout=20)

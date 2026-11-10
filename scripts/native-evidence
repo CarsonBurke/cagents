@@ -810,7 +810,7 @@ cmd_relaunch() {
     flock -n 7 || die 'a relaunched app is already running'
     nested_session_env
     local session_environment
-    session_environment=$(timeout -k 5 30 niri-harness --session "$session_name" session env)
+    session_environment=$(timeout -k 5 30 niri-harness --session "$session_name" env)
     eval "$session_environment"
     app_window_is_open && observed=0 || observed=$?
     case $observed in
@@ -1039,7 +1039,7 @@ select_task "$task_argument"
 # Each command is a new process. Resolve the same CLI for later captures and
 # interaction too, not only the command that starts the session.
 case $command in
-    start|drive|nested|shot)
+    start|drive|nested|shot|relaunch)
         harness_directory=$("$tool_root/scripts/require-niri-harness") || exit 1
         PATH=$harness_directory:$PATH
         export PATH
