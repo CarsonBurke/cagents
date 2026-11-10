@@ -40,7 +40,7 @@ pub(crate) struct StoppedSnapshot {
     pub limitation: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Presentation {
     pub agent: crate::model::AgentId,
     pub session: Session,

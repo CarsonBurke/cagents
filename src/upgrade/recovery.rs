@@ -41,11 +41,15 @@ const SNAPSHOT_LIMIT: usize = 8 * 1024 * 1024;
 const SEALS: i32 = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
 static INHERITED: OnceLock<io::Result<Mutex<Option<Inherited>>>> = OnceLock::new();
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Census {
     pub terminals: Vec<TerminalSession>,
     pub chats: Vec<Session>,
     pub snapshots: Vec<super::floor::StoppedSnapshot>,
+    #[serde(default)]
+    pub aliases: Vec<Session>,
+    #[serde(default)]
+    pub presentations: Vec<super::floor::Presentation>,
 }
 
 #[derive(Default)]
@@ -139,6 +143,7 @@ impl Census {
                     .into(),
             );
         }
+        self.validate_presentations()?;
         let existing = super::floor::existing_capture_size(source)?;
         let available = SNAPSHOT_LIMIT
             .checked_sub(existing)
@@ -150,7 +155,44 @@ impl Census {
             self.terminal_ids().into_iter().collect(),
         );
         record.snapshots = self.snapshots.clone();
+        record.aliases = self.aliases.clone();
+        record.presentations = self.presentations.clone();
         encoded_size(&record, available)?;
+        Ok(())
+    }
+
+    fn validate_presentations(&self) -> Result<(), String> {
+        if self.aliases.iter().any(|alias| {
+            !self
+                .chats
+                .iter()
+                .any(|source| super::floor::same_allocation(source, alias))
+        }) {
+            return Err("Recovery pane alias changed its captured allocation".into());
+        }
+        let mut owners = BTreeSet::new();
+        for presentation in &self.presentations {
+            if !self.chats.contains(&presentation.session)
+                || presentation.restored
+                || presentation.pane.id.as_uuid() != presentation.agent.as_uuid()
+                || !owners.insert(presentation.agent)
+            {
+                return Err("Recovery presentation changed its captured owner".into());
+            }
+            presentation.pane.validate()?;
+            let matches = match &presentation.pane.kind {
+                crate::model::CardKind::Chat(saved) => {
+                    super::floor::same_allocation(&presentation.session, saved)
+                }
+                crate::model::CardKind::Terminal(saved) => {
+                    presentation.session.terminal.as_ref() == Some(saved)
+                }
+                _ => false,
+            };
+            if !matches {
+                return Err("Recovery presentation changed its captured pane source".into());
+            }
+        }
         Ok(())
     }
 }
@@ -1379,6 +1421,7 @@ mod tests {
                     terminals: vec![terminal],
                     chats: Vec::new(),
                     snapshots: Vec::new(),
+                    ..Default::default()
                 },
                 checkpoint_path: root.join("daemon-upgrade.json"),
                 checkpoint_hash: String::new(),
@@ -1589,6 +1632,76 @@ mod tests {
             validate_ready_scope(&duplicate_review, &serde_json::to_vec(&original).unwrap())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn captured_pane_aliases_and_presentations_bind_the_exact_confirmed_allocation() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let preparation = preparation(root.path());
+        let known = Session {
+            id: TerminalId::new(),
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Codex,
+                recipe: preparation.authority.census.terminals[0].launch.clone(),
+                session_id: Some("confirmed-thread".into()),
+            },
+            proof: Some(preparation.authority.source.clone()),
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: Default::default(),
+        };
+        let mut alias = known.clone();
+        alias.launch.session_id = None;
+        let agent = crate::model::AgentId::new();
+        let presentation = super::super::floor::Presentation {
+            agent,
+            session: known.clone(),
+            scope: crate::workspace_model::views::Scope::Channel(crate::model::ChannelId::new()),
+            pane: crate::workspace_model::views::Pane {
+                id: crate::model::CardId::from_uuid(agent.as_uuid()),
+                title: "Exact paused pane".into(),
+                user_title: None,
+                pending_terminal_start: false,
+                width_fraction: 0.5,
+                kind: crate::model::CardKind::Chat(alias.clone()),
+                scope: None,
+            },
+            ordinal: 0,
+            restored: false,
+        };
+        let census = Census {
+            chats: vec![known],
+            aliases: vec![alias],
+            presentations: vec![presentation],
+            ..Default::default()
+        };
+        census.validate_presentations().unwrap();
+        for changed in ["proof", "thread", "recipe", "allocation", "owner", "pane"] {
+            let mut invalid = census.clone();
+            match changed {
+                "proof" => {
+                    invalid.aliases[0].proof.as_mut().unwrap().host_incarnation =
+                        HostIncarnation::new("foreign")
+                }
+                "thread" => invalid.aliases[0].launch.session_id = Some("unrelated-thread".into()),
+                "recipe" => invalid.aliases[0]
+                    .launch
+                    .recipe
+                    .arguments
+                    .push("changed".into()),
+                "allocation" => invalid.aliases[0].id = TerminalId::new(),
+                "owner" => invalid.presentations[0].agent = crate::model::AgentId::new(),
+                "pane" => {
+                    invalid.presentations[0].pane.kind = crate::model::CardKind::Chat({
+                        let mut unrelated = invalid.aliases[0].clone();
+                        unrelated.id = TerminalId::new();
+                        unrelated
+                    })
+                }
+                _ => unreachable!(),
+            }
+            assert!(invalid.validate_presentations().is_err(), "{changed}");
+        }
     }
 
     #[test]

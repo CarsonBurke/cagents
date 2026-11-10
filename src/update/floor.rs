@@ -393,14 +393,26 @@ impl<O: FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>> FloorSour
                     let snapshot = client.capture_chat_snapshot(chat.clone())?;
                     snapshots.push(chat.clone(), snapshot).map_err(invalid)?;
                 }
+                let terminals: Vec<_> = client
+                    .list()?
+                    .into_iter()
+                    .map(|item| item.session)
+                    .collect();
+                let mut presentation = crate::upgrade::floor::Record::new(
+                    self.proof.clone(),
+                    chats.clone(),
+                    terminals.iter().map(|terminal| terminal.id).collect(),
+                );
+                presentation.protocol = client.protocol();
+                // Saved panes can predate ChatList's confirmed conversation ID.
+                // Capture their exact aliases before preparation changes ownership.
+                let presentation = capture_floor(self.guard, presentation)?;
                 Ok(crate::upgrade::recovery::Census {
-                    terminals: client
-                        .list()?
-                        .into_iter()
-                        .map(|item| item.session)
-                        .collect(),
+                    terminals,
                     chats,
                     snapshots: snapshots.finish(),
+                    aliases: presentation.aliases,
+                    presentations: presentation.presentations,
                 })
             },
         )?;
