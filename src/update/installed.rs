@@ -71,12 +71,11 @@ pub(super) fn perform(
     state: &Path,
     job: &mut UpdateJob,
     root: &Path,
-    accept_unreopenable: bool,
 ) -> Result<(), UpdateError> {
     let layout = locate(&std::env::current_exe()?)?;
     let (source_protocol, _) = source::inspect_identity(None)?;
     // Retain the exact installation boundary even for an older source.
-    installed_daemon_owner(&layout)?;
+    let source_owner = installed_daemon_owner(&layout)?;
     if served_version_root(&layout)? != root {
         return Err(invalid(
             "the installed candidate changed; inspect the installation again",
@@ -117,8 +116,16 @@ pub(super) fn perform(
     if staged.identity.protocol == source_protocol {
         staged.verify_compatible_handshake(&cancellation)?;
     }
-    reconcile_saved_sources(staged.identity.protocol, accept_unreopenable)?;
-    let confirmed = confirmation::wait(state, job, observe)?;
+    // A different installed daemon is replaced even at the same protocol.
+    // Inspect with the same intent used by the reviewed impact and preflight.
+    let replaces_compatible_daemon = source_owner
+        .as_ref()
+        .is_some_and(|owner| owner.version_root != root);
+    let inspection = reconcile_saved_sources(staged.identity.protocol, replaces_compatible_daemon)?;
+    let context = ReviewContext::capture(installation)?;
+    let confirmed = confirmation::wait(state, job, |policy| {
+        Ok(context.apply(observe(policy)?.with_inspection(&inspection)))
+    })?;
     set_phase(
         state,
         job,
@@ -128,11 +135,11 @@ pub(super) fn perform(
     let mut guard = crate::instance::UiUpdateGuard::acquire()?;
     crate::install_guard::preflight_editor_companions(Some(staged.identity.protocol))?;
     let windows = guard.prepare_and_close_windows_with_preflight(Duration::from_secs(45), |guard| {
-        crate::install_guard::preflight_source_panes(guard,
-            confirmed.daemon.as_ref().map(|daemon| daemon.capability.proof.clone()), confirmed.replaces_daemon, accept_unreopenable)?;
+        let inspected = crate::install_guard::preflight_source_panes(guard,
+            confirmed.daemon.as_ref().map(|daemon| daemon.capability.proof.clone()), confirmed.replaces_daemon)?;
         let latest = observe(confirmed.daemon.as_ref().map_or(impact::Policy::WhenIdle, |daemon| daemon.policy))
-            .map_err(io::Error::other)?;
-        if !confirmed.preserves_consent(&latest) || digest(root).map_err(io::Error::other)? != staged.identity.digest {
+            .map_err(io::Error::other)?.with_inspection(&inspected);
+        if !confirmed.preserves_consent(&context.apply(latest)) || digest(root).map_err(io::Error::other)? != staged.identity.digest {
             return Err(io::Error::other("The installed build or session ownership changed during pane inspection; existing windows were kept open"));
         }
         Ok(())
@@ -145,7 +152,9 @@ pub(super) fn perform(
                 .daemon
                 .as_ref()
                 .map_or(impact::Policy::WhenIdle, |daemon| daemon.policy),
-        )?;
+        )?
+        .with_inspection(&confirmed.inspection());
+        let current = context.apply(current);
         if !confirmed.preserves_consent(&current) || digest(root)? != staged.identity.digest {
             return Err(invalid(
                 "the installed build or session ownership changed; review the update again",
@@ -282,6 +291,11 @@ fn observe_installed_source(
         ));
     }
     Ok(impact::Preview {
+        from_version: String::new(),
+        windows: 0,
+        stopped: Vec::new(),
+        stopped_windows: Vec::new(),
+        labels: Default::default(),
         candidate: staged.identity.clone(),
         replaces_daemon: true,
         daemon: Some(daemon),

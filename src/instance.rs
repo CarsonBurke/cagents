@@ -1172,6 +1172,14 @@ pub struct UiUpdateGuard {
 }
 
 impl UiUpdateGuard {
+    /// The authenticated windows while this guard is held. Its shared legacy
+    /// fence already excludes a legacy exclusive UI owner, so absence of
+    /// window leases means no windows; probing legacy exclusivity again would
+    /// conflict with the guard's own fence.
+    pub(crate) fn verified_windows(&self) -> io::Result<Vec<VerifiedWindow>> {
+        verified_window_lease_owners_in(&self.runtime, Path::new("/proc"))
+    }
+
     pub fn set_fallback_executable(&mut self, executable: PathBuf) {
         self.fallback_executable = Some(executable);
     }
@@ -2677,6 +2685,35 @@ mod tests {
         fs::remove_file(editor.join("exe")).unwrap();
         symlink("/fixture/ceditor (deleted)", editor.join("exe")).unwrap();
         assert!(verified_editors_in(runtime.path(), processes.path()).is_err());
+    }
+
+    #[test]
+    fn update_guard_sees_no_windows_without_mistaking_its_own_fence_for_a_legacy_ui() {
+        let runtime = tempfile::tempdir().unwrap();
+        let lock = owned_lock(
+            &runtime
+                .path()
+                .join(format!("{APPLICATION_LOCK_FILE}.update")),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+        .unwrap();
+        let legacy = owned_lock(
+            &runtime.path().join(APPLICATION_LOCK_FILE),
+            libc::LOCK_SH | libc::LOCK_NB,
+        )
+        .unwrap();
+        let guard = UiUpdateGuard {
+            lock: Some(lock),
+            runtime: runtime.path().into(),
+            _legacy_fence: legacy,
+            prepared: Vec::new(),
+            closed: Vec::new(),
+            fallback_executable: None,
+        };
+        // A daemon-only update has no windows; the generic probe cannot tell
+        // the guard's own shared fence from a legacy UI.
+        assert!(verified_windows_in(runtime.path(), Path::new("/proc")).is_err());
+        assert!(guard.verified_windows().unwrap().is_empty());
     }
 
     #[test]
