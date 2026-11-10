@@ -1671,7 +1671,7 @@ mod tests {
     #[test]
     fn shared_cards_preserve_nan_value_inequality() {
         let mut card = titled("non-reflexive width");
-        card.width_fraction = f64::NAN;
+        card.width_fraction = f32::NAN;
         let shared = Shared::new(card.clone());
         let alias = shared.clone();
         assert!(Shared::ptr_eq(&shared, &alias));
