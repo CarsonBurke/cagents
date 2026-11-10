@@ -659,15 +659,15 @@ fn an_open_pane_whose_holder_died_names_what_runs_then_closes() {
     );
     // The pane names the provider, and the person ends it from there and
     // closes the pane again.
-    let found = lost_processes(&fixture.host, &fixture.source, false).unwrap();
+    let found = lost_processes(&fixture.host, &fixture.source, &[]).unwrap();
     assert!(
         found
             .iter()
-            .any(|process| process.pid == record.root.pid && process.proved),
+            .any(|process| process.process.pid == record.root.pid && process.proved),
         "{found:?}"
     );
     assert_eq!(
-        lost_processes(&fixture.host, &fixture.source, true).unwrap(),
+        lost_processes(&fixture.host, &fixture.source, &shown(&found)).unwrap(),
         []
     );
     assert!(record.root.reaped(), "ending left the provider running");
@@ -724,16 +724,16 @@ fn a_codex_tool_left_after_its_provider_and_helper_died_is_ended_then_closes() {
         refusal.contains("Codex is still running for this conversation"),
         "{refusal}"
     );
-    let found = lost_processes(&fixture.host, &fixture.source, false).unwrap();
+    let found = lost_processes(&fixture.host, &fixture.source, &[]).unwrap();
     assert_eq!(
         found
             .iter()
-            .map(|process| (process.pid, process.name.as_str(), process.proved))
+            .map(|process| (process.process.pid, process.name.as_str(), process.proved))
             .collect::<Vec<_>>(),
         [(tool_pid, "sleep", true)]
     );
     assert_eq!(
-        lost_processes(&fixture.host, &fixture.source, true).unwrap(),
+        lost_processes(&fixture.host, &fixture.source, &shown(&found)).unwrap(),
         []
     );
     assert!(tool.reaped(), "ending left the tool running");

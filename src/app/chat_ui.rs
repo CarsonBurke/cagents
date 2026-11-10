@@ -8437,6 +8437,7 @@ impl Cagents {
     /// behind its source terminal closes before that terminal's own close, so
     /// the terminal's close never races the actor that owns it.
     pub(super) fn begin_chat_close(&mut self, card: CardId) -> Task<Message> {
+        self.clear_close_refusal(card);
         if self.chat_awaiting_admission(card) {
             let Some(remove) = self.remove_chat_card(card, None) else {
                 return Task::none();
@@ -22335,7 +22336,7 @@ mod tests {
     /// closes again, and its notice leaves with the pane.
     #[test]
     fn a_refused_close_stays_on_its_pane_and_ends_what_holds_it() {
-        use crate::terminal::ipc::LostProcess;
+        use crate::terminal::ipc::{LostProcess, ProcessStart};
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, Some(KNOWN_THREAD));
         let source = app.chat_return_session(card).unwrap();
@@ -22355,13 +22356,19 @@ mod tests {
         assert!(app.notices.has(NoticeKey::ChatClose(card)));
 
         let codex = LostProcess {
-            pid: 4045845,
+            process: ProcessStart {
+                pid: 4045845,
+                start: 9000,
+            },
             name: "codex".into(),
             command: "codex app-server --listen unix:///tmp/cagents-codex-x/control.sock".into(),
             proved: true,
         };
         let stranger = LostProcess {
-            pid: 4100000,
+            process: ProcessStart {
+                pid: 4100000,
+                start: 9100,
+            },
             name: "sleep".into(),
             command: "sleep 100".into(),
             proved: false,
@@ -22383,12 +22390,14 @@ mod tests {
                 .unwrap()
                 .ending()
         );
-        // Once they are ended, it closes again.
+        // Once they are ended, it closes again, and that Close says anew
+        // whatever it finds.
         let _ = app.update(Message::ChatUi(Action::CloseHoldersEnded(
             target,
             source.clone(),
             Ok(Vec::new()),
         )));
+        assert!(chat_runtime(&app, card).close_refusal.is_none());
         let close = app.chat_ui.phases[&card].target();
         let _ = app.update(Message::ChatUi(Action::RetainedCloseFinished(
             close,

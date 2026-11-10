@@ -365,11 +365,13 @@ fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle:
                 | ClientRequest::ShutdownTerminal { .. }
                 | ClientRequest::ChatClose { .. }
                 | ClientRequest::ChatCloseRetained { .. }
-                | ClientRequest::ChatLostProcesses { end: true, .. }
                 | ClientRequest::Agent {
                     operation: crate::agent_execution::Operation::Close(_),
                     ..
                 }
+        ) || matches!(
+            &request,
+            ClientRequest::ChatLostProcesses { end, .. } if !end.is_empty()
         ) {
             match CheckedCloseReply::new(&host, client_id) {
                 Ok(reply) => Some(reply),
@@ -1551,7 +1553,7 @@ pub(super) fn process_request(
         }
         ClientRequest::ChatLostProcesses { session, end } => {
             let processes =
-                super::chat::lost_processes(host, &session, end).map_err(|message| {
+                super::chat::lost_processes(host, &session, &end).map_err(|message| {
                     ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true)
                 })?;
             Ok((

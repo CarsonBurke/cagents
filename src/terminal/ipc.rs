@@ -598,11 +598,13 @@ pub enum ClientRequest {
         conversation: TerminalId,
     },
     /// Lists what still runs for a conversation whose Cagents helper died,
-    /// which is what holds its Close, and with `end`, ends what is proved to
-    /// be the conversation's first. Ends nothing while its helper runs.
+    /// which is what holds its Close. It first ends each process in `end`
+    /// that is still the one listed and proved to be the conversation's: the
+    /// ones the person was shown and chose to end. Ends nothing while its
+    /// helper runs.
     ChatLostProcesses {
         session: crate::chat::Session,
-        end: bool,
+        end: Vec<ProcessStart>,
     },
 }
 
@@ -1006,10 +1008,19 @@ pub struct ChatReleaseProof {
     pub generation: u64,
 }
 
+/// One process, as it was when it was listed: a PID, and the start time
+/// that tells it apart from a later process given the same PID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ProcessStart {
+    pub pid: i32,
+    /// Clock ticks after boot, as `/proc/<pid>/stat` gives it.
+    pub start: u64,
+}
+
 /// A process that still runs for a conversation whose Cagents helper died.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LostProcess {
-    pub pid: i32,
+    pub process: ProcessStart,
     /// The executable's short name, as `ps` shows it.
     pub name: String,
     /// Its command line, shortened; empty when it shows none.

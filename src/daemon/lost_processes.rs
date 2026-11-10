@@ -12,23 +12,24 @@
 //! hands out a PID while a process still uses it as a process-group or
 //! session ID, so while the helper's session or the provider's group has a
 //! member, its ID is still theirs. Only once one empties can its ID be reused,
-//! by a process that is then alive under that PID with another start time.
-//! A member is therefore proved only when its ID's original process is still
-//! that process or no process has that PID at all, and it started no earlier
-//! than that original did. Anything else in the session or group is named and
-//! still holds the conversation, but is never signalled.
+//! by a process that is then alive under that PID with another start time;
+//! whatever is in a session or group of that ID is then that process's, and
+//! not counted at all. A member is proved only when its ID's original process
+//! is still that process or no process has that PID, it started no earlier
+//! than that original did, and it runs as this user. Anything else in the
+//! session or group is named and still holds the conversation, but is never
+//! signalled.
 //!
-//! Ending pins every proved process with a pidfd and reads it again before
-//! signalling it: a PID that changed hands between the scan and the signal
-//! fails that reading, and a pidfd can never signal another process.
+//! Ending signals only the processes the person was shown and chose to end,
+//! each as it was when shown: its PID and its start time. It pins each with
+//! a pidfd and reads it again before signalling it, so a PID that changed
+//! hands since fails that reading, and a pidfd can never signal another
+//! process. A process found since is shown before anything ends it.
 use crate::daemon::holder_registry::Process;
 use std::{
     fs::File,
     io,
-    os::{
-        fd::{AsRawFd, FromRawFd},
-        unix::fs::MetadataExt,
-    },
+    os::fd::{AsRawFd, FromRawFd},
     path::Path,
     time::{Duration, Instant},
 };
@@ -123,14 +124,15 @@ pub(crate) fn census_in(
     let group_kept = id_kept(proc, provider)?;
     let uid = crate::daemon::current_uid();
     scan(proc, |process, pid, stat| {
-        let in_session = stat.session == helper.pid;
-        let in_group = stat.group == provider.pid;
+        // A reused ID's session or group is its new owner's.
+        let in_session = session_kept && stat.session == helper.pid;
+        let in_group = group_kept && stat.group == provider.pid;
         if !in_session && !in_group {
             return Ok(None);
         }
-        let proved = owned_by(process, uid)
-            && ((in_session && session_kept && stat.start >= helper.start)
-                || (in_group && group_kept && stat.start >= provider.start));
+        let proved = owned_by(process, uid)?
+            && ((in_session && stat.start >= helper.start)
+                || (in_group && stat.start >= provider.start));
         Ok(Some(survivor(process, pid, stat, proved)))
     })
 }
@@ -148,7 +150,7 @@ pub(crate) fn listener_census(named: &[Process]) -> Result<Vec<Survivor>, String
         let Some(provider) = provider else {
             return Ok(None);
         };
-        let proved = owned_by(process, uid)
+        let proved = owned_by(process, uid)?
             && stat.start >= provider.start
             && (pid != provider.pid || stat.start == provider.start)
             && id_kept(proc, provider)?;
@@ -156,8 +158,32 @@ pub(crate) fn listener_census(named: &[Process]) -> Result<Vec<Survivor>, String
     })
 }
 
-fn owned_by(process: &Path, uid: u32) -> bool {
-    std::fs::metadata(process).is_ok_and(|metadata| metadata.uid() == uid)
+/// Whether `process` runs as `uid`, by its real user ID, which is what
+/// permits signalling it. Its `/proc` directory's owner is no proof: a
+/// process that made itself undumpable, as ssh does, shows root there.
+fn owned_by(process: &Path, uid: u32) -> Result<bool, String> {
+    let status = match std::fs::read_to_string(process.join("status")) {
+        Ok(status) => status,
+        // Gone since it was listed: nothing to prove or end.
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            return Ok(false);
+        }
+        Err(error) => {
+            return Err(format!(
+                "Cannot read process {}: {error}",
+                process.display()
+            ));
+        }
+    };
+    Ok(status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))
+        .and_then(|ids| ids.split_ascii_whitespace().next())
+        .and_then(|real| real.parse::<u32>().ok())
+        == Some(uid))
 }
 
 fn scan(
@@ -222,25 +248,28 @@ const TERMINATION_GRACE: Duration = Duration::from_secs(2);
 /// How long ending waits, in all, for what it ended to be collected.
 const ENDING_LIMIT: Duration = Duration::from_secs(10);
 
-/// Ends every proved survivor `scan` finds, then returns what is left.
+/// Ends each survivor `scan` finds that is proved and `chosen`, by its PID
+/// and start time, then returns everything still left.
 ///
 /// Each is asked to stop with SIGTERM, then killed if it is still running
-/// after a short grace. The scan is repeated, so a process started meanwhile
-/// is ended too, until nothing proved is left or the limit passes. Unproved
-/// survivors are never signalled; they stay in what is returned.
+/// after a short grace. The scan is repeated until none of them is left or
+/// the limit passes. Unproved survivors, and any not chosen, are never
+/// signalled; they stay in what is returned, for the person to see.
 pub(crate) fn end(
     mut scan: impl FnMut() -> Result<Vec<Survivor>, String>,
+    chosen: &[(i32, u64)],
 ) -> Result<Vec<Survivor>, String> {
     let deadline = Instant::now() + ENDING_LIMIT;
+    let ends =
+        |survivor: &&Survivor| survivor.proved && chosen.contains(&(survivor.pid, survivor.start));
     loop {
         let found = scan()?;
         let running: Vec<&Survivor> = found
             .iter()
-            .filter(|survivor| survivor.proved && !survivor.zombie)
+            .filter(ends)
+            .filter(|survivor| !survivor.zombie)
             .collect();
-        let collecting = found
-            .iter()
-            .any(|survivor| survivor.proved && survivor.zombie);
+        let collecting = found.iter().filter(ends).any(|survivor| survivor.zombie);
         if (running.is_empty() && !collecting) || Instant::now() >= deadline {
             return Ok(found);
         }
@@ -373,6 +402,17 @@ mod tests {
     use super::*;
 
     fn stat(root: &Path, pid: i32, group: i32, session: i32, start: u64) {
+        stat_as(
+            root,
+            pid,
+            group,
+            session,
+            start,
+            crate::daemon::current_uid(),
+        );
+    }
+
+    fn stat_as(root: &Path, pid: i32, group: i32, session: i32, start: u64, uid: u32) {
         let directory = root.join(pid.to_string());
         std::fs::create_dir_all(&directory).unwrap();
         // Fields after the name: state ppid pgrp session, then 15 more before
@@ -385,6 +425,11 @@ mod tests {
         .unwrap();
         std::fs::write(directory.join("comm"), "odd ) name\n").unwrap();
         std::fs::write(directory.join("cmdline"), b"tool\0--flag\0").unwrap();
+        std::fs::write(
+            directory.join("status"),
+            format!("Name:\todd\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n"),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -417,23 +462,42 @@ mod tests {
         let found = census_in(root.path(), &helper, &provider).unwrap();
         assert!(!found.iter().find(|s| s.pid == 202).unwrap().proved);
 
-        // Another process now has the helper's PID: the session is no longer
-        // provably the helper's, but its members still hold the conversation.
+        // Another user's process is never this user's to end.
+        stat_as(
+            root.path(),
+            203,
+            101,
+            100,
+            75,
+            crate::daemon::current_uid() + 1,
+        );
+        let found = census_in(root.path(), &helper, &provider).unwrap();
+        assert!(!found.iter().find(|s| s.pid == 203).unwrap().proved);
+
+        // Another process now has the helper's PID, so the helper's session
+        // emptied before it was reused: what is in a session of that ID now
+        // is the new owner's, and neither holds nor is ended.
         stat(root.path(), 100, 100, 100, 90);
         let found = census_in(root.path(), &helper, &provider).unwrap();
-        assert!(!found.iter().find(|s| s.pid == 201).unwrap().proved);
-        assert!(!found.iter().find(|s| s.pid == 100).unwrap().proved);
-        // The provider's group is still provably its own.
-        assert!(found.iter().find(|s| s.pid == 200).unwrap().proved);
+        assert_eq!(
+            found.iter().map(|s| (s.pid, s.proved)).collect::<Vec<_>>(),
+            [(200, true), (202, false), (203, false)]
+        );
+
+        // The same for the provider's group.
+        stat(root.path(), 101, 101, 101, 95);
+        assert_eq!(census_in(root.path(), &helper, &provider).unwrap(), []);
     }
 
     #[test]
-    fn ending_signals_only_proved_survivors_and_reports_what_is_left() {
+    fn ending_signals_only_chosen_proved_survivors_and_reports_what_is_left() {
         use std::process::Command;
         let mut proved = Command::new("/bin/sleep").arg("1000").spawn().unwrap();
         let mut spared = Command::new("/bin/sleep").arg("1000").spawn().unwrap();
+        let mut unseen = Command::new("/bin/sleep").arg("1000").spawn().unwrap();
         let identity = |child: &std::process::Child| Process::read(child.id() as i32).unwrap();
-        let (proved_identity, spared_identity) = (identity(&proved), identity(&spared));
+        let (proved_identity, spared_identity, unseen_identity) =
+            (identity(&proved), identity(&spared), identity(&unseen));
         let survivor = |process: &Process, proved: bool| {
             let stat = read_stat(&Path::new("/proc").join(process.pid.to_string()))
                 .unwrap()
@@ -449,31 +513,45 @@ mod tests {
                 proved,
             }
         };
-        let left = end(|| {
+        let scan = || -> Result<Vec<Survivor>, String> {
             Ok([
                 Process::read(proved_identity.pid)
                     .ok()
                     .filter(|process| *process == proved_identity)
                     .map(|process| survivor(&process, true)),
                 Some(survivor(&spared_identity, false)),
+                // Proved, but found after the person chose what to end.
+                Some(survivor(&unseen_identity, true)),
             ]
             .into_iter()
             .flatten()
             .filter(|survivor| !survivor.zombie)
             .collect())
-        })
-        .unwrap();
-        assert_eq!(
-            left.iter().map(|s| s.pid).collect::<Vec<_>>(),
-            [spared_identity.pid]
-        );
+        };
+        let chosen = [&proved_identity, &spared_identity]
+            .map(|process| (process.pid, survivor(process, true).start));
+        let mut left = end(scan, &chosen)
+            .unwrap()
+            .iter()
+            .map(|s| s.pid)
+            .collect::<Vec<_>>();
+        left.sort();
+        let mut expected = vec![spared_identity.pid, unseen_identity.pid];
+        expected.sort();
+        assert_eq!(left, expected);
         assert!(proved.wait().unwrap().code().is_none());
         assert!(
             spared.try_wait().unwrap().is_none(),
             "an unproved survivor was signalled"
         );
-        spared.kill().unwrap();
-        spared.wait().unwrap();
+        assert!(
+            unseen.try_wait().unwrap().is_none(),
+            "a survivor nobody chose was signalled"
+        );
+        for mut child in [spared, unseen] {
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
     }
 
     #[test]

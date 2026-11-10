@@ -735,7 +735,7 @@ fn codex_listener_survives(
     settle: Duration,
 ) -> Result<bool, String> {
     use std::os::unix::ffi::OsStrExt;
-    if !processes_naming_listener(processes, pane, settle, true)?.is_empty() {
+    if !processes_naming_listener(processes, pane, settle, Naming::Any)?.is_empty() {
         return Ok(true);
     }
     let bound = std::fs::read(processes.join("net/unix"))
@@ -751,22 +751,63 @@ fn codex_listener_survives(
     }))
 }
 
-/// This user's processes that name a Codex pane's listener directory in their
-/// arguments: the conversation's provider, which a person closing it can end
-/// once its helper has gone (see [`crate::daemon::lost_processes`]).
+/// This user's processes started to serve a Codex pane's listener, by the
+/// `--listen unix://<socket>` its provider is given: the conversation's
+/// provider, which a person closing it can end once its helper has gone (see
+/// [`crate::daemon::lost_processes`]). A process that merely names the
+/// listener's directory, such as one listing it, is not one.
 pub(super) fn codex_listener_providers(
     pane: crate::model::TerminalId,
+    socket: &Path,
 ) -> Result<Vec<crate::daemon::holder_registry::Process>, String> {
-    processes_naming_listener(Path::new("/proc"), pane, EXEC_SETTLE, false)
+    processes_naming_listener(
+        Path::new("/proc"),
+        pane,
+        EXEC_SETTLE,
+        Naming::Listen(socket),
+    )
 }
 
-/// See [`codex_listener_survives`]; with `first`, stops at the first found.
+/// Which processes [`processes_naming_listener`] looks for.
+#[derive(Clone, Copy)]
+enum Naming<'a> {
+    /// The first that names the listener's directory anywhere in its
+    /// arguments: evidence that something of the pane may still run.
+    Any,
+    /// Every one given exactly this socket to listen on.
+    Listen(&'a Path),
+}
+
+impl Naming<'_> {
+    fn matches(self, marker: &[u8], argv: &[u8]) -> bool {
+        match self {
+            Self::Any => argv.windows(marker.len()).any(|window| window == marker),
+            Self::Listen(socket) => {
+                use std::os::unix::ffi::OsStrExt;
+                let mut endpoint = b"unix://".to_vec();
+                endpoint.extend_from_slice(socket.as_os_str().as_bytes());
+                let mut joined = b"--listen=".to_vec();
+                joined.extend_from_slice(&endpoint);
+                let arguments: Vec<&[u8]> = argv.split(|byte| *byte == 0).collect();
+                arguments
+                    .iter()
+                    .any(|argument| *argument == joined.as_slice())
+                    || arguments
+                        .windows(2)
+                        .any(|pair| pair[0] == b"--listen" && pair[1] == endpoint.as_slice())
+            }
+        }
+    }
+}
+
+/// See [`codex_listener_survives`] and [`codex_listener_providers`].
 fn processes_naming_listener(
     processes: &Path,
     pane: crate::model::TerminalId,
     settle: Duration,
-    first: bool,
+    naming: Naming<'_>,
 ) -> Result<Vec<crate::daemon::holder_registry::Process>, String> {
+    let first = matches!(naming, Naming::Any);
     let marker = format!("cagents-codex-{pane}");
     let marker = marker.as_bytes();
     let uid = crate::daemon::current_uid().to_string();
@@ -813,9 +854,7 @@ fn processes_naming_listener(
             Some(_) => {}
             None => return Err("Cannot read a process's user".into()),
         }
-        if arguments(&path)?
-            .is_some_and(|argv| argv.windows(marker.len()).any(|window| window == marker))
-        {
+        if arguments(&path)?.is_some_and(|argv| naming.matches(marker, &argv)) {
             if first {
                 named.push(crate::daemon::holder_registry::Process { pid, start: 0 });
                 break;
@@ -1225,6 +1264,28 @@ mod tests {
         chat::{Launch, NativeContinuity},
         model::{BootId, HostIncarnation, HostSessionId, LaunchRecipe, TerminalId},
     };
+
+    #[test]
+    fn only_a_process_given_the_listener_to_serve_is_its_provider() {
+        let marker = b"cagents-codex-x";
+        let listen = Naming::Listen(Path::new("/tmp/cagents-codex-x/control.sock"));
+        for provider in [
+            &b"codex\0app-server\0--listen\0unix:///tmp/cagents-codex-x/control.sock\0"[..],
+            b"codex\0app-server\0--listen=unix:///tmp/cagents-codex-x/control.sock\0",
+        ] {
+            assert!(listen.matches(marker, provider));
+        }
+        // Naming the directory, or even the socket, is not serving it, but it
+        // is still evidence that something of the pane may run.
+        for other in [
+            &b"ls\0/tmp/cagents-codex-x\0"[..],
+            b"tail\0unix:///tmp/cagents-codex-x/control.sock\0",
+            b"codex\0--listen\0unix:///tmp/cagents-codex-x/control.sock.old\0",
+        ] {
+            assert!(!listen.matches(marker, other));
+            assert!(Naming::Any.matches(marker, other));
+        }
+    }
 
     #[test]
     fn cold_terminal_history_never_requires_replaying_a_launch_or_inventing_an_exit() {

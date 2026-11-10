@@ -1144,13 +1144,13 @@ impl ControlClient {
         }
     }
 
-    /// What still runs for a conversation whose Cagents helper died, and with
-    /// `end`, ends what is proved to be the conversation's first; see
+    /// What still runs for a conversation whose Cagents helper died, after
+    /// ending those of `end` proved to be the conversation's; see
     /// [`ClientRequest::ChatLostProcesses`].
     pub fn lost_chat_processes(
         &mut self,
         session: crate::chat::Session,
-        end: bool,
+        end: Vec<crate::terminal::ipc::ProcessStart>,
     ) -> Result<Vec<crate::terminal::ipc::LostProcess>, ControlError> {
         match self.request_with_deadline(
             ClientRequest::ChatLostProcesses { session, end },

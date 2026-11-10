@@ -1057,22 +1057,7 @@ fn settle_lost_execution(
     session: &Session,
     proof: &HostSessionProof,
 ) -> Result<(), String> {
-    // A scheduled agent is its automation's to end, as when a changed boot
-    // leaves one behind.
-    if let Ok(registry) = super::agent_execution::registry(host)
-        && registry
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .agent_for_session(session.id)?
-            .is_some_and(|agent| {
-                matches!(
-                    agent.origin,
-                    crate::agent_execution::Origin::Automation { .. }
-                )
-            })
-    {
-        return Err(SCHEDULED_AGENT.into());
-    }
+    refuse_scheduled_agent(host, session)?;
     if let Some(holds) = what_holds(host, session, proof)? {
         return Err(lost_execution_refusal(session, holds));
     }
@@ -1098,6 +1083,26 @@ fn settle_lost_execution(
                 &crate::agent_execution::HostedSession::Chat(source),
                 true,
             )?;
+    }
+    Ok(())
+}
+
+/// A scheduled agent is its automation's to end, as when a changed boot
+/// leaves one behind, so a lost conversation it runs as is not settled here.
+fn refuse_scheduled_agent(host: &SharedHost, session: &Session) -> Result<(), String> {
+    if let Ok(registry) = super::agent_execution::registry(host)
+        && registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .agent_for_session(session.id)?
+            .is_some_and(|agent| {
+                matches!(
+                    agent.origin,
+                    crate::agent_execution::Origin::Automation { .. }
+                )
+            })
+    {
+        return Err(SCHEDULED_AGENT.into());
     }
     Ok(())
 }
@@ -1179,16 +1184,30 @@ fn holder_lost_refusal(
 
 /// [`holder_lost_refusal`] for any owner of this boot registered for
 /// `source`: its Codex holder, or a retained Claude helper.
+///
+/// With no live owner registered, the provider may still run after its
+/// helper's record went: the evidence [`what_holds`] reads, such as a Codex
+/// process still naming its listener, says so in the same words.
 fn registered_holder_lost_refusal(
     host: &SharedHost,
     source: &Session,
 ) -> Result<Option<String>, String> {
-    for owner in lost_owners(host, source)? {
-        if let Some(refusal) = holder_lost_refusal(source, &owner)? {
+    let owners = lost_owners(host, source)?;
+    for owner in &owners {
+        if let Some(refusal) = holder_lost_refusal(source, owner)? {
             return Ok(Some(refusal));
         }
     }
-    Ok(None)
+    if owners.iter().any(|owner| owner.holder.is_current()) {
+        return Ok(None);
+    }
+    let proof = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .proof()
+        .clone();
+    Ok((what_holds(host, source, &proof)? == Some(Holds::Running))
+        .then(|| lost_execution_refusal(source, Holds::Running)))
 }
 
 /// Every owner of this boot registered for `session`: its native Codex
@@ -1236,16 +1255,18 @@ fn registered_native_owner(
 /// A conversation's processes are those in a dead helper's session or its
 /// provider's process group, for every owner of this boot registered for it,
 /// and for Codex the provider named by its listener directory with its group:
-/// exactly what its Close counts. A conversation whose helper still runs has
-/// nothing here to end; its own Close stops it.
+/// exactly what its Close counts. Only those of `end` are ended, the ones the
+/// person was shown, so a process found later is shown before it is ended. A
+/// conversation whose helper still runs has nothing here to end; its own
+/// Close stops it.
 pub(super) fn lost_processes(
     host: &SharedHost,
     session: &Session,
-    end: bool,
+    end: &[crate::terminal::ipc::ProcessStart],
 ) -> Result<Vec<crate::terminal::ipc::LostProcess>, String> {
     // Ending holds the conversation as its Close does, so no start or handoff
     // can put a new provider where the lost one ran meanwhile.
-    let _claim = if end {
+    let _claim = if !end.is_empty() {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         if state.chat_handoffs.contains_key(&session.id)
             || state.native_actor_startups.values().any(|startup| {
@@ -1265,7 +1286,10 @@ pub(super) fn lost_processes(
     if owners.iter().any(|owner| owner.holder.is_current()) {
         return Err(HELPER_STILL_RUNS.into());
     }
-    let codex = session.launch.provider == Provider::Codex;
+    let listener = session
+        .owned_codex_listener
+        .as_ref()
+        .filter(|_| session.owns_codex_listener());
     let census = || -> Result<Vec<crate::daemon::lost_processes::Survivor>, String> {
         let mut found = Vec::new();
         for owner in &owners {
@@ -1274,8 +1298,9 @@ pub(super) fn lost_processes(
                 &owner.root,
             )?);
         }
-        if codex {
-            let providers = super::upgrade_inspect::codex_listener_providers(session.id)?;
+        if let Some(listener) = &listener {
+            let providers =
+                super::upgrade_inspect::codex_listener_providers(session.id, &listener.socket)?;
             if !providers.is_empty() {
                 found.extend(crate::daemon::lost_processes::listener_census(&providers)?);
             }
@@ -1286,22 +1311,40 @@ pub(super) fn lost_processes(
         found.dedup_by_key(|survivor| survivor.pid);
         Ok(found)
     };
-    let found = if end {
-        crate::daemon::lost_processes::end(census)?
-    } else {
+    let found = if end.is_empty() {
         census()?
+    } else {
+        let chosen = end
+            .iter()
+            .map(|process| (process.pid, process.start))
+            .collect::<Vec<_>>();
+        crate::daemon::lost_processes::end(census, &chosen)?
     };
     Ok(found
         .into_iter()
         // One that has exited is collected in a moment and needs nothing.
         .filter(|survivor| !survivor.zombie)
         .map(|survivor| crate::terminal::ipc::LostProcess {
-            pid: survivor.pid,
+            process: crate::terminal::ipc::ProcessStart {
+                pid: survivor.pid,
+                start: survivor.start,
+            },
             name: survivor.name,
             command: survivor.command,
             proved: survivor.proved,
         })
         .collect())
+}
+
+/// The processes a person ending what `found` lists would choose: every one
+/// proved to be the conversation's, as the pane's action does.
+#[cfg(test)]
+fn shown(found: &[crate::terminal::ipc::LostProcess]) -> Vec<crate::terminal::ipc::ProcessStart> {
+    found
+        .iter()
+        .filter(|process| process.proved)
+        .map(|process| process.process)
+        .collect()
 }
 
 /// Why [`lost_processes`] ends nothing for a conversation whose helper runs.

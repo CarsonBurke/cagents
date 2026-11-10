@@ -1562,6 +1562,9 @@ fn close_with_target(
                     terminal: None,
                     ..source.clone()
                 };
+                // Everything that can still refuse comes before the console
+                // is closed, so a refused Close keeps the pane as it was.
+                super::refuse_scheduled_agent(host, &actor)?;
                 if let Some(holds) = super::what_holds(host, &actor, &proof)? {
                     return Err(super::lost_execution_refusal(&source, holds));
                 }

@@ -9195,7 +9195,11 @@
               ],
               [
                 "end",
-                "Bool"
+                {
+                  "Seq": {
+                    "Container": "cagents::terminal::ipc::ProcessStart"
+                  }
+                }
               ]
             ]
           }
@@ -9205,8 +9209,10 @@
     "cagents::terminal::ipc::LostProcess": {
       "Struct": [
         [
-          "pid",
-          "I32"
+          "process",
+          {
+            "Container": "cagents::terminal::ipc::ProcessStart"
+          }
         ],
         [
           "name",
@@ -9219,6 +9225,18 @@
         [
           "proved",
           "Bool"
+        ]
+      ]
+    },
+    "cagents::terminal::ipc::ProcessStart": {
+      "Struct": [
+        [
+          "pid",
+          "I32"
+        ],
+        [
+          "start",
+          "U64"
         ]
       ]
     },

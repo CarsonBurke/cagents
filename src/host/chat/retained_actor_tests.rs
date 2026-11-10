@@ -4676,7 +4676,7 @@ fn a_same_boot_claude_actor_killed_without_retirement_closes_once_nothing_surviv
             refused.contains("is still running for this conversation"),
             "{refused}"
         );
-        let found = super::lost_processes(&host, &confirmed, false).unwrap();
+        let found = super::lost_processes(&host, &confirmed, &[]).unwrap();
         let tool: i32 = fs::read_to_string(root.join("survivor-pid"))
             .unwrap()
             .trim()
@@ -4685,10 +4685,13 @@ fn a_same_boot_claude_actor_killed_without_retirement_closes_once_nothing_surviv
         assert!(
             found
                 .iter()
-                .any(|process| process.pid == tool && process.proved),
+                .any(|process| process.process.pid == tool && process.proved),
             "{tool} missing from {found:?}"
         );
-        assert_eq!(super::lost_processes(&host, &confirmed, true).unwrap(), []);
+        assert_eq!(
+            super::lost_processes(&host, &confirmed, &super::shown(&found)).unwrap(),
+            []
+        );
         attached().expect_err("a dead helper answers no attached close");
         close().expect("an open pane whose helper died closes once nothing of it runs");
         assert!(host.lock().unwrap().chats.is_empty());
@@ -4730,18 +4733,18 @@ fn a_same_boot_claude_actor_killed_without_retirement_closes_once_nothing_surviv
         );
         // The pane names it as the conversation's, and the person ends it
         // from there.
-        let found = super::lost_processes(&successor, &confirmed, false).unwrap();
+        let found = super::lost_processes(&successor, &confirmed, &[]).unwrap();
         assert!(
             found
                 .iter()
-                .any(|process| process.pid == pid && process.proved),
+                .any(|process| process.process.pid == pid && process.proved),
             "{found:?}"
         );
         assert!(
-            super::lost_processes(&successor, &confirmed, true)
+            super::lost_processes(&successor, &confirmed, &super::shown(&found))
                 .unwrap()
                 .iter()
-                .all(|process| process.pid != pid)
+                .all(|process| process.process.pid != pid)
         );
         wait_until(
             || !Path::new(&format!("/proc/{pid}")).exists(),
