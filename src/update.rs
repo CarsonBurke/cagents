@@ -3920,10 +3920,6 @@ finally:
         const MODE: &str = "CAGENTS_TEST_HEADLESS_RECOVERY";
         const TEST: &str = "update::tests::transferred_lease_skips_source_prepare_and_survives_installer_start_failure";
         if std::env::var_os(MODE).is_none() {
-            let isolated = tempfile::tempdir().unwrap();
-            let runtime = isolated.path().join("runtime");
-            fs::create_dir(&runtime).unwrap();
-            fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
             for failure in [
                 "reserved-start-failure",
                 "shutdown-requested-without-reservation",
@@ -3934,6 +3930,12 @@ finally:
                 "recovery-recording-failure",
                 "start-nonzero-with-service",
             ] {
+                // A retained Prepared checkpoint belongs to this one case;
+                // later cases must not consume or remove another case's state.
+                let isolated = tempfile::tempdir().unwrap();
+                let runtime = isolated.path().join("runtime");
+                fs::create_dir(&runtime).unwrap();
+                fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
                 let output = Command::new(std::env::current_exe().unwrap())
                     .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
                     .env(MODE, "worker")
@@ -3943,6 +3945,10 @@ finally:
                         std::env::current_exe().unwrap(),
                     )
                     .env("XDG_RUNTIME_DIR", &runtime)
+                    .env("XDG_DATA_HOME", isolated.path().join("data"))
+                    .env("XDG_CONFIG_HOME", isolated.path().join("config"))
+                    .env("XDG_STATE_HOME", isolated.path().join("state"))
+                    .env("XDG_CACHE_HOME", isolated.path().join("cache"))
                     .env("HOME", isolated.path())
                     .output()
                     .unwrap();

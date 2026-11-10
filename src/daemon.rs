@@ -1251,7 +1251,7 @@ pub(crate) fn shut_down_test_listener(listener: std::os::unix::net::UnixListener
 /// can share its description. An unrelated test's concurrent fork can
 /// retain even a CLOEXEC copy until exec; create the tested descriptors
 /// only inside a coordinator with no other tests running beside it.
-#[cfg(all(test, feature = "host"))]
+#[cfg(test)]
 pub(crate) fn isolated_handoff_coordinator() -> bool {
     use std::os::unix::process::CommandExt;
     use std::process::Command;

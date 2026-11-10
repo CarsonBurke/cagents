@@ -347,6 +347,12 @@ mod tests {
 
     #[test]
     fn lease_handoff_cancelled_waiter_is_joined_before_source_releases_lock() {
+        // Other tests can fork while this description is held. Their children
+        // briefly share it until exec closes CLOEXEC descriptors, obscuring
+        // whether this waiter's final close released the reservation.
+        if !crate::daemon::isolated_handoff_coordinator() {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let paths = RuntimePaths {
