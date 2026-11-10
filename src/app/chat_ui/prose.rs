@@ -2625,7 +2625,7 @@ mod tests {
             code: raw.clone(),
             source: display.clone(),
             lines: vec![],
-            reader_source: reader_source::Source::new(&display),
+            reader_source: Box::new(reader_source::Source::new(&display)),
         };
         let mut element = items_for_test(&cached, &[item], target);
         let renderer = crate::app::tests::headless_renderer();
