@@ -31,7 +31,7 @@ assert input() == 'stop'
 print('Apply the update? [y/N] ', end='', flush=True)
 assert input() == 'yes'
 print('reviewed and confirmed', flush=True)
-''', '--answer', 'yes', '--stop', 'stop')
+''', '--answer', 'yes', '--working', 'i', '--stop', 'stop')
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn('reviewed and confirmed', result.stdout)
 

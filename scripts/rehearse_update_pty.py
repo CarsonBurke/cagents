@@ -11,11 +11,12 @@ import sys
 import time
 
 # The updater's prompts: an ordinary confirmation, the choice offered while
-# agents are mid-turn, and the typed destructive confirmation. Each ends where
-# the updater starts reading its answer.
+# agents are mid-turn, the review of what will stop, and the typed destructive
+# confirmation. Each ends where the updater starts reading its answer.
 PROMPTS = re.compile(
     rb'(?P<confirm>[^\r\n]*(?:\[y/N\]|\[Y/n\])[ \t]*)'
-    rb'|(?P<working>[^\r\n]*(?:i: interrupt them now|Enter: review what stops)[^\r\n]*n: cancel[ \t]*\r?\n)'
+    rb'|(?P<working>[^\r\n]*i: interrupt them now[^\r\n]*n: cancel[ \t]*\r?\n)'
+    rb'|(?P<review>[^\r\n]*Enter: review what stops[^\r\n]*n: cancel[ \t]*\r?\n)'
     rb'|(?P<stop>[^\r\n]*Anything else cancels\.[ \t]*\r?\n)')
 
 
@@ -62,8 +63,14 @@ def main():
             # These are the updater's confirmation markers, including prompts
             # arriving across separate PTY reads. Do not queue answers early.
             while match := PROMPTS.search(pending):
-                answer = (args.answer if match.group('confirm') else
-                          args.working if match.group('working') else args.stop)
+                if match.group('confirm'):
+                    answer = args.answer
+                elif match.group('working'):
+                    answer = args.working
+                elif match.group('stop'):
+                    answer = args.stop
+                else:
+                    answer = ''
                 print(f'\n[rehearsal prompt={match.group().decode(errors="replace").strip()!r} answer={answer!r}]', flush=True)
                 os.write(fd, answer.encode()+b'\n')
                 pending = pending[match.end():]
