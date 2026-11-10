@@ -51,7 +51,16 @@ pub(crate) fn process_owns_lock(
 pub(crate) fn holder_pid(proc_root: &Path, expected: &fs::Metadata) -> io::Result<Option<u32>> {
     let locks = fs::read_to_string(proc_root.join("locks"))?;
     for pid in locks.lines().filter_map(|line| flock_owner(line, expected)) {
-        match process_owns_lock(&proc_root.join(pid.to_string()), pid, expected) {
+        let process = proc_root.join(pid.to_string());
+        // Inode collisions can belong to another user's filesystem. Exclude
+        // those owners before their private fdinfo can refuse inspection.
+        match fs::metadata(&process) {
+            Ok(metadata) if metadata.uid() != expected.uid() => continue,
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        }
+        match process_owns_lock(&process, pid, expected) {
             Ok(true) => return Ok(Some(pid)),
             Ok(false) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -99,6 +108,25 @@ mod tests {
     }
 
     #[test]
+    fn lease_handoff_skips_foreign_candidate_before_authenticating_its_owner() {
+        let root = tempfile::tempdir().unwrap();
+        let lock = tempfile::NamedTempFile::new().unwrap();
+        let expected = lock.as_file().metadata().unwrap();
+        // An ordinary user cannot enumerate init's fdinfo. Root has no
+        // foreign-owner permission boundary to exercise with this fixture.
+        if fs::metadata("/proc/1").unwrap().uid() == expected.uid() {
+            return;
+        }
+        let record = lock_record(&expected);
+        let foreign = record.replace(&format!("WRITE {PID} "), "WRITE 41 ");
+        let process = fake_process(root.path(), &format!("{foreign}{record}"));
+        symlink("/proc/1", root.path().join("41")).unwrap();
+        symlink(lock.path(), process.join("fd/7")).unwrap();
+        fs::write(process.join("fdinfo/7"), format!("lock: {record}")).unwrap();
+        assert_eq!(holder_pid(root.path(), &expected).unwrap(), Some(PID));
+    }
+
+    #[test]
     fn lease_handoff_rejects_same_inode_on_another_device() {
         let root = tempfile::tempdir().unwrap();
         // These Linux filesystem roots share inode 1 on distinct devices.
@@ -115,10 +143,12 @@ mod tests {
         fs::write(process.join("fdinfo/7"), format!("lock: {record}")).unwrap();
         symlink("/proc", process.join("fd/8")).unwrap();
         fs::write(process.join("fdinfo/8"), "pos: 0\n").unwrap();
+        assert!(!process_owns_lock(&process, PID, &expected).unwrap());
         assert_eq!(holder_pid(root.path(), &expected).unwrap(), None);
         // Nor can an unrelated flock in the correct descriptor authenticate it.
         let other_inode = record.replace(&format!(":{} ", expected.ino()), ":2 ");
         fs::write(process.join("fdinfo/8"), format!("lock: {other_inode}")).unwrap();
+        assert!(!process_owns_lock(&process, PID, &expected).unwrap());
         assert_eq!(holder_pid(root.path(), &expected).unwrap(), None);
     }
 }
