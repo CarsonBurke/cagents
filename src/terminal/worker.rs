@@ -3470,7 +3470,7 @@ impl Worker {
                         &self.pty_rx,
                         &self.child_exit_rx,
                         &self.published.capture_rx,
-                        pty_open && self.reader.is_some() && (deferred || !self.reply_pending()),
+                        pty_open && self.reader.is_some() && !self.reply_pending(),
                         !exited,
                         self.foreground_poll
                             .saturating_sub(self.last_foreground_observation.elapsed()),
@@ -5224,6 +5224,11 @@ impl Worker {
     }
 
     fn flush_pty_input(&mut self) -> bool {
+        if self.natural_close.is_some() {
+            // Parser replies can reach here while final output drains. Keep
+            // older admitted user input fenced too until close settles.
+            return false;
+        }
         if self.writer_failed {
             return false;
         }
@@ -8133,6 +8138,132 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn deferred_close_fences_older_input_during_final_query_backpressure() {
+        if !std::path::Path::new("/usr/bin/python3").exists() {
+            return;
+        }
+        for backpressured in [false, true] {
+            let accepted = vec![
+                b'x';
+                if backpressured {
+                    admission::ORDINARY_BYTES
+                } else {
+                    8
+                }
+            ];
+            let script = format!(
+                r#"
+import os, select, time, tty
+tty.setraw(0)
+if os.fork(): os._exit(7)
+os.write(1, b'\x1b[6n' * 64 + b'QUERY_FLOOD_END')
+remaining = {size}
+deadline = time.monotonic() + 5
+while remaining and time.monotonic() < deadline:
+    if not select.select([0], [], [], max(0, deadline-time.monotonic()))[0]: break
+    data = os.read(0, min(remaining, 65536))
+    if not data: break
+    remaining -= len(data)
+os.write(1, b'QUERY_READER_DONE')
+os._exit(0)
+"#,
+                size = accepted.len()
+            );
+            let (mut worker, events) = capture_worker_for(LaunchRecipe {
+                program: "/usr/bin/python3".into(),
+                arguments: vec!["-c".into(), script],
+                working_directory: "/".into(),
+                environment: Default::default(),
+                unset_environment: Default::default(),
+            });
+            let (_commands, inbox) = command_channel(1);
+            worker.commands = inbox;
+            let report = worker
+                .child_exit_rx
+                .recv_deadline(Instant::now() + Duration::from_secs(5))
+                .unwrap();
+            assert_eq!(report.as_ref().unwrap().exit_code(), 7);
+            let (relay, exits) = crossbeam_channel::bounded(1);
+            relay.send(report).unwrap();
+            worker.child_exit_rx = exits;
+            let storage = worker
+                .published
+                .input_storage
+                .reserve(accepted.len(), 1)
+                .unwrap();
+            assert!(worker.pending_input.admit_bytes(
+                &accepted,
+                true,
+                Some(admission::Permit::generated(storage))
+            ));
+            let deadline = Instant::now() + Duration::from_millis(200);
+            let (reply, outcome) = crossbeam_channel::bounded(1);
+            assert!(!worker.handle_command(Command::CloseChecked {
+                allow_active: true,
+                deadline,
+                reply
+            }));
+            assert!(worker.natural_close.is_some());
+            // These are real final VT queries from the surviving PTY child.
+            // Reply admission must not flush older user input behind the fence.
+            let mut final_queries = Vec::new();
+            while !final_queries.ends_with(b"QUERY_FLOOD_END") {
+                match worker
+                    .pty_rx
+                    .recv_deadline(deadline + Duration::from_secs(5))
+                    .unwrap()
+                {
+                    PtyMessage::Bytes(bytes) => final_queries.extend_from_slice(&bytes),
+                    other => panic!("query child ended before its real query batch: {other:?}"),
+                }
+            }
+            worker.process_output(final_queries);
+            let prefix_preserved = worker.pending_input.front() == accepted;
+            let writer_failed = worker.writer_failed;
+            let blocked = worker.reply_pending();
+            let retained_replies = worker
+                .effects
+                .borrow()
+                .ordered
+                .iter()
+                .filter(|effect| matches!(effect, Effect::PtyWrite(_)))
+                .count();
+            let published = worker.published.clone();
+            if !backpressured {
+                // Release this test's reversible request so the child's actual
+                // read and EOF also settle before any assertion can fail.
+                worker.refuse_natural_close();
+            }
+            worker.run();
+            let refusal = outcome.recv_timeout(Duration::from_secs(1));
+            assert!(matches!(
+                refusal,
+                Ok(super::super::ipc::TerminalCloseResult::Unknown(_))
+            ));
+            assert!(
+                prefix_preserved && !writer_failed,
+                "a parser reply flushed older user input"
+            );
+            if backpressured {
+                assert!(blocked && retained_replies > 0 && retained_replies <= 64);
+                assert!(
+                    Instant::now() >= deadline,
+                    "reply backpressure must retain the original deadline"
+                );
+            }
+            assert!(published.completed.load(Ordering::Acquire));
+            assert!(events.try_iter().any(|event| matches!(
+                event,
+                TerminalEvent::Completed {
+                    exit_code: 7,
+                    signal: None,
+                    intentional: false
+                }
+            )));
+        }
     }
 
     #[test]
