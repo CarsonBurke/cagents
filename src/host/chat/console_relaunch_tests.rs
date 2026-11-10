@@ -133,7 +133,7 @@ root=pathlib.Path(os.environ['HOME']).parent
 with (root/'new-views').open('a') as log: log.write(str(os.getpid())+'\n')
 print('Console reconnected to the retained agent', flush=True)
 owner=json.loads(os.environ['CAGENTS_CONSOLE_STARTUP_OWNER'])
-lock=pathlib.Path(os.environ['XDG_RUNTIME_DIR'])/'cagents'/'cagentsd.lock'
+lock=pathlib.Path((root/'console-lock-path').read_text())
 while True:
     try:
         with lock.open() as lease:
@@ -154,6 +154,7 @@ while True:
     let listener = UnixListener::bind(root.join("old.sock")).unwrap();
     listener.set_nonblocking(true).unwrap();
     let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    fs::write(root.join("console-lock-path"), paths.lock.to_str().unwrap()).unwrap();
     let proof = |name| HostSessionProof {
         host_session_id: HostSessionId::new("console-fixture"),
         boot_id: crate::daemon::read_boot_id().unwrap(),
@@ -368,10 +369,10 @@ while True:
     super::super::state::restore_orphaned_holders(&successor).unwrap();
     if let Some(point) = crash {
         super::console_relaunch::fail_after_for_test(point);
+        let error = super::native_recovery::restore(&successor, 0, &before).unwrap_err();
         assert!(
-            super::native_recovery::restore(&successor, 0, &before)
-                .unwrap_err()
-                .contains("fixture crash")
+            error.contains("fixture crash"),
+            "expected crash after {point}, got: {error}"
         );
         assert!(successor.lock().unwrap().startup_recovery().is_some());
         assert_eq!(
@@ -475,8 +476,16 @@ while True:
         matches!(&saved.kind, CardKind::Terminal(view) if view.id == id && view.launch.program == root.join("new/cagents").display().to_string())
     );
     assert!(!registry.lock().unwrap().has_console_relaunch(id).unwrap());
+    let expected_views = if matches!(crash, Some("spawn" | "pair")) {
+        2
+    } else {
+        1
+    };
     wait(
-        || root.join("new-views").exists(),
+        || {
+            fs::read_to_string(root.join("new-views"))
+                .is_ok_and(|views| views.lines().count() >= expected_views)
+        },
         "replacement view did not start",
     );
     assert_eq!(
@@ -484,11 +493,7 @@ while True:
             .unwrap()
             .lines()
             .count(),
-        if matches!(crash, Some("spawn" | "pair")) {
-            2
-        } else {
-            1
-        },
+        expected_views,
         "each view replacement needs exact closure of the previous startup owner's view"
     );
     fs::write(root.join("lease-third-frame-release"), b"continue").unwrap();

@@ -2064,21 +2064,33 @@ impl TerminalHandle {
         let outcome = result
             .recv_timeout(std::time::Duration::from_secs(3))
             .unwrap_or_else(|error| TerminalCloseResult::Unknown(error.to_string()));
-        if matches!(outcome, TerminalCloseResult::Unknown(_))
-            && matches!(
-                *self
-                    .inner
-                    .published
-                    .archive
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner()),
-                ArchivePhase::Frozen { .. }
-            )
-        {
-            return match self.shutdown() {
-                Ok(()) => TerminalCloseResult::Closed,
-                Err(error) => TerminalCloseResult::Unknown(error.to_string()),
-            };
+        if matches!(outcome, TerminalCloseResult::Unknown(_)) {
+            // An adopted root can already be reaped when preparation tries to
+            // capture its live process identity. A checked close may then run
+            // before the queued exit report and PTY EOF finish publication.
+            // Give that ordinary completion the remainder of the close budget;
+            // neither the failed inspection nor elapsed time proves release.
+            let published = &self.inner.published;
+            let mut archive = published.archive.lock().unwrap_or_else(|p| p.into_inner());
+            while matches!(*archive, ArchivePhase::Live | ArchivePhase::Preparing) {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let (next, _) = published
+                    .archive_ready
+                    .wait_timeout(archive, remaining)
+                    .unwrap_or_else(|p| p.into_inner());
+                archive = next;
+            }
+            let frozen = matches!(*archive, ArchivePhase::Frozen { .. });
+            drop(archive);
+            if frozen {
+                return match self.shutdown() {
+                    Ok(()) => TerminalCloseResult::Closed,
+                    Err(error) => TerminalCloseResult::Unknown(error.to_string()),
+                };
+            }
         }
         if outcome == TerminalCloseResult::Closed {
             // Completion is not reported until the owner has released its PTY.
@@ -6471,6 +6483,88 @@ mod tests {
             TerminalRetirement::Released
         ));
         assert!(handle.worker_joined_for_test());
+    }
+
+    #[test]
+    fn checked_close_waits_for_an_adopted_reaped_roots_exact_release() {
+        if isolated_retirement_worker_case() {
+            return;
+        }
+        let proof = retirement_test_proof();
+        let paths = crate::daemon::RuntimePaths::discover().unwrap();
+        let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+        let mut source = shell_session("printf 'already-reaped-console'; exit 1");
+        source.continuity = crate::model::TerminalContinuity::DetachedSameBoot {
+            host_session_id: proof.host_session_id.clone(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: proof.host_incarnation.clone(),
+        };
+        let config = TerminalConfig {
+            holder_recovery: Some(holder::Recovery {
+                source: source.clone(),
+                previous_sources: Vec::new(),
+                relaunches: Vec::new(),
+                options: super::super::TerminalSpawnOptions::default(),
+                execution_environment: None,
+                execution_recipe: None,
+            }),
+            ..TerminalConfig::default()
+        };
+        let (commands, receiver) = command_channel(1);
+        let (events, event_receiver) = crossbeam_channel::unbounded();
+        let published = Arc::new(PublishedState::new(true, Arc::new(|_| {})));
+        let owner = joins::JoinOwner::new(published.clone(), joins::reserve().unwrap());
+        let handle = TerminalHandle {
+            inner: Arc::new(HandleInner {
+                commands,
+                events: event_receiver,
+                published: published.clone(),
+                worker: owner.clone(),
+            }),
+        };
+        let (ready, initialized) = crossbeam_channel::bounded(1);
+        let (begin, admitted) = crossbeam_channel::bounded(1);
+        let worker_owner = owner.clone();
+        let worker_source = source.clone();
+        let worker_published = published.clone();
+        owner.install(thread::spawn(move || {
+            let _body = joins::BodyCompletion(worker_owner);
+            let (mut worker, _) = Worker::start(
+                worker_source,
+                config,
+                None,
+                receiver,
+                events,
+                worker_published,
+            )
+            .unwrap();
+            assert!(worker.child.exited_within(Duration::from_secs(5)).unwrap());
+            // Adoption after this actual exit cannot capture a live root.
+            // Keep its real pending exit report and PTY output for the worker.
+            worker.child_identity = None;
+            ready.send(()).unwrap();
+            admitted.recv().unwrap();
+            worker.run();
+        }));
+        initialized.recv_timeout(Duration::from_secs(5)).unwrap();
+        let expected = handle.holder_identity().unwrap().clone();
+        let closer = handle.clone();
+        let close_source = source.clone();
+        let close_proof = proof.clone();
+        let result = thread::spawn(move || closer.close_with_receipt(&close_source, &close_proof));
+        wait_for_retirement_fact(|| published.priority_close.lock().unwrap().is_some());
+        begin.send(()).unwrap();
+        result.join().unwrap().unwrap();
+        assert!(handle.is_completed());
+        assert!(
+            holder::cleanup::confirmed_with_role(
+                &source,
+                &expected,
+                &proof,
+                published.original_holder_role.get(),
+            )
+            .unwrap()
+        );
     }
 
     #[test]

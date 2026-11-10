@@ -97,7 +97,7 @@ pub(super) fn prepare(
             if intent.owner != identity.record || intent.source.id != source.id {
                 return Err("Console replacement belongs to another exact retained actor".into());
             }
-            handle.recognize_retained_sources(&[intent.source.clone()])?;
+            handle.recognize_retained_sources(&[source.clone(), intent.source.clone()])?;
             sources.push(intent.source.clone());
             intent
         } else {
@@ -141,8 +141,13 @@ pub(super) fn prepare(
             else {
                 return Err("The console agent is not bound to its retained provider".into());
             };
-            sources.extend([owned, ownership.source().clone()]);
-            handle.recognize_retained_sources(&sources)?;
+            // The private protocol recognizes at most one source pair per
+            // request. Inspect already authenticated its published lineage;
+            // prove each additional Registry descriptor against that source.
+            for registered in [owned, ownership.source().clone()] {
+                handle.recognize_retained_sources(&[source.clone(), registered.clone()])?;
+                sources.push(registered);
+            }
             let (worker, options, aliases) = {
                 let state = host.lock().unwrap_or_else(|p| p.into_inner());
                 let worker = state
