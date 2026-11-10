@@ -11314,15 +11314,14 @@ impl Cagents {
                 {
                     return Task::none();
                 }
-                // The new conversation runs the saved launch verbatim - same
-                // program, same options including the session directory, same
-                // working directory and environment - with only the
-                // conversation it was resuming dropped. That is what makes
-                // this a new conversation in the same place rather than a
-                // different launch.
+                // Keep the launch settings, but give up the ended actor's
+                // ownership and terminal pair. A fresh Codex thread asks for
+                // its own listener rather than reusing the old thread's socket.
                 let mut session = session.clone();
+                session.reset_owned_codex_listener();
                 session.launch.session_id = None;
                 session.proof = None;
+                session.terminal = None;
                 self.chat_ui.fresh_offers.remove(&card);
                 // A chat runtime whose provider has exited still holds the
                 // daemon's record for the conversation that failed. Closing it
@@ -27514,7 +27513,11 @@ mod tests {
             panic!("the explicit fresh action must close the failed attachment first");
         };
         assert_eq!(fresh.launch.session_id, None);
-        assert_eq!(fresh.launch.recipe, source.launch.recipe);
+        assert_eq!(fresh.launch.recipe.arguments, ["--remote", "unix://"]);
+        assert_eq!(
+            fresh.launch.recipe.environment,
+            source.launch.recipe.environment
+        );
         assert_eq!(chat_runtime(&app, card).session, source);
         assert_eq!(chat_runtime(&app, card).composer.text(), "keep this draft");
         drop(app.handle_chat_ui(Action::CloseFinished(target, Ok(()))));
@@ -27524,11 +27527,139 @@ mod tests {
             .expect("the selected fresh start resumes after Close");
         assert_eq!(fresh.intent, chat::Intent::Start);
         assert_eq!(fresh.session.launch.session_id, None);
-        assert_eq!(fresh.session.launch.recipe, source.launch.recipe);
+        assert_eq!(
+            fresh.session.launch.recipe.arguments,
+            ["--remote", "unix://"]
+        );
+        assert_eq!(
+            fresh.session.launch.recipe.environment,
+            source.launch.recipe.environment
+        );
         assert_eq!(
             app.chat_ui.drafts.get(&card).map(String::as_str),
             Some("keep this draft")
         );
+    }
+
+    #[test]
+    fn an_explicit_fresh_start_drops_retained_actor_and_pair_authority() {
+        let conversation = "33333333-4444-4aaa-8bbb-cccccccccccc";
+        for (provider, paired) in [Provider::Claude, Provider::Codex]
+            .into_iter()
+            .flat_map(|provider| [false, true].map(|paired| (provider, paired)))
+        {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat_for_provider(&mut app, provider, Some(conversation));
+            let target = chat_runtime(&app, card).target;
+            let mut source = chat_runtime(&app, card).session.clone();
+            source
+                .launch
+                .recipe
+                .arguments
+                .extend(["--model".into(), "fixture-model".into()]);
+            let account_home = crate::account::home_variable(provider).unwrap();
+            source
+                .launch
+                .recipe
+                .environment
+                .insert(account_home.into(), "/fixture/selected-account".into());
+            source.native_continuity = match provider {
+                Provider::Claude => chat::NativeContinuity::RetainedClaudeActor { protocol: 2 },
+                Provider::Codex => chat::NativeContinuity::Durable {
+                    provider_version: "0.100.0".into(),
+                },
+                Provider::Omp => unreachable!(),
+            };
+            if paired {
+                let proof = source.proof.clone().unwrap();
+                source.terminal = Some(TerminalSession {
+                    id: source.id,
+                    launch: source.launch.terminal_recipe().unwrap(),
+                    continuity: TerminalContinuity::Live {
+                        host_session_id: proof.host_session_id,
+                        boot_id: proof.boot_id,
+                        host_incarnation: proof.host_incarnation,
+                    },
+                    transcript_path: None,
+                    resume_hint: None,
+                    owned_codex_listener: source.owned_codex_listener.clone(),
+                    recovery_origin: None,
+                    predecessor: None,
+                });
+            }
+            assert!(source.has_valid_native_continuity());
+            assert_eq!(source.owns_codex_listener(), provider == Provider::Codex);
+            app.card_state_mut(card).unwrap().kind = CardKind::Chat(source.clone());
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.session = source.clone();
+            runtime.start_retry_blocked = true;
+            runtime.replace_draft(text_editor::Content::with_text("keep the chosen draft"));
+            let snapshot = Arc::make_mut(&mut runtime.snapshot);
+            snapshot.exited = true;
+            snapshot.session_id = None;
+            assert!(app.chat_offers_fresh_conversation(card));
+
+            drop(app.handle_chat_ui(Action::StartFresh(card)));
+            let Some(Phase::Closing {
+                restart: Some(fresh),
+                ..
+            }) = app.chat_ui.phases.get(&card)
+            else {
+                panic!("the explicit choice must close its exact old attachment first");
+            };
+            assert!(
+                fresh.is_unstarted(),
+                "{provider:?}, paired={paired}: {fresh:?}"
+            );
+            assert!(fresh.has_valid_native_continuity());
+            assert_eq!(
+                fresh.native_continuity,
+                chat::NativeContinuity::ReconnectOnly
+            );
+            assert!(fresh.terminal.is_none());
+            assert!(fresh.owned_codex_listener.is_none());
+            assert_eq!(fresh.launch.recipe.program, source.launch.recipe.program);
+            assert_eq!(
+                fresh.launch.recipe.working_directory,
+                source.launch.recipe.working_directory
+            );
+            assert_eq!(
+                fresh.launch.recipe.environment,
+                source.launch.recipe.environment
+            );
+            assert_eq!(
+                fresh.launch.recipe.unset_environment,
+                source.launch.recipe.unset_environment
+            );
+            let mut expected_arguments = source.launch.recipe.arguments.clone();
+            if provider == Provider::Codex {
+                let remote = expected_arguments
+                    .iter()
+                    .position(|argument| argument == "--remote")
+                    .unwrap();
+                expected_arguments[remote + 1] = "unix://".into();
+            }
+            assert_eq!(fresh.launch.recipe.arguments, expected_arguments);
+            let fresh = fresh.clone();
+            assert_eq!(chat_runtime(&app, card).session, source);
+            assert_eq!(
+                chat_runtime(&app, card).composer.text(),
+                "keep the chosen draft"
+            );
+
+            drop(app.handle_chat_ui(Action::CloseFinished(target, Ok(()))));
+            let attempt = app
+                .chat_ui
+                .attempt(card)
+                .expect("Close admits the selected fresh start");
+            assert_eq!(attempt.intent, chat::Intent::Start);
+            assert_eq!(attempt.session, fresh);
+            assert!(attempt.session.is_unstarted());
+            assert_eq!(
+                app.chat_ui.drafts.get(&card).map(String::as_str),
+                Some("keep the chosen draft")
+            );
+        }
     }
 
     #[test]
