@@ -2198,6 +2198,13 @@ mod tests {
         };
         let cases = [
             vec![
+                span("ordinary prefix ", false, false, None),
+                span("src/first.rs:12", false, true, None),
+                span(" then https://example.test/λ ", false, false, None),
+                span("src/last.rs:8", false, true, None),
+                span("", true, false, None),
+            ],
+            vec![
                 span("https://exa", false, false, None),
                 span("mple.test/λ", false, false, None),
             ],
