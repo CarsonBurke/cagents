@@ -870,7 +870,17 @@ mod tests {
                     .len(),
                 1
             );
-            for (table, expected) in &before {
+            // Schema 23 replaces these with normalized tables; the model
+            // comparison above holds their views.
+            for (table, expected) in before.iter().filter(|(table, _)| {
+                ![
+                    "shared_view_scopes",
+                    "shared_views",
+                    "shared_view_panes",
+                    "shared_view_edits",
+                ]
+                .contains(&table.as_str())
+            }) {
                 assert_eq!(
                     &rows(&registry.db, table),
                     expected,

@@ -83,6 +83,19 @@ def frame(value, opcode=1):
     return header + payload
 
 
+def private_listener(parent, runtime):
+    """Whether a listener may be bound in `parent`: beneath the private
+    runtime, or the daemon's own allocation for it, a private directory named
+    cagents-codex-ID, which a development instance whose runtime path is too
+    long for a socket address keeps in the temporary directory."""
+    parent = parent.resolve(strict=True)
+    if parent.is_relative_to(runtime):
+        return True
+    status = parent.stat()
+    return (parent.name.startswith("cagents-codex-") and status.st_uid == os.getuid()
+            and not status.st_mode & 0o077)
+
+
 def atomic_json(path, value):
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(value, indent=2) + "\n")
@@ -210,7 +223,7 @@ def main():
         raise SystemExit("fixture requires --listen unix://PATH")
     path = Path(address[len("unix://"):])
     runtime = Path(os.environ["XDG_RUNTIME_DIR"]).resolve(strict=True)
-    if not path.parent.resolve(strict=True).is_relative_to(runtime) or runtime.stat().st_uid != os.getuid() or runtime.stat().st_mode & 0o077:
+    if not private_listener(path.parent, runtime) or runtime.stat().st_uid != os.getuid() or runtime.stat().st_mode & 0o077:
         raise SystemExit("fixture socket must live beneath the private owned runtime")
     if path.exists() or path.is_symlink():
         raise SystemExit("fixture never replaces an existing socket")

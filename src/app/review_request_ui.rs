@@ -148,18 +148,37 @@ impl Cagents {
                 }),
             })
             .collect();
-        drop(self.update_review_requests(Action::Loaded {
-            repository,
-            generation,
-            work: Work::Page { cursor: None },
-            result: Ok(crate::pull_request_review::request_ui::Reply::Page(Page {
+        let mut scan = crate::github::review_requests::scan::Scan::default();
+        scan.page(
+            &Work::Page { cursor: None },
+            Page {
                 viewer: Viewer {
                     id: "viewer".into(),
                     login: "viewer".into(),
                 },
                 entries,
                 next_cursor: None,
-            })),
+            },
+        )
+        .unwrap();
+        drop(self.update_review_requests(Action::SharedLoaded {
+            repository,
+            generation,
+            result: Ok(crate::github::review_requests::shared::PollResult {
+                scan,
+                error: None,
+                due: crate::github::polling::now() + 60,
+                observation: (uuid::Uuid::new_v4().to_string(), 1),
+                observed: vec![crate::github::review_requests::shared::Observation {
+                        revision: 1,
+                        at: crate::github::polling::now(),
+                        viewer: "viewer".into(),
+                        requests: requested
+                            .iter()
+                            .map(|&number| (number, format!("request-{number}")))
+                            .collect(),
+                    }],
+            }),
         }));
     }
 }

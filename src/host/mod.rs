@@ -229,7 +229,11 @@ const RUNTIME_COLLECT_INTERVAL: std::time::Duration = std::time::Duration::from_
 /// Reclaims transcript caches whose owners have ended and the transcripts that
 /// retired actors' final receipts no longer need: now, then every interval,
 /// until the daemon is gone. The startup sweep has already run.
-fn collect_runtime_directory(host: std::sync::Weak<state::HostLock>, root: std::path::PathBuf) {
+fn collect_runtime_directory(
+    host: std::sync::Weak<state::HostLock>,
+    root: std::path::PathBuf,
+    model: Option<model::Registry>,
+) {
     let mut first = true;
     loop {
         if !first {
@@ -257,6 +261,15 @@ fn collect_runtime_directory(host: std::sync::Weak<state::HostLock>, root: std::
             Ok(bytes) => tracing::info!(bytes, "released retired actors' final transcripts"),
             Err(error) => tracing::warn!(%error, "retired actor receipts were not compacted"),
         }
+        drop(host);
+        // Its own connection, so a batch never waits on or holds the host lock.
+        if let Some(model) = &model {
+            match model.collect_view_operations() {
+                Ok(0) => {}
+                Ok(rows) => tracing::info!(rows, "forgot pane changes applied over a week ago"),
+                Err(error) => tracing::warn!(%error, "applied pane changes were not collected"),
+            }
+        }
     }
 }
 
@@ -274,6 +287,35 @@ fn listener_before_restore(
     Ok(listener)
 }
 
+/// Runs `work` on this installation's shared-model store while holding the
+/// daemon lease, so no daemon can open or convert the store meanwhile.
+fn with_store_stopped<T>(work: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    let paths = RuntimePaths::discover().map_err(|error| error.to_string())?;
+    let _lease = HostLease::acquire_for_store_maintenance(&paths).map_err(|error| match error {
+        PlatformError::AlreadyRunning { .. } => {
+            "a cagents daemon is running; stop it before reading or converting its store".to_owned()
+        }
+        error => error.to_string(),
+    })?;
+    work()
+}
+
+/// The schema of this installation's shared-model store, or `None` if there is
+/// no store yet. The installer records it before a replacement daemon starts,
+/// since that daemon may convert the store forward, so that a rollback can
+/// convert it back without running the previous release.
+pub fn stored_schema() -> Result<Option<u32>, String> {
+    with_store_stopped(model::Registry::stored_schema)
+}
+
+/// Converts this installation's shared-model store back to schema `target`, so
+/// a daemon that predates the current schema can open it after a rollback.
+/// Refuses while a daemon runs. Returns the schema it converted from, or
+/// `None` if there was nothing to do.
+pub fn downgrade_store(target: u32) -> Result<Option<u32>, String> {
+    with_store_stopped(|| model::Registry::downgrade(target))
+}
+
 pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     daemon::install_signal_handlers()?;
     descriptor_limit::raise();
@@ -283,7 +325,13 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
         host_incarnation: HostIncarnation::new(Uuid::new_v4().to_string()),
     };
     let paths = RuntimePaths::discover()?;
+    // The lock outlives every daemon but not the runtime directory, which a
+    // reboot removes: without it no daemon of this instance ran this boot.
+    let first_this_boot = fs::symlink_metadata(&paths.lock)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
     let _lease = HostLease::acquire(&paths, &proof)?;
+    // Before anything is launched, so the epoch precedes every launch.
+    crate::lineage_birth::open_instance_epoch(&proof.boot_id, first_this_boot);
     // Before anything is launched or adopted: sessions launched through this
     // entry by an earlier daemon now run the CLI that speaks this protocol.
     if let Err(error) = crate::agent_execution::bundled::publish_serving_cli(&paths.directory) {
@@ -440,9 +488,20 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     if !recovery_only {
         let collect_host = Arc::downgrade(&host);
         let runtime_root = paths.directory.clone();
+        let collect_model = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .independent_model()
+            .and_then(|connection| match connection {
+                Ok(connection) => Some(connection),
+                Err(error) => {
+                    tracing::warn!(%error, "applied pane changes will not be collected");
+                    None
+                }
+            });
         if let Err(error) = std::thread::Builder::new()
             .name("cagents-runtime-collect".into())
-            .spawn(move || collect_runtime_directory(collect_host, runtime_root))
+            .spawn(move || collect_runtime_directory(collect_host, runtime_root, collect_model))
         {
             tracing::warn!(%error, "runtime directory caches will be reclaimed only at startup");
         }

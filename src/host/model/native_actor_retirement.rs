@@ -529,6 +529,46 @@ impl Registry {
         Ok(None)
     }
 
+    /// Every owner the census registered for allocation `terminal`, under its
+    /// conversation or as its own allocation, each with whether its retirement
+    /// is recorded: the roster the upgrade inspector reads from the store
+    /// file, read here through the daemon's own connection.
+    pub(in crate::host) fn native_actor_owners_of(
+        &self,
+        terminal: crate::model::TerminalId,
+    ) -> Result<Vec<(Record, bool)>, String> {
+        // As above, the prefilter only spares decoding other allocations' rows.
+        let mut statement = self
+            .db
+            .prepare(
+                "SELECT o.actor,o.ownership,r.actor IS NOT NULL FROM native_actor_ownerships o
+                 LEFT JOIN native_actor_retirements r ON r.actor=o.actor
+                 WHERE instr(o.ownership, ?1) > 0 ORDER BY o.rowid",
+            )
+            .map_err(|e| e.to_string())?;
+        let mut rows = statement
+            .query([terminal.to_string()])
+            .map_err(|e| e.to_string())?;
+        let mut owners = Vec::new();
+        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            let actor: String = row.get(0).map_err(|e| e.to_string())?;
+            let encoded: String = row.get(1).map_err(|e| e.to_string())?;
+            let retired: bool = row.get(2).map_err(|e| e.to_string())?;
+            if encoded.len() > MAX_RECEIPT_BYTES {
+                return Err("Stored actor census exceeds its metadata bound".into());
+            }
+            let ownership: NativeActorOwnership =
+                serde_json::from_str(&encoded).map_err(|e| e.to_string())?;
+            if ownership.actor.to_string() != actor || ownership.actor.is_nil() {
+                return Err("Stored actor census key changed its identity".into());
+            }
+            if ownership.source.id == terminal || ownership.owner.terminal == terminal {
+                owners.push((ownership.owner, retired));
+            }
+        }
+        Ok(owners)
+    }
+
     /// Call only after the authenticated handle's finish_retained_close proves
     /// semantic/loss ACK, exact helper disappearance and discovery retirement.
     /// A completed provider, Stop ACK or an absent socket is never sufficient.

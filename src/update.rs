@@ -1685,6 +1685,10 @@ fn acquire_lock(state: &Path) -> Result<crate::instance::OwnedLock, UpdateError>
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(state.join("lock"))?;
     validate_lock(&file)?;
+    lock_file(file)
+}
+
+fn lock_file(file: File) -> Result<crate::instance::OwnedLock, UpdateError> {
     crate::instance::owned_file_lock(file, libc::LOCK_EX | libc::LOCK_NB).map_err(|error| {
         if error.kind() == io::ErrorKind::WouldBlock {
             UpdateError::Busy
@@ -1693,6 +1697,7 @@ fn acquire_lock(state: &Path) -> Result<crate::instance::OwnedLock, UpdateError>
         }
     })
 }
+
 fn validate_lock(file: &File) -> Result<(), UpdateError> {
     let metadata = file.metadata()?;
     if !metadata.is_file()
@@ -1718,8 +1723,7 @@ fn inherited_lock(state: &Path) -> Result<crate::instance::OwnedLock, UpdateErro
     if actual.dev() != expected.dev() || actual.ino() != expected.ino() {
         return Err(invalid("worker inherited the wrong lock"));
     }
-    let lock = crate::instance::owned_file_lock(file, libc::LOCK_EX | libc::LOCK_NB)
-        .map_err(|_| UpdateError::Busy)?;
+    let lock = lock_file(file)?;
     if unsafe { libc::fcntl(lock.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
         return Err(io::Error::last_os_error().into());
     }
@@ -2188,6 +2192,36 @@ mod tests {
             sessions,
             blockers: Vec::new(),
         }
+    }
+
+    #[test]
+    fn update_lock_distinguishes_contention_from_a_descriptor_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("lock");
+        let first = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        let held = lock_file(first).unwrap();
+        let other = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        assert!(matches!(lock_file(other), Err(UpdateError::Busy)));
+        // O_PATH is a live owned regular-file descriptor but cannot take flock.
+        let path_only = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH)
+            .open(&path)
+            .unwrap();
+        assert!(
+            matches!(lock_file(path_only), Err(UpdateError::Io(error)) if error.raw_os_error() == Some(libc::EBADF))
+        );
+        drop(held);
     }
 
     #[test]
