@@ -6257,7 +6257,7 @@ mod tests {
 
     #[test]
     fn update_source_client_speaks_and_requires_the_sources_own_protocol() {
-        for &source in crate::update::source::CURRENT_CLIENT_PROTOCOLS {
+        for source in crate::update::source::current_client_protocols() {
             if source == PROTOCOL_VERSION {
                 continue;
             }
