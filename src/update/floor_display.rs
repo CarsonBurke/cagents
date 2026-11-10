@@ -222,8 +222,8 @@ impl TerminalProcesses {
                 .is_some_and(|marker| marker == id || marker == origin)
         };
         // The session leader is the shell even when it has exec'd a command.
-        // Older holders may put it in an existing session; its parent then has
-        // no terminal marker, unlike the jobs descended from that shell.
+        // Older holders may use an existing session. The shell then marks a
+        // boundary from its daemon/holder parent's terminal marker.
         let (&pid, row) = self
             .rows
             .iter()
@@ -233,9 +233,19 @@ impl TerminalProcesses {
                     || self
                         .rows
                         .get(&row.stat.parent)
-                        .is_none_or(|parent| !matches(parent))
+                        .is_none_or(|parent| parent.terminal != row.terminal)
             })
-            .min_by_key(|(pid, row)| (**pid != row.stat.session, row.stat.start, **pid))?;
+            // A restarted pane can coexist with an old unattached process that
+            // has its recovery origin. Its exact current marker wins; origin
+            // matching is only a fallback for holders carrying the old marker.
+            .min_by_key(|(pid, row)| {
+                (
+                    row.terminal != Some(id),
+                    **pid != row.stat.session,
+                    row.stat.start,
+                    **pid,
+                )
+            })?;
         if read_stat(&self.root, pid)? != row.stat {
             return None;
         }
@@ -736,6 +746,69 @@ mod tests {
             TerminalProcesses::at(root.path(), crate::daemon::current_uid().wrapping_add(1))
                 .rows
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn current_terminal_marker_wins_over_an_older_surviving_recovery_origin() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut terminal, impact) = terminal();
+        let origin = TerminalId::new();
+        terminal.session.recovery_origin = Some(origin);
+        process(
+            root.path(),
+            10,
+            1,
+            10,
+            10,
+            10,
+            1,
+            Some(origin),
+            b"/bin/bash\0",
+        );
+        process(
+            root.path(),
+            20,
+            1,
+            20,
+            20,
+            30,
+            100,
+            Some(terminal.session.id),
+            b"/bin/bash\0",
+        );
+        process(
+            root.path(),
+            30,
+            20,
+            20,
+            30,
+            30,
+            200,
+            Some(terminal.session.id),
+            b"cargo\0test\0",
+        );
+        let observed = TerminalProcesses::at(root.path(), crate::daemon::current_uid());
+        assert_eq!(
+            terminal_item(&terminal, &impact, "build", &observed).running,
+            "shell running `cargo test`"
+        );
+        // A holder can keep its origin marker while issuing a fresh child.
+        process(
+            root.path(),
+            20,
+            10,
+            2,
+            20,
+            30,
+            100,
+            Some(terminal.session.id),
+            b"/bin/bash\0",
+        );
+        let observed = TerminalProcesses::at(root.path(), crate::daemon::current_uid());
+        assert_eq!(
+            terminal_item(&terminal, &impact, "build", &observed).running,
+            "shell running `cargo test`"
         );
     }
 
