@@ -778,6 +778,53 @@ pub(super) fn codex_execution_ended(source: &Session, boot: &crate::model::BootI
     codex_execution(source, boot) == CodexExecution::Ended
 }
 
+/// What the evidence an upgrade requires before it replaces a service says
+/// of what `source`'s execution left behind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ExecutionEnd {
+    /// Nothing of it can still run: its proof names another kernel boot, or
+    /// every owner of this boot is gone (see [`ExecutionEvidence::classify`]).
+    Ended,
+    /// A process or bound socket of it survives.
+    Running,
+    /// The evidence cannot tell, or does not cover this shape of pane.
+    Unproved,
+}
+
+/// What remains of `source`'s execution. `owners` is the census of this
+/// pane, each owner with whether its retirement is recorded, read from the
+/// daemon's own store. An actor that ended without recording what it
+/// confirmed has still ended: nothing of it remains to close, only nothing to
+/// reopen.
+pub(super) fn execution_end(
+    source: &Session,
+    boot: &crate::model::BootId,
+    owners: Result<Vec<(crate::daemon::holder_registry::Record, bool)>, String>,
+) -> ExecutionEnd {
+    let census = owners.as_ref().map_err(Clone::clone).map(|owners| {
+        owners
+            .iter()
+            .map(|(owner, _)| (source.id, owner.clone()))
+            .collect()
+    });
+    let retired = owners.map(|owners| {
+        owners
+            .into_iter()
+            .filter_map(|(owner, retired)| retired.then_some(owner))
+            .collect()
+    });
+    let evidence = ExecutionEvidence {
+        census,
+        retired,
+        ..ExecutionEvidence::codex(boot)
+    };
+    match evidence.classify(source) {
+        SavedExecution::Ended | SavedExecution::Unrecorded => ExecutionEnd::Ended,
+        SavedExecution::Running => ExecutionEnd::Running,
+        SavedExecution::Unproved => ExecutionEnd::Unproved,
+    }
+}
+
 /// Whether a Codex/cagents process of this user names the pane or conversation
 /// in its arguments, or a socket is still bound at one of `sockets`. A
 /// process shows no arguments once its group leader has released its memory,
@@ -801,29 +848,7 @@ fn codex_listener_survives(
     // within the same settle bound as exec, then exclude only processes with
     // neither argv nor an executable. A readable exe with unpublished argv
     // can still be a starting writer and must remain explicit uncertainty.
-    let arguments = |path: &Path| -> Result<Option<Vec<u8>>, String> {
-        let deadline = Instant::now() + settle;
-        settled_process_arguments(
-            || {
-                let observation = process_arguments(path)?;
-                if matches!(observation, Threads::Unsettled) && Instant::now() >= deadline {
-                    if process_executable(path)?.is_none() {
-                        // Recheck every thread after exe: publication between
-                        // the reads must not look like a kernel thread.
-                        return process_arguments_after_settle(path);
-                    }
-                }
-                Ok(observation)
-            },
-            || {
-                if Instant::now() >= deadline {
-                    return Err(CODEX_PROCESS_STARTING.into());
-                }
-                std::thread::sleep(Duration::from_millis(2));
-                Ok(())
-            },
-        )
-    };
+    let arguments = |path: &Path| settled_arguments(path, settle);
     let mut unreadable = None;
     let entries = std::fs::read_dir(processes)
         .map_err(|error| format!("Cannot enumerate processes: {error}"))?;
@@ -942,6 +967,125 @@ fn codex_listener_survives(
         }
     }
     unreadable.map_or(Ok(CodexExecution::Ended), Err)
+}
+
+/// This user's processes started to serve a Codex pane's listener, by the
+/// `--listen unix://<socket>` its provider is given: the conversation's
+/// provider, which a person closing it can end once its helper has gone (see
+/// [`crate::daemon::lost_processes`]). A process that merely names the
+/// listener, such as one listing its directory, is not one. A process still
+/// starting is not judged: the next look sees it.
+pub(super) fn codex_listener_providers(
+    pane: crate::model::TerminalId,
+    socket: &Path,
+) -> Result<Vec<crate::daemon::holder_registry::Process>, String> {
+    processes_serving_listener(Path::new("/proc"), pane, socket, EXEC_SETTLE)
+}
+
+fn processes_serving_listener(
+    processes: &Path,
+    pane: crate::model::TerminalId,
+    socket: &Path,
+    settle: Duration,
+) -> Result<Vec<crate::daemon::holder_registry::Process>, String> {
+    let marker = format!("cagents-codex-{pane}");
+    let uid = crate::daemon::current_uid().to_string();
+    let mut serving = Vec::new();
+    let entries = std::fs::read_dir(processes)
+        .map_err(|error| format!("Cannot enumerate processes: {error}"))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("Cannot enumerate processes: {error}"))?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let path = entry.path();
+        let status = match std::fs::read_to_string(path.join("status")) {
+            Ok(status) => status,
+            Err(error) if inaccessible_process(&error) => continue,
+            Err(error) => return Err(format!("Cannot inspect process status: {error}")),
+        };
+        // The effective user, as in [`codex_listener_survives`].
+        if status
+            .lines()
+            .find_map(|line| line.strip_prefix("Uid:"))
+            .and_then(|ids| ids.split_whitespace().nth(1))
+            != Some(uid.as_str())
+        {
+            continue;
+        }
+        let argv = match settled_arguments(&path, settle) {
+            Ok(Some(argv)) => argv,
+            Ok(None) => continue,
+            Err(reason) if reason == CODEX_PROCESS_STARTING => continue,
+            Err(reason) => return Err(reason),
+        };
+        if !argv
+            .windows(marker.len())
+            .any(|window| window == marker.as_bytes())
+            || !serves_listener(socket, &argv)
+        {
+            continue;
+        }
+        // Read after the arguments: an identity that changed meanwhile names
+        // a later process, which the next scan judges afresh.
+        let start = match std::fs::read(path.join("stat")) {
+            Ok(stat) => crate::model::agent_recovery::process_identity(&stat)
+                .map(|(_, start)| start)
+                .ok_or("A process has an unreadable identity")?,
+            Err(error) if gone(&error) => continue,
+            Err(error) => return Err(format!("Cannot inspect a process: {error}")),
+        };
+        serving.push(crate::daemon::holder_registry::Process { pid, start });
+    }
+    Ok(serving)
+}
+
+/// Whether `argv` gives exactly `socket` to listen on, as `--listen
+/// unix://<socket>` or `--listen=unix://<socket>`.
+fn serves_listener(socket: &Path, argv: &[u8]) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let mut endpoint = b"unix://".to_vec();
+    endpoint.extend_from_slice(socket.as_os_str().as_bytes());
+    let mut joined = b"--listen=".to_vec();
+    joined.extend_from_slice(&endpoint);
+    let arguments: Vec<&[u8]> = argv.split(|byte| *byte == 0).collect();
+    arguments
+        .iter()
+        .any(|argument| *argument == joined.as_slice())
+        || arguments
+            .windows(2)
+            .any(|pair| pair[0] == b"--listen" && pair[1] == endpoint.as_slice())
+}
+
+/// A process's arguments, read again for up to `settle` while it shows none
+/// (see [`codex_listener_survives`]). `Ok(None)` is a kernel thread or a
+/// process that has ended.
+fn settled_arguments(path: &Path, settle: Duration) -> Result<Option<Vec<u8>>, String> {
+    let deadline = Instant::now() + settle;
+    settled_process_arguments(
+        || {
+            let observation = process_arguments(path)?;
+            if matches!(observation, Threads::Unsettled) && Instant::now() >= deadline {
+                if process_executable(path)?.is_none() {
+                    // Recheck every thread after exe: publication between
+                    // the reads must not look like a kernel thread.
+                    return process_arguments_after_settle(path);
+                }
+            }
+            Ok(observation)
+        },
+        || {
+            if Instant::now() >= deadline {
+                return Err(CODEX_PROCESS_STARTING.into());
+            }
+            std::thread::sleep(Duration::from_millis(2));
+            Ok(())
+        },
+    )
 }
 
 fn codex_writer_arguments(
@@ -3205,6 +3349,25 @@ mod tests {
             &current,
             false
         ));
+    }
+
+    #[test]
+    fn only_a_process_given_the_listener_to_serve_is_its_provider() {
+        let socket = Path::new("/tmp/cagents-codex-x/control.sock");
+        for provider in [
+            &b"codex\0app-server\0--listen\0unix:///tmp/cagents-codex-x/control.sock\0"[..],
+            b"codex\0app-server\0--listen=unix:///tmp/cagents-codex-x/control.sock\0",
+        ] {
+            assert!(serves_listener(socket, provider));
+        }
+        // Naming the directory, or even the socket, is not serving it.
+        for other in [
+            &b"ls\0/tmp/cagents-codex-x\0"[..],
+            b"tail\0unix:///tmp/cagents-codex-x/control.sock\0",
+            b"codex\0--listen\0unix:///tmp/cagents-codex-x/control.sock.old\0",
+        ] {
+            assert!(!serves_listener(socket, other));
+        }
     }
 }
 
