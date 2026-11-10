@@ -3891,10 +3891,27 @@ fn an_owner_answers_and_interrupts_only_its_own_active_run() {
     let [asked] = asked.as_slice() else {
         panic!("{asked:?}")
     };
-    assert_eq!(
-        status(&host, &owner, agent).unwrap().1.state,
-        State::Waiting
-    );
+    // Requests can become visible in the actor before its activity observer
+    // commits the corresponding run state to the registry.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let waiting = loop {
+        let (_, latest) = status(&host, &owner, agent).unwrap();
+        assert_eq!(latest.id, accepted.run.id, "another run replaced the owner");
+        assert!(
+            !latest.state.is_terminal(),
+            "the permission request's run settled before waiting: {latest:?}"
+        );
+        if latest.state == State::Waiting {
+            break latest;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the permission request's run never waited: {latest:?}; requests: {:?}",
+            process(&host, owner.clone(), Operation::Requests(agent))
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(waiting.state, State::Waiting);
     let error = control(answer(&asked.id, "always", Vec::new())).unwrap_err();
     assert!(error.contains("accepts the actions allow, deny"), "{error}");
     let error = control(answer(
