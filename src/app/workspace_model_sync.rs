@@ -3934,6 +3934,37 @@ mod tests {
     }
 
     #[test]
+    fn repository_refresh_projects_managed_adoptions_outside_its_repository() {
+        let (mut app, agent, pane, destination) = managed_display_fixture();
+        let mut original_only = app.workspace_model.clone();
+        original_only.views.clear();
+        let display =
+            crate::workspace_model::views::managed_display(&original_only, &agent).unwrap();
+        assert!(app.adopt_execution_agent_display(&agent, display).is_some());
+        app.shared_views.initialize(
+            crate::workspace_model::views::Scope::Channel(destination),
+            vec![pane.clone()],
+        );
+        let actor = app.card_state(pane.id).unwrap().kind.clone();
+        assert_ne!(app.card_state(pane.id).unwrap().title, pane.title);
+        drop(app.reconcile_workspace_model_for_repository(Path::new("/unrelated")));
+        let current = app.card_state(pane.id).unwrap();
+        assert_eq!(current.kind, actor);
+        assert_eq!(current.title, pane.title);
+        assert_eq!(current.width_fraction, pane.width_fraction);
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .any(|channel| channel.id == destination && channel.cards.contains(&pane.id))
+        );
+        assert!(matches!(
+            app.cards.get(&pane.id),
+            Some(CardRuntime::Loading)
+        ));
+    }
+
+    #[test]
     fn observed_managed_terminal_exit_projects_without_live_adoption_or_relaunch() {
         for relaunch_available in [false, true] {
             let (mut app, agent, mut pane, destination) = managed_display_fixture();
