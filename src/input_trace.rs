@@ -16,7 +16,9 @@ use cosmic::iced::advanced::{
     Clipboard, Layout, Shell, Widget, input_method, layout, overlay, renderer,
     widget::{Operation, Tree},
 };
-use cosmic::iced::{Event, Length, Point, Rectangle, Size, Vector, keyboard, mouse, time::Instant};
+use cosmic::iced::{
+    Event, Length, Point, Rectangle, Size, Vector, keyboard, mouse, time::Instant, touch,
+};
 use cosmic::{Element, Renderer, Theme};
 
 /// How long the pointer must stay over a resize handle, or a dragged pane
@@ -69,6 +71,9 @@ struct Sample {
     /// When a key or a mouse button was last pressed, or an input method
     /// last changed what it is composing.
     pressed: Option<Instant>,
+    /// The latest user interaction, including scrolling and touch, without
+    /// input-method lifecycle events that automatic focus can produce.
+    interacted: Option<Instant>,
     /// Whether an input method holds uncommitted text, which moving keyboard
     /// focus would take out from under the person writing it.
     composing: bool,
@@ -78,6 +83,17 @@ impl InputTrace {
     /// Records one event the window delivered.
     pub(crate) fn record(&self, event: &Event) {
         let mut sample = self.0.get();
+        let interacted = matches!(
+            event,
+            Event::Mouse(mouse::Event::ButtonPressed(_) | mouse::Event::WheelScrolled { .. })
+                | Event::Keyboard(keyboard::Event::KeyPressed { .. })
+                | Event::Touch(touch::Event::FingerPressed { .. })
+        ) || matches!(event,
+            Event::InputMethod(input_method::Event::Preedit(text, _) | input_method::Event::Commit(text))
+                if !text.is_empty());
+        if interacted {
+            sample.interacted = Some(Instant::now());
+        }
         match event {
             Event::Mouse(mouse::Event::CursorMoved { position }) => {
                 // An overlay and the content beneath it can both see one
@@ -109,6 +125,9 @@ impl InputTrace {
                 };
                 sample.pressed = Some(Instant::now());
             }
+            // Wheel and touch input do not change the hover-press record,
+            // but their interaction timestamp still has to reach the trace.
+            _ if interacted => {}
             _ => return,
         }
         self.0.set(sample);
@@ -137,6 +156,17 @@ impl InputTrace {
             .get()
             .pressed
             .is_some_and(|pressed| pressed >= instant)
+    }
+
+    /// Whether the window received a mouse press, scroll, key press, touch
+    /// press or nonempty input-method text at or after `instant`.
+    /// Pointer motion and input-method activation alone do not count.
+    #[must_use]
+    pub fn interacted_since(&self, instant: Instant) -> bool {
+        self.0
+            .get()
+            .interacted
+            .is_some_and(|interacted| interacted >= instant)
     }
 }
 
@@ -433,6 +463,59 @@ mod tests {
         )));
         assert!(trace.pressed_since(before));
         assert!(!trace.pressed_since(Instant::now() + std::time::Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn interaction_includes_scrolling_keys_touch_and_composed_text() {
+        for event in [
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            Event::Mouse(mouse::Event::WheelScrolled {
+                delta: mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 },
+            }),
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Enter),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            }),
+            Event::Touch(touch::Event::FingerPressed {
+                id: touch::Finger(1),
+                position: Point::ORIGIN,
+            }),
+            Event::InputMethod(input_method::Event::Preedit("に".into(), None)),
+            Event::InputMethod(input_method::Event::Commit("に".into())),
+        ] {
+            let trace = InputTrace::default();
+            let before = Instant::now();
+            assert!(!trace.interacted_since(before));
+            trace.record(&event);
+            assert!(trace.interacted_since(before), "{event:?}");
+            assert!(!trace.interacted_since(Instant::now() + std::time::Duration::from_secs(1)));
+        }
+    }
+
+    #[test]
+    fn passive_input_method_events_and_pointer_motion_are_not_interaction() {
+        let trace = InputTrace::default();
+        let before = Instant::now();
+        for event in [
+            moved(1.0),
+            Event::InputMethod(input_method::Event::Opened),
+            Event::InputMethod(input_method::Event::Preedit(String::new(), None)),
+            Event::InputMethod(input_method::Event::Commit(String::new())),
+            Event::InputMethod(input_method::Event::Closed),
+        ] {
+            trace.record(&event);
+            assert!(!trace.interacted_since(before), "{event:?}");
+        }
+        assert!(
+            trace.pressed_since(before),
+            "the existing hover-press semantics still include input-method lifecycle events"
+        );
+        assert_eq!(trace.previous_position(), None);
     }
 
     #[test]

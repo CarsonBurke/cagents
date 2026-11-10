@@ -4694,6 +4694,7 @@ pub enum Message {
     ChannelWork(crate::channel_work_ui::Action),
     OpenChannelWork(ChannelId),
     ChannelWorkNavigation(channel_work::Navigation),
+    ChannelWorkRestoreExpired(uuid::Uuid),
     ChannelWorkPoll,
     ChannelWorkEscape,
     AutomationApproval(automation_approval::Action),
@@ -5472,7 +5473,13 @@ impl Cagents {
 
     fn focus_workspace_card(&mut self, id: CardId) -> Task<Message> {
         match self.workspace.focus(id) {
-            Ok(update) => self.apply_viewport(update, true, DurableChange::None),
+            Ok(update) => {
+                let restore = self.abandon_channel_work_restore();
+                Task::batch([
+                    restore,
+                    self.apply_viewport(update, true, DurableChange::None),
+                ])
+            }
             Err(error) => {
                 self.status = Some(TransientNotice::error(error.to_string()));
                 Task::none()
@@ -13901,36 +13908,40 @@ impl Cagents {
     /// somewhere it is not visible moves it here instead of taking the user
     /// away from their work to wherever it was last opened.
     fn open_utility_card(&mut self, kind: CardKind) -> Task<Message> {
-        debug_assert!(kind.is_utility());
-        let Some(id) = self.utility_card(&kind) else {
-            return self.add_utility_card(kind);
-        };
-        // The pane is on its way out and cannot take focus; asking for it
-        // again means the user wants it after all, so it comes back as soon
-        // as the close lands rather than the request being lost.
-        if self
-            .workspace
-            .pending_close()
-            .is_some_and(|handoff| handoff.unmounting == id)
-        {
-            self.reopen_utility = Some(kind);
-            return Task::none();
-        }
-        let rehome = if self.workspace.order().any(|card| card == id) {
-            Task::none()
-        } else {
-            self.rehome_utility_card(id)
-        };
-        let focus = match self.workspace.focus(id) {
-            // Focusing also hands the pane the keyboard, even when it was
-            // already the focused card.
-            Ok(update) => self.apply_viewport(update, true, DurableChange::None),
-            Err(error) => {
-                self.status = Some(TransientNotice::error(error.to_string()));
-                Task::none()
+        let restore = self.abandon_channel_work_restore();
+        let open = (|| {
+            debug_assert!(kind.is_utility());
+            let Some(id) = self.utility_card(&kind) else {
+                return self.add_utility_card(kind);
+            };
+            // The pane is on its way out and cannot take focus; asking for it
+            // again means the user wants it after all, so it comes back as soon
+            // as the close lands rather than the request being lost.
+            if self
+                .workspace
+                .pending_close()
+                .is_some_and(|handoff| handoff.unmounting == id)
+            {
+                self.reopen_utility = Some(kind);
+                return Task::none();
             }
-        };
-        Task::batch([rehome, focus])
+            let rehome = if self.workspace.order().any(|card| card == id) {
+                Task::none()
+            } else {
+                self.rehome_utility_card(id)
+            };
+            let focus = match self.workspace.focus(id) {
+                // Focusing also hands the pane the keyboard, even when it was
+                // already the focused card.
+                Ok(update) => self.apply_viewport(update, true, DurableChange::None),
+                Err(error) => {
+                    self.status = Some(TransientNotice::error(error.to_string()));
+                    Task::none()
+                }
+            };
+            Task::batch([rehome, focus])
+        })();
+        Task::batch([restore, open])
     }
 
     fn add_utility_card(&mut self, kind: CardKind) -> Task<Message> {
@@ -15091,6 +15102,7 @@ impl Application for Cagents {
                     app.repository_load_task(project.repository, Some(project.id), false)
                 }),
         );
+        app.finish_window_restore();
         let task = Task::batch(tasks);
         let chrome = app.sync_chrome();
         (app, Task::batch([task, chrome]))
@@ -15122,6 +15134,7 @@ impl Application for Cagents {
             message => (message, false),
         };
         let notice_control = self.notice_control_severity();
+        let restore_before = self.cancel_stale_channel_work_restore();
         let attention_scope_changed = matches!(
             &message,
             Message::RepositoryLoaded { result: Ok(_), .. }
@@ -18411,6 +18424,7 @@ impl Application for Cagents {
             Message::ChannelWork(action) => self.update_channel_work(action),
             Message::OpenChannelWork(channel) => self.open_channel_work(channel),
             Message::ChannelWorkNavigation(navigation) => self.channel_navigation(navigation),
+            Message::ChannelWorkRestoreExpired(token) => self.expire_channel_work_restore(token),
             Message::ChannelWorkEscape => self.escape_channel_work(),
             Message::ChannelWorkPoll => self.channel_work.view.refresh().map_or_else(Task::none, |effect| self.channel_work_effect(effect)),
             Message::GitUi(action) => self.update_git(action),
@@ -18831,7 +18845,15 @@ impl Application for Cagents {
         let visibility = self.sync_visible_attention();
         self.sync_notification_presence();
         let keyboard = self.settle_owed_keyboard();
-        Task::batch([task, activation, visibility, keyboard])
+        let restore_after = self.cancel_stale_channel_work_restore();
+        Task::batch([
+            restore_before,
+            task,
+            activation,
+            visibility,
+            keyboard,
+            restore_after,
+        ])
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -19732,7 +19754,6 @@ impl Application for Cagents {
             surface,
             self.workspace.is_animating() || self.context_inspector_transition.is_some(),
         );
-        let surface = crate::input_trace::observe(surface, &self.input_trace);
         let surface = crate::file_drop::surface(surface, self.core.scale_factor());
         let surface = crate::reorder::channel_scope(
             surface,
@@ -19749,6 +19770,7 @@ impl Application for Cagents {
                 channel,
             },
         );
+        let surface = crate::input_trace::observe(surface, &self.input_trace);
         #[cfg(feature = "latency-harness")]
         return latency_ui::instrument(
             surface,

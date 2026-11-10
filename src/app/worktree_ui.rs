@@ -370,7 +370,8 @@ impl Cagents {
     /// when the user opens it from the sidebar. The switch is saved with the
     /// next save, or within [`NAVIGATION_SAVE_DELAY`].
     pub(super) fn navigate_to_channel(&mut self, id: ChannelId) -> Task<Message> {
-        self.show_channel(id, DurableChange::Navigation)
+        let restore = self.abandon_channel_work_restore();
+        Task::batch([restore, self.show_channel(id, DurableChange::Navigation)])
     }
 
     fn show_channel(&mut self, id: ChannelId, change: DurableChange) -> Task<Message> {
@@ -728,7 +729,11 @@ impl Cagents {
     /// saved with the next save, or within [`NAVIGATION_SAVE_DELAY`]; a
     /// default pane opened for an empty worktree saves itself.
     pub(super) fn navigate_to_worktree(&mut self, path: PathBuf) -> Task<Message> {
-        self.show_worktree(path, true, DurableChange::Navigation).1
+        let restore = self.abandon_channel_work_restore();
+        Task::batch([
+            restore,
+            self.show_worktree(path, true, DurableChange::Navigation).1,
+        ])
     }
 
     fn show_worktree(
