@@ -13,10 +13,10 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    ModelChannel, ModelEdit,
+    ModelChannel, ModelEdit, ModelProject, NavigationOrder,
     views::{self, Change, Scope, View},
 };
-use crate::model::CardId;
+use crate::model::{AgentId, CardId, ChannelId};
 
 /// One scope's revision before and after an edit.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,12 +28,9 @@ pub struct ViewRevision {
     pub after: Option<u64>,
 }
 
-/// Everything an applied edit changed that the edit alone does not determine.
-///
-/// Empty for an edit that changed no view, no channel row beyond what it
-/// names, and no agent. An `AgentsChanged` edge also carries nothing: the
-/// execution service changes views as it adopts, rebinds and retires agents,
-/// and the subscriber reads the whole model for it.
+/// Canonical rows and view revisions changed by one committed edit.
+/// Metadata that the request cannot determine (assigned ranks, conditional
+/// titles, merged navigation and execution state) travels with the edit.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct EditEffects {
     /// Every scope whose revision the edit changed, created or deleted. A
@@ -48,9 +45,15 @@ pub struct EditEffects {
     /// title, and a conversation title suggestion is conditional on the
     /// stored title.
     pub channels: Vec<ModelChannel>,
+    pub projects: Vec<ModelProject>,
+    pub removed_projects: Vec<std::path::PathBuf>,
+    pub removed_channels: Vec<ChannelId>,
+    /// The complete changed order; an empty list restores automatic ordering.
+    pub navigation_orders: Vec<NavigationOrder>,
     /// Agent records as the edit left them: transferring an agent's pane moves
     /// the agent's placement with it.
     pub agents: Vec<crate::agent_execution::Agent>,
+    pub removed_agents: Vec<AgentId>,
 }
 
 impl EditEffects {
@@ -58,24 +61,44 @@ impl EditEffects {
         self.views.is_empty()
             && self.closed.is_empty()
             && self.channels.is_empty()
+            && self.projects.is_empty()
+            && self.removed_projects.is_empty()
+            && self.removed_channels.is_empty()
+            && self.navigation_orders.is_empty()
+            && self.removed_agents.is_empty()
             && self.agents.is_empty()
     }
+}
+
+/// A write acknowledgment containing only the state that edit changed.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EditReceipt {
+    pub identity: uuid::Uuid,
+    pub sequence: u64,
+    pub effects: EditEffects,
 }
 
 /// The views of one edge, as complete views rather than as an edit.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ViewChanges {
+    /// Highest model snapshot sequence read while resolving these scopes.
+    /// The observer also sets this to the edge sequence for derived views.
+    pub sequence: u64,
+    /// Exact query sequences for views resolved by individual scoped reads.
+    pub observed: HashMap<Scope, u64>,
     /// Each changed scope's complete view after the edge. A view a subscriber
     /// already holds at a later revision is newer than this one.
     pub views: Vec<View>,
     /// Scopes the edge deleted, with the revision they had. A view held at a
     /// later revision is a later incarnation of the scope and stays.
     pub removed: Vec<(Scope, u64)>,
+    /// A scope read found no row at this exact model sequence.
+    pub absent: Vec<(Scope, u64)>,
 }
 
 impl ViewChanges {
     pub fn is_empty(&self) -> bool {
-        self.views.is_empty() && self.removed.is_empty()
+        self.views.is_empty() && self.removed.is_empty() && self.absent.is_empty()
     }
 }
 
@@ -95,17 +118,29 @@ pub struct Applied {
 /// without one, and the scope is read rather than guessed.
 #[derive(Debug, Default)]
 pub struct Mirror {
+    identity: Option<uuid::Uuid>,
     views: HashMap<Scope, View>,
 }
 
 impl Mirror {
     pub fn new(views: &[View]) -> Self {
         Self {
+            identity: None,
             views: views
                 .iter()
                 .map(|view| (view.scope.clone(), view.clone()))
                 .collect(),
         }
+    }
+
+    pub fn for_model(model: &super::WorkspaceModel) -> Self {
+        let mut mirror = Self::new(&model.views);
+        mirror.identity = Some(model.identity);
+        mirror
+    }
+
+    pub fn identity(&self) -> Option<uuid::Uuid> {
+        self.identity
     }
 
     pub fn revision(&self, scope: &Scope) -> Option<u64> {
@@ -139,12 +174,18 @@ impl Mirror {
                         Some(held) if held <= before => {
                             self.views.remove(&revision.scope);
                         }
-                        Some(_) => applied.changes.views.push(self.views[&revision.scope].clone()),
+                        Some(_) => applied
+                            .changes
+                            .views
+                            .push(self.views[&revision.scope].clone()),
                         None => {}
                     }
                 }
                 (_, Some(after)) if held.is_some_and(|held| held >= after) => {
-                    applied.changes.views.push(self.views[&revision.scope].clone());
+                    applied
+                        .changes
+                        .views
+                        .push(self.views[&revision.scope].clone());
                 }
                 (_, Some(after)) => changed.push((revision, after)),
                 (None, None) => {}
@@ -251,6 +292,24 @@ impl Mirror {
         Some(views)
     }
 
+    /// Installs a scoped query's result with its exact consistency sequence.
+    /// Absence uses that sequence rather than this mirror's old view revision:
+    /// another connection may already have delivered a newer view to the UI.
+    pub fn install_at(&mut self, scope: Scope, view: Option<View>, sequence: u64) -> ViewChanges {
+        if view.is_none() {
+            self.views.remove(&scope);
+            return ViewChanges {
+                sequence,
+                absent: vec![(scope, sequence)],
+                ..Default::default()
+            };
+        }
+        let mut changes = self.install(scope.clone(), view);
+        changes.sequence = sequence;
+        changes.observed.insert(scope, sequence);
+        changes
+    }
+
     /// Records a scope as read, unless this copy already holds it at a later
     /// revision. Returns what the subscriber should install: the newest view
     /// this copy holds, or the removal of the one it held.
@@ -264,12 +323,18 @@ impl Mirror {
                     self.views.insert(scope.clone(), view);
                 }
                 ViewChanges {
+                    sequence: 0,
+                    observed: HashMap::new(),
                     views: vec![self.views[&scope].clone()],
                     removed: Vec::new(),
+                    absent: Vec::new(),
                 }
             }
             None => ViewChanges {
+                sequence: 0,
+                observed: HashMap::new(),
                 views: Vec::new(),
+                absent: Vec::new(),
                 removed: self
                     .views
                     .remove(&scope)

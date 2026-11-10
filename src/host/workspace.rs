@@ -1,7 +1,7 @@
 //! Workspace SQL owns its own serialized connection. HostState is borrowed only
 //! for resident admission, subscription and publication, never for layout SQL.
 use super::{
-    model::{Applied, Registry},
+    model::{Applied, DeltaApplied, Registry},
     state::{ClientId, SharedHost},
 };
 use crate::{
@@ -55,6 +55,38 @@ pub(super) fn snapshot(
     registry.model().map_err(unavailable)
 }
 
+/// Initial closed-identity inventory is read in the model's WAL snapshot.
+pub(super) fn subscriber_snapshot(
+    host: &SharedHost,
+    watcher: Option<ClientId>,
+) -> Result<(WorkspaceModel, Vec<CardId>), ProtocolError> {
+    let writer = {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let writer = state
+            .workspace_registry
+            .clone()
+            .ok_or_else(|| unavailable("The workspace model writer is unavailable"))?;
+        if let Some(watcher) = watcher {
+            state.subscribe_model(watcher);
+        }
+        writer
+    };
+    writer
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .subscriber_snapshot()
+        .map_err(unavailable)
+}
+
+pub(super) fn metadata(
+    host: &SharedHost,
+    query: crate::workspace_model::metadata::Query,
+) -> Result<crate::workspace_model::metadata::Reply, ProtocolError> {
+    let writer = writer(host)?;
+    let registry = writer.lock().unwrap_or_else(|p| p.into_inner());
+    registry.metadata(query).map_err(unavailable)
+}
+
 /// One scope and the model sequence it is consistent with.
 pub(super) fn view(
     host: &SharedHost,
@@ -68,11 +100,11 @@ pub(super) fn view(
 /// Called by the request handler while it retains shared control admission.
 /// Explicit close and automatic retention need exclusive admission to reserve
 /// retirement, so the resident check stays valid through commit/publication.
-pub(super) fn edit(
+pub(super) fn edit_delta(
     host: &SharedHost,
     origin: ClientId,
     edit: ModelEdit,
-) -> Result<WorkspaceModel, ProtocolError> {
+) -> Result<crate::workspace_model::delta::EditReceipt, ProtocolError> {
     let edit = edit
         .canonicalized()
         .map_err(|error| ProtocolError::new(ProtocolErrorCode::InvalidRequest, error, false))?;
@@ -80,35 +112,85 @@ pub(super) fn edit(
     // Always acquire this mutex outside HostState. Retain it through
     // publication so concurrent layout requests publish in commit order.
     let mut registry = writer.lock().unwrap_or_else(|p| p.into_inner());
+    flush_execution_changes(host, &mut registry)?;
     {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         state.ensure_view_retention_available(&edit)?;
         if matches!(&edit, ModelEdit::SuggestConversationTitle { .. }) {
             // Inference authorizes against current resident chat metadata.
             // Preserve its original identity/SQL guard; this is not a pane edit.
-            return state.edit_model(origin, edit);
+            return state.edit_model_delta(origin, edit);
         }
     }
-    let applied = apply(&mut registry, &edit)?;
+    let applied = apply_delta(&mut registry, &edit)?;
     if applied.changed {
         let waiting = Instant::now();
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let acquired = Instant::now();
-        state.announce_model_edit(origin, applied.sequence, &edit, &applied.effects);
+        state.announce_model_edit(
+            origin,
+            applied.receipt.sequence,
+            &edit,
+            &applied.receipt.effects,
+        );
         drop(state);
         tracing::debug!(
             operation = "workspace-model-edit",
-            sequence = applied.sequence,
+            sequence = applied.receipt.sequence,
             host_lock_wait_us = acquired.duration_since(waiting).as_micros() as u64,
             host_lock_hold_us = acquired.elapsed().as_micros() as u64,
             "Published a workspace model edit"
         );
     }
-    Ok(applied.model)
+    Ok(applied.receipt)
+}
+
+fn flush_execution_changes(
+    host: &SharedHost,
+    registry: &mut Registry,
+) -> Result<(), ProtocolError> {
+    // Execution mutations commit on this connection too. Publish their pending
+    // inventory before a public transaction clears its own trigger inventory.
+    let (sequence, effects) = registry.execution_delta().map_err(unavailable)?;
+    if !effects.is_empty() {
+        host.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .announce_model_edit(
+                super::agent_execution::EXECUTION_CLIENT,
+                sequence,
+                &ModelEdit::AgentsChanged,
+                &effects,
+            );
+    }
+    Ok(())
+}
+
+/// Older CLI clients retain their original whole-model reply. Current windows
+/// use `edit_delta`, which never constructs this snapshot.
+pub(super) fn edit(
+    host: &SharedHost,
+    origin: ClientId,
+    edit: ModelEdit,
+) -> Result<WorkspaceModel, ProtocolError> {
+    edit_delta(host, origin, edit)?;
+    snapshot(host, None)
 }
 
 /// Shared public-edit validation also serves the guarded title path.
 pub(super) fn apply(registry: &mut Registry, edit: &ModelEdit) -> Result<Applied, ProtocolError> {
+    let applied = apply_delta(registry, edit)?;
+    Ok(Applied {
+        model: registry.model().map_err(unavailable)?,
+        sequence: applied.receipt.sequence,
+        changed: applied.changed,
+        effects: applied.receipt.effects,
+    })
+}
+
+pub(super) fn apply_delta(
+    registry: &mut Registry,
+    edit: &ModelEdit,
+) -> Result<DeltaApplied, ProtocolError> {
     if let ModelEdit::ChangeView {
         scope,
         expected_revision,
@@ -139,7 +221,7 @@ pub(super) fn apply(registry: &mut Registry, edit: &ModelEdit) -> Result<Applied
             }
         }
     }
-    registry.apply(edit).map_err(|error| {
+    registry.apply_delta(edit).map_err(|error| {
         if error == Registry::VIEW_SOURCE_CONFLICT || error == Registry::VIEW_REVISION_CONFLICT {
             return ProtocolError::new(ProtocolErrorCode::ViewConflict, error, true);
         }
@@ -177,7 +259,7 @@ pub(super) fn pending_terminal(
     pane: CardId,
     terminal_id: TerminalId,
 ) -> Result<PendingTerminal, ProtocolError> {
-    for view in registry.model().map_err(unavailable)?.views {
+    if let Some(view) = registry.pane_view(pane).map_err(unavailable)? {
         for candidate in view.panes {
             if candidate.id == pane
                 && let CardKind::Terminal(session) = &candidate.kind
@@ -220,11 +302,15 @@ pub(super) fn complete_terminal(
             pane,
         },
     };
-    match registry.apply(&edit) {
+    if let Err(error) = flush_execution_changes(host, registry) {
+        tracing::warn!(%terminal_id, ?error, "could not publish pending execution changes");
+        return;
+    }
+    match registry.apply_delta(&edit) {
         Ok(applied) if applied.changed => host
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .announce_model_edit(0, applied.sequence, &edit, &applied.effects),
+            .announce_model_edit(0, applied.receipt.sequence, &edit, &applied.receipt.effects),
         Ok(_) => {}
         Err(error) => {
             tracing::warn!(%terminal_id, %error, "could not finish automatic terminal reservation")

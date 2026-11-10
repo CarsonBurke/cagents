@@ -134,7 +134,10 @@ fn view_edits_are_derived_from_the_edge_without_reading() {
             .collect::<Vec<_>>(),
         vec![(Scope::Channel(a), true), (Scope::Channel(b), false)]
     );
-    assert!(effects.closed.is_empty(), "a transferred pane is not closed");
+    assert!(
+        effects.closed.is_empty(),
+        "a transferred pane is not closed"
+    );
 
     // And back, into a destination that now exists.
     let back = edit(
@@ -149,7 +152,11 @@ fn view_edits_are_derived_from_the_edge_without_reading() {
     let (effects, reads) = subscriber.follow(&mut r, &back);
     assert_eq!(reads, vec![]);
     assert_eq!(effects.views.len(), 2);
-    assert_eq!(subscriber.reads, vec![Scope::Channel(a)], "only the seed was read");
+    assert_eq!(
+        subscriber.reads,
+        vec![Scope::Channel(a)],
+        "only the seed was read"
+    );
 }
 
 #[test]

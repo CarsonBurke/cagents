@@ -69,13 +69,19 @@ fn an_edge_applies_only_to_the_revision_it_was_made_against() {
     );
     // Revisions come from one clock, so 5 -> 9 is one edit, not four.
     let mut mirror = Mirror::new(&[view(&scope, 5, vec![first.clone()])]);
-    let applied = mirror.apply(&insert, &effects(vec![revised(&scope, Some(5), Some(9))], vec![]));
+    let applied = mirror.apply(
+        &insert,
+        &effects(vec![revised(&scope, Some(5), Some(9))], vec![]),
+    );
     assert_eq!(
         applied,
         Applied {
             changes: ViewChanges {
+                sequence: 0,
+                observed: HashMap::new(),
                 views: vec![view(&scope, 9, vec![first.clone(), second.clone()])],
                 removed: vec![],
+                absent: vec![],
             },
             unresolved: vec![],
         }
@@ -84,7 +90,10 @@ fn an_edge_applies_only_to_the_revision_it_was_made_against() {
 
     // An edge made against a revision this copy never held is read instead.
     let mut behind = Mirror::new(&[view(&scope, 4, vec![first.clone()])]);
-    let applied = behind.apply(&insert, &effects(vec![revised(&scope, Some(5), Some(9))], vec![]));
+    let applied = behind.apply(
+        &insert,
+        &effects(vec![revised(&scope, Some(5), Some(9))], vec![]),
+    );
     assert_eq!(applied.unresolved, vec![scope.clone()]);
     assert!(applied.changes.is_empty());
     assert_eq!(behind.revision(&scope), Some(4), "nothing is guessed");
@@ -103,7 +112,10 @@ fn a_scope_the_edit_created_or_a_seed_is_read_rather_than_derived() {
             before: None,
         },
     );
-    let applied = mirror.apply(&insert, &effects(vec![revised(&scope, None, Some(3))], vec![]));
+    let applied = mirror.apply(
+        &insert,
+        &effects(vec![revised(&scope, None, Some(3))], vec![]),
+    );
     assert_eq!(applied.unresolved, vec![scope.clone()]);
 
     let mut mirror = Mirror::new(&[view(&scope, 3, vec![])]);
@@ -112,7 +124,10 @@ fn a_scope_the_edit_created_or_a_seed_is_read_rather_than_derived() {
         panes: vec![pane()],
         closed: vec![],
     };
-    let applied = mirror.apply(&seed, &effects(vec![revised(&scope, Some(3), Some(4))], vec![]));
+    let applied = mirror.apply(
+        &seed,
+        &effects(vec![revised(&scope, Some(3), Some(4))], vec![]),
+    );
     assert_eq!(applied.unresolved, vec![scope]);
 }
 
@@ -226,7 +241,10 @@ fn a_read_installs_the_newest_view_or_the_removal() {
     let scope = Scope::Channel(ChannelId::new());
     let mut mirror = Mirror::new(&[view(&scope, 6, vec![])]);
     let read = view(&scope, 8, vec![pane()]);
-    assert_eq!(mirror.install(scope.clone(), Some(read.clone())).views, vec![read.clone()]);
+    assert_eq!(
+        mirror.install(scope.clone(), Some(read.clone())).views,
+        vec![read.clone()]
+    );
     // A read cannot rewind what an edge already brought further.
     let older = view(&scope, 7, vec![]);
     assert_eq!(mirror.install(scope.clone(), Some(older)).views, vec![read]);

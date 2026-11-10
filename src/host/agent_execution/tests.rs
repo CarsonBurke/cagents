@@ -3034,8 +3034,9 @@ fn edges_through(
     let queue = Arc::clone(watcher);
     std::thread::spawn(move || {
         while let Some(queued) = queue.pop() {
-            if let crate::terminal_ipc::ServerMessage::WorkspaceModelEdited { sequence, edit, .. } =
-                queued.message
+            if let crate::terminal_ipc::ServerMessage::WorkspaceModelEdited {
+                sequence, edit, ..
+            } = queued.message
                 && sender.send((sequence, edit)).is_err()
             {
                 return;

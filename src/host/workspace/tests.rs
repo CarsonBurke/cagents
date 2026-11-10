@@ -20,6 +20,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod delta_delivery_tests;
+
 fn fixture() -> (tempfile::TempDir, SharedHost, Arc<DeliveryQueue>) {
     let directory = tempfile::tempdir().unwrap();
     let mut state = HostState::new(HostSessionProof {
@@ -181,9 +183,12 @@ fn watching_before_snapshot_cannot_lose_a_concurrent_execution_writer_edge() {
     let edit = open_project(directory.path());
     let applied = execution.apply(&edit);
     if let Ok(applied) = &applied {
-        host.lock()
-            .unwrap()
-            .announce_model_edit(1, applied.model.sequence, &edit, &applied.effects);
+        host.lock().unwrap().announce_model_edit(
+            1,
+            applied.model.sequence,
+            &edit,
+            &applied.effects,
+        );
     }
     resume.send(()).unwrap();
     let observed = observer.join().unwrap().unwrap();

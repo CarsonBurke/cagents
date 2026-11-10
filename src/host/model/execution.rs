@@ -2233,6 +2233,219 @@ mod tests {
     };
 
     #[test]
+    fn execution_delta_carries_acceptance_and_run_transition_without_model_read() {
+        let (mut registry, _, request) = fixture();
+        registry.discard_execution_delta().unwrap();
+        let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+        let (sequence, effects) = registry.execution_delta().unwrap();
+        assert_eq!(sequence, registry.execution_sequence().unwrap());
+        assert_eq!(effects.agents, vec![accepted.agent.clone()]);
+        assert_eq!(effects.channels.len(), 1);
+        assert_eq!(effects.channels[0].id, accepted.agent.channel().unwrap());
+        assert!(effects.views.is_empty());
+        assert!(registry.execution_delta().unwrap().1.is_empty());
+
+        registry
+            .update_agent_run(
+                accepted.run.id,
+                accepted.run.revision,
+                Update::Started {
+                    provider_key: "delta-fixture".into(),
+                },
+                2,
+            )
+            .unwrap();
+        let (next, effects) = registry.execution_delta().unwrap();
+        assert!(next > sequence);
+        assert_eq!(effects.agents, vec![accepted.agent]);
+        assert!(effects.views.is_empty());
+        assert!(effects.channels.is_empty());
+        assert!(registry.execution_delta().unwrap().1.is_empty());
+    }
+
+    fn delta_pane_fixture() -> (
+        Registry,
+        tempfile::TempDir,
+        Accepted,
+        HostedSession,
+        crate::workspace_model::views::Scope,
+    ) {
+        use crate::{
+            model::{CardId, CardKind},
+            workspace_model::views::{Pane, Scope},
+        };
+        let (mut registry, directory, request) = fixture();
+        let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+        let source = source();
+        registry
+            .bind_agent(accepted.agent.id, None, source.clone())
+            .unwrap();
+        let scope = Scope::Channel(accepted.agent.channel().unwrap());
+        let kind = match &source {
+            HostedSession::Chat(chat) => CardKind::Chat(chat.clone()),
+            HostedSession::Terminal(terminal) => CardKind::Terminal(terminal.clone()),
+        };
+        registry
+            .apply(&ModelEdit::SeedView {
+                scope: scope.clone(),
+                panes: vec![Pane {
+                    id: CardId::from_uuid(accepted.agent.id.as_uuid()),
+                    title: "Delta fixture".into(),
+                    user_title: None,
+                    width_fraction: 0.5,
+                    pending_terminal_start: false,
+                    kind,
+                    scope: None,
+                }],
+                closed: vec![],
+            })
+            .unwrap();
+        registry.discard_execution_delta().unwrap();
+        (registry, directory, accepted, source, scope)
+    }
+
+    #[test]
+    fn execution_delta_inventory_is_connection_local_and_reads_current_snapshot() {
+        let (mut registry, directory, request) = fixture();
+        let mut execution = registry.execution_connection().unwrap();
+        let accepted = execution.submit_agent(&Origin::User, &request, 1).unwrap();
+        let public_channel = ChannelId::new();
+        registry
+            .apply(&ModelEdit::CreateChannel {
+                id: public_channel,
+                repository: directory.path().into(),
+                title: "Other connection".into(),
+                title_source: Default::default(),
+            })
+            .unwrap();
+        let (sequence, effects) = execution.execution_delta().unwrap();
+        assert_eq!(sequence, registry.execution_sequence().unwrap());
+        assert_eq!(effects.channels.len(), 1);
+        assert_eq!(effects.channels[0].id, accepted.agent.channel().unwrap());
+        assert_eq!(effects.agents, vec![accepted.agent]);
+        assert!(registry.execution_delta().unwrap().1.is_empty());
+    }
+
+    #[test]
+    fn execution_delta_scope_delete_and_recreate_keeps_logical_revision_basis() {
+        let (mut registry, _, accepted, _, scope) = delta_pane_fixture();
+        let before = registry.view_revision(&scope).unwrap();
+        let channel = accepted.agent.channel().unwrap();
+        let tx = registry.db.transaction().unwrap();
+        tx.execute(
+            "DELETE FROM view_scopes WHERE channel=?1",
+            [channel.to_string()],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO view_scopes(channel,revision) VALUES(?1,?2)",
+            params![channel.to_string(), before + 1],
+        )
+        .unwrap();
+        tx.execute("UPDATE metadata SET sequence=sequence+1 WHERE key=0", [])
+            .unwrap();
+        tx.commit().unwrap();
+        let (_, effects) = registry.execution_delta().unwrap();
+        assert_eq!(
+            effects.views,
+            vec![crate::workspace_model::delta::ViewRevision {
+                scope,
+                before: Some(before),
+                after: Some(before + 1),
+            }]
+        );
+        assert_eq!(
+            effects.closed,
+            vec![crate::model::CardId::from_uuid(accepted.agent.id.as_uuid())]
+        );
+    }
+
+    #[test]
+    fn execution_delta_retirement_carries_scope_revision_closed_id_and_removed_agent() {
+        let (mut registry, _, accepted, source, scope) = delta_pane_fixture();
+        let before = registry.view_revision(&scope).unwrap();
+        assert!(registry.retire_agent_process(&source, 3).unwrap());
+        let (_, effects) = registry.execution_delta().unwrap();
+        assert_eq!(
+            effects.closed,
+            vec![crate::model::CardId::from_uuid(accepted.agent.id.as_uuid())]
+        );
+        assert_eq!(effects.removed_agents, vec![accepted.agent.id]);
+        assert!(effects.agents.is_empty());
+        assert_eq!(
+            effects.views,
+            vec![crate::workspace_model::delta::ViewRevision {
+                scope: scope.clone(),
+                before: Some(before),
+                after: Some(registry.view_revision(&scope).unwrap()),
+            }]
+        );
+        assert!(effects.views[0].after.unwrap() > before);
+        assert!(registry.execution_delta().unwrap().1.is_empty());
+    }
+
+    #[test]
+    fn execution_delta_rolls_back_with_failed_retirement() {
+        let (mut registry, _, _, source, scope) = delta_pane_fixture();
+        let before = registry.view_snapshot(&scope).unwrap();
+        registry
+            .db
+            .execute_batch(
+                "CREATE TEMP TRIGGER refuse_delta_close
+            BEFORE UPDATE ON agents WHEN NEW.closed=1 BEGIN
+            SELECT RAISE(ABORT,'delta fixture refuses close'); END;",
+            )
+            .unwrap();
+        assert!(
+            registry
+                .retire_agent_process(&source, 3)
+                .unwrap_err()
+                .contains("delta fixture")
+        );
+        assert_eq!(registry.view_snapshot(&scope).unwrap(), before);
+        assert!(registry.execution_delta().unwrap().1.is_empty());
+        registry
+            .db
+            .execute_batch("DROP TRIGGER refuse_delta_close")
+            .unwrap();
+        assert!(registry.retire_agent_process(&source, 4).unwrap());
+        assert!(!registry.execution_delta().unwrap().1.is_empty());
+    }
+
+    #[test]
+    fn execution_delta_rebinds_only_the_changed_scope_and_agent() {
+        let (mut registry, _, accepted, source, scope) = delta_pane_fixture();
+        registry.stop_agent_process(&source, 2).unwrap();
+        registry.discard_execution_delta().unwrap();
+        let before = registry.view_revision(&scope).unwrap();
+        let HostedSession::Chat(previous) = source else {
+            unreachable!()
+        };
+        let mut successor = previous.clone();
+        successor.id = crate::model::TerminalId::new();
+        assert!(registry.adopt_successor(&previous, &successor).unwrap());
+        let (_, effects) = registry.execution_delta().unwrap();
+        assert!(effects.closed.is_empty());
+        assert!(effects.removed_agents.is_empty());
+        assert_eq!(
+            effects.views,
+            vec![crate::workspace_model::delta::ViewRevision {
+                scope: scope.clone(),
+                before: Some(before),
+                after: Some(registry.view_revision(&scope).unwrap()),
+            }]
+        );
+        assert_eq!(
+            effects.agents,
+            vec![registry.agent(accepted.agent.id).unwrap()]
+        );
+        assert_eq!(
+            effects.agents[0].session,
+            Some(HostedSession::Chat(successor))
+        );
+    }
+
+    #[test]
     fn unstarted_automation_close_requires_exact_failed_dispatch_and_no_custody() {
         for case in [
             "unstarted",

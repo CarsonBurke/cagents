@@ -24,6 +24,141 @@ const AGENT_REPLY: &str = "cagents::agent_execution::Reply";
 const AUTOMATION_RESPONSE: &str = "cagents::automations::Response";
 const SERVER_MESSAGE: &str = "cagents::terminal::ipc::ServerMessage";
 
+#[test]
+fn workspace_delta_requests_and_receipts_round_trip_as_framed_messages() {
+    use crate::{
+        model::{CardId, ChannelId, HostSessionProof},
+        terminal_ipc::{read_frame, write_frame},
+        workspace_model::{
+            ModelEdit,
+            delta::{EditEffects, EditReceipt, ViewRevision},
+            views::{Change, Scope},
+        },
+    };
+
+    let scope = Scope::Channel(ChannelId::new());
+    let closed = CardId::new();
+    let edit = ModelEdit::ChangeView {
+        scope: scope.clone(),
+        expected_revision: 7,
+        operation: uuid::Uuid::new_v4(),
+        change: Change::Remove { id: closed },
+    };
+    let proof = HostSessionProof {
+        host_session_id: "workspace-wire".into(),
+        boot_id: "boot".into(),
+        host_incarnation: "incarnation".into(),
+    };
+    for request in [
+        ClientRequest::ReadWorkspaceMetadata {
+            query: crate::workspace_model::metadata::Query::Identity,
+        },
+        ClientRequest::ReadWorkspaceMetadata {
+            query: crate::workspace_model::metadata::Query::Projects,
+        },
+        ClientRequest::ReadWorkspaceMetadata {
+            query: crate::workspace_model::metadata::Query::Agents,
+        },
+        ClientRequest::ReadWorkspaceSnapshot,
+        ClientRequest::ReadWorkspaceView {
+            scope: scope.clone(),
+        },
+        ClientRequest::ApplyWorkspaceEdit { edit },
+    ] {
+        let mut frame = Vec::new();
+        write_frame(
+            &mut frame,
+            &ClientEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: 41,
+                proof: Some(proof.clone()),
+                request: request.clone(),
+            },
+        )
+        .unwrap();
+        let decoded: ClientEnvelope = read_frame(&mut frame.as_slice()).unwrap().unwrap();
+        assert_eq!(decoded.request, request);
+        assert_eq!(decoded.request_id, 41);
+        assert_eq!(decoded.version, PROTOCOL_VERSION);
+        assert_eq!(decoded.proof, Some(proof.clone()));
+    }
+
+    use crate::workspace_model::metadata::Reply;
+    let identity = uuid::Uuid::new_v4();
+    for metadata in [
+        Reply::Identity(identity),
+        Reply::Projects {
+            identity,
+            projects: vec![],
+        },
+        Reply::Agents {
+            identity,
+            agents: vec![],
+        },
+    ] {
+        let mut frame = Vec::new();
+        write_frame(
+            &mut frame,
+            &ServerEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: Some(41),
+                proof: proof.clone(),
+                message: ServerMessage::Response {
+                    response: ServerResponse::WorkspaceMetadata(metadata.clone()),
+                },
+            },
+        )
+        .unwrap();
+        let decoded: ServerEnvelope = read_frame(&mut frame.as_slice()).unwrap().unwrap();
+        assert_eq!(decoded.proof, proof);
+        assert_eq!(decoded.request_id, Some(41));
+        let ServerMessage::Response {
+            response: ServerResponse::WorkspaceMetadata(decoded),
+        } = decoded.message
+        else {
+            panic!("metadata response")
+        };
+        assert_eq!(decoded, metadata);
+    }
+
+    let receipt = EditReceipt {
+        identity: uuid::Uuid::new_v4(),
+        sequence: 12,
+        effects: EditEffects {
+            views: vec![ViewRevision {
+                scope,
+                before: Some(7),
+                after: Some(12),
+            }],
+            closed: vec![closed],
+            ..Default::default()
+        },
+    };
+    let mut frame = Vec::new();
+    write_frame(
+        &mut frame,
+        &ServerEnvelope {
+            version: PROTOCOL_VERSION,
+            request_id: Some(41),
+            proof,
+            message: ServerMessage::Response {
+                response: ServerResponse::WorkspaceEdit(receipt.clone()),
+            },
+        },
+    )
+    .unwrap();
+    let decoded: ServerEnvelope = read_frame(&mut frame.as_slice()).unwrap().unwrap();
+    assert_eq!(decoded.version, PROTOCOL_VERSION);
+    assert_eq!(decoded.request_id, Some(41));
+    let ServerMessage::Response {
+        response: ServerResponse::WorkspaceEdit(decoded),
+    } = decoded.message
+    else {
+        panic!("a correlated workspace delta receipt was expected");
+    };
+    assert_eq!(decoded, receipt);
+}
+
 fn fixture(protocol: u16) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/wire-formats")
@@ -312,7 +447,8 @@ fn every_older_client_is_proven_against_its_recorded_format() {
             [
                 (client.protocol < FIRING_WITH_SKIPPED_OCCURRENCES)
                     .then_some((AUTOMATION_RESPONSE, FIRING_REPLIES)),
-                (client.protocol < MODEL_EDGES_WITH_EFFECTS).then_some((SERVER_MESSAGE, MODEL_EDGES)),
+                (client.protocol < MODEL_EDGES_WITH_EFFECTS)
+                    .then_some((SERVER_MESSAGE, MODEL_EDGES)),
             ]
             .into_iter()
             .flatten()

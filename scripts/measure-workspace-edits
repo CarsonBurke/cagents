@@ -1,0 +1,169 @@
+#!/usr/bin/python3 -I
+"""Measure native workspace edit receipts and UI-thread work in a private fixture.
+
+Build the matched app and examples/workspace-edit-workload through cargo-gate,
+start two native-evidence windows with the same generated seed and synthetic
+busy chats, then run this through `native-evidence env scripts/bounded ...`.
+This does not start providers or compile. It samples only fixture processes.
+"""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import sqlite3
+import subprocess
+import threading
+import time
+
+
+def stat(pid, main=False):
+    process = Path('/proc') / str(pid)
+    base = process / 'task' / str(pid) if main else process
+    fields = (base / 'stat').read_text().rsplit(')', 1)[1].split()
+    schedule = [int(value) for value in (base / 'schedstat').read_text().split()]
+    status = {}
+    for line in (base / 'status').read_text().splitlines():
+        key, value = line.split(':', 1)
+        if key in ('VmRSS', 'Threads', 'voluntary_ctxt_switches', 'nonvoluntary_ctxt_switches'):
+            status[key] = int(value.split()[0])
+    return dict(pid=pid, start=int(fields[19]), ticks=int(fields[11]) + int(fields[12]),
+                run_ns=schedule[0], wait_ns=schedule[1], slices=schedule[2], **status)
+
+
+def fixture_processes(root):
+    result = []
+    for process in Path('/proc').iterdir():
+        if not process.name.isdecimal():
+            continue
+        try:
+            executable = os.readlink(process / 'exe')
+            name = Path(executable).name
+            if name not in ('cagents-ui', 'cagentsd'):
+                continue
+            environment = (process / 'environ').read_bytes().split(b'\0')
+            if f'HOME={root}/home'.encode() not in environment:
+                continue
+            result.append((int(process.name), name, executable))
+        except (OSError, ValueError):
+            continue
+    return sorted(result)
+
+
+def pressure():
+    return {name: Path('/proc/pressure', name).read_text() for name in ('cpu', 'memory', 'io')}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--binary', required=True, type=Path)
+    parser.add_argument('--root', required=True, type=Path)
+    parser.add_argument('--side', required=True, choices=('before', 'after'))
+    parser.add_argument('--log', type=Path, action='append', required=True, help='One trace per UI window; repeat to capture both.')
+    parser.add_argument('--output', required=True, type=Path, help='New directory outside the fixture.')
+    parser.add_argument('--edits', type=int, default=200)
+    parser.add_argument('--drain-timeout', type=float, default=180, help='Seconds for both windows to persist the final pane title.')
+    parser.add_argument('--interval-ms', type=int, default=100)
+    arguments = parser.parse_args()
+    root = arguments.root.resolve(strict=True)
+    task = root.parent
+    if root.name != 'fixture' or not (task / '.native-evidence').is_file():
+        parser.error('--root must be a native-evidence task fixture')
+    if not os.environ.get('CAGENTS_BOUNDED'):
+        parser.error('run under scripts/bounded so the driver and sampler have an owner and deadline')
+    if not 1 <= arguments.edits <= 2000 or not 20 <= arguments.interval_ms <= 10000:
+        parser.error('use 1-2000 edits and a 20-10000 ms interval')
+    if not 0 < arguments.drain_timeout <= 600:
+        parser.error('--drain-timeout must be positive and at most 600 seconds')
+    if len(arguments.log) != 2 or len(set(path.resolve() for path in arguments.log)) != 2:
+        parser.error('give two distinct --log paths, one for each UI window')
+    output = arguments.output.resolve()
+    if output == root or root in output.parents:
+        parser.error('--output must be outside the fixture that start restores')
+    output.mkdir(parents=True, exist_ok=False)
+    processes = fixture_processes(root)
+    ui_pids = [pid for pid, name, _ in processes if name == 'cagents-ui']
+    if len(ui_pids) != 2:
+        parser.error(f'two fixture UI windows must be running; found {len(ui_pids)}')
+    command = [str(arguments.binary.resolve(strict=True)), str(root), str(arguments.edits), str(arguments.interval_ms)]
+    facts = dict(uname=list(os.uname()), hz=os.sysconf('SC_CLK_TCK'), processes=processes,
+                 pressure_before=pressure(), command=command)
+    (output / 'facts.json').write_text(json.dumps(facts, indent=2) + '\n')
+    logs = arguments.log
+    positions = [(log, log.stat().st_size) for log in logs]
+    stop = threading.Event()
+    samples = []
+
+    def sample():
+        while not stop.is_set():
+            started = time.monotonic_ns()
+            row = dict(time_ns=started, processes=[])
+            for pid, name, _ in processes:
+                try:
+                    row['processes'].append(dict(name=name, process=stat(pid), main=stat(pid, True)))
+                except OSError as error:
+                    row['processes'].append(dict(pid=pid, error=str(error)))
+            row['sampling_ns'] = time.monotonic_ns() - started
+            samples.append(row)
+            stop.wait(0.1)
+
+    outcome = dict(started_ns=time.monotonic_ns(), started_wall_ns=time.time_ns())
+    target_pane = None
+    sampler = threading.Thread(target=sample)
+    sampler.start()
+    try:
+        with (output / 'edits.jsonl').open('w') as records, (output / 'edits.stderr').open('w') as errors:
+            child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=errors, text=True)
+            for line in child.stdout:
+                record = json.loads(line)
+                if record.get('event') == 'begin':
+                    target_pane = record['pane']
+                if record.get('event') in ('begin', 'end'):
+                    event = record['event']
+                    outcome[f'{event}_ns'] = time.monotonic_ns()
+                    outcome[f'{event}_wall_ns'] = time.time_ns()
+                records.write(line)
+                records.flush()
+            outcome['status'] = child.wait()
+        if outcome['status'] == 0 and target_pane:
+            instance = os.environ.get('CAGENTS_DEVELOPMENT_INSTANCE')
+            namespace = 'cagents-development' + (f'-{instance}' if instance else '')
+            data = Path(os.environ['XDG_DATA_HOME']) / namespace
+            stores = [data / 'sessions.sqlite3', data / 'windows/window-2/sessions.sqlite3']
+            pending = set(range(len(stores)))
+            deadline = time.monotonic() + arguments.drain_timeout
+            while pending and time.monotonic() < deadline:
+                for index in sorted(pending):
+                    try:
+                        with sqlite3.connect(stores[index].as_uri() + '?mode=ro', uri=True, timeout=0.1) as database:
+                            found = database.execute('SELECT title FROM cards WHERE card_id = ?', [target_pane]).fetchone()
+                        if found == (f'Measurement {arguments.edits - 1}',):
+                            pending.remove(index)
+                            outcome[f'window_{index + 1}_converged_ns'] = time.monotonic_ns()
+                            outcome[f'window_{index + 1}_converged_wall_ns'] = time.time_ns()
+                    except sqlite3.Error:
+                        pass
+                if pending:
+                    time.sleep(0.1)
+            outcome['unconverged_windows'] = sorted(index + 1 for index in pending)
+            outcome['drained_ns'] = time.monotonic_ns()
+            outcome['drained_wall_ns'] = time.time_ns()
+            if pending:
+                outcome['status'] = 1
+        time.sleep(1)
+    finally:
+        stop.set()
+        sampler.join()
+    outcome.update(ended_ns=time.monotonic_ns(), pressure_after=pressure())
+    (output / 'proc.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in samples))
+    for index, (log, position) in enumerate(positions):
+        with log.open('rb') as source:
+            source.seek(position)
+            (output / f'ui-trace-{index + 1}.log').write_bytes(source.read())
+    (output / 'outcome.json').write_text(json.dumps(outcome, indent=2) + '\n')
+    print(json.dumps(dict(output=str(output), status=outcome['status'], samples=len(samples), ui_pids=ui_pids)))
+    raise SystemExit(outcome['status'])
+
+
+if __name__ == '__main__':
+    main()

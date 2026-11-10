@@ -216,14 +216,18 @@ use crate::{
 /// the gated `Member` with them. It also appends `ServerMessage::ChatLimit`,
 /// which reaches every chat subscriber unasked. 157 to 159 are reserved for
 /// parallel branches and are not adopted here.
-/// Version 161 adds the effects of an edit to `WorkspaceModelEdited`: each
+/// Version 161 is reserved for the channel-work removal in #2475.
+/// Version 162 records the initial stage-4 source contract.
+/// Version 163 records the initial subscriber snapshot contract.
+/// Version 164 is reserved for shared chat metadata.
+/// Version 165 adds the effects of an edit to `WorkspaceModelEdited`: each
 /// scope's revision before and after it, the panes it closed and the channel
 /// and agent rows it changed, so a window applies a view edge to its copy
 /// instead of reading the whole model. It appends `ReadWorkspaceView` and its
 /// `WorkspaceView` reply for the one scope a window cannot apply an edge to.
 /// The edge changed shape in place, so an older client is refused the watch
 /// that delivers it.
-pub const PROTOCOL_VERSION: u16 = 161;
+pub const PROTOCOL_VERSION: u16 = 165;
 /// The install candidate line's protocol. Every message an update exchanges
 /// with its daemon (Connect, the upgrade preview and preparation, and the
 /// inspector's frozen and saved-history requests) has this release's
@@ -607,6 +611,16 @@ pub enum ClientRequest {
     ReadWorkspaceView {
         scope: crate::workspace_model::views::Scope,
     },
+    /// Commit an edit and return only its authoritative effects.
+    ApplyWorkspaceEdit {
+        edit: crate::workspace_model::ModelEdit,
+    },
+    /// Read a reconnect baseline including closed identities, without subscribing.
+    ReadWorkspaceSnapshot,
+    /// Read only the metadata needed for an ownership or identity check.
+    ReadWorkspaceMetadata {
+        query: crate::workspace_model::metadata::Query,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -968,6 +982,13 @@ pub enum ServerResponse {
         view: Option<crate::workspace_model::views::View>,
         sequence: u64,
     },
+    /// Initial subscriber state and the closed identities that fence adoption.
+    WorkspaceSnapshot {
+        model: crate::workspace_model::WorkspaceModel,
+        closed: Vec<crate::model::CardId>,
+    },
+    WorkspaceEdit(crate::workspace_model::delta::EditReceipt),
+    WorkspaceMetadata(crate::workspace_model::metadata::Reply),
 }
 
 /// The daemon's startup recovery, as [`ClientRequest::StartupState`] reports it.

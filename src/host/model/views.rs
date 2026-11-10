@@ -64,6 +64,7 @@ impl Recorder {
             closed: self.closed,
             channels,
             agents,
+            ..Default::default()
         })
     }
 }
@@ -552,13 +553,18 @@ pub(super) fn retire_agent(
     let id = crate::model::CardId::from_uuid(agent.id.as_uuid());
     view.apply(&Change::Remove { id })?;
     view.revision = store::next_revision(db)?;
-    // Its `AgentsChanged` edge carries no effects: a subscriber reads the
-    // whole model for it.
+    // The connection-local execution inventory captures this scope revision
+    // and closed identity in the same transaction as the retirement.
     write(db, &view, &mut Recorder::default())?;
     Ok(true)
 }
 
-pub(super) fn apply(
+#[cfg(test)]
+fn apply(transaction: &rusqlite::Transaction<'_>, edit: &ModelEdit) -> Result<bool, String> {
+    apply_recorded(transaction, edit, &mut Recorder::default())
+}
+
+pub(super) fn apply_recorded(
     transaction: &rusqlite::Transaction<'_>,
     edit: &ModelEdit,
     recorder: &mut Recorder,
@@ -640,7 +646,8 @@ pub(super) fn apply(
                     if destination == scope {
                         false
                     } else {
-                        let destination_existed = store::scope_id(transaction, destination)?.is_some();
+                        let destination_existed =
+                            store::scope_id(transaction, destination)?.is_some();
                         let destination_row = store::register(transaction, destination)?;
                         let mut target = read(transaction, destination)?;
                         let target_before = target.clone();
@@ -721,15 +728,11 @@ pub(super) fn apply(
             Some((_, target, _)) => target.panes.iter().map(|pane| pane.id).collect(),
             None => Vec::new(),
         };
-        recorder.closed.extend(
-            stored
-                .panes
-                .iter()
-                .map(|pane| pane.id)
-                .filter(|id| {
-                    !transferred.contains(id) && !view.panes.iter().any(|pane| pane.id == *id)
-                }),
-        );
+        recorder
+            .closed
+            .extend(stored.panes.iter().map(|pane| pane.id).filter(|id| {
+                !transferred.contains(id) && !view.panes.iter().any(|pane| pane.id == *id)
+            }));
         write_from(transaction, &stored, &view, recorder)?;
     }
     if let Some((before, target, existed)) = deferred_target {

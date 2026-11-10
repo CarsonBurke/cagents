@@ -429,7 +429,7 @@ fn prove_not_hosted_at(
     client.daemon_version().map_err(|_| UNREACHABLE)?;
     let terminals = client.list().map_err(|_| UNREACHABLE)?;
     let chats = client.list_chats().map_err(|_| UNREACHABLE)?;
-    let model = client.read_workspace_model().map_err(|_| UNREACHABLE)?;
+    let (_, agents) = client.read_workspace_agents().map_err(|_| UNREACHABLE)?;
     if terminals
         .iter()
         .any(|hosted| hosted.session.id == session.id)
@@ -457,8 +457,7 @@ fn prove_not_hosted_at(
         return Err("A conversation still uses this terminal, so the pane was kept. Close that conversation, then close this pane.".into());
     }
     // Removing the pane would leave an open agent with no way to show it.
-    if let Some(agent) = model
-        .agents
+    if let Some(agent) = agents
         .iter()
         .find(|agent| !agent.closed && agent_uses_terminal(agent, session.id))
     {
@@ -1664,12 +1663,14 @@ mod tests {
                             ClientRequest::ChatList => ServerResponse::ChatListed {
                                 sessions: inventory.chats.clone(),
                             },
-                            ClientRequest::ReadWorkspaceModel => ServerResponse::WorkspaceModel {
-                                model: crate::workspace_model::WorkspaceModel {
+                            ClientRequest::ReadWorkspaceMetadata {
+                                query: crate::workspace_model::metadata::Query::Agents,
+                            } => ServerResponse::WorkspaceMetadata(
+                                crate::workspace_model::metadata::Reply::Agents {
+                                    identity: uuid::Uuid::nil(),
                                     agents: inventory.agents.clone(),
-                                    ..Default::default()
                                 },
-                            },
+                            ),
                             other => panic!("a Close proof sent {other:?}"),
                         },
                     },

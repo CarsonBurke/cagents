@@ -122,6 +122,11 @@ pub(super) struct State {
     // Full snapshots advance view/agent authority. Metadata-only folds advance
     // the outer model sequence without supplying either of these collections.
     pub(super) snapshot_sequence: u64,
+    pub(super) scope_absences: HashMap<Scope, u64>,
+    pub(super) view_sequences: HashMap<Scope, u64>,
+    pub(super) metadata_revisions: HashMap<super::workspace_model_sync::MetadataKey, u64>,
+    /// Exact closed pane identities, retained across reconnects to this registry.
+    pub(super) closed: HashSet<CardId>,
     #[cfg(test)]
     local_projection_count: std::cell::Cell<usize>,
     /// The daemon answered this window without a shared model to give.
@@ -282,6 +287,17 @@ impl Cagents {
         {
             return Task::none();
         }
+        self.install_workspace_model_snapshot(model);
+        self.refuse_conflicting_view_change(scope, operation, change, error)
+    }
+
+    pub(super) fn refuse_conflicting_view_change(
+        &mut self,
+        scope: Scope,
+        operation: uuid::Uuid,
+        change: Change,
+        error: String,
+    ) -> Task<Message> {
         let repository = |model: &crate::workspace_model::WorkspaceModel, scope: &Scope| match scope
         {
             Scope::Channel(channel) => model
@@ -295,7 +311,6 @@ impl Cagents {
             .get(&operation)
             .filter(|(identity, _)| *identity == self.workspace_model.identity)
             .map(|(_, repository)| repository.clone());
-        self.install_workspace_model_snapshot(model);
         let Some(index) =
             self.shared_views
                 .pending
@@ -1259,6 +1274,9 @@ impl Cagents {
         {
             return true;
         }
+        if self.shared_views.closed.contains(&card) {
+            return true;
+        }
         let mut owners = self
             .workspace_model
             .views
@@ -1737,6 +1755,24 @@ impl Cagents {
             for (_, scope, change) in &self.shared_views.pending {
                 if *scope == view.scope && !matches!(change, Change::Transfer { .. }) {
                     let _ = view.apply(change);
+                }
+            }
+        }
+        // A scoped read or a deferred receipt may prove a close beyond the
+        // snapshot that supplied a descriptor. Exact closed identity wins over
+        // both that older descriptor and a pending local insertion overlay.
+        for view in &mut views {
+            let closed: Vec<_> = view
+                .panes
+                .iter()
+                .filter(|pane| self.shared_views.closed.contains(&pane.id))
+                .map(|pane| pane.id)
+                .collect();
+            view.panes
+                .retain(|pane| !self.shared_views.closed.contains(&pane.id));
+            for id in closed {
+                if !view.retired.contains(&id) {
+                    view.retired.push(id);
                 }
             }
         }
@@ -2537,7 +2573,8 @@ impl Cagents {
     /// `view` carries this window's pending edits over the canonical one, so a
     /// local close counts here as well as a peer's.
     fn pane_retired(&self, id: CardId, view: &View) -> bool {
-        view.retired.contains(&id)
+        self.shared_views.closed.contains(&id)
+            || view.retired.contains(&id)
             || self
                 .workspace_model
                 .views

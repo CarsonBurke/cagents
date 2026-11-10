@@ -89,7 +89,7 @@ fn read_lifecycle(
     if client.proof() != &activation.host {
         return Err(());
     }
-    if client.read_workspace_model().map_err(|_| ())?.identity != activation.registry {
+    if client.workspace_registry_identity().map_err(|_| ())? != activation.registry {
         return Err(());
     }
     // At SQLite's maximum sequence there cannot be a later receipt. The
@@ -112,7 +112,7 @@ fn read_lifecycle(
         crate::automations::Response::Audit(page) => page,
         _ => return Err(()),
     };
-    if client.read_workspace_model().map_err(|_| ())?.identity != activation.registry {
+    if client.workspace_registry_identity().map_err(|_| ())? != activation.registry {
         return Err(());
     }
     Ok(page)

@@ -774,6 +774,15 @@ impl HostState {
         origin: ClientId,
         edit: ModelEdit,
     ) -> Result<WorkspaceModel, ProtocolError> {
+        self.edit_model_delta(origin, edit)?;
+        self.registry()?.model().map_err(model_unavailable)
+    }
+
+    pub(crate) fn edit_model_delta(
+        &mut self,
+        origin: ClientId,
+        edit: ModelEdit,
+    ) -> Result<crate::workspace_model::delta::EditReceipt, ProtocolError> {
         self.ensure_view_retention_available(&edit)?;
         let edit = edit
             .canonicalized()
@@ -837,11 +846,16 @@ impl HostState {
                 _ => return Err(invalid()),
             }
         }
-        let applied = super::workspace::apply(self.registry()?, &edit)?;
+        let applied = super::workspace::apply_delta(self.registry()?, &edit)?;
         if applied.changed {
-            self.announce_model_edit(origin, applied.sequence, &edit, &applied.effects);
+            self.announce_model_edit(
+                origin,
+                applied.receipt.sequence,
+                &edit,
+                &applied.receipt.effects,
+            );
         }
-        Ok(applied.model)
+        Ok(applied.receipt)
     }
 
     fn registry(&mut self) -> Result<&mut super::model::Registry, ProtocolError> {

@@ -2,6 +2,7 @@
 
 - [Redraw scheduling](#redraw-scheduling)
 - [Activity spinner cost](#activity-spinner-cost)
+- [Workspace model edits](#workspace-model-edits)
 - [Native chat stage attribution](#native-chat-stage-attribution)
 - [Pane open](#pane-open)
 - [Terminal pipeline](#terminal-pipeline)
@@ -93,6 +94,69 @@ agent still costs about 3% of a core above idle in this build. Slowing
 unfocused spinners instead of stopping them costs little: an earlier revision
 that stopped them entirely measured 1.0-1.6% with another window focused
 (3 wakeups/s).
+
+## Workspace model edits
+
+Use the generated `realistic` workspace, two windows on the same fixture daemon,
+and synthetic busy chats to compare subscriber changes at a long-lived workspace's
+scale. Keep the seed, provider output, number of working chats, viewport, focus,
+edit count, interval and build profile the same on both sides. The generator is
+`scripts/fixture-workspace`; if it has not landed on the measured revision, seed
+with a generator build first and let that revision perform its ordinary store
+migration. Record both source revisions and the seed's store hashes.
+
+Use the runner for the matched development app. Build the edit driver
+separately through the gate:
+
+```sh
+scripts/cargo-gate build --locked --profile dev-runtime --no-default-features \
+  --features development --example workspace-edit-workload
+```
+
+Run both windows with `scripts/run-development --browserless --debug` inside
+one private headless harness session, selecting the second window with
+`-- --window window-2`. Give each runner its own `--log-file`. The app's
+`cagents::workspace_pipeline` debug target records inclusive wall time for each
+shared-model update, including its projection tail. Visible activity indicators
+also record redraw-event intervals, once per event on the UI thread. With the
+target disabled these paths read no clock and allocate nothing.
+
+Before measuring, verify the matched daemon reports the intended busy run count,
+that its resident capacity agrees, and that the processes are the fixture's
+synthetic providers under its own HOME and config directory. A requested spawn
+or an agent row alone does not prove a running provider. Keep one busy chat
+visible in each window and hold keyboard focus in the same window on both sides.
+
+In the fixture environment, sample the two UI processes while the matched edit
+driver sends a fixed number of metadata edits. For example, use the harness's
+`exec --keep-awake` around this command so its idle policy cannot suspend
+rendering partway through the sample:
+
+```sh
+scripts/bounded --ttl 300 --name workspace-edits -- scripts/measure-workspace-edits \
+  --root "$fixture" --side after --binary "$products/examples/workspace-edit-workload" \
+  --log "$task/logs/ui-after-1.log" --log "$task/logs/ui-after-2.log" \
+  --output "$task/measurement-after" --edits 200 --interval-ms 100
+```
+
+`measure-workspace-edits` refuses an unbounded run, an arbitrary workspace, or a
+fixture without exactly two UI processes. It records per-edit receipt times,
+monotonic boundaries, each UI main thread's CPU and runqueue counters, process
+CPU/RSS/thread counts, host pressure and sampler overhead. It also preserves
+both UI traces through the point where each window saves the final edited pane
+title. A bounded drain timeout fails the run when either window never converges.
+Keep the orchestration shell alive through
+the sample: `scripts/bounded` cleans up detached children when its command ends,
+whereas the runner's `--instance` launch returns as soon as its window maps.
+
+Report cumulative UI update wall time per requested edit and notification count
+for each window, as well as per-notification percentiles: a change can alter how
+many notifications an edit produces. Report main-thread CPU separately from
+inclusive wall time. Redraw-event intervals show event-loop cadence while a
+busy indicator is visible; they do not establish compositor presentation,
+scanout, or input latency. Fixture providers exercise the transport and native
+UI without a live model, and generated saved panes do not establish successful
+provider reattachment.
 
 ## Native chat stage attribution
 

@@ -180,6 +180,8 @@ fn may_release_retention(request: &ClientRequest) -> bool {
             | ClientRequest::ChatList
             | ClientRequest::ReadWorkspaceModel
             | ClientRequest::ReadWorkspaceView { .. }
+            | ClientRequest::ReadWorkspaceSnapshot
+            | ClientRequest::ReadWorkspaceMetadata { .. }
             | ClientRequest::ReadNotifications
     )
 }
@@ -1594,16 +1596,45 @@ pub(super) fn process_request(
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }
         ClientRequest::WatchWorkspaceModel => {
-            let model = super::workspace::snapshot(host, Some(client_id))?;
-            Ok((ServerResponse::WorkspaceModel { model }, Vec::new(), false))
+            let (model, closed) = super::workspace::subscriber_snapshot(host, Some(client_id))?;
+            Ok((
+                ServerResponse::WorkspaceSnapshot { model, closed },
+                Vec::new(),
+                false,
+            ))
         }
         ClientRequest::ReadWorkspaceModel => {
             let model = super::workspace::snapshot(host, None)?;
             Ok((ServerResponse::WorkspaceModel { model }, Vec::new(), false))
         }
+        ClientRequest::ReadWorkspaceMetadata { query } => {
+            let metadata = super::workspace::metadata(host, query)?;
+            Ok((
+                ServerResponse::WorkspaceMetadata(metadata),
+                Vec::new(),
+                false,
+            ))
+        }
+        ClientRequest::ReadWorkspaceSnapshot => {
+            let (model, closed) = super::workspace::subscriber_snapshot(host, None)?;
+            Ok((
+                ServerResponse::WorkspaceSnapshot { model, closed },
+                Vec::new(),
+                false,
+            ))
+        }
         ClientRequest::ReadWorkspaceView { scope } => {
             let (view, sequence) = super::workspace::view(host, &scope)?;
-            Ok((ServerResponse::WorkspaceView { view, sequence }, Vec::new(), false))
+            Ok((
+                ServerResponse::WorkspaceView { view, sequence },
+                Vec::new(),
+                false,
+            ))
+        }
+        ClientRequest::ApplyWorkspaceEdit { edit } => {
+            let receipt = super::workspace::edit_delta(host, client_id, edit)?;
+            crate::daemon::wake();
+            Ok((ServerResponse::WorkspaceEdit(receipt), Vec::new(), false))
         }
         ClientRequest::EditWorkspaceModel { edit } => {
             let model = super::workspace::edit(host, client_id, edit)?;

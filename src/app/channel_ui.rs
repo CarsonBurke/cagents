@@ -155,12 +155,11 @@ fn read_open_agents<'a>(
     client: &mut crate::control::ControlClient,
 ) -> Result<&'a [crate::agent_execution::Agent], String> {
     if agents.is_none() {
-        let model = client
-            .read_workspace_model()
+        let (_, open_agents) = client
+            .read_workspace_agents()
             .map_err(|error| error.to_string())?;
         *agents = Some(
-            model
-                .agents
+            open_agents
                 .into_iter()
                 .filter(|agent| !agent.closed)
                 .collect(),

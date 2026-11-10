@@ -1158,6 +1158,21 @@ impl std::hash::Hash for HostedTerminalSource {
     }
 }
 
+/// Inclusive UI-thread wall time for a shared-model notification, including
+/// dispatch and projection. This does not measure rendering or presentation.
+struct WorkspaceUpdateTiming(std::time::Instant);
+
+impl Drop for WorkspaceUpdateTiming {
+    fn drop(&mut self) {
+        tracing::debug!(
+            target: "cagents::workspace_pipeline",
+            stage = "ui_update",
+            elapsed_ns = self.0.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+            "Applied a shared workspace notification"
+        );
+    }
+}
+
 /// Shared workspace model updates, from the observer and publisher threads.
 #[derive(Clone)]
 struct WorkspaceModelSource(async_channel::Receiver<workspace_model_sync::ModelUpdate>);
@@ -15074,6 +15089,11 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        // Include dispatch and the shared projection tail. The trace is opt-in;
+        // an ordinary update does not read the clock or allocate.
+        let _workspace_timing = (matches!(&message, Message::WorkspaceModelObserved(_))
+            && tracing::enabled!(target: "cagents::workspace_pipeline", tracing::Level::DEBUG))
+        .then(|| WorkspaceUpdateTiming(std::time::Instant::now()));
         if let Some(settled) = self.settle_chat_close_confirm() {
             // An answer to the question that just ended must not answer the
             // next one, which the reader has not seen.

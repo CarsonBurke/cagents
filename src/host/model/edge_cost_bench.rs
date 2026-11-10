@@ -4,14 +4,14 @@
 //!
 //! ```text
 //! CAGENTS_STORE_COPY=/path/to/workspace-model.sqlite3 \
-//!     cargo test --release --no-default-features --features host --lib \
+//!     scripts/cargo-gate test --locked --release --no-default-features --features host --lib \
 //!     edge_cost_bench -- --ignored --nocapture --test-threads=1
 //! ```
 //!
 //! Each edit is measured both ways in one build. The full read is exactly what
-//! a window did for every view edge before edges carried their effects, and
-//! what it still does when it cannot apply one: the daemon reads the model, and
-//! both sides frame it. The delta is the edge with its effects, applied to the
+//! a window did for every view edge before edges carried their effects: the
+//! daemon reads the model, and both sides frame it. A revision gap now reads
+//! only the affected scope. The delta is the edge with its effects, applied to the
 //! window's copy of the views. Frames are encoded and decoded as on the socket;
 //! the socket itself and the window's reconcile, which both paths share, are
 //! not measured.
@@ -22,8 +22,8 @@ use crate::model::{
     BrowserId, BrowserRestoreFidelity, BrowserSession, CardId, CardKind, HostSessionProof,
 };
 use crate::terminal::ipc::{
-    ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage,
-    ServerResponse, read_frame, write_frame,
+    ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage, ServerResponse,
+    read_frame, write_frame,
 };
 use crate::workspace_model::{
     ModelEdit,
@@ -200,7 +200,11 @@ fn edge_cost_bench() {
         "bench views {} occupied {} panes {} agents {} channels {}; model frame {whole} bytes",
         model.views.len(),
         occupied.len(),
-        model.views.iter().map(|view| view.panes.len()).sum::<usize>(),
+        model
+            .views
+            .iter()
+            .map(|view| view.panes.len())
+            .sum::<usize>(),
         model.agents.len(),
         model.channels.len(),
     );

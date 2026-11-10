@@ -903,7 +903,78 @@ impl ControlClient {
     /// the subscription with the model itself, so there is no gap between
     /// subscribing and reading for an edit to fall into.
     pub fn watch_workspace_model(&mut self) -> Result<WorkspaceModel, ControlError> {
-        self.expect_model(ClientRequest::WatchWorkspaceModel)
+        self.watch_workspace_state().map(|(model, _)| model)
+    }
+
+    /// Subscribe and read the model and closed identities from one snapshot.
+    pub fn watch_workspace_state(
+        &mut self,
+    ) -> Result<(WorkspaceModel, Vec<crate::model::CardId>), ControlError> {
+        match self.request_strict(ClientRequest::WatchWorkspaceModel)? {
+            ServerResponse::WorkspaceSnapshot { model, closed } => Ok((model, closed)),
+            response => Err(unexpected_response("a workspace snapshot", &response)),
+        }
+    }
+
+    /// Read the same coherent baseline as a subscription, without a watch.
+    pub fn read_workspace_state(
+        &mut self,
+    ) -> Result<(WorkspaceModel, Vec<crate::model::CardId>), ControlError> {
+        match self.request_strict(ClientRequest::ReadWorkspaceSnapshot)? {
+            ServerResponse::WorkspaceSnapshot { model, closed } => Ok((model, closed)),
+            response => Err(unexpected_response("a workspace snapshot", &response)),
+        }
+    }
+
+    pub fn workspace_registry_identity(&mut self) -> Result<uuid::Uuid, ControlError> {
+        match self.request_strict(ClientRequest::ReadWorkspaceMetadata {
+            query: crate::workspace_model::metadata::Query::Identity,
+        })? {
+            ServerResponse::WorkspaceMetadata(
+                crate::workspace_model::metadata::Reply::Identity(identity),
+            ) => Ok(identity),
+            response => Err(unexpected_response(
+                "the workspace registry identity",
+                &response,
+            )),
+        }
+    }
+
+    pub fn read_workspace_projects(
+        &mut self,
+    ) -> Result<(uuid::Uuid, Vec<ModelProject>), ControlError> {
+        match self.request_strict(ClientRequest::ReadWorkspaceMetadata {
+            query: crate::workspace_model::metadata::Query::Projects,
+        })? {
+            ServerResponse::WorkspaceMetadata(
+                crate::workspace_model::metadata::Reply::Projects { identity, projects },
+            ) => Ok((identity, projects)),
+            response => Err(unexpected_response("workspace projects", &response)),
+        }
+    }
+
+    pub fn read_workspace_agents(
+        &mut self,
+    ) -> Result<(uuid::Uuid, Vec<crate::agent_execution::Agent>), ControlError> {
+        match self.request_strict(ClientRequest::ReadWorkspaceMetadata {
+            query: crate::workspace_model::metadata::Query::Agents,
+        })? {
+            ServerResponse::WorkspaceMetadata(
+                crate::workspace_model::metadata::Reply::Agents { identity, agents },
+            ) => Ok((identity, agents)),
+            response => Err(unexpected_response("workspace agents", &response)),
+        }
+    }
+
+    /// Commit an edit without reading or transporting unrelated model state.
+    pub fn apply_workspace_edit(
+        &mut self,
+        edit: ModelEdit,
+    ) -> Result<crate::workspace_model::delta::EditReceipt, ControlError> {
+        match self.request_strict(ClientRequest::ApplyWorkspaceEdit { edit })? {
+            ServerResponse::WorkspaceEdit(receipt) => Ok(receipt),
+            response => Err(unexpected_response("a workspace edit receipt", &response)),
+        }
     }
 
     pub fn watch_notifications(
@@ -2237,6 +2308,9 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::UpgradeChatResolved { .. } => "upgrade_chat_resolved",
         ServerResponse::WorkspaceModel { .. } => "workspace_model",
         ServerResponse::WorkspaceView { .. } => "workspace_view",
+        ServerResponse::WorkspaceSnapshot { .. } => "workspace_snapshot",
+        ServerResponse::WorkspaceEdit(_) => "workspace_edit",
+        ServerResponse::WorkspaceMetadata(_) => "workspace_metadata",
         ServerResponse::ChatResumePrepared { .. } => "chat_resume_prepared",
         ServerResponse::ChatUpdate { .. } => "chat_update",
         ServerResponse::ChatFileChanges { .. } => "chat_file_changes",
