@@ -1132,31 +1132,11 @@ enum Holds {
     /// Its agent's launch, or that launch's teardown, never confirmed how it
     /// ended.
     LaunchUnconfirmed,
-    /// A process of its provider survives the helper that controlled it,
-    /// with that helper and provider when they are known.
-    Running(Option<Survivors>),
+    /// A process of its provider survives the helper that controlled it.
+    /// [`lost_processes`] says which, and can end them.
+    Running,
     /// Nothing proves whether something of it still runs.
     Unproved,
-}
-
-/// The helper and provider whose processes outlived the helper. A process is
-/// still the conversation's while it is in the helper's session or the
-/// provider's process group (see `retained_actor_abandoned`). The helper
-/// leads its own session and its provider's group is part of it, so ending
-/// both sessions ends exactly what holds the conversation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Survivors {
-    helper: i32,
-    provider: i32,
-}
-
-impl Survivors {
-    fn of(owner: &crate::daemon::holder_registry::Record) -> Self {
-        Self {
-            helper: owner.holder.pid,
-            provider: owner.root.pid,
-        }
-    }
 }
 
 /// Why a Close of a conversation whose owner is gone was refused, and what
@@ -1169,17 +1149,8 @@ fn lost_execution_refusal(session: &Session, holds: Holds) -> String {
         Holds::LaunchUnconfirmed => format!(
             "{LOST_EXECUTION_UNPROVED}. Its agent's launch never confirmed whether {provider} started or stopped, so it and its agent were kept rather than leave {provider} running unseen."
         ),
-        Holds::Running(Some(Survivors { helper, provider: root })) => format!(
-            "{provider} is still running for this conversation, but the Cagents helper that controlled it is gone, so closing now would leave {provider} running unseen. End {provider} with `pkill -s {helper},{root}`, then close again."
-        ),
-        // Only Codex is found running with no owner: something still names or
-        // serves the conversation's listener.
-        Holds::Running(None) if session.launch.provider == Provider::Codex => format!(
-            "Codex is still running for this conversation, but the Cagents helper that controlled it is gone, so closing now would leave Codex running unseen. End Codex with `pkill -f cagents-codex-{}`, then close again.",
-            session.id
-        ),
-        Holds::Running(None) => format!(
-            "{provider} is still running for this conversation, but the Cagents helper that controlled it is gone, so closing now would leave {provider} running unseen. End what is left of it, then close again."
+        Holds::Running => format!(
+            "{provider} is still running for this conversation, but the Cagents helper that controlled it is gone, so the conversation was kept rather than leave {provider} running unseen."
         ),
         Holds::Unproved => format!(
             "{LOST_EXECUTION_UNPROVED}. Its Cagents helper is gone, and Cagents can't tell whether its {provider} process stopped, so it was kept rather than leave {provider} running unseen. After the computer restarts nothing of it can run, so closing it will work."
@@ -1191,8 +1162,9 @@ fn lost_execution_refusal(session: &Session, holds: Holds) -> String {
 /// its provider runs on, if that is what happened to `owner`.
 ///
 /// Nothing can ask that provider to stop any more: Release reaches only a
-/// closed channel, and settling would leave it running unseen. Close says so
-/// and how to end it, rather than report the dead channel's I/O error.
+/// closed channel, and settling would leave it running unseen. Close says so,
+/// rather than report the dead channel's I/O error, and [`lost_processes`]
+/// can end what is left.
 fn holder_lost_refusal(
     source: &Session,
     owner: &crate::daemon::holder_registry::Record,
@@ -1202,36 +1174,139 @@ fn holder_lost_refusal(
     {
         return Ok(None);
     }
-    Ok(Some(lost_execution_refusal(
-        source,
-        Holds::Running(Some(Survivors::of(owner))),
-    )))
+    Ok(Some(lost_execution_refusal(source, Holds::Running)))
 }
 
-/// Runs the command a refusal tells the person to run, as they would, and
-/// requires it to have ended something.
-#[cfg(test)]
-fn run_recovery_command(refusal: &str) {
-    let command = refusal
-        .split('`')
-        .nth(1)
-        .unwrap_or_else(|| panic!("the refusal names no command: {refusal}"));
-    let status = std::process::Command::new("/bin/sh")
-        .args(["-c", command])
-        .status()
-        .unwrap();
-    assert!(status.success(), "`{command}` ended nothing: {status}");
+/// [`holder_lost_refusal`] for any owner of this boot registered for
+/// `source`: its Codex holder, or a retained Claude helper.
+fn registered_holder_lost_refusal(
+    host: &SharedHost,
+    source: &Session,
+) -> Result<Option<String>, String> {
+    for owner in lost_owners(host, source)? {
+        if let Some(refusal) = holder_lost_refusal(source, &owner)? {
+            return Ok(Some(refusal));
+        }
+    }
+    Ok(None)
 }
 
-/// [`holder_lost_refusal`] for the native owner registered for `source`.
-fn registered_holder_lost_refusal(source: &Session) -> Result<Option<String>, String> {
+/// Every owner of this boot registered for `session`: its native Codex
+/// holder's discovery record and its retained Claude helpers.
+fn lost_owners(
+    host: &SharedHost,
+    session: &Session,
+) -> Result<Vec<crate::daemon::holder_registry::Record>, String> {
+    let boot = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .proof()
+        .boot_id
+        .clone();
+    let mut owners: Vec<crate::daemon::holder_registry::Record> =
+        registered_native_owner(session)?.into_iter().collect();
+    if let Ok(registry) = super::agent_execution::registry(host) {
+        owners.extend(
+            registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .native_actor_owners_of(session.id)?
+                .into_iter()
+                .map(|(owner, _)| owner),
+        );
+    }
+    owners.retain(|owner| owner.boot == boot);
+    owners.dedup();
+    Ok(owners)
+}
+
+fn registered_native_owner(
+    source: &Session,
+) -> Result<Option<crate::daemon::holder_registry::Record>, String> {
     use crate::daemon::holder_registry::{self as registry, Kind};
     let socket = registry::socket(&registry::directory(Kind::Native)?, source.id);
-    match registry::recovery_candidate(&socket, Kind::Native)? {
-        Some(owner) => holder_lost_refusal(source, &owner),
-        None => Ok(None),
-    }
+    registry::recovery_candidate(&socket, Kind::Native)
 }
+
+/// The processes still running for a conversation whose Cagents helper has
+/// died, which is why its Close was refused, and with `end`, ends those
+/// proved to be the conversation's first (see
+/// [`crate::daemon::lost_processes`]). The person closes it again afterwards.
+///
+/// A conversation's processes are those in a dead helper's session or its
+/// provider's process group, for every owner of this boot registered for it,
+/// and for Codex the provider named by its listener directory with its group:
+/// exactly what its Close counts. A conversation whose helper still runs has
+/// nothing here to end; its own Close stops it.
+pub(super) fn lost_processes(
+    host: &SharedHost,
+    session: &Session,
+    end: bool,
+) -> Result<Vec<crate::terminal::ipc::LostProcess>, String> {
+    // Ending holds the conversation as its Close does, so no start or handoff
+    // can put a new provider where the lost one ran meanwhile.
+    let _claim = if end {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if state.chat_handoffs.contains_key(&session.id)
+            || state.native_actor_startups.values().any(|startup| {
+                startup.source.id == session.id || startup.requested.id == session.id
+            })
+        {
+            return Err(lost_execution_refusal(session, Holds::InProgress));
+        }
+        Some(
+            capacity::Reservation::closing(host, &mut state, session)
+                .map_err(|_| lost_execution_refusal(session, Holds::InProgress))?,
+        )
+    } else {
+        None
+    };
+    let owners = lost_owners(host, session)?;
+    if owners.iter().any(|owner| owner.holder.is_current()) {
+        return Err(HELPER_STILL_RUNS.into());
+    }
+    let codex = session.launch.provider == Provider::Codex;
+    let census = || -> Result<Vec<crate::daemon::lost_processes::Survivor>, String> {
+        let mut found = Vec::new();
+        for owner in &owners {
+            found.extend(crate::daemon::lost_processes::census(
+                &owner.holder,
+                &owner.root,
+            )?);
+        }
+        if codex {
+            let providers = super::upgrade_inspect::codex_listener_providers(session.id)?;
+            if !providers.is_empty() {
+                found.extend(crate::daemon::lost_processes::listener_census(&providers)?);
+            }
+        }
+        // One process can be in an owner's session and name the listener;
+        // it is proved if either proves it.
+        found.sort_by_key(|survivor| (survivor.pid, !survivor.proved));
+        found.dedup_by_key(|survivor| survivor.pid);
+        Ok(found)
+    };
+    let found = if end {
+        crate::daemon::lost_processes::end(census)?
+    } else {
+        census()?
+    };
+    Ok(found
+        .into_iter()
+        // One that has exited is collected in a moment and needs nothing.
+        .filter(|survivor| !survivor.zombie)
+        .map(|survivor| crate::terminal::ipc::LostProcess {
+            pid: survivor.pid,
+            name: survivor.name,
+            command: survivor.command,
+            proved: survivor.proved,
+        })
+        .collect())
+}
+
+/// Why [`lost_processes`] ends nothing for a conversation whose helper runs.
+const HELPER_STILL_RUNS: &str =
+    "This conversation's Cagents helper is still running, so closing it stops it as usual.";
 
 /// The start of what a Close says when nothing proves a conversation whose
 /// owner is gone stopped.
@@ -1247,9 +1322,9 @@ pub(super) const SCHEDULED_AGENT: &str =
 /// nothing does.
 ///
 /// The owner is lost only when no start or handoff claims the conversation,
-/// no unconfirmed agent launch or startup cleanup is pending for it, no
-/// Codex close receipt names its terminal, and nothing of it can still run by
-/// the evidence an upgrade requires before replacing its service: no live
+/// no unconfirmed agent launch or startup cleanup is pending for it, and
+/// nothing of it can still run by the evidence an upgrade requires before
+/// replacing its service: no live
 /// holder record, and for Codex no process naming the conversation's
 /// listener and nothing bound or served where it listens, or for a retained
 /// Claude actor every registered owner gone with its process group and
@@ -1260,14 +1335,10 @@ fn what_holds(
     session: &Session,
     proof: &HostSessionProof,
 ) -> Result<Option<Holds>, String> {
-    // A receipt is exact cleanup's, including when it closed a conversation
-    // other than the one asked for. Exact cleanup has consumed any receipt of
-    // this one before it comes here, so this one names another descriptor of
-    // the terminal, which no close of this one consumes. Only a restart, which
-    // clears the runtime directory, says anything more.
-    if session.launch.provider == Provider::Codex && chat::native_holder::has_receipt(session.id)? {
-        return Ok(Some(Holds::Unproved));
-    }
+    // A receipt exact cleanup did not consume names another descriptor of
+    // the terminal. It confirms that one's close, and says nothing either way
+    // about this one, so it neither holds nor settles this Close: the evidence
+    // below does.
     {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         if state.chat_handoffs.contains_key(&session.id)
@@ -1305,22 +1376,7 @@ fn what_holds(
     use super::upgrade_inspect::ExecutionEnd;
     match super::upgrade_inspect::execution_end(session, &proof.boot_id, owners.clone()) {
         ExecutionEnd::Ended => {}
-        ExecutionEnd::Running => {
-            // The owner of this boot that left something running, for the
-            // person to end.
-            let survivors = owners.ok().and_then(|owners| {
-                owners
-                    .into_iter()
-                    .map(|(owner, _)| owner)
-                    .filter(|owner| owner.boot == proof.boot_id)
-                    .find(|owner| {
-                        crate::chat::runtime::retained_actor_abandoned(&owner.holder, &owner.root)
-                            .is_ok_and(|abandoned| !abandoned)
-                    })
-                    .map(|owner| Survivors::of(&owner))
-            });
-            return Ok(Some(Holds::Running(survivors)));
-        }
+        ExecutionEnd::Running => return Ok(Some(Holds::Running)),
         ExecutionEnd::Unproved => return Ok(Some(Holds::Unproved)),
     }
     match session
@@ -1331,7 +1387,7 @@ fn what_holds(
         Some(listener)
             if owned_listener::served(&listener.socket).map_err(|error| error.to_string())? =>
         {
-            Ok(Some(Holds::Running(None)))
+            Ok(Some(Holds::Running))
         }
         _ => Ok(None),
     }
@@ -3922,8 +3978,9 @@ pub(super) fn close_captured(
     ));
     if let Err(error) = handle.close_for_resume() {
         // Its Release failed. When that is because the helper died while the
-        // provider runs on, say what holds the conversation and how to end it.
-        let refusal = registered_holder_lost_refusal(&source).ok().flatten();
+        // provider runs on, say what holds the conversation; the pane offers
+        // to end it.
+        let refusal = registered_holder_lost_refusal(host, &source).ok().flatten();
         return Err(unavailable(refusal.unwrap_or(error)));
     }
     let snapshot = handle.snapshot(None).ok_or_else(|| {

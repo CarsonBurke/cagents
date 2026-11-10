@@ -735,6 +735,38 @@ fn codex_listener_survives(
     settle: Duration,
 ) -> Result<bool, String> {
     use std::os::unix::ffi::OsStrExt;
+    if !processes_naming_listener(processes, pane, settle, true)?.is_empty() {
+        return Ok(true);
+    }
+    let bound = std::fs::read(processes.join("net/unix"))
+        .map_err(|error| format!("Cannot inspect bound sockets: {error}"))?;
+    // The path is the last field, after the fixed-width columns.
+    Ok(bound.split(|byte| *byte == b'\n').skip(1).any(|line| {
+        sockets.iter().any(|socket| {
+            let socket = socket.as_os_str().as_bytes();
+            line.len() > socket.len()
+                && line.ends_with(socket)
+                && line[line.len() - socket.len() - 1] == b' '
+        })
+    }))
+}
+
+/// This user's processes that name a Codex pane's listener directory in their
+/// arguments: the conversation's provider, which a person closing it can end
+/// once its helper has gone (see [`crate::daemon::lost_processes`]).
+pub(super) fn codex_listener_providers(
+    pane: crate::model::TerminalId,
+) -> Result<Vec<crate::daemon::holder_registry::Process>, String> {
+    processes_naming_listener(Path::new("/proc"), pane, EXEC_SETTLE, false)
+}
+
+/// See [`codex_listener_survives`]; with `first`, stops at the first found.
+fn processes_naming_listener(
+    processes: &Path,
+    pane: crate::model::TerminalId,
+    settle: Duration,
+    first: bool,
+) -> Result<Vec<crate::daemon::holder_registry::Process>, String> {
     let marker = format!("cagents-codex-{pane}");
     let marker = marker.as_bytes();
     let uid = crate::daemon::current_uid().to_string();
@@ -754,15 +786,16 @@ fn codex_listener_survives(
     };
     let entries = std::fs::read_dir(processes)
         .map_err(|error| format!("Cannot enumerate processes: {error}"))?;
+    let mut named = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|error| format!("Cannot enumerate processes: {error}"))?;
-        if entry
+        let Some(pid) = entry
             .file_name()
             .to_str()
-            .is_none_or(|name| name.parse::<u32>().is_err())
-        {
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
             continue;
-        }
+        };
         let path = entry.path();
         // The effective user, not the owner of `/proc/<pid>`, which becomes
         // root for a process that made itself non-dumpable.
@@ -783,20 +816,23 @@ fn codex_listener_survives(
         if arguments(&path)?
             .is_some_and(|argv| argv.windows(marker.len()).any(|window| window == marker))
         {
-            return Ok(true);
+            if first {
+                named.push(crate::daemon::holder_registry::Process { pid, start: 0 });
+                break;
+            }
+            // Read after the arguments: an identity that changed meanwhile
+            // names a later process, which the next scan judges afresh.
+            let start = match std::fs::read(path.join("stat")) {
+                Ok(stat) => crate::model::agent_recovery::process_identity(&stat)
+                    .map(|(_, start)| start)
+                    .ok_or("A process has an unreadable identity")?,
+                Err(error) if gone(&error) => continue,
+                Err(error) => return Err(format!("Cannot inspect a process: {error}")),
+            };
+            named.push(crate::daemon::holder_registry::Process { pid, start });
         }
     }
-    let bound = std::fs::read(processes.join("net/unix"))
-        .map_err(|error| format!("Cannot inspect bound sockets: {error}"))?;
-    // The path is the last field, after the fixed-width columns.
-    Ok(bound.split(|byte| *byte == b'\n').skip(1).any(|line| {
-        sockets.iter().any(|socket| {
-            let socket = socket.as_os_str().as_bytes();
-            line.len() > socket.len()
-                && line.ends_with(socket)
-                && line[line.len() - socket.len() - 1] == b' '
-        })
-    }))
+    Ok(named)
 }
 
 /// A process or thread no longer found, or a thread whose id an `execve`

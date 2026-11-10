@@ -4626,8 +4626,21 @@ fn a_same_boot_claude_actor_killed_without_retirement_closes_once_nothing_surviv
             refused.contains("is still running for this conversation"),
             "{refused}"
         );
-        // The person ends it with the command it names.
-        super::run_recovery_command(&refused);
+        // The pane names it as the conversation's, and the person ends it
+        // from there.
+        let found = super::lost_processes(&successor, &confirmed, false).unwrap();
+        assert!(
+            found
+                .iter()
+                .any(|process| process.pid == pid && process.proved),
+            "{found:?}"
+        );
+        assert!(
+            super::lost_processes(&successor, &confirmed, true)
+                .unwrap()
+                .iter()
+                .all(|process| process.pid != pid)
+        );
         wait_until(
             || !Path::new(&format!("/proc/{pid}")).exists(),
             "the survivor never exited",

@@ -1406,7 +1406,7 @@ fn close_with_target(
                 {
                     return Err(super::lost_execution_refusal(
                         requested,
-                        super::Holds::Running(Some(super::Survivors::of(owner))),
+                        super::Holds::Running,
                     ));
                 }
                 Some(owner) if !chat::native_holder::retire_abandoned(owner)? => {}

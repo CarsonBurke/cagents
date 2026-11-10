@@ -312,15 +312,13 @@ fn a_provider_that_outlived_its_holder_keeps_the_refusal() {
     let fixture = Fixture::new(&root);
     let record = fixture.record(exited(i32::MAX - 1), current());
     let refusal = close_retained_from_pane(&fixture.host, &fixture.source).unwrap_err();
-    // It names what still runs and how to end it: everything left in the
-    // dead helper's session and the provider's.
+    // It says what still runs; the pane names the processes and ends them
+    // (see `lost_processes`), so it gives no command to run.
     assert!(
-        refusal.contains(&format!(
-            "`pkill -s {},{}`",
-            record.holder.pid, record.root.pid
-        )),
+        refusal.contains("Codex is still running for this conversation"),
         "{refusal}"
     );
+    assert!(!refusal.contains('`'), "{refusal}");
     assert_eq!(
         registry::recovery_candidate(
             &registry::socket(
@@ -426,12 +424,13 @@ fn a_process_naming_the_listener_keeps_the_refusal() {
     close_retained_from_pane(&fixture.host, &fixture.source).unwrap();
 }
 
-/// A receipt shows how this terminal's owner was closed. A pane asking to close
-/// another conversation there is answered by exact cleanup, which refuses it;
-/// the receipt is not evidence that the request's owner was lost.
+/// A receipt shows how this terminal's owner closed another descriptor of
+/// its conversation. It proves nothing about this one either way, so this
+/// one's Close asks what can still run, as it would with no receipt: once
+/// nothing can, it closes, and the receipt stays for the close it confirms.
 #[test]
-fn a_receipt_for_another_conversation_keeps_the_refusal() {
-    let Some(root) = isolated("a_receipt_for_another_conversation_keeps_the_refusal") else {
+fn a_receipt_for_another_descriptor_does_not_hold_the_close() {
+    let Some(root) = isolated("a_receipt_for_another_descriptor_does_not_hold_the_close") else {
         return;
     };
     let fixture = Fixture::new(&root);
@@ -448,8 +447,13 @@ fn a_receipt_for_another_conversation_keeps_the_refusal() {
             .unwrap()
             .is_some()
     );
-    close_retained_from_pane(&fixture.host, &fixture.source).unwrap_err();
-    assert!(fixture.socket().parent().unwrap().exists());
+    close_retained_from_pane(&fixture.host, &fixture.source).unwrap();
+    fixture.assert_settled();
+    assert!(
+        chat::native_holder::closed_source(&other, &proof)
+            .unwrap()
+            .is_some()
+    );
 }
 
 /// A holder spawned for the fixture's conversation, serving a provider that
@@ -477,6 +481,10 @@ impl Spawned {
     }
 
     fn new(source: &Session) -> Self {
+        Self::running(source, "/bin/sleep", &["60"])
+    }
+
+    fn running(source: &Session, program: &str, arguments: &[&str]) -> Self {
         let working = tempfile::tempdir_in("/var/tmp").unwrap();
         let context = Arc::new(chat::protocol::ExecutionContext::new(Some(Arc::new(
             std::fs::File::open(working.path()).unwrap(),
@@ -487,8 +495,11 @@ impl Spawned {
             execution: Some(context.clone()),
             messages: None,
             transport: chat::protocol::TransportSpec::OwnedUnixWebSocket { socket },
-            program: "/bin/sleep".into(),
-            arguments: vec!["60".into()],
+            program: program.into(),
+            arguments: arguments
+                .iter()
+                .map(|argument| (*argument).into())
+                .collect(),
             working_directory: working.path().to_owned(),
             environment: Default::default(),
             unset_environment: Default::default(),
@@ -635,10 +646,7 @@ fn an_open_pane_whose_holder_died_names_what_runs_then_closes() {
     assert!(record.root.is_current(), "the provider outlived its holder");
     let refusal = close().err().expect("Close refused").message;
     assert!(
-        refusal.contains(&format!(
-            "`pkill -s {},{}`",
-            record.holder.pid, record.root.pid
-        )),
+        refusal.contains("Codex is still running for this conversation"),
         "{refusal}"
     );
     assert!(
@@ -649,20 +657,89 @@ fn an_open_pane_whose_holder_died_names_what_runs_then_closes() {
             .chats
             .contains_key(&fixture.source.id)
     );
-    // The person ends it as told, and closes the pane again.
-    run_recovery_command(&refusal);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while record.root.is_current() {
-        assert!(
-            Instant::now() < deadline,
-            "the named command left it running"
-        );
-        thread::sleep(Duration::from_millis(10));
-    }
+    // The pane names the provider, and the person ends it from there and
+    // closes the pane again.
+    let found = lost_processes(&fixture.host, &fixture.source, false).unwrap();
+    assert!(
+        found
+            .iter()
+            .any(|process| process.pid == record.root.pid && process.proved),
+        "{found:?}"
+    );
+    assert_eq!(
+        lost_processes(&fixture.host, &fixture.source, true).unwrap(),
+        []
+    );
+    assert!(record.root.reaped(), "ending left the provider running");
     close().unwrap();
     fixture.assert_settled();
     assert!(!has_native_owner(&fixture.source).unwrap());
     assert!(!fixture.socket().parent().unwrap().exists());
+}
+
+/// A tool Codex started stays in its process group after Codex and the
+/// helper die, and still holds the conversation. Its pane names it, though it
+/// names no listener, and ends it, and the conversation then closes.
+#[test]
+fn a_codex_tool_left_after_its_provider_and_helper_died_is_ended_then_closes() {
+    let Some(root) =
+        isolated("a_codex_tool_left_after_its_provider_and_helper_died_is_ended_then_closes")
+    else {
+        return;
+    };
+    let fixture = Fixture::new(&root);
+    let spawned = Spawned::running(
+        &fixture.source,
+        "/bin/sh",
+        &[
+            "-c",
+            "/bin/sleep 120 & echo $! > \"$0\"; exec /bin/sleep 120",
+            "tool-pid",
+        ],
+    );
+    let record = Spawned::record(&fixture.source);
+    let tool_pid = {
+        let pid_file = spawned._working.path().join("tool-pid");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(pid) = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|pid| pid.trim().parse::<i32>().ok())
+            {
+                break pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the provider never started its tool"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let tool = registry::Process::read(tool_pid).unwrap();
+    kill(&record.holder);
+    kill(&record.root);
+    assert!(tool.is_current(), "the tool outlived its provider");
+    let refusal = close_retained_from_pane(&fixture.host, &fixture.source).unwrap_err();
+    assert!(
+        refusal.contains("Codex is still running for this conversation"),
+        "{refusal}"
+    );
+    let found = lost_processes(&fixture.host, &fixture.source, false).unwrap();
+    assert_eq!(
+        found
+            .iter()
+            .map(|process| (process.pid, process.name.as_str(), process.proved))
+            .collect::<Vec<_>>(),
+        [(tool_pid, "sleep", true)]
+    );
+    assert_eq!(
+        lost_processes(&fixture.host, &fixture.source, true).unwrap(),
+        []
+    );
+    assert!(tool.reaped(), "ending left the tool running");
+    close_retained_from_pane(&fixture.host, &fixture.source).unwrap();
+    fixture.assert_settled();
+    assert!(!has_native_owner(&fixture.source).unwrap());
 }
 
 /// Reopening a conversation whose pane closed this way: its owner left no

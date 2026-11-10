@@ -47,52 +47,8 @@ fn abandoned_in(proc: &std::path::Path, holder: &Process, root: &Process) -> Res
     if !identity_absent(holder)? || !identity_absent(root)? {
         return Ok(false);
     }
-    let entries = std::fs::read_dir(proc)
-        .map_err(|error| format!("Cannot enumerate processes for exact absence: {error}"))?;
-    for entry in entries {
-        let entry = entry.map_err(|error| format!("Cannot enumerate processes: {error}"))?;
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<i32>().ok())
-        else {
-            continue;
-        };
-        let stat = match std::fs::read(entry.path().join("stat")) {
-            Ok(stat) => stat,
-            // A process that exited during the scan holds no group: its
-            // entry is gone, or was reaped between opening and reading it.
-            Err(error)
-                if error.kind() == io::ErrorKind::NotFound
-                    || error.raw_os_error() == Some(libc::ESRCH) =>
-            {
-                continue;
-            }
-            Err(error) => {
-                return Err(format!(
-                    "Cannot read process {pid} for exact absence: {error}"
-                ));
-            }
-        };
-        let Some(close) = stat.iter().rposition(|&byte| byte == b')') else {
-            return Err(format!("Process {pid} has an unreadable identity"));
-        };
-        let fields = String::from_utf8_lossy(&stat[close + 1..]);
-        let mut fields = fields.split_ascii_whitespace().skip(2);
-        let (Some(group), Some(session)) = (
-            fields.next().and_then(|field| field.parse::<i32>().ok()),
-            fields.next().and_then(|field| field.parse::<i32>().ok()),
-        ) else {
-            return Err(format!("Process {pid} has an unreadable group identity"));
-        };
-        if [group, session]
-            .iter()
-            .any(|id| *id == root.pid || *id == holder.pid)
-        {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+    // Ending a lost conversation's processes ends exactly this census.
+    Ok(crate::daemon::lost_processes::census_in(proc, holder, root)?.is_empty())
 }
 
 pub(super) fn observe(expected: &Process) -> Result<Observation, String> {

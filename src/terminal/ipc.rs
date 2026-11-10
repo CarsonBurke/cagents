@@ -216,7 +216,10 @@ use crate::{
 /// the gated `Member` with them. It also appends `ServerMessage::ChatLimit`,
 /// which reaches every chat subscriber unasked. 157 to 159 are reserved for
 /// parallel branches and are not adopted here.
-pub const PROTOCOL_VERSION: u16 = 160;
+/// Version 165 appends `ChatLostProcesses`, which lists and ends what a dead
+/// Cagents helper left running for a conversation, and its reply. 161 to 164
+/// are reserved for parallel branches and are not adopted here.
+pub const PROTOCOL_VERSION: u16 = 165;
 /// The install candidate line's protocol. Every message an update exchanges
 /// with its daemon (Connect, the upgrade preview and preparation, and the
 /// inspector's frozen and saved-history requests) has this release's
@@ -594,6 +597,13 @@ pub enum ClientRequest {
     WatchConversationPullRequests {
         conversation: TerminalId,
     },
+    /// Lists what still runs for a conversation whose Cagents helper died,
+    /// which is what holds its Close, and with `end`, ends what is proved to
+    /// be the conversation's first. Ends nothing while its helper runs.
+    ChatLostProcesses {
+        session: crate::chat::Session,
+        end: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -945,6 +955,11 @@ pub enum ServerResponse {
     Work(crate::work::Response),
     ChannelWork(crate::channel_work_api::Response),
     StartupState(StartupState),
+    /// What [`ClientRequest::ChatLostProcesses`] found still running, after
+    /// ending what it ended.
+    ChatLostProcesses {
+        processes: Vec<LostProcess>,
+    },
 }
 
 /// The daemon's startup recovery, as [`ClientRequest::StartupState`] reports it.
@@ -989,6 +1004,19 @@ pub struct ChatReleaseProof {
     pub session: crate::chat::Session,
     pub execution_instance: uuid::Uuid,
     pub generation: u64,
+}
+
+/// A process that still runs for a conversation whose Cagents helper died.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LostProcess {
+    pub pid: i32,
+    /// The executable's short name, as `ps` shows it.
+    pub name: String,
+    /// Its command line, shortened; empty when it shows none.
+    pub command: String,
+    /// Whether it is proved to be the conversation's, so that Cagents may
+    /// end it. One that isn't is only named, and still holds the Close.
+    pub proved: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

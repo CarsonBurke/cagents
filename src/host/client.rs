@@ -365,6 +365,7 @@ fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle:
                 | ClientRequest::ShutdownTerminal { .. }
                 | ClientRequest::ChatClose { .. }
                 | ClientRequest::ChatCloseRetained { .. }
+                | ClientRequest::ChatLostProcesses { end: true, .. }
                 | ClientRequest::Agent {
                     operation: crate::agent_execution::Operation::Close(_),
                     ..
@@ -576,6 +577,7 @@ fn ensure_startup_recovery_request(
             | ClientRequest::Authenticate { .. }
             | ClientRequest::CloseTerminalChecked { .. }
             | ClientRequest::ChatCloseRetained { .. }
+            | ClientRequest::ChatLostProcesses { .. }
     );
     let shutdown = matches!(
         request,
@@ -1546,6 +1548,17 @@ pub(super) fn process_request(
                 ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true)
             })?;
             Ok((ServerResponse::Accepted, Vec::new(), false))
+        }
+        ClientRequest::ChatLostProcesses { session, end } => {
+            let processes =
+                super::chat::lost_processes(host, &session, end).map_err(|message| {
+                    ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true)
+                })?;
+            Ok((
+                ServerResponse::ChatLostProcesses { processes },
+                Vec::new(),
+                false,
+            ))
         }
         request @ (ClientRequest::ChatStart { .. }
         | ClientRequest::ChatPrepareResume { .. }

@@ -97,7 +97,7 @@ impl Owners {
         if let Err(error) = self.target.handle.close() {
             // As for an unpaired close: a helper that died while its provider
             // runs on is what holds it, not the dead channel's I/O error.
-            let refusal = super::registered_holder_lost_refusal(&self.target.source)
+            let refusal = super::registered_holder_lost_refusal(host, &self.target.source)
                 .ok()
                 .flatten();
             return Err(unavailable(refusal.unwrap_or(error)));

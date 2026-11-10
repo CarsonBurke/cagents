@@ -69,6 +69,7 @@ mod auth_recovery;
 mod changes;
 mod child_navigation;
 mod clipboard_image;
+mod close_refusal;
 mod closed_draft;
 mod completion;
 mod coordination;
@@ -491,6 +492,21 @@ pub enum Action {
     HandoffFinished(Target, Result<TerminalSession, String>),
     CloseFinished(Target, Result<(), String>),
     RetainedCloseFinished(Target, chat::Session, Result<(), String>),
+    /// What still runs for a conversation whose Close was refused.
+    CloseHolders(
+        Target,
+        chat::Session,
+        Result<Vec<crate::terminal::ipc::LostProcess>, String>,
+    ),
+    /// Ends what the daemon proves still runs for the conversation, then
+    /// closes it again.
+    EndCloseHolders(Target),
+    CloseHoldersEnded(
+        Target,
+        chat::Session,
+        Result<Vec<crate::terminal::ipc::LostProcess>, String>,
+    ),
+    DismissCloseRefusal(Target),
     /// Where the transcript's viewport has moved to, which is what asks for
     /// another page of history.
     Scrolled(Target, Option<String>, view::Scroll, bool),
@@ -555,6 +571,8 @@ impl Action {
                 | Self::ReturnedLocally(..)
                 | Self::CloseFinished(..)
                 | Self::RetainedCloseFinished(..)
+                | Self::CloseHolders(..)
+                | Self::CloseHoldersEnded(..)
                 | Self::Retired(..)
                 | Self::DispatchQueued(..)
                 | Self::ClearCopied(..)
@@ -2479,6 +2497,8 @@ pub(super) struct Runtime {
     error: Option<String>,
     /// A typed admission refusal, independent of provider/account failures.
     capacity_refused: bool,
+    /// A Close the daemon refused, shown on the pane until it closes.
+    close_refusal: Option<close_refusal::CloseRefusal>,
     /// Resuming this card's stopped provider failed, so it offers to try
     /// again; the failure itself stands in `error`.
     resume_failed: bool,
@@ -3481,6 +3501,7 @@ impl Runtime {
             visible: AtomicBool::new(visible),
             error: None,
             capacity_refused: false,
+            close_refusal: None,
             resume_failed: false,
             failures: Vec::new(),
             unplaced_failures: Vec::new(),
@@ -13466,13 +13487,20 @@ impl Cagents {
                     return Task::none();
                 }
                 if let Err(error) = result {
-                    self.status = Some(TransientNotice::error(error));
-                    return Task::none();
+                    return self.refuse_chat_close(target.card, session, error);
                 }
                 return self
                     .remove_chat_card(target.card, None)
                     .unwrap_or_else(Task::none);
             }
+            Action::CloseHolders(target, session, result) => {
+                return self.show_close_holders(target, session, result);
+            }
+            Action::EndCloseHolders(target) => return self.end_close_holders(target),
+            Action::CloseHoldersEnded(target, session, result) => {
+                return self.close_holders_ended(target, session, result);
+            }
+            Action::DismissCloseRefusal(target) => return self.dismiss_close_refusal(target),
             Action::CloseFinished(target, result) => {
                 if let Some(session) = self.chat_ui.abandoned.remove(&target) {
                     // A restart's close whose card has since been closed. It
@@ -22300,6 +22328,75 @@ mod tests {
             Ok(()),
         )));
         assert!(!app.card_state(card).unwrap().existence.is_open());
+    }
+
+    /// A Close the daemon refuses because a dead helper left processes
+    /// running stays on the pane: it names them, ends the proved ones and
+    /// closes again, and its notice leaves with the pane.
+    #[test]
+    fn a_refused_close_stays_on_its_pane_and_ends_what_holds_it() {
+        use crate::terminal::ipc::LostProcess;
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let source = app.chat_return_session(card).unwrap();
+        let _ = app.begin_chat_close(card);
+        let close = app.chat_ui.phases[&card].target();
+        let reason = "Codex is still running for this conversation, but the Cagents helper that controlled it is gone, so the conversation was kept rather than leave Codex running unseen.";
+        let _ = app.update(Message::ChatUi(Action::RetainedCloseFinished(
+            close,
+            source.clone(),
+            Err(reason.into()),
+        )));
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        let runtime = chat_runtime(&app, card);
+        let target = runtime.target;
+        let refusal = runtime.close_refusal.as_ref().expect("shown on the pane");
+        assert_eq!(refusal.reason(), reason);
+        assert!(app.notices.has(NoticeKey::ChatClose(card)));
+
+        let codex = LostProcess {
+            pid: 4045845,
+            name: "codex".into(),
+            command: "codex app-server --listen unix:///tmp/cagents-codex-x/control.sock".into(),
+            proved: true,
+        };
+        let stranger = LostProcess {
+            pid: 4100000,
+            name: "sleep".into(),
+            command: "sleep 100".into(),
+            proved: false,
+        };
+        let _ = app.update(Message::ChatUi(Action::CloseHolders(
+            target,
+            source.clone(),
+            Ok(vec![codex.clone(), stranger.clone()]),
+        )));
+        let refusal = chat_runtime(&app, card).close_refusal.as_ref().unwrap();
+        assert_eq!(refusal.processes(), [codex, stranger]);
+        assert_eq!(refusal.end_action(), Some("End 1 process and close".into()));
+
+        let _ = app.update(Message::ChatUi(Action::EndCloseHolders(target)));
+        assert!(
+            chat_runtime(&app, card)
+                .close_refusal
+                .as_ref()
+                .unwrap()
+                .ending()
+        );
+        // Once they are ended, it closes again.
+        let _ = app.update(Message::ChatUi(Action::CloseHoldersEnded(
+            target,
+            source.clone(),
+            Ok(Vec::new()),
+        )));
+        let close = app.chat_ui.phases[&card].target();
+        let _ = app.update(Message::ChatUi(Action::RetainedCloseFinished(
+            close,
+            source,
+            Ok(()),
+        )));
+        assert!(!app.card_state(card).unwrap().existence.is_open());
+        assert!(!app.notices.has(NoticeKey::ChatClose(card)));
     }
 
     #[test]
