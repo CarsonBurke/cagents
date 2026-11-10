@@ -1452,67 +1452,84 @@ The app and Ceditor share a resumable review-request scan per repository and
 credential context. A settled scan waits 60 seconds, and continuation pages
 wait at least six seconds. Background monitoring still serves desktop review
 alerts; hidden inspector and review panes retain their existing visibility
-guards. Private snapshots and cooldowns live under
+guards. Private snapshots and resource-aware cooldowns live under
 `${XDG_STATE_HOME:-~/.local/state}/cagents/github-status`. Token environment
 and gh account/configuration changes select another cache. Rotating a keyring
 secret without changing its account/configuration is not detected locally.
 
-To measure agent and app traffic without generating additional requests,
-install an earlier-on-PATH gh wrapper:
+To measure a repository agent shell without generating additional requests,
+opt that shell into observation explicitly:
 
 ```sh
-scripts/gh-observe install --real /usr/bin/gh
-# Keep ~/.local/bin before /usr/bin on PATH. Use `hash -r` in an existing Bash.
-scripts/gh-observe report --since 2026-11-09T23:24:00+00:00 \
-    --until 2026-11-09T23:54:00+00:00 > github-traffic.json
+scripts/gh-observe run --real /usr/bin/gh -- bash
+# Optional HTTP header/cost profiling for supported JSON operations:
+scripts/gh-observe run --http --real /usr/bin/gh -- bash
+# Exit that child shell to end observation; the parent PATH is unchanged.
+scripts/gh-observe report --since 2026-11-09T23:31:00+00:00 \
+    --until 2026-11-10T00:01:00+00:00 > github-traffic.json
 ```
 
-Installation copies the runtime outside the checkout, so removing a worktree
-does not break gh. The daily JSONL logs are private files under
+The observer is measurement only. It never admits, queues, retries or defers
+GitHub commands, even when legacy coordination files or environment settings
+exist. Request headers are logged as evidence, not used to delay another
+request. Do not install it into `~/.local/bin`, change a login shell's PATH,
+or route the running app or other projects through it. A child process outside
+the selected repository/worktrees executes the real gh without observation.
+The passive runtime stays under that repository's Git common directory so
+background descendants can keep resolving gh after the launcher exits; only
+the opted-in child environment places it on PATH.
+
+The daily JSONL logs are private files under
 `${XDG_STATE_HOME:-~/.local/state}/cagents/gh-observe`. They record timestamps,
 caller process ancestry/session IDs, subcommands, GraphQL operation shapes,
-HTTP status, duration and allowlisted rate-limit headers. Credentials,
+invocation metadata and, when `--http` supports the operation, HTTP status,
+duration and allowlisted rate-limit headers. Credentials,
 arguments, GraphQL variables and response bodies are discarded. Operation
 names and endpoint paths can identify private repositories; keep raw logs
 local and publish only the needed aggregates. Remove old daily logs when the
 measurement no longer needs them.
 
-With coordination disabled, the wrapper execs the real gh with its original arguments, stdin and stdout;
-it filters injected HTTP debug from stderr. Explicit debug and interactive
-stderr retain their behavior and log invocations only, which the report marks
-as a coverage gap. Absolute gh paths, other hosts, connectors and Git's own
-HTTPS traffic bypass this wrapper. Exact GraphQL primary cost is reported only
-when the original query asks `rateLimit { cost }`; quota headers are cumulative,
-so their deltas cannot be attributed to one concurrent caller. Secondary point
-estimates use GitHub's published defaults and are separate from primary cost.
+Normal observation execs the real gh with its original arguments, environment,
+stdin, stdout, stderr and exit status; it does not enable HTTP debug or filter
+output. Logging/setup failures pass through to the real command.
 
-After the baseline, enable shared cooldown and content-write coordination:
+`--http` explicitly enables HTTP metadata profiling only for supported JSON
+operations. Raw REST API bodies, diffs, logs, downloads and unknown operations
+remain invocation-only and do not enable debug output. The profiler filters
+injected debug and never prints request/response bodies. Unexpected opaque or
+unframed responses are conservatively suppressed, including ambiguous stderr
+inside such dumps, rather than exposed as diagnostics; treat them as coverage
+gaps. Explicit debug and interactive stderr retain their original behavior and
+also log invocations only. Absolute gh paths, other hosts, connectors and Git's
+own HTTPS traffic bypass observation.
+
+Exact GraphQL primary cost is reported only when the original query asks
+`rateLimit { cost }`; quota headers are cumulative, so their deltas cannot be
+attributed to one concurrent caller. Secondary point estimates use GitHub's
+published defaults and are separate from primary cost. Set
+`CAGENTS_GH_OBSERVE=0` to bypass observation inside an opted-in shell.
+
+Content serialization is separate from observation. Invoke it only when
+intentionally serializing selected writes; it never installs a wrapper or
+activates global state:
 
 ```sh
-scripts/gh-observe coordinate on
-scripts/gh-observe coordinate status
-scripts/gh-observe coordinate off
+scripts/gh-coordinate.py --real /usr/bin/gh --wait 30 -- \
+    pr comment 1234 -R CarsonBurke/cagents --body-file comment.txt
 ```
 
-The coordinator honors `Retry-After`, exhausted-primary reset times and
-exponential secondary-limit backoff across new gh invocations on this host.
-Waiting shells receive one notice with the deadline, and attempts are logged
-before admission. Local diagnostics, configuration and credential helpers can
-still run. App requests opt into immediate deferral, so a long cooldown does
-not consume a process timeout or turn an unsubmitted write into an unknown
-outcome.
-It serializes recognized content-writing commands with eight seconds between
-starts, adding no automatic retries. A write's outcome remains gh's outcome.
-One gh invocation can send several content requests; aliases, extensions and
-already-running internal watch loops are not a per-request quota guarantee.
-Use the shared status command and avoid `gh pr checks --watch`, `gh run watch`
-and independent polling loops.
-
-Set `CAGENTS_GH_OBSERVE=0` to bypass the wrapper entirely, or
-`CAGENTS_GH_COORDINATE=0` to keep measurement but bypass coordination for one
-shell. `CAGENTS_GH_COORDINATE=1` enables it for one shell. To uninstall, remove
-only the generated gh wrapper whose second line is `# cagents gh-observe shim`.
-Do not replace another tool's gh executable.
+Only the documented allowlist of PR/issue content commands acquires a slot.
+Reads, local helpers and unsupported commands execute immediately. Selected
+writes must identify their repository explicitly, share state only through
+that repository's Git common directory, and start at least eight seconds apart.
+Waiting is bounded; `--wait 0` refuses a busy slot immediately with exit 75 and
+`cagents-gh: deferred`, before starting gh. Callers setting
+`CAGENTS_GH_NONBLOCKING=1` always use immediate refusal, including when a
+positive `--wait` was supplied. A started mutation is never retried
+or timed out by the helper. It does not read response headers, transfer
+cooldowns between requests, or apply a GraphQL reset to REST. One gh command
+may create multiple contents, and independent repositories do not share this
+slot; this is not enforcement of an account-wide GitHub quota.
 
 ## Native evidence
 
