@@ -18,9 +18,44 @@ use std::{os::unix::fs::PermissionsExt, path::Path};
 // Environment isolation also proves the service does not depend on any user's
 // account, project, provider installation, or running daemon.
 pub(in crate::host) fn isolated(name: &str) -> Option<tempfile::TempDir> {
+    isolated_with_process_namespace(name, false)
+}
+
+// Recovery deliberately inspects every same-user process. Its positive fixture
+// needs a real private /proc, so unrelated nondumpable processes on a shared
+// host cannot make a safe refusal look like failed recovery.
+fn isolated_with_process_namespace(
+    name: &str,
+    private_process_namespace: bool,
+) -> Option<tempfile::TempDir> {
+    const PARENT_NAMESPACE: &str = "CAGENTS_EXECUTION_TEST_PARENT_PID_NAMESPACE";
+    #[cfg(not(target_os = "linux"))]
+    assert!(
+        !private_process_namespace,
+        "private PID fixtures require Linux"
+    );
     const CHILD: &str = "CAGENTS_EXECUTION_SERVICE_TEST";
     const INHERITED_SCOPE: &str = "CAGENTS_EXECUTION_TEST_AUTHORITY_PRESENCE";
     if std::env::var(CHILD).as_deref() == Ok(name) {
+        #[cfg(target_os = "linux")]
+        if private_process_namespace {
+            let namespace = std::fs::read_link("/proc/self/ns/pid")
+                .expect("private recovery fixture needs its real procfs PID namespace");
+            assert_ne!(
+                namespace.as_os_str(),
+                std::env::var_os(PARENT_NAMESPACE).expect("parent PID namespace identity"),
+                "the recovery fixture must enter a new PID namespace"
+            );
+            assert_eq!(
+                std::fs::read_link("/proc/1/ns/pid").unwrap(),
+                namespace,
+                "the recovery fixture must mount procfs for its private PID namespace"
+            );
+            assert!(
+                std::process::id() > 1,
+                "the fixture test must run beneath its namespace init"
+            );
+        }
         // Only this helper sets the presence marker. The separate owned-late-
         // decision controller also uses CHILD, without this helper's spawn.
         if let Ok(expected) = std::env::var(INHERITED_SCOPE) {
@@ -55,7 +90,29 @@ pub(in crate::host) fn isolated(name: &str) -> Option<tempfile::TempDir> {
         std::fs::create_dir_all(root.join(path)).unwrap();
     }
     install_claude(&root.join("bin/claude"));
-    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    let executable = std::env::current_exe().unwrap();
+    let mut command = std::process::Command::new(&executable);
+    #[cfg(target_os = "linux")]
+    if private_process_namespace {
+        command = std::process::Command::new("/usr/bin/unshare");
+        command
+            .args([
+                "--user",
+                "--map-root-user",
+                "--pid",
+                "--fork",
+                "--kill-child",
+                "--mount-proc",
+                "/bin/sh",
+                "-c",
+                // Keep init alive while the test runs as PID > 1, as real
+                // process proofs require. Init exiting kills every remaining
+                // provider, including after a panic in the isolated test.
+                "\"$@\" & child=$!; wait \"$child\"",
+                "execution-fixture-init",
+            ])
+            .arg(&executable);
+    }
     // Keep the caller's delegation and optional matched helper inherited
     // unchanged. Retained mode still requires its separate explicit opt-in;
     // ordinary service fixtures continue using the local transport.
@@ -65,6 +122,14 @@ pub(in crate::host) fn isolated(name: &str) -> Option<tempfile::TempDir> {
         {
             command.env_remove(name);
         }
+    }
+    #[cfg(target_os = "linux")]
+    if private_process_namespace {
+        command.env(
+            PARENT_NAMESPACE,
+            std::fs::read_link("/proc/self/ns/pid")
+                .expect("private recovery fixture needs the parent procfs PID namespace"),
+        );
     }
     let result = command
         .args([
@@ -98,7 +163,11 @@ pub(in crate::host) fn isolated(name: &str) -> Option<tempfile::TempDir> {
         )
         .status()
         .unwrap();
-    assert!(result.success(), "isolated service fixture failed");
+    assert!(
+        result.success(),
+        "isolated service fixture {name} failed; private PID/procfs requested: {private_process_namespace}. \
+         Private recovery fixtures require permitted Linux user/PID namespaces and procfs mounting"
+    );
     Some(directory)
 }
 
@@ -2589,7 +2658,12 @@ fn fresh_codex_execution_uses_owned_listener_and_correlated_provider_result() {
 /// every prompt as an unavailable conversation, through successive updates.
 #[test]
 fn updated_codex_agent_answers_through_its_relaunched_server() {
-    if isolated("updated_codex_agent_answers_through_its_relaunched_server").is_some() {
+    if isolated_with_process_namespace(
+        "updated_codex_agent_answers_through_its_relaunched_server",
+        cfg!(target_os = "linux"),
+    )
+    .is_some()
+    {
         return;
     }
     use serde_json::{Value, json};
