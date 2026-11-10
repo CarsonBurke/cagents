@@ -21,6 +21,15 @@ SCRIPT = REPOSITORY / "scripts" / "native-evidence"
 AUTHORITY_NAMES = ("CAGENTS_AGENT_AUTHORITY", "CAGENTS_AGENT_TOKEN", "CAGENTS_SESSION_TOKEN")
 
 STUBS = {
+    "niri": """
+        #!/bin/sh
+        [ "$*" = 'msg -j windows' ] || exit 2
+        [ ! -e "$STUB_LOG/windows-error" ] || exit 1
+        if [ -e "$STUB_LOG/windows-malformed" ]; then printf invalid; exit 0; fi
+        if [ -e "$STUB_LOG/windows-nonarray" ]; then printf '{}'; exit 0; fi
+        if [ -e "$STUB_LOG/windows-invalid-entry" ]; then printf '[{}]'; exit 0; fi
+        if [ -e "$STUB_LOG/ui-absent" ]; then printf '[]'; else printf '[{"id":1}]'; fi
+    """,
     "dbus-run-session": """
         #!/bin/sh
         shift
@@ -81,7 +90,7 @@ STUBS = {
                 observe)
                     [ ! -e "$STUB_LOG/observe-error" ] || exit 1
                     if [ -e "$STUB_LOG/observe-malformed" ]; then printf 'invalid'; exit 0; fi
-                    if [ -e "$STUB_LOG/ui-absent" ]; then printf '{"window":null}\\n'; exit 0; fi
+                    if [ -e "$STUB_LOG/ui-absent" ]; then echo 'nested session has no windows' >&2; exit 2; fi
                     if [ -e "$STUB_LOG/cropped" ]; then
                         printf '{"window":{"size":[900,600]},"output":{"logical":{"width":900,"height":561}},"text":"'
                     else
@@ -948,7 +957,7 @@ class Evidence(unittest.TestCase):
         (self.task / "niri" / "session.rc").write_text("0")
         (self.logs / "ui-absent").touch()
         before = (self.logs / "runner").read_text()
-        for marker in ("observe-error", "observe-malformed"):
+        for marker in ("windows-error", "windows-malformed", "windows-nonarray", "windows-invalid-entry"):
             with self.subTest(marker=marker):
                 failed = self.logs / marker
                 failed.touch()

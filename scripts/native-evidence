@@ -774,22 +774,23 @@ run_app() {
     return "$status"
 }
 
-# Observe the explicit machine format; display text is not a window contract.
+# Query the compositor inventory: an observer needs a target window, so its
+# failure cannot establish that the app closed. Unknown state stays refused.
 app_window_is_open() {
-    local observed
-    observed=$(timeout -k 1 10 niri-harness --no-heal --session "$session_name" --json observe --no-text 2>/dev/null) || return 2
+    local windows
+    windows=$(timeout -k 1 10 niri msg -j windows 2>/dev/null) || return 2
     /usr/bin/python3 -c 'import json,sys
 try:
-    state=json.load(sys.stdin)
-    if not isinstance(state,dict) or "window" not in state:
+    windows=json.load(sys.stdin)
+    if not isinstance(windows,list) or any(
+        not isinstance(window,dict) or type(window.get("id")) is not int or window["id"] < 0
+        for window in windows
+    ):
         sys.exit(2)
-    window=state["window"]
-    if window is None:
-        sys.exit(1)
-    sys.exit(0 if isinstance(window,dict) and window else 2)
+    sys.exit(0 if windows else 1)
 except (ValueError,AttributeError):
     sys.exit(2)
-' <<<"$observed"
+' <<<"$windows"
 }
 
 cmd_relaunch() {
