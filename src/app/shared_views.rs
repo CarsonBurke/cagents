@@ -5205,8 +5205,9 @@ mod tests {
     #[cfg(not(feature = "integrated-browser"))]
     fn presentation_projection_preserves_an_unrelated_draft_and_pending_history() {
         let (mut app, source, destination, pane) = presentation_fixture();
-        Arc::make_mut(&mut app.durable).active_channel = Some(destination);
-        app.active_workspace = Some(PathBuf::from("/repo"));
+        drop(app.select_channel(destination));
+        assert_eq!(app.durable.active_channel, Some(destination));
+        assert!(app.workspace.order().next().is_none());
         drop(app.add_default_pane(PathBuf::from("/repo"), settings::DefaultPane::NativeChat));
         let draft = app.workspace.focused().unwrap();
         app.retain_local_pane(draft);
@@ -5352,8 +5353,9 @@ mod tests {
     #[cfg(not(feature = "integrated-browser"))]
     fn presentation_duplicate_local_placement_uses_full_recovery_and_keeps_active_draft() {
         let (mut app, source, destination, pane) = presentation_fixture();
-        Arc::make_mut(&mut app.durable).active_channel = Some(destination);
-        app.active_workspace = Some(PathBuf::from("/repo"));
+        drop(app.select_channel(destination));
+        assert_eq!(app.durable.active_channel, Some(destination));
+        assert!(app.workspace.order().next().is_none());
         drop(app.add_default_pane(PathBuf::from("/repo"), settings::DefaultPane::NativeChat));
         let draft = app.workspace.focused().unwrap();
         app.retain_local_pane(draft);
