@@ -385,10 +385,81 @@ mod tests {
         let host = Arc::new(state::HostLock::new(initial));
         let resolved = super::super::chat::upgrade_resolution::resolve(&host, 1, &alias).unwrap();
         assert!(matches!(
-            super::super::chat::process(&host, 1, ClientRequest::ChatAttach { session: resolved })
-                .unwrap(),
+            super::super::chat::process(
+                &host,
+                1,
+                ClientRequest::ChatAttach {
+                    session: resolved.clone()
+                }
+            )
+            .unwrap(),
             ServerResponse::ChatAttached { .. }
         ));
+        let reader = crate::workspace_model::views::Pane {
+            kind: crate::model::CardKind::Chat(resolved.clone()),
+            ..pane.clone()
+        };
+        let mut model = crate::workspace_model::WorkspaceModel {
+            agents: vec![agent.clone()],
+            views: vec![crate::workspace_model::views::View {
+                scope: agent.placement.clone(),
+                revision: 2,
+                panes: vec![reader.clone()],
+                retired: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        let index = crate::workspace_model::views::ManagedDisplayIndex::new(&model);
+        assert!(index.permits_projection(&agent, &reader));
+        assert_eq!(index.resolve(&agent).unwrap().pane, Some(reader.clone()));
+        for changed in [
+            Session {
+                proof: None,
+                ..resolved.clone()
+            },
+            Session {
+                launch: chat::Launch {
+                    session_id: Some(uuid::Uuid::new_v4().to_string()),
+                    ..resolved.launch.clone()
+                },
+                ..resolved.clone()
+            },
+            Session {
+                launch: chat::Launch {
+                    recipe: LaunchRecipe {
+                        program: "/different-provider".into(),
+                        ..resolved.launch.recipe.clone()
+                    },
+                    ..resolved.launch.clone()
+                },
+                ..resolved.clone()
+            },
+        ] {
+            let changed = crate::workspace_model::views::Pane {
+                kind: crate::model::CardKind::Chat(changed),
+                ..reader.clone()
+            };
+            assert!(!index.permits_projection(&agent, &changed));
+        }
+        let mut uncaptured = agent.clone();
+        if let Some(crate::agent_execution::HostedSession::Chat(session)) = &mut uncaptured.session
+        {
+            session.launch.recipe.program = "/uncaptured-provider".into();
+        }
+        assert!(!index.permits_projection(&uncaptured, &reader));
+        model.views.push(crate::workspace_model::views::View {
+            scope: crate::workspace_model::views::Scope::Channel(crate::model::ChannelId::new()),
+            revision: 1,
+            panes: vec![reader.clone()],
+            retired: Vec::new(),
+        });
+        let ambiguous = crate::workspace_model::views::ManagedDisplayIndex::new(&model);
+        assert!(!ambiguous.permits_projection(&agent, &reader));
+        assert!(ambiguous.resolve(&agent).is_none());
+        assert_eq!(
+            agent.session,
+            Some(crate::agent_execution::HostedSession::Chat(alias.clone()))
+        );
         let handle = host.lock().unwrap().chats[&source.id].handle.clone();
         let deadline = Instant::now() + Duration::from_secs(5);
         let snapshot = loop {
