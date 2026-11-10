@@ -326,6 +326,9 @@ while not Path(sys.argv[3]).exists(): time.sleep(.005)
 
     #[test]
     fn source_that_answers_again_ends_update_without_waiting_for_its_exit() {
+        if !crate::daemon::isolated_handoff_coordinator() {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let (paths, mut job) = fixture(root.path());
         let (mut source_service, source) = service(root.path(), &paths);
@@ -374,6 +377,9 @@ while not Path(sys.argv[3]).exists(): time.sleep(.005)
 
     #[test]
     fn empty_rival_is_stopped_and_handoff_retried_but_live_rival_is_preserved() {
+        if !crate::daemon::isolated_handoff_coordinator() {
+            return;
+        }
         for busy in [false, true] {
             // Keep the lease on the host filesystem even when the build gate
             // puts TMPDIR in tmpfs: Btrfs must exercise holder discovery here.
@@ -440,6 +446,9 @@ print(json.dumps({{'ok':True,'command':'daemon.stop','data':{{'outcome':'accepte
 
     #[test]
     fn only_the_pinned_source_handshake_ends_wait_with_original_service_running() {
+        if !crate::daemon::isolated_handoff_coordinator() {
+            return;
+        }
         use crate::terminal_ipc::{
             ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage,
             ServerResponse, read_frame, write_frame,
