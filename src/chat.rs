@@ -27,6 +27,10 @@ pub mod protocol;
 pub mod runtime;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod skills;
+#[cfg(any(feature = "ui", feature = "host"))]
+mod work_hold;
+#[cfg(any(feature = "ui", feature = "host"))]
+pub use work_hold::{Held, HeldSubagent, WorkHold};
 
 /// Whether answering a request with `action` turns its work down rather than
 /// authorizing it.
@@ -1433,12 +1437,12 @@ pub struct Subagent {
 }
 
 impl Subagent {
-    /// Running delegated work that cancelling the parent's turn would also
-    /// stop, where the provider's interrupt does not spare it.
+    /// Delegated work, running or waiting on its own background work, that
+    /// cancelling the parent's turn would also stop, where the provider's
+    /// interrupt does not spare it. Claude Code's interrupt kills a waiting
+    /// agent and its own background work as it does a running one.
     pub fn stopped_by_interrupt(&self, capabilities: &Capabilities) -> bool {
-        self.status == ToolStatus::Running
-            && self.background
-            && capabilities.interrupt_stops_background
+        self.status.is_live() && self.background && capabilities.interrupt_stops_background
     }
 }
 
@@ -1517,6 +1521,12 @@ impl Snapshot {
     /// prompt, and which no usage limit from an earlier turn stops.
     pub fn turn_accepted(&self) -> bool {
         self.busy || self.waiting || !self.requests.is_empty()
+    }
+    /// Whether closing the conversation now would end or abandon something:
+    /// its turn, a question to the user, or a subagent working or waiting on
+    /// its own background work.
+    pub fn holds_work(&self) -> bool {
+        self.turn_accepted() || self.subagents.iter().any(|agent| agent.status.is_live())
     }
     /// Parent prompt controls use `busy`; card activity includes delegated work.
     pub fn is_working(&self) -> bool {
@@ -1854,7 +1864,7 @@ pub enum Phase {
     Commentary,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 pub enum ToolStatus {
     Running,
     Succeeded,
@@ -1863,6 +1873,46 @@ pub enum ToolStatus {
     /// Ended before it finished: cancelled by the user, interrupted with the
     /// work that started it, or cut short because its provider stopped.
     Stopped,
+    /// A delegated agent that stopped with background work of its own still
+    /// running. It's alive and what it has reported may be interim, but it
+    /// isn't doing anything itself and may never report again, so it neither
+    /// counts as working nor as finished. A later notice settles it, any sign
+    /// of life returns it to `Running`, and a Stop or the provider exiting
+    /// ends it as `Stopped`. Its parent's turn ending doesn't change it.
+    Waiting,
+}
+
+/// As derived, except that a client from before `Waiting` was added is sent
+/// `Running`: the agent hasn't finished.
+impl Serialize for ToolStatus {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let status = match self {
+            Self::Waiting
+                if crate::terminal_ipc::encoding_before(
+                    crate::terminal_ipc::WAITING_TOOL_STATUS,
+                ) =>
+            {
+                Self::Running
+            }
+            status => *status,
+        };
+        let name = match status {
+            Self::Running => "Running",
+            Self::Succeeded => "Succeeded",
+            Self::Failed => "Failed",
+            Self::Denied => "Denied",
+            Self::Stopped => "Stopped",
+            Self::Waiting => "Waiting",
+        };
+        serializer.serialize_unit_variant("ToolStatus", status as u32, name)
+    }
+}
+
+impl ToolStatus {
+    /// Whether the agent or tool has yet to end.
+    pub fn is_live(self) -> bool {
+        matches!(self, Self::Running | Self::Waiting)
+    }
 }
 
 /// What a shell command was actually for.
@@ -2947,6 +2997,37 @@ mod tests {
     }
 
     #[test]
+    fn an_agent_waiting_on_its_background_work_neither_works_nor_asks_for_the_user() {
+        let mut snapshot = Snapshot::default();
+        snapshot.subagents.push(Subagent {
+            id: "tool".into(),
+            kind: String::new(),
+            description: String::new(),
+            status: ToolStatus::Waiting,
+            model: None,
+            waiting: false,
+            detail: String::new(),
+            background: true,
+            items: Vec::new(),
+        });
+        assert!(!snapshot.is_working());
+        // Closing the conversation would end it, so an update or a cleanup
+        // that waits for idle waits for it too.
+        assert!(snapshot.holds_work());
+        // `Waiting` means the person is needed, and nothing here needs them.
+        assert_eq!(snapshot.activity(), crate::agent::ActivityState::Idle);
+        // An interrupt kills it, as recorded from Claude Code, so a person is
+        // warned as for running work.
+        let capabilities = Capabilities {
+            interrupt_stops_background: true,
+            ..Capabilities::default()
+        };
+        assert!(snapshot.subagents[0].stopped_by_interrupt(&capabilities));
+        snapshot.exited = true;
+        assert_eq!(snapshot.activity(), crate::agent::ActivityState::Unknown);
+    }
+
+    #[test]
     fn older_subagent_snapshots_default_to_unknown_model_and_child_waiting_is_visible() {
         let mut agent: super::Subagent = serde_json::from_value(serde_json::json!({
             "id":"child", "kind":"Codex agent", "description":"", "status":"Running", "items":[]
@@ -2982,8 +3063,10 @@ mod tests {
         assert!(!snapshot.busy);
         assert!(snapshot.is_working());
         assert_eq!(snapshot.activity(), super::ActivityState::Working);
+        assert!(snapshot.holds_work());
         snapshot.subagents[0].status = super::ToolStatus::Succeeded;
         assert_eq!(snapshot.activity(), super::ActivityState::Idle);
+        assert!(!snapshot.holds_work());
     }
 
     use super::*;

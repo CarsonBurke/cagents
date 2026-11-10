@@ -1252,7 +1252,7 @@ impl Store {
             None => self.boundary(id, len0, target),
         }
     }
-    /// Marks every cached step still running as stopped, once the provider
+    /// Marks every cached step still running or waiting as stopped, once the provider
     /// that ran it has exited and nothing will report its end. A step's
     /// status is part of its metadata, so its cached output is kept as is.
     pub(super) fn stop_running_steps(&mut self) -> Result<(), String> {
@@ -1266,7 +1266,7 @@ impl Store {
             let metadata: Vec<u8> = row.get(1).map_err(|e| e.to_string())?;
             let mut item: Item = postcard::from_bytes(&metadata).map_err(|e| e.to_string())?;
             if let Some(status) = item.content.status_mut()
-                && *status == crate::chat::ToolStatus::Running
+                && status.is_live()
             {
                 *status = crate::chat::ToolStatus::Stopped;
                 // It ended now, so its duration runs to the provider's exit.
@@ -3519,6 +3519,9 @@ mod tests {
         store
             .apply(Event::Item(tool("done", ToolStatus::Succeeded)))
             .unwrap();
+        store
+            .apply(Event::Item(tool("waiting", ToolStatus::Waiting)))
+            .unwrap();
         // The actor reuses its last window, so the stop must reach it as a
         // change, not only in a fresh read.
         let mut presented = store.window().unwrap().items;
@@ -3539,7 +3542,8 @@ mod tests {
             steps,
             [
                 ("epoch 1 of 40", ToolStatus::Stopped),
-                ("", ToolStatus::Succeeded)
+                ("", ToolStatus::Succeeded),
+                ("", ToolStatus::Stopped)
             ]
         );
         // Nothing is left to stop the second time.

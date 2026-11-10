@@ -6,13 +6,13 @@ use super::{HistoryPage, Page, scan::Scan, scan::Work};
 use crate::{
     github::{GitHubError, GitHubRepoKey, GitHubService, PullRequestKey, polling, pr_status},
     repository::{
-        CancellationToken, CommandSpec, ProcessExecutor, ProcessFailure, ProcessOutput,
-        SystemProcessExecutor,
+        CancellationToken, CommandSpec, ProcessExecutor, ProcessFailure, ProcessFailureKind,
+        ProcessOutput, SystemProcessExecutor,
     },
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{os::fd::AsRawFd, path::Path, sync::Arc};
+use std::{fs::File, path::Path, sync::Arc};
 
 const REFRESH: u64 = 60;
 const PACE: u64 = 6;
@@ -137,7 +137,7 @@ pub fn poll(
 }
 
 /// The child retains the lease if its window dies while gh is still running.
-struct FlightExecutor(i32);
+struct FlightExecutor(Arc<File>);
 
 impl ProcessExecutor for FlightExecutor {
     fn execute(
@@ -145,8 +145,17 @@ impl ProcessExecutor for FlightExecutor {
         command: &CommandSpec,
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, ProcessFailure> {
-        let mut command = command.clone();
-        command.inherited_lease = Some(self.0);
+        let command = command
+            .clone()
+            .inherit_file(Arc::clone(&self.0))
+            .map_err(|error| {
+                crate::process::process_failure(
+                    command,
+                    ProcessFailureKind::Spawn,
+                    &format!("Cannot inherit the GitHub review flight: {error}"),
+                    false,
+                )
+            })?;
         SystemProcessExecutor.execute(&command, cancellation)
     }
 }
@@ -172,7 +181,7 @@ fn poll_with(
     repository: &GitHubRepoKey,
     cancellation: &CancellationToken,
     clock: impl Fn() -> u64,
-    read: impl FnOnce(&Work, i32) -> Result<Reply, GitHubError>,
+    read: impl FnOnce(&Work, Arc<File>) -> Result<Reply, GitHubError>,
     validate_context: impl Fn() -> Result<(), String>,
 ) -> Result<PollResult, String> {
     repository.validate().map_err(|error| error.to_string())?;
@@ -205,7 +214,14 @@ fn poll_with(
         return Err("Review-request read cancelled".into());
     }
     let work = stored.scan.next();
-    let reply = polling::with_scope(credentials, || read(&work, flight.as_raw_fd()));
+    // Preserve this exclusive description in gh, while the scoped owner still
+    // releases unrelated fork copies after the executor has reaped the child.
+    let lease = Arc::new(
+        flight
+            .try_clone()
+            .map_err(|error| format!("Cannot inherit the GitHub review flight: {error}"))?,
+    );
+    let reply = polling::with_scope(credentials, || read(&work, lease));
     // A gh auth switch can race a subprocess. Never publish the response under
     // the credential context captured before it started.
     validate_context()?;
@@ -368,6 +384,45 @@ pub(crate) mod tests {
                 .collect(),
             next_cursor: next.map(str::to_owned),
         })
+    }
+
+    #[test]
+    fn an_exclusive_scan_flight_allows_its_actual_query_child_to_run() {
+        let root = private_root();
+        let cancellation = CancellationToken::new();
+        let result = poll_with(
+            root.path(),
+            "actual-flight-test",
+            &repository(),
+            &cancellation,
+            || 1000,
+            |_, lease| {
+                let output = FlightExecutor(lease)
+                    .execute(
+                        &CommandSpec::new("/bin/sh").args(["-c", "printf query"]),
+                        &cancellation,
+                    )
+                    .expect("the scan's real child must start while its flight is locked");
+                assert!(output.success);
+                assert_eq!(output.stdout, b"query");
+                Ok(page("viewer", &[1], None))
+            },
+            || Ok(()),
+        )
+        .unwrap();
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert!(result.scan.requested.contains_key(&1));
+        let cached = poll_with(
+            root.path(),
+            "actual-flight-test",
+            &repository(),
+            &cancellation,
+            || 1001,
+            |_, _| panic!("the completed real query must be cached"),
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(cached.observation, result.observation);
     }
 
     #[test]

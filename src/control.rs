@@ -746,12 +746,15 @@ impl ControlClient {
 
     /// Handshake with an update source at its own protocol number. Only the
     /// update source client calls this, for a number whose wire is this
-    /// release's except for appended requests the update never sends.
+    /// release's for the frozen lifecycle subset.
     pub(crate) fn from_stream_at_source_protocol(
         stream: UnixStream,
         deadline: Instant,
         protocol: u16,
     ) -> Result<Self, ControlError> {
+        if !crate::update::source::current_client_supports(protocol) {
+            return Err(ControlError::UnsupportedVersion { actual: protocol });
+        }
         Self::from_stream_at(stream, deadline, deadline, protocol)
     }
 
@@ -2795,9 +2798,8 @@ fn staged_command_requires_daemon(command: &TopCommand) -> bool {
 }
 
 fn routes_to_staged_owner(command: &TopCommand) -> bool {
-    // `daemon upgrade` selects its own worker: an older owner's updater would
-    // apply that owner's preflight, which cannot qualify panes this release
-    // knows how to carry (`update::installed_update_worker`).
+    // `daemon upgrade` enters the served candidate's updater. An older owner's
+    // preflight cannot qualify the panes this candidate knows how to carry.
     !matches!(
         command,
         TopCommand::Completions { .. }
@@ -3496,7 +3498,7 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                     }
                     let preflight = client.shutdown_preflight().map_err(protocol_error)?;
                     eprint!(
-                        "Stop daemon and terminate {} hosted terminal/chat sessions and all their background subagents ({} currently running; includes pending spawns and unconfirmed provider work)? Type yes to confirm: ",
+                        "Stop daemon and terminate {} hosted terminal/chat sessions and all their background subagents ({} currently running or waiting on their own background work; includes pending spawns and unconfirmed provider work)? Type yes to confirm: ",
                         preflight.capability.live_terminals,
                         preflight.capability.background_subagents
                     );
@@ -6400,64 +6402,79 @@ mod tests {
 
     #[test]
     fn update_source_client_speaks_and_requires_the_sources_own_protocol() {
-        let source = crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL;
-        for answered in [source, PROTOCOL_VERSION] {
-            let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
-            let expected = proof("session", "boot", "incarnation");
-            let server_proof = expected.clone();
-            let server = thread::spawn(move || {
-                let connect: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
-                assert_eq!(connect.version, source);
-                let mut connected =
-                    connected_envelope(1, server_proof.clone(), server_proof.clone());
-                connected.version = answered;
-                write_frame(&mut server_stream, &connected).unwrap();
-                if answered != source {
-                    return;
-                }
-                let list: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
-                assert_eq!(list.version, source);
-                for version in [source, PROTOCOL_VERSION] {
-                    write_frame(
-                        &mut server_stream,
-                        &ServerEnvelope {
-                            version,
-                            request_id: Some(list.request_id),
-                            proof: server_proof.clone(),
-                            message: ServerMessage::Response {
-                                response: ServerResponse::Listed {
-                                    terminals: Vec::new(),
+        for source in crate::update::source::current_client_protocols() {
+            if source == PROTOCOL_VERSION {
+                continue;
+            }
+            for answered in [source, PROTOCOL_VERSION] {
+                let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+                let expected = proof("session", "boot", "incarnation");
+                let server_proof = expected.clone();
+                let server = thread::spawn(move || {
+                    let connect: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                    assert_eq!(connect.version, source);
+                    let mut connected =
+                        connected_envelope(1, server_proof.clone(), server_proof.clone());
+                    connected.version = answered;
+                    write_frame(&mut server_stream, &connected).unwrap();
+                    if answered != source {
+                        return;
+                    }
+                    let list: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                    assert_eq!(list.version, source);
+                    for version in [source, PROTOCOL_VERSION] {
+                        write_frame(
+                            &mut server_stream,
+                            &ServerEnvelope {
+                                version,
+                                request_id: Some(list.request_id),
+                                proof: server_proof.clone(),
+                                message: ServerMessage::Response {
+                                    response: ServerResponse::Listed {
+                                        terminals: Vec::new(),
+                                    },
                                 },
                             },
-                        },
-                    )
-                    .unwrap();
-                    if version == source {
-                        let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                        )
+                        .unwrap();
+                        if version == source {
+                            let _: ClientEnvelope =
+                                read_frame(&mut server_stream).unwrap().unwrap();
+                        }
                     }
+                });
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let client =
+                    ControlClient::from_stream_at_source_protocol(client_stream, deadline, source);
+                if answered != source {
+                    // A source that answers in another number is not the source
+                    // the update authenticated.
+                    assert!(matches!(
+                        client,
+                        Err(ControlError::UnsupportedVersion { actual }) if actual == answered
+                    ));
+                } else {
+                    let mut client = client.unwrap();
+                    assert_eq!(client.protocol(), source);
+                    assert_eq!(client.proof(), &expected);
+                    assert!(client.list().unwrap().is_empty());
+                    assert!(matches!(
+                        client.list(),
+                        Err(ControlError::UnsupportedVersion { actual }) if actual == PROTOCOL_VERSION
+                    ));
                 }
-            });
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let client =
-                ControlClient::from_stream_at_source_protocol(client_stream, deadline, source);
-            if answered != source {
-                // A source that answers in another number is not the source
-                // the update authenticated.
-                assert!(matches!(
-                    client,
-                    Err(ControlError::UnsupportedVersion { actual }) if actual == answered
-                ));
-            } else {
-                let mut client = client.unwrap();
-                assert_eq!(client.protocol(), source);
-                assert_eq!(client.proof(), &expected);
-                assert!(client.list().unwrap().is_empty());
-                assert!(matches!(
-                    client.list(),
-                    Err(ControlError::UnsupportedVersion { actual }) if actual == PROTOCOL_VERSION
-                ));
+                server.join().unwrap();
             }
-            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn update_source_client_refuses_unlisted_protocols_before_handshake() {
+        for protocol in [0, 77, 119, 127, PROTOCOL_VERSION + 1, u16::MAX] {
+            let (client, _server) = UnixStream::pair().unwrap();
+            assert!(matches!(ControlClient::from_stream_at_source_protocol(
+                client, Instant::now() + Duration::from_secs(5), protocol),
+                Err(ControlError::UnsupportedVersion { actual }) if actual == protocol));
         }
     }
 

@@ -38,9 +38,12 @@ that an update superseded it. The daemon answers that CLI in its protocol's
 version. It refuses requests to stop, update or hand off the daemon, and requests whose
 reply the CLI couldn't read, such as `automation history`, `automation run` and
 `automation run-now` on protocols before 156. It withholds notifications the CLI couldn't read.
+What a later protocol only added detail to is sent as the CLI knew it: on
+protocols before 166, a subagent waiting on its own background work reads as
+running.
 Each protocol's postcard wire format is recorded under
 `tests/fixtures/wire-formats/`. A test checks that every listed older protocol
-encodes the same way, except for what is refused or withheld. It checks
+encodes the same way, except for what is refused, withheld or restated. It checks
 encoding, not meaning, and not JSON carried as text inside a message.
 
 When a daemon takes the runtime lease, it points `bin` in its runtime
@@ -191,7 +194,12 @@ launches and automation prechecks must settle first. Changed ownership or impact
 requires a fresh confirmation. The final check also waits behind previously
 accepted provider commands, so a queued prompt cannot masquerade as idle.
 
-`daemon upgrade` uses this same worker and confirmation. `--yes` skips the
+`daemon upgrade` uses the served candidate's worker and this same confirmation.
+The candidate drives supported source daemons through a frozen lifecycle subset:
+the current protocol, historical current-wire protocols 128 and 156, and bespoke
+protocols 68 and 77. Other source protocols are refused with the build to update
+to first, or, for a newer service, the newer build to install;
+the update is never handed to an older build's worker. `--yes` skips the
 interactive prompt; `--interrupt` additionally permits native turn interruption.
 `--accept-unreopenable` carries saved panes whose ended actor never recorded
 its conversation; they stay in their windows without reopening it.

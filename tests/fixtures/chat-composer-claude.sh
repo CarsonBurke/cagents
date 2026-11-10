@@ -643,8 +643,15 @@ while next_frame; do
                     ;;
                 stop_task)
                     task=$(printf '%s' "$frame" | jq -r '.request.task_id')
-                    case $task in
-                        fixture-task-*) stop_agent "${task#fixture-task-}" ;;
+                    case " $background_agents " in
+                        *" ${task#fixture-task-} "*) stop_agent "${task#fixture-task-}" ;;
+                        # Any other task, such as one fixture-frames.jsonl
+                        # started, has already sent its notice: Claude Code
+                        # 2.1.296 answers a stop for an agent waiting on its
+                        # own background work by patching it killed, with no
+                        # further notice.
+                        *) jq -cn --arg task "$task" \
+                            '{type:"system",subtype:"task_updated",uuid:("fixture-"+$task+"-killed"),task_id:$task,patch:{status:"killed"}}' ;;
                     esac
                     ;;
                 interrupt)

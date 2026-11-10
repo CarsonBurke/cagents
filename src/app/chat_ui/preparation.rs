@@ -245,12 +245,15 @@ struct Shared {
     data: Option<Box<SharedData>>,
     // Capture admission on the UI thread where the application owns the job.
     // Its future may be polled on another executor thread.
-    workers: Arc<tokio::sync::Semaphore>,
+    workers: Arc<Pool>,
 }
 struct SharedData {
     latest: Mutex<Request>,
     canonical: Mutex<Option<Canonical>>,
     cancelled: AtomicBool,
+    // Where this input waits for a parser; see [`Pool`].
+    priority: AtomicU64,
+    place: Place,
     // Actual request/canonical allocations are destroyed before this lease.
     lease: Arc<Lease>,
 }
@@ -563,6 +566,12 @@ impl State {
                         theme,
                         reader_proofs: Arc::default(),
                     }),
+                    // The prompt just sent shows where the reader is, so it
+                    // ranks with the growing answer, and like it never takes
+                    // the last parser while history waits: a short wait
+                    // behind one history parse, rather than none left for it.
+                    priority: AtomicU64::new(TAIL),
+                    place: Place::default(),
                     canonical: Mutex::default(),
                     cancelled: AtomicBool::new(false),
                     lease,
@@ -693,6 +702,17 @@ impl State {
     }
     pub(super) fn contains(&self, id: &str) -> bool {
         self.entries.contains_key(id)
+    }
+    /// Rank a staged item's wait for a parser: lower ranks are parsed first.
+    /// One already waiting moves to its new place; one already parsing keeps
+    /// its parser.
+    pub(super) fn rank(&self, id: &str, rank: u64) {
+        if let Some(entry) = self.entries.get(id) {
+            entry
+                .shared
+                .workers
+                .rank(&entry.shared.priority, &entry.shared.place, rank);
+        }
     }
     #[cfg(test)]
     pub(super) fn growing_canonical_for_test(&self, item: &Arc<chat::Item>) -> Option<usize> {
@@ -855,6 +875,8 @@ impl State {
                         theme,
                         reader_proofs: self.reader_proofs.clone(),
                     }),
+                    priority: AtomicU64::new(UNRANKED),
+                    place: Place::default(),
                     canonical: Mutex::new(None),
                     cancelled: AtomicBool::new(false),
                     lease,
@@ -1020,7 +1042,7 @@ pub(super) struct Prepared {
     _owner: Arc<Shared>,
     // Hold admission through UI consumption: completed outputs cannot build
     // an unbounded queue while a busy UI has not handled their messages yet.
-    _permit: tokio::sync::OwnedSemaphorePermit,
+    _permit: Permit,
 }
 impl Prepared {
     pub(super) fn install_local(mut self, presentation: &mut prompt::LocalPresentation) {
@@ -1158,7 +1180,7 @@ impl Prepared {
 }
 
 /// A single background reclaimer drops only Send data. Installed output
-/// retirement retains one of its application's two parser/output permits; detached
+/// retirement retains one of its application's parser/output permits; detached
 /// canonical owners retain their existing source/item admission until dropped.
 /// Reader Rc state and renderer trees never leave the event thread.
 struct Retired {
@@ -1174,7 +1196,7 @@ struct Retired {
     _prepared_tools: Option<Arc<tool_text::PreparedSources>>,
     _owner: Arc<Shared>,
     // Declared last so retirement completes before the next parser is admitted.
-    _permit: tokio::sync::OwnedSemaphorePermit,
+    _permit: Permit,
 }
 #[allow(dead_code)] // Fields deliberately retain owned allocations until background drop.
 pub(super) struct Presentation {
@@ -1493,8 +1515,295 @@ impl std::hash::Hash for Job {
         self.run.hash(state);
     }
 }
-fn workers() -> Arc<tokio::sync::Semaphore> {
-    application_capacity!(2)
+/// The rank of a staged input no caller has ranked.
+const UNRANKED: u64 = u64::MAX;
+
+/// Parser admission for one application, granted in rank order.
+///
+/// Every queued message is its own subscription, and subscriptions start in
+/// no particular order, so a plain semaphore parsed a returning transcript in
+/// whatever order its entries hashed to: the rows on screen could wait behind
+/// the whole history. Waiters here queue by the rank their transcript gives
+/// them, ties in arrival order, and ranking a waiting input again moves it.
+/// Only the waiter at the head contends for a permit, and only a change of
+/// head wakes anyone, so a queue of n waiters costs O(n log n), not O(n²).
+///
+/// The growing tail ranks first, but never holds every parser while others
+/// wait: with two or more parsers, one is always left for the rest, so a
+/// streaming chat cannot stall a transcript's history however long it runs.
+struct Pool {
+    permits: Arc<tokio::sync::Semaphore>,
+    capacity: usize,
+    queue: Mutex<Queue>,
+    #[cfg(test)]
+    wakes: AtomicUsize,
+    /// Whether ranks order the queue; measurements compare arrival order.
+    #[cfg(test)]
+    ranked: bool,
+    /// Runs as a waiter arrives, before it takes its place in the queue.
+    #[cfg(test)]
+    arriving: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+#[derive(Default)]
+struct Queue {
+    waiting: std::collections::BTreeMap<(u64, u64), Arc<Ticket>>,
+    arrivals: u64,
+    /// The waiter contending for the next permit.
+    head: Option<(u64, u64)>,
+    /// Parsers the growing tail holds.
+    tail_held: usize,
+}
+/// One waiter: its place in the queue, which ranking can move, and how it
+/// is told it reached or lost the head.
+struct Ticket {
+    key: Mutex<(u64, u64)>,
+    turn: tokio::sync::Notify,
+}
+/// Where a staged input's waiter is, so ranking it again finds it.
+#[derive(Default)]
+pub(super) struct Place(Mutex<std::sync::Weak<Ticket>>);
+/// A parser's permit. Held through UI consumption of what it prepared.
+pub(super) struct Permit {
+    tail: Option<Arc<Pool>>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+/// A permit outside any application's queue, as fixtures grant.
+impl From<tokio::sync::OwnedSemaphorePermit> for Permit {
+    fn from(permit: tokio::sync::OwnedSemaphorePermit) -> Self {
+        Self {
+            tail: None,
+            _permit: permit,
+        }
+    }
+}
+impl Drop for Permit {
+    fn drop(&mut self) {
+        if let Some(pool) = self.tail.take() {
+            let mut queue = pool.lock();
+            queue.tail_held -= 1;
+            queue.advance(pool.capacity);
+        }
+    }
+}
+const TAIL: u64 = 0;
+impl Queue {
+    /// Who should contend next: the best-ranked waiter, unless it is the
+    /// tail and the tail already holds all but one parser while other work
+    /// waits.
+    fn eligible(&self, capacity: usize) -> Option<(u64, u64)> {
+        let first = *self.waiting.keys().next()?;
+        if first.0 == TAIL && capacity > 1 && self.tail_held + 1 >= capacity {
+            if let Some(other) = self.waiting.keys().find(|key| key.0 != TAIL) {
+                return Some(*other);
+            }
+        }
+        Some(first)
+    }
+    /// Wake the new head, and the old one so it stops contending, when the
+    /// head changed.
+    fn advance(&mut self, capacity: usize) {
+        let next = self.eligible(capacity);
+        if next == self.head {
+            return;
+        }
+        for key in [self.head, next].into_iter().flatten() {
+            if let Some(ticket) = self.waiting.get(&key) {
+                ticket.turn.notify_one();
+            }
+        }
+        self.head = next;
+    }
+}
+impl Pool {
+    fn new(permits: usize) -> Self {
+        Self {
+            permits: Arc::new(tokio::sync::Semaphore::new(permits)),
+            capacity: permits,
+            queue: Mutex::default(),
+            #[cfg(test)]
+            wakes: AtomicUsize::new(0),
+            #[cfg(test)]
+            ranked: true,
+            #[cfg(test)]
+            arriving: Mutex::default(),
+        }
+    }
+    /// Two parsers. Ranking, not parallelism, is what shows the reader's rows
+    /// sooner: more parsers only finish off-screen history sooner, while each
+    /// holds its message's working set and installs more outputs before one
+    /// frame (`frame_cost::a_cold_open_parses_what_is_read_first`).
+    const PARSERS: usize = 2;
+
+    fn sized() -> Self {
+        #[cfg(test)]
+        if let Some((capacity, ranked)) = POLICY.get() {
+            return Self {
+                ranked,
+                ..Self::new(capacity)
+            };
+        }
+        Self::new(Self::PARSERS)
+    }
+    fn lock(&self) -> std::sync::MutexGuard<'_, Queue> {
+        self.queue.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    #[cfg(test)]
+    fn first(&self) -> Option<(u64, u64)> {
+        self.lock().waiting.keys().next().copied()
+    }
+    /// Rank the input whose wait for a parser `priority` and `place` record.
+    ///
+    /// A waiter reads its rank under the queue's lock as it joins, and a
+    /// waiter in the queue moves under that lock, so a rank given while the
+    /// input joins is either read as it joins or moves it once it is there.
+    fn rank(&self, priority: &AtomicU64, place: &Place, rank: u64) {
+        if priority.swap(rank, Ordering::Relaxed) != rank {
+            self.rerank(place, rank);
+        }
+    }
+    /// Move the waiter at `place`, if it is still waiting, to `rank`.
+    fn rerank(&self, place: &Place, rank: u64) {
+        #[cfg(test)]
+        if !self.ranked {
+            return;
+        }
+        // The queue's lock first: a waiter joining now has either taken its
+        // place by then or will read the rank just stored.
+        let mut queue = self.lock();
+        let Some(ticket) = place.0.lock().unwrap_or_else(|e| e.into_inner()).upgrade() else {
+            return;
+        };
+        let mut key = ticket.key.lock().unwrap_or_else(|e| e.into_inner());
+        if key.0 == rank {
+            return;
+        }
+        let Some(ticket) = queue.waiting.remove(&key) else {
+            return;
+        };
+        let was_head = queue.head == Some(*key);
+        key.0 = rank;
+        let moved = *key;
+        drop(key);
+        queue.waiting.insert(moved, ticket.clone());
+        if was_head {
+            if queue.eligible(self.capacity) == Some(moved) {
+                // Still first, as when an append shifts every rank alike:
+                // it keeps contending, and nobody is woken.
+                queue.head = Some(moved);
+                return;
+            }
+            // Someone else is eligible now: it stops contending, and
+            // `advance` tells the new head.
+            queue.head = None;
+            ticket.turn.notify_one();
+        }
+        queue.advance(self.capacity);
+    }
+    /// Wait for a parser at the rank `priority` holds when this joins the
+    /// queue, or any rank it is given later through `place`.
+    async fn acquire(
+        self: &Arc<Self>,
+        priority: &AtomicU64,
+        place: Option<&Place>,
+    ) -> Result<Permit, tokio::sync::AcquireError> {
+        #[cfg(test)]
+        if let Some(arriving) = self
+            .arriving
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            arriving();
+        }
+        struct Waiting<'a>(&'a Pool, &'a Ticket, bool);
+        impl Drop for Waiting<'_> {
+            fn drop(&mut self) {
+                if self.2 {
+                    return;
+                }
+                let mut queue = self.0.lock();
+                let key = *self.1.key.lock().unwrap_or_else(|e| e.into_inner());
+                queue.waiting.remove(&key);
+                queue.advance(self.0.capacity);
+            }
+        }
+        let ticket = {
+            let mut queue = self.lock();
+            let rank = priority.load(Ordering::Relaxed);
+            #[cfg(test)]
+            let rank = if self.ranked { rank } else { UNRANKED };
+            let key = (rank, queue.arrivals);
+            queue.arrivals += 1;
+            let ticket = Arc::new(Ticket {
+                key: Mutex::new(key),
+                turn: tokio::sync::Notify::new(),
+            });
+            queue.waiting.insert(key, ticket.clone());
+            if let Some(place) = place {
+                *place.0.lock().unwrap_or_else(|e| e.into_inner()) = Arc::downgrade(&ticket);
+            }
+            ticket
+        };
+        let mut waiting = Waiting(self, &ticket, false);
+        // Subscriptions started together all queue before any contends, so
+        // the first parsers go by rank too rather than by start order.
+        tokio::task::yield_now().await;
+        self.lock().advance(self.capacity);
+        loop {
+            let turn = ticket.turn.notified();
+            let turn = std::pin::pin!(turn);
+            let mine = {
+                let queue = self.lock();
+                queue.head == Some(*ticket.key.lock().unwrap_or_else(|e| e.into_inner()))
+            };
+            if !mine {
+                turn.await;
+                #[cfg(test)]
+                self.wakes.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            let acquire = std::pin::pin!(self.permits.clone().acquire_owned());
+            if let iced::futures::future::Either::Left((permit, _)) =
+                iced::futures::future::select(acquire, turn).await
+            {
+                let permit = permit?;
+                let mut queue = self.lock();
+                let key = *ticket.key.lock().unwrap_or_else(|e| e.into_inner());
+                if queue.head != Some(key) {
+                    // It lost the head while the semaphore had already
+                    // queued it for this permit; the permit goes back for
+                    // the waiter that is ahead now.
+                    drop(queue);
+                    drop(permit);
+                    continue;
+                }
+                queue.waiting.remove(&key);
+                let tail = key.0 == TAIL;
+                if tail {
+                    queue.tail_held += 1;
+                }
+                queue.advance(self.capacity);
+                waiting.2 = true;
+                return Ok(Permit {
+                    tail: tail.then(|| self.clone()),
+                    _permit: permit,
+                });
+            }
+            // Told while contending: it may have lost the head.
+            #[cfg(test)]
+            self.wakes.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+#[cfg(test)]
+thread_local! {
+    /// The parser count and whether ranks apply, for pools this thread
+    /// creates from now on; measurements compare policies on fresh threads.
+    pub(super) static POLICY: std::cell::Cell<Option<(usize, bool)>> =
+        const { std::cell::Cell::new(None) };
+}
+fn workers() -> Arc<Pool> {
+    application_shared!(Pool, Pool::sized())
 }
 fn stream(job: &Job) -> Pin<Box<dyn iced::futures::Stream<Item = Message> + Send>> {
     let job = job.clone();
@@ -1509,8 +1818,7 @@ fn stream(job: &Job) -> Pin<Box<dyn iced::futures::Stream<Item = Message> + Send
 async fn run(shared: Arc<Shared>) -> Result<Prepared, String> {
     let permit = shared
         .workers
-        .clone()
-        .acquire_owned()
+        .acquire(&shared.priority, Some(&shared.place))
         .await
         .map_err(|_| "Message loading stopped.".to_owned())?;
     if shared.cancelled.load(Ordering::Relaxed) {
@@ -1521,10 +1829,8 @@ async fn run(shared: Arc<Shared>) -> Result<Prepared, String> {
         .map_err(|_| "A message could not be loaded. Retry loading it.".to_owned())?
 }
 
-fn execute(
-    shared: Arc<Shared>,
-    permit: tokio::sync::OwnedSemaphorePermit,
-) -> Result<Prepared, String> {
+fn execute(shared: Arc<Shared>, permit: impl Into<Permit>) -> Result<Prepared, String> {
+    let permit = permit.into();
     reclaim_before_work()?;
     let request = shared
         .latest
@@ -1738,6 +2044,90 @@ pub(super) fn drain_fixture(runtime: &mut Runtime) {
     panic!("fixture preparation did not quiesce");
 }
 
+/// Drive the production parser admission as the application's subscriptions
+/// do: every running entry starts at once, in the order the subscriptions
+/// list them. Results are installed on this thread in UI updates: each takes
+/// every result that arrived since the last, then `frame` draws, as the
+/// event loop handles all queued messages before a redraw.
+#[cfg(test)]
+pub(super) fn drain_concurrently<T>(
+    owner: &mut T,
+    runtime: impl Fn(&mut T) -> &mut Runtime,
+    mut frame: impl FnMut(&mut T),
+) -> Drained {
+    let executor = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let start = std::time::Instant::now();
+    let (sent, mut arrivals) = tokio::sync::mpsc::unbounded_channel();
+    let mut started = std::collections::HashSet::new();
+    let mut drained = Drained::default();
+    let mut pending = 0usize;
+    loop {
+        for (id, entry) in runtime(owner)
+            .preparation
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.running)
+        {
+            if started.insert((id.clone(), entry.run)) {
+                let (id, generation, shared) = (id.clone(), entry.run, entry.shared.clone());
+                let sent = sent.clone();
+                pending += 1;
+                executor.spawn(async move {
+                    let _ = sent.send((id, generation, run(shared).await));
+                });
+            }
+        }
+        if pending == 0 {
+            return drained;
+        }
+        // One UI update: everything that finished since the last one, as the
+        // event loop handles every queued message before it draws.
+        let first = executor.block_on(arrivals.recv()).expect("a parser result");
+        let mut batch = vec![first];
+        while let Ok(next) = arrivals.try_recv() {
+            batch.push(next);
+        }
+        pending -= batch.len();
+        let clock = std::time::Instant::now();
+        let count = batch.len();
+        for (id, generation, result) in batch {
+            let runtime = runtime(owner);
+            runtime.markdown_prepared(runtime.target, &id, generation, Ready::new(result));
+            drained.installed.push((id, start.elapsed()));
+        }
+        let installing = clock.elapsed();
+        let clock = std::time::Instant::now();
+        frame(owner);
+        let framing = clock.elapsed();
+        drained.updates.push(Update {
+            outputs: count,
+            installing,
+            framing,
+            drawn: start.elapsed(),
+        });
+    }
+}
+
+/// What [`drain_concurrently`] saw: when each output was installed, and each
+/// UI update that installed some.
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct Drained {
+    pub(super) installed: Vec<(String, std::time::Duration)>,
+    pub(super) updates: Vec<Update>,
+}
+#[cfg(test)]
+pub(super) struct Update {
+    pub(super) outputs: usize,
+    pub(super) installing: std::time::Duration,
+    pub(super) framing: std::time::Duration,
+    /// When the frame that shows this update's outputs was done.
+    pub(super) drawn: std::time::Duration,
+}
+
 /// Parse one coalesced publication once. The parser can reparse an unfinished
 /// rich block on append; feeding a cold body in artificial chunks amplifies
 /// that cost. Cancellation fences ownership before and after the parser call;
@@ -1792,6 +2182,471 @@ mod tests {
         let entry = &state.entries["message"];
         (entry.run, entry.shared.clone())
     }
+    /// The ranks that obtain `pool`'s permits, in the order they do, when
+    /// waiters with `ranks` queue behind permits that are all held.
+    fn grants(pool: Pool, held: usize, ranks: &[u64], late: Option<u64>) -> Vec<u64> {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        executor.block_on(async {
+            let pool = Arc::new(pool);
+            let blockers: Vec<_> = (0..held)
+                .map(|_| pool.permits.clone().try_acquire_owned().unwrap())
+                .collect();
+            let (granted, mut order) = tokio::sync::mpsc::unbounded_channel();
+            let spawn = |rank: u64| {
+                let (pool, granted) = (pool.clone(), granted.clone());
+                tokio::spawn(async move {
+                    let permit = pool.acquire(&AtomicU64::new(rank), None).await.unwrap();
+                    granted.send(rank).unwrap();
+                    // Hold the parser briefly, as a worker does.
+                    tokio::task::yield_now().await;
+                    drop(permit);
+                })
+            };
+            let mut tasks: Vec<_> = ranks.iter().map(|&rank| spawn(rank)).collect();
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+            tasks.extend(late.map(spawn));
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+            drop(blockers);
+            for task in tasks {
+                task.await.unwrap();
+            }
+            drop(granted);
+            let mut grants = Vec::new();
+            while let Some(rank) = order.recv().await {
+                grants.push(rank);
+            }
+            grants
+        })
+    }
+
+    #[test]
+    fn parsers_go_to_the_best_ranked_waiters_first() {
+        // Arrival order is the order subscriptions happened to start in.
+        assert_eq!(
+            grants(Pool::new(1), 1, &[40, 2, 30, 1, 20], None),
+            [1, 2, 20, 30, 40]
+        );
+        // A row the reader returned to, ranked after others already queued,
+        // still goes before them.
+        assert_eq!(
+            grants(Pool::new(1), 1, &[40, 30, 20], Some(1)),
+            [1, 20, 30, 40]
+        );
+        // Equal ranks keep arrival order.
+        assert_eq!(grants(Pool::new(1), 1, &[5, 5, 5], None), [5, 5, 5]);
+    }
+
+    #[test]
+    fn a_waiter_that_stops_waiting_gives_up_its_place() {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        executor.block_on(async {
+            let pool = Arc::new(Pool::new(1));
+            let held = pool.permits.clone().try_acquire_owned().unwrap();
+            let first = tokio::spawn({
+                let pool = pool.clone();
+                async move { pool.acquire(&AtomicU64::new(1), None).await.map(drop) }
+            });
+            tokio::task::yield_now().await;
+            let second = tokio::spawn({
+                let pool = pool.clone();
+                async move { pool.acquire(&AtomicU64::new(2), None).await.map(drop) }
+            });
+            tokio::task::yield_now().await;
+            // The first in line is cancelled, as when its message is replaced.
+            first.abort();
+            assert!(first.await.unwrap_err().is_cancelled());
+            assert_eq!(pool.first(), Some((2, 1)));
+            drop(held);
+            tokio::time::timeout(Duration::from_secs(5), second)
+                .await
+                .expect("the next waiter is granted the released parser")
+                .unwrap()
+                .unwrap();
+            assert!(pool.lock().waiting.is_empty());
+        });
+    }
+
+    /// Spawns a waiter at `rank` that reports its rank when granted and
+    /// holds the parser until `release` says so.
+    fn waiter(
+        pool: &Arc<Pool>,
+        rank: u64,
+        place: Option<Arc<Place>>,
+        granted: &tokio::sync::mpsc::UnboundedSender<u64>,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let (pool, granted) = (pool.clone(), granted.clone());
+        let task = tokio::spawn(async move {
+            let permit = pool
+                .acquire(&AtomicU64::new(rank), place.as_deref())
+                .await
+                .unwrap();
+            granted.send(rank).unwrap();
+            let _ = released.await;
+            drop(permit);
+        });
+        (task, release)
+    }
+    async fn settle() {
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+    }
+    fn current_thread() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn ranking_a_waiting_input_again_moves_it() {
+        current_thread().block_on(async {
+            let pool = Arc::new(Pool::new(1));
+            let held = pool.permits.clone().try_acquire_owned().unwrap();
+            let (granted, mut order) = tokio::sync::mpsc::unbounded_channel();
+            let place = Arc::new(Place::default());
+            let mut releases: HashMap<u64, _> = [(30, Some(place.clone())), (20, None), (10, None)]
+                .into_iter()
+                .map(|(rank, place)| (rank, waiter(&pool, rank, place, &granted).1))
+                .collect();
+            settle().await;
+            // The reader scrolled to the oldest one while it waited.
+            pool.rerank(&place, 5);
+            assert_eq!(pool.first(), Some((5, 0)));
+            drop(held);
+            let mut grants = Vec::new();
+            for _ in 0..3 {
+                let rank = order.recv().await.unwrap();
+                grants.push(rank);
+                let _ = releases.remove(&rank).unwrap().send(());
+            }
+            // Waiters report the rank they arrived with.
+            assert_eq!(grants, [30, 10, 20]);
+        });
+    }
+
+    #[test]
+    fn ranking_every_waiter_alike_leaves_the_head_contending() {
+        current_thread().block_on(async {
+            let pool = Arc::new(Pool::new(1));
+            let held = pool.permits.clone().try_acquire_owned().unwrap();
+            let (granted, mut order) = tokio::sync::mpsc::unbounded_channel();
+            let places: Vec<_> = (0..3).map(|_| Arc::new(Place::default())).collect();
+            let mut releases: Vec<_> = places
+                .iter()
+                .zip([10, 20, 30])
+                .map(|(place, rank)| waiter(&pool, rank, Some(place.clone()), &granted).1)
+                .collect();
+            settle().await;
+            let wakes = pool.wakes.load(Ordering::Relaxed);
+            // A message arrives: everything already waiting is one further
+            // from the newest.
+            for (place, rank) in places.iter().zip([11, 21, 31]) {
+                pool.rerank(place, rank);
+            }
+            settle().await;
+            assert_eq!(pool.lock().head, Some((11, 0)));
+            assert_eq!(
+                pool.wakes.load(Ordering::Relaxed),
+                wakes,
+                "nobody is woken when the order stays the same"
+            );
+            drop(held);
+            for expected in [10, 20, 30] {
+                assert_eq!(order.recv().await, Some(expected));
+                let _ = releases.remove(0).send(());
+            }
+        });
+    }
+
+    #[test]
+    fn a_rank_given_as_an_input_joins_the_queue_is_kept() {
+        current_thread().block_on(async {
+            let pool = Arc::new(Pool::new(1));
+            let _held = pool.permits.clone().try_acquire_owned().unwrap();
+            let priority = Arc::new(AtomicU64::new(30));
+            let place = Arc::new(Place::default());
+            // The UI ranks the input again after its subscription started
+            // waiting, but before it has a place in the queue to move.
+            *pool.arriving.lock().unwrap() = Some(Box::new({
+                let (pool, priority, place) = (pool.clone(), priority.clone(), place.clone());
+                move || pool.rank(&priority, &place, 5)
+            }));
+            let waiting = tokio::spawn({
+                let (pool, priority, place) = (pool.clone(), priority.clone(), place.clone());
+                async move { pool.acquire(&priority, Some(&place)).await.map(drop) }
+            });
+            settle().await;
+            assert_eq!(pool.first(), Some((5, 0)));
+            waiting.abort();
+        });
+    }
+
+    #[test]
+    fn the_growing_tail_leaves_a_parser_for_the_rest() {
+        current_thread().block_on(async {
+            let pool = Arc::new(Pool::new(2));
+            let (granted, mut order) = tokio::sync::mpsc::unbounded_channel();
+            // One streaming chat parses its tail.
+            let (_first, first_release) = waiter(&pool, TAIL, None, &granted);
+            settle().await;
+            assert_eq!(order.recv().await, Some(TAIL));
+            let held = pool.permits.clone().try_acquire_owned().unwrap();
+            // Another chat's tail and some history wait for the other parser.
+            let (_second, second_release) = waiter(&pool, TAIL, None, &granted);
+            let (_history, history_release) = waiter(&pool, 9, None, &granted);
+            settle().await;
+            drop(held);
+            assert_eq!(
+                order.recv().await,
+                Some(9),
+                "the last parser goes to history while a tail holds the other"
+            );
+            let _ = first_release.send(());
+            assert_eq!(order.recv().await, Some(TAIL));
+            let _ = second_release.send(());
+            let _ = history_release.send(());
+        });
+    }
+
+    #[test]
+    fn a_contending_tail_yields_the_head_to_history_that_arrives() {
+        current_thread().block_on(async {
+            let pool = Arc::new(Pool::new(2));
+            let (granted, mut order) = tokio::sync::mpsc::unbounded_channel();
+            let (_first, first_release) = waiter(&pool, TAIL, None, &granted);
+            settle().await;
+            assert_eq!(order.recv().await, Some(TAIL));
+            let held = pool.permits.clone().try_acquire_owned().unwrap();
+            // Alone, another tail is the head and contends for the last
+            // parser.
+            let (_second, second_release) = waiter(&pool, TAIL, None, &granted);
+            settle().await;
+            assert_eq!(pool.lock().head.map(|key| key.0), Some(TAIL));
+            // History arriving behind it takes the head from it.
+            let (_history, history_release) = waiter(&pool, 9, None, &granted);
+            settle().await;
+            assert_eq!(pool.lock().head.map(|key| key.0), Some(9));
+            drop(held);
+            assert_eq!(
+                order.recv().await,
+                Some(9),
+                "the tail that was contending leaves the last parser to history"
+            );
+            settle().await;
+            assert!(order.try_recv().is_err(), "the tail still waits");
+            let _ = history_release.send(());
+            assert_eq!(order.recv().await, Some(TAIL));
+            let _ = first_release.send(());
+            let _ = second_release.send(());
+        });
+    }
+
+    #[test]
+    fn waiters_behind_the_head_are_not_woken_by_others_coming_and_going() {
+        current_thread().block_on(async {
+            let pool = Arc::new(Pool::new(1));
+            let held = pool.permits.clone().try_acquire_owned().unwrap();
+            let (granted, mut order) = tokio::sync::mpsc::unbounded_channel();
+            let waiters: Vec<_> = (1..=64)
+                .map(|rank| waiter(&pool, rank, None, &granted))
+                .collect();
+            settle().await;
+            drop(held);
+            for (rank, (_task, release)) in (1..=64).zip(waiters) {
+                assert_eq!(order.recv().await, Some(rank));
+                let _ = release.send(());
+            }
+            let wakes = pool.wakes.load(Ordering::Relaxed);
+            assert!(
+                wakes <= 2 * 64,
+                "each waiter wakes about once, on reaching the head: {wakes}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_transcript_ranks_its_newest_messages_first() {
+        let session = fresh_chat_session(
+            Provider::Claude,
+            TerminalId::new(),
+            "/project".into(),
+            &Account::system(Provider::Claude),
+            false,
+        )
+        .unwrap();
+        let items: Vec<_> = (0..6)
+            .map(|index| {
+                Arc::new(chat::Item {
+                    id: format!("answer-{index}"),
+                    role: chat::Role::Assistant,
+                    content: ItemContent::Text {
+                        text: format!("Answer **{index}**"),
+                        thinking: false,
+                        phase: chat::Phase::Final,
+                    },
+                    started_at: None,
+                    at: None,
+                })
+            })
+            .collect();
+        let handle = Arc::new(ClientHandle::fixture(
+            session.clone(),
+            Snapshot {
+                ready: true,
+                generation: 1,
+                items,
+                ..Snapshot::default()
+            },
+        ));
+        let runtime = Runtime::new(
+            target(),
+            session,
+            Connection::Live(handle),
+            true,
+            crate::settings::EditorSyntaxTheme::Auto,
+        );
+        let ranks: Vec<u64> = (0..6)
+            .map(|index| {
+                runtime.preparation.entries[&format!("answer-{index}")]
+                    .shared
+                    .priority
+                    .load(Ordering::Relaxed)
+            })
+            .collect();
+        assert!(
+            ranks.windows(2).all(|pair| pair[0] > pair[1]),
+            "older messages wait behind newer ones: {ranks:?}"
+        );
+    }
+
+    #[test]
+    fn a_saved_window_at_the_old_end_is_in_the_first_staged_wave() {
+        let session = fresh_chat_session(
+            Provider::Claude,
+            TerminalId::new(),
+            "/project".into(),
+            &Account::system(Provider::Claude),
+            false,
+        )
+        .unwrap();
+        let handle = Arc::new(ClientHandle::fixture(
+            session.clone(),
+            Snapshot {
+                ready: true,
+                ..Snapshot::default()
+            },
+        ));
+        let mut runtime = Runtime::new(
+            target(),
+            session,
+            Connection::Live(handle.clone()),
+            true,
+            crate::settings::EditorSyntaxTheme::Auto,
+        );
+        let total = 3 * QUEUED_ITEMS;
+        let items: Vec<_> = (0..total)
+            .map(|index| {
+                Arc::new(chat::Item {
+                    id: format!("answer-{index}"),
+                    role: chat::Role::Assistant,
+                    content: ItemContent::Text {
+                        text: format!("Answer **{index}**"),
+                        thinking: false,
+                        phase: chat::Phase::Final,
+                    },
+                    started_at: None,
+                    at: None,
+                })
+            })
+            .collect();
+        // The reader left the main transcript near its oldest messages,
+        // far beyond the newest-back reach of one wave.
+        let window = ["answer-2", "answer-3", "answer-4"];
+        runtime.scroll_memory.save_window(None, &window);
+        handle.replace_snapshot_for_test(Snapshot {
+            generation: 1,
+            ready: true,
+            items,
+            ..Snapshot::default()
+        });
+        runtime.refresh();
+        assert!(
+            runtime.preparation.waiting(),
+            "the wave is bounded and the rest waits"
+        );
+        assert!(runtime.preparation.entries.len() <= QUEUED_ITEMS);
+        for id in window {
+            let rank = runtime
+                .preparation
+                .entries
+                .get(id)
+                .unwrap_or_else(|| panic!("{id} from the saved window is staged in the first wave"))
+                .shared
+                .priority
+                .load(Ordering::Relaxed);
+            assert_eq!(rank, 1, "{id} ranks as a reading row");
+        }
+        assert!(
+            runtime
+                .preparation
+                .contains(&format!("answer-{}", total - 1)),
+            "the newest message still follows the saved window"
+        );
+        assert!(
+            !runtime.preparation.contains("answer-1"),
+            "history next to the saved window waits its newest-back turn"
+        );
+    }
+
+    #[test]
+    fn another_applications_waiters_leave_this_queue_alone() {
+        let ours = workers();
+        let theirs = std::thread::spawn(workers).join().unwrap();
+        assert!(!Arc::ptr_eq(&ours, &theirs));
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        executor.block_on(async {
+            let _full = theirs
+                .permits
+                .clone()
+                .try_acquire_many_owned(theirs.permits.available_permits() as u32)
+                .unwrap();
+            // Their best-ranked waiter is stuck behind their own full pool.
+            let stuck = tokio::spawn({
+                let theirs = theirs.clone();
+                async move { theirs.acquire(&AtomicU64::new(0), None).await.map(drop) }
+            });
+            tokio::task::yield_now().await;
+            assert_eq!(theirs.first(), Some((0, 0)));
+            assert_eq!(ours.first(), None);
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                ours.acquire(&AtomicU64::new(UNRANKED), None),
+            )
+            .await
+            .expect("our worst-ranked waiter still gets one of our parsers")
+            .unwrap();
+            stuck.abort();
+        });
+    }
+
     fn permit() -> tokio::sync::OwnedSemaphorePermit {
         Arc::new(tokio::sync::Semaphore::new(1))
             .try_acquire_owned()
@@ -1814,7 +2669,8 @@ mod tests {
             |_, _| false,
         );
         let (_, shared) = job(&state);
-        let originating_workers: Arc<tokio::sync::Semaphore> = workers();
+        let originating_workers = workers().permits.clone();
+        let capacity = originating_workers.available_permits();
         let observed_workers = originating_workers.clone();
         let held = hold_retirement();
         let (report, observed) = std::sync::mpsc::channel();
@@ -1822,15 +2678,21 @@ mod tests {
         let executor_thread = std::thread::spawn(move || {
             // A fresh thread is a different test application with its own
             // pool. Exhausting that pool must not touch the constructing UI's.
-            let _foreign_application = workers().try_acquire_many_owned(2).unwrap();
+            let foreign = workers().permits.clone();
+            let all = foreign.available_permits() as u32;
+            let _foreign_application = foreign.try_acquire_many_owned(all).unwrap();
             let executor = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .unwrap();
             executor.block_on(async {
                 let mut output = Box::pin(run(shared));
-                // The real worker cannot pass its reclamation barrier yet.
-                assert!(output.as_mut().now_or_never().is_none());
+                // Admission yields once so a wave of subscriptions queues
+                // before any contends; then the real worker holds its slot
+                // and cannot pass its reclamation barrier yet.
+                for _ in 0..2 {
+                    assert!(output.as_mut().now_or_never().is_none());
+                }
                 report.send(observed_workers.available_permits()).unwrap();
                 if resumed.await.unwrap() {
                     Some(output.await)
@@ -1843,23 +2705,24 @@ mod tests {
         });
         let available = observed.recv().unwrap();
         drop(held);
-        proceed.send(available == 1).unwrap();
+        proceed.send(available == capacity - 1).unwrap();
         let output = executor_thread.join().unwrap();
         assert_eq!(
-            available, 1,
+            available,
+            capacity - 1,
             "the dispatched job must own a slot from its constructing application"
         );
         let output = output.expect("admitted real parser job").unwrap();
         assert!(Arc::ptr_eq(output.item(), &source));
-        assert_eq!(originating_workers.available_permits(), 1);
+        assert_eq!(originating_workers.available_permits(), capacity - 1);
         // Discarded outputs retain their originating slot through queued
         // storage retirement, even while the reclaimer is held.
         let held = hold_retirement();
         output.discard();
-        assert_eq!(originating_workers.available_permits(), 1);
+        assert_eq!(originating_workers.available_permits(), capacity - 1);
         drop(held);
         retirement_barrier();
-        assert_eq!(originating_workers.available_permits(), 2);
+        assert_eq!(originating_workers.available_permits(), capacity);
         drop(state);
         retirement_barrier();
     }

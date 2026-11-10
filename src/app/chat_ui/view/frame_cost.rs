@@ -234,6 +234,15 @@ fn a_streaming_frame_of_a_full_window() {
 
 /// A live runtime showing `items`, and the handle that publishes to it.
 pub(super) fn live_runtime(items: &[chat::Item]) -> (Runtime, Arc<ClientHandle>) {
+    let (mut runtime, handle) = cold_runtime(items);
+    // This helper supplies ready rendered content to focused widget tests.
+    // Native/cold preparation timing must drive the actual async subscription.
+    preparation::drain_fixture(&mut runtime);
+    (runtime, handle)
+}
+
+/// A live runtime that has just opened `items`, nothing prepared yet.
+fn cold_runtime(items: &[chat::Item]) -> (Runtime, Arc<ClientHandle>) {
     let account = Account::system(Provider::Claude);
     let session = fresh_chat_session(
         Provider::Claude,
@@ -253,16 +262,13 @@ pub(super) fn live_runtime(items: &[chat::Item]) -> (Runtime, Arc<ClientHandle>)
         card: CardId::new(),
         generation: 1,
     };
-    let mut runtime = Runtime::new(
+    let runtime = Runtime::new(
         target,
         session,
         Connection::Live(handle.clone()),
         true,
         crate::settings::EditorSyntaxTheme::default(),
     );
-    // This helper supplies ready rendered content to focused widget tests.
-    // Native/cold preparation timing must drive the actual async subscription.
-    preparation::drain_fixture(&mut runtime);
     (runtime, handle)
 }
 
@@ -284,6 +290,16 @@ struct Pane {
 impl Pane {
     fn new(items: Vec<chat::Item>) -> Self {
         let (runtime, handle) = live_runtime(&items);
+        Self::showing(runtime, handle, items)
+    }
+
+    /// A pane that has just opened `items`, before any is prepared.
+    fn cold(items: Vec<chat::Item>) -> Self {
+        let (runtime, handle) = cold_runtime(&items);
+        Self::showing(runtime, handle, items)
+    }
+
+    fn showing(runtime: Runtime, handle: Arc<ClientHandle>, items: Vec<chat::Item>) -> Self {
         Self {
             runtime,
             handle,
@@ -1566,6 +1582,7 @@ fn a_reveal_of_a_hidden_full_window() {
 /// Each workload is shown and settled, then hidden while it stays warm; the
 /// heap that cooling it releases is what keeping it warm cost. Run it alone:
 /// the heap count is process-wide.
+#[cfg(not(feature = "integrated-browser"))]
 #[test]
 #[ignore = "a measurement, not a check; see the module documentation"]
 fn what_a_warm_hidden_chat_holds() {
@@ -1639,5 +1656,195 @@ fn what_a_warm_hidden_chat_holds() {
             census[1],
             census[2],
         );
+    }
+}
+
+/// How soon a chat opened cold shows what its reader sees first, and what
+/// installing its messages costs the frames on the way. Every message of the
+/// window waits for a parser at once, as the subscriptions start them; a
+/// person at the latest edge sees the newest exchange, so what matters is
+/// when the frame showing it is drawn, not when the whole history is.
+///
+/// Each policy runs on its own thread, so it gets its own parser pool:
+/// arrival order with two parsers is what main shipped; ranking, then the
+/// parser count with ranking, are varied.
+#[test]
+#[ignore = "a measurement, not a check; see the module documentation"]
+fn a_cold_open_parses_what_is_read_first() {
+    const CYCLES: usize = 12;
+    for (workload, items) in [
+        ("16 exchanges", transcript(16)),
+        ("16 exchanges delegating to agents", delegating(16)),
+    ] {
+        for (parsers, ranked) in [(2, false), (2, true), (4, true), (8, true)] {
+            let items = items.clone();
+            std::thread::Builder::new()
+                .stack_size(32 << 20)
+                .spawn(move || {
+                    preparation::POLICY.set(Some((parsers, ranked)));
+                    println!("{workload}:");
+                    cold_open(items, CYCLES, parsers, ranked);
+                })
+                .expect("a measuring thread")
+                .join()
+                .expect("the measurement finished");
+        }
+    }
+}
+
+/// [`transcript`], where each exchange also starts two agents with a brief
+/// and gets their reports back, so installs regroup the turns.
+fn delegating(turns: usize) -> Vec<chat::Item> {
+    let brief =
+        "# Task\n\nRead the parser and report **every** caller.\n\n- one\n- two\n\n".repeat(8);
+    let report =
+        "## Report\n\nThe parser has three callers; `cache::digest` is one.\n\n".repeat(12);
+    let mut items = Vec::new();
+    for entry in transcript(turns) {
+        let turn = entry.id.split('-').next().expect("a turn").to_owned();
+        if entry.id.ends_with("-answer") {
+            for agent in 0..2 {
+                items.push(item(
+                    format!("{turn}-agent-{agent}"),
+                    chat::Role::Assistant,
+                    ItemContent::Tool {
+                        name: "Agent".into(),
+                        input: serde_json::json!({
+                            "prompt": brief,
+                            "subagent_type": "Explore",
+                            "run_in_background": false,
+                        })
+                        .to_string(),
+                        output: report.clone(),
+                        status: chat::ToolStatus::Succeeded,
+                    },
+                ));
+            }
+        }
+        items.push(entry);
+    }
+    items
+}
+
+fn cold_open(items: Vec<chat::Item>, cycles: usize, parsers: usize, ranked: bool) {
+    let newest = items.last().expect("an item").id.clone();
+    let screen: Vec<String> = items[items.len() - 8..]
+        .iter()
+        .map(|item| item.id.clone())
+        .collect();
+    let [
+        mut first,
+        mut read,
+        mut shown,
+        mut all,
+        mut opening,
+        mut stall,
+        mut burst,
+    ] = std::array::from_fn(|_| Stage::default());
+    let mut largest = 0;
+    // The installs and frame of each update, by how many outputs it installed.
+    let mut by_outputs = std::collections::BTreeMap::<usize, Stage>::new();
+    for cycle in 0..cycles + 2 {
+        let mut pane = Pane::cold(items.clone());
+        // The first paint, of placeholders, before any parser is done.
+        let opened = pane.frame().iter().sum::<Duration>();
+        let drained = preparation::drain_concurrently(
+            &mut pane,
+            |pane| &mut pane.runtime,
+            |pane| {
+                pane.frame();
+            },
+        );
+        assert!(
+            pane.runtime
+                .cache
+                .values()
+                .all(|cached| !cached.placeholder)
+        );
+        let installed = &drained.installed;
+        let at = |id: &str| {
+            installed
+                .iter()
+                .rposition(|(installed, _)| installed == id)
+                .map_or(Duration::ZERO, |place| installed[place].1)
+        };
+        // The frame that first shows `id`'s last install.
+        let drawn = |id: &str| {
+            let place = installed
+                .iter()
+                .rposition(|(installed, _)| installed == id)
+                .expect("installed");
+            let mut seen = 0;
+            drained
+                .updates
+                .iter()
+                .find(|update| {
+                    seen += update.outputs;
+                    seen > place
+                })
+                .expect("an update")
+                .drawn
+        };
+        if cycle == cycles + 1 {
+            for id in &screen {
+                let places: Vec<String> = installed
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (installed, _))| installed == id)
+                    .map(|(place, (_, at))| format!("#{place} at {:.1} ms", at.as_secs_f64() * 1e3))
+                    .collect();
+                println!("    {id}: installed {}", places.join(", "));
+            }
+            println!(
+                "    {} installs of {} messages in {} updates",
+                installed.len(),
+                items.len(),
+                drained.updates.len()
+            );
+        }
+        if cycle >= 2 {
+            opening.0.push(opened);
+            first.0.push(at(&newest));
+            read.0
+                .push(screen.iter().map(|id| at(id)).max().unwrap_or_default());
+            shown.0.push(drawn(&newest));
+            all.0.push(
+                installed
+                    .iter()
+                    .map(|(_, at)| *at)
+                    .max()
+                    .unwrap_or_default(),
+            );
+            for update in &drained.updates {
+                stall.0.push(update.installing + update.framing);
+                burst.0.push(update.installing);
+                largest = largest.max(update.outputs);
+                by_outputs
+                    .entry(update.outputs)
+                    .or_default()
+                    .0
+                    .push(update.installing + update.framing);
+            }
+        }
+    }
+    println!(
+        "{} items opened cold, {cycles} cycles, {} cores, {parsers} parsers in {} order:",
+        items.len(),
+        std::thread::available_parallelism().map_or(0, usize::from),
+        if ranked { "rank" } else { "arrival" },
+    );
+    opening.report("first paint, placeholders");
+    first.report("newest message ready");
+    shown.report("newest message drawn");
+    read.report("newest exchange ready");
+    all.report("whole window ready");
+    burst.report("installs per UI update");
+    stall.report("installs + frame per UI update");
+    println!("    at most {largest} outputs installed in one update");
+    for (outputs, stage) in &mut by_outputs {
+        stage.report(&format!(
+            "installs + frame of {} updates installing {outputs}",
+            stage.0.len()
+        ));
     }
 }

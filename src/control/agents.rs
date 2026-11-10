@@ -134,7 +134,8 @@ pub enum AgentCommand {
     Interrupt {
         #[arg(help = "Agent handle, ID, or unique ID prefix.")]
         agent: String,
-        /// Permit the interrupt to stop the provider's running background subagents.
+        /// Permit the interrupt to stop the provider's background subagents,
+        /// including any waiting on their own background work.
         #[arg(long)]
         including_subagents: bool,
     },
