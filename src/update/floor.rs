@@ -585,7 +585,7 @@ fn quiesce_inner(
         let inventory = source.inventory(daemon, true)?;
         service = source.predict_service(&preview, &inventory)?;
     }
-    loop {
+    'review: loop {
         let (reviewed, listed) = confirmation::wait_stop(state, job, terminal, || {
             let current = source.observe()?;
             if current
@@ -687,7 +687,23 @@ fn quiesce_inner(
             }
         }
         for chat in ending {
-            let snapshot = source.close_chat(daemon, chat.clone())?;
+            let snapshot = match source.close_chat(daemon, chat.clone()) {
+                Ok(snapshot) => snapshot,
+                Err(error) if completed.is_empty() => {
+                    // Attachment can reveal a descriptor change after our last
+                    // inventory read. It has not authorized any close: renew the
+                    // same confirmation flow when its exact list changed.
+                    let observed = source.observe()?;
+                    let (current, current_list, _) = reviewed_inventory(source, observed, service)?;
+                    if !fresh.preserves_stop_consent(&current)
+                        || listed.digest() != current_list.digest()
+                    {
+                        continue 'review;
+                    }
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            };
             completed.extend(
                 listed
                     .items

@@ -25,6 +25,7 @@ struct FakeSource {
     fail_inventory: bool,
     close_attempts: usize,
     fail_close_at: Option<usize>,
+    change_on_first_close: bool,
     retain_attempts: usize,
     fail_retain_at: Option<usize>,
     fail_stopped: bool,
@@ -96,6 +97,29 @@ impl FloorSource for FakeSource {
         chat: crate::chat::Session,
     ) -> Result<crate::chat::Snapshot, UpdateError> {
         self.close_attempts += 1;
+        if self.change_on_first_close && self.close_attempts == 1 {
+            self.event("ChatClose descriptor changed");
+            let changed = self
+                .inventory
+                .chats
+                .iter_mut()
+                .find(|source| source.id == chat.id)
+                .unwrap();
+            changed.launch.session_id = Some("replacement-conversation".into());
+            self.preview
+                .daemon
+                .as_mut()
+                .unwrap()
+                .sessions
+                .iter_mut()
+                .find(|item| item.id == chat.id)
+                .unwrap()
+                .identity
+                .push_str(" replacement owner");
+            return Err(invalid(
+                "chat attachment no longer matches the reviewed descriptor",
+            ));
+        }
         if self.fail_close_at == Some(self.close_attempts) {
             self.event("ChatClose refused");
             return Err(invalid("fake close refused"));
@@ -292,6 +316,7 @@ fn fixture() -> FakeSource {
         fail_inventory: false,
         close_attempts: 0,
         fail_close_at: None,
+        change_on_first_close: false,
         retain_attempts: 0,
         fail_retain_at: None,
         fail_stopped: false,
@@ -1400,4 +1425,84 @@ fn ordinary_prepare_preserves_legacy_sources_without_floor_inventory_operations(
         ]
     );
     assert_no_destructive_actions(&source);
+}
+
+#[test]
+fn changed_attachment_before_the_first_close_requires_fresh_typed_consent() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut source = fixture();
+    source.prepare_refusals = 0;
+    source.change_on_first_close = true;
+    let chat = add_chat(&mut source, impact::Disposition::Blocked, false);
+    let records = source.records.clone();
+    let events = source.events.clone();
+    let observations = source.observations.clone();
+    let worker = spawn_source(source, directory.path(), true);
+    let first = await_stop(directory.path());
+    let original = first.confirmation.as_ref().unwrap();
+    let old_digest = original.stop.as_ref().unwrap().digest();
+    confirm_stop(directory.path(), &first);
+    let renewed = await_prompt(directory.path(), |confirmation| {
+        confirmation.stop.is_some() && confirmation.nonce != original.nonce
+    });
+    let new_digest = renewed
+        .confirmation
+        .as_ref()
+        .unwrap()
+        .stop
+        .as_ref()
+        .unwrap()
+        .digest();
+    assert_ne!(old_digest, new_digest);
+    assert!(records.lock().unwrap().is_empty());
+    assert!(
+        !events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event == "ChatClose acknowledged")
+    );
+    // Even a decision addressed to the new prompt cannot reuse the old owners'
+    // digest. Wait for its consumption before typing the current confirmation.
+    let observed = observations.load(Ordering::Acquire);
+    let stale = submit(
+        directory.path(),
+        &renewed,
+        UpdateChoice::StopListed {
+            items_digest: old_digest,
+        },
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while stale.exists() || observations.load(Ordering::Acquire) <= observed + 1 {
+        assert!(!worker.is_finished());
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(records.lock().unwrap().is_empty());
+    assert!(
+        !events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event == "ChatClose acknowledged")
+    );
+    confirm_stop(directory.path(), &renewed);
+    let (result, source) = finish(worker);
+    result.unwrap();
+    assert_eq!(source.retain_attempts, 1);
+    let ledger = source.ledger();
+    assert_eq!(ledger.records[0].chats[0].id, chat);
+    assert_eq!(
+        ledger.records[0].chats[0].launch.session_id.as_deref(),
+        Some("replacement-conversation")
+    );
+    assert_eq!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.as_str() == "ChatClose acknowledged")
+            .count(),
+        1
+    );
 }
