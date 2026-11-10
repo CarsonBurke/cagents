@@ -162,6 +162,14 @@ one window and a busy fixture chat in the other, then create `driver-ready.go`
 beside it. The driver starts its timing origin only after that marker. The
 selection wait is bounded at 120 seconds.
 
+If preparation stops before timed edits, set `CAGENTS_WORKSPACE_EDIT_RESUME` to
+that task's existing `driver-ready.json` when starting a new bounded sample in
+a fresh output directory. The driver verifies the prepared marker, channel and
+repository, and the complete unchanged browser descriptor before reusing its
+IDs and current revision. Its new ready marker still gates selection and timing.
+Record the resumed preparation and replay the same navigation on the other side
+of the comparison, including any conversations opened while selecting the pane.
+
 `measure-workspace-edits` refuses an unbounded run, an arbitrary workspace, or a
 fixture without exactly two UI processes. It verifies that each process's open
 stderr file is its supplied window log and that the logs are different files.

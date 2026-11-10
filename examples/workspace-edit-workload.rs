@@ -25,6 +25,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         time::{Duration, Instant},
     };
 
+    fn prepared_pane(id: CardId, browser: BrowserId) -> Result<Pane, Box<dyn std::error::Error>> {
+        Ok(Pane {
+            id,
+            title: "Edit measurement".into(),
+            user_title: Some("Edit measurement".into()),
+            pending_terminal_start: false,
+            width_fraction: 0.5,
+            scope: None,
+            kind: CardKind::Browser(BrowserSession {
+                id: browser,
+                current_url: "about:blank".parse()?,
+                history: vec![],
+                history_index: 0,
+                scroll_x: 0.0,
+                scroll_y: 0.0,
+                fidelity: BrowserRestoreFidelity::UrlOnly,
+            }),
+        })
+    }
+
     let arguments: Vec<_> = std::env::args().skip(1).collect();
     if arguments.len() != 3 {
         return Err("usage: workspace-edit-workload FIXTURE_ROOT EDITS INTERVAL_MS".into());
@@ -80,46 +100,86 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .projects
         .first()
         .ok_or("seed the fixture workspace first")?;
-    let channel = ChannelId::new();
-    client.edit_workspace_model(ModelEdit::CreateChannel {
-        id: channel,
-        repository: project.repository.clone(),
-        title: "Workspace edit measurement".into(),
-        title_source: cagents::model::ChannelTitleSource::Manual,
-    })?;
-    let scope = Scope::Channel(channel);
-    let mut pane = Pane {
-        id: CardId::new(),
-        title: "Edit measurement".into(),
-        user_title: Some("Edit measurement".into()),
-        pending_terminal_start: false,
-        width_fraction: 0.5,
-        scope: None,
-        kind: CardKind::Browser(BrowserSession {
-            id: BrowserId::new(),
-            current_url: "about:blank".parse()?,
-            history: vec![],
-            history_index: 0,
-            scroll_x: 0.0,
-            scroll_y: 0.0,
-            fidelity: BrowserRestoreFidelity::UrlOnly,
-        }),
-    };
-    let initial = client.edit_workspace_model(ModelEdit::ChangeView {
-        scope: scope.clone(),
-        expected_revision: 0,
-        operation: uuid::Uuid::new_v4(),
-        change: Change::Insert {
-            pane: pane.clone(),
-            before: None,
-        },
-    })?;
-    let mut revision = initial
+    let (channel, scope, mut pane, mut revision) =
+        if let Some(resume) = std::env::var_os("CAGENTS_WORKSPACE_EDIT_RESUME") {
+            let resume = PathBuf::from(resume).canonicalize()?;
+            if !resume.starts_with(task) || resume.starts_with(&root) {
+                return Err("resume marker must belong to this task outside its fixture".into());
+            }
+            let ready: serde_json::Value = serde_json::from_slice(&std::fs::read(resume)?)?;
+            if ready.get("event").and_then(serde_json::Value::as_str) != Some("prepared") {
+                return Err("resume marker is not a prepared event".into());
+            }
+            let channel: ChannelId = serde_json::from_value(ready["channel"].clone())?;
+            let id: CardId = serde_json::from_value(ready["pane"].clone())?;
+            let metadata = model
+                .channels
+                .iter()
+                .find(|entry| entry.id == channel)
+                .ok_or("prepared measurement channel is absent")?;
+            if metadata.title != "Workspace edit measurement"
+                || metadata.title_source != cagents::model::ChannelTitleSource::Manual
+                || metadata.repository != project.repository
+            {
+                return Err(
+                    "resume requires the same manual measurement channel and repository".into(),
+                );
+            }
+            let scope = Scope::Channel(channel);
+            let view = model
+                .views
+                .iter()
+                .find(|view| view.scope == scope)
+                .ok_or("prepared scope is absent")?;
+            if !view.retired.is_empty() {
+                return Err("resume requires a fresh prepared scope without retired panes".into());
+            }
+            let [pane] = view.panes.as_slice() else {
+                return Err("resume requires exactly one active prepared pane".into());
+            };
+            let CardKind::Browser(browser) = &pane.kind else {
+                return Err("prepared pane is not a browser".into());
+            };
+            if pane.id != id || *pane != prepared_pane(id, browser.id)? {
+                return Err("resume requires the exact unchanged prepared pane descriptor".into());
+            }
+            let pane = pane.clone();
+            (channel, scope, pane, view.revision)
+        } else {
+            let channel = ChannelId::new();
+            client.edit_workspace_model(ModelEdit::CreateChannel {
+                id: channel,
+                repository: project.repository.clone(),
+                title: "Workspace edit measurement".into(),
+                title_source: cagents::model::ChannelTitleSource::Manual,
+            })?;
+            let scope = Scope::Channel(channel);
+            let pane = prepared_pane(CardId::new(), BrowserId::new())?;
+            let initial = client.edit_workspace_model(ModelEdit::ChangeView {
+                scope: scope.clone(),
+                expected_revision: 0,
+                operation: uuid::Uuid::new_v4(),
+                change: Change::Insert {
+                    pane: pane.clone(),
+                    before: None,
+                },
+            })?;
+            let revision = initial
+                .views
+                .iter()
+                .find(|view| view.scope == scope)
+                .ok_or("inserted scope missing")?
+                .revision;
+            (channel, scope, pane, revision)
+        };
+    let resumed = model.views.iter().any(|view| view.scope == scope);
+    let prepared_views = model.views.len() + usize::from(!resumed);
+    let prepared_panes = model
         .views
         .iter()
-        .find(|view| view.scope == scope)
-        .ok_or("inserted scope missing")?
-        .revision;
+        .map(|view| view.panes.len())
+        .sum::<usize>()
+        + usize::from(!resumed);
     // A native observer can select this pane before timed deadlines exist.
     // The optional marker belongs to this task, outside the restored fixture.
     if let Some(ready) = std::env::var_os("CAGENTS_WORKSPACE_EDIT_READY") {
@@ -151,7 +211,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let origin = Instant::now();
     println!(
         "{}",
-        serde_json::json!({"event":"begin", "pane":pane.id.to_string(), "edits":edits, "interval_ms":interval.as_millis(), "views":model.views.len(), "panes":model.views.iter().map(|view|view.panes.len()).sum::<usize>(), "agents":model.agents.len()})
+        serde_json::json!({"event":"begin", "pane":pane.id.to_string(), "edits":edits, "interval_ms":interval.as_millis(), "views":prepared_views, "panes":prepared_panes, "agents":model.agents.len(), "resumed":resumed})
     );
     for index in 0..edits {
         let deadline = origin + interval * index as u32;
