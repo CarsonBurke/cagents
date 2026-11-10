@@ -959,12 +959,14 @@ impl Cagents {
         )
     }
 
-    /// Must run before initialize_runtimes so hidden restored terminals are
-    /// admitted as offscreen, not with another worktree's persisted exposure.
+    /// Exercise pre-window-view stores through the legacy test adapter.
+    #[cfg(test)]
     pub(super) fn restore_worktree_scope(&mut self) -> Task<Message> {
         self.restore_workspace_scope(false)
     }
 
+    /// Must run before initialize_runtimes so hidden restored terminals are
+    /// admitted as offscreen, not with another worktree's persisted exposure.
     pub(super) fn restore_workspace_scope(&mut self, has_saved_view: bool) -> Task<Message> {
         Arc::make_mut(&mut self.durable).normalize_channels();
         self.refresh_worktree_owners(None);
