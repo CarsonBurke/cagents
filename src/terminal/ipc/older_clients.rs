@@ -18,10 +18,12 @@
 //!
 //! Requests, replies and notifications this protocol added after it are
 //! refused or withheld at the connection, since the older client cannot
-//! encode or decode them. Payloads carried as JSON text inside a message
-//! (device account reports) are not part of the recorded format.
+//! encode or decode them. What a later protocol only added detail to is
+//! encoded for it as it was before: see [`encoding_for`]. Payloads carried as
+//! JSON text inside a message (device account reports) are not part of the
+//! recorded format.
 
-use std::path::Path;
+use std::{cell::Cell, path::Path};
 
 use serde::{
     Serialize, Serializer,
@@ -55,7 +57,7 @@ pub struct OlderClient {
 /// across an update to this release and keep running its CLI.
 const CANDIDATE_LINE: OlderClient = OlderClient {
     protocol: CANDIDATE_LINE_PROTOCOL,
-    proven_at: 165,
+    proven_at: 166,
     client_requests: 74,
     server_messages: 17,
     server_responses: 40,
@@ -72,6 +74,48 @@ const FIRING_WITH_SKIPPED_OCCURRENCES: u16 = 156;
 /// The `automations::Response` variants holding a `Firing`. The wire format
 /// proof skips exactly these, so a variant here is one no older client gets.
 const FIRING_REPLIES: &[&str] = &["Firing", "History", "Detail"];
+
+/// The first protocol with `ToolStatus::Waiting`. An older client is told such
+/// an agent is running, which is what it was before: it hasn't finished.
+pub(crate) const WAITING_TOOL_STATUS: u16 = 166;
+
+/// Variants a later protocol appended that a client from before it is sent as
+/// a variant it knows: the enum's type name, the variant, and the protocol that
+/// added it. The wire format proof accepts exactly these.
+#[cfg(test)]
+const RESTATED_VARIANTS: &[(&str, &str, u16)] =
+    &[("cagents::chat::ToolStatus", "Waiting", WAITING_TOOL_STATUS)];
+
+thread_local! {
+    /// The older protocol this thread is encoding a message for.
+    static ENCODING_FOR: Cell<Option<u16>> = const { Cell::new(None) };
+}
+
+/// Runs `encode` with this thread encoding for a client of `protocol`, so that
+/// values a later protocol changed encode as that client decodes them. The
+/// recorded wire format proof checks the rest still matches.
+///
+/// The restatement applies only to what `encode` serializes on this thread.
+/// A server message serialized anywhere else, such as ahead of time or on
+/// another thread, is sent in the current protocol's encoding, so every
+/// write to a client must serialize inside this scope (as
+/// `ServerEnvelopeRef::serialize` does).
+pub(crate) fn encoding_for<R>(protocol: u16, encode: impl FnOnce() -> R) -> R {
+    struct Restore(Option<u16>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ENCODING_FOR.set(self.0);
+        }
+    }
+    let older = (protocol < PROTOCOL_VERSION).then_some(protocol);
+    let _restore = Restore(ENCODING_FOR.replace(older));
+    encode()
+}
+
+/// Whether the value being encoded goes to a client from before `protocol`.
+pub(crate) fn encoding_before(protocol: u16) -> bool {
+    ENCODING_FOR.get().is_some_and(|older| older < protocol)
+}
 
 /// The older protocol a client opened its connection with, when this daemon
 /// serves it.
@@ -390,6 +434,52 @@ mod tests {
         assert_eq!(variant_index(&TerminalCloseResult::Closed), Some(0));
         assert_eq!(variant_index("not an enum"), None);
         assert_eq!(variant_index(&Some(ClientRequest::List)), None);
+    }
+
+    #[test]
+    fn a_waiting_agent_reaches_an_older_client_as_running() {
+        use crate::chat::ToolStatus;
+        let encode = |status: ToolStatus| postcard::to_stdvec(&status).unwrap();
+        let every = [
+            ToolStatus::Running,
+            ToolStatus::Succeeded,
+            ToolStatus::Failed,
+            ToolStatus::Denied,
+            ToolStatus::Stopped,
+            ToolStatus::Waiting,
+        ];
+        // Encoded as derived: by declaration position, and by name in JSON.
+        for status in every {
+            let encoded = encode(status);
+            assert_eq!(
+                postcard::from_bytes::<ToolStatus>(&encoded).unwrap(),
+                status
+            );
+            let json = serde_json::to_string(&status).unwrap();
+            assert_eq!(json, format!("\"{status:?}\""));
+            assert_eq!(serde_json::from_str::<ToolStatus>(&json).unwrap(), status);
+        }
+        let waiting = encode(ToolStatus::Waiting);
+        assert_eq!(waiting, [5]);
+        assert_eq!(
+            postcard::from_bytes::<ToolStatus>(&waiting).unwrap(),
+            ToolStatus::Waiting
+        );
+        assert_eq!(
+            serde_json::to_string(&ToolStatus::Waiting).unwrap(),
+            "\"Waiting\""
+        );
+        assert_eq!(
+            encoding_for(CANDIDATE_LINE_PROTOCOL, || encode(ToolStatus::Waiting)),
+            encode(ToolStatus::Running)
+        );
+        assert_eq!(
+            encoding_for(WAITING_TOOL_STATUS, || encode(ToolStatus::Waiting)),
+            waiting
+        );
+        // The scope ends with the encoding it was entered for.
+        assert!(!encoding_before(PROTOCOL_VERSION + 1));
+        assert_eq!(encode(ToolStatus::Waiting), waiting);
     }
 
     #[test]

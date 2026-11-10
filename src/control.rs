@@ -3498,7 +3498,7 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                     }
                     let preflight = client.shutdown_preflight().map_err(protocol_error)?;
                     eprint!(
-                        "Stop daemon and terminate {} hosted terminal/chat sessions and all their background subagents ({} currently running; includes pending spawns and unconfirmed provider work)? Type yes to confirm: ",
+                        "Stop daemon and terminate {} hosted terminal/chat sessions and all their background subagents ({} currently running or waiting on their own background work; includes pending spawns and unconfirmed provider work)? Type yes to confirm: ",
                         preflight.capability.live_terminals,
                         preflight.capability.background_subagents
                     );

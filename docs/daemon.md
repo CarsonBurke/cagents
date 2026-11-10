@@ -38,9 +38,12 @@ that an update superseded it. The daemon answers that CLI in its protocol's
 version. It refuses requests to stop, update or hand off the daemon, and requests whose
 reply the CLI couldn't read, such as `automation history`, `automation run` and
 `automation run-now` on protocols before 156. It withholds notifications the CLI couldn't read.
+What a later protocol only added detail to is sent as the CLI knew it: on
+protocols before 166, a subagent waiting on its own background work reads as
+running.
 Each protocol's postcard wire format is recorded under
 `tests/fixtures/wire-formats/`. A test checks that every listed older protocol
-encodes the same way, except for what is refused or withheld. It checks
+encodes the same way, except for what is refused, withheld or restated. It checks
 encoding, not meaning, and not JSON carried as text inside a message.
 
 When a daemon takes the runtime lease, it points `bin` in its runtime
