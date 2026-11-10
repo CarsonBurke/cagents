@@ -389,7 +389,9 @@ impl Preview {
             &self.stopped_windows,
             &observed.stopped,
             &observed.stopped_windows,
-        ) && self.candidate == observed.candidate
+        ) && self.labels.details.console_capabilities
+            == observed.labels.details.console_capabilities
+            && self.candidate == observed.candidate
             && self.replaces_daemon == observed.replaces_daemon
             && match (&self.daemon, &observed.daemon) {
                 (None, None) => true,

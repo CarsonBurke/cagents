@@ -9,7 +9,7 @@ pub(super) use current::Client as InspectionClient;
 
 use crate::install_guard::SourceInspectionRequest as Request;
 use crate::update::source_inspection::{
-    InspectedPane, SavedOutcome, SourceInspection, StoppedKind, StoppedWindow,
+    ConsoleCapability, InspectedPane, SavedOutcome, SourceInspection, StoppedKind, StoppedWindow,
 };
 use crate::{
     chat::Session,
@@ -123,26 +123,6 @@ const UNCHECKED: &str = "could not be checked before the update";
 const CHAT_RECOVERY: &str = "Choose Resume conversation in the new tab (+) menu";
 const TERMINAL_RECOVERY: &str = "Press Reconnect in the pane to check the saved terminal";
 const CONSOLE_REFUSAL: &str = "This update cannot keep a running agent console connected. Finish or close the console, then retry.";
-
-/// An unsupported live console is an update refusal, not uncertain pane
-/// evidence that can be represented as a stopped pane or an informational note.
-#[derive(Debug, PartialEq, Eq)]
-enum LiveInspectionError {
-    Unchecked(String),
-    UnresumableConsole,
-}
-
-impl From<String> for LiveInspectionError {
-    fn from(reason: String) -> Self {
-        Self::Unchecked(reason)
-    }
-}
-
-impl From<&'static str> for LiveInspectionError {
-    fn from(reason: &'static str) -> Self {
-        Self::Unchecked(reason.into())
-    }
-}
 
 fn stop_unchecked(
     inspection: &mut SourceInspection,
@@ -293,7 +273,7 @@ fn inspect(request: Request) -> Result<SourceInspection, String> {
         }
     };
     let mut checked_saved = HashSet::new();
-    let inspect_live = (|| -> Result<(), LiveInspectionError> {
+    let inspect_live = (|| -> Result<(), String> {
         let initial_inventory = reader.list()?;
         let mut resolutions: Vec<(Session, Result<Session, String>)> = Vec::new();
         let mut cold_history = Vec::new();
@@ -351,13 +331,15 @@ fn inspect(request: Request) -> Result<SourceInspection, String> {
             .proof
             .as_ref()
             .ok_or("Source service is unavailable")?;
-        let matched_cli = crate::companion::Product::Cli
-            .beside_current()
-            .map_err(|_| "Cannot inspect the destination console companion")?;
-        qualify_live_consoles(&terminals, proof, request.require_resumable, &matched_cli)?;
         record_live_panes(
             &mut inspection,
             &inventory,
+            &terminals,
+            proof,
+            request.require_resumable,
+        );
+        record_live_console_outcomes(
+            &mut inspection,
             &terminals,
             proof,
             request.require_resumable,
@@ -472,18 +454,25 @@ fn inspect(request: Request) -> Result<SourceInspection, String> {
 
 fn finish_live_inspection(
     mut inspection: SourceInspection,
-    result: Result<(), LiveInspectionError>,
+    result: Result<(), String>,
     saved: &[(crate::model::CardId, CardKind)],
     checked_saved: &HashSet<crate::model::TerminalId>,
     current_boot: &crate::model::BootId,
 ) -> Result<SourceInspection, String> {
-    match result {
-        Err(LiveInspectionError::UnresumableConsole) => return Err(CONSOLE_REFUSAL.into()),
-        Err(LiveInspectionError::Unchecked(reason)) => {
-            inspection_failure(&mut inspection, &reason);
-            stop_unchecked(&mut inspection, saved, checked_saved, current_boot);
-        }
-        Ok(()) => {}
+    // Refusal is derived from the exact reviewed capability, never another
+    // argv, provider, path or protocol eligibility check. A future qualified
+    // reconnect producer changes review and preflight together.
+    if inspection
+        .details
+        .console_capabilities
+        .values()
+        .any(|review| review.capability == ConsoleCapability::Blocked)
+    {
+        return Err(CONSOLE_REFUSAL.into());
+    }
+    if let Err(reason) = result {
+        inspection_failure(&mut inspection, &reason);
+        stop_unchecked(&mut inspection, saved, checked_saved, current_boot);
     }
     Ok(inspection)
 }
@@ -1838,45 +1827,55 @@ fn check_deadline(deadline: Instant) -> Result<(), String> {
     Ok(())
 }
 
-/// The authenticated terminal roster includes both standalone terminal panes
-/// and terminals attached to chat panels. Inspect every live accepted console:
-/// its provider surviving does not preserve the console's daemon connection.
-fn qualify_live_consoles(
+/// Review both terminal panes and chat-backed accepted consoles. This build
+/// has no destination console-reconnection implementation, so replacement is
+/// blocked. Leaving the source daemon in place needs no migration capability.
+fn record_live_console_outcomes(
+    inspection: &mut SourceInspection,
     terminals: &[v77::Terminal],
     proof: &HostSessionProof,
     require_resumable: bool,
-    matched_cli: &Path,
-) -> Result<(), LiveInspectionError> {
-    if require_resumable
-        && terminals.iter().any(|terminal| {
-            terminal.session.continuity.can_resume_live(proof)
-                && qualify_console_migration(&terminal.session, matched_cli).is_err()
-        })
-    {
-        return Err(LiveInspectionError::UnresumableConsole);
+) {
+    for terminal in terminals {
+        if terminal.session.continuity.can_resume_live(proof)
+            && crate::agent_execution::console_agent(&terminal.session.launch).is_some()
+        {
+            record_console_outcome(
+                inspection,
+                terminal.session.id,
+                if require_resumable {
+                    ConsoleCapability::Blocked
+                } else {
+                    ConsoleCapability::Continues
+                },
+            );
+        }
     }
-    Ok(())
 }
 
-/// A console's issued recipe is not permission to replay a different installed
-/// CLI. Even an unchanged path cannot prove that its existing ControlClient
-/// survives the source daemon stopping. Refuse until an exact, typed migration
-/// route qualifies both the accepted console and its retained provider.
-fn qualify_console_migration(
-    terminal: &crate::model::TerminalSession,
-    matched_cli: &Path,
-) -> Result<(), &'static str> {
-    if crate::agent_execution::console_agent(&terminal.launch).is_none() {
-        return Ok(());
-    }
-    if Path::new(&terminal.launch.program) != matched_cli {
-        return Err(
-            "its accepted console belongs to a different matched CLI installation; this pairing cannot migrate yet",
-        );
-    }
-    Err(
-        "its accepted console has no qualified reconnection across daemon replacement; this pairing cannot migrate yet",
-    )
+/// One review producer for both direct continuity and qualified reconnection.
+/// The console-relaunch implementation's existing boolean qualifier can feed
+/// this function directly: true records Reconnects, false records Blocked.
+/// Preflight consumes the recorded capability without requalifying the pane.
+fn record_console_outcome(
+    inspection: &mut SourceInspection,
+    id: crate::model::TerminalId,
+    capability: impl Into<ConsoleCapability>,
+) {
+    let kind = inspection
+        .details
+        .panes
+        .get(&id)
+        .map(|pane| pane.kind)
+        .or_else(|| {
+            inspection
+                .details
+                .console_capabilities
+                .get(&id)
+                .map(|review| review.kind)
+        })
+        .unwrap_or(crate::update::impact::SessionKind::NativeChat);
+    inspection.record_console_outcome(id, kind, capability);
 }
 
 // A foreground process hint is an observation of the retained PTY, not an
@@ -2094,9 +2093,7 @@ mod tests {
     fn live_inspection_failure_keeps_one_readable_reason() {
         let inspection = finish_live_inspection(
             SourceInspection::default(),
-            Err(LiveInspectionError::Unchecked(
-                "Cannot connect to the source service".into(),
-            )),
+            Err("Cannot connect to the source service".into()),
             &[],
             &HashSet::new(),
             &current_boot(),
@@ -2132,13 +2129,107 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_live_console_refuses_update_instead_of_claiming_it_keeps_running() {
-        let matched = Path::new("/installed/new/bin/cagents");
+    fn reviewed_blocked_console_is_fatal_but_both_allowed_capabilities_pass() {
+        let id = TerminalId::new();
+        let boot = current_boot();
+        for capability in [ConsoleCapability::Continues, ConsoleCapability::Reconnects] {
+            let mut inspection = SourceInspection::default();
+            record_console_outcome(&mut inspection, id, capability);
+            let inspection =
+                finish_live_inspection(inspection, Ok(()), &[], &HashSet::new(), &boot).unwrap();
+            assert_eq!(
+                inspection.details.console_capabilities[&id].capability,
+                capability
+            );
+            assert_eq!(
+                inspection.details.panes[&id].outcome,
+                SavedOutcome::KeepsRunning
+            );
+            assert!(inspection.stopped.is_empty());
+        }
+        // The floor reconnection qualifier's existing bool call feeds exactly
+        // the same producer; no independent admission rule needs updating.
+        let mut qualified = SourceInspection::default();
+        record_console_outcome(&mut qualified, id, true);
+        assert!(finish_live_inspection(qualified, Ok(()), &[], &HashSet::new(), &boot).is_ok());
+        let mut blocked = SourceInspection::default();
+        record_console_outcome(&mut blocked, id, false);
+        assert_eq!(
+            blocked.details.console_capabilities[&id].capability,
+            ConsoleCapability::Blocked
+        );
+        assert!(!blocked.details.panes.contains_key(&id));
+        assert!(blocked.stopped.is_empty());
+        assert_eq!(
+            finish_live_inspection(blocked, Ok(()), &[], &HashSet::new(), &boot).unwrap_err(),
+            CONSOLE_REFUSAL
+        );
+    }
+
+    #[test]
+    fn qualified_console_replaces_blocked_policy_without_losing_kind_or_generic_stops() {
+        use crate::update::impact::SessionKind;
+        let boot = current_boot();
+        for kind in [SessionKind::NativeChat, SessionKind::Terminal] {
+            for independent_stop in [false, true] {
+                let id = TerminalId::new();
+                let mut inspection = SourceInspection::default();
+                inspection.details.panes.insert(
+                    id,
+                    InspectedPane {
+                        kind,
+                        outcome: SavedOutcome::KeepsRunning,
+                        detail: String::new(),
+                    },
+                );
+                if independent_stop {
+                    inspection.stop(
+                        id,
+                        match kind {
+                            SessionKind::NativeChat => StoppedKind::Chat,
+                            SessionKind::Terminal => StoppedKind::Terminal,
+                        },
+                        "independent pane problem",
+                        "recover this pane separately",
+                    );
+                }
+                let stopped = inspection.stopped.clone();
+                record_console_outcome(&mut inspection, id, false);
+                assert_eq!(inspection.details.console_capabilities[&id].kind, kind);
+                assert_eq!(
+                    inspection.details.console_capabilities[&id].capability,
+                    ConsoleCapability::Blocked
+                );
+                assert!(!inspection.details.panes.contains_key(&id));
+                assert_eq!(inspection.stopped, stopped);
+                // This is the floor producer's exact existing call. It must
+                // replace Blocked policy and restore the correct presentation.
+                record_console_outcome(&mut inspection, id, true);
+                let inspection =
+                    finish_live_inspection(inspection, Ok(()), &[], &HashSet::new(), &boot)
+                        .unwrap();
+                assert_eq!(inspection.details.console_capabilities[&id].kind, kind);
+                assert_eq!(
+                    inspection.details.console_capabilities[&id].capability,
+                    ConsoleCapability::Reconnects
+                );
+                assert_eq!(inspection.details.panes[&id].kind, kind);
+                assert_eq!(
+                    inspection.details.panes[&id].outcome,
+                    SavedOutcome::KeepsRunning
+                );
+                assert_eq!(inspection.stopped, stopped);
+            }
+        }
+    }
+
+    #[test]
+    fn live_console_review_blocks_replacement_but_keeps_compatible_updates_and_shells() {
         let proof = session().proof.unwrap();
         let mut console = crate::terminal_ipc::TerminalDescriptor::relaunchable(
             TerminalId::new(),
             LaunchRecipe {
-                program: matched.to_string_lossy().into_owned(),
+                program: "/installed/old/bin/cagents".into(),
                 arguments: vec![
                     "agent".into(),
                     "console".into(),
@@ -2155,109 +2246,67 @@ mod tests {
             boot_id: proof.boot_id.clone(),
             host_incarnation: proof.host_incarnation.clone(),
         };
-        for program in [matched.to_str().unwrap(), "/installed/old/bin/cagents"] {
-            console.session.launch.program = program.into();
+        for is_chat in [false, true] {
+            let mut chat = session();
+            chat.id = console.session.id;
+            chat.terminal = Some(console.session.clone());
+            let chats = if is_chat { vec![chat] } else { Vec::new() };
             let roster = vec![v77::Terminal::from(console.clone())];
-            let result = qualify_live_consoles(&roster, &proof, true, matched);
-            assert_eq!(result, Err(LiveInspectionError::UnresumableConsole));
-            let refused = finish_live_inspection(
-                SourceInspection::default(),
-                result,
-                &[],
-                &HashSet::new(),
-                &proof.boot_id,
-            )
-            .unwrap_err();
-            assert_eq!(refused, CONSOLE_REFUSAL);
-            assert!(!refused.contains("private-directory"));
-            assert!(!refused.contains("never-print-this"));
-            assert!(!refused.contains("/installed"));
-            // Keeping the source daemon does not require console migration.
-            assert!(qualify_live_consoles(&roster, &proof, false, matched).is_ok());
+            for requires_migration in [false, true] {
+                let mut inspection = SourceInspection::default();
+                record_live_panes(&mut inspection, &chats, &roster, &proof, requires_migration);
+                record_live_console_outcomes(&mut inspection, &roster, &proof, requires_migration);
+                let result = finish_live_inspection(
+                    inspection,
+                    Ok(()),
+                    &[],
+                    &HashSet::new(),
+                    &proof.boot_id,
+                );
+                if requires_migration {
+                    assert_eq!(result.unwrap_err(), CONSOLE_REFUSAL);
+                } else {
+                    let inspected = result.unwrap();
+                    assert_eq!(
+                        inspected.details.console_capabilities[&console.session.id].capability,
+                        ConsoleCapability::Continues
+                    );
+                    assert!(inspected.stopped.is_empty());
+                }
+            }
         }
-        // The same console can back a chat panel; it remains a live terminal
-        // in the authoritative roster and cannot be downgraded to a chat note.
-        let mut chat = session();
-        chat.id = console.session.id;
-        chat.terminal = Some(console.session.clone());
-        let mut inspection = SourceInspection::default();
-        record_live_panes(
-            &mut inspection,
-            &[chat],
-            &[console.clone().into()],
-            &proof,
-            true,
-        );
-        assert!(
-            finish_live_inspection(
-                inspection,
-                qualify_live_consoles(&[console.into()], &proof, true, matched),
-                &[],
-                &HashSet::new(),
-                &proof.boot_id,
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn console_refusal_does_not_affect_shells_inactive_terminals_or_other_owners() {
-        let matched = Path::new("/installed/new/bin/cagents");
-        let proof = session().proof.unwrap();
-        let mut descriptor = crate::terminal_ipc::TerminalDescriptor::relaunchable(
-            TerminalId::new(),
-            session().launch.recipe,
+        let inactive = crate::terminal_ipc::TerminalDescriptor::relaunchable(
+            console.session.id,
+            console.session.launch.clone(),
             None,
         );
-        // A saved launch with no accepted live terminal does not block updates.
-        descriptor.session.launch.program = matched.to_string_lossy().into_owned();
-        descriptor.session.launch.arguments = vec![
-            "agent".into(),
-            "console".into(),
-            crate::model::AgentId::new().to_string(),
-        ];
-        assert!(qualify_live_consoles(&[descriptor.clone().into()], &proof, true, matched).is_ok());
-        descriptor.session.continuity = crate::model::TerminalContinuity::Live {
+        let mut foreign = console.clone();
+        foreign.session.continuity = crate::model::TerminalContinuity::Live {
             host_session_id: proof.host_session_id.clone(),
             boot_id: proof.boot_id.clone(),
-            host_incarnation: crate::model::HostIncarnation::new("different-owner"),
+            host_incarnation: HostIncarnation::new("other-owner"),
         };
-        assert!(qualify_live_consoles(&[descriptor.clone().into()], &proof, true, matched).is_ok());
-        descriptor.session.continuity = crate::model::TerminalContinuity::Live {
-            host_session_id: proof.host_session_id.clone(),
-            boot_id: proof.boot_id.clone(),
-            host_incarnation: proof.host_incarnation.clone(),
-        };
-        for (program, arguments) in [
-            ("bash", vec!["--login"]),
-            (matched.to_str().unwrap(), vec!["--login"]),
-            (
-                "codex",
-                vec![
-                    "--remote",
-                    "unix://owned-listener",
-                    "resume",
-                    "exact-thread",
-                ],
-            ),
-        ] {
-            descriptor.session.launch.program = program.into();
-            descriptor.session.launch.arguments =
-                arguments.into_iter().map(str::to_owned).collect();
-            let roster = vec![v77::Terminal::from(descriptor.clone())];
-            let result = qualify_live_consoles(&roster, &proof, true, matched);
-            assert!(result.is_ok());
+        for terminal in [inactive, foreign] {
             let mut inspection = SourceInspection::default();
-            record_live_panes(&mut inspection, &[], &roster, &proof, true);
-            let inspected =
-                finish_live_inspection(inspection, result, &[], &HashSet::new(), &proof.boot_id)
-                    .unwrap();
-            assert!(inspected.stopped.is_empty());
-            assert_eq!(
-                inspected.details.panes[&descriptor.session.id].outcome,
-                SavedOutcome::KeepsRunning
-            );
+            record_live_console_outcomes(&mut inspection, &[terminal.into()], &proof, true);
+            assert!(inspection.details.console_capabilities.is_empty());
         }
+        // Ordinary live shells do not require agent-console reconnection.
+        console.session.launch.program = "bash".into();
+        console.session.launch.arguments = vec!["--login".into()];
+        let roster = vec![v77::Terminal::from(console.clone())];
+        let mut inspection = SourceInspection::default();
+        record_live_panes(&mut inspection, &[], &roster, &proof, true);
+        record_live_console_outcomes(&mut inspection, &roster, &proof, true);
+        let inspected =
+            finish_live_inspection(inspection, Ok(()), &[], &HashSet::new(), &proof.boot_id)
+                .unwrap();
+        assert!(inspected.details.console_capabilities.is_empty());
+        assert_eq!(
+            inspected.details.panes[&console.session.id].outcome,
+            SavedOutcome::KeepsRunning
+        );
+        assert!(inspected.stopped.is_empty());
     }
 
     pub(super) fn session() -> Session {

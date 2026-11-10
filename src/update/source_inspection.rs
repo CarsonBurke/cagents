@@ -47,6 +47,36 @@ pub enum SavedOutcome {
     KeepsRunning,
 }
 
+/// The capability computed for the exact accepted console during review.
+/// Preflight consumes this same result; it has no second qualification policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsoleCapability {
+    Continues,
+    Reconnects,
+    Blocked,
+}
+
+/// Keep the pane kind with its reviewed policy even when Blocked removes
+/// the ordinary pane presentation. A later qualified result keeps that kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsoleReview {
+    pub kind: super::impact::SessionKind,
+    pub capability: ConsoleCapability,
+}
+
+impl From<bool> for ConsoleCapability {
+    /// The console-reconnection qualifier publishes its result through the
+    /// same review producer. A successful qualifier authorizes reconnecting.
+    fn from(qualified: bool) -> Self {
+        if qualified {
+            Self::Reconnects
+        } else {
+            Self::Blocked
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InspectedPane {
     pub kind: super::impact::SessionKind,
@@ -57,6 +87,8 @@ pub struct InspectedPane {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewDetails {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub console_capabilities: BTreeMap<TerminalId, ConsoleReview>,
     #[serde(default)]
     pub panes: BTreeMap<TerminalId, InspectedPane>,
     #[serde(default)]
@@ -77,12 +109,13 @@ pub struct SourceInspection {
 
 impl SourceInspection {
     pub fn preserves_consent(&self, observed: &Self) -> bool {
-        Self::same_outcomes(
-            &self.stopped,
-            &self.stopped_windows,
-            &observed.stopped,
-            &observed.stopped_windows,
-        )
+        self.details.console_capabilities == observed.details.console_capabilities
+            && Self::same_outcomes(
+                &self.stopped,
+                &self.stopped_windows,
+                &observed.stopped,
+                &observed.stopped_windows,
+            )
     }
 
     pub fn same_outcomes(
@@ -113,6 +146,37 @@ impl SourceInspection {
             && before_windows.len() == previous_windows.len()
             && after_windows.len() == current_windows.len()
             && before_windows == after_windows
+    }
+
+    #[cfg(feature = "host")]
+    pub(crate) fn record_console_outcome(
+        &mut self,
+        pane: TerminalId,
+        kind: super::impact::SessionKind,
+        capability: impl Into<ConsoleCapability>,
+    ) {
+        let capability = capability.into();
+        self.details
+            .console_capabilities
+            .insert(pane, ConsoleReview { kind, capability });
+        self.details.panes.remove(&pane);
+        let detail = match capability {
+            // This is a refusal to perform the update, never consent to stop
+            // the console. Keep generic stopped-pane policy independent.
+            ConsoleCapability::Blocked => return,
+            ConsoleCapability::Continues => "keeps working in its existing console.",
+            ConsoleCapability::Reconnects => {
+                "keeps working; its console reconnects in the same pane after the update."
+            }
+        };
+        self.details.panes.insert(
+            pane,
+            InspectedPane {
+                kind,
+                outcome: SavedOutcome::KeepsRunning,
+                detail: detail.into(),
+            },
+        );
     }
 
     #[cfg(feature = "host")]
@@ -263,6 +327,37 @@ fn transcript_started(reader: impl std::io::Read) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn console_capability_receipts_default_for_old_readers_and_bind_consent() {
+        let mut before: SourceInspection =
+            serde_json::from_str(r#"{"details":{"panes":{}}}"#).unwrap();
+        assert!(before.details.console_capabilities.is_empty());
+        let id = TerminalId::new();
+        before.details.console_capabilities.insert(
+            id,
+            ConsoleReview {
+                kind: super::super::impact::SessionKind::Terminal,
+                capability: ConsoleCapability::Continues,
+            },
+        );
+        let after: SourceInspection =
+            serde_json::from_slice(&serde_json::to_vec(&before).unwrap()).unwrap();
+        assert_eq!(before, after);
+        assert!(before.preserves_consent(&after));
+        for capability in [ConsoleCapability::Reconnects, ConsoleCapability::Blocked] {
+            let mut changed = after.clone();
+            changed
+                .details
+                .console_capabilities
+                .get_mut(&id)
+                .unwrap()
+                .capability = capability;
+            assert!(!before.preserves_consent(&changed));
+        }
+        assert_eq!(ConsoleCapability::from(true), ConsoleCapability::Reconnects);
+        assert_eq!(ConsoleCapability::from(false), ConsoleCapability::Blocked);
+    }
 
     #[test]
     fn pane_labels_preserve_punctuation_and_missing_times() {
