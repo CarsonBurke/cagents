@@ -901,10 +901,33 @@ with open(os.environ['FIXTURE_LEASE_PATH'], 'r+') as contender:
             std::io::ErrorKind::WouldBlock
         );
         drop(handoff_lease);
-        assert_eq!(
-            unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0
-        );
+        let released = unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if released != 0 {
+            let error = std::io::Error::last_os_error();
+            use std::os::unix::fs::MetadataExt;
+            let expected = contender.metadata().unwrap();
+            let mut owners = Vec::new();
+            for process in fs::read_dir("/proc").unwrap().filter_map(Result::ok) {
+                let Ok(pid) = process.file_name().to_string_lossy().parse::<u32>() else {
+                    continue;
+                };
+                let Ok(descriptors) = fs::read_dir(process.path().join("fd")) else {
+                    continue;
+                };
+                for fd in descriptors.filter_map(Result::ok) {
+                    if fs::metadata(fd.path()).is_ok_and(|actual| {
+                        actual.dev() == expected.dev() && actual.ino() == expected.ino()
+                    }) {
+                        owners.push(format!(
+                            "pid={pid} fd={} inode={}",
+                            fd.file_name().to_string_lossy(),
+                            expected.ino()
+                        ));
+                    }
+                }
+            }
+            panic!("installer reservation still held after worker exit: {error}; {owners:?}");
+        }
         return;
     }
     if outer_signal {
@@ -1377,18 +1400,41 @@ fn staging_cannot_borrow_candidate_support_from_an_installed_coordinator() {
     coordinated_release_mode(false, 38, None, None, None, "stage-unsupported", true);
 }
 
+/// Other tests fork concurrently, briefly inheriting even CLOEXEC descriptors
+/// before exec. Give lease-release assertions a sole fixture process, so they
+/// measure installer descendants rather than unrelated tests' fork windows.
+fn isolated_handoff_fixture(test: &str, modes: &[&str]) {
+    const CHILD: &str = "CAGENTS_TEST_INSTALLER_LEASE_TRANSACTION";
+    if std::env::var(CHILD).ok().as_deref() != Some(test) {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(CHILD, test)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        return;
+    }
+    for mode in modes {
+        upgrade_fixture(false, 7, None, Some(mode));
+    }
+}
+
 /// Shell transaction coverage with a real inherited flock and mocked companion
 /// replies; native daemon adoption is exercised by the daemon process tests.
 #[test]
 fn lease_path_installer_transaction() {
-    for mode in ["handoff-success", "handoff-start-failure"] {
-        upgrade_fixture(false, 7, None, Some(mode));
-    }
+    isolated_handoff_fixture(
+        "lease_path_installer_transaction",
+        &["handoff-success", "handoff-start-failure"],
+    );
 }
 
 /// A real starting daemon is distinct from the worker's held reservation.
 /// Cleanup must retain the live process's executable tree.
 #[test]
 fn inherited_starting_daemon_keeps_its_new_version_on_installer_failure() {
-    upgrade_fixture(false, 7, None, Some("handoff-starting"));
+    isolated_handoff_fixture(
+        "inherited_starting_daemon_keeps_its_new_version_on_installer_failure",
+        &["handoff-starting"],
+    );
 }

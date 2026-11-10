@@ -844,8 +844,15 @@ else
     else
         set -- --prefix "$PREFIX" --installer "$INSTALLER_SOURCE" -- "$@"
     fi
-    CAGENTS_ARCHIVE=$ARCHIVE_PATH CAGENTS_CHECKSUMS=$CHECKSUMS_PATH \
-        installer_tool "$COORDINATOR" coordinate-install "$@" &
+    # The background PID must be the coordinator itself. Calling a function
+    # whose body is a subshell would leave an intermediate shell as $!, so
+    # cancellation could kill the waiter while its installer kept running.
+    (
+        if [ "${CAGENTS_DAEMON_LEASE_FD:-}" = 3 ]; then exec 3<&-; fi
+        unset CAGENTS_DAEMON_LEASE_FD
+        export CAGENTS_ARCHIVE=$ARCHIVE_PATH CAGENTS_CHECKSUMS=$CHECKSUMS_PATH
+        exec "$COORDINATOR" coordinate-install "$@"
+    ) &
     COORDINATOR_PID=$!
     if [ "$COORDINATOR_INTERRUPTED" -eq 1 ]; then
         kill -TERM "$COORDINATOR_PID" 2>/dev/null || :
