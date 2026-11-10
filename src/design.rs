@@ -240,6 +240,38 @@ pub const ELEVATION: iced::Shadow = iced::Shadow {
     blur_radius: 16.0,
 };
 
+/// A pane docked against the window's leading edge, on COSMIC's Primary
+/// layer.
+///
+/// `Container::Primary` rounds all four corners for a card floating in a
+/// layout. A navigation pane runs the full height of the window and meets its
+/// neighbour at a rule, so a rounded corner there only notches the frame:
+/// against the content beside it and the status bar beneath it. Only the
+/// top-left corner is the window's own, so it alone follows the window: round
+/// as libcosmic rounds a floating window, square when the window is
+/// maximized or tiled. The layer's fill and ink are unchanged.
+pub fn docked_primary(window_rounded: bool) -> cosmic::theme::Container<'static> {
+    cosmic::theme::Container::custom(move |theme| widget::container::Style {
+        border: iced::Border {
+            radius: iced::border::Radius::default().top_left(if window_rounded {
+                window_corner_radius(theme)
+            } else {
+                0.0
+            }),
+            ..iced::Border::default()
+        },
+        ..cosmic::theme::Container::primary(theme.cosmic(), theme.transparent)
+    })
+}
+
+/// The radius libcosmic gives a floating window's corners
+/// (`cosmic::app::Application::view_main`), so content painted into a window
+/// corner meets the window's outline instead of squaring it off.
+pub fn window_corner_radius(theme: &cosmic::Theme) -> f32 {
+    let radius = theme.cosmic().radius_s()[0];
+    if radius < 4.0 { radius } else { radius + 4.0 }
+}
+
 /// An alignment-only container class.
 ///
 /// COSMIC's default transparent container resets the ink it inherits. A

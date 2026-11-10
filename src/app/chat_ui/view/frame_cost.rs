@@ -1304,3 +1304,125 @@ fn preparing_a_window_one_message_after_another() {
     );
     prepare.report("prepare");
 }
+
+/// Where the first shape of a face goes. Font matching walks every face the
+/// system has for each new family, weight, style and stretch, and a fresh
+/// font system, as each long paragraph's worker builds, starts that over.
+/// Run alone, so no earlier test has matched the faces already.
+#[test]
+#[ignore = "a measurement, not a check; see the module documentation"]
+fn first_shape_of_each_face() {
+    use cosmic::iced::advanced::graphics::text::{self as graphics_text, cosmic_text};
+    use cosmic::iced::advanced::text::{Paragraph as _, Span, Text};
+    use cosmic::iced::font::{Style, Weight};
+    type Paragraph = <cosmic::Renderer as cosmic::iced::advanced::text::Renderer>::Paragraph;
+    let _renderer = crate::app::tests::headless_renderer();
+    let body = "The parser now keeps its cursor across refreshes, so a streamed body costs \
+                its new bytes rather than its whole length. "
+        .repeat(5);
+    let bold = iced::Font {
+        weight: Weight::Bold,
+        ..iced::Font::DEFAULT
+    };
+    let faces = [
+        ("regular", iced::Font::DEFAULT),
+        ("bold", bold),
+        (
+            "italic",
+            iced::Font {
+                style: Style::Italic,
+                ..iced::Font::DEFAULT
+            },
+        ),
+        ("monospace", iced::Font::MONOSPACE),
+        (
+            "monospace bold",
+            iced::Font {
+                weight: Weight::Bold,
+                ..iced::Font::MONOSPACE
+            },
+        ),
+    ];
+    let shape = |font| {
+        let spans = [Span::<'_, ()>::new(body.as_str()).font(font)];
+        let clock = Instant::now();
+        std::hint::black_box(Paragraph::with_spans(Text {
+            content: &spans[..],
+            bounds: Size::new(720.0, f32::INFINITY),
+            size: 14.0.into(),
+            line_height: Default::default(),
+            font: iced::Font::DEFAULT,
+            align_x: Default::default(),
+            align_y: iced::alignment::Vertical::Top,
+            shaping: iced::widget::text::Shaping::Advanced,
+            wrapping: iced::widget::text::Wrapping::WordOrGlyph,
+            ellipsize: Default::default(),
+        }));
+        clock.elapsed().as_secs_f64() * 1e3
+    };
+    let (faces_known, locale, db) = {
+        let mut system = graphics_text::font_system().write().unwrap();
+        let raw = system.raw();
+        (raw.db().len(), raw.locale().to_owned(), raw.db().clone())
+    };
+    println!("{faces_known} faces known");
+    for (name, font) in faces {
+        let attrs = graphics_text::to_attributes(font);
+        let mut fresh = cosmic_text::FontSystem::new_with_locale_and_db(locale.clone(), db.clone());
+        let clock = Instant::now();
+        std::hint::black_box(fresh.get_font_matches(&attrs));
+        let fresh_matching = clock.elapsed().as_secs_f64() * 1e3;
+        let matching = {
+            let mut system = graphics_text::font_system().write().unwrap();
+            let clock = Instant::now();
+            std::hint::black_box(system.raw().get_font_matches(&attrs));
+            clock.elapsed().as_secs_f64() * 1e3
+        };
+        let times: Vec<f64> = (0..4).map(|_| shape(font)).collect();
+        println!(
+            "{name:>15}: matching {matching:>8.3} ms (fresh system {fresh_matching:>8.3} ms), \
+             then shapes {:>7.3} {:>7.3} {:>7.3} {:>7.3} ms",
+            times[0], times[1], times[2], times[3]
+        );
+    }
+    // The same face again in a fresh system, as the next long paragraph's
+    // worker does.
+    let attrs = graphics_text::to_attributes(bold);
+    let mut fresh = cosmic_text::FontSystem::new_with_locale_and_db(locale.clone(), db.clone());
+    let clock = Instant::now();
+    std::hint::black_box(fresh.get_font_matches(&attrs));
+    println!(
+        "bold again, fresh system: matching {:.3} ms",
+        clock.elapsed().as_secs_f64() * 1e3
+    );
+    // End to end in a system of its own, as a Flow worker shapes: matching,
+    // fallback reading the faces it reaches, and shaping, for each face's
+    // first paragraph and the next. What that system then holds is what a
+    // kept worker system keeps.
+    let resident_mib = || {
+        let statm = std::fs::read_to_string("/proc/self/statm").unwrap();
+        let pages: f64 = statm.split_whitespace().nth(1).unwrap().parse().unwrap();
+        pages * 4096.0 / (1024.0 * 1024.0)
+    };
+    let before = resident_mib();
+    let mut worker = cosmic_text::FontSystem::new_with_locale_and_db(locale, db);
+    let mut shape_in_worker = |font| {
+        let attrs = graphics_text::to_attributes(font);
+        let mut buffer = cosmic_text::Buffer::new_empty(cosmic_text::Metrics::new(14.0, 20.0));
+        buffer.set_size(Some(720.0), None);
+        let clock = Instant::now();
+        buffer.set_text(&body, &attrs, cosmic_text::Shaping::Advanced, None);
+        buffer.shape_until_scroll(&mut worker, false);
+        std::hint::black_box(&buffer);
+        clock.elapsed().as_secs_f64() * 1e3
+    };
+    for (name, font) in faces {
+        let first = shape_in_worker(font);
+        let next = shape_in_worker(font);
+        println!("{name:>15}: worker system, first paragraph {first:>8.3} ms, next {next:>7.3} ms");
+    }
+    println!(
+        "a worker system after all five faces holds {:.1} MiB more resident memory",
+        resident_mib() - before
+    );
+}

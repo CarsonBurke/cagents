@@ -958,6 +958,9 @@ fn start_job(
     }
     match command.spawn() {
         Ok(mut child) => {
+            // spawn confirmed exec; the worker now owns the inherited lease.
+            // Close our copy without unlocking its shared description.
+            drop(lock.into_file());
             thread::spawn(move || {
                 let _ = child.wait();
             });
@@ -1777,7 +1780,7 @@ fn write_job(state: &Path, job: &UpdateJob) -> Result<(), UpdateError> {
     File::open(state)?.sync_all()?;
     Ok(())
 }
-fn acquire_lock(state: &Path) -> Result<File, UpdateError> {
+fn acquire_lock(state: &Path) -> Result<crate::instance::OwnedLock, UpdateError> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -1787,16 +1790,13 @@ fn acquire_lock(state: &Path) -> Result<File, UpdateError> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(state.join("lock"))?;
     validate_lock(&file)?;
-    // SAFETY: descriptor remains owned by the returned File.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        let error = io::Error::last_os_error();
-        return Err(if error.kind() == io::ErrorKind::WouldBlock {
+    crate::instance::owned_file_lock(file, libc::LOCK_EX | libc::LOCK_NB).map_err(|error| {
+        if error.kind() == io::ErrorKind::WouldBlock {
             UpdateError::Busy
         } else {
             error.into()
-        });
-    }
-    Ok(file)
+        }
+    })
 }
 fn validate_lock(file: &File) -> Result<(), UpdateError> {
     let metadata = file.metadata()?;
@@ -1809,7 +1809,7 @@ fn validate_lock(file: &File) -> Result<(), UpdateError> {
     }
     Ok(())
 }
-fn inherited_lock(state: &Path) -> Result<File, UpdateError> {
+fn inherited_lock(state: &Path) -> Result<crate::instance::OwnedLock, UpdateError> {
     // SAFETY: F_GETFD probes existence before taking ownership of the reserved fd.
     if unsafe { libc::fcntl(WORKER_LOCK_FD, libc::F_GETFD) } == -1 {
         return Err(invalid(
@@ -1823,13 +1823,12 @@ fn inherited_lock(state: &Path) -> Result<File, UpdateError> {
     if actual.dev() != expected.dev() || actual.ino() != expected.ino() {
         return Err(invalid("worker inherited the wrong lock"));
     }
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return Err(UpdateError::Busy);
-    }
-    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+    let lock = crate::instance::owned_file_lock(file, libc::LOCK_EX | libc::LOCK_NB)
+        .map_err(|_| UpdateError::Busy)?;
+    if unsafe { libc::fcntl(lock.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
         return Err(io::Error::last_os_error().into());
     }
-    Ok(file)
+    Ok(lock)
 }
 
 fn metadata(endpoint: &str, cancellation: &CancellationToken) -> Result<Vec<u8>, UpdateError> {
@@ -3917,26 +3916,22 @@ finally:
     fn concurrent_apply_lease_survives_parent_handle_and_excludes_duplicates() {
         let root = tempfile::tempdir().unwrap();
         let first = acquire_lock(root.path()).unwrap();
-        let inherited = first.try_clone().unwrap();
+        // The parent deliberately hands the shared description to the worker.
+        let parent = first.into_file();
+        let inherited = crate::instance::owned_file_lock(
+            parent.try_clone().unwrap(),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+        .unwrap();
+        let unrelated_fork = parent.try_clone().unwrap();
         assert!(matches!(acquire_lock(root.path()), Err(UpdateError::Busy)));
-        drop(first);
+        drop(parent);
         assert!(matches!(acquire_lock(root.path()), Err(UpdateError::Busy)));
         drop(inherited);
-        // Other tests may fork while either handle is live; those children
-        // retain the description until their CLOEXEC boundary.
-        let deadline = Instant::now() + Duration::from_secs(3);
-        loop {
-            match acquire_lock(root.path()) {
-                Ok(next) => {
-                    drop(next);
-                    break;
-                }
-                Err(UpdateError::Busy) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                result => panic!("worker lease was not released: {result:?}"),
-            }
-        }
+        let next = acquire_lock(root.path()).unwrap();
+        drop(unrelated_fork);
+        assert!(matches!(acquire_lock(root.path()), Err(UpdateError::Busy)));
+        drop(next);
     }
 
     #[test]

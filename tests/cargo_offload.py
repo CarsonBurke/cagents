@@ -1918,6 +1918,29 @@ class StandInHostPython(unittest.TestCase):
         self.assert_interpreter(result, caller=None)
 
 
+def incremental_session(slot, crate, *, age, size=64 * 1024, profile="debug"):
+    """A crate's incremental directory in the slot's target, as rustc leaves
+    it: a finalized session of `size` bytes and its lock file, last written
+    `age` seconds ago."""
+    directory = Path(slot, "src", "target", profile, "incremental", crate)
+    session = directory / f"s-{crate}-0-0"
+    session.mkdir(parents=True)
+    (session / "query-cache.bin").write_bytes(os.urandom(size))
+    (directory / f"s-{crate}-0.lock").touch()
+    then = time.time() - age
+    for path in (session / "query-cache.bin", session, directory / f"s-{crate}-0.lock"):
+        os.utime(path, (then, then))
+    return directory
+
+
+def wait_until(condition, timeout=10):
+    deadline = time.monotonic() + timeout
+    while not condition():
+        if time.monotonic() > deadline:
+            raise AssertionError("timed out")
+        time.sleep(0.05)
+
+
 class RemoteRun(unittest.TestCase):
     """The build host's end of a command: it ends what it started when the
     connection to this host closes, outside any supervisor here."""
@@ -1991,12 +2014,13 @@ class RemoteRun(unittest.TestCase):
             self.scope = scope
             yield scope.name
 
-    def lease(self, base, *, slots=2, build="", slot_disk=0, figures=None, registry="", env=None):
+    def lease(self, base, *, slots=2, build="", slot_disk=0, figures=None, registry="", env=None,
+              floor=0, budget=""):
         if figures is None:
             figures = Path(base, "figures")
             write_figures(figures)
         lease = self.agent(
-            self.scope, "lease", base, str(slots), "key", "0", "", "", build,
+            self.scope, "lease", base, str(slots), "key", str(floor), "", "", build, str(budget),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
             env={"CAGENTS_BUILD_REGISTRY": str(registry),
                  "CAGENTS_OFFLOAD_SLOT_DISK_BYTES": str(slot_disk),
@@ -2014,6 +2038,51 @@ class RemoteRun(unittest.TestCase):
         self.addCleanup(lock.close)
         fcntl.flock(lock, fcntl.LOCK_EX)
         return lock
+
+    def test_a_lease_trims_its_slot_before_the_build_and_keeps_what_a_rustc_holds(self):
+        with self.slots() as base:
+            slot = Path(base, "slot-0")
+            (slot / "owner").parent.mkdir(parents=True)
+            (slot / "owner").write_text("key\n")
+            stale = incremental_session(slot, "stale-1", age=3600)
+            compiling = incremental_session(slot, "compiling-2", age=7200)
+            with open(next(compiling.glob("s-*.lock")), "rb") as rustc:
+                fcntl.flock(rustc, fcntl.LOCK_EX)
+                lease, lines = self.lease(base, budget=0)
+                self.assertEqual(json.loads(lines.next(10).removeprefix("slot "))["index"], 0)
+            self.assertFalse(stale.exists())
+            self.assertTrue(compiling.exists())
+            # What it moved out goes in the background.
+            wait_until(lambda: not any((slot / "evicted").iterdir()))
+            lease.stdin.close()
+            self.assertEqual(lease.wait(timeout=10), 0)
+
+    def test_below_twice_the_floor_a_lease_trims_the_slots_no_lease_holds(self):
+        free = shutil.disk_usage(tempfile.gettempdir()).free // 2**30
+        if free < 4:
+            self.skipTest("too little free space to place a floor below it")
+        # Between the floor and twice it, and with room.
+        roomy = shutil.disk_usage(tempfile.gettempdir()).free >= \
+            agent_scope()["pressure_floor"](tempfile.gettempdir(), 0)
+        for floor, pressed in ((free * 2 // 3, True), (0, False)):
+            if not pressed and not roomy:
+                continue
+            with self.subTest(pressed=pressed), self.slots() as base:
+                idle = incremental_session(Path(base, "slot-0"), "idle-1", age=60)
+                Path(base, "slot-0", "owner").write_text("other\n")
+                mine = incremental_session(Path(base, "slot-1"), "mine-1", age=60)
+                Path(base, "slot-1", "owner").write_text("key\n")
+                lock = self.hold(base, 2)
+                Path(base, "slot-2", "owner").write_text("other\n")
+                leased = incremental_session(Path(base, "slot-2"), "leased-1", age=60)
+                lease, lines = self.lease(base, slots=3, floor=floor, budget=0)
+                self.assertEqual(json.loads(lines.next(10).removeprefix("slot "))["index"], 1)
+                self.assertFalse(mine.exists())
+                self.assertEqual(idle.exists(), not pressed)
+                self.assertTrue(leased.exists())
+                lease.stdin.close()
+                self.assertEqual(lease.wait(timeout=10), 0)
+                lock.close()
 
     def test_a_further_slot_is_made_while_the_disk_holds_one(self):
         with self.slots() as base:
@@ -2429,6 +2498,179 @@ class RemoteRun(unittest.TestCase):
                 reported = agent.stdout.read().decode().strip()
                 self.assertEqual(reported, "unlimited" if hard == resource.RLIM_INFINITY
                                  else str(hard))
+
+
+class Trim(unittest.TestCase):
+    """The bound on a slot's build output, which its lease, or the guard for
+    a slot no lease holds, applies under the slot's locks."""
+
+    def setUp(self):
+        self.agent = agent_scope()
+        directory = tempfile.TemporaryDirectory(prefix="cagents-trim-")
+        self.addCleanup(directory.cleanup)
+        self.slot = Path(directory.name, "slot-0")
+        self.slot.mkdir()
+
+    def trim(self, budget, pressed=False):
+        return self.agent["trim"](str(self.slot), budget, pressed)
+
+    def session_size(self, crate):
+        """What trim counts for `crate`: what its sessions hold, not the
+        directories' own blocks, which some file systems give a size."""
+        return sum(self.agent["tree_size"](str(session), set())
+                   for session in crate.iterdir() if session.is_dir())
+
+    def test_the_crates_compiled_most_recently_stay_within_the_budget(self):
+        oldest = incremental_session(self.slot, "oldest-1", age=3 * 3600)
+        older = incremental_session(self.slot, "older-1", age=2 * 3600, profile="dev-runtime")
+        newer = incremental_session(self.slot, "newer-1", age=3600,
+                                    profile="x86_64-unknown-linux-gnu/local")
+        newest = incremental_session(self.slot, "newest-1", age=60)
+        size = self.session_size(newest)
+        moved = self.trim(2 * size)
+        self.assertEqual([crate.exists() for crate in (oldest, older, newer, newest)],
+                         [False, False, True, True])
+        self.assertGreaterEqual(moved, 2 * size)
+        # Moved out whole, in one rename each, then removed.
+        self.assertEqual(len(list((self.slot / "evicted").iterdir())), 2)
+        self.agent["remove_evicted"]([str(self.slot)], wait=True)
+        self.assertEqual(list((self.slot / "evicted").iterdir()), [])
+        # Under the budget, nothing goes.
+        self.assertEqual(self.trim(2 * size), 0)
+        self.assertTrue(newer.exists() and newest.exists())
+
+    def test_below_twice_the_floor_a_quarter_of_the_budget_stays(self):
+        crates = [incremental_session(self.slot, f"crate-{age}", age=age) for age in (10, 20, 30, 40)]
+        size = self.session_size(crates[0])
+        self.trim(4 * size, pressed=True)
+        self.assertEqual([crate.exists() for crate in crates], [True, False, False, False])
+
+    def test_a_crate_a_rustc_compiles_stays_whatever_the_budget(self):
+        compiling = incremental_session(self.slot, "compiling-1", age=7200)
+        idle = incremental_session(self.slot, "idle-1", age=60)
+        with open(next(compiling.glob("s-*.lock")), "rb") as rustc:
+            fcntl.flock(rustc, fcntl.LOCK_EX)
+            self.trim(0)
+        self.assertTrue(compiling.exists())
+        self.assertFalse(idle.exists())
+
+    def test_the_large_session_compiled_last_stays_though_it_crosses_the_budget(self):
+        small = incremental_session(self.slot, "small-1", age=3600)
+        large = incremental_session(self.slot, "large-1", age=60, size=256 * 1024)
+        self.trim(self.session_size(small))
+        self.assertEqual((large.exists(), small.exists()), (True, False))
+
+    def test_each_finalized_session_is_measured_once(self):
+        crate = incremental_session(self.slot, "crate-1", age=60)
+        older = incremental_session(self.slot, "older-1", age=3600)
+        size = self.session_size(crate)
+        self.trim(2 * size - 1)
+        self.assertTrue(older.exists())
+        # Rustc never changes a finalized session; one it is writing is
+        # measured again each time.
+        session = next(path for path in crate.iterdir() if path.is_dir())
+        (session / "more.o").write_bytes(os.urandom(64 * 1024))
+        self.trim(2 * size - 1)
+        self.assertTrue(older.exists())
+        session.rename(crate / f"{session.name}-working")
+        self.trim(2 * size - 1)
+        self.assertTrue(crate.exists())
+        self.assertFalse(older.exists())
+
+    def test_an_unreadable_record_of_sizes_is_measured_again(self):
+        crate = incremental_session(self.slot, "crate-1", age=60)
+        older = incremental_session(self.slot, "older-1", age=3600)
+        for record in ("not json", "[]", '{"src/target/debug/incremental/crate-1/s-crate-1-0-0": "x"}'):
+            with self.subTest(record=record):
+                (self.slot / "incremental-sizes").write_text(record)
+                self.trim(self.session_size(crate) + 1)
+                self.assertTrue(older.exists())
+
+    def test_units_no_build_looked_at_for_days_go_every_few_hours_or_at_once_when_pressed(self):
+        if os.statvfs(self.slot).f_flag & os.ST_NOATIME:
+            self.skipTest("this file system keeps no access times")
+        profile = self.slot / "src/target/debug"
+        def written(path, days):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"output")
+            then = time.time() - days * 86400
+            os.utime(path, (then, then))
+            return path
+        def unit(package, crate, unit_hash, *, looked, built=4):
+            """A unit laid out as Cargo leaves it; a build reads its
+            fingerprint `looked` days ago, its outputs only when it is built."""
+            written(profile / f".fingerprint/{package}-{unit_hash}/lib-{crate}", looked)
+            return [profile / f".fingerprint/{package}-{unit_hash}",
+                    written(profile / f"deps/lib{crate}-{unit_hash}.rlib", built),
+                    written(profile / f"deps/{crate}-{unit_hash}.d", built),
+                    written(profile / f"build/{package}-{unit_hash}/build-script-build",
+                            built).parent]
+        stale = unit("old-crate", "old_crate", "1a", looked=4)
+        # A build dependency and a compiled build script: every build looks
+        # at their fingerprints, though none reads them until they change.
+        needed = unit("build-helper", "build_helper", "2b", looked=1)
+        # Nothing dates what no fingerprint names.
+        unnamed = written(profile / "deps/libloose-3c.rlib", 4)
+        self.trim(2**40)
+        self.assertEqual([path.exists() for path in stale], [False] * 4)
+        self.assertEqual([path.exists() for path in needed], [True] * 4)
+        self.assertTrue(unnamed.exists())
+        # Not again for hours, unless the disk is low.
+        later = unit("later-crate", "later_crate", "4d", looked=4)
+        self.trim(2**40)
+        self.assertTrue(all(path.exists() for path in later))
+        self.trim(2**40, pressed=True)
+        self.assertFalse(any(path.exists() for path in later))
+
+    def test_a_removal_a_build_waits_for_does_not_wait_behind_an_idle_one(self):
+        evicted = self.slot / "evicted"
+        (evicted / "1-1-crate-1" / "s-1").mkdir(parents=True)
+        (evicted / "1-1-crate-1" / "s-1" / "query-cache.bin").write_bytes(b"x" * 4096)
+        (evicted / "2-1-libold-1.rlib").write_bytes(b"rlib")
+        with open(self.slot / "evicted.lock", "a") as idle:
+            fcntl.flock(idle, fcntl.LOCK_EX)
+            # Another idle one passes over a slot whose remover is at work.
+            self.agent["remove_evicted"]([str(self.slot)])
+            time.sleep(0.5)
+            self.assertEqual(len(list(evicted.iterdir())), 2)
+            self.agent["remove_evicted"]([str(self.slot)], wait=True)
+            self.assertEqual(list(evicted.iterdir()), [])
+
+    def test_a_slot_held_shared_by_a_trim_is_not_taken_for_a_running_build(self):
+        lock = self.slot / "lock"
+        with open(lock, "a") as trimming:
+            fcntl.flock(trimming, fcntl.LOCK_SH)
+            self.assertFalse(self.agent["leased"](str(self.slot)))
+        with open(lock, "a") as leasing:
+            fcntl.flock(leasing, fcntl.LOCK_EX)
+            self.assertTrue(self.agent["leased"](str(self.slot)))
+
+    def test_the_guard_trims_only_the_slots_no_lease_holds(self):
+        root = self.slot.parent / "offload"
+        idle, leased = (root / "repository" / f"slot-{index}" for index in (0, 1))
+        crates = [incremental_session(slot, "crate-1", age=60) for slot in (idle, leased)]
+        offloading = [sys.executable, str(ROOT / "scripts/cargo-offload"), "--trim-slots"]
+        environment = os.environ | {"CAGENTS_BUILD_OFFLOAD_SLOTS": str(root),
+                                    "CAGENTS_BUILD_REMOTE_INCREMENTAL_GIB": "0"}
+        with open(leased / "lock", "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            result = subprocess.run([*offloading, "0", "--wait"], env=environment,
+                                    capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([crate.exists() for crate in crates], [False, True])
+        self.assertIn("out of 1 idle build slots", result.stdout)
+        # It waited for the removal.
+        self.assertEqual(list((idle / "evicted").iterdir()), [])
+        for arguments in ([], ["x"], ["0", "--later"]):
+            with self.subTest(arguments=arguments):
+                result = subprocess.run([*offloading, *arguments], env=environment,
+                                        capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("usage", result.stderr)
+        result = subprocess.run([*offloading, "0"], capture_output=True, text=True, timeout=30,
+                                env=environment | {"CAGENTS_BUILD_REMOTE_INCREMENTAL_GIB": "-1"})
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("must be a nonnegative integer", result.stderr)
 
 
 class Prune(unittest.TestCase):

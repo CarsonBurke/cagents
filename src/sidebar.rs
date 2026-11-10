@@ -44,6 +44,8 @@ use row_interaction::RowInteraction;
 mod attention;
 pub use attention::{State as AttentionState, Summary as AttentionSummary};
 
+mod rail;
+
 mod selection;
 pub use selection::{Intent as SelectionIntent, Row as SelectionRow};
 
@@ -84,11 +86,6 @@ const ROW_GUTTER: f32 = space::XS;
 /// this frame. A spinner, an attention badge and a chat count all land here,
 /// so a label cannot reflow when an agent starts working or a chat opens.
 const ROW_STATUS_WIDTH: f32 = design::ROW_ICON_SIZE as f32;
-/// One rail row: the leading glyph and the indicator slot, with no gutter
-/// between them. `COMPACT_WIDTH` less the list's own inset and the scrollbar
-/// rail leaves exactly this much, which is why the rail spends none of it on a
-/// hierarchy indent.
-const COMPACT_ROW_WIDTH: f32 = ROW_ICON_WIDTH + ROW_STATUS_WIDTH;
 /// The project header's hover-revealed commands: disclose, new channel, new
 /// worktree. Reserved inside the header row so a long project name ellipsizes
 /// instead of running under them, and read by `row_interaction::header_at` so
@@ -4073,7 +4070,6 @@ impl SidebarState {
             | SidebarAction::NewWorktree { .. }
             | SidebarAction::NewChannel { .. }
             | SidebarAction::OpenChannel { .. }
-            | SidebarAction::OpenChannelWork { .. }
             | SidebarAction::DeleteChannel { .. }
             | SidebarAction::ReorderMember { .. }
             | SidebarAction::ReorderProject { .. }
@@ -4210,9 +4206,6 @@ pub enum SidebarAction {
         project_id: ProjectId,
     },
     OpenChannel {
-        channel_id: ChannelId,
-    },
-    OpenChannelWork {
         channel_id: ChannelId,
     },
     /// Asks to delete a channel. The application confirms before removing
@@ -4519,6 +4512,7 @@ pub fn view<'a>(
         modal_open,
         None,
         &crate::settings::KeyboardShortcuts::default(),
+        false,
     )
 }
 
@@ -4830,6 +4824,10 @@ mod cached_projects {
     }
 }
 
+/// `window_rounded` says the window draws rounded corners, as a floating
+/// window does and a maximized or tiled one does not: the pane's top-left
+/// corner is the window's, and follows it.
+#[allow(clippy::too_many_arguments)]
 pub fn view_cached<'a>(
     model: &'a SidebarModel,
     state: &'a SidebarState,
@@ -4838,6 +4836,7 @@ pub fn view_cached<'a>(
     modal_open: bool,
     cache: &'a NavigationCache,
     shortcuts: &crate::settings::KeyboardShortcuts,
+    window_rounded: bool,
 ) -> Element<'a, SidebarAction> {
     view_inner(
         model,
@@ -4847,6 +4846,7 @@ pub fn view_cached<'a>(
         modal_open,
         Some(cache),
         shortcuts,
+        window_rounded,
     )
 }
 
@@ -4858,6 +4858,7 @@ fn view_inner<'a>(
     modal_open: bool,
     cache: Option<&'a NavigationCache>,
     shortcuts: &crate::settings::KeyboardShortcuts,
+    window_rounded: bool,
 ) -> Element<'a, SidebarAction> {
     let compact = mode == SidebarMode::Compact;
     let width = effective_width(mode, persisted_width);
@@ -4929,7 +4930,7 @@ fn view_inner<'a>(
         .height(Length::Fill)
         .into(),
     ))
-    .class(theme::Container::Primary)
+    .class(design::docked_primary(window_rounded))
     .width(Length::Fixed(width))
     .height(Length::Fill)
     .into()
@@ -5539,8 +5540,8 @@ enum RowKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RowGrid {
     kind: RowKind,
-    /// The rail renders glyphs only: no label, no hierarchy indent, and no
-    /// gutter to spend between the two slots it has room for.
+    /// The rail renders one centred glyph per row, with its status pinned to
+    /// the glyph's corners; see [`rail`].
     compact: bool,
 }
 
@@ -5578,15 +5579,15 @@ impl RowGrid {
     /// The rail belongs to the content inside the viewport rather than to a
     /// container around the scrollable: an outer gutter moves the thumb along
     /// with the content and leaves the two touching exactly as before. The
-    /// rail's inset is the grid's own gutter, so nothing can squeeze
-    /// `COMPACT_ROW_WIDTH` out of the rail.
+    /// compact rail mirrors the scrollbar's rail on the left, which leaves
+    /// exactly [`rail::CELL_WIDTH`] centred in the pane.
     fn list_padding(compact: bool) -> Padding {
         design::with_vertical_rail(if compact {
             Padding {
                 top: ROW_GUTTER,
                 right: 0.0,
                 bottom: ROW_GUTTER,
-                left: ROW_GUTTER,
+                left: design::SCROLLBAR_GUTTER,
             }
         } else {
             Padding::from(space::XS)
@@ -5627,12 +5628,27 @@ impl RowGrid {
         content
     }
 
+    /// A rail row's content: its glyph and corner badges, and nothing else.
+    fn rail<'a>(
+        self,
+        glyph: impl Into<Element<'a, SidebarAction>>,
+        badges: rail::Badges,
+    ) -> RowContent<'a> {
+        debug_assert!(self.compact, "only the rail draws rail cells");
+        widget::row::with_capacity(1)
+            .height(Length::Fill)
+            .push(rail::cell(glyph, badges))
+    }
+
     /// The button a row is: one height, one inset, one width rule.
     fn control<'a>(
         self,
         content: RowContent<'a>,
         selected: bool,
     ) -> button::Button<'a, SidebarAction> {
+        if self.compact {
+            return rail::control(content.into(), selected);
+        }
         button::custom(content)
             .class(match self.kind {
                 RowKind::Project => row_button_style::<true, false>(selected),
@@ -5640,11 +5656,7 @@ impl RowGrid {
             })
             .selected(selected)
             .padding([0.0, self.gutter()])
-            .width(if self.compact {
-                Length::Fixed(COMPACT_ROW_WIDTH)
-            } else {
-                Length::Fill
-            })
+            .width(Length::Fill)
             .height(Length::Fixed(self.height()))
     }
 
@@ -5839,7 +5851,7 @@ fn operation_rows<'a>(
             .width(Length::Fill)
             .into();
         let content = grid.content(
-            operation_icon(operation.phase, false),
+            operation_icon(operation.phase, CHILD_ROW_ICON_SIZE),
             Some(label),
             operation_status(operation.phase),
         );
@@ -5889,7 +5901,13 @@ fn compact_operation_rows<'a>(
     project.operations.iter().map(move |operation| {
         let control = grid
             .control(
-                grid.content(operation_icon(operation.phase, true), None, None),
+                grid.rail(
+                    operation_icon(operation.phase, rail::CHILD_GLYPH),
+                    match operation.phase {
+                        WorktreeOperationPhase::Working => rail::Badges::busy(),
+                        WorktreeOperationPhase::Failed => rail::Badges::default(),
+                    },
+                ),
                 false,
             )
             .name(operation_accessible_name(operation))
@@ -5902,27 +5920,12 @@ fn compact_operation_rows<'a>(
 }
 
 /// The leading glyph: the worktree icon the row will keep, muted, while the
-/// creation runs; a warning once it has failed. The rail has no status slot,
-/// so there the spinner takes the glyph's place.
-fn operation_icon<'a>(
-    phase: WorktreeOperationPhase,
-    compact: bool,
-) -> Element<'static, SidebarAction> {
+/// creation runs; a warning once it has failed. The spinner is the status
+/// slot's in a row, and a corner badge's in the rail.
+fn operation_icon<'a>(phase: WorktreeOperationPhase, size: u16) -> Element<'static, SidebarAction> {
     match phase {
-        WorktreeOperationPhase::Working if compact => {
-            crate::ui_controls::activity_spinner(f32::from(ROW_ICON_SIZE), design::muted_icon_color)
-        }
-        WorktreeOperationPhase::Working => {
-            widget::container(widget::icon(worktree_icon()).size(ROW_ICON_SIZE))
-                .class(theme::Container::custom(|theme| {
-                    cosmic::iced::widget::container::Style {
-                        icon_color: Some(design::muted_icon_color(theme)),
-                        ..Default::default()
-                    }
-                }))
-                .into()
-        }
-        WorktreeOperationPhase::Failed => toned_icon(Icon::Warning, BadgeTone::Warning),
+        WorktreeOperationPhase::Working => worktree_glyph_muted(size).into(),
+        WorktreeOperationPhase::Failed => toned_icon_sized(Icon::Warning, BadgeTone::Warning, size),
     }
 }
 
@@ -6032,15 +6035,23 @@ fn unreachable_project<'a>(
             project.name
         )
     };
-    let control = grid
-        .control(
-            grid.content(
-                toned_icon(Icon::Warning, BadgeTone::Warning),
-                (!compact).then(|| project_name_label(project, &state.query)),
-                None,
-            ),
-            false,
+    // The rail keeps the project's own chip, because which project could not
+    // be read is the first thing to know, and marks it with the warning.
+    let content = if compact {
+        let (initials, color) = project_identity(&project.name);
+        grid.rail(
+            rail::project_chip(project.avatar.as_ref(), initials, color, true),
+            rail::Badges::warning(),
         )
+    } else {
+        grid.content(
+            toned_icon(Icon::Warning, BadgeTone::Warning),
+            Some(project_name_label(project, &state.query)),
+            None,
+        )
+    };
+    let control = grid
+        .control(content, false)
         .id(chrome.open_id.clone())
         .name(description.clone())
         .on_press_maybe(reload.clone());
@@ -6060,10 +6071,7 @@ fn unreachable_project<'a>(
         for row in compact_operation_rows(project, modal_open) {
             column = column.push(row);
         }
-        return widget::container(column)
-            .padding([space::XS, 0.0])
-            .width(Length::Fill)
-            .into();
+        return rail::group(column.into(), !project.operations.is_empty());
     }
     let mut details = widget::column::with_capacity(project.operations.len() + 2)
         .spacing(space::XS)
@@ -6198,7 +6206,7 @@ fn project_view<'a>(
     let mut identity = widget::row::with_children(vec![project_identity])
         .align_y(Alignment::Center)
         .width(Length::Fill);
-    if let Some(indicator) = attention_indicator(header_attention, false) {
+    if let Some(indicator) = attention_indicator(header_attention) {
         identity = identity.push(indicator);
     }
     if !expanded {
@@ -6377,7 +6385,6 @@ fn compact_project_attention(
     project: &SidebarProject,
     state: &SidebarState,
 ) -> CompactProjectAttention {
-    use crate::agent::ActivityState;
     let worktrees: BTreeSet<_> = project.worktrees.iter().map(|row| row.id).collect();
     let waiting_worktrees = worktrees
         .into_iter()
@@ -6396,40 +6403,16 @@ fn compact_project_identity(
     selected: bool,
     modal_open: bool,
     state: &SidebarState,
+    badged: bool,
 ) -> Element<'static, SidebarAction> {
     let listing = state.folder_aggregate_listing(project);
-    let muted = listing != Listing::Live;
     let (initials, color) = project_identity(&project.name);
-    let identity: Element<'static, SidebarAction> = if project.avatar.is_some() {
-        project_icon(project, ROW_ICON_WIDTH as u16)
-    } else {
-        design::caption(initials)
-            .class(theme::Text::Color(cosmic::iced::Color::WHITE))
-            .into()
-    };
-    let chip = widget::container(identity)
-        .center_x(ROW_ICON_WIDTH)
-        .center_y(24.0)
-        .class(theme::Container::custom(move |theme| {
-            cosmic::iced::widget::container::Style {
-                background: Some((if muted { color.scale_alpha(0.5) } else { color }).into()),
-                text_color: Some(if muted {
-                    design::muted_icon_color(theme)
-                } else {
-                    cosmic::iced::Color::WHITE
-                }),
-                border: cosmic::iced::Border {
-                    color: if selected {
-                        cosmic::iced::Color::WHITE
-                    } else {
-                        color
-                    },
-                    width: if selected { 2.0 } else { 0.0 },
-                    radius: 4.0.into(),
-                },
-                ..Default::default()
-            }
-        }));
+    let chip = rail::project_chip(
+        project.avatar.as_ref(),
+        initials,
+        color,
+        listing != Listing::Live,
+    );
     let attention = compact_project_attention(project, state);
     let activity = attention.activity;
     let mut description = project.name.clone();
@@ -6474,19 +6457,34 @@ fn compact_project_identity(
         description.push_str("\nAn agent is waiting for input");
     }
     description.push_str(listing.accessible_suffix());
-    let grid = RowGrid::child(true);
+    // The tooltip names the project and says what is going on in it; the
+    // per-worktree breakdown is for a screen reader, which cannot glance at
+    // the rows below.
+    let mut tip = project.name.clone();
+    if !news.is_empty() {
+        tip.push('\n');
+        tip.push_str(&news);
+    }
+    let grid = RowGrid::project(true);
     let control = grid
         .control(
-            grid.content(chip, None, attention_indicator(attention.summary, true)),
+            grid.rail(
+                chip,
+                if badged {
+                    rail::Badges::attention(attention.summary)
+                } else {
+                    rail::Badges::default()
+                },
+            ),
             selected,
         )
         .id(project.chrome.open_id.clone())
-        .name(description.clone())
+        .name(description)
         .on_press_maybe(
             project_primary_action(project, state.filter)
                 .and_then(|action| gated(action, modal_open)),
         );
-    grid.mount(crate::interaction::tooltip(control, description))
+    grid.mount(crate::interaction::tooltip(control, tip))
 }
 
 fn compact_project<'a>(
@@ -6504,34 +6502,11 @@ fn compact_project<'a>(
             | Some(SidebarSelection::PullRequest { project_id, .. })
             if project_id == entity.id
     );
-    let header = context_controls(
-        compact_project_identity(entity, selected, modal_open, project.state),
-        entity.id,
-        None,
-        modal_open,
-        entity.kind == ProjectKind::Git,
-        true,
-        entity.github_ready,
-        project.editors,
-        project
-            .state
-            .rows
-            .group_size(SelectionRow::Project(entity.id)),
-    );
-    let header = RowInteraction::selectable(
-        header,
-        SelectionRow::Project(entity.id),
-        project.state,
-        !modal_open,
-    );
     let selection = if entity.channels.iter().any(|channel| channel.selected) {
         None
     } else {
         selection
     };
-    // The rail's rows are one fixed width, so they start where the header
-    // above them starts. Centring them instead would move every row sideways
-    // whenever the reserved rail changed the content box's width.
     let mut column = widget::column::with_capacity(project.worktrees.len() + 1).width(Length::Fill);
     for row in compact_operation_rows(entity, modal_open) {
         column = column.push(row);
@@ -6596,17 +6571,44 @@ fn compact_project<'a>(
         let ranks = navigation_search_ranks(entity, &fold(project.state.query.trim()));
         members.sort_by_cached_key(|(row, _)| ranks.get(row).copied().unwrap_or(usize::MAX));
     }
+    let has_children = !members.is_empty() || !entity.operations.is_empty();
+    let header = context_controls(
+        compact_project_identity(
+            entity,
+            selected,
+            modal_open,
+            project.state,
+            // Every row with news is drawn below the chip with its own badges
+            // (see `compact_rail_shows_channel`), so the chip speaks for the
+            // project only while none are: repeating them would count the
+            // same news twice.
+            members.is_empty(),
+        ),
+        entity.id,
+        None,
+        modal_open,
+        entity.kind == ProjectKind::Git,
+        true,
+        entity.github_ready,
+        project.editors,
+        project
+            .state
+            .rows
+            .group_size(SelectionRow::Project(entity.id)),
+    );
+    let header = RowInteraction::selectable(
+        header,
+        SelectionRow::Project(entity.id),
+        project.state,
+        !modal_open,
+    );
     for (_, member) in members {
         column = column.push(member);
     }
-    widget::container(RowInteraction::group(
-        header,
-        column.into(),
-        sticky_viewport,
-    ))
-    .padding([space::XS, 0.0])
-    .width(Length::Fill)
-    .into()
+    rail::group(
+        RowInteraction::group(header, column.into(), sticky_viewport),
+        has_children,
+    )
 }
 
 /// How strongly a navigation row draws where no state color claims it.
@@ -6749,11 +6751,8 @@ fn worktree_glyph_tone(pull_request: Option<PullRequestTone>, ink: RowInk) -> Gl
 /// Attention outranks the chat count: a channel whose agent is working or
 /// waiting is the reason to look at the sidebar at all, and the count stays in
 /// the row's accessible name and tooltip either way.
-fn channel_indicator(
-    channel: &SidebarChannel,
-    compact: bool,
-) -> Option<Element<'static, SidebarAction>> {
-    attention_indicator(channel.attention, compact)
+fn channel_indicator(channel: &SidebarChannel) -> Option<Element<'static, SidebarAction>> {
+    attention_indicator(channel.attention)
         .or_else(|| (channel.chats > 1).then(|| design::caption(channel.chats.to_string()).into()))
 }
 
@@ -6763,12 +6762,11 @@ fn agent_indicator(
     activity: Option<crate::agent::ActivityState>,
     unread: bool,
 ) -> Option<Element<'static, SidebarAction>> {
-    attention_indicator(AttentionSummary::card(activity, unread, false), false)
+    attention_indicator(AttentionSummary::card(activity, unread, false))
 }
 
 pub fn attention_indicator<Message: Clone + 'static>(
     summary: AttentionSummary,
-    compact: bool,
 ) -> Option<Element<'static, Message>> {
     let state = summary.state()?;
     let indicator: Element<'static, Message> = match state {
@@ -6796,19 +6794,12 @@ pub fn attention_indicator<Message: Clone + 'static>(
     if summary.unread == 0 {
         return Some(indicator);
     }
-    let label = if summary.unread > 99 {
-        "99+".to_owned()
-    } else {
-        summary.unread.to_string()
-    };
-    let count: Element<'static, Message> = widget::text(label).size(9).into();
-    let counted: Element<'static, Message> = if compact && state == AttentionState::Unread {
-        count
-    } else {
-        widget::column::with_children(vec![indicator, count])
-            .align_x(Alignment::Center)
-            .into()
-    };
+    let count: Element<'static, Message> = widget::text(rail::count_label(summary.unread))
+        .size(9)
+        .into();
+    let counted: Element<'static, Message> = widget::column::with_children(vec![indicator, count])
+        .align_x(Alignment::Center)
+        .into();
     Some(crate::interaction::tooltip(counted, summary.description()))
 }
 
@@ -6823,9 +6814,32 @@ fn deleting_indicator<'a>() -> Element<'static, SidebarAction> {
 
 /// A failed deletion is a fact about the row until it is retried, so it is a
 /// badge after the reserved slot and leaves live activity where it was. The
-/// rail has room for nothing after the slot, so there it takes the slot.
+/// rail shows it as a warning badge instead; see [`rail_deletion_badges`].
 fn deletion_failed_badge(reason: &str) -> Element<'static, SidebarAction> {
     status_icon(Icon::Warning, reason.to_owned(), BadgeTone::Warning)
+}
+
+/// A rail row's badges: a deletion under way or failed takes them over, as it
+/// takes over the expanded row's status slot; otherwise its live attention.
+fn rail_deletion_badges(
+    deletion: Option<&RowDeletion>,
+    attention: AttentionSummary,
+) -> rail::Badges {
+    match deletion {
+        Some(RowDeletion::Deleting) => rail::Badges::busy(),
+        Some(RowDeletion::Failed(_)) => rail::Badges::warning(),
+        None => rail::Badges::attention(attention),
+    }
+}
+
+/// A row's tooltip. The rail has no room for the expanded row's "Deleting…"
+/// caption or its failure badge, so its tooltip says what they would.
+fn rail_tooltip(tooltip: &str, deletion: Option<&RowDeletion>, compact: bool) -> String {
+    match deletion.filter(|_| compact) {
+        Some(RowDeletion::Deleting) => format!("{tooltip}\nDeleting…"),
+        Some(RowDeletion::Failed(reason)) => format!("{tooltip}\nCould not delete: {reason}"),
+        None => tooltip.to_owned(),
+    }
 }
 
 /// A row being deleted reads as muted as a creation's row does, glyph and
@@ -6890,28 +6904,33 @@ fn channel_view(
     let deletion = channel.deletion.as_ref();
     let deleting = deletion == Some(&RowDeletion::Deleting);
     let tone = channel_glyph_tone(channel, listing);
-    let glyph = widget::container(widget::icon(Icon::Channel.handle()).size(CHILD_ROW_ICON_SIZE))
-        .class(theme::Container::custom(move |theme| {
-            cosmic::iced::widget::container::Style {
-                icon_color: Some(tone.color(theme)),
-                ..Default::default()
-            }
-        }));
-    let label = (!compact).then(|| {
-        search_label(
+    let glyph = widget::container(widget::icon(Icon::Channel.handle()).size(if compact {
+        rail::CHILD_GLYPH
+    } else {
+        CHILD_ROW_ICON_SIZE
+    }))
+    .class(theme::Container::custom(move |theme| {
+        cosmic::iced::widget::container::Style {
+            icon_color: Some(tone.color(theme)),
+            ..Default::default()
+        }
+    }));
+    let mut content = if compact {
+        grid.rail(glyph, rail_deletion_badges(deletion, channel.attention))
+    } else {
+        let label = search_label(
             &channel.title,
             query,
             CHILD_ROW_TEXT_SIZE,
             channel_ink(channel, listing).text_class(),
             false,
-        )
-    });
-    let indicator = match deletion {
-        Some(RowDeletion::Deleting) => Some(deleting_indicator()),
-        Some(RowDeletion::Failed(reason)) if compact => Some(deletion_failed_badge(reason)),
-        _ => channel_indicator(channel, compact),
+        );
+        let indicator = match deletion {
+            Some(RowDeletion::Deleting) => Some(deleting_indicator()),
+            _ => channel_indicator(channel),
+        };
+        grid.content(glyph, Some(label), indicator)
     };
-    let mut content = grid.content(glyph, label, indicator);
     if !compact {
         match deletion {
             Some(RowDeletion::Deleting) => content = content.push(design::caption("Deleting…")),
@@ -6944,7 +6963,7 @@ fn channel_view(
             inert,
         ));
     let action = row_quick_delete(
-        crate::interaction::tooltip(action, channel.tooltip.to_string()),
+        crate::interaction::tooltip(action, rail_tooltip(&channel.tooltip, deletion, compact)),
         &channel.delete_name,
         gated(
             SidebarAction::DeleteChannel {
@@ -6975,8 +6994,8 @@ fn channel_view(
 }
 
 /// Keep the row's primary button and its destructive quick action separate.
-/// The compact rail reuses its indicator slot while hovered; an expanded row
-/// reserves the button width so the label continues to ellipsize correctly.
+/// An expanded row reserves the button width so the label continues to
+/// ellipsize correctly; the rail has no room for the action at all.
 fn row_quick_delete<'a>(
     content: Element<'static, SidebarAction>,
     label: &str,
@@ -6984,11 +7003,13 @@ fn row_quick_delete<'a>(
     id: Id,
     compact: bool,
 ) -> Element<'static, SidebarAction> {
-    let width = if compact {
-        ROW_STATUS_WIDTH
-    } else {
-        ICON_CONTROL_SIZE
-    };
+    // A rail cell is one glyph wide: a hover-revealed delete would land on
+    // the badges and next to the glyph a press means to open. The row's
+    // context menu and the Delete key still reach it.
+    if compact {
+        return content;
+    }
+    let width = ICON_CONTROL_SIZE;
     let control = centered_icon_button(Icon::Delete, width, WORKTREE_ROW_HEIGHT)
         .class(sidebar_button_style(false))
         .id(id)
@@ -7002,7 +7023,7 @@ fn row_quick_delete<'a>(
     )
     .align_right(Length::Fill)
     .into();
-    RowInteraction::actions(content, controls, if compact { 0.0 } else { width })
+    RowInteraction::actions(content, controls, width)
 }
 
 /// The commands a channel row offers on right-click.
@@ -7037,14 +7058,6 @@ fn channel_context_controls<'a>(
             entries.insert(
                 0,
                 Item::Button(
-                    "Channel work".into(),
-                    None,
-                    ChannelContextCommand(channel_id, false, ChannelMenuCommand::Work),
-                ),
-            );
-            entries.insert(
-                0,
-                Item::Button(
                     "Rename channel…".into(),
                     Some(Icon::Rename.handle()),
                     ChannelContextCommand(channel_id, false, ChannelMenuCommand::Rename),
@@ -7074,7 +7087,6 @@ struct ChannelContextCommand(ChannelId, bool, ChannelMenuCommand);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ChannelMenuCommand {
-    Work,
     Delete,
     Rename,
     MarkRead,
@@ -7085,9 +7097,6 @@ impl widget::menu::Action for ChannelContextCommand {
 
     fn message(&self) -> SidebarAction {
         match self.2 {
-            ChannelMenuCommand::Work => {
-                return SidebarAction::OpenChannelWork { channel_id: self.0 };
-            }
             ChannelMenuCommand::Rename => return SidebarAction::RenameChannel(self.0),
             ChannelMenuCommand::MarkRead => return SidebarAction::MarkChannelRead(self.0),
             ChannelMenuCommand::Delete => {}
@@ -7162,38 +7171,6 @@ pub fn worktree_indicators(worktree: &SidebarWorktree) -> WorktreeIndicators<'_>
     }
 }
 
-/// The one live indicator a worktree row shows in its reserved slot.
-///
-/// The rail folds pending checks into the same spinner: it has room for one
-/// indicator, and "something is running here" is what the rail is for. The
-/// expanded row keeps checks as a durable badge of their own, after the
-/// reserved slot.
-fn worktree_indicator(
-    worktree: &SidebarWorktree,
-    agent_update: bool,
-    activity: Option<crate::agent::ActivityState>,
-    compact: bool,
-    show_changes_icons: bool,
-) -> Option<Element<'static, SidebarAction>> {
-    let indicators = worktree_indicators(worktree);
-    if let Some(indicator) = agent_indicator(activity, agent_update) {
-        return Some(indicator);
-    }
-    let checks = indicators.pending_checks;
-    if compact && checks {
-        return Some(crate::interaction::tooltip(
-            crate::ui_controls::activity_spinner(f32::from(ROW_ICON_SIZE), design::warning_color),
-            "CI checks pending or running",
-        ));
-    }
-    if compact && show_changes_icons {
-        return indicators
-            .dirty
-            .map(|label| status_icon(Icon::Changes, label.to_owned(), BadgeTone::Warning));
-    }
-    None
-}
-
 fn worktree_view<'a>(
     project_id: ProjectId,
     worktree: &'a SidebarWorktree,
@@ -7219,41 +7196,39 @@ fn worktree_view<'a>(
     let deletion = worktree.deletion.as_ref();
     let deleting = deletion == Some(&RowDeletion::Deleting);
     let ink = row_state.ink();
-    let label = (!compact).then(|| {
-        search_label(
+    let mut content = if compact {
+        // The rail is for live news only. Dirty changes and pending checks are
+        // durable facts about the worktree, kept in its tooltip and accessible
+        // name and in the expanded row; drawn here they made every worktree
+        // look like it wanted attention.
+        let mut attention = row_state.attention;
+        attention.union(AttentionSummary::card(activity, agent_update, false));
+        let glyph = if deleting {
+            worktree_glyph_muted(rail::CHILD_GLYPH)
+        } else {
+            worktree_glyph(worktree, ink, rail::CHILD_GLYPH)
+        };
+        grid.rail(glyph, rail_deletion_badges(deletion, attention))
+    } else {
+        let label = search_label(
             &chrome.label,
             query,
             CHILD_ROW_TEXT_SIZE,
             deletion_ink(ink, deletion).text_class(),
             false,
-        )
-    });
-    let indicator = match deletion {
-        Some(RowDeletion::Deleting) => Some(deleting_indicator()),
-        Some(RowDeletion::Failed(reason)) if compact => Some(deletion_failed_badge(reason)),
-        _ => attention_indicator(row_state.attention, compact).or_else(|| {
-            worktree_indicator(
-                worktree,
-                agent_update,
-                activity,
-                compact,
-                show_changes_icons,
-            )
-        }),
+        );
+        let indicator = match deletion {
+            Some(RowDeletion::Deleting) => Some(deleting_indicator()),
+            _ => attention_indicator(row_state.attention)
+                .or_else(|| agent_indicator(activity, agent_update)),
+        };
+        let glyph = if deleting {
+            worktree_glyph_muted(CHILD_ROW_ICON_SIZE).into()
+        } else {
+            worktree_status_icon(worktree, false, ink)
+        };
+        grid.content(glyph, Some(label), indicator)
     };
-    let glyph = if deleting {
-        widget::container(widget::icon(worktree_icon()).size(CHILD_ROW_ICON_SIZE))
-            .class(theme::Container::custom(|theme| {
-                cosmic::iced::widget::container::Style {
-                    icon_color: Some(design::muted_icon_color(theme)),
-                    ..Default::default()
-                }
-            }))
-            .into()
-    } else {
-        worktree_status_icon(worktree, false, ink)
-    };
-    let mut content = grid.content(glyph, label, indicator);
     if !compact {
         match deletion {
             Some(RowDeletion::Deleting) => content = content.push(design::caption("Deleting…")),
@@ -7355,7 +7330,8 @@ fn worktree_view<'a>(
     } else {
         crate::interaction::hover(action)
     };
-    let action = crate::interaction::tooltip(action, chrome.tooltip.to_string());
+    let action =
+        crate::interaction::tooltip(action, rail_tooltip(&chrome.tooltip, deletion, compact));
     let action = if !primary
         && worktree
             .pull_request()
@@ -7787,11 +7763,23 @@ fn editor_icon(editor: &SidebarEditor) -> icon::Handle {
     }
 }
 
-fn worktree_status_icon(
+/// The plain worktree glyph, muted: a worktree being created or deleted.
+fn worktree_glyph_muted(size: u16) -> widget::Container<'static, SidebarAction, cosmic::Theme> {
+    widget::container(widget::icon(worktree_icon()).size(size)).class(theme::Container::custom(
+        |theme| cosmic::iced::widget::container::Style {
+            icon_color: Some(design::muted_icon_color(theme)),
+            ..Default::default()
+        },
+    ))
+}
+
+/// A worktree's own glyph: its pull request's, in that request's tone, or the
+/// plain worktree glyph in the row's ink.
+fn worktree_glyph(
     worktree: &SidebarWorktree,
-    update: bool,
     ink: RowInk,
-) -> Element<'static, SidebarAction> {
+    size: u16,
+) -> widget::Container<'static, SidebarAction, cosmic::Theme> {
     let (handle, pull_request) = worktree
         .chrome
         .pull_request
@@ -7799,16 +7787,24 @@ fn worktree_status_icon(
         .map(|pr| (pull_request_icon(pr), Some(pull_request_tone(pr))))
         .unwrap_or_else(|| (worktree_icon(), None));
     let tone = worktree_glyph_tone(pull_request, ink);
-    let glyph = widget::container(widget::icon(handle).size(CHILD_ROW_ICON_SIZE)).class(
-        theme::Container::custom(move |theme| cosmic::iced::widget::container::Style {
+    widget::container(widget::icon(handle).size(size)).class(theme::Container::custom(
+        move |theme| cosmic::iced::widget::container::Style {
             // Resolved here, against the theme this frame is drawing with: this
             // builder runs once per visible worktree row, and reaching for
             // `cosmic::theme::active()` locked the process-global theme and
             // cloned it that many times per frame.
             icon_color: Some(tone.color(theme)),
             ..Default::default()
-        }),
-    );
+        },
+    ))
+}
+
+fn worktree_status_icon(
+    worktree: &SidebarWorktree,
+    update: bool,
+    ink: RowInk,
+) -> Element<'static, SidebarAction> {
+    let glyph = worktree_glyph(worktree, ink, CHILD_ROW_ICON_SIZE);
     let dot = widget::container(cosmic::iced::widget::Space::new().width(4).height(4)).class(
         theme::Container::Custom(Box::new(move |theme| {
             cosmic::iced::widget::container::Style {
@@ -10772,7 +10768,15 @@ fn check_description(status: CheckStatus) -> &'static str {
 /// process-global one while the view is built, so a row that carries a tone
 /// costs no theme lock per frame.
 fn toned_icon<'a, Message: 'a>(icon_name: Icon, tone: BadgeTone) -> Element<'a, Message> {
-    widget::container(widget::icon(icon_name.handle()).size(ROW_ICON_SIZE))
+    toned_icon_sized(icon_name, tone, ROW_ICON_SIZE)
+}
+
+fn toned_icon_sized<'a, Message: 'a>(
+    icon_name: Icon,
+    tone: BadgeTone,
+    size: u16,
+) -> Element<'a, Message> {
+    widget::container(widget::icon(icon_name.handle()).size(size))
         .class(theme::Container::custom(move |theme| {
             let cosmic = theme.cosmic();
             cosmic::iced::widget::container::Style {
@@ -10894,8 +10898,9 @@ fn navigation_search_ranks(
 
 /// The rail has room only for rows worth a glance: a search's matches, where
 /// the user is, news, live agents, deletions, and rows the Attention list
-/// keeps in place. Drawing and keyboard order both ask this, so the two
-/// cannot disagree about which rows exist.
+/// keeps in place. A worktree with open panes counts as where the user is: the
+/// rail is how they switch back to it. Drawing and keyboard order both ask
+/// this, so the two cannot disagree about which rows exist.
 fn compact_rail_shows_channel(state: &SidebarState, channel: &SidebarChannel) -> bool {
     compact_rail_searching(state)
         || channel.selected
@@ -12830,7 +12835,7 @@ pub(crate) mod tests {
         );
         let names = accessible_names(
             &headless_renderer(),
-            compact_project_identity(&project, false, false, &state),
+            compact_project_identity(&project, false, false, &state, true),
         );
         assert!(
             names
@@ -13354,7 +13359,7 @@ pub(crate) mod tests {
         let renderer = headless_renderer();
         let names = accessible_names(
             &renderer,
-            compact_project_identity(&project, true, false, &state),
+            compact_project_identity(&project, true, false, &state, true),
         );
         assert!(
             names
@@ -13383,8 +13388,13 @@ pub(crate) mod tests {
                 let mut renderer = headless_renderer();
                 // No selected outline or hover: bright ink inside the chip
                 // must come from its actual initials, not a white border.
-                let mut element =
-                    compact_project_identity(&project, false, false, &SidebarState::default());
+                let mut element = compact_project_identity(
+                    &project,
+                    false,
+                    false,
+                    &SidebarState::default(),
+                    true,
+                );
                 let mut tree = Tree::new(&element);
                 let viewport = Rectangle::with_size(Size::new(COMPACT_WIDTH, WORKTREE_ROW_HEIGHT));
                 let node = element.as_widget_mut().layout(
@@ -13899,8 +13909,81 @@ pub(crate) mod tests {
         assert!(visible_selection_rows(&model, &state, true).contains(&row));
     }
 
+    /// Every rail row is one fixed cell whatever its status says, and nothing
+    /// it draws - glyph, count pill or spinner - leaves that cell. The rail's
+    /// old status slot let a count wrap under its icon and a spinner spill
+    /// over the next row.
     #[test]
-    fn channel_hover_delete_targets_its_row_without_opening_it_in_both_densities() {
+    fn rail_cells_keep_one_size_and_their_badges_inside_it() {
+        use cosmic::iced::Rectangle;
+        fn assert_within(layout: Layout<'_>, cell: Rectangle, case: &str) {
+            let bounds = layout.bounds();
+            assert!(
+                bounds.x >= cell.x - 0.01
+                    && bounds.y >= cell.y - 0.01
+                    && bounds.x + bounds.width <= cell.x + cell.width + 0.01
+                    && bounds.y + bounds.height <= cell.y + cell.height + 0.01,
+                "{case}: {bounds:?} leaves the cell {cell:?}"
+            );
+            for child in layout.children() {
+                assert_within(child, cell, case);
+            }
+        }
+        let renderer = headless_renderer();
+        let summaries = [
+            AttentionSummary::default(),
+            AttentionSummary {
+                unread: 1,
+                ..AttentionSummary::default()
+            },
+            AttentionSummary {
+                unread: 120,
+                working: 2,
+                ..AttentionSummary::default()
+            },
+            AttentionSummary {
+                waiting: 1,
+                working: 1,
+                ..AttentionSummary::default()
+            },
+            AttentionSummary {
+                unread: 12,
+                failed: 3,
+                ..AttentionSummary::default()
+            },
+        ];
+        for summary in summaries {
+            let channel = SidebarChannel::new(
+                ChannelId::new(),
+                "Investigation".into(),
+                summary.unread != 0,
+                None,
+                false,
+                4,
+                true,
+                1,
+            )
+            .with_attention(summary);
+            let case = format!("{summary:?}");
+            let mut element = channel_view(&channel, Listing::Live, false, true, Some(1), "");
+            let mut tree = Tree::new(&element);
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(rail::CELL_WIDTH, 400.0)),
+            );
+            assert_eq!(
+                node.bounds().size(),
+                Size::new(rail::CELL_WIDTH, rail::CELL_HEIGHT),
+                "{case}"
+            );
+            let layout = Layout::new(&node);
+            assert_within(layout, layout.bounds(), &case);
+        }
+    }
+
+    #[test]
+    fn channel_hover_delete_targets_its_row_and_the_rail_cell_opens_it() {
         use cosmic::iced::{
             Event, Point, Rectangle,
             advanced::{Shell, clipboard},
@@ -13920,7 +14003,7 @@ pub(crate) mod tests {
             let renderer = headless_renderer();
             let mut element = channel_view(&channel, Listing::Live, modal, compact, Some(1), "");
             let mut tree = Tree::new(&element);
-            let width = if compact { COMPACT_ROW_WIDTH } else { 240.0 };
+            let width = if compact { rail::CELL_WIDTH } else { 240.0 };
             let viewport = Rectangle::with_size(Size::new(width, WORKTREE_ROW_HEIGHT));
             let limits = layout::Limits::new(Size::ZERO, viewport.size());
             let node = element
@@ -13958,10 +14041,15 @@ pub(crate) mod tests {
                     &viewport,
                 );
             }
+            // The rail has no hover delete: the whole cell opens the channel.
             assert_eq!(
                 messages,
                 if modal {
                     Vec::new()
+                } else if compact {
+                    vec![SidebarAction::OpenChannel {
+                        channel_id: channel.id,
+                    }]
                 } else {
                     vec![SidebarAction::DeleteChannel {
                         channel_id: channel.id,
@@ -14069,26 +14157,19 @@ pub(crate) mod tests {
             1,
         );
         let label = "Delete channel WhatsApp conversation export";
-        for compact in [false, true] {
-            let width = if compact { COMPACT_ROW_WIDTH } else { 240.0 };
-            let hover = cosmic::iced::Point::new(width - 8.0, WORKTREE_ROW_HEIGHT / 2.0);
-            let (control, glyphs) = icon_glyphs_in_control(
-                channel_view(&channel, Listing::Live, false, compact, Some(1), ""),
-                Size::new(width, WORKTREE_ROW_HEIGHT),
-                hover,
-                label,
-            );
-            assert_eq!(
-                control.width,
-                if compact {
-                    ROW_STATUS_WIDTH
-                } else {
-                    ICON_CONTROL_SIZE
-                },
-                "compact={compact}: the hit area keeps its reserved slot"
-            );
-            assert_glyph_centered(&format!("{label}, compact={compact}"), control, &glyphs);
-        }
+        let width = 240.0;
+        let hover = cosmic::iced::Point::new(width - 8.0, WORKTREE_ROW_HEIGHT / 2.0);
+        let (control, glyphs) = icon_glyphs_in_control(
+            channel_view(&channel, Listing::Live, false, false, Some(1), ""),
+            Size::new(width, WORKTREE_ROW_HEIGHT),
+            hover,
+            label,
+        );
+        assert_eq!(
+            control.width, ICON_CONTROL_SIZE,
+            "the hit area keeps its reserved slot"
+        );
+        assert_glyph_centered(label, control, &glyphs);
 
         let mut worktree = worktree(3, "feature", false);
         let mut pr = project().pull_requests.remove(0);
@@ -14129,7 +14210,8 @@ pub(crate) mod tests {
                         == Size::new(f32::from(ROW_ICON_SIZE), f32::from(ROW_ICON_SIZE)),
             ) + node.children().iter().map(badge_count).sum::<usize>()
         }
-        for compact in [false, true] {
+        {
+            let compact = false;
             let row = |show| {
                 worktree_view(
                     project_id(1),
@@ -14167,7 +14249,7 @@ pub(crate) mod tests {
                 accessible_names(&renderer, row(false)),
                 "dirty status remains available to assistive technology"
             );
-            assert!(worktree_indicator(&worktree, true, None, compact, false).is_some());
+            assert!(agent_indicator(None, true).is_some());
         }
         let model = SidebarModel::ready(SidebarMode::Expanded, vec![project()]);
         let mut state = SidebarState::default();
@@ -14881,8 +14963,8 @@ pub(crate) mod tests {
             assert_eq!(row.height, design::ROW_HEIGHT);
         }
 
-        let compact_header = header(true, COMPACT_ROW_WIDTH);
-        let compact = members(true, COMPACT_ROW_WIDTH);
+        let compact_header = header(true, rail::CELL_WIDTH);
+        let compact = members(true, rail::CELL_WIDTH);
         // Quiet children and creation controls do not fill the compact rail.
         assert_eq!((compact_header.len(), compact.len()), (1, 0));
         for (row, slots) in compact_header.iter().chain(&compact) {
@@ -14892,7 +14974,7 @@ pub(crate) mod tests {
         for (row, _) in &compact {
             assert_eq!(
                 row.x + row.width,
-                COMPACT_ROW_WIDTH,
+                rail::CELL_WIDTH,
                 "every rail row reserves the same indicator slot",
             );
         }
@@ -15781,6 +15863,7 @@ pub(crate) mod tests {
                 false,
                 navigation,
                 &crate::settings::KeyboardShortcuts::default(),
+                false,
             ),
             bounds,
             cache,
@@ -21491,6 +21574,7 @@ pub(crate) mod tests {
                 false,
                 None,
                 &shortcuts,
+                false,
             ),
             file_panel(&model, &state, width, false),
             git_panel(&model, &state, width, false),

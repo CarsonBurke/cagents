@@ -137,6 +137,7 @@ scripts/run-development                 # with the embedded browser
 | `--debug` | Opt into local raw stderr tracing/panic output and Rust backtraces (`CAGENTS_LOCAL_DEBUG=1`, `cagents=debug,cagentsd=debug,warn`); an explicit `RUST_LOG` or `RUST_BACKTRACE` takes precedence |
 | `--fresh-daemon` | Stop the existing development daemon, its sessions and background subagents after all three builds succeed, before launching |
 | `--log-file PATH` | Write UI tracing and panic output to `PATH` (relative to the calling directory); build diagnostics stay in the terminal |
+| `--daemon-log PATH` | Append the development daemon's tracing and panic output to `PATH` (relative to the calling directory), and imply `--debug`. A daemon is otherwise started with its output on `/dev/null`. It also works with `--instance`, and applies to the daemon the launch starts, so add `--fresh-daemon` to replace one that is already running |
 | `--instance NAME` | Run an isolated instance in a headless niri-harness session; see [Parallel instances](#parallel-instances) |
 | `--stop-instance NAME` | Stop that instance's daemon, its jobs and its harness session; keep its storage |
 | `--list-instances` | List the development daemons running on this computer, with checkout, age, instance, who started them, when they stop and how to stop them; see [Finding and stopping instances](#finding-and-stopping-instances) |
@@ -761,6 +762,44 @@ bounds that wait, and the wait for a slot there, as it does a wait here; on
 expiry the command exits 124 naming the cause. The build there has no
 timeout. Set `CAGENTS_BUILD_REMOTE=local` to build here.
 
+Each slot's build output is bounded by its lease. Cargo removes nothing, and
+every feature lane, profile and kind of target of the `cagents` crate keeps
+an incremental session of 1–6 GiB, so slots on fw16 grew to about 97 GiB
+each, 40–60 GiB of it incremental state. Once a lease holds a slot, and no
+earlier command of the slot's is still running, it keeps the incremental
+state of the crates the slot compiled most recently until they fill
+`CAGENTS_BUILD_REMOTE_INCREMENTAL_GIB` (default 20), the one that crosses it
+included, and moves the rest out of the target; with `0` it keeps none. Every
+6 hours it also moves out compiled units no build has looked at for 3 days,
+such as old versions after a dependency update. Cargo reads the fingerprint
+of every unit in a build's graph, even one it doesn't compile, so a unit is
+dated by its `.fingerprint/<package>-<hash>` directory and its outputs: a
+build dependency's rlib or a compiled build script is read only when it is
+rebuilt, so judged alone it would look unused in a lane that builds daily.
+A stale unit's fingerprint goes first, then its `deps/<crate>-<hash>` files
+and `build/<package>-<hash>` directory, so a unit moved out only in part is
+rebuilt. It skips this where the file system keeps no access times. Below twice the host's floor, the larger of
+`CAGENTS_BUILD_REMOTE_FREE_FLOOR_GIB` and the [guard's](#compilation-jobs-and-shared-build-directories)
+default, a slot keeps a quarter of the budget, its dependencies are looked
+through at once, and the lease does the same to every other slot no lease
+holds, under that slot's locks; it holds their lease locks shared, which no
+lease, admission or hold takes for a running build. A crate whose session a `rustc` holds stays,
+whatever started it. Each crate's state is moved out with one rename into the
+slot's `evicted` directory, which Cargo never reads, so a build never finds
+part of one; a process of its own then removes it at idle CPU and I/O
+priority, or, when a build waits for the space, at low priority beside any
+idle removal already under way. The next trim of the slot finishes a removal
+that was cut short. Rustc remakes an evicted session, so that crate's next build compiles
+it in full rather than incrementally; Cargo rebuilds a removed dependency.
+Incremental compilation stays on in every lane: on fw16, a one-line edit in
+the UI crate rebuilt in 19–31 s for `check`, 50–60 s for the `dev-runtime`
+build and 68–74 s for the library tests, against 54–79 s, 104–145 s and
+166–217 s with `CARGO_INCREMENTAL=0`.
+Measuring a full slot's sessions takes 1–2 seconds; a finalized session
+never changes, so each is measured once and recorded in the slot's
+`incremental-sizes`, and a lease measures only what the last build made. One
+that takes over 5 seconds says it is trimming the slot.
+
 A checkout's gate defers to the installed one, `/var/tmp/cagents-cargo-gate`
 (`CAGENTS_BUILD_INSTALLED_GATE`; empty disables this), when the installed
 `gate_version` is newer, so a worktree that has fallen behind `main` still
@@ -870,7 +909,7 @@ local build, removes them with `scripts/prune-build-dirs` in two ways:
 - **Running low.** When the file system has less than twice a floor free (5% of its size, at most 64 GiB), it starts the pruner in the background at once, and again each hour, at low rather than idle priority. Builds still don't wait. This run also removes, at once, the build directories of removed workspaces in the mirrored `/var/tmp/cargo-build` layout, and native-evidence builds unused for an hour; on the schedule they wait six and twelve hours.
 - **Below the floor.** The guard starts the same background run, unless one did within the hour. The build waits for the pruner, at most every ten minutes across the host, or for the run already pruning. After `CAGENTS_BUILD_PRUNE_BUDGET_SECONDS` (default 300) it starts no new search or removal, so the build waits about that long at most. If there is still too little room, the guard refuses the build and says why. With no pruner beside it and no `CAGENTS_BUILD_PRUNE`, it says it has nothing to reclaim with. A `CAGENTS_BUILD_PRUNE` command runs before the build whenever there is less than twice the floor free.
 
-The pruner searches the repository's main checkout first, then the mirrored `/var/tmp/cargo-build`, then `~/.cache`, `~/.local/state` and `/var/tmp`, six levels deep. `CAGENTS_BUILD_PRUNE_ROOTS` replaces the last three. `~` is the account's home from the password database, because a test fixture's builds run under a private `HOME` that holds none of the account's build output, and a search of only that would find nothing yet count as a complete run. When `HOME` differs, its `~/.cache` and `~/.local/state` are searched as well, for a user who keeps builds under a `HOME` of their own. `~/.local/share` and the offload slots are never touched under either. It skips a checkout's committed directories, which hold only sources.
+The pruner searches the repository's main checkout first, then the mirrored `/var/tmp/cargo-build`, then `~/.cache`, `~/.local/state` and `/var/tmp`, six levels deep. `CAGENTS_BUILD_PRUNE_ROOTS` replaces the last three. `~` is the account's home from the password database, because a test fixture's builds run under a private `HOME` that holds none of the account's build output, and a search of only that would find nothing yet count as a complete run. When `HOME` differs, its `~/.cache` and `~/.local/state` are searched as well, for a user who keeps builds under a `HOME` of their own. `~/.local/share` and the offload slots are never touched under either: their leases bound them, as [described above](#building-on-another-host), and before each of the guard's background runs and its run below the floor, `scripts/cargo-offload --trim-slots` beside it bounds the slots under the account's `~/.cache/cagents-offload` (`CAGENTS_BUILD_OFFLOAD_SLOTS`; empty for none) that no lease holds, under their leases' locks, as a lease would. A background run's account of it is in `/var/tmp/cagents-prune-build-dirs-UID.slots.log`. Below the floor the build waits for that trim and its removals beside the pruner, within the same budget. A `CAGENTS_BUILD_PRUNE` command replaces both. It skips a checkout's committed directories, which hold only sources.
 
 It recognizes build output by Cargo's own markers, not by name or place: a root `.rustc_info.json`, or a `CACHEDIR.TAG` beside a profile's `.fingerprint`. A [native-evidence](#native-evidence) task's `target-before` and `target-after`, beside the task's `.native-evidence` marker, are build output too. It removes a build directory only when all of these hold:
 
@@ -1633,6 +1672,124 @@ branch is built, and the script names it.
 
 Published releases still come from `scripts/build-release-linux`; see
 [Releasing](releasing.md).
+
+## Rehearsing an update
+
+`scripts/rehearse-update` runs installed archives in a disposable user environment.
+It measures what an update does to two windows, their saved panes, channels,
+agents, chats, terminals and a long-lived terminal child. It never builds or
+changes product code. Use a fresh, absent root outside a checkout, under
+`/var/tmp`, `/tmp` or `/dev/shm`, at most 40 bytes long, such as `/var/tmp/cr/u1`.
+`init` records its absolute path in `.rehearse-update`; `cleanup` requires that
+marker to match the root before removing it.
+
+Run from a genuine user shell. A hosted agent uses plain `ssh fw16`; never
+remove or forward `CAGENTS_AGENT_AUTHORITY`, `CAGENTS_AGENT_TOKEN` or
+`CAGENTS_SESSION_TOKEN` to bypass the harness's refusal. On fw16, fetch the
+branch and use your own worktree under the repository's `.worktrees/`.
+
+Each input directory must contain
+`cagents-VERSION-x86_64-unknown-linux-gnu.tar.gz` and `SHA256SUMS`. Supply the
+matching revision's `install.sh`, for example from `git show SHA:install.sh`.
+The archive bytes, rather than the harness checkout, select the tested code.
+
+```sh
+scripts/rehearse-update --root /var/tmp/cr/u1 run \
+  --old-dir /var/tmp/cagents-rehearsal/builds/0.1.3+local.991daa43e \
+  --old-version 0.1.3+local.991daa43e \
+  --old-installer /var/tmp/cagents-rehearsal/builds/0.1.3+local.991daa43e/install.sh \
+  --new-dir /var/tmp/cagents-rehearsal/builds/0.1.3+local.d25093651 \
+  --new-version 0.1.3+local.d25093651 \
+  --new-installer /var/tmp/cagents-rehearsal/builds/0.1.3+local.d25093651/install.sh \
+  --answer yes
+```
+
+The scenario installs OLD, starts a KWin virtual desktop with nested niri,
+opens the main and `second` windows, seeds offline work, records and captures
+both windows, stages NEW, and invokes the staged CLI's `daemon upgrade` on a
+controlling pseudo-terminal. `--answer` responds to each observed confirmation;
+`--yes` instead passes the updater's approval flag. Extra upgrade flags use
+`--upgrade-arg=--interrupt` or `--upgrade-arg=--accept-unreopenable`. The harness
+does not add either policy automatically. Refusals are measured outcomes: even
+a deliberately expected refusal, such as `--uncarryable`, reports `Outcome: FAIL`.
+
+Add `--ceditor /var/tmp/cagents-rehearsal/builds/ceditor-07e7efc/bin` to launch
+that build with its matched `cagents` and `cagentsd`, in the same private runtime.
+The scenario verifies its mapped window too. The default seed includes Claude
+chat and console agents, an offline Codex app-server, two untitled conversations
+in one project, a channel containing ` Details: `, a shell and `sleep 86400`.
+Use `--untitled 0|1|2`, `--no-codex` and `--no-child` to vary that baseline.
+
+Optional problem states each have their own switch:
+
+- `--no-init`: a Claude peer that accepts work without reporting a session ID.
+- `--exit-mid-turn`: a Claude peer that exits without a completion receipt.
+- `--ignore-term`: a terminal job that ignores SIGTERM.
+- `--uncarryable`: a live job plus OLD's `prepare-upgrade --yes
+  --no-relaunch-agents` probe. Local jobs normally carry, so this option
+  temporarily replaces the private holder registry directory with a file,
+  retaining the directory beside it. This makes preservation unavailable and
+  exercises the active-job refusal. `stop` restores the directory before
+  cleanup. If preparation unexpectedly succeeds, it can stop the private
+  daemon; the report identifies that outcome.
+- `--unreachable`: SIGSTOP the selected terminal's private holder.
+
+A seeded state does not guarantee a particular refusal on every revision.
+`seeds.json` preserves spawn results, OLD's actual inventories, verification
+failures and the preparation probe. Retained Claude actors can carry work
+without an exact resume ID on builds that support that protocol.
+
+The root owns HOME, XDG directories, XDG_RUNTIME_DIR, CLAUDE_CONFIG_DIR and
+CODEX_HOME. Fakes precede every real provider on PATH. This is environment and
+fixture isolation, not an OS network sandbox. The installed daemon and editor
+service use that private namespace. Terminals and holders deliberately register
+transient scopes with the real systemd user manager for update fidelity, just
+as the development runner does: `src/daemon/process_scope.rs` and
+`src/upgrade.rs` connect to the hard-coded `/run/user/UID/systemd/private`.
+Before killing private processes, `stop` attributes their cgroup scope names
+using their private HOME or XDG_RUNTIME_DIR. It then checks the real user
+manager's running scopes and fails if any attributed scope survives. It never
+stops a unit it did not attribute to this root.
+
+The desktop holds
+`/var/tmp/cagents-fw16-native.lock` (override with
+`CAGENTS_EVIDENCE_NATIVE_LOCK`), shared with native evidence work. `run` stops
+its desktop and all private processes on completion; keep manual sessions short.
+Do not run the harness inside `native-evidence`: both acquire the same native
+lock, so the inner invocation would wait on its caller.
+
+`report.txt` contains step durations, the complete update transcript, prompts,
+refusals, comparison changes and seed verification. `records/before/` and
+`records/after/` contain CLI envelopes and stable `snapshot.json` inventories,
+including read-only SQLite/WAL card and terminal recipe rows for each window.
+`shots/` contains a WebP for each mapped window before and after. A missing
+inventory is an evidence failure, not proof that no items existed. A nonzero
+exit means an update refusal, lost/changed state, or a harness/evidence failure;
+read the report to distinguish them. Healthy completion and chat resumption
+are listed as changes without being counted as losses.
+
+For a manual investigation, compose the same commands:
+
+```sh
+scripts/rehearse-update --root /var/tmp/cr/u1 status
+scripts/rehearse-update --root /var/tmp/cr/u1 compare before after
+# On a manually initialized/installed root:
+scripts/rehearse-update --root /var/tmp/cr/u2 desktop start --limit 300
+scripts/rehearse-update --root /var/tmp/cr/u2 launch main
+scripts/rehearse-update --root /var/tmp/cr/u2 launch second
+scripts/rehearse-update --root /var/tmp/cr/u2 seed --no-init
+scripts/rehearse-update --root /var/tmp/cr/u2 record before
+scripts/rehearse-update --root /var/tmp/cr/u2 drive --json observe --no-text
+scripts/rehearse-update --root /var/tmp/cr/u2 desktop stop
+scripts/rehearse-update --root /var/tmp/cr/u2 cleanup
+```
+
+`env CMD...` runs inside the private user; `app CMD...` also receives the nested
+display. `ceditor start BIN_DIR`, `record NAME`, `shot NAME` and `update DIR
+VERSION INSTALLER --answer yes` are available separately. `stop` retains evidence;
+`cleanup` stops everything and removes the marked root. Copy reports and images
+elsewhere before cleanup. Run the pure checks with
+`/usr/bin/python3 tests/rehearse_update.py`; no compositor or Rust build is needed.
 
 ## Troubleshooting
 

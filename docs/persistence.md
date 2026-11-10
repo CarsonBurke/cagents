@@ -475,9 +475,16 @@ stores, so an old copy can never feed a later upgrade or seed.
   backup is not a rollback: it discards every daemon write since, including
   native actor ownerships and retirements that running helpers depend on.
   Each schema stage therefore ships a converter back to the previous layout
-  (`cagentsd --downgrade-store <version>`), run by the installer's rollback
-  path before it starts the previous daemon, and tested in both directions on
-  a realistic store. The backup is kept only for manual recovery.
+  (`cagents daemon downgrade-store <version>`, which runs the matched
+  `cagentsd --downgrade-store`), run by the installer's rollback path before
+  it starts the previous daemon, and tested in both directions on a
+  realistic store. The backup is kept only for manual recovery.
+- A downgrade step must leave a store the older daemon can edit, not only
+  open. Restoring a table the newer schema dropped means restoring its
+  invariants too: the view writers of schemas 22 and 23 refuse any edit to a
+  view holding a pane without a `channel_work_placement_epochs` row, so a step
+  that brings back `channel_work` tables writes one epoch per pane and sets
+  the placement clock, as the channel-work migration does.
 - The wire changes (scope revisions on edits, `ReadWorkspaceView`, draft
   edits) bump `PROTOCOL_VERSION`. Window and daemon versions are a matched set,
   so the in-app update performs a full daemon upgrade, with its existing
@@ -541,7 +548,7 @@ measurement on a realistic-size workspace.
    state.
 3. Normalized daemon view schema (`view_scopes`, `view_revision_clock`,
    `panes`, `retired_panes`, `view_operations`), row-level edits, 7-day
-   operation retention, and `cagentsd --downgrade-store`, with which a failed
+   operation retention, and `cagents daemon downgrade-store`, with which a failed
    update converts the store back to the schema it recorded before the
    replacement daemon started; no wire change.
    Conversion keeps every pane a view holds open, in list order. A pane

@@ -53,6 +53,32 @@ pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
     create_chat: crate::chat::protocol::claude::create,
 };
 
+/// Whether Claude Code has a transcript for `id` in `cwd`, even one that
+/// [`transcript`] refuses, such as a symlink. Claude Code resumes from any
+/// file it finds there; with none, it has nothing to resume.
+#[cfg(feature = "host")]
+pub(crate) fn transcript_exists(config: &Path, cwd: &Path, id: &str) -> bool {
+    let Some(cwd) = cwd.to_str() else {
+        return false;
+    };
+    let sanitized: String = cwd
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let root = config.join("projects");
+    let filename = format!("{id}.jsonl");
+    if sanitized.len() <= 200 {
+        return std::fs::symlink_metadata(root.join(sanitized).join(filename)).is_ok();
+    }
+    let prefix = format!("{}-", &sanitized[..200]);
+    std::fs::read_dir(&root).is_ok_and(|entries| {
+        entries.filter_map(Result::ok).any(|entry| {
+            entry.file_name().to_string_lossy().starts_with(&prefix)
+                && std::fs::symlink_metadata(entry.path().join(&filename)).is_ok()
+        })
+    })
+}
+
 /// The transcript of conversation `id` that Claude Code keeps under `config`
 /// for a session started in `cwd`, which must already be canonical.
 ///

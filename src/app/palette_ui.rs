@@ -388,7 +388,7 @@ impl Cagents {
                 }
             }
             Action::Open => {
-                if self.shell_inputs_blocked() {
+                if self.workspace_inputs_blocked() {
                     return Task::none();
                 }
                 self.chrome_ui.close();
@@ -1777,7 +1777,7 @@ mod tests {
                 .map(cosmic::Action::App);
             let initial = focus_fixture_step(&app, &mut tree, &renderer, focus, true);
             assert!(initial.iter().any(|message| matches!(
-                message, Message::UtilityPaneUi(inner) if matches!(inner.as_ref(), Message::SettingsSearchChanged(value) if value == "x")
+                message, Message::SettingsSearchChanged(value) if value == "x"
             )));
 
             let open = app.update_palette(Action::Open);
@@ -1787,7 +1787,7 @@ mod tests {
             assert!(
                 !while_open
                     .iter()
-                    .any(|message| matches!(message, Message::UtilityPaneUi(inner) if matches!(inner.as_ref(), Message::SettingsSearchChanged(_))))
+                    .any(|message| matches!(message, Message::SettingsSearchChanged(_)))
             );
             assert!(
                 while_open
@@ -1799,7 +1799,7 @@ mod tests {
             assert!(!app.palette.is_open());
             let after = focus_fixture_step(&app, &mut tree, &renderer, dismiss, true);
             assert!(after.iter().any(|message| matches!(
-                message, Message::UtilityPaneUi(inner) if matches!(inner.as_ref(), Message::SettingsSearchChanged(value) if value == "x")
+                message, Message::SettingsSearchChanged(value) if value == "x"
             )));
         }
     }
@@ -1830,7 +1830,7 @@ mod tests {
         assert!(!app.palette.is_open());
         let after = focus_fixture_step(&app, &mut tree, &renderer, submit, true);
         assert!(after.iter().any(|message| matches!(
-            message, Message::UtilityPaneUi(inner) if matches!(inner.as_ref(), Message::SettingsSearchChanged(value) if value == "x")
+            message, Message::SettingsSearchChanged(value) if value == "x"
         )));
     }
 
@@ -1856,7 +1856,7 @@ mod tests {
         ));
         let after = focus_fixture_step(&app, &mut tree, &renderer, submit, true);
         assert!(after.iter().any(|message| matches!(
-            message, Message::UtilityPaneUi(inner) if matches!(inner.as_ref(), Message::SettingsSearchChanged(value) if value == "x")
+            message, Message::SettingsSearchChanged(value) if value == "x"
         )));
     }
 
@@ -1886,7 +1886,7 @@ mod tests {
             assert!(
                 !after
                     .iter()
-                    .any(|message| matches!(message, Message::UtilityPaneUi(inner) if matches!(inner.as_ref(), Message::SettingsSearchChanged(_))))
+                    .any(|message| matches!(message, Message::SettingsSearchChanged(_)))
             );
         }
     }
@@ -2878,51 +2878,6 @@ mod tests {
         drop(app.update_palette(Action::Query(">Next diagnostic".into())));
         drop(app.update(Message::Palette(Action::Submit)));
         assert!(!app.palette.is_open());
-        assert_eq!(
-            diagnostic_cursor(&app, card),
-            Some(crate::lsp::LspPosition::new(1, 0))
-        );
-    }
-
-    #[test]
-    fn main_work_hides_diagnostics_and_refuses_queued_rows_until_conversations_returns() {
-        let (mut app, card) = diagnostic_palette_fixture();
-        drop(app.update_palette(Action::Open));
-        drop(app.update_palette(Action::Query(">Next diagnostic".into())));
-        let queued = click_diagnostic_palette_row(&app, card, true);
-        drop(app.update_palette(Action::Close));
-        let channel = crate::model::ChannelId::new();
-        app.workspace_model.identity = uuid::Uuid::new_v4();
-        app.workspace_model
-            .channels
-            .push(crate::workspace_model::ModelChannel {
-                id: channel,
-                repository: "/repo".into(),
-                title: "Diagnostic fixture".into(),
-                title_source: Default::default(),
-                ordinal: 1,
-            });
-        drop(app.open_channel_work(channel));
-        assert!(app.channel_work_is_main());
-        drop(app.update_palette(Action::Open));
-        drop(app.update_palette(Action::Query(">diagnostic".into())));
-        assert!(app.palette_entries().is_empty());
-        assert_eq!(app.palette.selected, None);
-        drop(app.update(Message::Palette(Action::Submit)));
-        drop(app.update(queued));
-        assert!(app.channel_work_is_main());
-        assert_eq!(
-            diagnostic_cursor(&app, card),
-            Some(crate::lsp::LspPosition::new(0, 0))
-        );
-
-        let owner = app.channel_work.view.owner().unwrap();
-        drop(app.update_channel_work(crate::channel_work_ui::Action::Close(owner)));
-        assert!(!app.channel_work_is_main());
-        drop(app.update_palette(Action::Open));
-        drop(app.update_palette(Action::Query(">Next diagnostic".into())));
-        let message = click_diagnostic_palette_row(&app, card, true);
-        drop(app.update(message));
         assert_eq!(
             diagnostic_cursor(&app, card),
             Some(crate::lsp::LspPosition::new(1, 0))
