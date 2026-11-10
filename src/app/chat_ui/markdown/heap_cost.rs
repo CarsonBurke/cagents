@@ -36,7 +36,7 @@ fn parsed_prose_heap_cost() {
                 _ => None,
             })
             .fold((0, 0), |(count, capacity), text| {
-                (count + text.spans.len(), capacity + text.spans.capacity())
+                (count + text.spans.len(), capacity + text.spans.runs.len())
             });
         let publication = prose_document::Data::snapshot(&content);
         let both = crate::test_heap::live();
@@ -50,7 +50,7 @@ fn parsed_prose_heap_cost() {
             input.len(),
             std::mem::size_of::<Item>(),
             std::mem::size_of::<Text>(),
-            std::mem::size_of::<Span>(),
+            std::mem::size_of::<Run>(),
         );
         assert_eq!(remaining, 0, "the census retained part of {name}");
     }
