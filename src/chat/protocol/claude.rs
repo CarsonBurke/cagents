@@ -93,29 +93,48 @@ pub(crate) fn embedded_protocol_frame(line: &[u8]) -> bool {
 /// where it starts. Claude Code appends to a file a crash left mid-record,
 /// so the next record shares that record's line.
 fn trailing_record(line: &[u8]) -> Option<(usize, Value)> {
-    // Inspect a bounded number of objects, however many braces a line has.
-    const CANDIDATES: usize = 256;
     let end = line.len()
         - line
             .iter()
             .rev()
             .take_while(|byte| byte.is_ascii_whitespace())
             .count();
-    let mut start = 1;
-    for _ in 0..CANDIDATES {
-        let at = start
-            + line
-                .get(start..end)?
-                .iter()
-                .position(|byte| *byte == b'{')?;
-        let mut values = serde_json::Deserializer::from_slice(&line[at..end]).into_iter::<Value>();
-        match values.next() {
-            Some(Ok(value)) if at + values.byte_offset() == end => {
-                return (value.is_object() && value["type"].is_string()).then_some((at, value));
+    if line.get(end.checked_sub(1)?) != Some(&b'}') {
+        return None;
+    }
+    // A valid trailing object has balanced braces and quoted strings even
+    // when everything before it is damaged. Match its opening brace from the
+    // end, then parse that candidate once. No prefix can make us repeatedly
+    // parse the same large suffix.
+    let mut position = end;
+    let mut depth = 0usize;
+    let mut quoted = false;
+    while position > 0 {
+        position -= 1;
+        match line[position] {
+            b'"' => {
+                let mut escapes = position;
+                while escapes > 0 && line[escapes - 1] == b'\\' {
+                    escapes -= 1;
+                }
+                if (position - escapes) % 2 == 0 {
+                    quoted = !quoted;
+                }
+                // Count every escape run only once during the reverse scan.
+                position = escapes;
             }
-            // An object nested in the damaged record ends before the line.
-            Some(Ok(_)) => start = at + values.byte_offset(),
-            _ => start = at + 1,
+            b'}' if !quoted => depth += 1,
+            b'{' if !quoted => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    if position == 0 {
+                        return None;
+                    }
+                    let value: Value = serde_json::from_slice(&line[position..end]).ok()?;
+                    return value["type"].is_string().then_some((position, value));
+                }
+            }
+            _ => {}
         }
     }
     None
@@ -4396,6 +4415,13 @@ const UNRECORDED_BACKGROUND_RESULT: &str =
 /// for, each with how it ended. Only a notification that names its call and
 /// says how it ended settles one: a Monitor's event names neither.
 fn notified_calls(content: &str) -> Vec<(String, TaskOutcome)> {
+    notified_call_tasks(content)
+        .into_iter()
+        .map(|(tool, _, outcome)| (tool, outcome))
+        .collect()
+}
+
+fn notified_call_tasks(content: &str) -> Vec<(String, String, TaskOutcome)> {
     notification_elements(content)
         .into_iter()
         .filter_map(|inner| {
@@ -4403,7 +4429,11 @@ fn notified_calls(content: &str) -> Vec<(String, TaskOutcome)> {
             let tool = notification_field(head, "tool-use-id").filter(|tool| !tool.is_empty())?;
             let status = task_status(&notification_field(head, "status")?, false)?;
             let summary = notification_field(head, "summary").unwrap_or_default();
-            Some((tool, TaskOutcome::new(status, &summary)))
+            Some((
+                tool,
+                notification_field(head, "task-id").unwrap_or_default(),
+                TaskOutcome::new(status, &summary),
+            ))
         })
         .collect()
 }
@@ -5804,6 +5834,8 @@ struct History {
     subagent_dir: Option<PathBuf>,
     /// Each Agent tool call, with the order it was made in.
     agent_tools: HashMap<String, usize>,
+    /// Provider IDs for historical call occurrences that needed a scope.
+    agent_raw_tools: HashMap<String, String>,
     /// The agent ID Claude Code gave each background agent, which names its
     /// sidecar files.
     agent_ids: HashMap<String, String>,
@@ -5817,9 +5849,10 @@ struct History {
     /// each with a bounded summary, so that any page replayed later can tell
     /// a launch that was settled from one that never was.
     call_outcomes: HashMap<String, TaskOutcome>,
-    /// Result carriers' preceding call locations in the selected visible
-    /// chain. Offset metadata only; no input or patch bodies are retained.
-    result_calls: HashMap<u64, Vec<(usize, (u64, u64, usize, usize))>>,
+    /// Result carriers' ancestor calls across the visible branches. Offset
+    /// metadata only; no input or patch bodies are retained.
+    result_calls: history_branches::ResultCalls,
+    tool_identities: history_branches::ToolIdentities,
     /// Messages in this conversation that were skipped because they were
     /// damaged, such as cut short by a crash.
     damaged: usize,
@@ -6069,7 +6102,8 @@ struct HistoryNode {
     /// it. On resume Claude Code rewrites the messages a compaction kept
     /// with the summary as their parent; only this still leads to the turns
     /// before them.
-    first_parent: Option<String>,
+    // Outer None means no parent rewrite; Some(None) preserves a root.
+    first_parent: Option<Option<String>>,
     /// Where this record was first written; a rewrite moves `order`.
     first_order: usize,
     /// Where a compaction boundary leads back to. Compaction starts a new
@@ -6082,6 +6116,16 @@ struct HistoryNode {
     range: (u64, u64, usize),
     order: usize,
     tool_refs: Vec<(String, usize, bool)>,
+    agents: Vec<history_branches::AgentCall>,
+    result: history_branches::ResultDetails,
+}
+impl HistoryNode {
+    fn original_parent(&self) -> Option<&str> {
+        self.first_parent
+            .as_ref()
+            .unwrap_or(&self.parent)
+            .as_deref()
+    }
 }
 /// Claude Code records a manual compaction's summary before the `/compact`
 /// the user typed; the live stream shows the command first.
@@ -6219,15 +6263,7 @@ impl History {
         let mut parents = std::collections::HashSet::new();
         let mut message_offsets = HashMap::<String, usize>::new();
         let mut retracted = std::collections::HashSet::<String>::new();
-        let mut agent_tools = HashMap::new();
-        let mut agent_ids = HashMap::<String, String>::new();
-        let mut agent_names = HashMap::<String, String>::new();
-        let mut agent_status = HashMap::new();
-        let mut background_agent_tools = HashSet::new();
-        // Ended agents whose delayed launch acknowledgement, or refused result
-        // after a stop, would otherwise overwrite their terminal outcome.
-        let mut ended_agent_tools = HashMap::<String, ToolStatus>::new();
-        let mut call_outcomes = HashMap::<String, TaskOutcome>::new();
+        let mut task_notices = Vec::new();
         let mut main_message: Option<String> = None;
         let mut position = 0;
         let mut line = Vec::new();
@@ -6289,112 +6325,21 @@ impl History {
             if value["sessionId"].as_str().is_some_and(|value| value != id) {
                 return Err("Claude transcript contains another session identity".into());
             }
-            if let Some(blocks) = value["message"]["content"].as_array() {
-                for block in blocks {
-                    if string(&value, "type") == "assistant" {
-                        if string(block, "name") == "Agent"
-                            && let Some(tool_id) = block["id"].as_str()
-                        {
-                            let launched = agent_tools.len();
-                            agent_tools.entry(tool_id.to_owned()).or_insert(launched);
-                            let name = string(&block["input"], "name").trim();
-                            if !name.is_empty() {
-                                agent_names.insert(tool_id.to_owned(), name.to_owned());
-                            }
-                            if block["input"]["run_in_background"].as_bool() == Some(true) {
-                                background_agent_tools.insert(tool_id.to_owned());
-                            }
-                        }
-                    } else if string(block, "type") == "tool_result"
-                        && let Some(tool_id) = block["tool_use_id"].as_str()
-                        && agent_tools.contains_key(tool_id)
-                    {
-                        let launched = async_launch(&value);
-                        let ended = ended_agent_tools.get(tool_id).copied();
-                        if launched {
-                            if ended.is_none() {
-                                background_agent_tools.insert(tool_id.to_owned());
-                            }
-                            if let Some(agent) = value["toolUseResult"]["agentId"].as_str() {
-                                agent_ids.insert(tool_id.to_owned(), agent.to_owned());
-                            }
-                        }
-                        agent_status.insert(
-                            tool_id.to_owned(),
-                            if let Some(ended) =
-                                ended.filter(|ended| launched || *ended == ToolStatus::Stopped)
-                            {
-                                ended
-                            } else if block["is_error"].as_bool() == Some(true) {
-                                ToolStatus::Failed
-                            } else if background_agent_tools.contains(tool_id) {
-                                ToolStatus::Running
-                            } else {
-                                ToolStatus::Succeeded
-                            },
-                        );
-                    }
+            let main = value["isSidechain"].as_bool() != Some(true)
+                && value["teamName"].as_str().is_none_or(str::is_empty);
+            let task_notice = recorded_notification(&value).is_some()
+                || (string(&value, "type") == "system"
+                    && matches!(
+                        string(&value, "subtype"),
+                        "task_started" | "task_progress" | "task_notification" | "task_updated"
+                    ));
+            if main && task_notice {
+                if task_notices.len() >= 200_000 {
+                    return Err(
+                        "Claude transcript exceeds the task notification index limit".into(),
+                    );
                 }
-            }
-            if string(&value, "type") == "system"
-                && matches!(
-                    string(&value, "subtype"),
-                    "task_started" | "task_progress" | "task_notification" | "task_updated"
-                )
-                && let Some(tool_id) = value["tool_use_id"].as_str()
-                && agent_tools.contains_key(tool_id)
-            {
-                let patch = if value["patch"].is_object() {
-                    &value["patch"]
-                } else {
-                    &value
-                };
-                let status = task_status(
-                    string(patch, "status"),
-                    string(&value, "subtype") == "task_notification",
-                );
-                if string(&value, "subtype") == "task_started" {
-                    ended_agent_tools.remove(tool_id);
-                } else if let Some(status) = status
-                    && ended_agent_tools.get(tool_id) != Some(&ToolStatus::Stopped)
-                {
-                    ended_agent_tools.insert(tool_id.into(), status);
-                }
-                if background_agent_tools.contains(tool_id)
-                    || string(&value, "subtype") == "task_started"
-                {
-                    agent_status.insert(tool_id.into(), status.unwrap_or(ToolStatus::Running));
-                } else if status == Some(ToolStatus::Stopped) {
-                    if let Some(status) = agent_status.get_mut(tool_id) {
-                        *status = ToolStatus::Stopped;
-                    }
-                }
-            }
-            if let Some(content) = recorded_notification(&value) {
-                for (tool, outcome) in notified_calls(&content) {
-                    if agent_tools.contains_key(&tool) {
-                        continue;
-                    }
-                    call_outcomes.insert(tool, outcome.recorded());
-                }
-                for (tool, task, status) in notification_outcomes(&content) {
-                    // A resumed agent's notification names the `SendMessage`
-                    // call that resumed it rather than its own.
-                    let tool = if agent_tools.contains_key(&tool) {
-                        Some(tool)
-                    } else {
-                        agent_ids
-                            .iter()
-                            .find(|(_, agent)| **agent == task)
-                            .map(|(tool, _)| tool.clone())
-                    };
-                    if let Some(tool) = tool {
-                        if ended_agent_tools.get(&tool) != Some(&ToolStatus::Stopped) {
-                            ended_agent_tools.insert(tool.clone(), status);
-                        }
-                        agent_status.insert(tool, status);
-                    }
-                }
+                task_notices.push((record_offset, count as u64, 0));
             }
             for field in ["supersedes", "retracted_message_uuids"] {
                 if let Some(ids) = value[field].as_array() {
@@ -6413,13 +6358,21 @@ impl History {
             if nodes.len() >= 200_000 {
                 return Err("Claude transcript exceeds the history index limit".into());
             }
-            let parent = value["parentUuid"].as_str().map(str::to_owned);
+            let message = matches!(string(&value, "type"), "user" | "assistant");
+            // Legacy messages omitted parentUuid and followed file order.
+            // An explicit null is a branch root, never an omitted link. A
+            // rewritten legacy carrier keeps its already established parent.
+            let parent = match value.get("parentUuid") {
+                Some(parent) => parent.as_str().map(str::to_owned),
+                None if main && message => nodes.get(uuid).map_or_else(
+                    || main_message.clone().filter(|parent| parent != uuid),
+                    |node| node.parent.clone(),
+                ),
+                None => None,
+            };
             if let Some(parent) = &parent {
                 parents.insert(parent.clone());
             }
-            let message = matches!(string(&value, "type"), "user" | "assistant");
-            let main = value["isSidechain"].as_bool() != Some(true)
-                && value["teamName"].as_str().is_none_or(str::is_empty);
             // A manual compaction's output repeats the summary shown above it.
             let visible = message
                 && !model_only(&value)
@@ -6432,11 +6385,9 @@ impl History {
                 .as_ref()
                 .map_or(record_offset as usize, |node| node.first_order);
             let first_parent = previous.as_ref().and_then(|node| {
-                node.first_parent.clone().or_else(|| {
-                    node.parent
-                        .clone()
-                        .filter(|first| parent.as_ref() != Some(first))
-                })
+                node.first_parent
+                    .clone()
+                    .or_else(|| (node.parent != parent).then(|| node.parent.clone()))
             });
             let compaction = previous
                 .and_then(|node| node.compaction.take())
@@ -6483,6 +6434,8 @@ impl History {
             // references actually retained, not all prior serialized carriers.
             if let Some(previous) = nodes.get(uuid) {
                 tool_ref_count -= previous.tool_refs.len();
+                tool_ref_bytes -=
+                    history_branches::details_bytes(&previous.agents, &previous.result);
                 tool_ref_bytes -= previous
                     .tool_refs
                     .iter()
@@ -6490,12 +6443,17 @@ impl History {
                     .sum::<usize>();
             }
             let mut tool_refs = Vec::new();
-            if visible && let Some(blocks) = value["message"]["content"].as_array() {
+            if message
+                && main
+                && let Some(blocks) = value["message"]["content"].as_array()
+            {
                 for (index, block) in blocks.iter().enumerate() {
                     let result = string(block, "type") == "tool_result";
                     let tool = if result {
                         block["tool_use_id"].as_str()
-                    } else if matches!(string(block, "type"), "tool_use" | "server_tool_use") {
+                    } else if visible
+                        && matches!(string(block, "type"), "tool_use" | "server_tool_use")
+                    {
                         block["id"].as_str()
                     } else {
                         None
@@ -6513,6 +6471,19 @@ impl History {
                 }
             }
 
+            let (mut agents, result) = if message && main {
+                history_branches::details(&value)
+            } else {
+                Default::default()
+            };
+            if !visible {
+                agents.clear();
+            }
+            tool_ref_bytes =
+                tool_ref_bytes.saturating_add(history_branches::details_bytes(&agents, &result));
+            if tool_ref_bytes > tool_bytes_limit {
+                return Err("Claude transcript exceeds the tool correlation index limit".into());
+            }
             nodes.insert(
                 uuid.into(),
                 HistoryNode {
@@ -6527,12 +6498,17 @@ impl History {
                     range,
                     order,
                     tool_refs,
+                    agents,
+                    result,
                 },
             );
         }
         for id in retracted {
             if let Some(node) = nodes.get_mut(&id) {
                 node.visible = false;
+                node.tool_refs.clear();
+                node.agents.clear();
+                node.result = Default::default();
             }
         }
         let mut leaf: Option<&str> = None;
@@ -6589,7 +6565,7 @@ impl History {
         };
         let mut crossed = vec![false; skipped.len()];
         let mut chain = Vec::new();
-        let mut chain_tools = Vec::new();
+
         let mut seen = std::collections::HashSet::new();
         let mut compacted = false;
         let mut newer_record = None;
@@ -6618,9 +6594,7 @@ impl History {
                 };
                 let (offset, len, base) = node.range;
                 // Gaps hold no tools, so the tools list counts from its end.
-                let tools = chain_tools.len() - (chain.len() - position);
                 chain.insert(position, Link::Record(offset, len, base));
-                chain_tools.insert(tools, (node.range, &node.tool_refs));
                 newer_record = node.compact_record;
             }
             leaf = match node.parent.as_deref() {
@@ -6698,54 +6672,69 @@ impl History {
                             return None;
                         }
                         let node = nodes.get(previous)?;
-                        previous = node.first_parent.as_deref().or(node.parent.as_deref())?;
+                        previous = node.original_parent()?;
                     }
                     Some(previous)
                 }),
             };
         }
         chain.reverse();
-        chain_tools.reverse();
-        // A skipped message nothing went on from, such as the last one before
-        // a crash that Claude Code's next record replaced, is marked after
-        // the message it followed. One that followed a message on another
-        // branch is not part of this conversation.
+
+        // Keep each admitted skipped message at its own file position. Branch
+        // records may fall between skipped ancestors from the active chain.
         let mut marked = true;
         let mut unplaced = Gap::default();
-        for (record, _) in skipped
+        let mut gaps = Vec::new();
+        let mut parents = history_branches::Parents::new(&nodes, &skipped, &written);
+        for (record, crossed) in skipped
             .iter()
             .zip(&crossed)
-            .filter(|(record, crossed)| !**crossed && record.shown())
+            .filter(|(record, _)| record.shown())
         {
-            match &record.parent {
-                Some(Some(parent)) if !seen.contains(parent.as_str()) => continue,
-                Some(_) => {}
-                None => {
-                    marked = false;
-                    unplaced.add(record);
-                    continue;
+            if !crossed {
+                match &record.parent {
+                    Some(Some(parent)) if parents.resolve(parent, record.at).is_none() => continue,
+                    Some(_) => {}
+                    None => {
+                        marked = false;
+                        unplaced.add(record);
+                        continue;
+                    }
                 }
             }
-            let index = chain
-                .iter()
-                .position(
-                    |link| matches!(link, Link::Record(offset, ..) if *offset > record.at as u64),
-                )
-                .unwrap_or(chain.len());
-            match index
-                .checked_sub(1)
-                .and_then(|previous| chain.get_mut(previous))
-            {
-                Some(Link::Gap(gap)) => gap.add(record),
-                _ => {
-                    let mut gap = Gap {
-                        at: record.at as u64,
-                        ..Gap::default()
-                    };
-                    gap.add(record);
-                    chain.insert(index, Link::Gap(gap));
-                }
+            let mut gap = Gap {
+                at: record.at as u64,
+                ..Gap::default()
+            };
+            gap.add(record);
+            gaps.push(gap);
+        }
+        let history_branches::Index {
+            chain: records,
+            result_calls,
+            tool_identities,
+            ambiguous,
+        } = history_branches::index(&nodes, &seen, &mut parents)
+            .map_err(super::SetupError::Invalid)?;
+        gaps.sort_unstable_by_key(|gap| gap.at);
+        let mut gaps = gaps.into_iter().peekable();
+        let mut chain = Vec::with_capacity(records.len() + gaps.len());
+        let append_gap = |chain: &mut Vec<Link>, gap: Gap| {
+            if let Some(Link::Gap(previous)) = chain.last_mut() {
+                previous.damaged += gap.damaged;
+                previous.oversized += gap.oversized;
+            } else {
+                chain.push(Link::Gap(gap));
             }
+        };
+        for (offset, len, base) in records {
+            while gaps.peek().is_some_and(|gap| gap.at < offset) {
+                append_gap(&mut chain, gaps.next().unwrap());
+            }
+            chain.push(Link::Record(offset, len, base));
+        }
+        for gap in gaps {
+            append_gap(&mut chain, gap);
         }
         let (damaged, oversized) = chain
             .iter()
@@ -6757,40 +6746,28 @@ impl History {
             .fold((0, 0), |(damaged, oversized), gap| {
                 (damaged + gap.damaged, oversized + gap.oversized)
             });
-        let mut tool_calls = HashMap::new();
-        let mut result_calls = HashMap::<u64, Vec<(usize, (u64, u64, usize, usize))>>::new();
-        for (range, refs) in chain_tools {
-            for (id, index, result) in refs {
-                if *result {
-                    if let Some(call) = tool_calls.get(id).copied() {
-                        result_calls
-                            .entry(range.0)
-                            .or_default()
-                            .push((*index, call));
-                    }
-                } else {
-                    tool_calls.insert(id.clone(), (range.0, range.1, range.2, *index));
-                }
-            }
-        }
         let offset = chain.len();
-        Ok(Self {
+        let mut history = Self {
             file,
             chain,
             offset,
             session_id: id.into(),
             subagent_dir: None,
-            agent_tools,
-            agent_ids,
-            agent_names,
-            agent_status,
-            background_agent_tools,
-            call_outcomes,
+            agent_tools: HashMap::new(),
+            agent_raw_tools: HashMap::new(),
+            agent_ids: HashMap::new(),
+            agent_names: HashMap::new(),
+            agent_status: HashMap::new(),
+            background_agent_tools: HashSet::new(),
+            call_outcomes: HashMap::new(),
             result_calls,
+            tool_identities,
             damaged,
             oversized,
             marked,
-        })
+        };
+        history_branches::index_activity(&mut history, &nodes, &ambiguous, &task_notices)?;
+        Ok(history)
     }
     /// Settles each agent the transcript leaves running that the user stopped,
     /// which Claude Code records only in the agent's sidecar metadata.
@@ -6879,10 +6856,30 @@ impl History {
             let Some(meta) = sidecar_meta(&meta_path) else {
                 continue;
             };
-            let Some(parent) = meta["toolUseId"]
-                .as_str()
-                .filter(|id| self.agent_tools.contains_key(*id))
-            else {
+            let Some(raw_parent) = meta["toolUseId"].as_str() else {
+                continue;
+            };
+            let parent = if !self.agent_raw_tools.contains_key(raw_parent) {
+                self.agent_tools
+                    .get_key_value(raw_parent)
+                    .map(|(tool, _)| tool.as_str())
+            } else {
+                let mut scoped = self
+                    .agent_ids
+                    .iter()
+                    .filter(|(tool, agent)| {
+                        agent.as_str() == agent_id
+                            && self
+                                .agent_raw_tools
+                                .get(*tool)
+                                .map_or(tool.as_str(), String::as_str)
+                                == raw_parent
+                    })
+                    .map(|(tool, _)| tool.as_str());
+                let first = scoped.next();
+                if scoped.next().is_none() { first } else { None }
+            };
+            let Some(parent) = parent else {
                 continue;
             };
             let path = dir.join(format!("{stem}.jsonl"));
@@ -7138,6 +7135,7 @@ impl History {
                 call_blocks.insert((offset, index), std::sync::Arc::new(block));
             }
         }
+        let mut aliased_calls = HashMap::new();
         for offset in self.chain[start..self.offset]
             .iter()
             .filter_map(Link::offset)
@@ -7162,7 +7160,34 @@ impl History {
                             "Claude indexed tool result identity changed while reading".into(),
                         ));
                     }
+                    let context =
+                        if let Some(identity) = self.tool_identities.get(&(call, call_index)) {
+                            aliased_calls
+                                .entry((call, call_index))
+                                .or_insert_with(|| {
+                                    let mut block = (*context).clone();
+                                    block["id"] = json!(identity);
+                                    std::sync::Arc::new(block)
+                                })
+                                .clone()
+                        } else {
+                            context
+                        };
                     record.tool_calls.insert(result_index, context);
+                }
+            }
+        }
+        for (&offset, &position) in &positions {
+            if let Some(blocks) = result[position].frame["message"]["content"].as_array_mut() {
+                for (index, block) in blocks.iter_mut().enumerate() {
+                    if let Some(identity) = self.tool_identities.get(&(offset, index)) {
+                        let field = if string(block, "type") == "tool_result" {
+                            "tool_use_id"
+                        } else {
+                            "id"
+                        };
+                        block[field] = json!(identity);
+                    }
                 }
             }
         }
@@ -7441,6 +7466,7 @@ fn elicitation_value(schema: &Value, values: &[String]) -> Result<Value, String>
     Ok(value)
 }
 
+mod history_branches;
 #[cfg(test)]
 mod history_tests;
 mod streamed_input;
@@ -15520,6 +15546,525 @@ mod tests {
     }
 
     #[test]
+    fn history_rewritten_original_root_and_out_of_order_parent_remain_readable() {
+        let mut history = correlation_history(vec![
+            json!({"type":"user","uuid":"root","parentUuid":null,"message":{"content":"Root"}}),
+            json!({"type":"system","subtype":"compact_boundary","uuid":"compact","parentUuid":null,"logicalParentUuid":"root"}),
+            json!({"type":"user","uuid":"summary","parentUuid":"compact","isCompactSummary":true,"message":{"content":"Summary"}}),
+            json!({"type":"user","uuid":"root","parentUuid":"summary","message":{"content":"Root"}}),
+            json!({"type":"user","uuid":"next","parentUuid":"root","message":{"content":"Next"}}),
+        ]);
+        assert_eq!(
+            history
+                .page()
+                .unwrap()
+                .iter()
+                .map(|record| record["uuid"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["summary", "root", "next"]
+        );
+        let mut history = correlation_history(vec![
+            json!({"type":"user","uuid":"child","parentUuid":"later-parent","message":{"content":[correlation_result("out-of-order", false)]}}),
+            json!({"type":"assistant","uuid":"later-parent","parentUuid":null,"message":{"content":[correlation_call("out-of-order", "/project/out-of-order.rs")]}}),
+        ]);
+        let page = history.page().unwrap();
+        assert_eq!(
+            page[0].tool_calls[&0]["input"]["file_path"],
+            "/project/out-of-order.rs"
+        );
+    }
+
+    fn branch_notification(tool: &str, task: &str, status: &str) -> Value {
+        json!({"type":"user","origin":{"kind":"task-notification"},"message":{"content":format!("<task-notification><task-id>{task}</task-id><tool-use-id>{tool}</tool-use-id><status>{status}</status><summary>Task {status}</summary></task-notification>")}})
+    }
+
+    #[test]
+    fn history_off_chain_unique_background_and_agent_metadata_keep_their_ids() {
+        let history = correlation_history(vec![
+            json!({"type":"user","uuid":"root","message":{"content":"Root"}}),
+            json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"old-command","name":"Bash","input":{"command":"make","run_in_background":true}}]}}),
+            json!({"type":"user","toolUseResult":{"backgroundTaskId":"command-task"},"message":{"content":[{"type":"tool_result","tool_use_id":"old-command","content":"Running in background"}]}}),
+            json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"old-agent","name":"Agent","input":{"name":"Reviewer","run_in_background":true}}]}}),
+            json!({"type":"user","toolUseResult":{"status":"async_launched","agentId":"agent-old"},"message":{"content":[{"type":"tool_result","tool_use_id":"old-agent","content":"Launched"}]}}),
+            branch_notification("old-command", "command-task", "completed"),
+            branch_notification("old-agent", "agent-old", "killed"),
+            json!({"type":"user","parentUuid":"root","message":{"content":"Resumed branch"}}),
+        ]);
+        assert!(history.tool_identities.values().all(|id| id != "old-agent"));
+        assert_eq!(
+            history.call_outcomes["old-command"].status,
+            ToolStatus::Succeeded
+        );
+        assert_eq!(history.agent_ids["old-agent"], "agent-old");
+        assert_eq!(history.agent_status["old-agent"], ToolStatus::Stopped);
+        let mut adapter = Claude {
+            history: Some(history),
+            ..Claude::default()
+        };
+        let step = adapter.initialize().unwrap();
+        assert!(step.events.iter().any(|event| matches!(event, Event::Subagent { id, status:Some(ToolStatus::Stopped), .. } if id == "old-agent")));
+        assert!(step.events.iter().any(|event| matches!(event, Event::History { items, .. } if items.iter().any(|item| item.id == "old-command" && item.content.status() == Some(ToolStatus::Succeeded)))));
+    }
+
+    #[test]
+    fn history_reused_agent_ids_keep_outcomes_and_sidecars_with_their_occurrence() {
+        let mut frames = vec![json!({"type":"user","uuid":"root","message":{"content":"Root"}})];
+        for (branch, task, status) in [
+            ("earlier", "agentold", "completed"),
+            ("current", "agentnew", "killed"),
+        ] {
+            frames.extend([
+                json!({"type":"assistant","uuid":format!("{branch}-call"),"parentUuid":"root","message":{"content":[{"type":"tool_use","id":"reused-agent","name":"Agent","input":{"name":branch,"run_in_background":true}}]}}),
+                json!({"type":"user","toolUseResult":{"status":"async_launched","agentId":task},"message":{"content":[{"type":"tool_result","tool_use_id":"reused-agent","content":"Launched"}]}}),
+                branch_notification("reused-agent", task, status),
+            ]);
+        }
+        let mut history = correlation_history(frames);
+        assert_eq!(history.agent_tools.len(), 2);
+        let old = history
+            .agent_ids
+            .iter()
+            .find(|(_, agent)| agent.as_str() == "agentold")
+            .unwrap()
+            .0
+            .clone();
+        assert_ne!(old, "reused-agent");
+        assert_eq!(history.agent_status[&old], ToolStatus::Succeeded);
+        assert_eq!(history.agent_status["reused-agent"], ToolStatus::Stopped);
+        let directory = tempfile::tempdir().unwrap();
+        for agent in ["agentold", "agentnew"] {
+            std::fs::write(
+                directory.path().join(format!("agent-{agent}.meta.json")),
+                json!({"toolUseId":"reused-agent","agentType":"Explore"}).to_string(),
+            )
+            .unwrap();
+            std::fs::write(directory.path().join(format!("agent-{agent}.jsonl")), format!("{}\n", json!({"type":"assistant","uuid":format!("{agent}-answer"),"sessionId":history.session_id,"agentId":agent,"isSidechain":true,"message":{"content":"Child answer"}}))).unwrap();
+        }
+        history.subagent_dir = Some(directory.path().into());
+        let children = history.subagent_frames().unwrap();
+        assert!(
+            children
+                .iter()
+                .all(|(_, _, _, frames, _)| frames.len() == 1)
+        );
+        let parents = children
+            .into_iter()
+            .map(|(parent, ..)| parent)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            parents,
+            HashSet::from([old.clone(), "reused-agent".to_owned()])
+        );
+        let mut adapter = Claude {
+            history: Some(history),
+            ..Claude::default()
+        };
+        let rows = adapter
+            .initialize()
+            .unwrap()
+            .events
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::Subagent { id, .. } => Some(id),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(rows, HashSet::from([old, "reused-agent".to_owned()]));
+    }
+
+    #[test]
+    fn history_ambiguous_raw_task_notice_does_not_settle_sibling_agents() {
+        let mut history = correlation_history(vec![
+            json!({"type":"user","uuid":"root","message":{"content":"Root"}}),
+            json!({"type":"assistant","uuid":"old","message":{"content":[{"type":"tool_use","id":"shared-agent","name":"Agent","input":{"run_in_background":true}}]}}),
+            json!({"type":"user","toolUseResult":{"status":"async_launched","agentId":"old"},"message":{"content":[{"type":"tool_result","tool_use_id":"shared-agent","content":"Launched"}]}}),
+            json!({"type":"assistant","uuid":"new","parentUuid":"root","message":{"content":[{"type":"tool_use","id":"shared-agent","name":"Agent","input":{"run_in_background":true}}]}}),
+            json!({"type":"user","toolUseResult":{"status":"async_launched","agentId":"new"},"message":{"content":[{"type":"tool_result","tool_use_id":"shared-agent","content":"Launched"}]}}),
+            branch_notification("shared-agent", "", "completed"),
+        ]);
+        assert_eq!(history.agent_status.len(), 2);
+        assert!(
+            history
+                .agent_status
+                .values()
+                .all(|status| *status == ToolStatus::Running)
+        );
+        assert!(history.page().is_ok());
+    }
+
+    #[test]
+    fn history_preserves_manual_compaction_branch_after_earlier_boundary_is_rewritten() {
+        let automatic = json!({"type":"system","subtype":"compact_boundary","uuid":"automatic","parentUuid":null,"logicalParentUuid":"root"});
+        let summary = json!({"type":"user","uuid":"automatic-summary","parentUuid":"automatic","isCompactSummary":true,"message":{"content":"Automatic summary"}});
+        let mut frames = vec![
+            json!({"type":"user","uuid":"root","message":{"content":"Root"}}),
+            automatic.clone(),
+            summary.clone(),
+            json!({"type":"system","subtype":"compact_boundary","uuid":"manual","parentUuid":null,"logicalParentUuid":"automatic-summary"}),
+            json!({"type":"user","uuid":"manual-summary","parentUuid":"manual","isCompactSummary":true,"message":{"content":"Manual summary"}}),
+            json!({"type":"user","uuid":"manual-command","message":{"content":"<command-name>/compact</command-name><command-message>compact</command-message><command-args></command-args>"}}),
+        ];
+        for index in 0..12 {
+            frames.push(json!({"type":"user","uuid":format!("earlier-{index}"),"message":{"content":format!("Earlier prompt {index}")}}));
+        }
+        frames.extend([automatic, summary,
+            json!({"type":"user","uuid":"resumed","parentUuid":"automatic-summary","message":{"content":"Resumed prompt"}})]);
+        let mut history = correlation_history(frames);
+        let page = history.page().unwrap();
+        let ids = page
+            .iter()
+            .map(|record| record["uuid"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids.len(), 17);
+        assert_eq!(
+            ids.iter().filter(|id| **id == "automatic-summary").count(),
+            1
+        );
+        assert!(
+            ids.iter().position(|id| *id == "manual-command")
+                < ids.iter().position(|id| *id == "manual-summary")
+        );
+        for index in 0..12 {
+            assert!(ids.contains(&format!("earlier-{index}").as_str()));
+        }
+    }
+
+    #[test]
+    fn history_preserves_main_turns_beside_resumed_parent_chain() {
+        let mut history = correlation_history(vec![
+            json!({"type":"user","uuid":"root","message":{"content":"First prompt"}}),
+            json!({"type":"assistant","uuid":"earlier-answer","message":{"content":"Earlier answer"}}),
+            json!({"type":"user","uuid":"earlier-followup","message":{"content":"Do the next step"}}),
+            json!({"type":"assistant","uuid":"earlier-result","message":{"content":"Earlier result"}}),
+            json!({"type":"user","uuid":"resumed-prompt","parentUuid":"root","message":{"content":"Continued after resuming"}}),
+            json!({"type":"assistant","uuid":"resumed-answer","message":{"content":"Resumed answer"}}),
+            json!({"type":"assistant","uuid":"side","isSidechain":true,"message":{"content":"Private child"}}),
+            json!({"type":"assistant","uuid":"team","teamName":"reviewers","message":{"content":"Private teammate"}}),
+        ]);
+        let page = history.page().unwrap();
+        assert_eq!(
+            page.iter()
+                .map(|record| record["uuid"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "root",
+                "earlier-answer",
+                "earlier-followup",
+                "earlier-result",
+                "resumed-prompt",
+                "resumed-answer"
+            ]
+        );
+    }
+
+    #[test]
+    fn history_legacy_missing_parents_follow_main_messages_but_explicit_roots_do_not() {
+        for (explicit_root, rewind, matched) in [
+            (false, false, true),
+            (true, false, false),
+            (false, true, false),
+        ] {
+            let session = "00000000-0000-4000-8000-000000000001";
+            let mut file = tempfile::tempfile().unwrap();
+            let mut result = json!({"type":"user","uuid":"result","sessionId":session,"message":{"content":[correlation_result("call", false)]}});
+            if explicit_root {
+                result["parentUuid"] = Value::Null;
+            }
+            let mut frames = vec![
+                json!({"type":"assistant","uuid":"call","sessionId":session,"message":{"content":[correlation_call("call", "/project/main.rs")]}}),
+                json!({"type":"assistant","uuid":"private","isSidechain":true,"sessionId":session,"message":{"content":[correlation_call("call", "/project/private.rs")]}}),
+            ];
+            if rewind {
+                frames.push(json!({"type":"user","uuid":"rewind","parentUuid":null,"sessionId":session,"message":{"content":"New branch"}}));
+            }
+            frames.push(result);
+            for frame in frames {
+                writeln!(file, "{frame}").unwrap();
+            }
+            file.rewind().unwrap();
+            let mut history = History::index(file, session).unwrap();
+            assert_eq!(!history.result_calls.is_empty(), matched);
+            let page = history.page().unwrap();
+            assert_eq!(page.len(), if rewind { 3 } else { 2 });
+            assert_eq!(
+                page.last().unwrap()["message"]["content"][0]["tool_use_id"] == "call",
+                matched
+            );
+        }
+    }
+
+    #[test]
+    fn history_legacy_rewrites_keep_their_original_omitted_parent() {
+        let session = "00000000-0000-4000-8000-000000000001";
+        let mut file = tempfile::tempfile().unwrap();
+        let call = json!({"type":"assistant","uuid":"call","sessionId":session,"message":{"content":[correlation_call("call", "/project/main.rs")]}});
+        for frame in [
+            call.clone(),
+            json!({"type":"user","uuid":"branch","parentUuid":"call","sessionId":session,"message":{"content":"Continued"}}),
+            call,
+            json!({"type":"user","uuid":"result","sessionId":session,"message":{"content":[correlation_result("call",false)]}}),
+        ] {
+            writeln!(file, "{frame}").unwrap();
+        }
+        file.rewind().unwrap();
+        let mut history = History::index(file, session).unwrap();
+        assert_eq!(history.result_calls.len(), 1);
+        assert_eq!(history.page().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn history_model_only_result_can_settle_a_visible_agent_without_replaying_its_text() {
+        let mut notice = branch_notification("visible-agent", "agent-task", "completed");
+        notice["isMeta"] = json!(true);
+        let mut history = correlation_history(vec![
+            json!({"type":"assistant","uuid":"visible-call","message":{"content":[{"type":"tool_use","id":"visible-agent","name":"Agent","input":{"run_in_background":true}}]}}),
+            json!({"type":"user","uuid":"hidden-result","isMeta":true,"toolUseResult":{"status":"async_launched","agentId":"agent-task"},"message":{"content":[{"type":"tool_result","tool_use_id":"visible-agent","content":"Internal launch metadata"}]}}),
+            notice,
+        ]);
+        assert_eq!(history.agent_ids["visible-agent"], "agent-task");
+        assert_eq!(history.agent_status["visible-agent"], ToolStatus::Succeeded);
+        assert!(
+            history
+                .page()
+                .unwrap()
+                .iter()
+                .all(|record| record["uuid"] != "hidden-result")
+        );
+    }
+
+    #[test]
+    fn history_one_async_agent_result_with_narration_keeps_its_launch_identity() {
+        let history = correlation_history(vec![
+            json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"unasked-background","name":"Agent","input":{}}]}}),
+            json!({"type":"user","toolUseResult":{"status":"async_launched","agentId":"launched-agent"},"message":{"content":[{"type":"text","text":"The agent is working."},{"type":"tool_result","tool_use_id":"unasked-background","content":"Launched"}]}}),
+        ]);
+        assert_eq!(history.agent_ids["unasked-background"], "launched-agent");
+        assert_eq!(
+            history.agent_status["unasked-background"],
+            ToolStatus::Running
+        );
+        let mut adapter = Claude {
+            history: Some(history),
+            ..Claude::default()
+        };
+        assert!(adapter.initialize().unwrap().events.iter().any(|event| matches!(event, Event::Subagent { id, status:Some(ToolStatus::Running), .. } if id == "unasked-background")));
+    }
+
+    #[test]
+    fn history_many_agent_blocks_keep_order_and_metadata() {
+        let blocks = (0..4096).map(|index| json!({"type":"tool_use","id":format!("agent-{index}"),"name":"Agent","input":{"name":format!("Worker {index}"),"run_in_background":true}})).collect::<Vec<_>>();
+        let history = correlation_history(vec![
+            json!({"type":"assistant","uuid":"many-agents","message":{"content":blocks}}),
+        ]);
+        assert_eq!(history.agent_tools.len(), 4096);
+        assert_eq!(history.agent_tools["agent-4095"], 4095);
+        assert_eq!(history.agent_names["agent-4095"], "Worker 4095");
+    }
+
+    #[test]
+    fn history_reused_agent_multibody_results_do_not_claim_frame_metadata() {
+        let history = correlation_history(vec![
+            json!({"type":"user","uuid":"root","message":{"content":"Root"}}),
+            json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"shared-agent","name":"Agent","input":{"run_in_background":true}}]}}),
+            json!({"type":"user","toolUseResult":{"status":"async_launched","agentId":"old-agent"},"message":{"content":[{"type":"tool_result","tool_use_id":"shared-agent","content":"Launched"}]}}),
+            json!({"type":"assistant","parentUuid":"root","message":{"content":[{"type":"tool_use","id":"shared-agent","name":"Agent","input":{"run_in_background":true}}]}}),
+            json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"unrelated","name":"Agent","input":{"run_in_background":true}}]}}),
+            json!({"type":"user","toolUseResult":{"status":"async_launched","agentId":"unattributed-agent"},"message":{"content":[{"type":"tool_result","tool_use_id":"shared-agent","content":"Launched"},{"type":"tool_result","tool_use_id":"unrelated","content":"Launched"}]}}),
+            branch_notification("shared-agent", "unattributed-agent", "completed"),
+        ]);
+        assert!(
+            history
+                .agent_ids
+                .values()
+                .all(|agent| agent != "unattributed-agent")
+        );
+        assert_eq!(history.agent_status["shared-agent"], ToolStatus::Running);
+    }
+
+    #[test]
+    fn history_uuidless_task_notice_settles_its_reused_call_occurrence() {
+        let session = "00000000-0000-4000-8000-000000000001";
+        let mut file = tempfile::tempfile().unwrap();
+        for frame in [
+            json!({"type":"user","uuid":"root","parentUuid":null,"message":{"content":"Root"}}),
+            json!({"type":"assistant","uuid":"old-call","parentUuid":"root","message":{"content":[{"type":"tool_use","id":"shared-agent","name":"Agent","input":{"run_in_background":true}}]}}),
+            json!({"type":"user","uuid":"old-result","parentUuid":"old-call","toolUseResult":{"status":"async_launched","agentId":"old-agent"},"message":{"content":[{"type":"tool_result","tool_use_id":"shared-agent","content":"Launched"}]}}),
+            json!({"type":"assistant","uuid":"current-call","parentUuid":"root","message":{"content":[{"type":"tool_use","id":"shared-agent","name":"Agent","input":{"run_in_background":true}}]}}),
+            json!({"type":"user","uuid":"current-result","parentUuid":"current-call","toolUseResult":{"status":"async_launched","agentId":"current-agent"},"message":{"content":[{"type":"tool_result","tool_use_id":"shared-agent","content":"Launched"}]}}),
+            json!({"type":"system","subtype":"task_notification","tool_use_id":"shared-agent","task_id":"old-agent","status":"completed"}),
+        ] {
+            let mut frame = frame;
+            frame["sessionId"] = json!(session);
+            writeln!(file, "{frame}").unwrap();
+        }
+        file.rewind().unwrap();
+        let history = History::index(file, session).unwrap();
+        let old = history
+            .agent_ids
+            .iter()
+            .find(|(_, agent)| agent.as_str() == "old-agent")
+            .unwrap()
+            .0;
+        assert_eq!(history.agent_status[old], ToolStatus::Succeeded);
+        assert_eq!(history.agent_status["shared-agent"], ToolStatus::Running);
+    }
+
+    #[test]
+    fn history_excluded_agent_calls_cannot_reappear_through_metadata_or_sidecars() {
+        let mut frames = vec![json!({"type":"user","uuid":"root","message":{"content":"Root"}})];
+        for (id, flag) in [("meta", "isMeta"), ("side", "isSidechain")] {
+            let mut frame = json!({"type":"assistant","uuid":id,"parentUuid":"root","message":{"content":[{"type":"tool_use","id":id,"name":"Agent","input":{"run_in_background":true}}]}});
+            frame[flag] = json!(true);
+            frames.push(frame);
+        }
+        frames.extend([
+            json!({"type":"assistant","uuid":"team","parentUuid":"root","teamName":"private","message":{"content":[{"type":"tool_use","id":"team","name":"Agent","input":{}}]}}),
+            json!({"type":"assistant","uuid":"retracted","parentUuid":"root","message":{"content":[{"type":"tool_use","id":"retracted","name":"Agent","input":{}}]}}),
+            json!({"type":"user","parentUuid":"root","supersedes":["retracted"],"message":{"content":"Current prompt"}}),
+        ]);
+        let mut history = correlation_history(frames);
+        assert!(history.agent_tools.is_empty());
+        let directory = tempfile::tempdir().unwrap();
+        for agent in ["meta", "side", "team", "retracted"] {
+            std::fs::write(
+                directory.path().join(format!("agent-{agent}.meta.json")),
+                json!({"toolUseId":agent,"agentType":"Private"}).to_string(),
+            )
+            .unwrap();
+            std::fs::write(directory.path().join(format!("agent-{agent}.jsonl")), format!("{}\n",json!({"type":"assistant","uuid":format!("{agent}-answer"),"sessionId":history.session_id,"agentId":agent,"isSidechain":true,"message":{"content":"Private child answer"}}))).unwrap();
+        }
+        history.subagent_dir = Some(directory.path().into());
+        assert!(history.subagent_frames().unwrap().is_empty());
+        let mut adapter = Claude {
+            history: Some(history),
+            ..Claude::default()
+        };
+        assert!(
+            adapter
+                .initialize()
+                .unwrap()
+                .events
+                .iter()
+                .all(|event| !matches!(event, Event::Subagent { .. } | Event::SubagentItem { .. }))
+        );
+    }
+
+    #[test]
+    fn history_three_sibling_calls_with_one_raw_id_keep_distinct_items() {
+        let mut frames = vec![json!({"type":"user","uuid":"root","message":{"content":"Root"}})];
+        for (branch, failed) in [("first", false), ("second", false), ("current", false)] {
+            frames.extend([
+                json!({"type":"assistant","uuid":format!("{branch}-call"),"parentUuid":"root","message":{"content":[correlation_call("shared", &format!("/project/{branch}.rs"))]}}),
+                json!({"type":"user","message":{"content":[correlation_result("shared", failed)]}}),
+            ]);
+        }
+        let mut adapter = Claude {
+            history: Some(correlation_history(frames)),
+            ..Claude::default()
+        };
+        let step = adapter.initialize().unwrap();
+        let items = step
+            .events
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::History { items, .. } => Some(items),
+                _ => None,
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+        let tools = items
+            .iter()
+            .filter(|item| matches!(item.content, ItemContent::Changes { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(tools.len(), 3);
+        assert_eq!(
+            tools
+                .iter()
+                .map(|item| &item.id)
+                .collect::<HashSet<_>>()
+                .len(),
+            3
+        );
+        assert_eq!(
+            tools
+                .iter()
+                .filter(|item| item.content.status() == Some(ToolStatus::Succeeded))
+                .count(),
+            3
+        );
+        assert_eq!(
+            tools
+                .iter()
+                .filter(|item| item.content.status() == Some(ToolStatus::Failed))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn history_resume_branches_keep_tool_items_and_context_distinct_across_pages() {
+        let mut frames = vec![
+            json!({"type":"user","uuid":"root","message":{"content":"First prompt"}}),
+            json!({"type":"assistant","uuid":"earlier-call","message":{"content":[correlation_call("reused", "/project/earlier.rs")]}}),
+        ];
+        for index in 0..110 {
+            frames.push(json!({"type":"user","uuid":format!("earlier-prompt-{index}"),"message":{"content":format!("Earlier prompt {index}")}}));
+        }
+        frames.extend([
+            json!({"type":"user","uuid":"earlier-result","message":{"content":[correlation_result("reused", false)]}}),
+            json!({"type":"user","uuid":"resumed-prompt","parentUuid":"root","message":{"content":"Resumed prompt"}}),
+            json!({"type":"user","uuid":"unmatched-result","message":{"content":[correlation_result("reused", false)]}}),
+            json!({"type":"assistant","uuid":"current-call","message":{"content":[correlation_call("reused", "/project/current.rs")]}}),
+            json!({"type":"user","uuid":"current-result","message":{"content":[correlation_result("reused", false)]}}),
+        ]);
+        let mut adapter = Claude {
+            history: Some(correlation_history(frames)),
+            ..Claude::default()
+        };
+        let mut items = HashMap::new();
+        let mut pages = 0;
+        while adapter.history.as_ref().unwrap().offset > 0 {
+            let step = adapter.command(Command::LoadEarlier).unwrap();
+            pages += 1;
+            for event in step.events {
+                if let Event::History { items: page, .. } = event {
+                    for item in page {
+                        items.entry(item.id.clone()).or_insert(item);
+                    }
+                }
+            }
+        }
+        assert!(pages >= 2);
+        let paths = items
+            .values()
+            .filter_map(|item| match &item.content {
+                ItemContent::Changes {
+                    changes,
+                    status: ToolStatus::Succeeded,
+                } => Some(changes.iter().map(|change| change.path.clone())),
+                _ => None,
+            })
+            .flatten()
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            paths,
+            HashSet::from([
+                "/project/earlier.rs".to_owned(),
+                "/project/current.rs".to_owned()
+            ])
+        );
+        assert!(
+            matches!(&items["reused"].content, ItemContent::Changes { changes, .. } if changes[0].path == "/project/current.rs")
+        );
+        assert_eq!(items.values().filter(|item| matches!(&item.content, ItemContent::Tool { name, input, .. } if name == "Tool" && input.is_empty())).count(), 1,
+            "an unmatched sibling result must not inherit another branch's tool");
+        // Active-chain IDs still overlap the live provider's next observation.
+        let mut live = Step::default();
+        adapter.message(&json!({"type":"user","uuid":"live-result","message":{"content":[correlation_result("reused", false)]}}), &mut live).unwrap();
+        assert!(live.events.iter().any(|event| matches!(event, Event::Item(item) if item.id == "reused" && matches!(&item.content, ItemContent::Changes { changes, .. } if changes[0].path == "/project/current.rs"))));
+    }
+
+    #[test]
     fn history_reads_back_across_compaction_without_sidechain() {
         let id = "00000000-0000-4000-8000-000000000001";
         let mut file = tempfile::tempfile().unwrap();
@@ -16587,8 +17132,8 @@ mod tests {
         assert_eq!(shown(&history.page().unwrap()), ["u1", "a1", "1 cut", "a2"]);
     }
 
-    /// After a rewind, a skipped first prompt of the new branch leads back to
-    /// where the branch began, not to the abandoned branch written before it.
+    /// After a rewind, both branches remain visible and the skipped prompt
+    /// stays at its recorded position before the new branch's answer.
     #[test]
     fn a_skipped_record_after_a_rewind_follows_its_own_parent() {
         let mut history = index_lines(&[
@@ -16599,14 +17144,16 @@ mod tests {
             cut(&claude_line("u2b", Some("a1"), "user", "", "Instead")),
             claude_line("a3", Some("u2b"), "assistant", "", "New answer"),
         ]);
-        assert_eq!(shown(&history.page().unwrap()), ["u1", "a1", "1 cut", "a3"]);
+        assert_eq!(
+            shown(&history.page().unwrap()),
+            ["u1", "a1", "u2", "a2", "1 cut", "a3"]
+        );
         assert_eq!((history.damaged, history.oversized), (1, 0));
     }
 
     /// A crash cuts the record being written; on resume Claude Code goes on
     /// from the last one it could read. The lost message is marked where it
-    /// was, and a missing parent unrelated to any skipped record still ends
-    /// the conversation as it always has.
+    /// was, including when a later branch names an unknown parent.
     #[test]
     fn a_message_lost_in_a_crash_is_marked_where_it_was() {
         let mut history = index_lines(&[
@@ -16628,8 +17175,11 @@ mod tests {
             claude_line("u2b", Some("a1"), "user", "", "Asked again"),
             claude_line("a2", Some("never-written"), "assistant", "", "Reply"),
         ]);
-        assert_eq!(shown(&history.page().unwrap()), ["a2"]);
-        assert_eq!((history.damaged, history.oversized), (0, 0));
+        assert_eq!(
+            shown(&history.page().unwrap()),
+            ["u1", "a1", "1 cut", "u2b", "a2"]
+        );
+        assert_eq!((history.damaged, history.oversized), (1, 0));
     }
 
     #[test]
@@ -16650,6 +17200,22 @@ mod tests {
         let mut history = index_lines(&lines);
         assert_eq!(shown(&history.page().unwrap()), ["u1", "a1", "3 cut", "a2"]);
         assert!(history.marked);
+    }
+
+    #[test]
+    fn skipped_branch_ancestors_stay_on_each_side_of_interleaved_turns() {
+        let mut history = index_lines(&[
+            claude_line("root", None, "user", "", "Question"),
+            cut(&claude_line("lost1", Some("root"), "assistant", "", "Lost")),
+            claude_line("branch", Some("root"), "assistant", "", "Earlier branch"),
+            cut(&claude_line("lost2", Some("lost1"), "user", "", "Lost too")),
+            claude_line("reply", Some("lost2"), "assistant", "", "Reply"),
+        ]);
+        assert_eq!(
+            shown(&history.page().unwrap()),
+            ["root", "1 cut", "branch", "1 cut", "reply"]
+        );
+        assert_eq!((history.damaged, history.oversized), (2, 0));
     }
 
     /// Cut progress, system or subagent records lose nothing the reader
@@ -17427,7 +17993,7 @@ mod tests {
         );
     }
     #[test]
-    fn claude_history_context_excludes_abandoned_retracted_and_future_calls() {
+    fn claude_history_context_separates_branches_and_excludes_retracted_and_future_calls() {
         let frames = vec![
             json!({"type":"user","uuid":"root","parentUuid":null,"message":{"content":"root"}}),
             json!({"type":"assistant","uuid":"abandoned","parentUuid":"root","message":{"content":[correlation_call("reused","/wrong/abandoned.rs")]}}),
@@ -17440,10 +18006,7 @@ mod tests {
         ];
         let mut history = correlation_history(frames);
         let page = history.page().unwrap();
-        assert!(
-            page.iter()
-                .all(|record| record["uuid"] != "abandoned" && record["uuid"] != "retracted")
-        );
+        assert!(page.iter().all(|record| record["uuid"] != "retracted"));
         for record in &page {
             match record["uuid"].as_str().unwrap() {
                 "before-call" | "last" => assert!(record.tool_calls.is_empty()),
