@@ -541,7 +541,7 @@ mod tests {
 
     #[test]
     fn background_follower_delivers_two_hundred_requests_before_the_journal_expires() {
-        use cosmic::iced::futures::{FutureExt, StreamExt};
+        use cosmic::iced::futures::StreamExt;
         let mut monitor = Monitor::default();
         let repository = GitHubRepoKey::new("github.com", None, "owner", "repository").unwrap();
         drop(monitor.update(Action::Tick, [repository.clone()]));
@@ -566,11 +566,9 @@ mod tests {
         for _ in 0..3 {
             let mut stream = iced::runtime::task::into_stream(task)
                 .expect("a local continuation must drain the backlog now");
-            let action = stream
-                .next()
-                .now_or_never()
-                .expect("a local notification continuation must be immediately ready")
-                .unwrap();
+            // Iced yields once before every task, including Task::done. Drive
+            // that scheduler yield without waiting for a subscription timer.
+            let action = cosmic::iced::futures::executor::block_on(stream.next()).unwrap();
             let iced::runtime::Action::Output(action @ Action::Tick) = action else {
                 panic!("draining observations must not fetch GitHub");
             };
