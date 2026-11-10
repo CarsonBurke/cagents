@@ -49,7 +49,13 @@ pub(crate) fn process_owns_lock(
 /// the superblock device there, while stat reports the subvolume device.
 /// Disambiguate candidates with fdinfo and stat of the same descriptor.
 pub(crate) fn holder_pid(proc_root: &Path, expected: &fs::Metadata) -> io::Result<Option<u32>> {
-    let locks = fs::read_to_string(proc_root.join("locks"))?;
+    // This index is advisory contender discovery. Losing procfs visibility is
+    // not proof of an owner and must not abort a requested shutdown; flock on
+    // the caller's own validated file remains the authoritative reservation.
+    let locks = match fs::read_to_string(proc_root.join("locks")) {
+        Ok(locks) => locks,
+        Err(_) => return Ok(None),
+    };
     for pid in locks.lines().filter_map(|line| flock_owner(line, expected)) {
         let process = proc_root.join(pid.to_string());
         // Inode collisions can belong to another user's filesystem. Exclude
@@ -124,6 +130,16 @@ mod tests {
         symlink(lock.path(), process.join("fd/7")).unwrap();
         fs::write(process.join("fdinfo/7"), format!("lock: {record}")).unwrap();
         assert_eq!(holder_pid(root.path(), &expected).unwrap(), Some(PID));
+    }
+
+    #[test]
+    fn lease_handoff_missing_kernel_index_is_not_a_proven_owner() {
+        let root = tempfile::tempdir().unwrap();
+        let lock = tempfile::NamedTempFile::new().unwrap();
+        let expected = lock.as_file().metadata().unwrap();
+        assert_eq!(holder_pid(root.path(), &expected).unwrap(), None);
+        fs::create_dir(root.path().join("locks")).unwrap();
+        assert_eq!(holder_pid(root.path(), &expected).unwrap(), None);
     }
 
     #[test]
