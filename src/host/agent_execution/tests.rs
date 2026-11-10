@@ -2596,6 +2596,8 @@ fn updated_codex_agent_answers_through_its_relaunched_server() {
     const THREAD: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     let (host, mut request, path) = fixture();
     let root = path.parent().unwrap().to_owned();
+    let processes = root.join("upgrade-process-census");
+    std::fs::create_dir(&processes).unwrap();
     let program = root.join("bin/codex");
     std::fs::write(
         &program,
@@ -2722,6 +2724,24 @@ fn updated_codex_agent_answers_through_its_relaunched_server() {
     // The previous daemon prepares its checkpoint and stops; its successor
     // restores the checkpoint from the same registry.
     let update = |host: SharedHost, incarnation: &str| {
+        let providers = host
+            .lock()
+            .unwrap()
+            .chats
+            .values()
+            .map(|record| record.handle.clone())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| {
+                let process = handle.provider_process().expect("owned Codex server");
+                assert!(
+                    process.is_current(),
+                    "the fixture server must still be live"
+                );
+                (handle, process)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(providers.len(), 1);
         let control_gate = host.lock().unwrap().control_gate.clone();
         let control = control_gate.write().unwrap();
         let capability = host
@@ -2737,6 +2757,16 @@ fn updated_codex_agent_answers_through_its_relaunched_server() {
         for terminal in shutdown {
             let _ = terminal.shutdown();
         }
+        // This test exercises server relaunch and answer continuity. Prove
+        // its actual provider stopped before using the controlled census;
+        // unrelated desktop processes cannot affect that fixture evidence.
+        for (handle, process) in providers {
+            assert!(handle.is_completed(), "the provider teardown must complete");
+            assert!(
+                process.reaped(),
+                "owned Codex server was not reaped: {process:?}"
+            );
+        }
         drop(host);
         let proof = HostSessionProof {
             host_session_id: HostSessionId::new(format!("{incarnation}-execution-fixture")),
@@ -2747,7 +2777,7 @@ fn updated_codex_agent_answers_through_its_relaunched_server() {
         state.install_model(Registry::at(&path).unwrap());
         let successor = Arc::new(crate::host::state::HostLock::new(state));
         assert!(
-            crate::host::state::restore_upgrade(&successor)
+            crate::host::state::restore_upgrade_with_process_fixture(&successor, &processes)
                 .unwrap()
                 .is_empty()
         );
