@@ -801,6 +801,10 @@ pub(super) struct State {
     /// draft. If that window's start fails, the shared pane goes back to the
     /// same conversation as a draft, and so does this card.
     peer_started: HashMap<CardId, TerminalId>,
+    /// Drafts another window started, whose cards are attaching to that
+    /// conversation. Their carried-over unsent text may repeat its first
+    /// message, which is checked once the transcript shows it.
+    started_elsewhere: HashSet<CardId>,
     /// Automatically opened placeholders, discarded when their scope is left
     /// until the reader puts work into them or starts their conversation.
     default_chats: HashSet<CardId>,
@@ -838,6 +842,7 @@ impl Default for State {
             drafts: HashMap::new(),
             draft_attachments: HashMap::new(),
             peer_started: HashMap::new(),
+            started_elsewhere: HashSet::new(),
             default_chats: HashSet::new(),
             parked: HashMap::new(),
             fresh_offers: HashSet::new(),
@@ -2454,6 +2459,10 @@ pub(super) struct Runtime {
     image_pastes_saving: usize,
     submit_after_paste: Option<PromptMode>,
     attachment_chooser_pending: Option<uuid::Uuid>,
+    /// The composer revision at which unsent text carried over from a draft
+    /// another window started may still repeat that window's first message.
+    /// Cleared once the transcript settles it, or the reader edits the text.
+    first_message_echo: Option<u64>,
     expanded: HashSet<String>,
     child_expanded: HashMap<String, HashSet<String>>,
     child_unfolded: HashMap<String, HashSet<String>>,
@@ -3238,6 +3247,51 @@ impl Runtime {
             .unwrap_or(&self.attachments)
     }
 
+    /// Checks carried-over unsent text against the first message of the
+    /// conversation another window started from this draft, once the
+    /// transcript shows it.
+    fn await_first_message_echo(&mut self) {
+        self.first_message_echo = Some(self.revision);
+        self.settle_first_message_echo();
+    }
+
+    /// Drops the composer text if it is exactly the conversation's first
+    /// message, which the window that started it already sent, so it is not
+    /// offered again. Any other text is the reader's own and stays.
+    fn settle_first_message_echo(&mut self) {
+        let Some(revision) = self.first_message_echo else {
+            return;
+        };
+        if revision != self.revision || !self.attachments.is_empty() {
+            // Edited since, or more than the text: no longer a copy.
+            self.first_message_echo = None;
+            return;
+        }
+        if self.snapshot.history_loading || !self.visible.load(Ordering::Relaxed) {
+            return;
+        }
+        let first = self
+            .snapshot
+            .items
+            .iter()
+            .find_map(|item| match &item.content {
+                chat::ItemContent::Text { text, .. } if item.role == chat::Role::User => Some(text),
+                _ => None,
+            });
+        let Some(first) = first else {
+            if self.snapshot.has_earlier {
+                // The first message is not in view, so nothing can be shown
+                // to repeat it.
+                self.first_message_echo = None;
+            }
+            return;
+        };
+        self.first_message_echo = None;
+        if !self.snapshot.has_earlier && self.composer.text().trim() == first.trim() {
+            self.replace_draft(text_editor::Content::new());
+        }
+    }
+
     /// A first prompt is still local work until the provider accepts it.
     /// Keep that source and any later composer edits together as an inert
     /// recovery draft; restoring it never automatically submits either part.
@@ -3414,6 +3468,7 @@ impl Runtime {
             image_pastes_saving: 0,
             submit_after_paste: None,
             attachment_chooser_pending: None,
+            first_message_echo: None,
             expanded: HashSet::new(),
             child_expanded: HashMap::new(),
             child_unfolded: HashMap::new(),
@@ -4595,6 +4650,11 @@ impl Runtime {
     fn refresh(&mut self) {
         self.prepare_local_prompt();
         self.refresh_session();
+        self.refresh_snapshot();
+        self.settle_first_message_echo();
+    }
+
+    fn refresh_snapshot(&mut self) {
         if !self.visible.load(Ordering::Relaxed) {
             if let Some((snapshot, clock)) = self
                 .handle()
@@ -6979,8 +7039,9 @@ impl Cagents {
         self.load_draft_skills(target)
     }
 
-    /// Takes the draft out of `card` when another window has started the very
-    /// conversation it shows, so the card can attach to it.
+    /// Takes the draft out of `card` when another window has started the
+    /// conversation it shows, under the draft's identity or the new one a
+    /// first send saves, so the card can attach to it.
     ///
     /// The draft runtime cannot attach in place: its start attempt would be
     /// taken for this window's own first send, and a failure would retire the
@@ -7001,7 +7062,6 @@ impl Cagents {
             Some(CardRuntime::Chat(runtime))
                 if runtime.is_draft()
                     && runtime.session.is_unstarted()
-                    && runtime.session.id == session.id
                     && runtime.attachment_chooser_pending.is_none()
                     && runtime.pastes_pending == 0
         );
@@ -7012,7 +7072,7 @@ impl Cagents {
         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) {
             runtime.unqueue();
         }
-        self.stash_unsent_chat(card);
+        self.carry_unsent_chat(card, true);
         self.cards.remove(&card);
         self.lifecycle.remove(card);
         self.shared_views.attached.insert(card);
@@ -7037,7 +7097,7 @@ impl Cagents {
         }
         self.chat_ui.peer_started.remove(&card);
         self.chat_ui.phases.remove(&card);
-        self.stash_unsent_chat(card);
+        self.carry_unsent_chat(card, false);
         self.cards.remove(&card);
         self.lifecycle.remove(card);
         self.resolve_notice(NoticeKey::ChatAttach(card));
@@ -7047,6 +7107,26 @@ impl Cagents {
 
     pub(super) fn forget_peer_started(&mut self, card: CardId) {
         self.chat_ui.peer_started.remove(&card);
+    }
+
+    /// Whether draft `card` is choosing or loading files, whose result its
+    /// draft runtime has to receive before the card can follow a
+    /// conversation another window started from it.
+    pub(super) fn chat_draft_inserting(&self, card: CardId) -> bool {
+        !self.chat_start_pending(card)
+            && matches!(self.cards.get(&card), Some(CardRuntime::Chat(runtime))
+                if runtime.is_draft()
+                    && runtime.session.is_unstarted()
+                    && (runtime.attachment_chooser_pending.is_some() || runtime.pastes_pending != 0))
+    }
+
+    /// The conversation this window's own first send from draft `card` has
+    /// already queued for storage, while that send is still saving.
+    pub(super) fn draft_start_candidate(&self, card: CardId) -> Option<&chat::Session> {
+        self.chat_ui
+            .draft_checkpoints
+            .get(&card)
+            .map(|pending| &pending.candidate)
     }
 
     pub(in crate::app) fn chat_is_draft(&self, card: CardId) -> bool {
@@ -7821,7 +7901,9 @@ impl Cagents {
     }
 
     /// Gives a new runtime for `card` the draft saved when its last one
-    /// left: the text and every attachment, files as well as images.
+    /// left: the text and every attachment, files as well as images. Text
+    /// carried from a draft another window started is checked against that
+    /// conversation's first message, once.
     pub(super) fn restore_saved_draft(&mut self, card: CardId, runtime: &mut Runtime) {
         if let Some(draft) = self.chat_ui.drafts.remove(&card)
             && !draft.is_empty()
@@ -7830,6 +7912,9 @@ impl Cagents {
         }
         if let Some(attachments) = self.chat_ui.draft_attachments.remove(&card) {
             runtime.replace_attachments(attachments);
+        }
+        if self.chat_ui.started_elsewhere.remove(&card) {
+            runtime.await_first_message_echo();
         }
     }
 
@@ -7923,6 +8008,19 @@ impl Cagents {
         self.observe_agent_activity_for_card(card, None);
     }
 
+    /// Keeps what the reader is composing in draft `card`, whose conversation
+    /// another window replaced, for the composer that opens in its place, and
+    /// whether its text may only repeat the first message of a conversation
+    /// started from it.
+    pub(super) fn carry_unsent_chat(&mut self, card: CardId, started: bool) {
+        self.stash_unsent_chat(card);
+        if started && self.chat_is_draft(card) {
+            self.chat_ui.started_elsewhere.insert(card);
+        } else {
+            self.chat_ui.started_elsewhere.remove(&card);
+        }
+    }
+
     /// Captures the unsent text and attachments of `card`'s chat runtime, which is
     /// about to be dropped while the card lives on, so whatever runtime the
     /// card builds next opens with them rather than losing them.
@@ -7971,6 +8069,7 @@ impl Cagents {
             return;
         }
         let snapshot = self.persistent_workspace();
+        self.record_shared_chat_identities();
         if let Some(writer) = self.session.as_ref() {
             writer.replace_chat_identity(card, pending.candidate.id, current, snapshot);
         }
@@ -8001,6 +8100,7 @@ impl Cagents {
         self.chat_forget(card);
         self.chat_ui.drafts.remove(&card);
         self.chat_ui.draft_attachments.remove(&card);
+        self.chat_ui.started_elsewhere.remove(&card);
         self.chat_ui.parked.remove(&card);
         self.chat_ui.fresh_offers.remove(&card);
         self.chat_ui.removed_accounts.remove(&card);
@@ -9059,6 +9159,7 @@ impl Cagents {
         // The composer and public source are still A. The snapshot projection
         // contains the exact candidate B and the still-editable text/images.
         let snapshot = self.persistent_workspace();
+        self.record_shared_chat_identities();
         let writer = self.session.as_ref().expect("writer was checked above");
         // Exact replacement equality is idempotent when B already landed;
         // otherwise the original A identity must still match. This explicit
