@@ -415,16 +415,55 @@ fn committed_upgrade_shutdown_preserves_real_native_owner_even_if_final_save_fai
                     .is_none(),
                 "old-alias retry must retire the exact current adopted authority too"
             );
-            let mut unrelated = source;
+            let current_proof = restarted.lock().unwrap().proof().clone();
+            let (closed_owner, paired_closed) =
+                crate::chat::native_holder::closed_source(&source, &current_proof)
+                    .unwrap()
+                    .expect("the original issued source keeps its exact close receipt");
+            assert!(paired_closed);
+            let receipt_path = registry::directory(Kind::Native).unwrap().join(format!(
+                "{}-{}-{}.closed",
+                closed_owner.terminal, closed_owner.holder.pid, closed_owner.holder.start
+            ));
+            let receipt_bytes = fs::read(&receipt_path).unwrap();
+            let mut unrelated = source.clone();
             unrelated.launch.session_id = Some("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".into());
             assert!(
+                crate::chat::native_holder::closed_source(&unrelated, &current_proof)
+                    .unwrap()
+                    .is_none(),
+                "the existing receipt must not recognize a changed conversation digest"
+            );
+            assert_eq!(fs::read(&receipt_path).unwrap(), receipt_bytes);
+            // A mismatched receipt is not cleanup authority. This allocation
+            // has independently ended, so its Close may still settle under
+            // the lost-owner policy without borrowing that receipt's digest.
+            let owners = execution.lock().unwrap().native_actor_owners_of(id);
+            assert!(matches!(
+                super::super::upgrade_inspect::execution_end(
+                    &unrelated,
+                    &current_proof.boot_id,
+                    owners
+                ),
+                super::super::upgrade_inspect::ExecutionEnd::Ended
+            ));
+            assert!(matches!(
                 super::super::client::process_request(
                     &restarted,
                     0,
                     crate::terminal::ipc::ClientRequest::ChatCloseRetained { session: unrelated }
                 )
-                .is_err(),
-                "a close receipt must not authorize a changed conversation"
+                .unwrap()
+                .0,
+                crate::terminal::ipc::ServerResponse::Accepted
+            ));
+            // Other independently justified receipts may be published; keep
+            // this original receipt and its issued-source recognition intact.
+            assert_eq!(fs::read(&receipt_path).unwrap(), receipt_bytes);
+            assert!(
+                crate::chat::native_holder::closed_source(&source, &current_proof)
+                    .unwrap()
+                    .is_some()
             );
         } else {
             // Model the already-published failed local adapter from an older
