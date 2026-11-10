@@ -409,9 +409,13 @@ pub(crate) fn is_qualified_source(protocol: u16) -> bool {
 }
 
 pub(super) fn unsupported_source(protocol: u16) -> UpdateError {
+    if protocol > crate::terminal_ipc::PROTOCOL_VERSION {
+        return invalid(format!(
+            "The running cagents service is newer than this build (protocol {protocol}). Install the newer build instead."
+        ));
+    }
     invalid(format!(
-        "The source daemon (protocol version {protocol}) is too old for this build to update. \
-         Update it to an intermediate build first."
+        "The running cagents service uses protocol {protocol}. Update it to a build serving protocol 156 (such as 0.1.3+local.991daa43e) first."
     ))
 }
 
@@ -495,4 +499,33 @@ fn absent_source(expected: Option<&HostSessionProof>) -> Result<(), UpdateError>
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod admission_message_tests {
+    use super::*;
+
+    #[test]
+    fn newer_service_requires_the_newer_build() {
+        let protocol = crate::terminal_ipc::PROTOCOL_VERSION + 1;
+        assert_eq!(
+            unsupported_source(protocol).to_string(),
+            format!(
+                "The running cagents service is newer than this build (protocol {protocol}). Install the newer build instead."
+            )
+        );
+    }
+
+    #[test]
+    fn older_and_between_supported_protocols_name_the_exact_intermediate_build() {
+        for protocol in [119, 56] {
+            assert!(!is_qualified_source(protocol));
+            assert_eq!(
+                unsupported_source(protocol).to_string(),
+                format!(
+                    "The running cagents service uses protocol {protocol}. Update it to a build serving protocol 156 (such as 0.1.3+local.991daa43e) first."
+                )
+            );
+        }
+    }
 }

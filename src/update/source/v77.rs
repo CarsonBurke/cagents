@@ -839,7 +839,7 @@ mod tests {
         let current = layout("new");
         let previous = layout("old");
         assert_eq!(
-            super::super::super::installed_update_worker(
+            super::super::super::installed_candidate_version(
                 &current,
                 &current.version_root,
                 Some(&previous),
@@ -1058,7 +1058,7 @@ mod tests {
         let current = layout("new");
         let previous = layout("old");
         assert_eq!(
-            super::super::super::installed_update_worker(
+            super::super::super::installed_candidate_version(
                 &current,
                 &current.version_root,
                 Some(&previous),
