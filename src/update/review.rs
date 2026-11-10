@@ -255,9 +255,6 @@ pub fn render_review(preview: &Preview) -> String {
     if let Some(daemon) = &preview.daemon {
         notices.extend(daemon.blockers.iter().cloned());
     }
-    for version in &preview.labels.details.editor_companions {
-        notices.push(format!("Ceditor is using an older cagents ({version}). It keeps working; its agent features reconnect after Ceditor updates."));
-    }
     if !groups.is_empty() || !notices.is_empty() {
         output.push('\n');
     }
@@ -478,11 +475,6 @@ mod tests {
             recovery: "Its saved file stays as it is".into(),
         });
         preview
-            .labels
-            .details
-            .editor_companions
-            .push("0.1.3+local.07e7efc5".into());
-        preview
     }
 
     #[test]
@@ -509,7 +501,6 @@ mod tests {
             "{review}"
         );
         assert!(review.contains("  A saved window (window-3.sqlite) could not be read; it may not reopen. Its saved file stays as it is\n"), "{review}");
-        assert!(review.contains("  Ceditor is using an older cagents (0.1.3+local.07e7efc5). It keeps working; its agent features reconnect after Ceditor updates.\n"), "{review}");
         assert_eq!(
             review
                 .matches("    Untitled conversation in alpha, started ")

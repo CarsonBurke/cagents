@@ -61,9 +61,6 @@ pub struct ReviewDetails {
     pub panes: BTreeMap<TerminalId, InspectedPane>,
     #[serde(default)]
     pub notices: Vec<String>,
-    /// Versions belong to the matched cagents companions, not the editor.
-    #[serde(default)]
-    pub editor_companions: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

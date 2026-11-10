@@ -2,7 +2,6 @@
 //! never writes installation state. The detached worker alone may run an installer.
 mod candidate;
 mod confirmation;
-mod editor_review;
 mod installed;
 pub(crate) mod source;
 pub use confirmation::{Choice as UpdateChoice, Confirmation as UpdateConfirmation, decide};
@@ -1186,7 +1185,6 @@ fn perform_update(
 }
 
 struct ReviewContext {
-    details: source_inspection::ReviewDetails,
     from_version: String,
     windows: usize,
 }
@@ -1205,19 +1203,12 @@ impl ReviewContext {
             })
             .unwrap_or_else(|| installation.version.clone());
         Ok(Self {
-            details: editor_review::capture(),
             from_version,
             windows: windows.len(),
         })
     }
 
     fn apply(&self, mut preview: impact::Preview) -> impact::Preview {
-        preview.labels.details.editor_companions = self.details.editor_companions.clone();
-        preview
-            .labels
-            .details
-            .notices
-            .extend(self.details.notices.iter().cloned());
         preview.from_version = self.from_version.clone();
         preview.windows = self.windows;
         preview
