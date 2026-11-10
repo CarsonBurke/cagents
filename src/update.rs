@@ -653,6 +653,7 @@ fn drive_terminal_review_with(
     let mut submitted = std::collections::BTreeSet::new();
     let mut waiting = None;
     let mut policy_requested = None;
+    let mut reviewed = None;
     let deadline = Instant::now() + Duration::from_secs(45 * 60);
     let mut finishing_message_shown = false;
     loop {
@@ -789,7 +790,15 @@ fn drive_terminal_review_with(
                     submitted.insert(confirmation.nonce.clone());
                     continue;
                 }
-                write!(terminal, "{}", render_review(&confirmation.preview))?;
+                write!(
+                    terminal,
+                    "{}",
+                    match &reviewed {
+                        Some(previous) =>
+                            review::render_review_changes(previous, &confirmation.preview),
+                        None => render_review(&confirmation.preview),
+                    }
+                )?;
                 let choice = if ordinary_approval(yes, terminal.is_terminal())
                     == Some(OrdinaryChoice::Cancel)
                 {
@@ -828,13 +837,22 @@ fn drive_terminal_review_with(
                         terminal.decide(&job.id, &confirmation.nonce, choice.into())?;
                         return Err(UpdateError::Cancelled);
                     }
-                    OrdinaryChoice::Policy(next) => {
-                        policy = next;
-                        terminal.decide(&job.id, &confirmation.nonce, choice.into())?;
+                    OrdinaryChoice::InterruptNow => {
+                        reviewed = Some(review::interruption_review(&confirmation.preview));
+                        if !submit_current_choice(
+                            terminal,
+                            &job.id,
+                            &confirmation.nonce,
+                            choice.into(),
+                        )? {
+                            continue;
+                        }
+                        policy = impact::Policy::Interrupt;
                         policy_requested = Some(confirmation.nonce.clone());
                         submitted.insert(confirmation.nonce.clone());
                     }
                     OrdinaryChoice::Confirm => {
+                        reviewed = Some(confirmation.preview.clone());
                         if submit_current_choice(
                             terminal,
                             &job.id,
@@ -879,14 +897,14 @@ fn submit_current_choice(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OrdinaryChoice {
     Confirm,
-    Policy(impact::Policy),
+    InterruptNow,
     Cancel,
 }
 impl From<OrdinaryChoice> for UpdateChoice {
     fn from(choice: OrdinaryChoice) -> Self {
         match choice {
             OrdinaryChoice::Confirm => Self::Confirm,
-            OrdinaryChoice::Policy(policy) => Self::Policy(policy),
+            OrdinaryChoice::InterruptNow => Self::InterruptNow,
             OrdinaryChoice::Cancel => Self::Cancel,
         }
     }
@@ -905,7 +923,7 @@ fn ordinary_approval(yes: bool, terminal: bool) -> Option<OrdinaryChoice> {
 fn review_answer(answer: &str, working: bool) -> Option<OrdinaryChoice> {
     match answer.trim().to_ascii_lowercase().as_str() {
         "" | "y" | "yes" => Some(OrdinaryChoice::Confirm),
-        "i" if working => Some(OrdinaryChoice::Policy(impact::Policy::Interrupt)),
+        "i" if working => Some(OrdinaryChoice::InterruptNow),
         "n" | "no" => Some(OrdinaryChoice::Cancel),
         _ => None,
     }
@@ -2491,7 +2509,7 @@ mod tests {
         let mut output = Vec::new();
         assert!(matches!(
             read_review_choice(&mut &b"i\n"[..], &mut output, true, false).unwrap(),
-            OrdinaryChoice::Policy(impact::Policy::Interrupt)
+            OrdinaryChoice::InterruptNow
         ));
         assert_eq!(
             String::from_utf8(output).unwrap(),
@@ -2570,7 +2588,7 @@ mod tests {
         ));
         assert!(matches!(
             review_answer("i", true),
-            Some(OrdinaryChoice::Policy(impact::Policy::Interrupt))
+            Some(OrdinaryChoice::InterruptNow)
         ));
         assert!(review_answer("i", false).is_none());
         assert!(matches!(

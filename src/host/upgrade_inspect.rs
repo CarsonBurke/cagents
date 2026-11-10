@@ -1,6 +1,7 @@
 //! Bounded source qualification after source windows flush, before close.
 //! Stores remain read-only. Exact retained providers missing from startup
 //! discovery may be authenticated through Resolve; no launch recipe is run.
+mod console;
 mod current;
 mod v68;
 mod v77;
@@ -131,8 +132,9 @@ fn connect(request: &Request, deadline: Instant) -> Result<Reader, String> {
 const UNCHECKED: &str = "could not be checked before the update";
 const CHAT_RECOVERY: &str = "Choose Resume conversation in the new tab (+) menu";
 const TERMINAL_RECOVERY: &str = "Press Reconnect in the pane to check the saved terminal";
-const CONSOLE_REASON: &str = "keeps running in its terminal; its chat panel disconnects";
-const CONSOLE_RECOVERY: &str = "Choose Resume conversation in the new tab (+) menu afterwards";
+const CONSOLE_REASON: &str =
+    "keeps working; its console reconnects in the same pane after the update";
+const CONSOLE_UNSAFE: &str = "its console cannot reconnect safely after the update";
 
 fn stop_unchecked(
     inspection: &mut SourceInspection,
@@ -367,16 +369,14 @@ fn inspect(request: Request) -> Result<SourceInspection, String> {
             }
             if request.require_resumable
                 && session.terminal.as_ref().is_some_and(|terminal| {
-                    terminal.continuity.can_resume_live(proof)
-                        && qualify_terminal(terminal, &terminals, proof).is_ok()
-                        && qualify_console_migration(terminal, &matched_cli).is_err()
+                    crate::agent_execution::console_agent(&terminal.launch).is_some()
                 })
             {
-                console_keeps_running(
-                    &mut inspection,
-                    session.id,
-                    crate::update::impact::SessionKind::NativeChat,
-                );
+                let qualified =
+                    qualify_terminal(session.terminal.as_ref().unwrap(), &terminals, proof).is_ok()
+                        && validate_live_chat(session, true).is_ok()
+                        && console::qualify(session, &matched_cli, proof).is_ok();
+                record_console_outcome(&mut inspection, session.id, qualified);
             } else if validate_live_chat(session, request.require_resumable).is_err() {
                 inspection.stop(
                     session.id,
@@ -390,13 +390,14 @@ fn inspect(request: Request) -> Result<SourceInspection, String> {
             check_deadline(deadline)?;
             if request.require_resumable
                 && !inventory.iter().any(|chat| chat.id == terminal.session.id)
-                && terminal.session.continuity.can_resume_live(proof)
-                && qualify_console_migration(&terminal.session, &matched_cli).is_err()
+                && terminal_requires_migration(&terminal.session, &proof.boot_id)
+                && crate::agent_execution::console_agent(&terminal.session.launch).is_some()
             {
-                console_keeps_running(
-                    &mut inspection,
+                inspection.stop(
                     terminal.session.id,
-                    crate::update::impact::SessionKind::Terminal,
+                    StoppedKind::Terminal,
+                    CONSOLE_UNSAFE,
+                    "Reopen the agent after the update",
                 );
             }
         }
@@ -571,17 +572,21 @@ fn record_live_panes(
     }
 }
 
-fn console_keeps_running(
+fn record_console_outcome(
     inspection: &mut SourceInspection,
     id: crate::model::TerminalId,
-    kind: crate::update::impact::SessionKind,
+    qualified: bool,
 ) {
+    if !qualified {
+        inspection.stop(id, StoppedKind::Chat, CONSOLE_UNSAFE, CHAT_RECOVERY);
+        return;
+    }
     inspection.details.panes.insert(
         id,
         InspectedPane {
-            kind,
+            kind: crate::update::impact::SessionKind::NativeChat,
             outcome: SavedOutcome::KeepsRunning,
-            detail: format!("{CONSOLE_REASON}. {CONSOLE_RECOVERY}."),
+            detail: format!("{CONSOLE_REASON}."),
         },
     );
 }
@@ -1435,27 +1440,6 @@ fn check_deadline(deadline: Instant) -> Result<(), String> {
     Ok(())
 }
 
-/// A console's issued recipe is not permission to replay a different installed
-/// CLI. Even an unchanged path cannot prove that its existing ControlClient
-/// survives the source daemon stopping. Defer until an exact, typed migration
-/// route qualifies both the accepted console and its retained provider.
-fn qualify_console_migration(
-    terminal: &crate::model::TerminalSession,
-    matched_cli: &Path,
-) -> Result<(), &'static str> {
-    if crate::agent_execution::console_agent(&terminal.launch).is_none() {
-        return Ok(());
-    }
-    if Path::new(&terminal.launch.program) != matched_cli {
-        return Err(
-            "its accepted console belongs to a different matched CLI installation; this pairing cannot migrate yet",
-        );
-    }
-    Err(
-        "its accepted console has no qualified reconnection across daemon replacement; this pairing cannot migrate yet",
-    )
-}
-
 // A foreground process hint is an observation of the retained PTY, not an
 // issued launch or a choice of provider/thread to resume. Match the exact
 // complete proof and all immutable fields across Live/Detached presentation.
@@ -1701,54 +1685,24 @@ mod tests {
     }
 
     #[test]
-    fn accepted_console_migration_defers_even_when_the_cli_path_is_unchanged() {
-        let matched = Path::new("/installed/new/bin/cagents");
-        let recipe = crate::model::LaunchRecipe {
-            program: matched.to_string_lossy().into_owned(),
-            arguments: vec![
-                "agent".into(),
-                "console".into(),
-                crate::model::AgentId::new().to_string(),
-            ],
-            working_directory: "/private-directory".into(),
-            environment: [("PRIVATE_ACCOUNT".into(), "never-print-this".into())].into(),
-            unset_environment: Default::default(),
-        };
-        let mut terminal =
-            crate::terminal_ipc::TerminalDescriptor::relaunchable(TerminalId::new(), recipe, None)
-                .session;
-        let same_path = qualify_console_migration(&terminal, matched).unwrap_err();
-        assert!(same_path.contains("no qualified reconnection"));
-        terminal.launch.program = "/installed/old/bin/cagents".into();
-        let older = qualify_console_migration(&terminal, matched).unwrap_err();
-        assert!(older.contains("different matched CLI installation"));
-        for error in [same_path, older] {
-            let mut inspection = SourceInspection::default();
-            console_keeps_running(
-                &mut inspection,
-                terminal.id,
-                crate::update::impact::SessionKind::Terminal,
-            );
-            assert!(inspection.stopped.is_empty());
-            let pane = &inspection.details.panes[&terminal.id];
-            assert_eq!(pane.outcome, SavedOutcome::KeepsRunning);
-            assert_eq!(
-                pane.detail,
-                "keeps running in its terminal; its chat panel disconnects. Choose Resume conversation in the new tab (+) menu afterwards."
-            );
-            assert!(!error.contains("private-directory"));
-            assert!(!error.contains("never-print-this"));
-            assert!(!error.contains("/installed"));
-        }
-        terminal.launch.arguments = vec!["--login".into()];
-        assert!(qualify_console_migration(&terminal, matched).is_ok());
-        terminal.launch.arguments = vec![
-            "--remote".into(),
-            "unix://owned-listener".into(),
-            "resume".into(),
-            "exact-thread".into(),
-        ];
-        assert!(qualify_console_migration(&terminal, matched).is_ok());
+    fn console_review_promises_reconnection_only_for_a_qualified_pair() {
+        let id = TerminalId::new();
+        let mut qualified = SourceInspection::default();
+        record_console_outcome(&mut qualified, id, true);
+        assert!(qualified.stopped.is_empty());
+        let pane = &qualified.details.panes[&id];
+        assert_eq!(pane.outcome, SavedOutcome::KeepsRunning);
+        assert_eq!(
+            pane.detail,
+            "keeps working; its console reconnects in the same pane after the update."
+        );
+        assert!(!pane.detail.contains("Resume conversation"));
+        let mut unqualified = SourceInspection::default();
+        record_console_outcome(&mut unqualified, id, false);
+        assert!(!unqualified.details.panes.contains_key(&id));
+        assert_eq!(unqualified.stopped.len(), 1);
+        assert_eq!(unqualified.stopped[0].kind, StoppedKind::Chat);
+        assert_eq!(unqualified.stopped[0].reason, CONSOLE_UNSAFE);
     }
 
     pub(super) fn session() -> Session {

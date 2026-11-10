@@ -380,6 +380,13 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
                 return Err(io::Error::other(detail.to_owned()));
             }
             chat::restore_orphaned_native(&host, &unattached).map_err(io::Error::other)?;
+            if let Some(detail) = host
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .startup_recovery()
+            {
+                return Err(io::Error::other(detail.to_owned()));
+            }
             chat::retained_actor::reconcile_retired_actors(&host).map_err(io::Error::other)?;
             chat::retained_actor::reconcile_startup_losses(&host).map_err(io::Error::other)?;
             model::floor::restore_presentations().map_err(io::Error::other)?;

@@ -4,6 +4,9 @@ mod account_isolation_tests;
 #[cfg(test)]
 mod account_recovery_target_tests;
 pub(super) mod capacity;
+mod console_relaunch;
+#[cfg(test)]
+mod console_relaunch_tests;
 pub(super) mod floor_history;
 #[cfg(test)]
 mod lost_agent_close_tests;
@@ -2354,8 +2357,10 @@ fn codex_terminal_view(
         },
         Some(handle.execution_environment()),
         &TerminalViewReservation {
-            owners: &owners,
-            closing,
+            kind: TerminalViewKind::Codex {
+                owners: &owners,
+                closing,
+            },
         },
     );
     let (descriptor, paired_terminal) = match spawned {
@@ -3587,20 +3592,46 @@ fn process_inner(
 /// Borrow the complete native transition only while its closing reservation is
 /// alive. Ordinary terminal spawns cannot bypass native admission with an ID.
 pub(super) struct TerminalViewReservation<'a> {
-    owners: &'a paired_close::Owners,
-    closing: &'a capacity::Reservation,
+    kind: TerminalViewKind<'a>,
+}
+
+enum TerminalViewKind<'a> {
+    Codex {
+        owners: &'a paired_close::Owners,
+        closing: &'a capacity::Reservation,
+    },
+    /// Only retained-actor recovery constructs this after authenticating the
+    /// helper and committing its exact console replacement intent.
+    RetainedConsole { requested: &'a Session },
 }
 
 impl TerminalViewReservation<'_> {
+    pub(super) fn retained_console(requested: &Session) -> TerminalViewReservation<'_> {
+        TerminalViewReservation {
+            kind: TerminalViewKind::RetainedConsole { requested },
+        }
+    }
+
     pub(super) fn authorizes(&self, state: &HostState, terminal_id: TerminalId) -> bool {
-        self.owners.target.source.id == terminal_id
-            && self.owners.require_locked(state, self.closing).is_ok()
-            && state.chats.get(&terminal_id).is_some_and(|record| {
-                record.returning_terminal
-                    && record.session.launch.provider == Provider::Codex
-                    && record.session.terminal.is_none()
-                    && record.paired_terminal.is_none()
-            })
+        match &self.kind {
+            TerminalViewKind::Codex { owners, closing } => {
+                owners.target.source.id == terminal_id
+                    && owners.require_locked(state, closing).is_ok()
+                    && state.chats.get(&terminal_id).is_some_and(|record| {
+                        record.returning_terminal
+                            && record.session.launch.provider == Provider::Codex
+                            && record.session.terminal.is_none()
+                            && record.paired_terminal.is_none()
+                    })
+            }
+            TerminalViewKind::RetainedConsole { requested } => {
+                requested.id == terminal_id
+                    && state.chat_spawning.get(&terminal_id) == Some(*requested)
+                    && !state.chats.contains_key(&terminal_id)
+                    && !state.native_closing.contains_key(&terminal_id)
+                    && !state.chat_handoffs.contains_key(&terminal_id)
+            }
+        }
     }
 }
 

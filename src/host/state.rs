@@ -1157,6 +1157,10 @@ impl HostState {
         Ok(current)
     }
 
+    pub(super) fn terminal_options(&self, id: TerminalId) -> Option<TerminalSpawnOptions> {
+        self.terminals.get(&id).map(|record| record.options.clone())
+    }
+
     /// The descriptor an observer with attachment state `attached` is owed.
     ///
     /// Attachment is the only per-client input, so a broadcast to observers
@@ -4111,6 +4115,59 @@ pub(super) fn spawn_codex_view_reserved(
     )
 }
 
+/// Restart only a thin console whose previous exact holder has proved closed.
+/// Keep the issued aliases and accepted launch in the new holder, so a crash
+/// before native re-pairing or a window save remains recoverable.
+pub(super) fn spawn_console_replacement(
+    shared: &SharedHost,
+    session: TerminalSession,
+    options: TerminalSpawnOptions,
+    aliases: &[TerminalSession],
+    requested: &crate::chat::Session,
+) -> Result<(TerminalDescriptor, TerminalHandle), ProtocolError> {
+    let (source, previous_sources) = aliases.split_last().ok_or_else(|| {
+        ProtocolError::new(
+            ProtocolErrorCode::InvalidRequest,
+            "Console replacement has no authenticated previous view",
+            false,
+        )
+    })?;
+    let relaunches: Vec<_> = aliases
+        .iter()
+        .cloned()
+        .map(|source| crate::terminal_ipc::UpgradeRelaunch {
+            source,
+            recipe: session.launch.clone(),
+        })
+        .collect();
+    let previous = crate::terminal::holder::Recovery {
+        source: source.clone(),
+        previous_sources: previous_sources.to_vec(),
+        relaunches: relaunches.clone(),
+        options: options.clone(),
+        execution_environment: None,
+        execution_recipe: None,
+    };
+    let (_, handle) = start_terminal_view_owned_reserved(
+        shared,
+        0,
+        session,
+        options,
+        None,
+        true,
+        None,
+        Some(previous),
+        None,
+        None,
+        Some(&super::chat::TerminalViewReservation::retained_console(
+            requested,
+        )),
+    )?;
+    let mut state = shared.lock().unwrap_or_else(|p| p.into_inner());
+    state.adopt_upgrade_lineage(source, previous_sources, &relaunches)?;
+    Ok((state.descriptor(0, source.id)?, handle))
+}
+
 fn start_terminal_view_owned_reserved(
     shared: &SharedHost,
     client_id: ClientId,
@@ -4383,6 +4440,15 @@ fn start_terminal_view_owned_reserved(
     });
     let config = TerminalConfig {
         agent_authority,
+        console_startup_owner: (paired
+            && crate::agent_execution::console_agent(&session.launch).is_some())
+        .then(|| {
+            shared
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .proof()
+                .clone()
+        }),
         columns: options.columns,
         rows: options.rows,
         cell_width_px: options.cell_width_px,

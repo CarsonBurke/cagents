@@ -61,10 +61,17 @@ struct TurnActivity {
     generation: u64,
     parent_finished: bool,
     background: Vec<String>,
+    interrupted: Vec<String>,
 }
 
 impl From<Snapshot> for TurnActivity {
     fn from(snapshot: Snapshot) -> Self {
+        let interrupted = snapshot
+            .subagents
+            .iter()
+            .filter(|child| child.stopped_by_interrupt(&snapshot.capabilities))
+            .map(|child| child.id.clone())
+            .collect();
         Self {
             generation: snapshot.generation,
             parent_finished: snapshot.ready && !snapshot.exited && !snapshot.turn_accepted(),
@@ -74,6 +81,7 @@ impl From<Snapshot> for TurnActivity {
                 .filter(|child| child.background && child.status == ToolStatus::Running)
                 .map(|child| child.id)
                 .collect(),
+            interrupted,
         }
     }
 }
@@ -84,6 +92,10 @@ impl TurnActivity {
             item.disposition = impact::Disposition::Blocked;
             item.reason = "Its turn finished, but background agents are still running. Review stopping them to continue the update.".into();
             item.interrupted_subagents = self.background.clone();
+        } else if !self.parent_finished {
+            // Disclose interruption's complete scope before offering `i`.
+            // These are exact observed IDs, not the source's global count.
+            item.interrupted_subagents = self.interrupted.clone();
         }
     }
 }
@@ -235,6 +247,21 @@ mod tests {
         assert_eq!(impact.identity, "exact-source-owner");
         assert_eq!(impact.interrupted_subagents, ["background-child"]);
         assert!(impact.reason.contains("turn finished"));
+    }
+
+    #[test]
+    fn working_review_discloses_exact_background_interruption_before_the_choice() {
+        let mut snapshot = Snapshot {
+            ready: true,
+            busy: true,
+            subagents: vec![child(ToolStatus::Running), child(ToolStatus::Succeeded)],
+            ..Default::default()
+        };
+        snapshot.capabilities.interrupt_stops_background = true;
+        let mut impact = item();
+        TurnActivity::from(snapshot).review(&mut impact);
+        assert_eq!(impact.disposition, impact::Disposition::WaitsForIdle);
+        assert_eq!(impact.interrupted_subagents, ["background-child"]);
     }
 
     #[test]

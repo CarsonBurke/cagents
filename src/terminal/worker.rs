@@ -2929,6 +2929,13 @@ impl Worker {
             }
         }
         command.env_remove(crate::agent_execution::AUTHORITY_ENV);
+        command.env_remove(crate::agent_execution::CONSOLE_STARTUP_OWNER_ENV);
+        if let Some(proof) = &config.console_startup_owner {
+            command.env(
+                crate::agent_execution::CONSOLE_STARTUP_OWNER_ENV,
+                serde_json::to_string(proof).map_err(|error| error.to_string())?,
+            );
+        }
         if let Some(token) = config.agent_authority.token() {
             command.env(crate::agent_execution::AUTHORITY_ENV, token);
         }

@@ -14,9 +14,14 @@ pub struct Confirmation {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Choice {
     Confirm,
-    StopListed { items_digest: String },
+    StopListed {
+        items_digest: String,
+    },
     Policy(impact::Policy),
     Cancel,
+    /// The terminal's `i` choice approves interruption of the displayed work.
+    /// A policy selector alone still requires ordinary review.
+    InterruptNow,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -350,6 +355,14 @@ fn wait_with(
                         nonce = uuid::Uuid::new_v4().to_string();
                         continue;
                     }
+                    Choice::InterruptNow => {
+                        policy = impact::Policy::Interrupt;
+                        let current = observe(policy)?;
+                        approved = interruption_preserves_review(&preview, &current);
+                        preview = current;
+                        nonce = uuid::Uuid::new_v4().to_string();
+                        continue;
+                    }
                 }
             }
             Err(UpdateError::Io(error)) if error.kind() == io::ErrorKind::NotFound => (),
@@ -396,21 +409,45 @@ fn policy_choice_approves_service_floor(
     {
         return false;
     }
+    interruption_preserves_review(previous, current)
+}
+
+/// `i` is consent to interrupt these exact owners. A changed candidate,
+/// allocation or background-work census must return to human review.
+fn interruption_preserves_review(previous: &impact::Preview, current: &impact::Preview) -> bool {
+    let (Some(before), Some(after)) = (&previous.daemon, &current.daemon) else {
+        return false;
+    };
+    if before.policy != impact::Policy::WhenIdle
+        || after.policy != impact::Policy::Interrupt
+        || before.capability.background_identity != after.capability.background_identity
+        || before.capability.background_subagents != after.capability.background_subagents
+    {
+        return false;
+    }
     let mut approved = previous.clone();
+    // A typed service stop still reviews every affected background task next.
+    // Ordinary `i` may approve only work already displayed in its review.
+    let typed_stop = floor::needs_service_stop(before) && floor::needs_service_stop(after);
     let daemon = approved.daemon.as_mut().unwrap();
-    daemon.policy = next;
+    daemon.policy = impact::Policy::Interrupt;
     for session in &mut daemon.sessions {
         if session.disposition == impact::Disposition::WaitsForIdle {
             let Some(interrupted) = after.sessions.iter().find(|item| {
                 item.kind == session.kind
                     && item.id == session.id
                     && item.identity == session.identity
-                    && item.disposition == impact::Disposition::Interrupted
+                    && matches!(
+                        item.disposition,
+                        impact::Disposition::Interrupted | impact::Disposition::Resumes
+                    )
             }) else {
                 return false;
             };
-            session.disposition = impact::Disposition::Interrupted;
-            session.interrupted_subagents = interrupted.interrupted_subagents.clone();
+            session.disposition = interrupted.disposition;
+            if typed_stop {
+                session.interrupted_subagents = interrupted.interrupted_subagents.clone();
+            }
         }
     }
     approved.preserves_consent(current)
@@ -564,6 +601,232 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    fn working_preview() -> impact::Preview {
+        let mut preview = preview(false);
+        preview.daemon = Some(impact::DaemonImpact {
+            capability: crate::terminal_ipc::ShutdownCapability {
+                proof: crate::model::HostSessionProof {
+                    host_session_id: crate::model::HostSessionId::new("console-update"),
+                    boot_id: crate::model::BootId::new("console-update"),
+                    host_incarnation: crate::model::HostIncarnation::new("console-update"),
+                },
+                token: "review".into(),
+                inventory_generation: 1,
+                live_terminals: 1,
+                background_subagents: 0,
+                background_identity: String::new(),
+                expires_at_unix_ms: i64::MAX,
+            },
+            policy: impact::Policy::WhenIdle,
+            blockers: Vec::new(),
+            sessions: vec![impact::SessionImpact {
+                id: crate::model::TerminalId::new(),
+                kind: impact::SessionKind::NativeChat,
+                title: "Working agent".into(),
+                identity: "exact accepted turn".into(),
+                disposition: impact::Disposition::WaitsForIdle,
+                reason: "Finishing its turn".into(),
+                interrupted_subagents: Vec::new(),
+            }],
+        });
+        preview
+    }
+
+    #[test]
+    fn terminal_i_is_the_only_confirmation_for_an_unchanged_ordinary_update() {
+        struct Terminal {
+            state: PathBuf,
+            output: Vec<u8>,
+            reads: usize,
+            deadline: Instant,
+        }
+        impl Write for Terminal {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.output.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl TerminalReview for Terminal {
+            fn status(&mut self) -> Result<Option<UpdateJob>, UpdateError> {
+                Ok(Some(serde_json::from_slice(&fs::read(
+                    self.state.join("status.json"),
+                )?)?))
+            }
+            fn decide(
+                &mut self,
+                job: &str,
+                nonce: &str,
+                choice: Choice,
+            ) -> Result<(), UpdateError> {
+                decide_at(&self.state, job, nonce, choice)
+            }
+            fn cancel(&mut self, job: &str) -> Result<bool, UpdateError> {
+                cancel_at(&self.state, job)
+            }
+            fn read_line(&mut self, answer: &mut String) -> io::Result<usize> {
+                self.reads += 1;
+                let text = if self.reads == 1 { "i\n" } else { "n\n" };
+                answer.push_str(text);
+                Ok(text.len())
+            }
+            fn is_terminal(&self) -> bool {
+                true
+            }
+            fn interrupted(&self) -> bool {
+                false
+            }
+            fn pause(&mut self) {
+                assert!(Instant::now() < self.deadline, "terminal update stalled");
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().to_owned();
+        let initial = working_preview();
+        let worker = thread::spawn(move || {
+            let mut job = job(&path);
+            let outcome = wait(&path, &mut job, |policy| {
+                Ok(if policy == impact::Policy::Interrupt {
+                    super::super::review::interruption_review(&initial)
+                } else {
+                    initial.clone()
+                })
+            });
+            job.phase = if outcome.is_ok() {
+                UpdatePhase::Complete
+            } else {
+                UpdatePhase::Failed
+            };
+            job.confirmation = None;
+            job.message = "fixture finished".into();
+            write_job(&path, &job).unwrap();
+            outcome
+        });
+        let initial = published(directory.path(), None);
+        let mut terminal = Terminal {
+            state: directory.path().to_owned(),
+            output: Vec::new(),
+            reads: 0,
+            deadline: Instant::now() + Duration::from_secs(10),
+        };
+        let outcome = drive_terminal_review_with(initial, false, false, &mut terminal);
+        let worker_outcome = worker.join().unwrap();
+        outcome.unwrap();
+        worker_outcome.unwrap();
+        let output = String::from_utf8(terminal.output).unwrap();
+        assert_eq!(terminal.reads, 1, "{output}");
+        assert_eq!(output.matches("Update cagents ").count(), 1, "{output}");
+        assert!(!output.contains("Update now?"), "{output}");
+    }
+
+    #[test]
+    fn interrupt_now_approves_the_same_work_without_a_second_decision() {
+        let directory = tempfile::tempdir().unwrap();
+        let initial = working_preview();
+        let path = directory.path().to_owned();
+        let (finished, result) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut job = job(&path);
+            let outcome = wait(&path, &mut job, |policy| {
+                let mut current = initial.clone();
+                if policy == impact::Policy::Interrupt {
+                    current = super::super::review::interruption_review(&current);
+                }
+                Ok(current)
+            });
+            finished.send(outcome).unwrap();
+        });
+        let current = published(directory.path(), None);
+        publish_decision(
+            directory.path(),
+            &current.id,
+            &current.confirmation.as_ref().unwrap().nonce,
+            Choice::InterruptNow,
+        )
+        .unwrap();
+        let completed = result.recv_timeout(Duration::from_secs(5));
+        if completed.is_err() {
+            let latest = published(directory.path(), None);
+            publish_decision(
+                directory.path(),
+                &latest.id,
+                &latest.confirmation.as_ref().unwrap().nonce,
+                Choice::Cancel,
+            )
+            .unwrap();
+        }
+        worker.join().unwrap();
+        let completed = completed
+            .expect("i must finish without a second confirmation")
+            .unwrap();
+        assert_eq!(completed.daemon.unwrap().policy, impact::Policy::Interrupt);
+    }
+
+    #[test]
+    fn i_approves_already_displayed_background_work_but_not_a_replacement_child() {
+        let mut previous = working_preview();
+        let daemon = previous.daemon.as_mut().unwrap();
+        daemon.capability.background_subagents = 1;
+        daemon.capability.background_identity = "displayed task census".into();
+        daemon.sessions[0]
+            .interrupted_subagents
+            .push("displayed child".into());
+        let mut current = super::super::review::interruption_review(&previous);
+        assert!(interruption_preserves_review(&previous, &current));
+        current.daemon.as_mut().unwrap().sessions[0].interrupted_subagents =
+            vec!["different child".into()];
+        assert!(!interruption_preserves_review(&previous, &current));
+    }
+
+    #[test]
+    fn interrupt_now_requires_new_review_for_changed_work_but_policy_alone_is_not_consent() {
+        let previous = working_preview();
+        let current = super::super::review::interruption_review(&previous);
+        assert!(interruption_preserves_review(&previous, &current));
+        assert!(!policy_choice_approves_service_floor(
+            &previous,
+            &current,
+            impact::Policy::Interrupt
+        ));
+        for change in ["candidate", "owner", "agent", "background", "unseen child"] {
+            let mut changed = current.clone();
+            match change {
+                "candidate" => changed.candidate.digest.push_str(" changed"),
+                "owner" => changed.daemon.as_mut().unwrap().sessions[0]
+                    .identity
+                    .push_str(" changed"),
+                "agent" => {
+                    changed.daemon.as_mut().unwrap().sessions[0].id =
+                        crate::model::TerminalId::new()
+                }
+                "unseen child" => changed.daemon.as_mut().unwrap().sessions[0]
+                    .interrupted_subagents
+                    .push("existing but undisclosed child".into()),
+                "background" => changed
+                    .daemon
+                    .as_mut()
+                    .unwrap()
+                    .capability
+                    .background_identity
+                    .push_str(" new child"),
+                _ => unreachable!(),
+            }
+            assert!(
+                !interruption_preserves_review(&previous, &changed),
+                "{change}"
+            );
+        }
+        let mut idle = current;
+        idle.daemon.as_mut().unwrap().sessions[0].disposition = impact::Disposition::Resumes;
+        assert!(
+            interruption_preserves_review(&previous, &idle),
+            "finished work needs no interruption"
+        );
     }
 
     #[test]
@@ -869,6 +1132,7 @@ mod tests {
         for choice in [
             Choice::Confirm,
             Choice::Policy(impact::Policy::Interrupt),
+            Choice::InterruptNow,
             Choice::StopListed {
                 items_digest: "another list".into(),
             },

@@ -12,9 +12,8 @@ use std::{
 const CHAT_RECOVERY: &str = "Choose Resume conversation in the new tab (+) menu";
 
 /// Reconcile observations before grouping: a pane has exactly one outcome.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 struct Item {
-    #[cfg(test)]
     id: crate::model::TerminalId,
     label: String,
     kind: SessionKind,
@@ -164,7 +163,6 @@ fn items(preview: &Preview) -> Vec<Item> {
                 }
             }
             Item {
-                #[cfg(test)]
                 id,
                 label,
                 kind,
@@ -247,7 +245,7 @@ pub fn render_review(preview: &Preview) -> String {
                 .filter(|(count, _)| *count > 0)
                 .map(|(count, kind)| format!("{count} {kind}{}", if count == 1 { "" } else { "s" }))
                 .collect();
-            format!("{}; nothing restarts", counts.join(", "))
+            format!("{}; work continues", counts.join(", "))
         } else {
             description
         };
@@ -306,11 +304,179 @@ pub fn render_review(preview: &Preview) -> String {
     output
 }
 
+/// The expected result of choosing `i`, used only to explain a renewed review.
+/// Actual authorization remains with the worker's exact ownership comparison.
+pub(super) fn interruption_review(preview: &Preview) -> Preview {
+    let mut selected = preview.clone();
+    if let Some(daemon) = &mut selected.daemon {
+        daemon.policy = super::impact::Policy::Interrupt;
+        for session in &mut daemon.sessions {
+            if session.disposition == Disposition::WaitsForIdle {
+                session.disposition = Disposition::Interrupted;
+            }
+        }
+    }
+    selected
+}
+
+/// Refresh only the changes that require a renewed decision, rather than
+/// making the person read the unchanged workspace again.
+pub(super) fn render_review_changes(previous: &Preview, current: &Preview) -> String {
+    let mut output = "Update review changed:\n".to_owned();
+    if previous.candidate != current.candidate || previous.from_version != current.from_version {
+        writeln!(output, "  The verified build changed.").unwrap();
+        writeln!(
+            output,
+            "  Build: cagents {} -> {}",
+            current.from_version, current.candidate.version
+        )
+        .unwrap();
+    }
+    if previous.replaces_daemon != current.replaces_daemon {
+        writeln!(
+            output,
+            "  {}",
+            if current.replaces_daemon {
+                "The terminal service will be replaced."
+            } else {
+                "The running terminal service stays in place."
+            }
+        )
+        .unwrap();
+    }
+    let old = items(previous)
+        .into_iter()
+        .map(|item| (item.id, item))
+        .collect::<BTreeMap<_, _>>();
+    let new = items(current)
+        .into_iter()
+        .map(|item| (item.id, item))
+        .collect::<BTreeMap<_, _>>();
+    let owner = |preview: &Preview, id| {
+        preview
+            .daemon
+            .as_ref()
+            .and_then(|daemon| daemon.sessions.iter().find(|session| session.id == id))
+            .map(|session| {
+                (
+                    session.identity.clone(),
+                    session.interrupted_subagents.clone(),
+                )
+            })
+    };
+    for (id, item) in &new {
+        if old.get(id) == Some(item) && owner(previous, *id) == owner(current, *id) {
+            continue;
+        }
+        let detail = if item.detail.is_empty() {
+            match item.outcome {
+                Outcome::KeepsRunning => "keeps working",
+                Outcome::Resumes => "restarts on its recorded conversation",
+                Outcome::Working => "finishing its turn; the update waits",
+                Outcome::Interrupted => "its current turn will be interrupted",
+                Outcome::Paused => "comes back paused",
+                Outcome::Unchanged => "stays as it is",
+                Outcome::Attention => "needs attention before the update",
+                Outcome::Stops => "stops; you will confirm this next",
+            }
+        } else {
+            &item.detail
+        };
+        writeln!(output, "  {}: {detail}", item.label).unwrap();
+    }
+    for (id, item) in &old {
+        if !new.contains_key(id) {
+            writeln!(output, "  {}: no longer affected", item.label).unwrap();
+        }
+    }
+    for notice in &current.labels.details.notices {
+        if !previous.labels.details.notices.contains(notice) {
+            writeln!(output, "  {notice}").unwrap();
+        }
+    }
+    for window in &current.stopped_windows {
+        if !previous.stopped_windows.contains(window) {
+            writeln!(
+                output,
+                "  {}",
+                recovery_detail(&window.reason, &window.recovery, true)
+            )
+            .unwrap();
+        }
+    }
+    for window in &previous.stopped_windows {
+        if !current.stopped_windows.contains(window) {
+            output.push_str("  A previously affected saved window can now reopen normally.\n");
+        }
+    }
+    if previous.daemon.as_ref().map(|daemon| {
+        (
+            &daemon.capability.background_identity,
+            daemon.capability.background_subagents,
+        )
+    }) != current.daemon.as_ref().map(|daemon| {
+        (
+            &daemon.capability.background_identity,
+            daemon.capability.background_subagents,
+        )
+    }) {
+        let tasks = current
+            .daemon
+            .as_ref()
+            .map_or(0, |daemon| daemon.capability.background_subagents);
+        writeln!(
+            output,
+            "  Background work changed: {tasks} active background tasks."
+        )
+        .unwrap();
+    }
+    if previous.daemon.as_ref().map(|daemon| &daemon.blockers)
+        != current.daemon.as_ref().map(|daemon| &daemon.blockers)
+    {
+        for blocker in current.daemon.iter().flat_map(|daemon| &daemon.blockers) {
+            if !previous
+                .daemon
+                .iter()
+                .flat_map(|daemon| &daemon.blockers)
+                .any(|old| old == blocker)
+            {
+                writeln!(output, "  {blocker}").unwrap();
+            }
+        }
+        for blocker in previous.daemon.iter().flat_map(|daemon| &daemon.blockers) {
+            if !current
+                .daemon
+                .iter()
+                .flat_map(|daemon| &daemon.blockers)
+                .any(|new| new == blocker)
+            {
+                writeln!(output, "  Resolved: {blocker}").unwrap();
+            }
+        }
+    }
+    if output == "Update review changed:\n" {
+        output.push_str(
+            "  The running terminal service changed; review the update again before continuing.\n",
+        );
+    }
+    output
+}
+
 /// A source reason can combine live activity with its old destination plan.
 /// When merging outcomes, carry only activity; this review owns the destination.
 fn live_fact(session: &super::impact::SessionImpact) -> String {
     match session.disposition {
-        Disposition::WaitsForIdle => "finishing its turn".into(),
+        Disposition::WaitsForIdle => {
+            let tasks = session.interrupted_subagents.len();
+            if tasks == 0 {
+                "finishing its turn".into()
+            } else {
+                let noun = if tasks == 1 { "task" } else { "tasks" };
+                format!(
+                    "finishing its turn; interrupting now also stops {tasks} background {noun}; background work will not resume automatically"
+                )
+            }
+        }
         Disposition::Interrupted => {
             let tasks = session.interrupted_subagents.len();
             if tasks == 0 {
@@ -474,7 +640,7 @@ mod tests {
                 true
             ));
             preview.labels.details.panes.get_mut(&id).unwrap().detail =
-                "keeps running in its terminal; its chat panel disconnects. Choose Resume conversation in the new tab (+) menu afterwards.".into();
+                "keeps working; its console reconnects in the same pane after the update.".into();
             let mut console = session(&title, Disposition::Continues, "Keeps running");
             console.id = id;
             preview.daemon.as_mut().unwrap().sessions.push(console);
@@ -520,6 +686,142 @@ mod tests {
     }
 
     #[test]
+    fn renewed_interrupt_review_shows_only_changed_work() {
+        let mut previous = preview();
+        let waiting = session(
+            "Review agent",
+            Disposition::WaitsForIdle,
+            "Finishing its turn",
+        );
+        let unchanged = session("Unchanged agent", Disposition::Continues, "Keeps working");
+        previous.daemon.as_mut().unwrap().sessions = vec![waiting, unchanged];
+        let selected = interruption_review(&previous);
+        let mut changed = selected.clone();
+        changed.daemon.as_mut().unwrap().sessions[0].identity = "new accepted turn".into();
+        let output = render_review_changes(&selected, &changed);
+        assert!(output.starts_with("Update review changed:\n"), "{output}");
+        assert!(
+            output.contains("Review agent: its current turn is interrupted"),
+            "{output}"
+        );
+        assert!(!output.contains("Unchanged agent"), "{output}");
+        assert!(!output.contains("windows close"), "{output}");
+        assert!(!output.contains("Update cagents"), "{output}");
+        let removed = changed.daemon.as_mut().unwrap().sessions.remove(0);
+        let output = render_review_changes(&selected, &changed);
+        assert!(
+            output.contains(&format!("{}: no longer affected", removed.title)),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn renewed_review_explains_changes_outside_individual_panes() {
+        let mut previous = preview();
+        previous.daemon.as_mut().unwrap().sessions.push(session(
+            "Unaffected agent",
+            Disposition::Continues,
+            "Keeps working",
+        ));
+        for change in ["window", "background", "build", "service"] {
+            let mut current = previous.clone();
+            let expected = match change {
+                "window" => {
+                    current.stopped_windows.push(StoppedWindow {
+                        window: 3,
+                        reason: "A saved window could not be read".into(),
+                        recovery: "Its saved file stays as it is".into(),
+                    });
+                    "A saved window could not be read. Its saved file stays as it is"
+                }
+                "background" => {
+                    let capability = &mut current.daemon.as_mut().unwrap().capability;
+                    capability.background_identity = "changed tasks".into();
+                    capability.background_subagents = 2;
+                    "Background work changed: 2 active background tasks."
+                }
+                "build" => {
+                    current.candidate.digest.push_str(" replaced");
+                    "The verified build changed."
+                }
+                "service" => {
+                    current.replaces_daemon = false;
+                    "The running terminal service stays in place."
+                }
+                _ => unreachable!(),
+            };
+            let output = render_review_changes(&previous, &current);
+            assert!(output.contains(expected), "{change}: {output}");
+            assert!(!output.contains("Unaffected agent"), "{change}: {output}");
+        }
+    }
+
+    #[test]
+    fn renewed_review_reports_resolved_window_and_service_problems() {
+        let mut previous = preview();
+        previous.daemon.as_mut().unwrap().sessions.push(session(
+            "Unaffected agent",
+            Disposition::Continues,
+            "Keeps working",
+        ));
+        previous.stopped_windows.push(StoppedWindow {
+            window: 3,
+            reason: "A saved window could not be read".into(),
+            recovery: "Its saved file stays as it is".into(),
+        });
+        let mut current = previous.clone();
+        current.stopped_windows.clear();
+        let output = render_review_changes(&previous, &current);
+        assert!(
+            output.contains("saved window can now reopen normally"),
+            "{output}"
+        );
+        assert!(!output.contains("Unaffected agent"), "{output}");
+        let mut blocked = current.clone();
+        blocked
+            .daemon
+            .as_mut()
+            .unwrap()
+            .blockers
+            .push("A process could not be checked".into());
+        let output = render_review_changes(&blocked, &current);
+        assert!(
+            output.contains("Resolved: A process could not be checked"),
+            "{output}"
+        );
+        // Removing a service-wide stop also changes this agent's outcome.
+        assert!(
+            output.contains("Unaffected agent: keeps working"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn first_working_review_discloses_background_work_that_i_would_stop() {
+        let mut preview = preview();
+        let mut working = session(
+            "Working agent",
+            Disposition::WaitsForIdle,
+            "Finishing its turn",
+        );
+        working.interrupted_subagents = vec!["exact background child".into()];
+        preview.daemon.as_mut().unwrap().sessions.push(working);
+        let output = render_review(&preview);
+        assert!(
+            output.contains("interrupting now also stops 1 background task"),
+            "{output}"
+        );
+        assert!(
+            output.contains("background work will not resume automatically"),
+            "{output}"
+        );
+        assert!(
+            !output.contains("exact background child"),
+            "opaque transport IDs stay private: {output}"
+        );
+    }
+
+    #[test]
     fn representative_review_counts_routine_panes_and_names_recovery() {
         let review = render_review(&representative());
         println!("{review}");
@@ -527,7 +829,7 @@ mod tests {
             review.starts_with(concat!(
                 "Update cagents 0.1.3+local.991daa43e -> 0.1.3+local.d2509365\n",
                 "2 windows close and reopen.\n\n",
-                "  Keep running (7)        5 terminals, 2 agents; nothing restarts\n",
+                "  Keep running (7)        5 terminals, 2 agents; work continues\n",
             )),
             "{review}"
         );
@@ -552,7 +854,9 @@ mod tests {
         );
         assert_eq!(
             review
-                .matches(": keeps running in its terminal; its chat panel disconnects.")
+                .matches(
+                    ": keeps working; its console reconnects in the same pane after the update."
+                )
                 .count(),
             2,
             "{review}"
@@ -701,7 +1005,9 @@ mod tests {
                 super::super::source_inspection::InspectedPane {
                     kind: SessionKind::NativeChat,
                     outcome: SavedOutcome::KeepsRunning,
-                    detail: "keeps running in its terminal; its chat panel disconnects".into(),
+                    detail:
+                        "keeps working; its console reconnects in the same pane after the update"
+                            .into(),
                 },
             );
             preview.daemon.as_mut().unwrap().sessions.push(live);

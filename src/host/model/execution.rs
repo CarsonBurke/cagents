@@ -256,6 +256,24 @@ impl Registry {
         retained: &[HostedSession],
         successor: &HostedSession,
     ) -> Result<bool, String> {
+        self.adopt_authenticated_agent_session_inner(retained, successor, None)
+    }
+
+    pub(in crate::host) fn adopt_authenticated_console_session(
+        &mut self,
+        retained: &[HostedSession],
+        successor: &HostedSession,
+        replacement: &super::console_relaunch::ConsoleRelaunch,
+    ) -> Result<bool, String> {
+        self.adopt_authenticated_agent_session_inner(retained, successor, Some(replacement))
+    }
+
+    fn adopt_authenticated_agent_session_inner(
+        &mut self,
+        retained: &[HostedSession],
+        successor: &HostedSession,
+        replacement: Option<&super::console_relaunch::ConsoleRelaunch>,
+    ) -> Result<bool, String> {
         if retained.is_empty() || retained.iter().any(|source| source.id() != successor.id()) {
             return Err("Agent adoption requires exact same-session holder lineage".into());
         }
@@ -263,6 +281,18 @@ impl Registry {
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
+        if let Some(intent) = replacement {
+            super::console_relaunch::require_current(&tx, intent)?;
+            if !matches!(successor, HostedSession::Chat(next) if
+                next.id == intent.source.id
+                && next.terminal.as_ref().is_some_and(|terminal| intent.recognizes_target(terminal)))
+                || intent.replacement_holder.is_none()
+            {
+                return Err(
+                    "The acknowledged console does not match its replacement intent".into(),
+                );
+            }
+        }
         let authority: Option<String> = tx
             .query_row(
                 "SELECT source FROM agent_authorities WHERE session_id = ?1",
@@ -278,11 +308,19 @@ impl Registry {
             return Err("The issuing capability belongs to another session lineage".into());
         }
         let row: Option<String> = tx.query_row("SELECT record FROM agents WHERE session_id = ?1 OR id = (SELECT agent FROM agent_launches WHERE session_id = ?1)", [successor.id().to_string()], |row| row.get(0)).optional().map_err(|error| error.to_string())?;
+        if replacement.is_some() && row.is_none() {
+            return Err("The console replacement's agent binding disappeared".into());
+        }
         let mut changed = false;
         if let Some(row) = row {
             let mut agent: Agent = decode(&row)?;
             if agent.closed {
                 return Err("A retired agent cannot regain process authority".into());
+            }
+            if replacement.is_some_and(|intent| {
+                agent.id != intent.agent || agent.console.as_ref() != Some(&intent.console)
+            }) {
+                return Err("The agent's console changed during its replacement".into());
             }
             if let Some(source) = &agent.session {
                 if !recognizes(source) {
@@ -296,16 +334,27 @@ impl Registry {
                         .terminal
                         .as_ref()
                         .filter(|terminal| {
-                            terminal.id == console.id && terminal.launch == console.launch
+                            terminal.id == console.id
+                                && (terminal.launch == console.launch || replacement.is_some())
                         })
                         .ok_or("The retained console does not match the durable provider pair")?;
                     agent.console = Some(terminal.clone());
                 }
                 changed = agent.session.as_ref() != Some(successor);
                 agent.session = Some(successor.clone());
-                changed |= super::views::adopt_authenticated_agent_pane(
-                    &tx, agent.id, retained, successor,
-                )?;
+                changed |= if let Some(intent) = replacement {
+                    super::views::adopt_authenticated_agent_pane_with_console(
+                        &tx,
+                        agent.id,
+                        retained,
+                        successor,
+                        Some(&intent.console),
+                    )?
+                } else {
+                    super::views::adopt_authenticated_agent_pane(
+                        &tx, agent.id, retained, successor,
+                    )?
+                };
                 tx.execute(
                     "UPDATE agents SET record = ?2 WHERE id = ?1",
                     params![agent.id.to_string(), encode(&agent)?],
@@ -333,6 +382,13 @@ impl Registry {
             tx.execute(
                 "UPDATE agent_authorities SET source = ?2 WHERE session_id = ?1",
                 params![successor.id().to_string(), encode(successor)?],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        if let Some(intent) = replacement {
+            tx.execute(
+                "DELETE FROM console_relaunches WHERE actor=?1",
+                [intent.actor.to_string()],
             )
             .map_err(|error| error.to_string())?;
         }

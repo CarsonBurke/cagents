@@ -881,6 +881,16 @@ pub(super) fn adopt_authenticated_agent_pane(
     retained: &[crate::agent_execution::HostedSession],
     successor: &crate::agent_execution::HostedSession,
 ) -> Result<bool, String> {
+    adopt_authenticated_agent_pane_with_console(db, agent, retained, successor, None)
+}
+
+pub(super) fn adopt_authenticated_agent_pane_with_console(
+    db: &Connection,
+    agent: crate::model::AgentId,
+    retained: &[crate::agent_execution::HostedSession],
+    successor: &crate::agent_execution::HostedSession,
+    replaced_console: Option<&crate::model::TerminalSession>,
+) -> Result<bool, String> {
     use crate::{agent_execution::HostedSession, model::CardKind};
     let id = crate::model::CardId::from_uuid(agent.as_uuid());
     let Some(scope) = owner(db, id)? else {
@@ -908,20 +918,25 @@ pub(super) fn adopt_authenticated_agent_pane(
             let Some(next) = terminal(successor) else {
                 return Ok(false);
             };
-            if !retained.iter().any(|source| {
-                terminal(source).as_ref() == Some(current)
-                    && match (source, successor) {
-                        (HostedSession::Terminal(_), HostedSession::Terminal(_)) => true,
-                        (HostedSession::Chat(old), HostedSession::Chat(next)) => {
-                            crate::chat::is_upgrade_recovery(old, next)
-                                || crate::chat::is_upgrade_identity_learning(old, next)
+            let replacing_console = replaced_console.is_some_and(|old| {
+                crate::agent_execution::same_terminal_process(current, old) && next.id == old.id
+            });
+            if !replacing_console
+                && !retained.iter().any(|source| {
+                    terminal(source).as_ref() == Some(current)
+                        && match (source, successor) {
+                            (HostedSession::Terminal(_), HostedSession::Terminal(_)) => true,
+                            (HostedSession::Chat(old), HostedSession::Chat(next)) => {
+                                crate::chat::is_upgrade_recovery(old, next)
+                                    || crate::chat::is_upgrade_identity_learning(old, next)
+                            }
+                            _ => false,
                         }
-                        _ => false,
-                    }
-            }) || !current
-                .continuity
-                .live_proof()
-                .is_some_and(|proof| proof.is_complete())
+                })
+                || !current
+                    .continuity
+                    .live_proof()
+                    .is_some_and(|proof| proof.is_complete())
                 || !next
                     .continuity
                     .live_proof()
