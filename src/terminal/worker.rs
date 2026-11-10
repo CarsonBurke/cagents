@@ -8366,7 +8366,7 @@ os._exit(0)
             boot_id: proof.boot_id.clone(),
             host_incarnation: proof.host_incarnation.clone(),
         };
-        let recovery = holder::Recovery {
+        let recovery = crate::terminal::holder::Recovery {
             source: source.clone(),
             previous_sources: Vec::new(),
             relaunches: Vec::new(),
@@ -8431,7 +8431,7 @@ os._exit(0)
         let mut wrong_proof = proof.clone();
         wrong_proof.host_incarnation =
             crate::model::HostIncarnation::new(uuid::Uuid::new_v4().to_string());
-        assert!(holder::cleanup::authorize(&wrong_proof).is_err());
+        assert!(crate::terminal::holder::cleanup::authorize(&wrong_proof).is_err());
         let closed = thread::scope(|scope| {
             let close = scope.spawn(|| handle.close_with_receipt(&source, &proof));
             // Observe the real public request's priority admission before
@@ -8470,16 +8470,18 @@ os._exit(0)
         let joined = handle.worker_joined_for_test();
         let screen = handle.snapshot();
         let events: Vec<_> = handle.events().try_iter().collect();
-        let confirmed = holder::cleanup::confirmed(&source, &record, &proof);
+        let confirmed = crate::terminal::holder::cleanup::confirmed(&source, &record, &proof);
         let mut wrong_source = source.clone();
         wrong_source
             .launch
             .arguments
             .push("different source".into());
-        let wrong_source_confirmed = holder::cleanup::confirmed(&wrong_source, &record, &proof);
+        let wrong_source_confirmed =
+            crate::terminal::holder::cleanup::confirmed(&wrong_source, &record, &proof);
         let mut wrong_record = record.clone();
         wrong_record.holder.start += 1;
-        let wrong_holder_confirmed = holder::cleanup::confirmed(&source, &wrong_record, &proof);
+        let wrong_holder_confirmed =
+            crate::terminal::holder::cleanup::confirmed(&source, &wrong_record, &proof);
         drop(handle);
         assert!(closed.is_ok(), "{closed:?}");
         assert!(
