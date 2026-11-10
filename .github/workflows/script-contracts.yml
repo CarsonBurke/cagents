@@ -224,6 +224,7 @@ jobs:
               ("main build sentinel", "scripts/main-build-sentinel", "tests/main_build_sentinel.py"),
               ("focused lib tests", "scripts/test-lib", "tests/test_lib.py"),
               ("lock holders", "scripts/lock-holders", "tests/lock_holders.py"),
+              ("merge queue", "scripts/merge-queue", "tests/merge_queue.py"),
               ("memory limit", "scripts/memory-capped", "tests/memory_capped.py"),
               ("workload time limit", "scripts/bounded", "tests/bounded.py"),
               ("synthetic Claude provider", "tests/fixtures/chat-composer-claude.sh", "tests/chat_composer_provider.py"),

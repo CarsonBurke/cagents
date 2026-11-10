@@ -5,6 +5,7 @@
 - [Development runner](#development-runner)
 - [Build and test resource usage](#build-and-test-resource-usage)
 - [Testing](#testing)
+- [Merge queue](#merge-queue)
 - [Native evidence](#native-evidence)
 - [Installer and package checks](#installer-and-package-checks)
 - [Troubleshooting](#troubleshooting)
@@ -1504,6 +1505,107 @@ For UI changes, launch the real UI with
 the runner and exercise the changed path. For browser or feature-boundary
 changes, verify both the browserless and integrated lanes. Performance
 workloads are described in [Performance](performance.md).
+
+## Merge queue
+
+Stewards can share one validation cycle with `scripts/merge-queue` instead of
+holding `/var/tmp/cagents-merge.lock` through separate builds. Use one clone
+and its linked worktrees for the queue: independent clones or machines have
+independent queues. Finish review and the checks appropriate to your change
+before enqueueing; enqueue authorizes the runner to merge the pinned PR.
+
+```sh
+scripts/merge-queue enqueue 1234                  # current PR head
+scripts/merge-queue enqueue 1235 --sha FULL_SHA   # exact reviewed head
+scripts/merge-queue status
+scripts/merge-queue wait 1234
+```
+
+`enqueue` records a durable request and returns after starting a detached
+runner if needed. Repeating an active request for the same head is idempotent;
+a different head is refused until that request finishes. `wait` follows the
+latest request that existed when it started, prints its outcome and exits.
+After resolving a rejection, enqueue again to create a new request. Already
+merged PRs report `pr-closed`. `wait` can restart an interrupted runner.
+
+| Wait exit | Outcome | Steward action |
+| --- | --- | --- |
+| 0 | `merged` | Merge and tree verification succeeded |
+| 2 | `conflict` | Resolve the textual conflict and enqueue the new head |
+| 3 | `lane-failure` | Inspect the first error lines and full lane log, fix and enqueue again |
+| 4 | `ci-not-green` | Wait for all checks to complete successfully, or fix CI; then enqueue again |
+| 5 | `head-moved` | Review the new head and enqueue its SHA |
+| 6 | `pr-closed` | PR is closed or already merged |
+| 7 | `tree-mismatch` | Queue halted; inspect actual main and the tested tree before further merges |
+| 8 | `runner-error` | Inspect logs and remote state before enqueueing again; a write may have completed |
+
+The runner takes pending requests in enqueue order, checks that each PR is
+open, ready for review, targets `main`, and still has its requested head. One
+aggregate GitHub GraphQL read per PR supplies metadata and CI, including
+legacy commit statuses. Reads are cached across enqueue and runner processes
+for two minutes. Missing, unfinished, unsuccessful or incomplete CI evidence
+is rejected; more than 100 check contexts is treated as incomplete. No
+background CI watch is started. Rate limits honor `Retry-After` or GitHub's
+resource reset, with at least two minutes before retrying.
+
+It fetches fresh `origin/main`, creates a detached checkout under the main
+worktree's `.worktrees/merge-queue-batch`, and merges each pinned head locally.
+Textual conflicts are excluded. It checks the resulting head in three
+separate invocations, through the tested checkout's gate:
+
+```sh
+scripts/cargo-gate check --locked --no-default-features --all-targets
+scripts/cargo-gate check --locked --no-default-features --all-targets --features host
+scripts/cargo-gate check --locked --no-default-features --all-targets --features ui
+```
+
+A lane failure first checks the unchanged base: a failing base or build host
+reports `runner-error`, without blaming a PR. Otherwise the runner halves and
+retests the batch against a passing prefix, retaining a final group that passed
+all three lanes. If both halves fail, one bounded sweep tests the full group
+with one PR omitted at a time to preserve cooperating changes. Lane attribution
+is against the retained group; arbitrary interacting failures need not have a
+unique independent culprit. Error excerpts and full lane logs are retained.
+Requests arriving during a round enter the next round of the same runner.
+
+Before each merge write, including after a rate-limit cooldown, the runner
+fetches `main` again. A changed base rebuilds and rechecks the remaining batch.
+Writes use the pinned merge endpoint:
+
+```sh
+gh api -X PUT repos/OWNER/REPO/pulls/N/merge -f merge_method=merge -f sha=SHA
+```
+
+Each returned main tree must equal the corresponding prefix of the validated batch; the final tree must equal the batch's tested tree. No
+outcomes are published until the round finishes verification. A mismatch
+halts the queue, appears in `status`, and overrides every request in that
+round and every pending request with `tree-mismatch`.
+
+GitHub pins the PR head, but this merge endpoint cannot pin the base. Everyone
+merging through this shared queue prevents local write races. A writer outside
+the queue can still move main between the final fetch and the PUT; tree
+verification detects that race and halts further writes. Keep stewards on this
+queue rather than mixing it with the prototype or per-steward merge locks.
+
+State, locks, request history, `runner.log`, lane logs and scratch files live
+under `$(git rev-parse --path-format=absolute --git-common-dir)/merge-queue/`.
+The queue writes nothing to `/tmp`. `status` prints this directory and the
+current batch, lane, log path and tested head/tree. Keep the checkout whose
+script started the runner until the queue empties. Logs and history remain
+after the detached batch checkout is removed.
+
+Only one runner holds the repo-local flock. Its active gate inherits that
+lease so an interrupted runner cannot have its checkout reused while a build
+survives. Recovery marks interrupted requests `runner-error` instead of
+replaying possibly completed merge writes. Inspect GitHub and logs before
+reenqueueing them. A persistent mismatch alert requires investigation and
+manual acknowledgement: with no runner holding `runner.lock`, preserve the
+state/logs, acquire `state.lock`, and clear only the JSON `alert` field after
+main has been checked. Do not delete state while requests are active.
+
+Run the offline contracts with `/usr/bin/python3 -I -B tests/merge_queue.py -v`.
+They use real local Git repositories and fake GitHub/Cargo peers; they never
+merge a live PR or compile Rust. The script-contracts CI workflow runs them too.
 
 ## Native evidence
 
