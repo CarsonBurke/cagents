@@ -5123,7 +5123,10 @@ mod tests {
             let runtime = app.cards.get(&pane.id).unwrap() as *const CardRuntime;
             app.shared_views.scope_discovery_count.set(0);
             let task = app.release_held_terminals();
-            assert!(cosmic::iced::runtime::task::into_stream(task).is_none());
+            if let Some(mut stream) = cosmic::iced::runtime::task::into_stream(task) {
+                use cosmic::iced::futures::StreamExt;
+                assert!(cosmic::iced::futures::executor::block_on(stream.next()).is_none());
+            }
             assert_eq!(app.shared_views.scope_discovery_count.get(), 0);
             assert!(
                 !app.shared_views
