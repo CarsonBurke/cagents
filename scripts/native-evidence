@@ -752,19 +752,21 @@ run_app() {
     return "$status"
 }
 
-# Observe the explicit machine format; display text is not a window contract.
+# Query the isolated compositor, which represents a closed window as [].
 app_window_is_open() {
     local observed
-    observed=$(timeout -k 1 10 niri-harness --no-heal --session "$session_name" --json observe --no-text 2>/dev/null) || return 2
+    observed=$(timeout -k 1 10 niri msg --json windows 2>/dev/null) || return 2
     /usr/bin/python3 -c 'import json,sys
 try:
-    state=json.load(sys.stdin)
-    if not isinstance(state,dict) or "window" not in state:
+    windows=json.load(sys.stdin)
+    if not isinstance(windows,list):
         sys.exit(2)
-    window=state["window"]
-    if window is None:
-        sys.exit(1)
-    sys.exit(0 if isinstance(window,dict) and window else 2)
+    for window in windows:
+        if not isinstance(window,dict) or "app_id" not in window:
+            sys.exit(2)
+        if window["app_id"] is not None and not isinstance(window["app_id"],str):
+            sys.exit(2)
+    sys.exit(0 if any(window["app_id"] == "dev.cagents.Cagents.Development" for window in windows) else 1)
 except (ValueError,AttributeError):
     sys.exit(2)
 ' <<<"$observed"

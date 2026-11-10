@@ -866,7 +866,8 @@ class Evidence(unittest.TestCase):
         (self.task / "niri" / "session.rc").write_text("0")
         (self.logs / "ui-absent").touch()
         before = (self.logs / "runner").read_text()
-        for marker in ("observe-error", "observe-malformed"):
+        for marker in ("niri-error", "niri-malformed", "niri-object", "niri-scalar",
+                       "niri-missing-app", "niri-scalar-record", "niri-invalid-app"):
             with self.subTest(marker=marker):
                 failed = self.logs / marker
                 failed.touch()
@@ -880,9 +881,18 @@ class Evidence(unittest.TestCase):
         self.run_tool("stop")
 
     def test_relaunch_keeps_the_session_and_replays_only_the_built_products(self) -> None:
+        self.assert_relaunch_keeps_built_products()
+
+    def test_relaunch_ignores_unrelated_compositor_windows(self) -> None:
+        (self.logs / "other-window").touch()
+        self.assert_relaunch_keeps_built_products()
+
+    def assert_relaunch_keeps_built_products(self) -> None:
         self.built()
         self.run_tool("start", "after")
         original_pid = int((self.logs / "ui-pid").read_text())
+        # A previous runner receipt cannot establish that the current window closed.
+        (self.task / "niri" / "session.rc").write_text("0")
         refused = self.run_tool("relaunch", check=False)
         self.assertNotEqual(refused.returncode, 0)
         self.assertIn("close the app window", refused.stderr)
@@ -905,6 +915,7 @@ class Evidence(unittest.TestCase):
                 time.sleep(0.05)
             else:
                 self.fail("relaunched UI did not appear: " + output.read_text())
+            self.assertIn("msg --json windows", (self.logs / "niri").read_text())
             self.assertFalse(self.lock_is_free(self.native_lock))
             self.assertEqual((self.logs / "cargo").read_text(), cargo_before)
             self.assertEqual((self.task / "fixture" / "home" / ".claude").stat().st_ino, identity)
