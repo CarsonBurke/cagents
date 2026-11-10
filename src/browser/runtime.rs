@@ -1101,6 +1101,7 @@ impl CardSession {
         let buffer = match self.rendering.draw_buffer_size() {
             Ok(buffer) => buffer,
             Err(error) => {
+                tracing::warn!(%error, "cannot query the browser draw buffer");
                 events.semantic(BrowserEvent::Error(error));
                 return;
             }

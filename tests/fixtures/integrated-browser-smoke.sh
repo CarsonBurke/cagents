@@ -24,7 +24,7 @@ document=$(cat <<'HTML'
 <style>body{font:24px sans-serif;color:#111;background:#fff;margin:24px}input,button{font:24px sans-serif;padding:12px}#spinner{width:32px;height:32px;border:6px solid #ddd;border-top-color:#1677bd;border-radius:50%;animation:spin 1s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}</style>
 <h1>Native browser ready</h1><div id="spinner"></div>
 <p><input aria-label="Type value" placeholder="Type value" oninput="document.getElementById('echo').textContent='Typed '+this.value"></p>
-<button onclick="window.count=(window.count||0)+1;document.getElementById('count').textContent='Count '+window.count">Increment</button>
+<button onclick="const clicks=Number(this.dataset.clicks||0)+1;this.dataset.clicks=String(clicks);document.getElementById('count').textContent='Count '+clicks">Increment</button>
 <h2 id="echo">Waiting for input</h2><h2 id="count">Count 0</h2>
 <p style="margin-top:1200px">Bottom marker</p>
 HTML
@@ -100,11 +100,16 @@ evidence drive click Increment
 evidence drive wait 'Count 1' --timeout 15
 evidence drive key space
 evidence drive wait 'Count 2' --timeout 15
-evidence drive scroll v 80 --at 'Native browser ready'
+# Increment left the pointer inside the page. Keep that scroll target across
+# both directions, without resolving an unrelated heading again.
+evidence drive scroll v 80
 evidence drive wait 'Bottom marker' --timeout 15
-evidence drive scroll v -80 --at 'Bottom marker'
-evidence drive wait 'Native browser ready' --timeout 15
+evidence drive scroll v -80
+evidence drive wait 'Typed native42' --timeout 15
+evidence drive wait 'Count 2' --timeout 15
 evidence shot browser-wide
 evidence nested niri msg action set-column-width '75%'
-evidence drive wait 'Native browser ready' --timeout 15
+# Form state must survive the resize; the heading may wrap onto two lines.
+evidence drive wait 'Typed native42' --timeout 15
+evidence drive wait 'Count 2' --timeout 15
 evidence shot browser-narrow
