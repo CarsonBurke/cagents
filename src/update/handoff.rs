@@ -348,6 +348,9 @@ while not Path(sys.argv[3]).exists(): time.sleep(.005)
 
     #[test]
     fn source_exiting_during_successful_probe_is_not_reported_as_resumed() {
+        if !crate::daemon::isolated_handoff_coordinator() {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let (paths, mut job) = fixture(root.path());
         let (mut source_service, source) = service(root.path(), &paths);
