@@ -2030,17 +2030,22 @@ mod tests {
                 "cold clone has no styled allocation"
             );
         }
-        // Item's largest variant embeds two Text nodes. Bound the cold graph
-        // representation independently of whether a particular theme is used.
+        // Bound the per-node cold storage, including the raw Flow capture,
+        // independently of theme or whether caches were materialized.
         assert!(
-            std::mem::size_of::<Text>() <= 192,
+            std::mem::size_of::<Text>() <= 96,
             "cold Text bytes: {}",
             std::mem::size_of::<Text>()
         );
         assert!(
-            std::mem::size_of::<Item>() <= 448,
+            std::mem::size_of::<Item>() <= 128,
             "cold Item bytes: {}",
             std::mem::size_of::<Item>()
+        );
+        assert!(
+            std::mem::size_of::<FlowText>() <= 96,
+            "cold Flow text bytes: {}",
+            std::mem::size_of::<FlowText>()
         );
     }
 
