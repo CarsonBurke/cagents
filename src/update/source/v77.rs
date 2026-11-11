@@ -757,7 +757,9 @@ mod tests {
                 io::ErrorKind::WouldBlock,
                 "unqualified source must not receive an authenticated control connection"
             );
-            fs::write(root.join("observed"), b"Connect only").unwrap();
+            // Publish the complete receipt before existence wakes the parent.
+            fs::write(root.join("observed.pending"), b"Connect only").unwrap();
+            fs::rename(root.join("observed.pending"), root.join("observed")).unwrap();
             // Stay alive with the original lease until the parent finishes its
             // read-only assertions and closes this owned child's input pipe.
             assert_eq!(io::stdin().read(&mut [0]).unwrap(), 0);
