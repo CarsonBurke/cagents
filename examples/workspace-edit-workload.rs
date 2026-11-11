@@ -3,6 +3,10 @@
 
 cagents::stamp_version!();
 
+#[cfg(feature = "development")]
+#[path = "support/workspace_fixture.rs"]
+mod workspace_fixture;
+
 #[cfg(not(feature = "development"))]
 fn main() {
     eprintln!("workspace-edit-workload requires --features development");
@@ -13,8 +17,7 @@ fn main() {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use cagents::{
         control::ControlClient,
-        model::{BrowserId, BrowserRestoreFidelity, BrowserSession, CardId, CardKind, ChannelId},
-        terminal::ipc::daemon_socket_path,
+        model::{BrowserId, CardId, CardKind, ChannelId},
         workspace_model::{
             ModelEdit,
             views::{Change, Pane, Scope},
@@ -26,63 +29,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     fn prepared_pane(id: CardId, browser: BrowserId) -> Result<Pane, Box<dyn std::error::Error>> {
-        Ok(Pane {
-            id,
-            title: "Edit measurement".into(),
-            user_title: Some("Edit measurement".into()),
-            pending_terminal_start: false,
-            width_fraction: 0.5,
-            scope: None,
-            kind: CardKind::Browser(BrowserSession {
-                id: browser,
-                current_url: "about:blank".parse()?,
-                history: vec![],
-                history_index: 0,
-                scroll_x: 0.0,
-                scroll_y: 0.0,
-                fidelity: BrowserRestoreFidelity::UrlOnly,
-            }),
-        })
+        workspace_fixture::browser_pane(id, browser, "Edit measurement")
     }
 
     let arguments: Vec<_> = std::env::args().skip(1).collect();
     if arguments.len() != 3 {
-        return Err("usage: workspace-edit-workload FIXTURE_ROOT EDITS INTERVAL_MS".into());
+        return Err("usage: workspace-edit-workload FIXTURE_ROOT EDITS INTERVAL_MS | FIXTURE_ROOT focused-transfer WORKTREE_PATH".into());
     }
-    let root = PathBuf::from(&arguments[0]).canonicalize()?;
-    let task = root.parent().ok_or("fixture has no parent")?;
-    if !task.join(".native-evidence").is_file()
-        || root.file_name().is_none_or(|name| name != "fixture")
-    {
-        return Err("the root must be a native-evidence task's fixture directory".into());
+    let fixture = workspace_fixture::Fixture::open(PathBuf::from(&arguments[0]))?;
+    if arguments[1] == "focused-transfer" {
+        return workspace_fixture::focused_transfer(&fixture, PathBuf::from(&arguments[2]));
     }
-    let socket = daemon_socket_path()?;
-    let runtime = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").ok_or("XDG_RUNTIME_DIR")?);
-    let namespace = match std::env::var("CAGENTS_DEVELOPMENT_INSTANCE") {
-        Ok(name)
-            if !name.is_empty()
-                && name.len() <= 24
-                && name
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-') =>
-        {
-            Some(format!("cagents-development-{name}"))
-        }
-        Err(std::env::VarError::NotPresent) => Some("cagents-development".to_owned()),
-        _ => None,
-    };
-    let nested_fixture = namespace.is_some_and(|namespace| {
-        runtime.file_name().is_some_and(|part| {
-            let part = part.to_string_lossy();
-            part.starts_with("nh-") && part.len() == 11
-        }) && socket == runtime.join(namespace).join("cagentsd.sock")
-    });
-    if !(socket.starts_with(task) || nested_fixture)
-        || !PathBuf::from(std::env::var_os("XDG_DATA_HOME").ok_or("XDG_DATA_HOME")?)
-            .starts_with(&root)
-    {
-        return Err("the selected daemon and data directory must belong to the fixture".into());
-    }
+    let root = fixture.root.clone();
+    let task = &fixture.task;
+    let socket = fixture.socket.clone();
+
     let edits: usize = arguments[1].parse()?;
     let interval = Duration::from_millis(arguments[2].parse()?);
     if !(1..=2000).contains(&edits)
@@ -183,7 +144,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // A native observer can select this pane before timed deadlines exist.
     // The optional marker belongs to this task, outside the restored fixture.
     if let Some(ready) = std::env::var_os("CAGENTS_WORKSPACE_EDIT_READY") {
-        use std::io::Write as _;
         let ready = PathBuf::from(ready);
         let parent = ready
             .parent()
@@ -193,11 +153,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("the ready marker must be under this task and outside the fixture".into());
         }
         let setup = serde_json::json!({"event":"prepared", "pane":pane.id.to_string(), "channel":channel.to_string()});
-        let mut file = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&ready)?;
-        writeln!(file, "{setup}")?;
+        workspace_fixture::publish_json(&ready, &setup)?;
         println!("{setup}");
         let deadline = Instant::now() + Duration::from_secs(120);
         while !ready.with_extension("go").is_file() {

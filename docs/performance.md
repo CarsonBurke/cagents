@@ -212,6 +212,75 @@ scanout, or input latency. Fixture providers exercise the transport and native
 UI without a live model, and generated saved panes do not establish successful
 provider reattachment.
 
+## Focused transfer persistence
+
+After the measured edit and rename/close flows, use a separate provider-free
+native-evidence task to check focus when a pane moves from a channel to a
+Worktree. Keep the benchmark seed, controller and timing intervals unchanged.
+Build both matched browserless sets before starting the fixture, and build the
+`workspace-edit-workload` example with `--features development` through the gate.
+Use the same `examples/support/workspace_fixture.rs` on both sides. A baseline
+without `ApplyWorkspaceEdit` still needs its explicit legacy timed adapter;
+sharing this scenario does not make the modern timed branch compile against an
+older library.
+
+In that task's environment, after both windows and the destination Worktree
+have opened:
+
+```sh
+CAGENTS_WORKSPACE_EDIT_READY="$task/focused-transfer-ready.json" \
+  scripts/bounded --ttl 300 --name focused-transfer -- \
+  "$products/examples/workspace-edit-workload" "$fixture" focused-transfer "$worktree"
+```
+
+The driver creates a manual source channel with two distinct about:blank
+Browser panes, `Transfer sibling` and `Transfer target`. If the destination has
+no canonical ordinary pane, it first adds a new about:blank destination anchor;
+every existing occupant is preserved. It writes the exact prepared
+IDs, scopes, descriptors, revisions, registry identity and store identities to
+the prepared marker. It waits at most 120 seconds. Keep the target focused in
+window 1's active source channel. In window 2, focus the same target, then select
+the destination Worktree and one of its canonical panes so the source is
+inactive with a valid selected strip. Before releasing the transfer, run:
+
+```sh
+/usr/bin/python3 tests/fixtures/focused-transfer-probe.py --root "$fixture" \
+  --prepared "$task/focused-transfer-ready.json" --phase before \
+  --output "$task/focused-transfer-before.json"
+(
+  set -eu
+  transfer_go=$(mktemp "$task/focused-transfer-go.XXXXXX")
+  trap 'rm -f -- "$transfer_go"' EXIT
+  jq -e '.go' "$task/focused-transfer-before.json" > "$transfer_go"
+  ln -T -- "$transfer_go" "$task/focused-transfer-ready.go"
+)
+```
+
+The temporary file is complete before the no-clobber hard link publishes it to
+the polling driver. Prepared markers use the same complete-before-visible rule.
+The go marker must echo the schema, nonce, registry, source channel, sibling,
+moved pane and destination scope exactly. The driver rechecks the prepared
+registry, views and store identities before issuing the carried legacy
+`Change::Transfer` RPC. This scenario uses no model provider and does not
+change the normal timed workload's payload or cadence. Unset and explicitly
+empty development-instance names both select the default fixture namespace;
+nonempty names retain the named-instance checks.
+
+Observe the surviving sibling and focus in window 1, then the moved Browser
+and its recovery/close controls under the destination Worktree in window 2.
+Run the probe again with `--phase after --before "$task/focused-transfer-before.json"`
+and a fresh output filename. It opens both distinct window stores read-only,
+requires sibling-only source membership and sibling focus, rejects stale
+channel placement, and checks exact Worktree custody and unchanged destination
+occupants. Save and close both native windows, then use maintained
+`native-evidence --task "$task" relaunch` to reopen the same state. After its
+new primary window maps, run `native-evidence --task "$task" open-window window-2`
+from another owned shell and repeat with `--phase reopened`. Both launch
+commands remain in the foreground; keep their owners alive through the proof.
+Do not use `start` for this persistence check: it restores the seed. Retain
+native observations and each probe's exact window-local IDs; a successful
+canonical transfer alone does not prove valid saved focus.
+
 ## Native chat stage attribution
 
 Development UI builds can record bounded, content-free **inclusive wall time**

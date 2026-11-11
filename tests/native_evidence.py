@@ -116,6 +116,30 @@ STUBS = {
         if [ -e "$STUB_LOG/niri-missing-app" ]; then printf '[{}]'; exit 0; fi
         if [ -e "$STUB_LOG/niri-scalar-record" ]; then printf '[true]'; exit 0; fi
         if [ -e "$STUB_LOG/niri-invalid-app" ]; then printf '[{"app_id":17}]'; exit 0; fi
+        if [ -e "$STUB_LOG/multiple-windows" ]; then
+            python3 - "$STUB_LOG" <<'WINDOWS'
+        import json, sys
+        from pathlib import Path
+        logs = Path(sys.argv[1])
+        windows = []
+        for record in logs.glob("window-id-*"):
+            pid = int(record.read_text())
+            try:
+                state = Path(f"/proc/{pid}/stat").read_text().split(") ", 1)[1].split()[0]
+            except FileNotFoundError:
+                continue
+            if state != "Z":
+                windows.append({"id": pid, "pid": pid, "app_id": "dev.cagents.Cagents.Development"})
+        foreign = logs / "foreign-window.json"
+        if foreign.exists():
+            windows.append(json.loads(foreign.read_text()))
+            (logs / "observed-foreign-window").touch()
+        for pending in logs.glob("window-pending-*"):
+            (logs / ("observed-" + pending.name)).touch()
+        print(json.dumps(windows))
+        WINDOWS
+            exit
+        fi
         if [ -e "$STUB_LOG/ui-absent" ]; then
             if [ -e "$STUB_LOG/other-window" ]; then
                 printf '[{"id":2,"app_id":"example.Other"}]'
@@ -123,7 +147,7 @@ STUBS = {
                 printf '[]'
             fi
         else
-            printf '[{"id":1,"app_id":"dev.cagents.Cagents.Development"}]'
+            printf '[{"id":1,"pid":%s,"app_id":"dev.cagents.Cagents.Development"}]' "$(cat "$STUB_LOG/ui-pid")"
         fi
     """,
     "magick": """
@@ -157,8 +181,25 @@ STUBS = {
     "fixture-cli": """
         #!/bin/bash
         if [ "${0##*/}" = cagents-ui ]; then
+            if [ -e "$STUB_LOG/multiple-windows" ]; then
+                window=primary
+                arguments=("$@")
+                for ((i=0; i<$#; i++)); do
+                    if [ "${arguments[i]}" = --window ]; then ((i+=1)); window=${arguments[i]}; fi
+                done
+                printf '%s\\n' "$$" > "$STUB_LOG/ui-pid-$window"
+                printf '%s\\n' "$*" > "$STUB_LOG/ui-ran-$window"
+                if { [ "$window" != primary ] && [ -e "$STUB_LOG/block-new-window" ]; } ||
+                   { [ "$window" = primary ] && [ -e "$STUB_LOG/block-primary-window" ]; }; then
+                    touch "$STUB_LOG/window-pending-$window"
+                    until [ -e "$STUB_LOG/release-$window" ]; do sleep 0.05; done
+                fi
+                printf '%s\\n' "$$" > "$STUB_LOG/.window-id-$$"
+                mv "$STUB_LOG/.window-id-$$" "$STUB_LOG/window-id-$window"
+            fi
             rm -f "$STUB_LOG/ui-absent"
-            printf '%s\\n' "$$" > "$STUB_LOG/ui-pid"
+            printf '%s\\n' "$$" > "$STUB_LOG/.ui-pid-$$"
+            mv "$STUB_LOG/.ui-pid-$$" "$STUB_LOG/ui-pid"
             printf '%s\\n' "$*" > "$STUB_LOG/ui-ran"
             exec sleep 300
         fi
@@ -270,6 +311,11 @@ class Evidence(unittest.TestCase):
             #!/bin/bash
             printf '%s\\n' "$*" >> "$STUB_LOG/runner"
             env >> "$STUB_LOG/runner-env"
+            app_arguments=()
+            while [ "$#" -gt 0 ]; do
+                if [ "$1" = -- ]; then shift; app_arguments=("$@"); break; fi
+                shift
+            done
             [ ! -e "$STUB_LOG/runner-checks" ] || cargo check --locked
             [ ! -e "$STUB_LOG/runner-exits" ] || exit 7
             common="--locked --profile dev-runtime --no-default-features --features"
@@ -277,7 +323,7 @@ class Evidence(unittest.TestCase):
             GATE_PLACEHOLDER build $common development --bin cagents
             GATE_PLACEHOLDER build $common development,host --bin cagentsd
             GATE_PLACEHOLDER build $common development,ui --bin cagents-ui
-            exec cargo run --quiet $common development,ui --bin cagents-ui -- --app-argument
+            exec cargo run --quiet $common development,ui --bin cagents-ui -- --app-argument "${app_arguments[@]}"
             """,
             self.logs,
         )
@@ -892,12 +938,256 @@ class Evidence(unittest.TestCase):
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn("could not observe whether", result.stderr)
                     self.assertEqual((self.logs / "runner").read_text(), before)
+                    self.assertFalse((self.task / "session" / "failed").exists())
+                    self.assertFalse((self.task / "session" / "stop").exists())
+                    self.assertFalse(self.lock_is_free(self.native_lock))
                 finally:
                     failed.unlink()
         self.run_tool("stop")
 
     def test_relaunch_keeps_the_session_and_replays_only_the_built_products(self) -> None:
         self.assert_relaunch_keeps_built_products()
+
+    def multiple_window_fixture(self) -> None:
+        (self.logs / "multiple-windows").touch()
+        self.built()
+        self.run_tool("start", "after")
+
+    def launch_window_command(self, *arguments):
+        output = self.logs / f"window-command-{time.monotonic_ns()}"
+        with output.open("w") as sink:
+            process = subprocess.Popen(
+                [str(SCRIPT), *arguments], env=self.env, stdin=subprocess.DEVNULL,
+                stdout=sink, stderr=sink,
+            )
+
+        def cleanup():
+            if process.poll() is None:
+                self.run_tool("stop", check=False)
+                process.terminate()
+                try:
+                    process.wait(timeout=20)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+
+        self.addCleanup(cleanup)
+        return process, output
+
+    def wait_window_marker(self, marker: Path, process=None, output=None) -> None:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if marker.exists() and (marker.suffix != ".json" or not (self.task / "session" / "replaying").exists()):
+                return
+            if process is not None and process.poll() is not None:
+                self.fail(output.read_text())
+            time.sleep(0.02)
+        self.fail(f"window receipt did not appear: {marker}\n" + (output.read_text() if output else ""))
+
+    def close_primary_window(self) -> None:
+        pid = int((self.logs / "ui-pid-primary").read_text())
+        os.kill(pid, 15)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                state = Path(f"/proc/{pid}/stat").read_text().split(") ", 1)[1].split()[0]
+            except FileNotFoundError:
+                break
+            if state == "Z":
+                break
+            time.sleep(0.02)
+        else:
+            self.fail("the previous primary UI did not exit")
+        (self.task / "niri" / "session.rc").write_text("0")
+
+    def wait_for_native_release(self) -> None:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if self.lock_is_free(self.native_lock):
+                return
+            time.sleep(0.05)
+        self.fail("the failed default relaunch kept the native lock")
+
+    def test_relaunch_early_exit_ends_the_empty_session(self) -> None:
+        self.multiple_window_fixture()
+        self.close_primary_window()
+        (self.logs / "runner-exits").touch()
+        result = self.run_tool("relaunch", check=False)
+        self.assertEqual(result.returncode, 7)
+        self.assertIn("relaunched app exited before its window", (self.task / "session" / "failed").read_text())
+        self.assertTrue((self.task / "session" / "stop").exists())
+        self.assertFalse((self.task / "session" / "replaying").exists())
+        self.wait_for_native_release()
+
+    def test_relaunch_readiness_timeout_ends_the_empty_session(self) -> None:
+        self.multiple_window_fixture()
+        self.close_primary_window()
+        (self.logs / "block-primary-window").touch()
+        result = self.run_tool("relaunch", check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("within 30 seconds", (self.task / "session" / "failed").read_text())
+        self.assertTrue((self.task / "session" / "stop").exists())
+        self.assertFalse((self.task / "session" / "replaying").exists())
+        self.wait_for_native_release()
+
+    def test_unmapped_relaunch_cannot_fail_a_replacement_session(self) -> None:
+        self.multiple_window_fixture()
+        self.close_primary_window()
+        (self.logs / "block-primary-window").touch()
+        process, output = self.launch_window_command("relaunch")
+        self.wait_window_marker(self.logs / "observed-window-pending-primary", process, output)
+        pid_record = self.task / "session" / "pid"
+        original = pid_record.read_text()
+        replacement = subprocess.Popen(["sleep", "60"], env=self.env)
+        try:
+            # Model a new live session taking the shared record while the old
+            # unmapped launch is still unwinding its owned runner.
+            temporary = pid_record.with_suffix(".replacement")
+            temporary.write_text(str(replacement.pid) + "\n")
+            temporary.replace(pid_record)
+            self.assertEqual(process.wait(timeout=20), 1, output.read_text())
+            self.assertEqual(pid_record.read_text(), str(replacement.pid) + "\n")
+            self.assertFalse((self.task / "session" / "failed").exists())
+            self.assertFalse((self.task / "session" / "stop").exists())
+            self.assertIsNone(replacement.poll())
+        finally:
+            pid_record.write_text(original)
+            replacement.terminate()
+            replacement.wait(timeout=5)
+
+    def test_open_window_requires_a_new_id_before_restoring_real_cargo(self) -> None:
+        self.multiple_window_fixture()
+        original = int((self.logs / "ui-pid-primary").read_text())
+        built = (self.logs / "cargo").read_text()
+        (self.logs / "block-new-window").touch()
+        process, output = self.launch_window_command("open-window", "window-2")
+        # The runner has reached the UI, and the readiness probe has actually
+        # observed the existing window while this new one is blocked.
+        self.wait_window_marker(self.logs / "observed-window-pending-window-2", process, output)
+        self.assertTrue((self.task / "session" / "replaying").exists())
+        self.assertFalse((self.task / "session" / "window-window-2.json").exists())
+        self.assertEqual((self.logs / "cargo").read_text(), built)
+        os.kill(original, 0)
+        # A newly mapped but foreign Development window is not readiness for
+        # this runner and must not restore real Cargo either.
+        foreign = {"id": original + 10000000, "pid": original,
+                   "app_id": "dev.cagents.Cagents.Development"}
+        temporary = self.logs / ".foreign-window.json"
+        temporary.write_text(json.dumps(foreign))
+        temporary.replace(self.logs / "foreign-window.json")
+        self.wait_window_marker(self.logs / "observed-foreign-window", process, output)
+        self.assertTrue((self.task / "session" / "replaying").exists())
+        (self.logs / "release-window-2").touch()
+        self.wait_window_marker(self.task / "session" / "window-window-2.json", process, output)
+        self.assertNotEqual(json.loads((self.task / "session" / "window-window-2.json").read_text())["window_id"], original)
+        self.assertNotEqual(json.loads((self.task / "session" / "window-window-2.json").read_text())["window_id"], foreign["id"])
+        self.assertIn("--window window-2", (self.logs / "ui-ran-window-2").read_text())
+        self.assertIn(f"--log-file {self.task}/logs/ui-after-window-2.log", (self.logs / "runner").read_text())
+        self.assertFalse((self.task / "session" / "replaying").exists())
+        self.assertEqual((self.logs / "cargo").read_text(), built)
+        self.assertIsNone(process.poll())
+        os.kill(original, 0)
+
+    def test_open_window_admits_beside_a_foreground_default_relaunch(self) -> None:
+        self.multiple_window_fixture()
+        self.close_primary_window()
+        default, default_output = self.launch_window_command("relaunch")
+        self.wait_window_marker(self.task / "session" / "window-primary.json", default, default_output)
+        second, second_output = self.launch_window_command("open-window", "window-2")
+        self.wait_window_marker(self.task / "session" / "window-window-2.json", second, second_output)
+        self.assertIsNone(default.poll())
+        self.assertIsNone(second.poll())
+        self.assertNotIn("--window", (self.logs / "ui-ran-primary").read_text())
+        self.assertFalse(self.lock_is_free(self.native_lock))
+
+    def test_open_window_refuses_duplicate_and_malformed_slots_without_running(self) -> None:
+        self.multiple_window_fixture()
+        process, output = self.launch_window_command("open-window", "window-2")
+        self.wait_window_marker(self.task / "session" / "window-window-2.json", process, output)
+        before = (self.logs / "runner").read_text()
+        for arguments in [(), ("",), ("primary",), ("update",), ("x" * 41,),
+                          ("../window",), ("wíndow",),
+                          ("window-2",), ("window-2", "window-3")]:
+            with self.subTest(arguments=arguments):
+                result = self.run_tool("open-window", *arguments, check=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual((self.logs / "runner").read_text(), before)
+
+    def test_open_window_early_exit_restores_replay_and_admission(self) -> None:
+        self.multiple_window_fixture()
+        original = int((self.logs / "ui-pid-primary").read_text())
+        built = (self.logs / "cargo").read_text()
+        (self.logs / "runner-exits").touch()
+        result = self.run_tool("open-window", "window-2", check=False)
+        self.assertEqual(result.returncode, 7)
+        self.assertIn("exited before its new window", result.stderr)
+        self.assertFalse((self.task / "session" / "replaying").exists())
+        self.assertTrue(self.lock_is_free(self.task / "session" / "window-launch.lock"))
+        self.assertTrue(self.lock_is_free(self.task / "session" / "window-window-2.lock"))
+        self.assertEqual((self.logs / "cargo").read_text(), built)
+        os.kill(original, 0)
+        (self.logs / "runner-exits").unlink()
+        self.assertFalse((self.task / "session" / "failed").exists())
+        self.assertFalse((self.task / "session" / "stop").exists())
+        self.assertFalse(self.lock_is_free(self.native_lock))
+        process, output = self.launch_window_command("open-window", "window-2")
+        self.wait_window_marker(self.task / "session" / "window-window-2.json", process, output)
+
+    def test_open_window_preserves_a_valid_leading_hyphen_slot(self) -> None:
+        self.multiple_window_fixture()
+        process, output = self.launch_window_command("open-window", "--window")
+        self.wait_window_marker(self.task / "session" / "window---window.json", process, output)
+        self.assertEqual((self.logs / "ui-ran---window").read_text().strip(),
+                         "--app-argument --window --window")
+
+    def test_open_window_cleanup_preserves_a_replacement_session_record(self) -> None:
+        self.multiple_window_fixture()
+        process, output = self.launch_window_command("open-window", "window-2")
+        path = self.task / "session" / "window-window-2.json"
+        self.wait_window_marker(path, process, output)
+        # IDs can repeat after compositor restart. Ownership must include the
+        # session and launch token, rather than trusting that same integer.
+        replacement = {**json.loads(path.read_text()), "owner": "replacement-launch",
+                       "session_start": "replacement-session"}
+        temporary = path.with_suffix(".replacement")
+        temporary.write_text(json.dumps(replacement))
+        temporary.replace(path)
+        process.terminate()
+        self.assertEqual(process.wait(timeout=20), 143, output.read_text())
+        self.assertEqual(json.loads(path.read_text()), replacement)
+
+    def test_open_window_cancel_reaps_pending_runner_and_restores_replay(self) -> None:
+        self.multiple_window_fixture()
+        original = int((self.logs / "ui-pid-primary").read_text())
+        (self.logs / "block-new-window").touch()
+        process, output = self.launch_window_command("open-window", "window-2")
+        self.wait_window_marker(self.logs / "observed-window-pending-window-2", process, output)
+        pending = int((self.logs / "ui-pid-window-2").read_text())
+        process.terminate()
+        self.assertEqual(process.wait(timeout=20), 143, output.read_text())
+        self.assertFalse(Path(f"/proc/{pending}").exists())
+        self.assertFalse((self.task / "session" / "replaying").exists())
+        self.assertTrue(self.lock_is_free(self.task / "session" / "window-launch.lock"))
+        os.kill(original, 0)
+
+    def test_an_older_window_exit_does_not_clear_another_launch_replay(self) -> None:
+        self.multiple_window_fixture()
+        self.close_primary_window()
+        default, default_output = self.launch_window_command("relaunch")
+        self.wait_window_marker(self.task / "session" / "window-primary.json", default, default_output)
+        (self.logs / "block-new-window").touch()
+        second, output = self.launch_window_command("open-window", "window-2")
+        self.wait_window_marker(self.logs / "observed-window-pending-window-2", second, output)
+        self.close_primary_window()
+        self.assertEqual(default.wait(timeout=20), 143, default_output.read_text())
+        self.assertTrue((self.task / "session" / "replaying").exists())
+        (self.logs / "release-window-2").touch()
+        self.wait_window_marker(self.task / "session" / "window-window-2.json", second, output)
+        refused = self.run_tool("relaunch", check=False)
+        self.assertIn("close the app window", refused.stderr)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertFalse((self.task / "session" / "failed").exists())
+        self.assertFalse((self.task / "session" / "stop").exists())
 
     def test_relaunch_ignores_unrelated_compositor_windows(self) -> None:
         (self.logs / "other-window").touch()
@@ -1912,6 +2202,18 @@ class RemoteEvidence(unittest.TestCase):
         self.run_tool("cli", "project", "open", "{fixture}/project", "it's quoted")
         self.assertEqual((self.remote_task / "cli").read_text().strip(),
                          f"cli project open {self.remote_task}/fixture/project it's quoted")
+
+    def test_open_window_is_forwarded_without_agent_authority(self) -> None:
+        checkout = self.repository("after", {"src.rs": "\n"})
+        self.run_tool("build", "after", str(checkout))
+        self.run_tool("start", "after")
+        self.run_tool("open-window", "window-2")
+        self.assertEqual(self.tool_calls()[-1], "open-window window-2")
+        self.assertEqual(self.env["CAGENTS_AGENT_AUTHORITY"], "inherited-token")
+        self.assertNotIn("CAGENTS_AGENT_AUTHORITY", (self.logs / "remote-env").read_text())
+        for sent in ("ssh", "ssh-input"):
+            self.assertNotIn(b"inherited-token", (self.logs / sent).read_bytes())
+            self.assertNotIn(b"CAGENTS_AGENT_AUTHORITY", (self.logs / sent).read_bytes())
 
     def test_pair_runs_the_steps_on_both_sides_and_brings_back_every_shot(self) -> None:
         before = self.repository("before", {"src.rs": "old\n"})
