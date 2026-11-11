@@ -1179,10 +1179,7 @@ else: raise AssertionError(sys.argv)
         let (result, requests) =
             startup_fixture(vec![], StartupPeer::Matched, Duration::from_millis(500));
         let error = result.unwrap_err().to_string();
-        assert!(
-            error.contains("Timed out confirming restored panes"),
-            "{error}"
-        );
+        assert!(error.contains("still restoring saved panes"), "{error}");
         assert!(requests > 0);
     }
 
