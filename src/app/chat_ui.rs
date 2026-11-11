@@ -18038,9 +18038,10 @@ mod tests {
                 ..Snapshot::default()
             },
         );
+        // Read-only text alone does not establish an attached history reader.
         assert_eq!(
             app.inspector_runtime_status(card),
-            InspectorRuntimeStatus::Ready
+            InspectorRuntimeStatus::Attention
         );
     }
 
