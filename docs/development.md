@@ -1760,6 +1760,17 @@ harness, it provides:
   under `logs/` on normal close; these measure synchronous work rather than
   compositor presentation. Recreate the same workload on each revision when comparing
   startup; a saved descriptor whose provider was killed is not a live chat.
+  For two saved windows, close both, run `relaunch` for the primary, then run
+  `open-window window-2` from another shell once the primary maps. Both commands
+  stay foreground while their own UI runs. The second launch keeps existing
+  windows open and replays only the recorded build until a new matching window
+  ID appears. Its UI log is `logs/ui-SIDE-window-2.log`; the primary keeps
+  `logs/ui-SIDE.log`. `session/window-WINDOW.json` records that window's ID,
+  PID, launch token and session identity; readiness verifies the PID belongs
+  to this launch. `stop` still ends the whole task.
+  A default relaunch that fails after launching stops the empty task and
+  releases its native lock. A failed additional window keeps existing windows
+  alive; a refusal before launching leaves the session unchanged.
 - **Matching evidence.** `start` refuses a checkout that changed since its build.
   `shots/manifest.tsv` records each image's revision, source state, requested
   width and size, so a pair can be compared and named in the PR.

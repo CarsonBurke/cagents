@@ -9361,17 +9361,41 @@ for line in sys.stdin:
             stdout.read_line(&mut line).unwrap();
             pids.push(line.trim().parse::<u32>().unwrap());
         }
-        let is_shell =
-            |pid: u32| std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap() == "sh\n";
-        let find = |wanted: &dyn Fn(u32) -> bool| {
-            *pids
-                .iter()
-                .find(|pid| wanted(**pid))
-                .unwrap_or_else(|| panic!("unexpected command tree: {pids:?}"))
+        // `$!` is printed before the child necessarily execs: a sleep may
+        // still be named sh. Parent edges identify the roles before and after
+        // exec; command names are diagnostic only.
+        let tree: Vec<_> = pids
+            .iter()
+            .map(|pid| {
+                (
+                    *pid,
+                    parent(*pid),
+                    std::fs::read_to_string(format!("/proc/{pid}/comm")),
+                )
+            })
+            .collect();
+        assert_eq!(
+            pids.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            3,
+            "expected three distinct command identities: root={root}, {tree:?}"
+        );
+        let direct: Vec<_> = tree
+            .iter()
+            .filter(|(_, parent, _)| *parent == root)
+            .map(|(pid, _, _)| *pid)
+            .collect();
+        assert_eq!(direct.len(), 2, "root={root}, {tree:?}");
+        let nested: Vec<_> = tree
+            .iter()
+            .filter(|(_, parent, _)| *parent != root)
+            .map(|(pid, parent, _)| (*pid, *parent))
+            .collect();
+        let [(inner, shell)] = nested.as_slice() else {
+            panic!("expected one nested command: root={root}, {tree:?}");
         };
-        let alone = find(&|pid| parent(pid) == root && !is_shell(pid));
-        let shell = find(&|pid| parent(pid) == root && is_shell(pid));
-        let inner = find(&|pid| parent(pid) == shell);
+        let (inner, shell) = (*inner, *shell);
+        assert!(direct.contains(&shell), "root={root}, {tree:?}");
+        let alone = direct.into_iter().find(|pid| *pid != shell).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while [alone, shell, inner]
             .iter()

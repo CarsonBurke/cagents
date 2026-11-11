@@ -2,6 +2,7 @@
 
 - [Redraw scheduling](#redraw-scheduling)
 - [Activity spinner cost](#activity-spinner-cost)
+- [Workspace model edits](#workspace-model-edits)
 - [Native chat stage attribution](#native-chat-stage-attribution)
 - [Pane open](#pane-open)
 - [Terminal pipeline](#terminal-pipeline)
@@ -93,6 +94,192 @@ agent still costs about 3% of a core above idle in this build. Slowing
 unfocused spinners instead of stopping them costs little: an earlier revision
 that stopped them entirely measured 1.0-1.6% with another window focused
 (3 wakeups/s).
+
+## Workspace model edits
+
+Use the generated `realistic` workspace, two windows on the same fixture daemon,
+and synthetic busy chats to compare subscriber changes at a long-lived workspace's
+scale. Keep the seed, provider output, number of working chats, viewport, focus,
+edit count, interval and build profile the same on both sides. The generator is
+`scripts/fixture-workspace`; if it has not landed on the measured revision, seed
+with a generator build first and let that revision perform its ordinary store
+migration. Record both source revisions and the seed's store hashes.
+
+Use the runner for the matched development app. Build the edit driver
+separately through the gate:
+
+```sh
+scripts/cargo-gate build --locked --profile dev-runtime --no-default-features \
+  --features development --example workspace-edit-workload
+```
+
+Run both windows with `scripts/run-development --browserless --debug` inside
+one private headless harness session, selecting the second window with
+`-- --window window-2`. Give each runner its own `--log-file`. The app's
+`cagents::workspace_pipeline` debug target records inclusive wall time for each
+shared-model update, including its projection tail. Visible activity indicators
+also record redraw-event intervals, once per event on the UI thread. With the
+target disabled these paths read no clock and allocate nothing.
+
+For scope-projection qualification, also enable
+`cagents::workspace_projection=trace`. Count selected and full projections in
+both windows during the timed interval and retain any fallback reasons. A unit
+fixture's eligibility does not establish that the native workload qualifies.
+Settled channel presentation can project one scope; structural changes,
+derived worktree membership and unsettled admission still require a full pass.
+Selected passes also record `phase_us` for preparation, projection, saving,
+postlude, naming and chrome. These successive phase durations omit proof and
+other common update work; their sum does not replace inclusive handler time.
+
+Before measuring, verify the matched daemon reports the intended busy run count,
+that its resident capacity agrees, and that the processes are the fixture's
+synthetic providers under its own HOME and config directory. A requested spawn
+or an agent row alone does not prove a running provider. Keep a busy chat visible
+in the foreground window and select the edited pane in the other window. Hold
+keyboard focus in the same window on both sides, and record whether the second
+window is occluded. Verify its displayed initial and final titles separately.
+Build before launching and give the native application controller a finite
+lifetime long enough for startup and setup, such as three hours. This is
+separate from each measured workload's owner; keep the tools ready before
+starting that application lifetime.
+
+In the fixture environment, sample the two UI processes while the matched edit
+driver sends a fixed number of metadata edits. For example, use the harness's
+`exec --keep-awake` around this command so its idle policy cannot suspend
+rendering partway through the sample:
+
+```sh
+scripts/bounded --ttl 600 --name workspace-edits -- scripts/measure-workspace-edits \
+  --root "$fixture" --side after --binary "$products/examples/workspace-edit-workload" \
+  --log "$task/logs/ui-after-1.log" --log "$task/logs/ui-after-2.log" \
+  --output "$task/measurement-after" --edits 200 --interval-ms 100 \
+  --drain-timeout 300 --wait-for-selection
+```
+
+With `--wait-for-selection`, the driver writes `driver-ready.json` in the output
+directory after creating its synthetic channel and pane. Select that channel in
+one window and a busy fixture chat in the other, then create `driver-ready.go`
+beside it. The driver starts its timing origin only after that marker. The
+selection wait is bounded at 120 seconds.
+
+If preparation stops before timed edits, set `CAGENTS_WORKSPACE_EDIT_RESUME` to
+that task's existing `driver-ready.json` when starting a new bounded sample in
+a fresh output directory. The driver verifies the prepared marker, channel and
+repository, and the complete unchanged browser descriptor before reusing its
+IDs and current revision. Its new ready marker still gates selection and timing.
+Record the resumed preparation and replay the same navigation on the other side
+of the comparison, including any conversations opened while selecting the pane.
+
+`measure-workspace-edits` refuses an unbounded run, an arbitrary workspace, or a
+fixture without exactly two UI processes. It verifies that each process's open
+stderr file is its supplied window log and that the logs are different files.
+It records per-edit receipt times,
+monotonic boundaries, each UI main thread's CPU and runqueue counters, process
+CPU/RSS/thread counts, host pressure and sampler overhead. It also preserves
+both UI traces until each window saves the final pane title and its UI thread
+processes a later activity redraw. Establish that redraw's main-thread
+provenance separately. A saved title alone does not prove its applying handler
+or common tail has returned. Record store convergence and UI completion
+separately, account work over the common completion interval, and exclude the
+extra second of retained audit data. The bounded drain fails if either window
+never completes. An occluded window's completion includes its background redraw
+cadence.
+Keep the orchestration shell alive through the sample: `scripts/bounded` cleans
+up detached children when its command ends,
+whereas the runner's `--instance` launch returns as soon as its window maps.
+
+Report cumulative UI update wall time per requested edit and notification count
+for each window, as well as per-notification percentiles: a change can alter how
+many notifications an edit produces. Report main-thread CPU separately from
+inclusive wall time. When replica snapshot capture is deferred, also report
+instrumented synchronization wall time: sum `ui_update` and
+`replica_snapshot_timer` handler durations, plus debt-bearing
+`window_snapshot_capture` durations whose parent is `other_update` or
+`outside_update`. Observer and timer capture children are already included in
+their handlers. Count rejected captures too. Require classified wakes and
+complete timer/capture coverage on the instrumented revision. A missing event,
+or an in-bounds capture or wake whose parent completes outside the interval,
+invalidates the sample. Include whole handlers ending inside the interval,
+including those that began before it. Historical
+revisions without deferred capture have no additional work in this accounting.
+This sum covers the measured synchronization paths, not all UI-thread work;
+retain main-thread CPU as the broader measure. The controlled edit burst must
+avoid recursive close-confirm dispatch, whose inclusive handlers can overlap.
+
+Redraw-event intervals show event-loop cadence while a
+busy indicator is visible; they do not establish compositor presentation,
+scanout, or input latency. Fixture providers exercise the transport and native
+UI without a live model, and generated saved panes do not establish successful
+provider reattachment.
+
+## Focused transfer persistence
+
+After the measured edit and rename/close flows, use a separate provider-free
+native-evidence task to check focus when a pane moves from a channel to a
+Worktree. Keep the benchmark seed, controller and timing intervals unchanged.
+Build both matched browserless sets before starting the fixture, and build the
+`workspace-edit-workload` example with `--features development` through the gate.
+Use the same `examples/support/workspace_fixture.rs` on both sides. A baseline
+without `ApplyWorkspaceEdit` still needs its explicit legacy timed adapter;
+sharing this scenario does not make the modern timed branch compile against an
+older library.
+
+In that task's environment, after both windows and the destination Worktree
+have opened:
+
+```sh
+CAGENTS_WORKSPACE_EDIT_READY="$task/focused-transfer-ready.json" \
+  scripts/bounded --ttl 300 --name focused-transfer -- \
+  "$products/examples/workspace-edit-workload" "$fixture" focused-transfer "$worktree"
+```
+
+The driver creates a manual source channel with two distinct about:blank
+Browser panes, `Transfer sibling` and `Transfer target`. If the destination has
+no canonical ordinary pane, it first adds a new about:blank destination anchor;
+every existing occupant is preserved. It writes the exact prepared
+IDs, scopes, descriptors, revisions, registry identity and store identities to
+the prepared marker. It waits at most 120 seconds. Keep the target focused in
+window 1's active source channel. In window 2, focus the same target, then select
+the destination Worktree and one of its canonical panes so the source is
+inactive with a valid selected strip. Before releasing the transfer, run:
+
+```sh
+/usr/bin/python3 tests/fixtures/focused-transfer-probe.py --root "$fixture" \
+  --prepared "$task/focused-transfer-ready.json" --phase before \
+  --output "$task/focused-transfer-before.json"
+(
+  set -eu
+  transfer_go=$(mktemp "$task/focused-transfer-go.XXXXXX")
+  trap 'rm -f -- "$transfer_go"' EXIT
+  jq -e '.go' "$task/focused-transfer-before.json" > "$transfer_go"
+  ln -T -- "$transfer_go" "$task/focused-transfer-ready.go"
+)
+```
+
+The temporary file is complete before the no-clobber hard link publishes it to
+the polling driver. Prepared markers use the same complete-before-visible rule.
+The go marker must echo the schema, nonce, registry, source channel, sibling,
+moved pane and destination scope exactly. The driver rechecks the prepared
+registry, views and store identities before issuing the carried legacy
+`Change::Transfer` RPC. This scenario uses no model provider and does not
+change the normal timed workload's payload or cadence. Unset and explicitly
+empty development-instance names both select the default fixture namespace;
+nonempty names retain the named-instance checks.
+
+Observe the surviving sibling and focus in window 1, then the moved Browser
+and its recovery/close controls under the destination Worktree in window 2.
+Run the probe again with `--phase after --before "$task/focused-transfer-before.json"`
+and a fresh output filename. It opens both distinct window stores read-only,
+requires sibling-only source membership and sibling focus, rejects stale
+channel placement, and checks exact Worktree custody and unchanged destination
+occupants. Save and close both native windows, then use maintained
+`native-evidence --task "$task" relaunch` to reopen the same state. After its
+new primary window maps, run `native-evidence --task "$task" open-window window-2`
+from another owned shell and repeat with `--phase reopened`. Both launch
+commands remain in the foreground; keep their owners alive through the proof.
+Do not use `start` for this persistence check: it restores the seed. Retain
+native observations and each probe's exact window-local IDs; a successful
+canonical transfer alone does not prove valid saved focus.
 
 ## Native chat stage attribution
 

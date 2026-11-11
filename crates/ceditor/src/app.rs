@@ -5968,6 +5968,7 @@ mod tests {
             head_repository: Some(repository.clone()),
         };
         let loaded = pull_request_review::Loaded {
+            discussion_stamp: None,
             pull_request: pr.clone(),
             context: cagents::github::ReviewContext {
                 pull_request_id: "PR_7".into(),

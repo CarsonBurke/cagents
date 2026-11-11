@@ -3,6 +3,8 @@
 #[path = "support/hosted_agent_cleanup.rs"]
 mod hosted_agent_cleanup;
 
+#[path = "support/daemon_readiness.rs"]
+mod daemon_readiness;
 #[path = "support/private_cli_capture.rs"]
 mod private_cli_capture;
 #[path = "support/retained_fixture.rs"]
@@ -100,23 +102,14 @@ impl Fixture {
             .stderr(log)
             .spawn()
             .unwrap();
-        let fixture = Self {
+        let mut fixture = Self {
             root,
             daemon,
             agents: Default::default(),
         };
         let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let output = fixture.output_until(&["daemon", "status"], deadline);
-            if output.status.success()
-                && serde_json::from_slice::<Value>(&output.stdout).unwrap()["data"]["running"]
-                    == true
-            {
-                break;
-            }
-            assert!(Instant::now() < deadline, "fixture daemon did not start");
-            thread::sleep(Duration::from_millis(20));
-        }
+        daemon_readiness::wait(fixture.root.path(), &mut fixture.daemon, deadline)
+            .unwrap_or_else(|error| panic!("fixture daemon did not become ready: {error}"));
         fixture
     }
 
@@ -219,6 +212,169 @@ impl Fixture {
         assert_eq!(value["ok"], true, "{value}");
         value["data"].clone()
     }
+}
+
+// Private child modes let the readiness regressions control real socket binding
+// and process exit without starting another daemon or probing its inventory lock.
+#[test]
+fn owned_daemon_readiness_child() {
+    let Ok(mode) = std::env::var("CAGENTS_CONSOLE_READINESS_CHILD") else {
+        return;
+    };
+    let root =
+        std::path::PathBuf::from(std::env::var_os("CAGENTS_CONSOLE_READINESS_ROOT").unwrap());
+    if mode == "exit" {
+        std::process::exit(17);
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    if mode == "delayed-bind" {
+        fs::write(root.join("waiting-to-bind"), "ready").unwrap();
+        while !root.join("bind").exists() {
+            assert!(
+                Instant::now() < deadline,
+                "readiness fixture bind was not released"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+    match fs::remove_file(root.join("daemon.sock")) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("cannot remove stale fixture socket: {error}"),
+    }
+    let _listener = std::os::unix::net::UnixListener::bind(root.join("daemon.sock")).unwrap();
+    fs::write(root.join("bound"), "ready").unwrap();
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "readiness fixture was not retired"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+struct ReadinessChild(Child);
+
+impl Drop for ReadinessChild {
+    fn drop(&mut self) {
+        // Child retains an unreaped identity or its cached exit status, so
+        // cleanup cannot target a reused PID. This helper has no descendants.
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn readiness_child(root: &Path, mode: &str) -> ReadinessChild {
+    ReadinessChild(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "owned_daemon_readiness_child", "--nocapture"])
+            .env("CAGENTS_CONSOLE_READINESS_CHILD", mode)
+            .env("CAGENTS_CONSOLE_READINESS_ROOT", root)
+            .stdout(Stdio::null())
+            .stderr(fs::File::create(root.join("readiness-child.log")).unwrap())
+            .spawn()
+            .unwrap(),
+    )
+}
+
+fn wait_for_readiness_marker(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "readiness fixture marker missing: {}",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn readiness_status(version: Option<&str>) -> Output {
+    use std::os::unix::process::ExitStatusExt;
+    Output {
+        status: std::process::ExitStatus::from_raw(0),
+        stdout: serde_json::to_vec(&serde_json::json!({
+            "ok": true, "data": {"running": true, "daemon_version": version}
+        }))
+        .unwrap(),
+        stderr: Vec::new(),
+    }
+}
+
+#[test]
+fn owned_daemon_readiness_waits_for_connectable_bind_before_querying() {
+    for stale_socket in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("daemon.sock");
+        if stale_socket {
+            drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+            assert!(
+                socket.exists(),
+                "the stale socket remains after its listener closes"
+            );
+        }
+        let mut child = readiness_child(root.path(), "delayed-bind");
+        wait_for_readiness_marker(&root.path().join("waiting-to-bind"));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut readiness = daemon_readiness::Readiness::new(deadline);
+        assert!(
+            !readiness
+                .poll(&mut child.0, &socket, &mut |_| {
+                    panic!("a missing or stale listener must not issue Status")
+                })
+                .unwrap()
+        );
+        fs::write(root.path().join("bind"), "bind").unwrap();
+        let mut queries = 0;
+        daemon_readiness::wait_with(&mut child.0, &socket, deadline, |actual_deadline| {
+            assert_eq!(actual_deadline, deadline);
+            queries += 1;
+            Ok(readiness_status(Some("fixture-version")))
+        })
+        .unwrap();
+        assert_eq!(queries, 1);
+    }
+}
+
+#[test]
+fn owned_daemon_readiness_requires_version_after_lease_only_running() {
+    let root = tempfile::tempdir().unwrap();
+    let mut child = readiness_child(root.path(), "bind");
+    wait_for_readiness_marker(&root.path().join("bound"));
+    let mut queries = 0;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    daemon_readiness::wait_with(
+        &mut child.0,
+        &root.path().join("daemon.sock"),
+        deadline,
+        |actual_deadline| {
+            assert_eq!(actual_deadline, deadline);
+            queries += 1;
+            Ok(readiness_status((queries > 1).then_some("fixture-version")))
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        queries, 2,
+        "a lease-only running response is not serving readiness"
+    );
+}
+
+#[test]
+fn owned_daemon_readiness_reports_early_child_exit_without_querying() {
+    let root = tempfile::tempdir().unwrap();
+    let mut child = readiness_child(root.path(), "exit");
+    let error = daemon_readiness::wait_with(
+        &mut child.0,
+        &root.path().join("daemon.sock"),
+        Instant::now() + Duration::from_secs(10),
+        |_| panic!("an exited daemon must not be queried"),
+    )
+    .unwrap_err();
+    assert!(
+        error.contains("owned daemon exited") && error.contains("17"),
+        "{error}"
+    );
 }
 
 impl Drop for Fixture {

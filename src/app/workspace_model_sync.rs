@@ -1,16 +1,17 @@
 //! Mirrors the daemon's shared sidebar model into this window's own store.
 //!
-//! The daemon owns which projects and channels exist; this window owns what is
-//! open inside them. Two threads keep the two in step: one watches the registry
-//! for edges, one publishes this window's mutations. Neither ever runs on the UI
+//! The daemon owns shared membership and descriptors; this window retains its
+//! local presentation and pending intentions. One thread watches revisioned
+//! changes and another publishes this window's mutations. Neither runs on the UI
 //! thread, because a redraw must not wait on a daemon that may not be running.
 
 use super::*;
-use crate::control::{ControlClient, ControlError};
+use crate::control::{ControlClient, ControlError, ModelEdge};
 use crate::model::{ChannelId, ProjectChannel};
 use crate::workspace_model::{
     ModelChannel, ModelEdit, ModelProject, NO_REGISTRY, PENDING_ORDINAL, WorkspaceModel,
     canonical_repository,
+    delta::{EditEffects, EditReceipt, Mirror, ViewChanges},
 };
 
 /// How long a thread waits before reconnecting.
@@ -51,6 +52,32 @@ pub enum ModelUpdate {
     /// compares the registry's identity against the one it recorded and decides
     /// whether anything it holds has ever been shared with this registry.
     Connected(WorkspaceModel),
+    ConnectedClosed {
+        model: WorkspaceModel,
+        closed: Vec<CardId>,
+    },
+    /// The publisher waits until the observer establishes this registry before
+    /// draining edits. Its reconnect snapshot remains private to its mirror.
+    PublisherConnected {
+        identity: uuid::Uuid,
+        ready: std::sync::mpsc::SyncSender<bool>,
+    },
+    /// One local write, including canonical rows and only its affected scopes.
+    Committed {
+        receipt: EditReceipt,
+        edit: ModelEdit,
+        views: ViewChanges,
+    },
+    /// Refresh only the scope whose immutable source fields conflicted.
+    ScopeConflicted {
+        identity: Option<uuid::Uuid>,
+        scope: crate::workspace_model::views::Scope,
+        operation: uuid::Uuid,
+        change: crate::workspace_model::views::Change,
+        views: ViewChanges,
+        error: String,
+    },
+    RestoreCanonicalTitle,
     /// The daemon answered but has no shared model to give, so this window's
     /// shared panes have no registry to wait for.
     Unavailable(String),
@@ -67,6 +94,14 @@ pub enum ModelUpdate {
     Edited {
         sequence: u64,
         edit: ModelEdit,
+    },
+    /// An edge that changed views, or channel or agent rows beyond what its
+    /// edit says, with what it changed: complete views for the scopes it
+    /// changed, rather than the whole model.
+    Changed {
+        sequence: u64,
+        edit: ModelEdit,
+        changes: EdgeChanges,
     },
     /// The rank the registry gave a channel this window created.
     ///
@@ -119,6 +154,24 @@ pub enum ModelUpdate {
     },
 }
 
+/// What one edge changed, ready to install over the window's model.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EdgeChanges {
+    pub identity: Option<uuid::Uuid>,
+    pub views: ViewChanges,
+    pub effects: EditEffects,
+}
+
+/// Metadata rows have independent clocks: a newer receipt for one scope must
+/// not discard a delayed observer edge for a different channel or project.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) enum MetadataKey {
+    Project(PathBuf),
+    Channel(ChannelId),
+    Navigation(PathBuf),
+    Agent(crate::model::AgentId),
+}
+
 /// Watches the daemon for shared-model edges.
 pub(super) fn observe_workspace_model(sender: async_channel::Sender<ModelUpdate>) {
     let observer = std::thread::Builder::new()
@@ -155,8 +208,8 @@ fn observe_with_client(
     // One request subscribes and reads, so an edit applied between the two
     // cannot fall into a gap - the hazard `watch_terminals` then `list` has to
     // order around with two requests.
-    let model = match client.watch_workspace_model() {
-        Ok(model) => model,
+    let (model, closed) = match client.watch_workspace_state() {
+        Ok(state) => state,
         Err(ControlError::Remote { message, .. })
             if message == crate::workspace_model::REGISTRY_UNAVAILABLE =>
         {
@@ -167,47 +220,43 @@ fn observe_with_client(
         }
         Err(error) => return Err(error.to_string()),
     };
+    let mut mirror = Mirror::for_model(&model);
+    let identity = model.identity;
     sender
-        .send_blocking(ModelUpdate::Connected(model))
+        .send_blocking(ModelUpdate::ConnectedClosed { model, closed })
         .map_err(|error| error.to_string())?;
     loop {
-        let (sequence, edit) = client
+        let ModelEdge {
+            sequence,
+            edit,
+            effects,
+        } = client
             .next_workspace_model_edit()
             .map_err(|error| error.to_string())?;
-        // View edits and proof-dependent title suggestions need complete
-        // authoritative pane data: the cached view may precede their revision.
-        // Navigation also reads its settled registry ordering, and an agent
-        // invalidation carries no inventory of its own.
-        if matches!(
-            edit,
-            ModelEdit::SeedView { .. }
-                | ModelEdit::ChangeView { .. }
-                | ModelEdit::SuggestConversationTitle { .. }
-                | ModelEdit::ReorderNavigation { .. }
-                | ModelEdit::ResetNavigation { .. }
-                | ModelEdit::RetireEmptyChannel { .. }
-                | ModelEdit::AgentsChanged
-        ) {
-            let model = client
-                .read_workspace_model()
+        let applied = mirror.apply(&edit, &effects);
+        let mut views = applied.changes;
+        views.sequence = sequence;
+        for scope in applied.unresolved {
+            let (view, read_sequence) = client
+                .read_workspace_view(scope.clone())
                 .map_err(|error| error.to_string())?;
-            sender
-                .send_blocking(ModelUpdate::Read(model))
-                .map_err(|error| error.to_string())?;
-            continue;
+            let installed = mirror.install_at(scope, view, read_sequence);
+            views.observed.extend(installed.observed);
+            views.views.extend(installed.views);
+            views.removed.extend(installed.removed);
+            views.absent.extend(installed.absent);
         }
-        let ranked = matches!(edit, ModelEdit::CreateChannel { .. });
         sender
-            .send_blocking(ModelUpdate::Edited { sequence, edit })
+            .send_blocking(ModelUpdate::Changed {
+                sequence,
+                edit,
+                changes: EdgeChanges {
+                    identity: Some(identity),
+                    views,
+                    effects,
+                },
+            })
             .map_err(|error| error.to_string())?;
-        if ranked {
-            let model = client
-                .read_workspace_model()
-                .map_err(|error| error.to_string())?;
-            sender
-                .send_blocking(ModelUpdate::Read(model))
-                .map_err(|error| error.to_string())?;
-        }
     }
 }
 
@@ -246,14 +295,56 @@ fn publish(
     // a daemon to hold it.
     let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
     let mut client = ControlClient::connect(&socket).map_err(|error| error.to_string())?;
-    publish_with_client(updates, requests, pending, &mut client)
+    // This connection may reach a replaced registry. Its one baseline is a
+    // reconnect read; subsequent edits and conflicts read affected scopes only.
+    let (model, _) = client
+        .read_workspace_state()
+        .map_err(|error| error.to_string())?;
+    let mut mirror = Mirror::for_model(&model);
+    let (ready, waiting) = std::sync::mpsc::sync_channel(1);
+    updates
+        .send_blocking(ModelUpdate::PublisherConnected {
+            identity: model.identity,
+            ready,
+        })
+        .map_err(|error| error.to_string())?;
+    // The observer owns registry identity. Until the UI has received its
+    // baseline, keep every queued edit and any uncertain prior write pending.
+    // Only this worker waits; the UI and daemon hold no lock for the handshake.
+    loop {
+        match waiting.recv_timeout(Duration::from_millis(100)) {
+            Ok(true) => break,
+            Ok(false) => {
+                return Err("the publisher is waiting for the observer's registry baseline".into());
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("the window stopped publishing".into());
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) if updates.is_closed() => {
+                return Err("the window stopped publishing".into());
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+    publish_with_mirror(updates, requests, pending, &mut client, &mut mirror)
 }
 
+#[cfg(test)]
 fn publish_with_client(
     updates: &async_channel::Sender<ModelUpdate>,
     requests: &async_channel::Receiver<ModelEdit>,
     pending: &mut Option<Unsent>,
     client: &mut ControlClient,
+) -> Result<(), String> {
+    publish_with_mirror(updates, requests, pending, client, &mut Mirror::default())
+}
+
+fn publish_with_mirror(
+    updates: &async_channel::Sender<ModelUpdate>,
+    requests: &async_channel::Receiver<ModelEdit>,
+    pending: &mut Option<Unsent>,
+    client: &mut ControlClient,
+    mirror: &mut Mirror,
 ) -> Result<(), String> {
     loop {
         let (request, first) = match pending.take() {
@@ -287,7 +378,7 @@ fn publish_with_client(
         // Retained until it is sent, so a daemon replaced mid-publish costs a
         // reconnection rather than the edit.
         *pending = Some((request.clone(), first));
-        match send(client, request.clone(), updates) {
+        match send_with_mirror(client, request.clone(), updates, mirror) {
             Ok(()) => *pending = None,
             Err(error) => {
                 // A refusal is final: the registry rejected the edit itself, so
@@ -311,13 +402,7 @@ fn publish_with_client(
                     if matches!(&request, ModelEdit::SuggestConversationTitle { .. }) {
                         // A refused suggestion is not replayed against a newer
                         // owner. Restore the authoritative name after optimism.
-                        match client.read_workspace_model() {
-                            Ok(model) => {
-                                let _ = updates.send_blocking(ModelUpdate::Read(model));
-                            }
-                            Err(ControlError::Remote { .. }) => {}
-                            Err(error) => return Err(error.to_string()),
-                        }
+                        let _ = updates.send_blocking(ModelUpdate::RestoreCanonicalTitle);
                     }
                     if let ModelEdit::ChangeView {
                         scope, operation, ..
@@ -352,36 +437,28 @@ fn publish_with_client(
     }
 }
 
+#[cfg(test)]
 fn send(
     client: &mut ControlClient,
     edit: ModelEdit,
     updates: &async_channel::Sender<ModelUpdate>,
 ) -> Result<(), ControlError> {
-    let reordered = matches!(
-        &edit,
-        ModelEdit::ReorderNavigation { .. } | ModelEdit::ResetNavigation { .. }
-    );
-    let created = match &edit {
-        ModelEdit::CreateChannel { id, .. } => Some(*id),
-        _ => None,
-    };
-    let reopened = match &edit {
-        ModelEdit::ReopenProject { repository, .. } => Some(repository.clone()),
-        _ => None,
-    };
-    let view_edit = match &edit {
-        ModelEdit::SeedView { scope, .. } => Some((scope.clone(), None)),
-        ModelEdit::ChangeView {
-            scope, operation, ..
-        } => Some((scope.clone(), Some(*operation))),
-        _ => None,
-    };
+    send_with_mirror(client, edit, updates, &mut Mirror::default())
+}
+
+fn send_with_mirror(
+    client: &mut ControlClient,
+    edit: ModelEdit,
+    updates: &async_channel::Sender<ModelUpdate>,
+    mirror: &mut Mirror,
+) -> Result<(), ControlError> {
+    use crate::workspace_model::views::{Change, Scope};
     let mut request = edit;
     let mut conflicts = 0;
     let mut title_busy = 0;
-    let model = loop {
-        match client.edit_workspace_model(request.clone()) {
-            Ok(model) => break model,
+    let receipt = loop {
+        match client.apply_workspace_edit(request.clone()) {
+            Ok(receipt) => break receipt,
             Err(ControlError::Remote {
                 code: crate::terminal::ipc::ProtocolErrorCode::QueueFull,
                 retryable: true,
@@ -392,11 +469,7 @@ fn send(
                     std::thread::sleep(Duration::from_millis(20 * title_busy));
                     continue;
                 }
-                // Optional metadata must not hold every later model edit at
-                // the queue head. Do not renew its proof or reconnect/replay it.
-                if let Ok(model) = client.read_workspace_model() {
-                    let _ = updates.send_blocking(ModelUpdate::Read(model));
-                }
+                let _ = updates.send_blocking(ModelUpdate::RestoreCanonicalTitle);
                 let _ = updates.send_blocking(ModelUpdate::TitleDeferred(request));
                 return Ok(());
             }
@@ -411,72 +484,71 @@ fn send(
                     return Err(error);
                 }
                 std::thread::sleep(Duration::from_millis(20 * conflicts));
-                let model = client.read_workspace_model()?;
-                if let ModelEdit::ChangeView {
+                let ModelEdit::ChangeView {
                     scope,
                     operation,
                     change,
-                    ..
-                } = &request
-                    && source_update_conflicts(&model, scope, change)
-                {
-                    let _ = updates.send_blocking(ModelUpdate::ViewConflicted {
+                    expected_revision,
+                } = &mut request
+                else {
+                    return Err(error);
+                };
+                let (view, read_sequence) = client.read_workspace_view(scope.clone())?;
+                mirror.install_at(scope.clone(), view.clone(), read_sequence);
+                let scoped = WorkspaceModel {
+                    views: view.clone().into_iter().collect(),
+                    ..Default::default()
+                };
+                if source_update_conflicts(&scoped, scope, change) {
+                    let views = mirror.install_at(scope.clone(), view, read_sequence);
+                    let _ = updates.send_blocking(ModelUpdate::ScopeConflicted {
+                        identity: mirror.identity(),
                         scope: scope.clone(),
                         operation: *operation,
                         change: change.clone(),
-                        model,
+                        views,
                         error: error.to_string(),
                     });
-                    // This is an explicit refusal delivered to the UI, never
-                    // a successful ViewApplied receipt or a partial commit.
                     return Ok(());
                 }
-                if let ModelEdit::ChangeView {
-                    scope,
-                    expected_revision,
-                    ..
-                } = &mut request
-                {
-                    *expected_revision = model
-                        .views
-                        .iter()
-                        .find(|view| view.scope == *scope)
-                        .map(|view| view.revision)
-                        .unwrap_or(0);
-                }
+                *expected_revision = view.as_ref().map_or(0, |view| view.revision);
             }
             Err(error) => return Err(error),
         }
     };
-    if let Some((scope, operation)) = view_edit {
-        let _ = updates.send_blocking(ModelUpdate::ViewApplied {
-            scope,
-            operation,
-            model: model.clone(),
-        });
+    let applied = mirror.apply(&request, &receipt.effects);
+    let mut views = applied.changes;
+    views.sequence = receipt.sequence;
+    let mut scopes: Vec<Scope> = applied.unresolved;
+    // An operation replay may have no new effects. Its acknowledgment still
+    // settles the exact pending intent against current scoped authority.
+    if receipt.effects.views.is_empty() {
+        match &request {
+            ModelEdit::SeedView { scope, .. } => scopes.push(scope.clone()),
+            ModelEdit::ChangeView { scope, change, .. } => {
+                scopes.push(scope.clone());
+                if let Change::Transfer { destination, .. } = change
+                    && destination != scope
+                {
+                    scopes.push(destination.clone());
+                }
+            }
+            _ => {}
+        }
     }
-    // The originating client is deliberately not sent its own echo, so this
-    // response is how the window that minted the channel learns the rank the
-    // registry gave it - and learns that the registry now holds it.
-    if let Some(id) = created
-        && let Some(channel) = model.channel(id)
-    {
-        let _ = updates.send_blocking(ModelUpdate::Ranked {
-            channel: channel.id,
-            model: model.clone(),
-        });
+    for scope in scopes {
+        let (view, read_sequence) = client.read_workspace_view(scope.clone())?;
+        let installed = mirror.install_at(scope, view, read_sequence);
+        views.observed.extend(installed.observed);
+        views.views.extend(installed.views);
+        views.removed.extend(installed.removed);
+        views.absent.extend(installed.absent);
     }
-    if let ModelEdit::RetireEmptyChannel { home, .. } = &request {
-        let _ = updates.send_blocking(ModelUpdate::RetirementAnswered {
-            channel: home.channel,
-            model: model.clone(),
-        });
-    } else if reordered || matches!(&request, ModelEdit::SuggestConversationTitle { .. }) {
-        let _ = updates.send_blocking(ModelUpdate::Read(model.clone()));
-    }
-    if let Some(repository) = reopened {
-        let _ = updates.send_blocking(ModelUpdate::Reopened { repository, model });
-    }
+    let _ = updates.send_blocking(ModelUpdate::Committed {
+        receipt,
+        edit: request,
+        views,
+    });
     Ok(())
 }
 
@@ -601,24 +673,204 @@ impl Cagents {
         Task::none()
     }
 
+    fn newer_live_ancestors(&self, sequence: u64) -> (HashSet<ChannelId>, HashSet<PathBuf>) {
+        let mut protected_channels = HashSet::new();
+        let mut protected_projects = HashSet::new();
+        for (scope, observed) in &self.shared_views.view_sequences {
+            if *observed <= sequence
+                || !self
+                    .workspace_model
+                    .views
+                    .iter()
+                    .any(|view| &view.scope == scope)
+            {
+                continue;
+            }
+            match scope {
+                crate::workspace_model::views::Scope::Channel(id) => {
+                    protected_channels.insert(*id);
+                    if let Some(channel) = self.workspace_model.channel(*id) {
+                        protected_projects.insert(channel.repository.clone());
+                    }
+                }
+                crate::workspace_model::views::Scope::Worktree { repository, .. } => {
+                    protected_projects.insert(repository.clone());
+                }
+            }
+        }
+        for (key, observed) in &self.shared_views.metadata_revisions {
+            if *observed <= sequence {
+                continue;
+            }
+            match key {
+                MetadataKey::Channel(id) => {
+                    if let Some(channel) = self.workspace_model.channel(*id) {
+                        protected_projects.insert(channel.repository.clone());
+                    }
+                }
+                MetadataKey::Navigation(repository) => {
+                    if self
+                        .workspace_model
+                        .navigation_orders
+                        .iter()
+                        .any(|order| &order.repository == repository)
+                    {
+                        protected_projects.insert(repository.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        (protected_channels, protected_projects)
+    }
+
     /// Keep complete view/agent snapshots ordered independently of observed
     /// metadata edges. A title/rank/project edge has no replacement pane data.
     pub(super) fn install_workspace_model_snapshot(&mut self, mut model: WorkspaceModel) -> bool {
-        if model.identity != self.workspace_model.identity
-            || model.sequence >= self.workspace_model.sequence
-        {
-            self.shared_views.snapshot_sequence = model.sequence;
-            self.workspace_model = model;
-            return true;
-        }
-        if model.sequence < self.shared_views.snapshot_sequence {
+        let snapshot_sequence = model.sequence;
+        if model.identity != self.workspace_model.identity {
+            self.shared_views.snapshot_sequence = 0;
+            self.shared_views.metadata_revisions.clear();
+            self.shared_views.view_sequences.clear();
+            self.shared_views.scope_absences.clear();
+            self.shared_views.closed.clear();
+        } else if model.sequence < self.shared_views.snapshot_sequence {
             return false;
+        } else if model.sequence < self.workspace_model.sequence
+            || self
+                .shared_views
+                .view_sequences
+                .values()
+                .any(|sequence| *sequence > model.sequence)
+            || self
+                .shared_views
+                .scope_absences
+                .values()
+                .any(|sequence| *sequence > model.sequence)
+        {
+            // A reconnect baseline can race a newer publisher receipt or a
+            // scoped read taken ahead of the last processed model edge. Keep
+            // each newer row while still installing unrelated changes this
+            // complete read recovered during the lost connection.
+            let sequence = model.sequence;
+            let (protected_channels, protected_projects) = self.newer_live_ancestors(sequence);
+            let newer = |key: &MetadataKey| {
+                self.shared_views
+                    .metadata_revisions
+                    .get(key)
+                    .is_some_and(|held| *held > sequence)
+            };
+            for project in &self.workspace_model.projects {
+                if newer(&MetadataKey::Project(project.repository.clone()))
+                    || protected_projects.contains(&project.repository)
+                {
+                    model
+                        .projects
+                        .retain(|held| held.repository != project.repository);
+                    model.projects.push(project.clone());
+                }
+            }
+            model.projects.retain(|project| {
+                !newer(&MetadataKey::Project(project.repository.clone()))
+                    || self.workspace_model.project(&project.repository).is_some()
+            });
+            for path in &self.workspace_model.closed_projects {
+                if newer(&MetadataKey::Project(path.clone()))
+                    && !model.closed_projects.contains(path)
+                {
+                    model.closed_projects.push(path.clone());
+                }
+            }
+            model.closed_projects.retain(|path| {
+                !protected_projects.contains(path)
+                    && (!newer(&MetadataKey::Project(path.clone()))
+                        || self.workspace_model.closed_projects.contains(path))
+            });
+            for channel in &self.workspace_model.channels {
+                if newer(&MetadataKey::Channel(channel.id))
+                    || protected_channels.contains(&channel.id)
+                {
+                    model.channels.retain(|held| held.id != channel.id);
+                    model.channels.push(channel.clone());
+                }
+            }
+            model.channels.retain(|channel| {
+                !newer(&MetadataKey::Channel(channel.id))
+                    || self.workspace_model.channel(channel.id).is_some()
+            });
+            for agent in &self.workspace_model.agents {
+                if newer(&MetadataKey::Agent(agent.id)) {
+                    model.agents.retain(|held| held.id != agent.id);
+                    model.agents.push(agent.clone());
+                }
+            }
+            model.agents.retain(|agent| {
+                !newer(&MetadataKey::Agent(agent.id))
+                    || self
+                        .workspace_model
+                        .agents
+                        .iter()
+                        .any(|held| held.id == agent.id)
+            });
+            for order in &self.workspace_model.navigation_orders {
+                if newer(&MetadataKey::Navigation(order.repository.clone())) {
+                    model
+                        .navigation_orders
+                        .retain(|held| held.repository != order.repository);
+                    model.navigation_orders.push(order.clone());
+                }
+            }
+            model.navigation_orders.retain(|order| {
+                !newer(&MetadataKey::Navigation(order.repository.clone()))
+                    || self
+                        .workspace_model
+                        .navigation_orders
+                        .iter()
+                        .any(|held| held.repository == order.repository)
+            });
+            model.views.retain(|view| {
+                !self
+                    .shared_views
+                    .scope_absences
+                    .get(&view.scope)
+                    .is_some_and(|absence| *absence > sequence)
+            });
+            for view in &self.workspace_model.views {
+                let previous = model.views.iter().find(|held| held.scope == view.scope);
+                let preserve = previous.is_some_and(|held| held.revision < view.revision)
+                    || (previous.is_none()
+                        && self
+                            .shared_views
+                            .view_sequences
+                            .get(&view.scope)
+                            .is_some_and(|held| *held > sequence));
+                if preserve {
+                    model.views.retain(|held| held.scope != view.scope);
+                    model.views.push(view.clone());
+                }
+            }
+            model.sequence = model.sequence.max(self.workspace_model.sequence);
         }
-        self.shared_views.snapshot_sequence = model.sequence;
-        // Preserve newer folded metadata, including explicit project/channel
-        // removal, while accepting the complete, newer collection evidence.
-        self.workspace_model.views = std::mem::take(&mut model.views);
-        self.workspace_model.agents = std::mem::take(&mut model.agents);
+        // `model.sequence` may retain a newer receipt's high watermark; the
+        // caller's original read sequence is the complete baseline's floor.
+        self.shared_views.snapshot_sequence =
+            self.shared_views.snapshot_sequence.max(snapshot_sequence);
+        self.shared_views
+            .metadata_revisions
+            .retain(|_, sequence| *sequence > self.shared_views.snapshot_sequence);
+        let open: HashSet<_> = model
+            .views
+            .iter()
+            .flat_map(|view| view.panes.iter().map(|pane| pane.id))
+            .collect();
+        self.shared_views.closed.extend(
+            model
+                .views
+                .iter()
+                .flat_map(|view| view.retired.iter().copied())
+                .filter(|id| !open.contains(id)),
+        );
+        self.workspace_model = model;
         true
     }
 
@@ -626,10 +878,266 @@ impl Cagents {
         self.apply_workspace_model_update_effect(update).0
     }
 
+    /// Gives the application an explicit tail budget. Only a proven
+    /// presentation change may avoid structural sidebar/ownership work.
+    pub(super) fn apply_workspace_model_update_projection(
+        &mut self,
+        update: ModelUpdate,
+    ) -> (Task<Message>, Projection) {
+        let foreign = match &update {
+            ModelUpdate::Committed { receipt, .. } => {
+                receipt.identity != self.workspace_model.identity
+            }
+            ModelUpdate::Changed { changes, .. } => changes
+                .identity
+                .is_some_and(|identity| identity != self.workspace_model.identity),
+            _ => false,
+        };
+        if foreign {
+            return (Task::none(), Projection::Unchanged);
+        }
+        match self.presentation_scope_for_update(&update) {
+            Ok(scope) => {
+                tracing::trace!(target: "cagents::workspace_projection", selected = true, "Projecting shared presentation");
+                return self.apply_presentation_model_update(update, scope);
+            }
+            Err(reason) => {
+                tracing::trace!(target: "cagents::workspace_projection", selected = false, reason, "Projecting shared model")
+            }
+        }
+        let (task, changed) = self.apply_workspace_model_update_full_effect(update);
+        (
+            task,
+            if changed {
+                Projection::Full
+            } else {
+                Projection::Unchanged
+            },
+        )
+    }
+
+    pub(super) fn apply_workspace_model_update_effect(
+        &mut self,
+        update: ModelUpdate,
+    ) -> (Task<Message>, bool) {
+        let (task, projection) = self.apply_workspace_model_update_projection(update);
+        (task, projection != Projection::Unchanged)
+    }
+
+    fn presentation_scope_for_update(
+        &self,
+        update: &ModelUpdate,
+    ) -> Result<crate::workspace_model::views::Scope, &'static str> {
+        use crate::workspace_model::views::Change;
+        // The active-strip projector can commit this draft through
+        // apply_viewport before returning to the common projection tail.
+        if self.settings_blur_pending() {
+            return Err("a settings draft is leaving focus");
+        }
+        let (edit, effects, changes, pending, identity) = match update {
+            ModelUpdate::Committed {
+                receipt,
+                edit,
+                views,
+            } => {
+                let ModelEdit::ChangeView { operation, .. } = edit else {
+                    return Err("not a view update");
+                };
+                (
+                    edit,
+                    &receipt.effects,
+                    views,
+                    Some(*operation),
+                    Some(receipt.identity),
+                )
+            }
+            ModelUpdate::Changed { edit, changes, .. } => {
+                // The observer can win the race against our receipt. Its exact
+                // operation may project through the held overlay, but only
+                // the publisher receipt below acknowledges that intent.
+                let pending = match edit {
+                    ModelEdit::ChangeView {
+                        operation,
+                        scope,
+                        change,
+                        ..
+                    } if self
+                        .shared_views
+                        .pending
+                        .iter()
+                        .any(|(id, owner, captured)| {
+                            id == operation && owner == scope && captured == change
+                        }) =>
+                    {
+                        Some(*operation)
+                    }
+                    _ => None,
+                };
+                (
+                    edit,
+                    &changes.effects,
+                    &changes.views,
+                    pending,
+                    changes.identity,
+                )
+            }
+            _ => return Err("not a scoped edge"),
+        };
+        if identity != Some(self.workspace_model.identity) {
+            return Err("no matching registry authority");
+        }
+        let ModelEdit::ChangeView { scope, change, .. } = edit else {
+            return Err("not a presentation update");
+        };
+        let Change::Update { before, pane } = change else {
+            return Err("not a presentation update");
+        };
+        if before.id != pane.id
+            || before.kind != pane.kind
+            || before.scope != pane.scope
+            || before.pending_terminal_start != pane.pending_terminal_start
+        {
+            return Err("requested source changed");
+        }
+        if !effects.closed.is_empty()
+            || !effects.channels.is_empty()
+            || !effects.projects.is_empty()
+            || !effects.removed_channels.is_empty()
+            || !effects.removed_projects.is_empty()
+            || !effects.navigation_orders.is_empty()
+            || !effects.agents.is_empty()
+            || !effects.removed_agents.is_empty()
+            || effects.views.len() > 1
+            || effects
+                .views
+                .iter()
+                .any(|revision| &revision.scope != scope || revision.after.is_none())
+        {
+            return Err("canonical metadata or lifecycle changed");
+        }
+        if changes.views.len() != 1
+            || !changes.removed.is_empty()
+            || !changes.absent.is_empty()
+            || changes.views[0].scope != *scope
+        {
+            return Err("not one complete scope");
+        }
+        let mut held = self
+            .workspace_model
+            .views
+            .iter()
+            .filter(|view| &view.scope == scope);
+        let Some(held_view) = held.next() else {
+            return Err("scope is not held");
+        };
+        if held.next().is_some() {
+            return Err("scope identity is ambiguous");
+        }
+        if let Some(operation) = pending
+            && !self
+                .shared_views
+                .pending
+                .iter()
+                .any(|(id, owner, captured)| {
+                    *id == operation && owner == scope && captured == change
+                })
+        {
+            return Err("receipt does not acknowledge the held intent");
+        }
+        self.presentation_projection_ready(held_view, &changes.views[0], pending)?;
+        Ok(scope.clone())
+    }
+
+    fn apply_presentation_model_update(
+        &mut self,
+        update: ModelUpdate,
+        scope: crate::workspace_model::views::Scope,
+    ) -> (Task<Message>, Projection) {
+        let (sequence, edit, changes, operation) = match update {
+            ModelUpdate::Committed {
+                receipt,
+                edit,
+                views,
+            } => {
+                let operation = match &edit {
+                    ModelEdit::ChangeView { operation, .. } => Some(*operation),
+                    _ => None,
+                };
+                (
+                    receipt.sequence,
+                    edit,
+                    EdgeChanges {
+                        identity: Some(receipt.identity),
+                        views,
+                        effects: receipt.effects,
+                    },
+                    operation,
+                )
+            }
+            ModelUpdate::Changed {
+                sequence,
+                edit,
+                changes,
+            } => (sequence, edit, changes, None),
+            _ => unreachable!("only a proven scoped edge selects presentation projection"),
+        };
+        let active_primary = self.durable.active_channel.and_then(|id| {
+            self.durable
+                .channels
+                .iter()
+                .find(|channel| channel.id == id)
+                .map(|channel| (id, self.channel_primary_chat(channel)))
+        });
+        let Some(installed) = self.install_changed_edge(sequence, &edit, changes) else {
+            return (Task::none(), Projection::Unchanged);
+        };
+        if let Some(operation) = operation {
+            self.acknowledge_view_edit(scope.clone(), Some(operation));
+            self.retire_settled_empty_channels();
+            self.retarget_transferred_pane_updates(None);
+        }
+        let projected = self.reconcile_shared_presentation(std::slice::from_ref(&scope));
+        // A new view proof also wakes retained automatic names. These tails
+        // inspect canonical open views and must run even for presentation-only
+        // changes, just as they do after a complete reconciliation.
+        let mut phase = WorkspaceProjectionTiming::new(true);
+        let naming_source = Arc::downgrade(&self.durable);
+        self.refresh_channel_title_suggestions();
+        self.restore_channel_names();
+        phase.mark("selected_naming");
+        let names_unchanged = naming_source.as_ptr() == Arc::as_ptr(&self.durable);
+        // Saving snapshots the active strip, even for an inactive scope.
+        // Its normalized order can change which open chat inherits a manual
+        // channel title. Closed-member pruning cannot change that primary.
+        let active_primary_unchanged = active_primary
+            == self.durable.active_channel.and_then(|id| {
+                self.durable
+                    .channels
+                    .iter()
+                    .find(|channel| channel.id == id)
+                    .map(|channel| (id, self.channel_primary_chat(channel)))
+            });
+        let projection = if names_unchanged && active_primary_unchanged {
+            Projection::ScopedChrome(self.presentation_chrome_cards(&scope))
+        } else {
+            // A retained name can belong to another channel; its cards need
+            // the same chrome refresh as the complete projection.
+            Projection::Chrome
+        };
+        if !matches!(projection, Projection::ScopedChrome(_))
+            || !self.shared_views.adoptions.is_empty()
+            || !self.shared_views.restorations.is_empty()
+            || !self.shared_views.chat_adoptions.is_empty()
+        {
+            self.materialize_replica_snapshot();
+        }
+        (Task::batch([installed, projected]), projection)
+    }
+
     /// Only stale complete snapshots skip projection. Even an equal model can
     /// restore optimistic local state after refusal (for example channel titles).
     /// Newer metadata edges may still lack an older snapshot's full inventory.
-    pub(super) fn apply_workspace_model_update_effect(
+    fn apply_workspace_model_update_full_effect(
         &mut self,
         update: ModelUpdate,
     ) -> (Task<Message>, bool) {
@@ -670,6 +1178,93 @@ impl Cagents {
 
     fn apply_workspace_model_update_inner(&mut self, update: ModelUpdate) -> Task<Message> {
         match update {
+            ModelUpdate::ConnectedClosed { model, closed } => {
+                if model.identity == self.workspace_model.identity
+                    && model.sequence < self.shared_views.snapshot_sequence
+                {
+                    return Task::none();
+                }
+                self.shared_views.registry_unavailable = false;
+                self.join_workspace_model(model.identity);
+                self.install_workspace_model_snapshot(model);
+                self.shared_views.closed.extend(closed);
+                Task::batch([
+                    self.apply_closed_project_tombstones(),
+                    self.reconcile_workspace_model(),
+                ])
+            }
+            ModelUpdate::PublisherConnected { identity, ready } => {
+                let matches = identity != NO_REGISTRY && identity == self.workspace_model.identity;
+                let _ = ready.send(matches);
+                Task::none()
+            }
+            ModelUpdate::Committed {
+                receipt,
+                edit,
+                views,
+            } => {
+                if receipt.identity != self.workspace_model.identity {
+                    return Task::none();
+                }
+                let operation = match &edit {
+                    ModelEdit::ChangeView { operation, .. } => Some(*operation),
+                    _ => None,
+                };
+                let transferred =
+                    operation.and_then(|id| self.shared_views.requested_transfer_card(id));
+                let Some(result) = self.install_changed_edge(
+                    receipt.sequence,
+                    &edit,
+                    EdgeChanges {
+                        identity: Some(receipt.identity),
+                        views,
+                        effects: receipt.effects,
+                    },
+                ) else {
+                    return Task::none();
+                };
+                match &edit {
+                    ModelEdit::ChangeView { scope, .. } => {
+                        self.acknowledge_view_edit(scope.clone(), operation);
+                        self.retire_settled_empty_channels();
+                        self.retarget_transferred_pane_updates(transferred);
+                    }
+                    ModelEdit::SeedView { scope, .. } => {
+                        self.acknowledge_view_edit(scope.clone(), None)
+                    }
+                    ModelEdit::RetireEmptyChannel { home, .. } => {
+                        self.channel_ui.retiring.remove(&home.channel);
+                    }
+                    ModelEdit::ReopenProject { repository, .. } => {
+                        self.project_ui
+                            .reopening
+                            .retain(|_, path| path != repository);
+                    }
+                    _ => {}
+                }
+                let finish = match edit {
+                    ModelEdit::RetireEmptyChannel { home, .. } => {
+                        self.finish_channel_reopen(home.channel)
+                    }
+                    _ => Task::none(),
+                };
+                Task::batch([result, finish, self.reconcile_workspace_model()])
+            }
+            ModelUpdate::ScopeConflicted {
+                identity,
+                scope,
+                operation,
+                change,
+                views,
+                error,
+            } => {
+                if identity.is_some_and(|identity| identity != self.workspace_model.identity) {
+                    return Task::none();
+                }
+                self.install_edge_views(views, true);
+                self.refuse_conflicting_view_change(scope, operation, change, error)
+            }
+            ModelUpdate::RestoreCanonicalTitle => self.reconcile_workspace_model(),
             ModelUpdate::RetirementFailed { channel, error } => {
                 self.channel_ui.retiring.remove(&channel);
                 self.fail_channel_reopen(
@@ -792,72 +1387,12 @@ impl Cagents {
                 )));
                 self.apply_closed_project_tombstones()
             }
-            ModelUpdate::Edited { sequence, edit } => {
-                // A channel-work invalidation is not a folded canonical edit,
-                // and nothing in the window shows channel work. Advancing the
-                // watermark could discard a delayed, lower-sequence edit.
-                if matches!(edit, ModelEdit::ChannelWorkChanged { .. }) {
-                    return Task::none();
-                }
-
-                if sequence <= self.workspace_model.sequence {
-                    if let ModelEdit::DeleteChannel { id } = edit {
-                        // A snapshot can overtake this explicit instruction.
-                        // It must still revoke automatic revival, even when
-                        // absence already removed the local channel.
-                        self.forget_channel_revival(id);
-                        self.workspace_model
-                            .channels
-                            .retain(|channel| channel.id != id);
-                        let retired = self.retire_peer_channel(id);
-                        return Task::batch([retired, self.finish_channel_reopen(id)]);
-                    }
-                    return Task::none();
-                }
-                // An explicit delete is an instruction rather than an absence,
-                // so folding it in retires the channel whether or not this
-                // window had recorded the channel as shared - which is exactly
-                // the case absence may not be trusted in.
-                let deleted = match &edit {
-                    ModelEdit::DeleteChannel { id } => Some(*id),
-                    _ => None,
-                };
-                let closing = match &edit {
-                    ModelEdit::CloseProject { repository } => Some(repository.clone()),
-                    ModelEdit::ReopenProject { repository, .. } => {
-                        self.cancel_shared_project_close(repository);
-                        self.project_ui.closed.remove(repository);
-                        // The observer can see a reopen from another window
-                        // before this window's own publish reply. Only that
-                        // reply completes this window's pending intent.
-                        None
-                    }
-                    ModelEdit::OpenProject { .. } => None,
-                    _ => None,
-                };
-                self.workspace_model.fold(sequence, &edit);
-                let removed = closing.map_or_else(Task::none, |repository| {
-                    self.close_shared_project(&repository)
-                });
-                let retired = deleted.map_or_else(Task::none, |id| {
-                    // An explicit deletion is final even if an automatic
-                    // retirement of this identity was already in flight.
-                    self.forget_channel_revival(id);
-                    // The registry has authoritatively removed this identity,
-                    // even if its creation acknowledgment never reached us.
-                    // A failed session close must not make it publishable again.
-                    if let Some(channel) = Arc::make_mut(&mut self.durable)
-                        .channels
-                        .iter_mut()
-                        .find(|channel| channel.id == id)
-                    {
-                        channel.shared = true;
-                    }
-                    let retired = self.retire_peer_channel(id);
-                    Task::batch([retired, self.finish_channel_reopen(id)])
-                });
-                Task::batch([removed, retired, self.reconcile_workspace_model()])
-            }
+            ModelUpdate::Edited { sequence, edit } => self.apply_model_edge(sequence, edit, None),
+            ModelUpdate::Changed {
+                sequence,
+                edit,
+                changes,
+            } => self.apply_changed_edge(sequence, &edit, changes),
             ModelUpdate::Ranked { channel, model } => {
                 // The publisher and observer use separate connections. Keep the
                 // complete response: a rank alone cannot fence an older observer
@@ -911,6 +1446,365 @@ impl Cagents {
         }
     }
 
+    /// Folds one observed edge, and installs what it changed when the observer
+    /// resolved that from its copy of the views.
+    fn apply_model_edge(
+        &mut self,
+        sequence: u64,
+        edit: ModelEdit,
+        changes: Option<EdgeChanges>,
+    ) -> Task<Message> {
+        // Channel-work is no longer shown and its independent invalidation
+        // never advances the canonical model watermark.
+        if matches!(edit, ModelEdit::ChannelWorkChanged { .. }) {
+            return Task::none();
+        }
+
+        if sequence <= self.workspace_model.sequence {
+            // A snapshot overtook this edge, so its channel and agent rows are
+            // older than the window's. A view the observer read for it can
+            // still be newer than that snapshot: the edit that made it newer
+            // arrives as an edge the observer then has nothing to apply for.
+            // A scope the snapshot lacks was deleted after this edge; one
+            // created again after the snapshot arrives with a later edge.
+            let refreshed =
+                changes.is_some_and(|changes| self.install_edge_views(changes.views, false));
+            let reconciled = if refreshed {
+                self.reconcile_workspace_model()
+            } else {
+                Task::none()
+            };
+            if let ModelEdit::DeleteChannel { id } = edit {
+                // A snapshot can overtake this explicit instruction.
+                // It must still revoke automatic revival, even when
+                // absence already removed the local channel.
+                self.forget_channel_revival(id);
+                self.workspace_model
+                    .channels
+                    .retain(|channel| channel.id != id);
+                let retired = self.retire_peer_channel(id);
+                return Task::batch([reconciled, retired, self.finish_channel_reopen(id)]);
+            }
+            return reconciled;
+        }
+        // An explicit delete is an instruction rather than an absence,
+        // so folding it in retires the channel whether or not this
+        // window had recorded the channel as shared - which is exactly
+        // the case absence may not be trusted in.
+        let deleted = match &edit {
+            ModelEdit::DeleteChannel { id } => Some(*id),
+            _ => None,
+        };
+        let closing = match &edit {
+            ModelEdit::CloseProject { repository } => Some(repository.clone()),
+            ModelEdit::ReopenProject { repository, .. } => {
+                self.cancel_shared_project_close(repository);
+                self.project_ui.closed.remove(repository);
+                // The observer can see a reopen from another window
+                // before this window's own publish reply. Only that
+                // reply completes this window's pending intent.
+                None
+            }
+            ModelEdit::OpenProject { .. } => None,
+            _ => None,
+        };
+        let keys: Vec<_> = match &edit {
+            ModelEdit::OpenProject { repository, .. }
+            | ModelEdit::ReopenProject { repository, .. } => {
+                vec![MetadataKey::Project(repository.clone())]
+            }
+            ModelEdit::CloseProject { repository } => {
+                std::iter::once(MetadataKey::Project(repository.clone()))
+                    .chain(
+                        self.workspace_model
+                            .channels
+                            .iter()
+                            .filter(|channel| &channel.repository == repository)
+                            .map(|channel| MetadataKey::Channel(channel.id)),
+                    )
+                    .collect()
+            }
+            ModelEdit::CreateChannel { id, .. }
+            | ModelEdit::DeleteChannel { id }
+            | ModelEdit::RetitleChannel { id, .. }
+            | ModelEdit::SuggestChannelTitle { id, .. }
+            | ModelEdit::SuggestConversationTitle { id, .. } => vec![MetadataKey::Channel(*id)],
+            ModelEdit::ResetNavigation { repository }
+            | ModelEdit::ReorderNavigation { repository, .. } => {
+                vec![MetadataKey::Navigation(repository.clone())]
+            }
+            _ => Vec::new(),
+        };
+        for key in keys {
+            self.shared_views.metadata_revisions.insert(key, sequence);
+        }
+        self.workspace_model.fold(sequence, &edit);
+        if let Some(changes) = changes {
+            return self.apply_changed_edge(sequence, &edit, changes);
+        }
+        let removed = closing.map_or_else(Task::none, |repository| {
+            self.close_shared_project(&repository)
+        });
+        let retired = deleted.map_or_else(Task::none, |id| {
+            // An explicit deletion is final even if an automatic
+            // retirement of this identity was already in flight.
+            self.forget_channel_revival(id);
+            // The registry has authoritatively removed this identity,
+            // even if its creation acknowledgment never reached us.
+            // A failed session close must not make it publishable again.
+            if let Some(channel) = Arc::make_mut(&mut self.durable)
+                .channels
+                .iter_mut()
+                .find(|channel| channel.id == id)
+            {
+                channel.shared = true;
+            }
+            let retired = self.retire_peer_channel(id);
+            Task::batch([retired, self.finish_channel_reopen(id)])
+        });
+        Task::batch([removed, retired, self.reconcile_workspace_model()])
+    }
+
+    /// Installs one observed change and projects it once. A publishing window
+    /// uses the same installation before acknowledging its pending operation,
+    /// then performs its one projection after that overlay has been removed.
+    fn apply_changed_edge(
+        &mut self,
+        sequence: u64,
+        edit: &ModelEdit,
+        changes: EdgeChanges,
+    ) -> Task<Message> {
+        let Some(installed) = self.install_changed_edge(sequence, edit, changes) else {
+            return Task::none();
+        };
+        Task::batch([installed, self.reconcile_workspace_model()])
+    }
+
+    /// Installs canonical rows and scope authority, preserving lifecycle tasks
+    /// without projecting the workspace or advancing a complete-model watermark.
+    fn install_changed_edge(
+        &mut self,
+        sequence: u64,
+        edit: &ModelEdit,
+        changes: EdgeChanges,
+    ) -> Option<Task<Message>> {
+        if changes
+            .identity
+            .is_some_and(|identity| identity != self.workspace_model.identity)
+        {
+            return None;
+        }
+        self.shared_views
+            .closed
+            .extend(changes.effects.closed.iter().copied());
+        self.install_edge_views(
+            changes.views,
+            sequence > self.shared_views.snapshot_sequence,
+        );
+        if sequence < self.shared_views.snapshot_sequence {
+            return Some(Task::none());
+        }
+        let floor = self.shared_views.snapshot_sequence;
+        let (protected_channels, protected_projects) =
+            if changes.effects.removed_projects.is_empty()
+                && changes.effects.removed_channels.is_empty()
+            {
+                (HashSet::new(), HashSet::new())
+            } else {
+                self.newer_live_ancestors(sequence)
+            };
+        let revisions = &mut self.shared_views.metadata_revisions;
+        let mut accepts = |key| {
+            let held = revisions.entry(key).or_insert(floor);
+            if sequence < *held {
+                false
+            } else {
+                *held = sequence;
+                true
+            }
+        };
+        let model = &mut self.workspace_model;
+        let effects = changes.effects;
+        let mut closed_projects = Vec::new();
+        let mut removed_channels = Vec::new();
+        for project in effects.projects {
+            if !accepts(MetadataKey::Project(project.repository.clone())) {
+                continue;
+            }
+            model
+                .closed_projects
+                .retain(|path| path != &project.repository);
+            match model
+                .projects
+                .iter_mut()
+                .find(|held| held.repository == project.repository)
+            {
+                Some(held) => *held = project,
+                None => model.projects.push(project),
+            }
+        }
+        for repository in effects.removed_projects {
+            // Closing a project also deletes its order. Record that tombstone
+            // even if a later reopen or live child already protects the parent.
+            if accepts(MetadataKey::Navigation(repository.clone())) {
+                model
+                    .navigation_orders
+                    .retain(|held| held.repository != repository);
+            }
+            if protected_projects.contains(&repository)
+                || !accepts(MetadataKey::Project(repository.clone()))
+            {
+                continue;
+            }
+            model.projects.retain(|held| held.repository != repository);
+            if !model.closed_projects.contains(&repository) {
+                model.closed_projects.push(repository.clone());
+            }
+            closed_projects.push(repository);
+        }
+        for channel in effects.channels {
+            if !accepts(MetadataKey::Channel(channel.id)) {
+                continue;
+            }
+            match model.channels.iter_mut().find(|held| held.id == channel.id) {
+                Some(held) => *held = channel,
+                None => model.channels.push(channel),
+            }
+        }
+        for id in effects.removed_channels {
+            if protected_channels.contains(&id) || !accepts(MetadataKey::Channel(id)) {
+                continue;
+            }
+            model.channels.retain(|held| held.id != id);
+            removed_channels.push(id);
+        }
+        for order in effects.navigation_orders {
+            if !accepts(MetadataKey::Navigation(order.repository.clone())) {
+                continue;
+            }
+            model
+                .navigation_orders
+                .retain(|held| held.repository != order.repository);
+            if !order.items.is_empty() {
+                model.navigation_orders.push(order);
+            }
+        }
+        for agent in effects.agents {
+            if !accepts(MetadataKey::Agent(agent.id)) {
+                continue;
+            }
+            match model.agents.iter_mut().find(|held| held.id == agent.id) {
+                Some(held) => *held = agent,
+                None => model.agents.push(agent),
+            }
+        }
+        for id in effects.removed_agents {
+            if !accepts(MetadataKey::Agent(id)) {
+                continue;
+            }
+            model.agents.retain(|held| held.id != id);
+        }
+        model.sequence = model.sequence.max(sequence);
+        let mut tasks = Vec::new();
+        for repository in closed_projects {
+            tasks.push(self.close_shared_project(&repository));
+        }
+        for id in removed_channels {
+            if !matches!(edit, ModelEdit::RetireEmptyChannel { .. }) {
+                self.forget_channel_revival(id);
+            }
+            tasks.push(self.retire_peer_channel(id));
+            tasks.push(self.finish_channel_reopen(id));
+        }
+        if let ModelEdit::ReopenProject { repository, .. } = edit
+            && self.workspace_model.project(repository).is_some()
+        {
+            self.cancel_shared_project_close(repository);
+            self.project_ui.closed.remove(repository);
+        }
+        Some(Task::batch(tasks))
+    }
+
+    /// Installs complete views by revision, adding a scope the window lacks
+    /// only when `current`; returns whether any changed.
+    fn install_edge_views(&mut self, changes: ViewChanges, current: bool) -> bool {
+        let views = &mut self.workspace_model.views;
+        let mut changed = false;
+        for view in changes.views {
+            let sequence = changes
+                .observed
+                .get(&view.scope)
+                .copied()
+                .unwrap_or(changes.sequence);
+            if self
+                .shared_views
+                .scope_absences
+                .get(&view.scope)
+                .is_some_and(|absence| *absence >= sequence)
+            {
+                continue;
+            }
+            self.shared_views
+                .view_sequences
+                .entry(view.scope.clone())
+                .and_modify(|held| *held = (*held).max(sequence))
+                .or_insert(sequence);
+            match views.iter_mut().find(|held| held.scope == view.scope) {
+                Some(held) if held.revision < view.revision => {
+                    *held = view;
+                    changed = true;
+                }
+                Some(_) => {}
+                None if current => {
+                    views.push(view);
+                    changed = true;
+                }
+                None => {}
+            }
+        }
+        for (scope, revision) in changes.removed {
+            self.shared_views
+                .view_sequences
+                .entry(scope.clone())
+                .and_modify(|held| *held = (*held).max(changes.sequence))
+                .or_insert(changes.sequence);
+            let newer_incarnation = views
+                .iter()
+                .any(|view| view.scope == scope && view.revision > revision);
+            if !newer_incarnation {
+                self.shared_views
+                    .scope_absences
+                    .entry(scope.clone())
+                    .and_modify(|held| *held = (*held).max(changes.sequence))
+                    .or_insert(changes.sequence);
+            }
+            let held = views.len();
+            views.retain(|view| view.scope != scope || view.revision > revision);
+            changed |= views.len() != held;
+        }
+        for (scope, sequence) in changes.absent {
+            self.shared_views
+                .scope_absences
+                .entry(scope.clone())
+                .and_modify(|held| *held = (*held).max(sequence))
+                .or_insert(sequence);
+            if sequence < self.shared_views.snapshot_sequence
+                || self
+                    .shared_views
+                    .view_sequences
+                    .get(&scope)
+                    .is_some_and(|held| *held > sequence)
+            {
+                continue;
+            }
+            let count = views.len();
+            views.retain(|view| view.scope != scope);
+            changed |= count != views.len();
+            self.shared_views.view_sequences.insert(scope, sequence);
+        }
+        changed
+    }
+
     pub(super) fn apply_closed_project_tombstones(&mut self) -> Task<Message> {
         let closed = self
             .workspace_model
@@ -942,6 +1836,7 @@ impl Cagents {
         if self.durable.workspace_model_identity == Some(identity) {
             return;
         }
+        self.materialize_replica_snapshot();
         self.shared_views = super::shared_views::State::for_workspace(&self.durable);
         self.clear_closed_chat_drafts();
         let durable = Arc::make_mut(&mut self.durable);
@@ -1075,6 +1970,13 @@ impl Cagents {
         let mut new_managed_panes = Vec::new();
         let mut adopted_scopes = HashSet::new();
         for agent in &model.agents {
+            if self
+                .shared_views
+                .closed
+                .contains(&CardId::from_uuid(agent.id.as_uuid()))
+            {
+                continue;
+            }
             // Scheduled agents stay headless until an explicit history or
             // notification action opens their exact live run.
             if matches!(
@@ -1204,6 +2106,10 @@ impl Cagents {
     ) -> Option<Task<Message>> {
         let placement = &display.scope;
         if !session.has_complete_proof()
+            || self
+                .shared_views
+                .closed
+                .contains(&CardId::from_uuid(agent.id.as_uuid()))
             || agent.closed
             || matches!(placement, crate::agent_execution::Placement::Channel(channel) if self.channel_ui.is_deleting(*channel) || self.channel_ui.was_deleted(*channel))
         {
@@ -1810,6 +2716,20 @@ mod tests {
         ServerEnvelope, ServerMessage, ServerResponse, read_frame, write_frame,
     };
 
+    fn receipt_response(model: WorkspaceModel) -> ServerResponse {
+        ServerResponse::WorkspaceEdit(EditReceipt {
+            identity: model.identity,
+            sequence: model.sequence,
+            effects: EditEffects {
+                channels: model.channels,
+                projects: model.projects,
+                agents: model.agents,
+                navigation_orders: model.navigation_orders,
+                ..Default::default()
+            },
+        })
+    }
+
     fn publisher_reply(
         peer: &mut std::os::unix::net::UnixStream,
         proof: &crate::model::HostSessionProof,
@@ -1861,7 +2781,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_title_restore_reconnects_before_sending_later_edits() {
+    fn invalid_receipt_reconnects_before_sending_later_edits() {
         let id = ChannelId::new();
         let title = ModelEdit::SuggestConversationTitle {
             id,
@@ -1878,7 +2798,7 @@ mod tests {
             let request: ClientEnvelope = read_frame(peer).unwrap().unwrap();
             assert!(matches!(
                 request.request,
-                ClientRequest::EditWorkspaceModel {
+                ClientRequest::ApplyWorkspaceEdit {
                     edit: ModelEdit::SuggestConversationTitle { .. }
                 }
             ));
@@ -1893,15 +2813,18 @@ mod tests {
                 )),
             );
             let read: ClientEnvelope = read_frame(peer).unwrap().unwrap();
-            assert_eq!(read.request, ClientRequest::ReadWorkspaceModel);
+            assert!(matches!(
+                read.request,
+                ClientRequest::ApplyWorkspaceEdit {
+                    edit: ModelEdit::RetitleChannel { .. }
+                }
+            ));
             publisher_reply(
                 peer,
                 proof,
                 read.request_id + 1,
                 ServerMessage::Response {
-                    response: ServerResponse::WorkspaceModel {
-                        model: WorkspaceModel::default(),
-                    },
+                    response: receipt_response(WorkspaceModel::default()),
                 },
             );
             let later: Option<ClientEnvelope> = read_frame(peer).unwrap();
@@ -1922,10 +2845,10 @@ mod tests {
         server.join().unwrap();
         assert!(error.contains("does not match"), "{error}");
         assert!(
-            pending.is_none(),
-            "the definitive title refusal must not be replayed"
+            pending.as_ref().is_some_and(|(edit, _)| edit == &next),
+            "only the edit with an unknown receipt may be retried"
         );
-        assert_eq!(requests.try_recv().unwrap(), next);
+        assert!(requests.try_recv().is_err());
     }
 
     #[test]
@@ -1945,7 +2868,7 @@ mod tests {
             let request: ClientEnvelope = read_frame(peer).unwrap().unwrap();
             assert_eq!(
                 request.request,
-                ClientRequest::EditWorkspaceModel { edit: title }
+                ClientRequest::ApplyWorkspaceEdit { edit: title }
             );
             publisher_reply(
                 peer,
@@ -1960,7 +2883,7 @@ mod tests {
             let request: ClientEnvelope = read_frame(peer).unwrap().unwrap();
             assert_eq!(
                 request.request,
-                ClientRequest::EditWorkspaceModel { edit: expected }
+                ClientRequest::ApplyWorkspaceEdit { edit: expected }
             );
             peer.shutdown(std::net::Shutdown::Both).unwrap();
         });
@@ -1989,16 +2912,14 @@ mod tests {
             let request: ClientEnvelope = read_frame(peer).unwrap().unwrap();
             assert_eq!(
                 request.request,
-                ClientRequest::EditWorkspaceModel { edit: expected }
+                ClientRequest::ApplyWorkspaceEdit { edit: expected }
             );
             publisher_reply(
                 peer,
                 proof,
                 request.request_id,
                 ServerMessage::Response {
-                    response: ServerResponse::WorkspaceModel {
-                        model: WorkspaceModel::default(),
-                    },
+                    response: receipt_response(WorkspaceModel::default()),
                 },
             );
         });
@@ -2009,6 +2930,10 @@ mod tests {
         drop(client);
         server.join().unwrap();
         assert!(pending.is_none());
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            ModelUpdate::Committed { .. }
+        ));
         assert!(received.is_empty());
     }
 
@@ -2074,7 +2999,7 @@ mod tests {
                 let request: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
                 assert_eq!(
                     request.request,
-                    ClientRequest::EditWorkspaceModel {
+                    ClientRequest::ApplyWorkspaceEdit {
                         edit: title.clone()
                     }
                 );
@@ -2087,24 +3012,11 @@ mod tests {
                         false,
                     )),
                 );
-                if matches!(title, ModelEdit::SuggestConversationTitle { .. }) {
-                    let read: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
-                    assert_eq!(read.request, ClientRequest::ReadWorkspaceModel);
-                    respond(
-                        &mut peer,
-                        read.request_id,
-                        ServerMessage::Response {
-                            response: ServerResponse::WorkspaceModel {
-                                model: WorkspaceModel::default(),
-                            },
-                        },
-                    );
-                }
             }
             let request: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
             assert_eq!(
                 request.request,
-                ClientRequest::EditWorkspaceModel {
+                ClientRequest::ApplyWorkspaceEdit {
                     edit: expected_next
                 }
             );
@@ -2112,9 +3024,7 @@ mod tests {
                 &mut peer,
                 request.request_id,
                 ServerMessage::Response {
-                    response: ServerResponse::WorkspaceModel {
-                        model: WorkspaceModel::default(),
-                    },
+                    response: receipt_response(WorkspaceModel::default()),
                 },
             );
         });
@@ -2134,7 +3044,14 @@ mod tests {
             "only draining the queue ends publication"
         );
         assert!(pending.is_none());
-        assert!(matches!(received.try_recv().unwrap(), ModelUpdate::Read(_)));
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            ModelUpdate::RestoreCanonicalTitle
+        ));
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            ModelUpdate::Committed { .. }
+        ));
         drop(client);
         server.join().unwrap();
     }
@@ -2256,166 +3173,344 @@ mod tests {
     }
 
     #[test]
-    fn agent_invalidation_reads_once_without_reconciling_a_stale_inventory_edge() {
-        use crate::terminal::ipc::{
-            ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage,
-            ServerResponse, read_frame, write_frame,
-        };
-        // Exercise both a real inventory arrival and removal while preserving
-        // the exact five-update ordering contract in each scenario.
+    fn agent_and_rank_edges_carry_canonical_rows_without_full_reads() {
         for removed in [false, true] {
             let (_, mut agent, _, _) = managed_display_fixture();
             agent.name = Some("Refreshed managed agent".into());
+            let agent_id = agent.id;
             let initial = if removed {
                 vec![agent.clone()]
             } else {
                 Vec::new()
             };
-            let refreshed = if removed { Vec::new() } else { vec![agent] };
-            let server_initial = initial.clone();
-            let server_refreshed = refreshed.clone();
-            let channel = ChannelId::new();
-            let title = ModelEdit::RetitleChannel {
-                id: channel,
-                title: "Manual title".into(),
+            let expected_agents = if removed {
+                Vec::new()
+            } else {
+                vec![agent.clone()]
             };
-            let create = ModelEdit::CreateChannel {
-                id: ChannelId::new(),
-                repository: "/repo/.git".into(),
-                title: "Other channel".into(),
-                title_source: Default::default(),
-            };
-            let expected_title = title.clone();
-            let expected_create = create.clone();
-            let (stream, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
-            peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            let server = std::thread::spawn(move || {
-                let proof = crate::model::HostSessionProof {
-                    host_session_id: "observer".into(),
-                    boot_id: "boot".into(),
-                    host_incarnation: "owner".into(),
-                };
-                let hello: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
-                write_frame(
-                    &mut peer,
-                    &ServerEnvelope {
-                        version: PROTOCOL_VERSION,
-                        request_id: Some(hello.request_id),
-                        proof: proof.clone(),
-                        message: ServerMessage::Response {
-                            response: ServerResponse::Connected {
-                                proof: proof.clone(),
-                                resumed: vec![],
-                            },
-                        },
-                    },
-                )
-                .unwrap();
-                let watch: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+            let channel = shared(ChannelId::new(), Path::new("/repo/.git"), "Original", 1);
+            let mut titled = channel.clone();
+            titled.title = "Manual title".into();
+            let created = shared(ChannelId::new(), Path::new("/repo/.git"), "Other", 2);
+            let expected_created = created.clone();
+            let expected_initial = initial.clone();
+            let (mut client, server) = publisher_connection(move |peer, proof| {
+                let watch: ClientEnvelope = read_frame(peer).unwrap().unwrap();
                 assert_eq!(watch.request, ClientRequest::WatchWorkspaceModel);
-                let mut model = WorkspaceModel {
-                    identity: uuid::Uuid::new_v4(),
-                    agents: server_initial,
-                    ..Default::default()
-                };
-                write_frame(
-                    &mut peer,
-                    &ServerEnvelope {
-                        version: PROTOCOL_VERSION,
-                        request_id: Some(watch.request_id),
-                        proof: proof.clone(),
-                        message: ServerMessage::Response {
-                            response: ServerResponse::WorkspaceModel {
-                                model: model.clone(),
+                publisher_reply(
+                    peer,
+                    proof,
+                    watch.request_id,
+                    ServerMessage::Response {
+                        response: ServerResponse::WorkspaceSnapshot {
+                            model: WorkspaceModel {
+                                identity: uuid::Uuid::new_v4(),
+                                channels: vec![channel.clone()],
+                                agents: initial,
+                                ..Default::default()
                             },
+                            closed: vec![],
                         },
                     },
-                )
-                .unwrap();
-                for (sequence, edit) in [(1, title), (2, ModelEdit::AgentsChanged), (3, create)] {
+                );
+                let edits = [
+                    (
+                        ModelEdit::RetitleChannel {
+                            id: channel.id,
+                            title: titled.title.clone(),
+                        },
+                        EditEffects {
+                            channels: vec![titled],
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        ModelEdit::AgentsChanged,
+                        EditEffects {
+                            agents: if removed { Vec::new() } else { vec![agent] },
+                            removed_agents: if removed { vec![agent_id] } else { Vec::new() },
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        ModelEdit::CreateChannel {
+                            id: created.id,
+                            repository: created.repository.clone(),
+                            title: created.title.clone(),
+                            title_source: created.title_source,
+                        },
+                        EditEffects {
+                            channels: vec![created],
+                            ..Default::default()
+                        },
+                    ),
+                ];
+                for (sequence, (edit, effects)) in (1..).zip(edits) {
                     write_frame(
-                        &mut peer,
+                        peer,
                         &ServerEnvelope {
                             version: PROTOCOL_VERSION,
                             request_id: None,
                             proof: proof.clone(),
                             message: ServerMessage::WorkspaceModelEdited {
                                 sequence,
-                                edit: edit.clone(),
+                                edit,
+                                effects,
                             },
                         },
                     )
                     .unwrap();
-                    model.fold(sequence, &edit);
-                    if sequence == 2 {
-                        model.agents = server_refreshed.clone();
-                    }
-                    if sequence != 1 {
-                        let read: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
-                        assert_eq!(read.request, ClientRequest::ReadWorkspaceModel);
-                        write_frame(
-                            &mut peer,
-                            &ServerEnvelope {
-                                version: PROTOCOL_VERSION,
-                                request_id: Some(read.request_id),
-                                proof: proof.clone(),
-                                message: ServerMessage::Response {
-                                    response: ServerResponse::WorkspaceModel {
-                                        model: model.clone(),
-                                    },
-                                },
-                            },
-                        )
-                        .unwrap();
-                    }
                 }
                 write_frame(
-                    &mut peer,
+                    peer,
                     &ServerEnvelope {
                         version: PROTOCOL_VERSION,
                         request_id: None,
-                        proof,
+                        proof: proof.clone(),
                         message: ServerMessage::HostShuttingDown,
                     },
                 )
                 .unwrap();
+                assert!(
+                    read_frame::<ClientEnvelope>(peer).unwrap().is_none(),
+                    "metadata deltas must not request another model"
+                );
             });
-            let mut client = ControlClient::from_stream(stream).unwrap();
             let (tx, rx) = async_channel::unbounded();
             assert!(observe_with_client(&tx, &mut client).is_err());
+            drop(client);
             server.join().unwrap();
-            let updates = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
-            assert_eq!(
-                updates.len(),
-                5,
-                "one full Read for AgentsChanged, never a stale Edited first"
-            );
-            assert!(matches!(&updates[0], ModelUpdate::Connected(model) if model.sequence == 0));
+            let updates: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+            assert_eq!(updates.len(), 4);
             assert!(
-                matches!(&updates[0], ModelUpdate::Connected(model) if model.agents == initial),
-                "the watch response keeps the original inventory"
+                matches!(&updates[0], ModelUpdate::ConnectedClosed { model, .. } if model.agents == expected_initial)
             );
-            assert!(
-                matches!(&updates[1], ModelUpdate::Edited { sequence: 1, edit } if edit == &expected_title)
-            );
-            assert!(matches!(&updates[2], ModelUpdate::Read(model) if model.sequence == 2));
-            assert!(
-                matches!(&updates[2], ModelUpdate::Read(model) if model.agents == refreshed),
-                "AgentsChanged must carry the exact fresh inventory, including removal"
-            );
-            assert!(
-                matches!(&updates[3], ModelUpdate::Edited { sequence: 3, edit } if edit == &expected_create)
-            );
-            assert!(matches!(&updates[4], ModelUpdate::Read(model) if model.sequence == 3));
-            assert!(
-                matches!(&updates[4], ModelUpdate::Read(model) if model.agents == refreshed),
-                "later full reads must not restore stale agent inventory"
-            );
+            assert!(matches!(&updates[2], ModelUpdate::Changed { changes, .. }
+                if changes.effects.agents == expected_agents
+                    && changes.effects.removed_agents == if removed { vec![agent_id] } else { Vec::new() }));
+            assert!(matches!(&updates[3], ModelUpdate::Changed { changes, .. }
+                if changes.effects.channels == [expected_created]));
         }
     }
 
     #[test]
-    fn create_publisher_keeps_the_complete_canonical_rank_response() {
+    fn a_view_edge_applies_to_the_held_view_and_reads_only_the_scope_it_cannot() {
+        use crate::terminal::ipc::{
+            ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage,
+            ServerResponse, read_frame, write_frame,
+        };
+        use crate::workspace_model::{
+            delta::{EditEffects, ViewRevision},
+            views::{Change, Pane, Scope, View},
+        };
+        let pane = || Pane {
+            id: crate::model::CardId::new(),
+            title: "browser".into(),
+            user_title: None,
+            pending_terminal_start: false,
+            width_fraction: 0.5,
+            scope: None,
+            kind: crate::model::CardKind::Browser(crate::model::BrowserSession {
+                id: crate::model::BrowserId::new(),
+                current_url: "https://example.com".parse().unwrap(),
+                history: vec![],
+                history_index: 0,
+                scroll_x: 0.,
+                scroll_y: 0.,
+                fidelity: crate::model::BrowserRestoreFidelity::UrlOnly,
+            }),
+        };
+        let view = |scope: &Scope, revision, panes| View {
+            scope: scope.clone(),
+            revision,
+            panes,
+            retired: vec![],
+        };
+        let edge = |scope: &Scope, change, before, after| {
+            (
+                ModelEdit::ChangeView {
+                    scope: scope.clone(),
+                    expected_revision: 0,
+                    operation: uuid::Uuid::new_v4(),
+                    change,
+                },
+                EditEffects {
+                    views: vec![ViewRevision {
+                        scope: scope.clone(),
+                        before,
+                        after,
+                    }],
+                    ..Default::default()
+                },
+            )
+        };
+        let held = Scope::Channel(ChannelId::new());
+        let seeded = Scope::Channel(ChannelId::new());
+        let (first, second, third) = (pane(), pane(), pane());
+        let initial = view(&held, 5, vec![first.clone()]);
+        let inserted = view(&held, 9, vec![first.clone(), second.clone()]);
+        // The daemon's view after an edit this window never saw an edge for.
+        let missed = view(&held, 14, vec![second.clone(), third.clone()]);
+        let created = view(&seeded, 15, vec![third.clone()]);
+        let edges = [
+            edge(
+                &held,
+                Change::Insert {
+                    pane: second.clone(),
+                    before: None,
+                },
+                Some(5),
+                Some(9),
+            ),
+            edge(&held, Change::Remove { id: first.id }, Some(12), Some(14)),
+            (
+                ModelEdit::SeedView {
+                    scope: seeded.clone(),
+                    panes: vec![third.clone()],
+                    closed: vec![],
+                },
+                EditEffects {
+                    views: vec![ViewRevision {
+                        scope: seeded.clone(),
+                        before: None,
+                        after: Some(15),
+                    }],
+                    ..Default::default()
+                },
+            ),
+        ];
+        let expected_edits = edges
+            .iter()
+            .map(|(edit, _)| edit.clone())
+            .collect::<Vec<_>>();
+        let reads = [None, Some(missed.clone()), Some(created.clone())];
+        let watched = WorkspaceModel {
+            identity: uuid::Uuid::new_v4(),
+            views: vec![initial],
+            ..Default::default()
+        };
+        let (stream, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let server = std::thread::spawn(move || {
+            let proof = crate::model::HostSessionProof {
+                host_session_id: "observer".into(),
+                boot_id: "boot".into(),
+                host_incarnation: "owner".into(),
+            };
+            let send = |peer: &mut std::os::unix::net::UnixStream, request_id, message| {
+                write_frame(
+                    peer,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id,
+                        proof: proof.clone(),
+                        message,
+                    },
+                )
+                .unwrap()
+            };
+            let hello: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+            let connected = ServerResponse::Connected {
+                proof: proof.clone(),
+                resumed: vec![],
+            };
+            send(
+                &mut peer,
+                Some(hello.request_id),
+                ServerMessage::Response {
+                    response: connected,
+                },
+            );
+            let watch: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+            assert_eq!(watch.request, ClientRequest::WatchWorkspaceModel);
+            send(
+                &mut peer,
+                Some(watch.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::WorkspaceSnapshot {
+                        model: watched,
+                        closed: vec![],
+                    },
+                },
+            );
+            for (sequence, ((edit, effects), read)) in (1..).zip(edges.into_iter().zip(reads)) {
+                send(
+                    &mut peer,
+                    None,
+                    ServerMessage::WorkspaceModelEdited {
+                        sequence,
+                        edit,
+                        effects: effects.clone(),
+                    },
+                );
+                let Some(view) = read else {
+                    continue;
+                };
+                let request: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+                assert_eq!(
+                    request.request,
+                    ClientRequest::ReadWorkspaceView {
+                        scope: effects.views[0].scope.clone(),
+                    },
+                    "only the scope the edge does not determine is read"
+                );
+                send(
+                    &mut peer,
+                    Some(request.request_id),
+                    ServerMessage::Response {
+                        response: ServerResponse::WorkspaceView {
+                            view: Some(view),
+                            sequence,
+                        },
+                    },
+                );
+            }
+            send(&mut peer, None, ServerMessage::HostShuttingDown);
+        });
+        let mut client = ControlClient::from_stream(stream).unwrap();
+        let (tx, rx) = async_channel::unbounded();
+        assert!(observe_with_client(&tx, &mut client).is_err());
+        server.join().unwrap();
+        let updates = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(matches!(&updates[0], ModelUpdate::ConnectedClosed { .. }));
+        let changed = updates[1..]
+            .iter()
+            .map(|update| match update {
+                ModelUpdate::Changed {
+                    sequence,
+                    edit,
+                    changes,
+                } => (*sequence, edit.clone(), changes.views.clone()),
+                other => panic!("every view edge installs its views, not {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        let installed = |sequence, views: Vec<crate::workspace_model::views::View>| ViewChanges {
+            sequence,
+            observed: if sequence > 1 {
+                views
+                    .iter()
+                    .map(|view| (view.scope.clone(), sequence))
+                    .collect()
+            } else {
+                HashMap::new()
+            },
+            views,
+            removed: vec![],
+            absent: vec![],
+        };
+        assert_eq!(
+            changed,
+            vec![
+                (1, expected_edits[0].clone(), installed(1, vec![inserted])),
+                (2, expected_edits[1].clone(), installed(2, vec![missed])),
+                (3, expected_edits[2].clone(), installed(3, vec![created])),
+            ],
+            "no edge reads the whole model"
+        );
+    }
+
+    #[test]
+    fn create_publisher_keeps_the_canonical_rank_without_unrelated_views() {
         use crate::terminal::ipc::{
             ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage,
             ServerResponse, read_frame, write_frame,
@@ -2475,7 +3570,7 @@ mod tests {
             let request: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
             assert_eq!(
                 request.request,
-                ClientRequest::EditWorkspaceModel {
+                ClientRequest::ApplyWorkspaceEdit {
                     edit: expected_edit
                 }
             );
@@ -2486,7 +3581,7 @@ mod tests {
                     request_id: Some(request.request_id),
                     proof,
                     message: ServerMessage::Response {
-                        response: ServerResponse::WorkspaceModel { model },
+                        response: receipt_response(model),
                     },
                 },
             )
@@ -2495,11 +3590,17 @@ mod tests {
         let mut client = ControlClient::from_stream(stream).unwrap();
         let (sender, updates) = async_channel::unbounded();
         send(&mut client, edit, &sender).unwrap();
-        let ModelUpdate::Ranked { channel, model } = updates.try_recv().unwrap() else {
+        let ModelUpdate::Committed { receipt, views, .. } = updates.try_recv().unwrap() else {
             panic!("a successful create forwards its canonical receipt")
         };
-        assert_eq!(channel, id);
-        assert_eq!(model, expected);
+        assert_eq!(receipt.identity, expected.identity);
+        assert_eq!(receipt.sequence, expected.sequence);
+        assert_eq!(receipt.effects.channels, expected.channels);
+        assert_eq!(receipt.effects.projects, expected.projects);
+        assert!(
+            views.is_empty(),
+            "unrelated pane descriptors never reach the UI"
+        );
         assert!(updates.try_recv().is_err());
         drop(client);
         server.join().unwrap();
@@ -2553,7 +3654,7 @@ mod tests {
                 let request: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
                 assert_eq!(
                     request.request,
-                    ClientRequest::EditWorkspaceModel {
+                    ClientRequest::ApplyWorkspaceEdit {
                         edit: expected_title.clone()
                     }
                 );
@@ -2572,26 +3673,10 @@ mod tests {
                 )
                 .unwrap();
             }
-            let read: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
-            assert_eq!(read.request, ClientRequest::ReadWorkspaceModel);
-            write_frame(
-                &mut peer,
-                &ServerEnvelope {
-                    version: PROTOCOL_VERSION,
-                    request_id: Some(read.request_id),
-                    proof: proof.clone(),
-                    message: ServerMessage::Response {
-                        response: ServerResponse::WorkspaceModel {
-                            model: WorkspaceModel::default(),
-                        },
-                    },
-                },
-            )
-            .unwrap();
             let next: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
             assert_eq!(
                 next.request,
-                ClientRequest::EditWorkspaceModel {
+                ClientRequest::ApplyWorkspaceEdit {
                     edit: expected_manual
                 }
             );
@@ -2602,9 +3687,7 @@ mod tests {
                     request_id: Some(next.request_id),
                     proof: proof.clone(),
                     message: ServerMessage::Response {
-                        response: ServerResponse::WorkspaceModel {
-                            model: WorkspaceModel::default(),
-                        },
+                        response: receipt_response(WorkspaceModel::default()),
                     },
                 },
             )
@@ -2617,7 +3700,10 @@ mod tests {
         let mut client = ControlClient::from_stream(client).unwrap();
         let (sender, updates) = async_channel::unbounded();
         send(&mut client, title.clone(), &sender).unwrap();
-        assert!(matches!(updates.try_recv().unwrap(), ModelUpdate::Read(_)));
+        assert!(matches!(
+            updates.try_recv().unwrap(),
+            ModelUpdate::RestoreCanonicalTitle
+        ));
         assert!(
             matches!(updates.try_recv().unwrap(), ModelUpdate::TitleDeferred(edit) if edit == title)
         );
@@ -2707,7 +3793,7 @@ mod tests {
             )
             .unwrap();
             let edit: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
-            assert!(matches!(edit.request, ClientRequest::EditWorkspaceModel {
+            assert!(matches!(edit.request, ClientRequest::ApplyWorkspaceEdit {
                 edit: ModelEdit::ChangeView { operation, .. } } if operation == stale));
             write_frame(
                 &mut server_stream,
@@ -2722,14 +3808,20 @@ mod tests {
             )
             .unwrap();
             let read: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
-            assert!(matches!(read.request, ClientRequest::ReadWorkspaceModel));
+            assert_eq!(
+                read.request,
+                ClientRequest::ReadWorkspaceView {
+                    scope: model.views[0].scope.clone()
+                }
+            );
             write_frame(
                 &mut server_stream,
                 &envelope(
                     read.request_id,
                     ServerMessage::Response {
-                        response: ServerResponse::WorkspaceModel {
-                            model: model.clone(),
+                        response: ServerResponse::WorkspaceView {
+                            view: Some(model.views[0].clone()),
+                            sequence: 2,
                         },
                     },
                 ),
@@ -2738,14 +3830,25 @@ mod tests {
             // A revision-only retry would repeat stale here and fail. The
             // publisher must instead be free to admit the next independent edit.
             let edit: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
-            assert!(matches!(edit.request, ClientRequest::EditWorkspaceModel {
+            assert!(matches!(edit.request, ClientRequest::ApplyWorkspaceEdit {
                 edit: ModelEdit::ChangeView { operation, .. } } if operation == next));
             write_frame(
                 &mut server_stream,
                 &envelope(
                     edit.request_id,
                     ServerMessage::Response {
-                        response: ServerResponse::WorkspaceModel { model },
+                        response: ServerResponse::WorkspaceEdit(EditReceipt {
+                            identity: model.identity,
+                            sequence: 3,
+                            effects: EditEffects {
+                                views: vec![crate::workspace_model::delta::ViewRevision {
+                                    scope: model.views[0].scope.clone(),
+                                    before: Some(2),
+                                    after: Some(3),
+                                }],
+                                ..Default::default()
+                            },
+                        }),
                     },
                 ),
             )
@@ -2758,19 +3861,20 @@ mod tests {
         });
         let mut client = ControlClient::from_stream(client_stream).unwrap();
         let (tx, rx) = async_channel::unbounded();
-        send(&mut client, first_edit, &tx).unwrap();
+        let mut mirror = Mirror::default();
+        send_with_mirror(&mut client, first_edit, &tx, &mut mirror).unwrap();
         assert!(
-            matches!(rx.try_recv().unwrap(), ModelUpdate::ViewConflicted {
-            operation, change: actual, model, ..
-        } if operation == stale && actual == change && model == expected_model)
+            matches!(rx.try_recv().unwrap(), ModelUpdate::ScopeConflicted {
+            operation, change: actual, views, ..
+        } if operation == stale && actual == change && views.views == expected_model.views)
         );
         assert!(
             rx.try_recv().is_err(),
             "a refused source edit has no ViewApplied receipt"
         );
-        send(&mut client, next_edit, &tx).unwrap();
-        assert!(matches!(rx.try_recv().unwrap(), ModelUpdate::ViewApplied {
-            operation: Some(operation), ..
+        send_with_mirror(&mut client, next_edit, &tx, &mut mirror).unwrap();
+        assert!(matches!(rx.try_recv().unwrap(), ModelUpdate::Committed {
+            edit: ModelEdit::ChangeView { operation, .. }, ..
         } if operation == next));
         drop(client);
         server.join().unwrap();
@@ -3599,6 +4703,869 @@ mod tests {
             );
             assert_eq!(app.workspace_model.views, original.views);
         }
+    }
+
+    #[test]
+    fn edge_views_install_by_revision_and_fence_older_snapshots() {
+        use crate::workspace_model::{
+            delta::ViewChanges,
+            views::{Scope, View},
+        };
+        let (mut app, _, repository) = app_with_project();
+        let channel = ChannelId::new();
+        let scope = Scope::Channel(channel);
+        let mut original = registry(vec![shared(channel, &repository, "Original", 0)]);
+        original.sequence = 4;
+        original.views.push(View {
+            revision: 3,
+            ..View::empty(scope.clone())
+        });
+        assert!(app.install_workspace_model_snapshot(original.clone()));
+        let at = |revision| View {
+            revision,
+            ..View::empty(scope.clone())
+        };
+        let mut retitled = original.channels[0].clone();
+        retitled.title = String::new();
+        let changes = |views, channels| EdgeChanges {
+            identity: None,
+            views: ViewChanges {
+                sequence: 0,
+                observed: HashMap::new(),
+                views,
+                removed: vec![],
+                absent: vec![],
+            },
+            effects: EditEffects {
+                channels,
+                ..Default::default()
+            },
+        };
+        let change = || ModelEdit::ChangeView {
+            scope: scope.clone(),
+            expected_revision: 0,
+            operation: uuid::Uuid::new_v4(),
+            change: crate::workspace_model::views::Change::Remove {
+                id: crate::model::CardId::new(),
+            },
+        };
+        drop(app.apply_workspace_model_update(ModelUpdate::Changed {
+            sequence: 6,
+            edit: change(),
+            changes: changes(vec![at(7)], vec![retitled.clone()]),
+        }));
+        assert_eq!(app.workspace_model.views, vec![at(7)]);
+        assert_eq!(app.workspace_model.channels, vec![retitled]);
+        assert_eq!(app.shared_views.snapshot_sequence, 4);
+        // A reconnect snapshot recovers unrelated rows while preserving newer edge rows.
+        let mut older = original.clone();
+        older.sequence = 5;
+        assert!(app.install_workspace_model_snapshot(older));
+        assert_eq!(app.workspace_model.views, vec![at(7)]);
+
+        // A stale edge still brings a view a read took past the snapshot,
+        // but neither rewinds one nor revives a scope the snapshot lacks.
+        let other = Scope::Channel(ChannelId::new());
+        drop(app.apply_workspace_model_update(ModelUpdate::Changed {
+            sequence: 5,
+            edit: change(),
+            changes: changes(
+                vec![at(9), View::empty(other.clone())],
+                vec![original.channels[0].clone()],
+            ),
+        }));
+        assert_eq!(app.workspace_model.views, vec![at(9)]);
+        assert_eq!(app.workspace_model.channels[0].title, "");
+        drop(app.apply_workspace_model_update(ModelUpdate::Changed {
+            sequence: 5,
+            edit: change(),
+            changes: changes(vec![at(8)], vec![]),
+        }));
+        assert_eq!(app.workspace_model.views, vec![at(9)]);
+    }
+
+    #[test]
+    fn scoped_absence_removes_newer_window_data_and_preserves_later_recreation() {
+        use crate::workspace_model::views::{Scope, View};
+        let (mut app, _, repository) = app_with_project();
+        let channel = ChannelId::new();
+        let scope = Scope::Channel(channel);
+        let at = |revision| View {
+            revision,
+            ..View::empty(scope.clone())
+        };
+        let mut initial = registry(vec![shared(channel, &repository, "Work", 0)]);
+        initial.sequence = 4;
+        initial.views = vec![at(10)];
+        assert!(app.install_workspace_model_snapshot(initial));
+        assert!(app.install_edge_views(
+            ViewChanges {
+                sequence: 13,
+                views: vec![at(13)],
+                ..Default::default()
+            },
+            true
+        ));
+        let mut older_mirror = Mirror::new(&[at(10)]);
+        let absent = older_mirror.install_at(scope.clone(), None, 20);
+        assert!(app.install_edge_views(absent, true));
+        assert!(
+            app.workspace_model.views.is_empty(),
+            "query absence is authoritative beyond the mirror's old revision"
+        );
+        assert!(!app.install_edge_views(
+            ViewChanges {
+                sequence: 15,
+                views: vec![at(15)],
+                ..Default::default()
+            },
+            true
+        ));
+        assert!(
+            app.workspace_model.views.is_empty(),
+            "an older presence cannot undo a later absence"
+        );
+        assert!(app.install_edge_views(
+            ViewChanges {
+                sequence: 21,
+                views: vec![at(30)],
+                ..Default::default()
+            },
+            true
+        ));
+        assert!(!app.install_edge_views(older_mirror.install_at(scope.clone(), None, 20), true));
+        assert_eq!(
+            app.workspace_model.views,
+            vec![at(30)],
+            "a delayed absence cannot erase a recreated scope"
+        );
+    }
+
+    #[test]
+    fn delayed_reconnect_baseline_never_resurrects_a_deleted_scope() {
+        use crate::workspace_model::views::{Scope, View};
+        let (mut app, _, repository) = app_with_project();
+        let channel = ChannelId::new();
+        let scope = Scope::Channel(channel);
+        let mut baseline = registry(vec![shared(channel, &repository, "Work", 0)]);
+        baseline.sequence = 100;
+        baseline.views = vec![View {
+            revision: 80,
+            ..View::empty(scope.clone())
+        }];
+        assert!(app.install_workspace_model_snapshot(baseline.clone()));
+        drop(app.apply_changed_edge(
+            120,
+            &ModelEdit::AgentsChanged,
+            EdgeChanges {
+                views: ViewChanges {
+                    sequence: 120,
+                    removed: vec![(scope.clone(), 80)],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ));
+        assert!(app.workspace_model.views.is_empty());
+        assert!(app.install_workspace_model_snapshot(baseline.clone()));
+        assert!(
+            app.workspace_model.views.is_empty(),
+            "a delayed reconnect baseline cannot resurrect a deleted scope"
+        );
+        let recreated = View {
+            revision: 130,
+            ..View::empty(scope)
+        };
+        drop(app.apply_changed_edge(
+            130,
+            &ModelEdit::AgentsChanged,
+            EdgeChanges {
+                views: ViewChanges {
+                    sequence: 130,
+                    views: vec![recreated.clone()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ));
+        baseline.views.clear();
+        baseline.sequence = 110;
+        assert!(app.install_workspace_model_snapshot(baseline));
+        assert_eq!(
+            app.workspace_model.views,
+            vec![recreated],
+            "a baseline's older absence cannot delete a later scope incarnation"
+        );
+    }
+
+    #[test]
+    fn scoped_reads_ahead_of_the_edge_fence_later_but_older_full_snapshots() {
+        use crate::workspace_model::views::{Scope, View};
+        let (mut app, _, repository) = app_with_project();
+        let channel = ChannelId::new();
+        let scope = Scope::Channel(channel);
+        let at = |revision| View {
+            revision,
+            ..View::empty(scope.clone())
+        };
+        let mut baseline = registry(vec![shared(channel, &repository, "Work", 0)]);
+        baseline.sequence = 4;
+        baseline.views = vec![at(4)];
+        assert!(app.install_workspace_model_snapshot(baseline.clone()));
+        let mut mirror = Mirror::new(&baseline.views);
+        let ahead = mirror.install_at(scope.clone(), Some(at(10)), 10);
+        drop(app.apply_changed_edge(
+            5,
+            &ModelEdit::AgentsChanged,
+            EdgeChanges {
+                views: ahead,
+                ..Default::default()
+            },
+        ));
+        assert_eq!(app.workspace_model.sequence, 5);
+        baseline.sequence = 8;
+        baseline.views = vec![at(8)];
+        assert!(app.install_workspace_model_snapshot(baseline.clone()));
+        assert_eq!(
+            app.workspace_model.views,
+            vec![at(10)],
+            "the scope read is newer even though the full snapshot overtook the edge sequence"
+        );
+        let absent = mirror.install_at(scope.clone(), None, 20);
+        drop(app.apply_changed_edge(
+            9,
+            &ModelEdit::AgentsChanged,
+            EdgeChanges {
+                views: absent,
+                ..Default::default()
+            },
+        ));
+        baseline.sequence = 18;
+        baseline.views = vec![at(18)];
+        assert!(app.install_workspace_model_snapshot(baseline));
+        assert!(
+            app.workspace_model.views.is_empty(),
+            "a later full snapshot can still predate an already observed absence"
+        );
+    }
+
+    #[test]
+    fn newer_scoped_presence_preserves_ancestors_across_an_older_reconnect_absence() {
+        use crate::workspace_model::views::{Scope, View};
+        let (mut app, _, repository) = app_with_project();
+        let channel = ChannelId::new();
+        let scope = Scope::Channel(channel);
+        let mut baseline = registry(vec![shared(channel, &repository, "Work", 0)]);
+        baseline.sequence = 4;
+        baseline.projects = vec![ModelProject {
+            repository: repository.clone(),
+            name: "repo".into(),
+            kind: ProjectKind::Git,
+            ordinal: 0,
+        }];
+        baseline.views = vec![View {
+            revision: 4,
+            ..View::empty(scope.clone())
+        }];
+        assert!(app.install_workspace_model_snapshot(baseline.clone()));
+        let mut mirror = Mirror::new(&baseline.views);
+        drop(app.apply_changed_edge(
+            5,
+            &ModelEdit::AgentsChanged,
+            EdgeChanges {
+                views: mirror.install_at(
+                    scope.clone(),
+                    Some(View {
+                        revision: 10,
+                        ..View::empty(scope.clone())
+                    }),
+                    10,
+                ),
+                ..Default::default()
+            },
+        ));
+        baseline.sequence = 8;
+        baseline.projects.clear();
+        baseline.channels.clear();
+        baseline.views.clear();
+        baseline.closed_projects.push(repository.clone());
+        assert!(app.install_workspace_model_snapshot(baseline.clone()));
+        assert!(app.workspace_model.project(&repository).is_some());
+        assert!(app.workspace_model.channel(channel).is_some());
+        assert_eq!(app.workspace_model.views.len(), 1);
+        assert!(
+            !app.workspace_model.closed_projects.contains(&repository),
+            "positive scope evidence newer than the reconnect baseline also fences its old ancestor close"
+        );
+        drop(app.apply_changed_edge(
+            9,
+            &ModelEdit::AgentsChanged,
+            EdgeChanges {
+                views: mirror.install_at(scope, None, 20),
+                ..Default::default()
+            },
+        ));
+        baseline.sequence = 18;
+        assert!(app.install_workspace_model_snapshot(baseline));
+        assert!(app.workspace_model.project(&repository).is_none());
+        assert!(app.workspace_model.channel(channel).is_none());
+        assert!(
+            app.workspace_model.views.is_empty(),
+            "a newer absence alone never protects old parent metadata"
+        );
+    }
+
+    #[test]
+    fn newer_receipt_does_not_discard_an_unrelated_earlier_observer_edge() {
+        let (mut app, _, repository) = app_with_project();
+        let first = ChannelId::new();
+        let second = ChannelId::new();
+        let mut baseline = registry(vec![
+            shared(first, &repository, "First", 0),
+            shared(second, &repository, "Second", 1),
+        ]);
+        baseline.sequence = 100;
+        assert!(app.install_workspace_model_snapshot(baseline.clone()));
+        let mut newer = baseline.channels[0].clone();
+        newer.title = "First at 120".into();
+        drop(app.apply_workspace_model_update(ModelUpdate::Committed {
+            receipt: EditReceipt {
+                identity: baseline.identity,
+                sequence: 120,
+                effects: EditEffects {
+                    channels: vec![newer.clone()],
+                    ..Default::default()
+                },
+            },
+            edit: ModelEdit::RetitleChannel {
+                id: first,
+                title: newer.title.clone(),
+            },
+            views: ViewChanges::default(),
+        }));
+        let mut earlier = baseline.channels[1].clone();
+        earlier.title = "Second at 110".into();
+        drop(app.apply_changed_edge(
+            110,
+            &ModelEdit::RetitleChannel {
+                id: second,
+                title: earlier.title.clone(),
+            },
+            EdgeChanges {
+                effects: EditEffects {
+                    channels: vec![earlier.clone()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ));
+        assert_eq!(app.workspace_model.channel(first), Some(&newer));
+        assert_eq!(app.workspace_model.channel(second), Some(&earlier));
+        assert_eq!(
+            app.shared_views.snapshot_sequence, 100,
+            "a partial receipt is never a full snapshot watermark"
+        );
+        assert!(app.install_workspace_model_snapshot(baseline));
+        assert_eq!(app.workspace_model.channel(first), Some(&newer));
+        assert_eq!(app.workspace_model.channel(second), Some(&earlier));
+    }
+
+    #[test]
+    fn closed_identity_survives_deleted_scope_reconnect_until_registry_changes() {
+        use crate::workspace_model::views::{Scope, View};
+        let (mut app, _, repository) = app_with_project();
+        let channel = ChannelId::new();
+        let card = CardId::new();
+        let scope = Scope::Channel(channel);
+        let mut baseline = registry(vec![shared(channel, &repository, "Work", 0)]);
+        baseline.sequence = 4;
+        baseline.views = vec![View {
+            revision: 3,
+            ..View::empty(scope.clone())
+        }];
+        drop(
+            app.apply_workspace_model_update(ModelUpdate::ConnectedClosed {
+                model: baseline.clone(),
+                closed: vec![],
+            }),
+        );
+        drop(app.apply_changed_edge(
+            5,
+            &ModelEdit::AgentsChanged,
+            EdgeChanges {
+                views: ViewChanges {
+                    sequence: 5,
+                    removed: vec![(scope, 3)],
+                    ..Default::default()
+                },
+                effects: EditEffects {
+                    closed: vec![card],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ));
+        baseline.sequence = 6;
+        baseline.views.clear();
+        // Cascading the scope deletes its retired rows; the live window keeps
+        // the already observed close across a connection loss.
+        drop(
+            app.apply_workspace_model_update(ModelUpdate::ConnectedClosed {
+                model: baseline.clone(),
+                closed: vec![],
+            }),
+        );
+        assert!(app.shared_views.closed.contains(&card));
+        assert!(app.shared_chat_creation_revoked(card, None));
+        baseline.identity = uuid::Uuid::new_v4();
+        drop(
+            app.apply_workspace_model_update(ModelUpdate::ConnectedClosed {
+                model: baseline,
+                closed: vec![],
+            }),
+        );
+        assert!(
+            !app.shared_views.closed.contains(&card),
+            "closed identities belong to one registry"
+        );
+    }
+
+    #[test]
+    fn absent_close_survives_scope_deletion_and_blocks_a_delayed_agent_arrival() {
+        use crate::workspace_model::{
+            delta::ViewRevision,
+            views::{Change, Scope, View},
+        };
+        for seed_closed in [false, true] {
+            let (mut app, mut agent, pane, destination) = managed_display_fixture();
+            let source = agent.placement.clone();
+            let Scope::Channel(source_channel) = source.clone() else {
+                unreachable!()
+            };
+            agent.placement = Scope::Channel(destination);
+            agent.spec.target.placement = Some(agent.placement.clone());
+            let identity = app.workspace_model.identity;
+            let mut baseline = app.workspace_model.clone();
+            baseline.sequence = 10;
+            baseline.agents.clear();
+            for view in &mut baseline.views {
+                view.revision = 10;
+                view.panes.clear();
+                view.retired.clear();
+            }
+            let (sent, requests) = async_channel::unbounded();
+            app.workspace_model_tx = sent;
+            drop(
+                app.apply_workspace_model_update(ModelUpdate::ConnectedClosed {
+                    model: baseline,
+                    closed: vec![],
+                }),
+            );
+            assert!(!app.durable.cards.iter().any(|card| card.id == pane.id));
+            let edit = if seed_closed {
+                ModelEdit::SeedView {
+                    scope: source.clone(),
+                    panes: vec![],
+                    closed: vec![pane.id],
+                }
+            } else {
+                ModelEdit::ChangeView {
+                    scope: source.clone(),
+                    expected_revision: 10,
+                    operation: uuid::Uuid::new_v4(),
+                    change: Change::Remove { id: pane.id },
+                }
+            };
+            drop(app.apply_workspace_model_update(ModelUpdate::Changed {
+                sequence: 11,
+                edit,
+                changes: EdgeChanges {
+                    identity: Some(identity),
+                    views: ViewChanges {
+                        sequence: 11,
+                        views: vec![View {
+                            scope: source.clone(),
+                            revision: 11,
+                            panes: vec![],
+                            retired: vec![pane.id],
+                        }],
+                        ..Default::default()
+                    },
+                    effects: EditEffects {
+                        views: vec![ViewRevision {
+                            scope: source.clone(),
+                            before: Some(10),
+                            after: Some(11),
+                        }],
+                        closed: vec![pane.id],
+                        ..Default::default()
+                    },
+                },
+            }));
+            drop(app.apply_workspace_model_update(ModelUpdate::Changed {
+                sequence: 12,
+                edit: ModelEdit::DeleteChannel { id: source_channel },
+                changes: EdgeChanges {
+                    identity: Some(identity),
+                    views: ViewChanges {
+                        sequence: 12,
+                        removed: vec![(source.clone(), 11)],
+                        ..Default::default()
+                    },
+                    effects: EditEffects {
+                        views: vec![ViewRevision {
+                            scope: source.clone(),
+                            before: Some(11),
+                            after: None,
+                        }],
+                        removed_channels: vec![source_channel],
+                        ..Default::default()
+                    },
+                },
+            }));
+            assert!(
+                !app.workspace_model
+                    .views
+                    .iter()
+                    .any(|view| view.retired.contains(&pane.id)),
+                "scope deletion erased the only view tombstone"
+            );
+            drop(app.apply_workspace_model_update(ModelUpdate::Changed {
+                sequence: 13,
+                edit: ModelEdit::AgentsChanged,
+                changes: EdgeChanges {
+                    identity: Some(identity),
+                    effects: EditEffects {
+                        agents: vec![agent.clone()],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            }));
+            assert!(
+                crate::workspace_model::views::managed_display(&app.workspace_model, &agent)
+                    .is_some(),
+                "without the retained closed-identity fence, this otherwise valid delayed agent would be adopted"
+            );
+            assert_eq!(app.workspace_model.agents, vec![agent]);
+            assert!(
+                app.shared_views.closed.contains(&pane.id),
+                "the close is retained without a reconnect after its scope disappears"
+            );
+            assert!(
+                !app.durable.cards.iter().any(|card| card.id == pane.id),
+                "a delayed agent row must not adopt the explicitly closed pane in another channel"
+            );
+            assert!(
+                !app.cards.contains_key(&pane.id),
+                "no runtime or attachment may be admitted for that pane"
+            );
+            assert!(
+                !std::iter::from_fn(|| requests.try_recv().ok()).any(|edit| match edit {
+                    ModelEdit::SeedView { panes, .. } =>
+                        panes.iter().any(|candidate| candidate.id == pane.id),
+                    ModelEdit::ChangeView {
+                        change:
+                            Change::Insert {
+                                pane: candidate, ..
+                            }
+                            | Change::InsertIfEmpty { pane: candidate },
+                        ..
+                    } => candidate.id == pane.id,
+                    _ => false,
+                }),
+                "the delayed agent must not publish a replacement membership"
+            );
+        }
+    }
+
+    #[test]
+    fn baseline_closed_identities_fence_adoption_before_reconciliation() {
+        use crate::workspace_model::views::Scope;
+        let (mut app, agent, pane, destination) = managed_display_fixture();
+        let mut replacement = app.workspace_model.clone();
+        replacement.identity = uuid::Uuid::new_v4();
+        replacement.sequence = 100;
+        assert!(!app.durable.cards.iter().any(|card| card.id == pane.id));
+        drop(
+            app.apply_workspace_model_update(ModelUpdate::ConnectedClosed {
+                model: replacement,
+                closed: vec![pane.id],
+            }),
+        );
+        assert!(app.shared_views.closed.contains(&pane.id));
+        assert!(
+            !app.durable.cards.iter().any(|card| card.id == pane.id),
+            "closed identity must fence both managed and ordinary projection before adoption"
+        );
+        assert!(!app.cards.contains_key(&pane.id));
+        assert!(app.shared_chat_creation_revoked(pane.id, Some(&Scope::Channel(destination))));
+        assert!(app.adopt_execution_agent(&agent).is_none());
+    }
+
+    #[test]
+    fn newer_live_children_fence_old_ancestor_closes_but_absence_does_not() {
+        use crate::workspace_model::views::{Scope, View};
+        let (mut app, _, repository) = app_with_project();
+        let channel = ChannelId::new();
+        let scope = Scope::Channel(channel);
+        let mut baseline = registry(vec![shared(channel, &repository, "Work", 0)]);
+        baseline.sequence = 100;
+        baseline.projects.push(ModelProject {
+            repository: repository.clone(),
+            name: "repo".into(),
+            kind: ProjectKind::Git,
+            ordinal: 0,
+        });
+        baseline.views.push(View {
+            revision: 100,
+            ..View::empty(scope.clone())
+        });
+        assert!(app.install_workspace_model_snapshot(baseline));
+        drop(app.apply_changed_edge(
+            120,
+            &ModelEdit::AgentsChanged,
+            EdgeChanges {
+                views: ViewChanges {
+                    sequence: 120,
+                    views: vec![View {
+                        revision: 120,
+                        ..View::empty(scope.clone())
+                    }],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ));
+        drop(app.apply_changed_edge(
+            110,
+            &ModelEdit::CloseProject {
+                repository: repository.clone(),
+            },
+            EdgeChanges {
+                effects: EditEffects {
+                    removed_projects: vec![repository.clone()],
+                    removed_channels: vec![channel],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ));
+        assert!(
+            app.workspace_model.project(&repository).is_some(),
+            "a newer live scope proves an older close was followed by reopening"
+        );
+        assert!(app.workspace_model.channel(channel).is_some());
+        // A later empty-scope read, unlike live scope evidence, does not imply
+        // reopening and cannot keep a correctly closed project alive.
+        app.install_edge_views(
+            ViewChanges {
+                absent: vec![(scope, 130)],
+                ..Default::default()
+            },
+            true,
+        );
+        drop(app.apply_changed_edge(
+            125,
+            &ModelEdit::CloseProject {
+                repository: repository.clone(),
+            },
+            EdgeChanges {
+                effects: EditEffects {
+                    removed_projects: vec![repository.clone()],
+                    removed_channels: vec![channel],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ));
+        assert!(app.workspace_model.project(&repository).is_none());
+        assert!(app.workspace_model.channel(channel).is_none());
+    }
+
+    #[test]
+    fn project_close_fences_delayed_navigation_even_after_reopen() {
+        use crate::workspace_model::{NavigationItem, NavigationOrder};
+        for close_before_reopen in [false, true] {
+            let (mut app, _, repository) = app_with_project();
+            let project = ModelProject {
+                repository: repository.clone(),
+                name: "repo".into(),
+                kind: ProjectKind::Git,
+                ordinal: 0,
+            };
+            let mut baseline = registry(Vec::new());
+            baseline.sequence = 10;
+            baseline.projects.push(project.clone());
+            assert!(app.install_workspace_model_snapshot(baseline));
+            let reopened = EdgeChanges {
+                effects: EditEffects {
+                    projects: vec![project],
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let closed = EdgeChanges {
+                effects: EditEffects {
+                    removed_projects: vec![repository.clone()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let reopen_edit = ModelEdit::ReopenProject {
+                repository: repository.clone(),
+                name: "repo".into(),
+                kind: ProjectKind::Git,
+            };
+            let close_edit = ModelEdit::CloseProject {
+                repository: repository.clone(),
+            };
+            if close_before_reopen {
+                drop(app.apply_changed_edge(12, &close_edit, closed));
+                drop(app.apply_changed_edge(13, &reopen_edit, reopened));
+            } else {
+                drop(app.apply_changed_edge(13, &reopen_edit, reopened));
+                drop(app.apply_changed_edge(12, &close_edit, closed));
+            }
+            let order = NavigationOrder {
+                repository: repository.clone(),
+                items: vec![NavigationItem::Worktree("/repo/worktree".into())],
+            };
+            drop(app.apply_changed_edge(
+                11,
+                &ModelEdit::ResetNavigation {
+                    repository: repository.clone(),
+                },
+                EdgeChanges {
+                    effects: EditEffects {
+                        navigation_orders: vec![order],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ));
+            assert!(app.workspace_model.project(&repository).is_some());
+            assert!(
+                app.workspace_model.navigation_orders.is_empty(),
+                "a close's implicit order deletion fences a delayed write even when parent reopening overtook it"
+            );
+        }
+    }
+
+    #[test]
+    fn publisher_waits_for_observer_identity_and_acknowledges_every_baseline() {
+        let (mut app, _, repository) = app_with_project();
+        let channel = ChannelId::new();
+        let old = registry(vec![shared(channel, &repository, "Old", 0)]);
+        drop(
+            app.apply_workspace_model_update(ModelUpdate::ConnectedClosed {
+                model: old.clone(),
+                closed: vec![],
+            }),
+        );
+        let mut replacement = old.clone();
+        replacement.identity = uuid::Uuid::new_v4();
+        replacement.channels[0].title = "Replacement".into();
+        let (ready, waiting) = std::sync::mpsc::sync_channel(1);
+        drop(
+            app.apply_workspace_model_update(ModelUpdate::PublisherConnected {
+                identity: replacement.identity,
+                ready,
+            }),
+        );
+        assert!(
+            !waiting.recv().unwrap(),
+            "no edit can be drained before the observer establishes the registry"
+        );
+        assert_eq!(app.workspace_model.identity, old.identity);
+        drop(
+            app.apply_workspace_model_update(ModelUpdate::ConnectedClosed {
+                model: replacement.clone(),
+                closed: vec![],
+            }),
+        );
+        let (ready, waiting) = std::sync::mpsc::sync_channel(1);
+        let mut older = replacement.clone();
+        older.sequence = 0;
+        drop(
+            app.apply_workspace_model_update(ModelUpdate::PublisherConnected {
+                identity: older.identity,
+                ready,
+            }),
+        );
+        assert!(
+            waiting.recv().unwrap(),
+            "same-registry readiness is acknowledged even when its stale snapshot is ignored"
+        );
+        let expected = app.workspace_model.clone();
+        let (ready, waiting) = std::sync::mpsc::sync_channel(1);
+        drop(
+            app.apply_workspace_model_update(ModelUpdate::PublisherConnected {
+                identity: old.identity,
+                ready,
+            }),
+        );
+        assert!(!waiting.recv().unwrap());
+        drop(app.apply_workspace_model_update(ModelUpdate::Committed {
+            receipt: EditReceipt {
+                identity: old.identity,
+                sequence: 900,
+                effects: EditEffects::default(),
+            },
+            edit: ModelEdit::AgentsChanged,
+            views: ViewChanges::default(),
+        }));
+        assert_eq!(
+            app.workspace_model, expected,
+            "a receipt already in flight from the superseded registry cannot mutate the replacement"
+        );
+    }
+
+    #[test]
+    fn delayed_observer_edge_cannot_mutate_a_replacement_registry() {
+        use crate::workspace_model::views::{Scope, View};
+        let (mut app, _, repository) = app_with_project();
+        let channel = ChannelId::new();
+        let card = CardId::new();
+        let original = registry(vec![shared(channel, &repository, "Old registry", 0)]);
+        drop(
+            app.apply_workspace_model_update(ModelUpdate::ConnectedClosed {
+                model: original.clone(),
+                closed: vec![],
+            }),
+        );
+        let mut replacement = original.clone();
+        replacement.identity = uuid::Uuid::new_v4();
+        replacement.channels[0].title = "Replacement registry".into();
+        drop(
+            app.apply_workspace_model_update(ModelUpdate::ConnectedClosed {
+                model: replacement.clone(),
+                closed: vec![],
+            }),
+        );
+        let expected = app.workspace_model.clone();
+        drop(app.apply_changed_edge(
+            900,
+            &ModelEdit::AgentsChanged,
+            EdgeChanges {
+                identity: Some(original.identity),
+                views: ViewChanges {
+                    sequence: 900,
+                    views: vec![View {
+                        revision: 900,
+                        ..View::empty(Scope::Channel(channel))
+                    }],
+                    ..Default::default()
+                },
+                effects: EditEffects {
+                    channels: original.channels,
+                    closed: vec![card],
+                    ..Default::default()
+                },
+            },
+        ));
+        assert_eq!(app.workspace_model, expected);
+        assert!(!app.shared_views.closed.contains(&card));
     }
 
     #[test]

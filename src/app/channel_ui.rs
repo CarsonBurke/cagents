@@ -155,12 +155,11 @@ fn read_open_agents<'a>(
     client: &mut crate::control::ControlClient,
 ) -> Result<&'a [crate::agent_execution::Agent], String> {
     if agents.is_none() {
-        let model = client
-            .read_workspace_model()
+        let (_, open_agents) = client
+            .read_workspace_agents()
             .map_err(|error| error.to_string())?;
         *agents = Some(
-            model
-                .agents
+            open_agents
                 .into_iter()
                 .filter(|agent| !agent.closed)
                 .collect(),
@@ -1078,6 +1077,11 @@ impl Cagents {
         if source != crate::model::ChannelTitleSource::Manual && !title.is_empty() {
             self.channel_ui.names.insert(id, (title, source));
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn remember_channel_name_for_test(&mut self, id: ChannelId, title: String) {
+        self.remember_channel_name(id, title, crate::model::ChannelTitleSource::Provider);
     }
 
     /// Gives a channel back the automatic name it had once the registry holds

@@ -1,0 +1,554 @@
+{
+  "provenance": {
+    "description": "Captured compiled focused-transfer producer and stopped pre-go SQLite DTOs; this snapshot did not satisfy native focus preconditions and is not a passing native proof.",
+    "prepared_receipt_sha256": "506458d390dc4ee09f2b1635658ad4bf66303b349df22cbf0572509d5bb9a570",
+    "prepared_receipt": "focused-fixture-before-failure/transfer-before.json",
+    "raw_state": "p4ft167/state-before-probe-contract-failure",
+    "capture": "SQLite mode=ro BEGIN; database/WAL/SHM bytes unchanged across capture; only browser cards and required navigation metadata retained."
+  },
+  "prepared": {
+    "destination": {
+      "panes": [
+        {
+          "id": "e9efd0ca-2707-4a21-86aa-05911433467f",
+          "kind": {
+            "current_url": "about:blank",
+            "fidelity": "url_only",
+            "history": [],
+            "history_index": 0,
+            "id": "6bee6977-9fee-44c2-8430-df01a809a0b0",
+            "kind": "browser",
+            "scroll_x": 0.0,
+            "scroll_y": 0.0
+          },
+          "pending_terminal_start": false,
+          "scope": "/home/marvin/.local/state/cev/p4ft167/fixture/project",
+          "title": "Transfer destination anchor",
+          "user_title": "Transfer destination anchor",
+          "width_fraction": 0.5
+        }
+      ],
+      "retired": [],
+      "revision": 2,
+      "scope": {
+        "Worktree": {
+          "path": "/home/marvin/.local/state/cev/p4ft167/fixture/project",
+          "repository": "/home/marvin/.local/state/cev/p4ft167/fixture/project/.git"
+        }
+      }
+    },
+    "event": "focused_transfer_prepared",
+    "fixture_root": "/home/marvin/.local/state/cev/p4ft167/fixture",
+    "moved": "9d0b65bd-ec90-4f6d-8e61-3cafb3080f3e",
+    "namespace": "cagents-development",
+    "nonce": "46c532bb-f27b-4f05-9796-2748a7896e56",
+    "registry": {
+      "device": 44,
+      "identity": "fd202ab5-3be7-42c4-badf-8436934a7a4b",
+      "inode": 102366988,
+      "path": "/home/marvin/.local/state/cev/p4ft167/fixture/data/cagents-development/workspace-model.sqlite3"
+    },
+    "schema": 1,
+    "sibling": "aea9745d-b163-4da6-b26d-f91bd8abf3ea",
+    "source": {
+      "channel": "9c52917b-5260-443e-afda-aa558edd8862",
+      "panes": [
+        {
+          "id": "aea9745d-b163-4da6-b26d-f91bd8abf3ea",
+          "kind": {
+            "current_url": "about:blank",
+            "fidelity": "url_only",
+            "history": [],
+            "history_index": 0,
+            "id": "785d7bfc-cb47-4283-bba5-5c43ee36db53",
+            "kind": "browser",
+            "scroll_x": 0.0,
+            "scroll_y": 0.0
+          },
+          "pending_terminal_start": false,
+          "scope": null,
+          "title": "Transfer sibling",
+          "user_title": "Transfer sibling",
+          "width_fraction": 0.5
+        },
+        {
+          "id": "9d0b65bd-ec90-4f6d-8e61-3cafb3080f3e",
+          "kind": {
+            "current_url": "about:blank",
+            "fidelity": "url_only",
+            "history": [],
+            "history_index": 0,
+            "id": "ca05d103-22ad-49ce-9c66-893f3cb8969e",
+            "kind": "browser",
+            "scroll_x": 0.0,
+            "scroll_y": 0.0
+          },
+          "pending_terminal_start": false,
+          "scope": null,
+          "title": "Transfer target",
+          "user_title": "Transfer target",
+          "width_fraction": 0.5
+        }
+      ],
+      "repository": "/home/marvin/.local/state/cev/p4ft167/fixture/project/.git",
+      "retired": [],
+      "revision": 4,
+      "scope": {
+        "Channel": "9c52917b-5260-443e-afda-aa558edd8862"
+      },
+      "title": "Focused transfer proof"
+    },
+    "stores": [
+      {
+        "device": 44,
+        "inode": 102367009,
+        "path": "/home/marvin/.local/state/cev/p4ft167/fixture/data/cagents-development/sessions.sqlite3",
+        "role": "active_source"
+      },
+      {
+        "device": 44,
+        "inode": 102368882,
+        "path": "/home/marvin/.local/state/cev/p4ft167/fixture/data/cagents-development/windows/window-2/sessions.sqlite3",
+        "role": "inactive_source"
+      }
+    ]
+  },
+  "databases": {
+    "data/cagents-development/workspace-model.sqlite3": {
+      "user_version": 23,
+      "tables": {
+        "metadata": {
+          "sql": "CREATE TABLE metadata(\n             key INTEGER PRIMARY KEY CHECK(key = 0),\n             identity TEXT NOT NULL,\n             sequence INTEGER NOT NULL,\n             next_project_ordinal INTEGER NOT NULL,\n             next_channel_ordinal INTEGER NOT NULL\n         ) STRICT",
+          "rows": [
+            {
+              "key": 0,
+              "identity": "fd202ab5-3be7-42c4-badf-8436934a7a4b",
+              "sequence": 6,
+              "next_project_ordinal": 2,
+              "next_channel_ordinal": 2
+            }
+          ]
+        },
+        "projects": {
+          "sql": "CREATE TABLE projects(\n             repository TEXT PRIMARY KEY,\n             name TEXT NOT NULL,\n             ordinal INTEGER NOT NULL\n         , kind TEXT NOT NULL DEFAULT 'git' CHECK(kind IN ('git', 'folder'))) STRICT",
+          "rows": [
+            {
+              "repository": "/home/marvin/.local/state/cev/p4ft167/fixture/project/.git",
+              "name": "project",
+              "ordinal": 1,
+              "kind": "git"
+            }
+          ]
+        },
+        "channels": {
+          "sql": "CREATE TABLE channels(\n             id TEXT PRIMARY KEY,\n             repository TEXT NOT NULL REFERENCES projects(repository) ON DELETE CASCADE,\n             title TEXT NOT NULL,\n             ordinal INTEGER NOT NULL\n         , title_source INTEGER NOT NULL DEFAULT 2 CHECK(title_source BETWEEN 0 AND 2)) STRICT",
+          "rows": [
+            {
+              "id": "9c52917b-5260-443e-afda-aa558edd8862",
+              "repository": "/home/marvin/.local/state/cev/p4ft167/fixture/project/.git",
+              "title": "Focused transfer proof",
+              "ordinal": 1,
+              "title_source": 2
+            }
+          ]
+        },
+        "view_scopes": {
+          "sql": "CREATE TABLE view_scopes(\n    id INTEGER PRIMARY KEY,\n    channel TEXT UNIQUE REFERENCES channels(id) ON DELETE CASCADE,\n    repository TEXT REFERENCES projects(repository) ON DELETE CASCADE,\n    worktree TEXT,\n    revision INTEGER NOT NULL CHECK(revision >= 0),\n    UNIQUE(repository, worktree),\n    CHECK((channel IS NULL) = (repository IS NOT NULL)),\n    CHECK((repository IS NULL) = (worktree IS NULL))\n) STRICT",
+          "rows": [
+            {
+              "id": 1,
+              "channel": null,
+              "repository": "/home/marvin/.local/state/cev/p4ft167/fixture/project/.git",
+              "worktree": "/home/marvin/.local/state/cev/p4ft167/fixture/project",
+              "revision": 2
+            },
+            {
+              "id": 2,
+              "channel": "9c52917b-5260-443e-afda-aa558edd8862",
+              "repository": null,
+              "worktree": null,
+              "revision": 4
+            }
+          ]
+        },
+        "panes": {
+          "sql": "CREATE TABLE panes(\n    id TEXT PRIMARY KEY,\n    scope INTEGER NOT NULL REFERENCES view_scopes(id) ON DELETE CASCADE,\n    position INTEGER NOT NULL,\n    title TEXT NOT NULL,\n    user_title TEXT,\n    width_fraction REAL NOT NULL CHECK(width_fraction > 0),\n    pending_terminal_start INTEGER NOT NULL CHECK(pending_terminal_start IN (0, 1)),\n    filing TEXT,\n    kind TEXT NOT NULL CHECK(kind IN ('terminal', 'chat', 'browser', 'pull_requests', 'repository')),\n    resource TEXT,\n    provider TEXT,\n    provider_session TEXT,\n    descriptor_format INTEGER NOT NULL,\n    descriptor TEXT NOT NULL,\n    UNIQUE(kind, resource)\n) STRICT",
+          "rows": [
+            {
+              "id": "e9efd0ca-2707-4a21-86aa-05911433467f",
+              "scope": 1,
+              "position": 1048576,
+              "title": "Transfer destination anchor",
+              "user_title": "Transfer destination anchor",
+              "width_fraction": 0.5,
+              "pending_terminal_start": 0,
+              "filing": "/home/marvin/.local/state/cev/p4ft167/fixture/project",
+              "kind": "browser",
+              "resource": "6bee6977-9fee-44c2-8430-df01a809a0b0",
+              "provider": null,
+              "provider_session": null,
+              "descriptor_format": 1,
+              "descriptor": "{\"kind\":\"browser\",\"id\":\"6bee6977-9fee-44c2-8430-df01a809a0b0\",\"current_url\":\"about:blank\",\"history\":[],\"history_index\":0,\"scroll_x\":0.0,\"scroll_y\":0.0,\"fidelity\":\"url_only\"}"
+            },
+            {
+              "id": "aea9745d-b163-4da6-b26d-f91bd8abf3ea",
+              "scope": 2,
+              "position": 1048576,
+              "title": "Transfer sibling",
+              "user_title": "Transfer sibling",
+              "width_fraction": 0.5,
+              "pending_terminal_start": 0,
+              "filing": null,
+              "kind": "browser",
+              "resource": "785d7bfc-cb47-4283-bba5-5c43ee36db53",
+              "provider": null,
+              "provider_session": null,
+              "descriptor_format": 1,
+              "descriptor": "{\"kind\":\"browser\",\"id\":\"785d7bfc-cb47-4283-bba5-5c43ee36db53\",\"current_url\":\"about:blank\",\"history\":[],\"history_index\":0,\"scroll_x\":0.0,\"scroll_y\":0.0,\"fidelity\":\"url_only\"}"
+            },
+            {
+              "id": "9d0b65bd-ec90-4f6d-8e61-3cafb3080f3e",
+              "scope": 2,
+              "position": 2097152,
+              "title": "Transfer target",
+              "user_title": "Transfer target",
+              "width_fraction": 0.5,
+              "pending_terminal_start": 0,
+              "filing": null,
+              "kind": "browser",
+              "resource": "ca05d103-22ad-49ce-9c66-893f3cb8969e",
+              "provider": null,
+              "provider_session": null,
+              "descriptor_format": 1,
+              "descriptor": "{\"kind\":\"browser\",\"id\":\"ca05d103-22ad-49ce-9c66-893f3cb8969e\",\"current_url\":\"about:blank\",\"history\":[],\"history_index\":0,\"scroll_x\":0.0,\"scroll_y\":0.0,\"fidelity\":\"url_only\"}"
+            }
+          ]
+        },
+        "retired_panes": {
+          "sql": "CREATE TABLE retired_panes(\n    scope INTEGER NOT NULL REFERENCES view_scopes(id) ON DELETE CASCADE,\n    pane TEXT NOT NULL,\n    ordinal INTEGER NOT NULL,\n    retired_at_unix_ms INTEGER NOT NULL,\n    PRIMARY KEY(scope, pane)\n) STRICT, WITHOUT ROWID",
+          "rows": []
+        }
+      }
+    },
+    "data/cagents-development/sessions.sqlite3": {
+      "user_version": 13,
+      "tables": {
+        "metadata": {
+          "sql": "CREATE TABLE metadata (\n            key TEXT PRIMARY KEY NOT NULL,\n            value TEXT NOT NULL\n         ) STRICT",
+          "rows": [
+            {
+              "key": "workspace:9b3b085e-6235-4aa7-bf79-de9004b13945:navigation:active_worktree",
+              "value": "null"
+            },
+            {
+              "key": "workspace:9b3b085e-6235-4aa7-bf79-de9004b13945:navigation:worktree_focus",
+              "value": "{}"
+            },
+            {
+              "key": "workspace:9b3b085e-6235-4aa7-bf79-de9004b13945:navigation:threads",
+              "value": "[{\"id\":\"9c52917b-5260-443e-afda-aa558edd8862\",\"project_id\":\"4464473e-90c6-41e0-8f8b-4527898015fa\",\"title\":\"Focused transfer proof\",\"title_source\":\"Manual\",\"ordinal\":1,\"shared\":true,\"cards\":[\"aea9745d-b163-4da6-b26d-f91bd8abf3ea\",\"9d0b65bd-ec90-4f6d-8e61-3cafb3080f3e\"],\"focused\":\"aea9745d-b163-4da6-b26d-f91bd8abf3ea\"}]"
+            },
+            {
+              "key": "workspace:9b3b085e-6235-4aa7-bf79-de9004b13945:navigation:active_thread",
+              "value": "null"
+            },
+            {
+              "key": "workspace:9b3b085e-6235-4aa7-bf79-de9004b13945:navigation:card_scopes",
+              "value": "{\"e9efd0ca-2707-4a21-86aa-05911433467f\":\"/home/marvin/.local/state/cev/p4ft167/fixture/project\"}"
+            },
+            {
+              "key": "workspace:9b3b085e-6235-4aa7-bf79-de9004b13945:navigation:workspace_model_identity",
+              "value": "\"fd202ab5-3be7-42c4-badf-8436934a7a4b\""
+            }
+          ]
+        },
+        "projects": {
+          "sql": "CREATE TABLE projects (\n            project_id TEXT PRIMARY KEY NOT NULL,\n            generation INTEGER NOT NULL CHECK (generation >= 0),\n            name TEXT NOT NULL,\n            repository_json TEXT NOT NULL,\n            existence_json TEXT NOT NULL,\n            updated_at_unix_ms INTEGER NOT NULL\n         , kind_json TEXT NOT NULL DEFAULT '\"Git\"') STRICT",
+          "rows": [
+            {
+              "project_id": "4464473e-90c6-41e0-8f8b-4527898015fa",
+              "generation": 2,
+              "name": "project",
+              "repository_json": "\"/home/marvin/.local/state/cev/p4ft167/fixture/project/.git\"",
+              "existence_json": "\"open\"",
+              "updated_at_unix_ms": 1794372155786,
+              "kind_json": "\"Git\""
+            }
+          ]
+        },
+        "worktrees": {
+          "sql": "CREATE TABLE worktrees (\n            worktree_id TEXT PRIMARY KEY NOT NULL,\n            project_id TEXT NOT NULL REFERENCES projects(project_id),\n            generation INTEGER NOT NULL CHECK (generation >= 0),\n            path_json TEXT NOT NULL,\n            branch TEXT,\n            existence_json TEXT NOT NULL,\n            updated_at_unix_ms INTEGER NOT NULL\n         ) STRICT",
+          "rows": [
+            {
+              "worktree_id": "405b5893-aace-8893-9936-dc6d84fbb8b8",
+              "project_id": "4464473e-90c6-41e0-8f8b-4527898015fa",
+              "generation": 2,
+              "path_json": "\"/home/marvin/.local/state/cev/p4ft167/fixture/project\"",
+              "branch": "main",
+              "existence_json": "\"open\"",
+              "updated_at_unix_ms": 1794372155786
+            }
+          ]
+        },
+        "workspaces": {
+          "sql": "CREATE TABLE workspaces (\n            workspace_id TEXT PRIMARY KEY NOT NULL,\n            generation INTEGER NOT NULL CHECK (generation >= 0),\n            schema_version INTEGER NOT NULL CHECK (schema_version >= 0),\n            existence_json TEXT NOT NULL,\n            focused_card_id TEXT,\n            updated_at_unix_ms INTEGER NOT NULL\n         ) STRICT",
+          "rows": [
+            {
+              "workspace_id": "9b3b085e-6235-4aa7-bf79-de9004b13945",
+              "generation": 5,
+              "schema_version": 1,
+              "existence_json": "\"open\"",
+              "focused_card_id": null,
+              "updated_at_unix_ms": 1794372320493
+            }
+          ]
+        },
+        "cards": {
+          "sql": "CREATE TABLE \"cards\" (\n                    card_id TEXT PRIMARY KEY NOT NULL,\n                    workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id),\n                    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),\n                    generation INTEGER NOT NULL CHECK (generation >= 0),\n                    title TEXT NOT NULL,\n                    width_fraction REAL NOT NULL CHECK (width_fraction > 0.0),\n                    existence_json TEXT NOT NULL,\n                    kind_tag TEXT NOT NULL CHECK (kind_tag IN (\n                        'terminal', 'chat', 'browser', 'pull_requests', 'repository',\n                        'settings', 'accounts', 'automations', 'work')),\n                    content_json TEXT,\n                    updated_at_unix_ms INTEGER NOT NULL,\n                    content_hash INTEGER\n                 ) STRICT",
+          "rows": [
+            {
+              "card_id": "e9efd0ca-2707-4a21-86aa-05911433467f",
+              "workspace_id": "9b3b085e-6235-4aa7-bf79-de9004b13945",
+              "ordinal": 0,
+              "generation": 1,
+              "title": "Transfer destination anchor",
+              "width_fraction": 0.5,
+              "existence_json": "\"open\"",
+              "kind_tag": "browser",
+              "content_json": null,
+              "updated_at_unix_ms": 1794372320493,
+              "content_hash": 8054238238510242058
+            },
+            {
+              "card_id": "aea9745d-b163-4da6-b26d-f91bd8abf3ea",
+              "workspace_id": "9b3b085e-6235-4aa7-bf79-de9004b13945",
+              "ordinal": 1,
+              "generation": 1,
+              "title": "Transfer sibling",
+              "width_fraction": 0.5,
+              "existence_json": "\"open\"",
+              "kind_tag": "browser",
+              "content_json": null,
+              "updated_at_unix_ms": 1794372320493,
+              "content_hash": -8328517354842536493
+            },
+            {
+              "card_id": "9d0b65bd-ec90-4f6d-8e61-3cafb3080f3e",
+              "workspace_id": "9b3b085e-6235-4aa7-bf79-de9004b13945",
+              "ordinal": 2,
+              "generation": 1,
+              "title": "Transfer target",
+              "width_fraction": 0.5,
+              "existence_json": "\"open\"",
+              "kind_tag": "browser",
+              "content_json": null,
+              "updated_at_unix_ms": 1794372320493,
+              "content_hash": -2708723650066292442
+            }
+          ]
+        },
+        "browser_restore": {
+          "sql": "CREATE TABLE browser_restore (\n            browser_id TEXT PRIMARY KEY NOT NULL,\n            card_id TEXT UNIQUE NOT NULL REFERENCES cards(card_id),\n            generation INTEGER NOT NULL CHECK (generation >= 0),\n            current_url TEXT NOT NULL,\n            history_json TEXT NOT NULL,\n            history_index INTEGER NOT NULL CHECK (history_index >= 0),\n            scroll_x REAL NOT NULL,\n            scroll_y REAL NOT NULL,\n            fidelity TEXT NOT NULL CHECK (fidelity IN ('history_and_scroll', 'url_only')),\n            updated_at_unix_ms INTEGER NOT NULL\n         ) STRICT",
+          "rows": [
+            {
+              "browser_id": "6bee6977-9fee-44c2-8430-df01a809a0b0",
+              "card_id": "e9efd0ca-2707-4a21-86aa-05911433467f",
+              "generation": 1,
+              "current_url": "about:blank",
+              "history_json": "[\"about:blank\"]",
+              "history_index": 0,
+              "scroll_x": 0.0,
+              "scroll_y": 0.0,
+              "fidelity": "url_only",
+              "updated_at_unix_ms": 1794372320493
+            },
+            {
+              "browser_id": "785d7bfc-cb47-4283-bba5-5c43ee36db53",
+              "card_id": "aea9745d-b163-4da6-b26d-f91bd8abf3ea",
+              "generation": 1,
+              "current_url": "about:blank",
+              "history_json": "[\"about:blank\"]",
+              "history_index": 0,
+              "scroll_x": 0.0,
+              "scroll_y": 0.0,
+              "fidelity": "url_only",
+              "updated_at_unix_ms": 1794372320493
+            },
+            {
+              "browser_id": "ca05d103-22ad-49ce-9c66-893f3cb8969e",
+              "card_id": "9d0b65bd-ec90-4f6d-8e61-3cafb3080f3e",
+              "generation": 1,
+              "current_url": "about:blank",
+              "history_json": "[\"about:blank\"]",
+              "history_index": 0,
+              "scroll_x": 0.0,
+              "scroll_y": 0.0,
+              "fidelity": "url_only",
+              "updated_at_unix_ms": 1794372320493
+            }
+          ]
+        }
+      }
+    },
+    "data/cagents-development/windows/window-2/sessions.sqlite3": {
+      "user_version": 13,
+      "tables": {
+        "metadata": {
+          "sql": "CREATE TABLE metadata (\n            key TEXT PRIMARY KEY NOT NULL,\n            value TEXT NOT NULL\n         ) STRICT",
+          "rows": [
+            {
+              "key": "workspace:9b3b085e-6235-4aa7-bf79-de9004b13945:navigation:active_worktree",
+              "value": "\"/home/marvin/.local/state/cev/p4ft167/fixture/project\""
+            },
+            {
+              "key": "workspace:9b3b085e-6235-4aa7-bf79-de9004b13945:navigation:worktree_focus",
+              "value": "{\"/home/marvin/.local/state/cev/p4ft167/fixture/project\":\"e9efd0ca-2707-4a21-86aa-05911433467f\"}"
+            },
+            {
+              "key": "workspace:9b3b085e-6235-4aa7-bf79-de9004b13945:navigation:threads",
+              "value": "[{\"id\":\"9c52917b-5260-443e-afda-aa558edd8862\",\"project_id\":\"4464473e-90c6-41e0-8f8b-4527898015fa\",\"title\":\"Focused transfer proof\",\"title_source\":\"Manual\",\"ordinal\":1,\"shared\":true,\"cards\":[\"aea9745d-b163-4da6-b26d-f91bd8abf3ea\",\"9d0b65bd-ec90-4f6d-8e61-3cafb3080f3e\"],\"focused\":\"aea9745d-b163-4da6-b26d-f91bd8abf3ea\"}]"
+            },
+            {
+              "key": "workspace:9b3b085e-6235-4aa7-bf79-de9004b13945:navigation:active_thread",
+              "value": "null"
+            },
+            {
+              "key": "workspace:9b3b085e-6235-4aa7-bf79-de9004b13945:navigation:card_scopes",
+              "value": "{\"e9efd0ca-2707-4a21-86aa-05911433467f\":\"/home/marvin/.local/state/cev/p4ft167/fixture/project\"}"
+            },
+            {
+              "key": "workspace:9b3b085e-6235-4aa7-bf79-de9004b13945:navigation:workspace_model_identity",
+              "value": "\"fd202ab5-3be7-42c4-badf-8436934a7a4b\""
+            }
+          ]
+        },
+        "projects": {
+          "sql": "CREATE TABLE projects (\n            project_id TEXT PRIMARY KEY NOT NULL,\n            generation INTEGER NOT NULL CHECK (generation >= 0),\n            name TEXT NOT NULL,\n            repository_json TEXT NOT NULL,\n            existence_json TEXT NOT NULL,\n            updated_at_unix_ms INTEGER NOT NULL\n         , kind_json TEXT NOT NULL DEFAULT '\"Git\"') STRICT",
+          "rows": [
+            {
+              "project_id": "4464473e-90c6-41e0-8f8b-4527898015fa",
+              "generation": 3,
+              "name": "project",
+              "repository_json": "\"/home/marvin/.local/state/cev/p4ft167/fixture/project/.git\"",
+              "existence_json": "\"open\"",
+              "updated_at_unix_ms": 1794372158565,
+              "kind_json": "\"Git\""
+            }
+          ]
+        },
+        "worktrees": {
+          "sql": "CREATE TABLE worktrees (\n            worktree_id TEXT PRIMARY KEY NOT NULL,\n            project_id TEXT NOT NULL REFERENCES projects(project_id),\n            generation INTEGER NOT NULL CHECK (generation >= 0),\n            path_json TEXT NOT NULL,\n            branch TEXT,\n            existence_json TEXT NOT NULL,\n            updated_at_unix_ms INTEGER NOT NULL\n         ) STRICT",
+          "rows": [
+            {
+              "worktree_id": "405b5893-aace-8893-9936-dc6d84fbb8b8",
+              "project_id": "4464473e-90c6-41e0-8f8b-4527898015fa",
+              "generation": 3,
+              "path_json": "\"/home/marvin/.local/state/cev/p4ft167/fixture/project\"",
+              "branch": "main",
+              "existence_json": "\"open\"",
+              "updated_at_unix_ms": 1794372158565
+            }
+          ]
+        },
+        "workspaces": {
+          "sql": "CREATE TABLE workspaces (\n            workspace_id TEXT PRIMARY KEY NOT NULL,\n            generation INTEGER NOT NULL CHECK (generation >= 0),\n            schema_version INTEGER NOT NULL CHECK (schema_version >= 0),\n            existence_json TEXT NOT NULL,\n            focused_card_id TEXT,\n            updated_at_unix_ms INTEGER NOT NULL\n         ) STRICT",
+          "rows": [
+            {
+              "workspace_id": "9b3b085e-6235-4aa7-bf79-de9004b13945",
+              "generation": 7,
+              "schema_version": 1,
+              "existence_json": "\"open\"",
+              "focused_card_id": "e9efd0ca-2707-4a21-86aa-05911433467f",
+              "updated_at_unix_ms": 1794372320500
+            }
+          ]
+        },
+        "cards": {
+          "sql": "CREATE TABLE \"cards\" (\n                    card_id TEXT PRIMARY KEY NOT NULL,\n                    workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id),\n                    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),\n                    generation INTEGER NOT NULL CHECK (generation >= 0),\n                    title TEXT NOT NULL,\n                    width_fraction REAL NOT NULL CHECK (width_fraction > 0.0),\n                    existence_json TEXT NOT NULL,\n                    kind_tag TEXT NOT NULL CHECK (kind_tag IN (\n                        'terminal', 'chat', 'browser', 'pull_requests', 'repository',\n                        'settings', 'accounts', 'automations', 'work')),\n                    content_json TEXT,\n                    updated_at_unix_ms INTEGER NOT NULL,\n                    content_hash INTEGER\n                 ) STRICT",
+          "rows": [
+            {
+              "card_id": "e9efd0ca-2707-4a21-86aa-05911433467f",
+              "workspace_id": "9b3b085e-6235-4aa7-bf79-de9004b13945",
+              "ordinal": 1,
+              "generation": 1,
+              "title": "Transfer destination anchor",
+              "width_fraction": 0.5,
+              "existence_json": "\"open\"",
+              "kind_tag": "browser",
+              "content_json": null,
+              "updated_at_unix_ms": 1794372320500,
+              "content_hash": -722044435381526486
+            },
+            {
+              "card_id": "aea9745d-b163-4da6-b26d-f91bd8abf3ea",
+              "workspace_id": "9b3b085e-6235-4aa7-bf79-de9004b13945",
+              "ordinal": 2,
+              "generation": 1,
+              "title": "Transfer sibling",
+              "width_fraction": 0.5,
+              "existence_json": "\"open\"",
+              "kind_tag": "browser",
+              "content_json": null,
+              "updated_at_unix_ms": 1794372320500,
+              "content_hash": 2748959771810761494
+            },
+            {
+              "card_id": "9d0b65bd-ec90-4f6d-8e61-3cafb3080f3e",
+              "workspace_id": "9b3b085e-6235-4aa7-bf79-de9004b13945",
+              "ordinal": 3,
+              "generation": 1,
+              "title": "Transfer target",
+              "width_fraction": 0.5,
+              "existence_json": "\"open\"",
+              "kind_tag": "browser",
+              "content_json": null,
+              "updated_at_unix_ms": 1794372320500,
+              "content_hash": -3208838349421641306
+            }
+          ]
+        },
+        "browser_restore": {
+          "sql": "CREATE TABLE browser_restore (\n            browser_id TEXT PRIMARY KEY NOT NULL,\n            card_id TEXT UNIQUE NOT NULL REFERENCES cards(card_id),\n            generation INTEGER NOT NULL CHECK (generation >= 0),\n            current_url TEXT NOT NULL,\n            history_json TEXT NOT NULL,\n            history_index INTEGER NOT NULL CHECK (history_index >= 0),\n            scroll_x REAL NOT NULL,\n            scroll_y REAL NOT NULL,\n            fidelity TEXT NOT NULL CHECK (fidelity IN ('history_and_scroll', 'url_only')),\n            updated_at_unix_ms INTEGER NOT NULL\n         ) STRICT",
+          "rows": [
+            {
+              "browser_id": "6bee6977-9fee-44c2-8430-df01a809a0b0",
+              "card_id": "e9efd0ca-2707-4a21-86aa-05911433467f",
+              "generation": 1,
+              "current_url": "about:blank",
+              "history_json": "[\"about:blank\"]",
+              "history_index": 0,
+              "scroll_x": 0.0,
+              "scroll_y": 0.0,
+              "fidelity": "url_only",
+              "updated_at_unix_ms": 1794372320500
+            },
+            {
+              "browser_id": "785d7bfc-cb47-4283-bba5-5c43ee36db53",
+              "card_id": "aea9745d-b163-4da6-b26d-f91bd8abf3ea",
+              "generation": 1,
+              "current_url": "about:blank",
+              "history_json": "[\"about:blank\"]",
+              "history_index": 0,
+              "scroll_x": 0.0,
+              "scroll_y": 0.0,
+              "fidelity": "url_only",
+              "updated_at_unix_ms": 1794372320500
+            },
+            {
+              "browser_id": "ca05d103-22ad-49ce-9c66-893f3cb8969e",
+              "card_id": "9d0b65bd-ec90-4f6d-8e61-3cafb3080f3e",
+              "generation": 1,
+              "current_url": "about:blank",
+              "history_json": "[\"about:blank\"]",
+              "history_index": 0,
+              "scroll_x": 0.0,
+              "scroll_y": 0.0,
+              "fidelity": "url_only",
+              "updated_at_unix_ms": 1794372320500
+            }
+          ]
+        }
+      }
+    }
+  }
+}

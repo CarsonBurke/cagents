@@ -900,6 +900,24 @@ fn a_move_or_retitle_rewrites_only_the_rows_that_changed() {
         (0..10).map(|index| browser(&index.to_string())).collect(),
     );
     let mut view = read(&registry.db, &scope).unwrap();
+    let original_revision = view.revision;
+    let inventory = || {
+        registry
+            .db
+            .query_row(
+                "SELECT COUNT(*), MIN(before_revision), MAX(after_revision)
+                 FROM temp.execution_view_changes",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, u64>(0)?,
+                        row.get::<_, Option<u64>>(1)?,
+                        row.get::<_, Option<u64>>(2)?,
+                    ))
+                },
+            )
+            .unwrap()
+    };
     let moved = view.panes.remove(7);
     view.panes.insert(2, moved);
     view.revision = next_revision(&registry.db).unwrap();
@@ -907,8 +925,12 @@ fn a_move_or_retitle_rewrites_only_the_rows_that_changed() {
     store(&registry.db, &view).unwrap();
     assert_eq!(
         registry.db.total_changes() - before,
-        2,
-        "one position and the revision"
+        3,
+        "one position, the revision, and one connection-local inventory update"
+    );
+    assert_eq!(
+        inventory(),
+        (1, Some(original_revision), Some(view.revision))
     );
     assert_eq!(read(&registry.db, &scope).unwrap(), view);
 
@@ -918,8 +940,12 @@ fn a_move_or_retitle_rewrites_only_the_rows_that_changed() {
     store(&registry.db, &view).unwrap();
     assert_eq!(
         registry.db.total_changes() - before,
-        2,
-        "one pane and the revision"
+        3,
+        "one pane, the revision, and one connection-local inventory update"
+    );
+    assert_eq!(
+        inventory(),
+        (1, Some(original_revision), Some(view.revision))
     );
     assert_eq!(read(&registry.db, &scope).unwrap(), view);
 }

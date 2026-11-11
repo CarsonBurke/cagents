@@ -1,0 +1,261 @@
+#!/usr/bin/python3 -I
+"""Measure native workspace edit receipts and UI-thread work in a private fixture.
+
+Build the matched app and examples/workspace-edit-workload through cargo-gate,
+start two native-evidence windows with the same generated seed and synthetic
+busy chats, then run this through `native-evidence env scripts/bounded ...`.
+This does not start providers or compile. It samples only fixture processes.
+"""
+
+import argparse
+import datetime
+import json
+import os
+import re
+from pathlib import Path
+import sqlite3
+import subprocess
+import threading
+import time
+
+
+def trace_timestamp_ns(stamp):
+    """Read the trace clock without rounding a redraw past persistence."""
+    match = re.fullmatch(
+        rb'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})',
+        stamp,
+    )
+    if match is None:
+        raise ValueError('invalid trace timestamp')
+    instant = datetime.datetime.fromisoformat(
+        match[1].decode() + match[3].decode().replace('Z', '+00:00'))
+    elapsed = instant - datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+    fraction = int((match[2] or b'').ljust(9, b'0'))
+    return (elapsed.days * 86400 + elapsed.seconds) * 1_000_000_000 + fraction
+
+
+def stat(pid, main=False):
+    process = Path('/proc') / str(pid)
+    base = process / 'task' / str(pid) if main else process
+    fields = (base / 'stat').read_text().rsplit(')', 1)[1].split()
+    schedule = [int(value) for value in (base / 'schedstat').read_text().split()]
+    status = {}
+    for line in (base / 'status').read_text().splitlines():
+        key, value = line.split(':', 1)
+        if key in ('VmRSS', 'Threads', 'voluntary_ctxt_switches', 'nonvoluntary_ctxt_switches'):
+            status[key] = int(value.split()[0])
+    return dict(pid=pid, start=int(fields[19]), ticks=int(fields[11]) + int(fields[12]),
+                run_ns=schedule[0], wait_ns=schedule[1], slices=schedule[2], **status)
+
+
+def fixture_processes(root):
+    result = []
+    for process in Path('/proc').iterdir():
+        if not process.name.isdecimal():
+            continue
+        try:
+            executable = os.readlink(process / 'exe')
+            name = Path(executable).name
+            if name not in ('cagents-ui', 'cagentsd'):
+                continue
+            environment = (process / 'environ').read_bytes().split(b'\0')
+            if f'HOME={root}/home'.encode() not in environment:
+                continue
+            result.append((int(process.name), name, executable))
+        except (OSError, ValueError):
+            continue
+    return sorted(result)
+
+
+def pressure():
+    return {name: Path('/proc/pressure', name).read_text() for name in ('cpu', 'memory', 'io')}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--binary', required=True, type=Path)
+    parser.add_argument('--root', required=True, type=Path)
+    parser.add_argument('--side', required=True, choices=('before', 'after'))
+    parser.add_argument('--log', type=Path, action='append', required=True, help='One trace per UI window; repeat to capture both.')
+    parser.add_argument('--output', required=True, type=Path, help='New directory outside the fixture.')
+    parser.add_argument('--edits', type=int, default=200)
+    parser.add_argument('--wait-for-selection', action='store_true', help='Pause at driver-ready.json until driver-ready.go exists, before timing.')
+    parser.add_argument('--drain-timeout', type=float, default=180, help='Seconds for both final pane titles to persist and both UI threads to process a later redraw.')
+    parser.add_argument('--interval-ms', type=int, default=100)
+    arguments = parser.parse_args()
+    root = arguments.root.resolve(strict=True)
+    task = root.parent
+    if root.name != 'fixture' or not (task / '.native-evidence').is_file():
+        parser.error('--root must be a native-evidence task fixture')
+    if not os.environ.get('CAGENTS_BOUNDED'):
+        parser.error('run under scripts/bounded so the driver and sampler have an owner and deadline')
+    if not 1 <= arguments.edits <= 2000 or not 20 <= arguments.interval_ms <= 10000:
+        parser.error('use 1-2000 edits and a 20-10000 ms interval')
+    if not 0 < arguments.drain_timeout <= 600:
+        parser.error('--drain-timeout must be positive and at most 600 seconds')
+    if len(arguments.log) != 2 or len(set(path.resolve() for path in arguments.log)) != 2:
+        parser.error('give two distinct --log paths, one for each UI window')
+    if os.path.samefile(arguments.log[0], arguments.log[1]):
+        parser.error('the two window traces must be different open files, including hard links')
+    output = arguments.output.resolve()
+    if output == root or root in output.parents or task not in output.parents:
+        parser.error('--output must be inside this task and outside the fixture that start restores')
+    output.mkdir(parents=True, exist_ok=False)
+    processes = fixture_processes(root)
+    ui_pids = [pid for pid, name, _ in processes if name == 'cagents-ui']
+    if len(ui_pids) != 2:
+        parser.error(f'two fixture UI windows must be running; found {len(ui_pids)}')
+    command = [str(arguments.binary.resolve(strict=True)), str(root), str(arguments.edits), str(arguments.interval_ms)]
+    associations = []
+    for pid in ui_pids:
+        process = Path('/proc') / str(pid)
+        arguments_bytes = (process / 'cmdline').read_bytes().split(b'\0')
+        second = b'window-2' in arguments_bytes or b'--window=window-2' in arguments_bytes
+        index = 1 if second else 0
+        stderr_fd = process / 'fd' / '2'
+        stderr = arguments.log[index].resolve()
+        try:
+            same_log = os.path.samefile(stderr_fd, stderr)
+        except OSError:
+            same_log = False
+        if not same_log:
+            parser.error(f'UI process {pid} stderr does not match window {index + 1} trace')
+        associations.append(dict(window=index + 1, pid=pid, main_tid=pid,
+                                 start=stat(pid, True)['start'], log=str(stderr)))
+    if {row['window'] for row in associations} != {1, 2}:
+        parser.error('the two UI processes must be the default and window-2 windows')
+    facts = dict(uname=list(os.uname()), hz=os.sysconf('SC_CLK_TCK'), processes=processes,
+                 ui_log_associations=associations,
+                 pressure_before=pressure(), command=command)
+    (output / 'facts.json').write_text(json.dumps(facts, indent=2) + '\n')
+    logs = arguments.log
+    positions = [(log, log.stat().st_size) for log in logs]
+    stop = threading.Event()
+    samples = []
+
+    def sample():
+        while not stop.is_set():
+            started = time.monotonic_ns()
+            row = dict(time_ns=started, processes=[])
+            for pid, name, _ in processes:
+                try:
+                    row['processes'].append(dict(name=name, process=stat(pid), main=stat(pid, True)))
+                except OSError as error:
+                    row['processes'].append(dict(pid=pid, error=str(error)))
+            row['sampling_ns'] = time.monotonic_ns() - started
+            samples.append(row)
+            stop.wait(0.1)
+
+    outcome = dict(started_ns=time.monotonic_ns(), started_wall_ns=time.time_ns())
+    target_pane = None
+    sampler = threading.Thread(target=sample)
+    sampler.start()
+    try:
+        with (output / 'edits.jsonl').open('w') as records, (output / 'edits.stderr').open('w') as errors:
+            environment = dict(os.environ)
+            if arguments.wait_for_selection:
+                environment['CAGENTS_WORKSPACE_EDIT_READY'] = str(output / 'driver-ready.json')
+            child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=errors, text=True, env=environment)
+            for line in child.stdout:
+                record = json.loads(line)
+                if record.get('event') == 'begin':
+                    target_pane = record.get('pane')
+                if record.get('event') in ('begin', 'end'):
+                    event = record['event']
+                    outcome[f'{event}_ns'] = time.monotonic_ns()
+                    outcome[f'{event}_wall_ns'] = time.time_ns()
+                records.write(line)
+                records.flush()
+            outcome['status'] = child.wait()
+        if outcome['status'] == 0 and (not target_pane or 'begin_ns' not in outcome):
+            outcome['status'] = 1
+            outcome['error'] = 'Driver exited successfully without the expected begin event and pane identity'
+        if outcome['status'] == 0 and target_pane:
+            instance = os.environ.get('CAGENTS_DEVELOPMENT_INSTANCE')
+            namespace = 'cagents-development' + (f'-{instance}' if instance else '')
+            data = Path(os.environ['XDG_DATA_HOME']) / namespace
+            stores = [data / 'sessions.sqlite3', data / 'windows/window-2/sessions.sqlite3']
+            pending = set(range(len(stores)))
+            pending_ui = set(range(len(stores)))
+            scan_positions = [position for _, position in positions]
+            scan_buffers = [b'' for _ in logs]
+            latest_redraw = [None for _ in logs]
+            deadline = time.monotonic() + arguments.drain_timeout
+            outcome['completion_criterion'] = ('Both final pane titles persisted, then an activity_redraw '
+                                               'on each corresponding UI thread strictly after its store observation')
+            while (pending or pending_ui) and time.monotonic() < deadline:
+                for index in sorted(pending):
+                    try:
+                        with sqlite3.connect(stores[index].as_uri() + '?mode=ro', uri=True, timeout=0.1) as database:
+                            found = database.execute('SELECT title FROM cards WHERE card_id = ?', [target_pane]).fetchone()
+                        if found == (f'Measurement {arguments.edits - 1}',):
+                            pending.remove(index)
+                            outcome[f'window_{index + 1}_converged_ns'] = time.monotonic_ns()
+                            outcome[f'window_{index + 1}_converged_wall_ns'] = time.time_ns()
+                    except sqlite3.Error:
+                        pass
+                if not pending and 'stores_drained_ns' not in outcome:
+                    outcome['stores_drained_ns'] = time.monotonic_ns()
+                    outcome['stores_drained_wall_ns'] = time.time_ns()
+                for index, log in enumerate(logs):
+                    # Read appended lines once, retaining a split final line until
+                    # its newline arrives. Prefix timestamps record the UI call,
+                    # not the supplied redraw event's possibly older timestamp.
+                    with log.open('rb') as trace:
+                        trace.seek(scan_positions[index])
+                        added = trace.read()
+                    scan_positions[index] += len(added)
+                    lines = (scan_buffers[index] + added).split(b'\n')
+                    scan_buffers[index] = lines.pop()
+                    for line in lines:
+                        if b'cagents::workspace_pipeline:' not in line or b'stage="activity_redraw"' not in line:
+                            continue
+                        stamp = re.match(rb'(\S+)', line)
+                        if stamp is None:
+                            continue
+                        try:
+                            when = trace_timestamp_ns(stamp[1])
+                        except ValueError:
+                            continue
+                        latest_redraw[index] = when
+                    persisted = outcome.get(f'window_{index + 1}_converged_wall_ns')
+                    if (index in pending_ui and persisted is not None
+                            and latest_redraw[index] is not None and latest_redraw[index] > persisted):
+                        pending_ui.remove(index)
+                        outcome[f'window_{index + 1}_ui_completed_wall_ns'] = latest_redraw[index]
+                        outcome[f'window_{index + 1}_ui_completed_observed_ns'] = time.monotonic_ns()
+                        outcome[f'window_{index + 1}_ui_completed_observed_wall_ns'] = time.time_ns()
+                if pending or pending_ui:
+                    time.sleep(0.1)
+            outcome['unconverged_windows'] = sorted(index + 1 for index in pending)
+            outcome['ui_incomplete_windows'] = sorted(index + 1 for index in pending_ui)
+            # Common accounting ends once both UIs have returned to event
+            # handling after their final persisted-title observations. It is
+            # not compositor presentation or input latency; an occluded
+            # window's next redraw includes its normal background cadence.
+            outcome['drained_ns'] = time.monotonic_ns()
+            outcome['drained_wall_ns'] = time.time_ns()
+            outcome['retention_seconds_excluded_from_accounting'] = 1
+            if pending or pending_ui:
+                outcome['status'] = 1
+        time.sleep(1)
+    finally:
+        stop.set()
+        sampler.join()
+    lost = sorted({entry['pid'] for row in samples for entry in row['processes'] if 'error' in entry and entry['pid'] in ui_pids})
+    outcome['lost_ui_processes'] = lost
+    if lost or len(samples) < 2:
+        outcome['status'] = 1
+    outcome.update(ended_ns=time.monotonic_ns(), pressure_after=pressure())
+    (output / 'proc.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in samples))
+    for index, (log, position) in enumerate(positions):
+        with log.open('rb') as source:
+            source.seek(position)
+            (output / f'ui-trace-{index + 1}.log').write_bytes(source.read())
+    (output / 'outcome.json').write_text(json.dumps(outcome, indent=2) + '\n')
+    print(json.dumps(dict(output=str(output), status=outcome['status'], samples=len(samples), ui_pids=ui_pids)))
+    raise SystemExit(outcome['status'])
+
+
+if __name__ == '__main__':
+    main()

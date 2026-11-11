@@ -3788,7 +3788,7 @@ impl GitHubReviewApi for ScriptedApi {
     {
         self.replies.lock().unwrap().push(request.clone());
         Ok(ReviewMutationOutcome::Applied(serde_json::from_value(serde_json::json!({
-            "id":"reply", "body":request.body, "createdAt":"2026-01-01T00:00:00Z", "url":"https://github.com/o/r/pull/1#reply"
+            "id":"reply", "body":request.body, "createdAt":"2026-01-01T00:00:00Z", "url":format!("https://{}/o/r/pull/1#reply", tests::SCRIPTED_REVIEW_HOST)
         })).unwrap()))
     }
 
@@ -3824,7 +3824,11 @@ impl GitHubReviewApi for ScriptedApi {
             crate::github::SubmittedReview {
                 id: "submitted".into(),
                 state: crate::github::RemoteValue("APPROVED".into()),
-                url: Url::parse("https://github.com/o/r/pull/1#review-1").unwrap(),
+                url: Url::parse(&format!(
+                    "https://{}/o/r/pull/1#review-1",
+                    tests::SCRIPTED_REVIEW_HOST
+                ))
+                .unwrap(),
             },
         ))
     }
@@ -3909,6 +3913,10 @@ pub(crate) mod tests {
     use super::*;
     use crate::github::{PullRequestFile, RemoteValue};
     use crate::repository::ValidatedRefName;
+
+    // Scripted review admission must not inherit real-host error budgets from
+    // unrelated GitHub transport tests running in this same test process.
+    pub(super) const SCRIPTED_REVIEW_HOST: &str = "scripted-review.invalid";
 
     #[test]
     fn summary_title_ellipsis_preserves_ordinary_word_wrap_geometry() {
@@ -3995,14 +4003,14 @@ pub(crate) mod tests {
             "headRefOid": "a".repeat(40),
             "baseRefName": "main",
             "updatedAt": "2026-01-01T00:00:00Z",
-            "url": format!("https://github.com/o/r/pull/{number}"),
+            "url": format!("https://{SCRIPTED_REVIEW_HOST}/o/r/pull/{number}"),
         }))
         .unwrap()
     }
 
     pub(crate) fn target(number: u64) -> ReviewTarget {
         ReviewTarget {
-            repository: GitHubRepoKey::new("github.com", None, "o", "r").unwrap(),
+            repository: GitHubRepoKey::new(SCRIPTED_REVIEW_HOST, None, "o", "r").unwrap(),
             worktree: PathBuf::from("/repo"),
             pull_request: Arc::new(pull_request(number)),
         }
@@ -4157,7 +4165,8 @@ pub(crate) mod tests {
             std::process::Command::new("git")
                 .arg("-C")
                 .arg(dir.path())
-                .args(["remote", "add", "origin", "https://github.com/o/r"])
+                .args(["remote", "add", "origin"])
+                .arg(format!("https://{SCRIPTED_REVIEW_HOST}/o/r"))
                 .status()
                 .unwrap()
                 .success()
@@ -5689,7 +5698,7 @@ pub(crate) mod tests {
     fn the_own_list_resolves_numbers_to_targets() {
         let (mut state, _) = state();
         drop(state.set_source(Some(ReviewSource {
-            repository: GitHubRepoKey::new("github.com", None, "o", "r").unwrap(),
+            repository: GitHubRepoKey::new(SCRIPTED_REVIEW_HOST, None, "o", "r").unwrap(),
             worktree: PathBuf::from("/repo"),
         })));
         assert_eq!(state.list, ListState::Loading);

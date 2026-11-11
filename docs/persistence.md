@@ -319,15 +319,73 @@ one would let a diverged window copy re-insert a closed pane.
 
 ### Subscribers get deltas
 
-`ServerMessage::WorkspaceModelEdited` already carries the edit. It gains the
-resulting revision of every scope the edit changed, and the ids it closed, so
-windows keep a closed-identity set for adoption checks without loading
-history. A window applies a
-`ChangeView` delta to its in-memory model when the delta's base revision equals
-the scope's revision it holds; otherwise it reads that one scope
-(`ReadWorkspaceView { scope }`). Only a changed registry identity or a lost
-connection triggers a full model read. Model reads use one query over `panes`
-ordered by `(scope, position)`, not one query per scope.
+`ServerMessage::WorkspaceModelEdited` carries the edit and its effects
+(`workspace_model::delta::EditEffects`): every changed scope's revision before
+and after the transaction, the pane ids it closed, and canonical project,
+channel, navigation and agent rows. `None` before identifies a new scope;
+`None` after identifies a deleted one. A transfer names both scopes and closes
+nothing. Channel deletion and project close name every removed scope and pane.
+Canonical metadata includes assigned ranks, conditional title changes and the
+settled navigation order, so none requires a full-model refresh.
+
+The observer keeps a `delta::Mirror`. It applies a `ChangeView` when its held
+revision equals the notification's base revision; otherwise it reads only the
+affected scope with `ReadWorkspaceView { scope }`. Scope reads return the view
+and the snapshot's model sequence. Seeds and execution changes also read only
+the scopes they name. The UI installs complete changed views by revision and
+metadata by per-entity sequence, preserving independently delivered changes
+when an edit receipt overtakes an observer notification. A full read occurs
+only on connection or registry identity changes. Full reads scan `panes` once,
+ordered by `(scope, position, id)`.
+
+For settled channel presentation, the UI projects only the changed scope and
+refreshes pane chrome. This requires unchanged membership, source descriptors
+and filing, complete ownership evidence, and no pending admission or lifecycle
+obligation. A retained unavailable browser surface keeps its error and recovery
+controls. Repository loads project their complete affected ownership closure,
+including aliases and managed panes outside that repository. They retain global
+structural preparation, ownership evidence, admission, notification attribution
+and immediate snapshots. Stable presentation is a separate mode; structural
+subsets do not acquire its capture policy. Inconsistent local placement and
+uncertain derived worktree membership retain full reconciliation. This stage
+does not remove all global projection work.
+
+Canonical rows, settled projection baselines and edit acknowledgments update
+immediately. For a settled presentation change, the window delays capturing
+its local saved snapshot until the existing autosave debounce expires: 250 ms
+after the latest change, capped at one second after the first. It retains only
+the original change times and registry, workspace and writer identities until
+then. The writer receives those times with the snapshot, so capture does not
+start another debounce. Only an accepted queue offer clears this save debt.
+Ordinary saves absorb it; flushes, ownership transitions, navigation and shutdown
+materialize it before their barriers. Ordered identity checkpoints and uncertain
+projections keep their immediate snapshot path. This does not change window-store
+ownership or move drafts out of the workspace snapshot; those remain stage 5.
+
+Current windows publish through `ApplyWorkspaceEdit`, whose `WorkspaceEdit`
+reply carries an `EditReceipt` rather than the model. A revision conflict reads
+only the source scope before retrying with the original operation identity and
+source descriptor fence. Older CLI clients retain `ReadWorkspaceModel` and
+`EditWorkspaceModel` with their original replies; their model watches are
+refused because they cannot decode the new notification. Window ownership and
+lifecycle checks use `ReadWorkspaceMetadata` for only the registry identity,
+projects or agents they need; they never load panes or retired history.
+
+Execution writes are captured by connection-private TEMP tables and SQL
+triggers. Their inventory commits or rolls back with the rows, including
+writes made by transaction helpers used by retained actors and automations.
+Draining it reads only changed identities. Public edits publish their pending
+execution inventory before applying their own transaction, so an interleaving
+edit cannot erase an unannounced execution change. These tables do not change
+the durable schema or its downgrade contract.
+
+The initial subscription returns a `WorkspaceSnapshot` with closed identities
+from retained tombstones, excluding panes that still have an owner after a
+transfer. The window keeps these identities in a set, adds every notification's
+closed ids before adoption, and retains its known closures across reconnects to
+the same registry. A changed registry identity resets that set. Stage 5 adds
+durable closed history for deleted scopes; until then the window keeps their
+received closures and the existing channel/project deletion fences.
 
 ### Windows write only what changed
 
@@ -539,7 +597,12 @@ measurement on a realistic-size workspace.
    file's contents shrink from 31.8 MB to 25.0 MB, but the file keeps its
    high-water mark (37.7 MB) as free pages SQLite reuses until the converted
    operations age out. Closed panes and drafts move to stage 5.
-4. Deltas to subscribers and per-scope reads (protocol bump).
+4. Deltas to subscribers and per-scope reads (#2573; protocol bump). Edges carry
+   changed revisions and closed ids; a revision gap reads only that scope.
+   Reconnects and changed registry identities establish full baselines, whose
+   pane read is one ordered query. Settled channel presentation reuses scope
+   projection and notification attribution; uncertain ownership or lifecycle
+   state retains full reconciliation. Window-owned copies remain until stage 5.
 5. Daemon-owned closed-pane history and drafts; windows become subscribers
    with per-window stores; migration from all window stores.
 6. Persistent provider history index.

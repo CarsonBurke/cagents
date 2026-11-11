@@ -582,7 +582,10 @@ class ScriptContractsApplicability(unittest.TestCase):
         ("validation checkout", "scripts/prepare-validation-checkout", "tests/prepare_validation_checkout.py"),
         ("process custody", "scripts/qualification/process_custody.py", "tests/qualification/test_process_custody.py"),
         ("native evidence", "scripts/native-evidence", "tests/native_evidence.py"),
+        ("focused transfer probe", "tests/fixtures/focused-transfer-probe.py", "tests/focused_transfer_probe.py"),
     )
+
+    probe_capture = "tests/fixtures/focused-transfer-producer.json"
 
     @classmethod
     def setUpClass(cls):
@@ -610,22 +613,25 @@ class ScriptContractsApplicability(unittest.TestCase):
             return "".join(body)
 
         cls.run_block = block("Check validation checkout and process custody contracts")
-        if not cls.run_block.startswith("python3 -I -B - <<'PY'\n"):
-            raise AssertionError("applicability step must run its inline isolated Python")
-        # Every other pair the step checks, in its order, which these private
-        # fixtures leave absent: a pair added to the workflow needs no edit here.
-        listed = [ast.literal_eval(line.strip().rstrip(","))[0]
-                  for line in cls.run_block.splitlines()
-                  if re.fullmatch(r'\s*\("[^"]+", "[^"]+", "[^"]+"\),', line)]
-        names = [name for name, _, _ in cls.pairs]
-        if listed[:len(names)] != names:
-            raise AssertionError(f"the step must check {names} first, not {listed}")
+        cls.native_block = block("Check native evidence contracts")
+        for command in (cls.run_block, cls.native_block):
+            if not command.startswith("python3 -I -B - <<'PY'\n"):
+                raise AssertionError("applicability steps must run their inline isolated Python")
+
+        def listed_pairs(command):
+            return [ast.literal_eval(line.strip().rstrip(","))
+                    for line in command.splitlines()
+                    if re.fullmatch(r'\s*\("[^"]+", "[^"]+", "[^"]+"\),', line)]
+
+        listed = listed_pairs(cls.run_block)
+        if listed[:2] != list(cls.pairs[:2]) or any(pair in listed for pair in cls.pairs[2:]):
+            raise AssertionError(f"serial contracts must own checkout and custody, not native evidence or the probe: {listed}")
+        if listed_pairs(cls.native_block) != list(cls.pairs[2:]):
+            raise AssertionError("native evidence and the focused probe must have their own applicability block")
+        # Other serial pairs remain absent in these private fixture heads.
         cls.absent = [f"Not applicable: {name} (source and fixture both absent at this head)"
-                      for name in listed[len(names):]]
+                      for name, _, _ in listed[2:]]
         cls.syntax_block = block("Check shell syntax")
-        # Exercise the historical unconditional fixture command, when present,
-        # as well as the applicability and syntax steps that can reach it.
-        cls.legacy_native_block = block("Check native evidence contracts", optional=True)
 
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="script-contract-applicability-", dir="/var/tmp")
@@ -637,14 +643,25 @@ class ScriptContractsApplicability(unittest.TestCase):
         root.mkdir(mode=0o700)
         return root
 
+    def members(self, index):
+        name, source, fixture = self.pairs[index]
+        return (source, fixture, self.probe_capture) if name == "focused transfer probe" else (source, fixture)
+
     def pair(self, root, index, *, exit_code=0):
         name, source, fixture = self.pairs[index]
         source = root / source
         fixture = root / fixture
         source.parent.mkdir(parents=True, exist_ok=True)
         fixture.parent.mkdir(parents=True, exist_ok=True)
-        source.write_text("#!/bin/bash\nitems=(before after)\nexit 79\n" if name == "native evidence"
-                          else "fixture source placeholder; never execute this file\n")
+        if name == "native evidence":
+            source.write_text("#!/bin/bash\nitems=(before after)\nexit 79\n")
+        elif name == "focused transfer probe":
+            # Valid Python, invalid Bash, and must never be executed by CI.
+            source.write_text("raise SystemExit(79)\n")
+        else:
+            source.write_text("fixture source placeholder; never execute this file\n")
+        if name == "focused transfer probe":
+            (root / self.probe_capture).write_text("{}\n")
         fixture.write_text(
             "import json\nfrom pathlib import Path\nimport sys\n"
             f"entry = {{'fixture': {name!r}, 'arguments': sys.argv[1:], "
@@ -659,7 +676,7 @@ class ScriptContractsApplicability(unittest.TestCase):
         # fixtures are those this test placed beneath the private cwd. No env
         # override, helper import, real Git repository or build is involved.
         stdout, stderr = "", ""
-        for command in filter(None, blocks if blocks is not None else [self.run_block]):
+        for command in filter(None, blocks if blocks is not None else [self.run_block, self.native_block]):
             result = subprocess.run(
                 ["/bin/sh", "-e", "-c", command], cwd=root,
                 capture_output=True, text=True, timeout=15,
@@ -686,8 +703,11 @@ class ScriptContractsApplicability(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(), [
             f"Not applicable: {name} (source and fixture both absent at this head)"
-            for name, _, _ in self.pairs
-        ] + self.absent)
+            for name, _, _ in self.pairs[:2]
+        ] + self.absent + [
+            f"Not applicable: {name} (source and fixture both absent at this head)"
+            for name, _, _ in self.pairs[2:]
+        ])
         self.assertEqual(self.calls(root), [])
         self.assertEqual(list(root.iterdir()), [])
 
@@ -697,13 +717,13 @@ class ScriptContractsApplicability(unittest.TestCase):
             self.pair(root, index)
         result = self.invoke_block(root)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines(), [f"Checking: {name}" for name, _, _ in self.pairs]
-                         + self.absent)
+        self.assertEqual(result.stdout.splitlines(), [f"Checking: {name}" for name, _, _ in self.pairs[:2]]
+                         + self.absent + [f"Checking: {name}" for name, _, _ in self.pairs[2:]])
         self.assertEqual(self.calls(root), self.expected_calls(*range(len(self.pairs))))
 
     def test_each_partial_pair_fails_instead_of_being_skipped(self):
-        for index, (_, source, fixture) in enumerate(self.pairs):
-            for missing in (source, fixture):
+        for index in range(len(self.pairs)):
+            for missing in self.members(index):
                 with self.subTest(pair=index, missing=missing):
                     root = self.case(f"partial-{index}-{Path(missing).name}")
                     self.pair(root, index)
@@ -712,6 +732,17 @@ class ScriptContractsApplicability(unittest.TestCase):
                     self.assertEqual(result.returncode, 2, result.stderr)
                     self.assertIn("Incomplete contract pair:", result.stderr)
                     self.assertEqual(self.calls(root), [])
+
+    def test_probe_capture_without_its_contract_pair_is_refused(self):
+        root = self.case("orphan-probe-capture")
+        capture = root / self.probe_capture
+        capture.parent.mkdir(parents=True)
+        capture.write_text("{}\n")
+        result = self.invoke_block(root)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("Incomplete contract pair:", result.stderr)
+        self.assertIn(self.probe_capture, result.stderr)
+        self.assertEqual(self.calls(root), [])
 
     def test_each_pair_can_be_applicable_independently(self):
         for index in range(len(self.pairs)):
@@ -726,15 +757,30 @@ class ScriptContractsApplicability(unittest.TestCase):
                     if other != index:
                         self.assertIn(f"Not applicable: {self.pairs[other][0]} ", result.stdout)
 
-    def test_original_failure_status_stops_later_pairs(self):
-        for index, exit_code in enumerate((7, 9, 11)):
+    def test_jobs_run_only_their_assigned_fixtures(self):
+        for job, blocks, expected in (
+            ("serial", [self.run_block], (0, 1)),
+            ("native", [self.native_block], (2, 3)),
+        ):
+            with self.subTest(job=job):
+                root = self.case(f"assigned-{job}")
+                for index in range(len(self.pairs)):
+                    self.pair(root, index)
+                result = self.invoke_block(root, blocks=blocks)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.calls(root), self.expected_calls(*expected))
+
+    def test_original_failure_status_stops_later_pairs_in_its_job(self):
+        for index, exit_code in enumerate((7, 9, 11, 13)):
             with self.subTest(failing_pair=index):
                 root = self.case(f"failure-{index}")
                 for other in range(len(self.pairs)):
                     self.pair(root, other, exit_code=exit_code if index == other else 0)
-                result = self.invoke_block(root)
+                blocks = [self.run_block] if index < 2 else [self.native_block]
+                expected = range(index + 1) if index < 2 else range(2, index + 1)
+                result = self.invoke_block(root, blocks=blocks)
                 self.assertEqual(result.returncode, exit_code, result.stderr)
-                self.assertEqual(self.calls(root), self.expected_calls(*range(index + 1)))
+                self.assertEqual(self.calls(root), self.expected_calls(*expected))
                 self.assertNotIn("Not applicable: build directory seeding", result.stdout)
                 if index == 0:
                     self.assertNotIn("Checking: process custody", result.stdout)
@@ -745,7 +791,7 @@ class ScriptContractsApplicability(unittest.TestCase):
         for name in ("run-development", "check-format"):
             (root / "scripts" / name).write_text("#!/bin/sh\nexit 0\n")
         result = self.invoke_block(root, blocks=[
-            self.run_block, self.legacy_native_block, self.syntax_block,
+            self.run_block, self.native_block, self.syntax_block,
         ])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Not applicable: native evidence (source and fixture both absent at this head)\n",
@@ -771,8 +817,8 @@ class ScriptContractsApplicability(unittest.TestCase):
         self.assertEqual(self.calls(root), [])
 
     def test_symlink_and_dangling_pair_members_fail_without_following_them(self):
-        for index, (_, source, fixture) in enumerate(self.pairs):
-            for member_index, member in enumerate((source, fixture)):
+        for index in range(len(self.pairs)):
+            for member_index, member in enumerate(self.members(index)):
                 for dangling in (False, True):
                     with self.subTest(pair=index, member=member, dangling=dangling):
                         root = self.case(f"symlink-{index}-{member_index}-{dangling}")
@@ -790,8 +836,8 @@ class ScriptContractsApplicability(unittest.TestCase):
                         self.assertEqual(self.calls(root), [])
 
     def test_nonregular_members_and_parent_components_fail_closed(self):
-        for index, (_, source, fixture) in enumerate(self.pairs):
-            for member_index, member in enumerate((source, fixture)):
+        for index in range(len(self.pairs)):
+            for member_index, member in enumerate(self.members(index)):
                 with self.subTest(pair=index, directory_member=member):
                     root = self.case(f"directory-{index}-{member_index}")
                     self.pair(root, index)
@@ -802,8 +848,8 @@ class ScriptContractsApplicability(unittest.TestCase):
                     self.assertEqual(result.returncode, 2, result.stderr)
                     self.assertIn("Invalid contract path:", result.stderr)
                     self.assertEqual(self.calls(root), [])
-        for index, (_, source, fixture) in enumerate(self.pairs):
-            for member_index, member in enumerate((source, fixture)):
+        for index in range(len(self.pairs)):
+            for member_index, member in enumerate(self.members(index)):
                 for kind in ("file", "symlink"):
                     with self.subTest(pair=index, parent_of=member, kind=kind):
                         root = self.case(f"parent-{index}-{member_index}-{kind}")

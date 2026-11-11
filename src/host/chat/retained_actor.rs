@@ -718,13 +718,19 @@ pub(super) fn publish_authenticated_source(
     }
     handle.update_native_source(source.clone(), console, pair)?;
     if install {
-        super::super::agent_execution::registry(host)?
+        let registry = super::super::agent_execution::registry(host)?;
+        let adopted = registry
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .adopt_authenticated_agent_session(
                 retained,
                 &crate::agent_execution::HostedSession::Chat(source.clone()),
             )?;
+        // The agent's record, and possibly its pane, now name the successor;
+        // watching windows learn it from the edge.
+        if adopted {
+            super::super::agent_execution::announce(host, &registry);
+        }
     }
     if install {
         // Promotion follows the exact helper ACK and Registry transaction and

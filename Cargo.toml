@@ -136,6 +136,10 @@ required-features = ["ui"]
 name = "terminal-workload"
 required-features = ["host"]
 
+[[example]]
+name = "workspace-edit-workload"
+required-features = ["development"]
+
 # Skip empty harnesses outside their owning lane. Keep the source cfgs for
 # platform restrictions; integrated-browser also selects the UI tests.
 [[test]]

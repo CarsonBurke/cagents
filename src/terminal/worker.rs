@@ -7255,16 +7255,17 @@ mod tests {
             .unwrap();
             wait_for_text(&handle, "completed-worker-result");
             let deadline = Instant::now() + Duration::from_secs(10);
-            while !handle.is_completed() {
-                assert!(Instant::now() < deadline, "worker did not finish");
-                thread::sleep(Duration::from_millis(10));
+            let events = handle.events();
+            loop {
+                if let TerminalEvent::Completed { exit_code, .. } = events
+                    .recv_deadline(deadline)
+                    .expect("worker did not publish completion")
+                {
+                    assert_eq!(exit_code, 7);
+                    break;
+                }
             }
-            assert!(
-                handle
-                    .events()
-                    .try_iter()
-                    .any(|event| matches!(event, TerminalEvent::Completed { exit_code: 7, .. }))
-            );
+            assert!(handle.is_completed());
             assert!(
                 handle
                     .inner

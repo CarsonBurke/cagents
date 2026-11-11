@@ -66,6 +66,10 @@ both use the same fixture data and selected providers.
                   this session, keeping its daemon and providers alive. Runs in
                   the foreground; stop still ends the complete session.
                   --chat-stages records UI stage timings on normal close.
+  open-window WINDOW
+                  Open another saved window in this session, keeping existing
+                  windows running. Uses the recorded build and stays foreground
+                  until this window exits. Use relaunch for the primary window.
   stop            End the session, its daemon and its processes; release the lock.
                   Also ends what remains of a session whose supervisor was killed.
   save-seed       Keep the stopped fixture as the data every later start restores.
@@ -870,7 +874,9 @@ CARGO
 }
 
 run_app() {
-    local side=$1
+    local side=$1 window=${2:-} chat_stage_output=${3:-} window_arguments=()
+    local ui_log=$logs/ui-$side${window:+-$window}.log
+    [ -z "$window" ] || window_arguments=(-- --window "$window")
     load_side "$side" "$state/source"
     # A session holds the native lock while others queue, so it must not wait on
     # Cargo, whose shared locks and fingerprints make even a no-op build uncertain.
@@ -895,86 +901,282 @@ run_app() {
     fixture_env env "${stage_environment[@]}" CAGENTS_BUILD_LOCK="$state/session-build.lock" CAGENTS_BUILD_SLOTS=1 CAGENTS_BUILD_SEED=0 \
         CAGENTS_BUILD_REMOTE=local CAGENTS_BUILD_FREE_FLOOR_GIB=0 \
         scripts/run-development --browserless "${runner_instance[@]}" \
-            --debug --log-file "$logs/ui-$side.log" || status=$?
+            --debug --log-file "$ui_log" "${window_arguments[@]}" || status=$?
     # Don't leave the lock held until the harness gives up on a window.
     if [ ! -e "$state/ready" ] && [ ! -e "$state/failed" ]; then
         printf 'the runner exited with status %s before the app window appeared; see %s and %s\n' \
-            "$status" "$harness_root/session.log" "$logs/ui-$side.log" >"$state/failed"
+            "$status" "$harness_root/session.log" "$ui_log" >"$state/failed"
     fi
     return "$status"
 }
 
-# Query the isolated compositor, which represents a closed window as [].
-app_window_is_open() {
-    local observed
-    observed=$(timeout -k 1 10 niri msg --json windows 2>/dev/null) || return 2
-    /usr/bin/python3 -c 'import json,sys
-try:
-    windows=json.load(sys.stdin)
-    if not isinstance(windows,list):
-        sys.exit(2)
-    for window in windows:
-        if not isinstance(window,dict) or "app_id" not in window:
-            sys.exit(2)
-        if window["app_id"] is not None and not isinstance(window["app_id"],str):
-            sys.exit(2)
-    sys.exit(0 if any(window["app_id"] == "dev.cagents.Cagents.Development" for window in windows) else 1)
-except (ValueError,AttributeError):
-    sys.exit(2)
-' <<<"$observed"
-}
-
 cmd_relaunch() {
-    local side watcher observed status=0 chat_stage_output=
-    side=$(current_side)
+    local chat_stage_output=
     case ${1:-} in
         --chat-stages)
             [ "$#" -eq 1 ] || die 'relaunch accepts only --chat-stages'
             mkdir -p -m 700 -- "$logs/chat-stages"
-            chat_stage_output=$logs/chat-stages/$side-$(date +%s)-$$.json
+            chat_stage_output=$logs/chat-stages/$(current_side)-$(date +%s)-$$.json
             printf 'chat stages: %s\n' "$chat_stage_output"
             ;;
         '') ;;
         *) die 'relaunch accepts only --chat-stages' ;;
     esac
     [ -f "$harness_root/session.rc" ] || die 'close the app window before relaunching it'
-    exec 7>"$state/relaunch.lock"
-    flock -n 7 || die 'a relaunched app is already running'
+    launch_window relaunch primary "$chat_stage_output"
+}
+
+cmd_open_window() {
+    [ "$#" -eq 1 ] || die 'open-window needs exactly one saved window name' 2
+    local window=$1
+    # Keep in step with instance::validate_window_slot; the primary is relaunched.
+    [[ $window =~ ^[A-Za-z0-9_-]{1,40}$ ]] && [ "$window" != update ] ||
+        die 'window name must contain 1–40 ASCII letters, digits, hyphens or underscores, and cannot be update' 2
+    [ "$window" != primary ] || die 'use relaunch for the primary window' 2
+    launch_window open-window "$window" ''
+}
+
+# Admission protects the shared replay while a window maps. A separate slot
+# guard lasts until that UI exits, so another slot can start in the meantime.
+launch_window() {
+    local mode=$1 window=$2 chat_stage_output=$3 side
+    side=$(current_side)
+    [ -e "$state/ready" ] || die 'wait for the session to become ready before opening another window'
+    exec 6>"$state/window-$window.lock"
+    flock -n 6 || die "window slot $window is already running"
+    exec 7>"$state/window-launch.lock"
+    flock -n 7 || die 'another window launch is still starting'
     nested_session_env
     local session_environment
     session_environment=$(timeout -k 5 30 niri-harness --session "$session_name" session env)
     eval "$session_environment"
-    app_window_is_open && observed=0 || observed=$?
-    case $observed in
-        0) die 'close the app window before relaunching it' ;;
-        1) ;;
-        *) die "could not observe whether the app window is closed; see $harness_root/session.log" ;;
-    esac
-    # Product copies need not contain Cargo dependency lists, so the runner's
-    # ordinary warm-build shortcut may decline them. Replay the exact recorded
-    # builds again until the new window appears; never compile under this lock.
-    touch "$state/replaying"
-    (
-        for _ in {1..300}; do
-            live_session || exit 1
-            if app_window_is_open; then
-                rm -f -- "$state/replaying"
-                exit 0
-            fi
-            sleep 0.1
-        done
-        printf 'the relaunched app window did not appear; see %s\n' "$logs/ui-$side.log" >"$state/failed"
-        touch "$state/stop"
-    ) 7>&- &
-    watcher=$!
-    trap 'rm -f -- "$state/replaying"; kill "$watcher" 2>/dev/null || :; wait "$watcher" 2>/dev/null || :' EXIT
-    trap 'exit 143' TERM HUP
-    run_app "$side" 7>&- || status=$?
-    if [ -e "$state/replaying" ]; then
-        printf 'the relaunched app exited before its window appeared; see %s\n' "$logs/ui-$side.log" >"$state/failed"
-        [ "$status" -ne 0 ] || status=1
-    fi
-    exit "$status"
+    exec /usr/bin/python3 - "$self" "$task" "$side" "$mode" "$window" "$chat_stage_output" <<'WINDOW'
+import ctypes
+import fcntl
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+
+tool, task, side, mode, slot, stages = sys.argv[1:]
+state = Path(task) / "session"
+replay = state / "replaying"
+window_record = state / f"window-{slot}.json"
+window_temporary = state / f".window-{slot}-{os.getpid()}.tmp"
+owner = f"{os.getpid()}:{time.monotonic_ns()}"
+child = None
+launch_started = False
+ready = False
+status = 1
+cancelled = 0
+launch_failure = None
+session_pid = int((state / "pid").read_text())
+
+
+def session_identity():
+    try:
+        fields = Path(f"/proc/{session_pid}/stat").read_text().split(") ", 1)[1].split()
+        return fields[19] if fields[0] != "Z" else None
+    except FileNotFoundError:
+        return None
+
+
+session_start = session_identity()
+
+
+def owns_session():
+    try:
+        return (session_start is not None
+                and int((state / "pid").read_text()) == session_pid
+                and session_identity() == session_start)
+    except (FileNotFoundError, ValueError):
+        return False
+
+
+def interrupted(signum, _frame):
+    # Retain the child handle before cancellation can unwind a pending Popen.
+    global cancelled
+    cancelled = signum
+
+
+def app_windows(deadline):
+    deadline_error = "the new app window did not appear within 30 seconds"
+    observation_error = "could not observe whether the app window is closed or a new window appeared"
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise RuntimeError(deadline_error)
+    try:
+        observed = subprocess.run(
+            ["niri", "msg", "--json", "windows"], check=True,
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            timeout=min(10, remaining),
+        )
+        windows = json.loads(observed.stdout)
+        if not isinstance(windows, list):
+            raise ValueError("window list is not an array")
+        ids = {}
+        for window in windows:
+            if not isinstance(window, dict) or "app_id" not in window:
+                raise ValueError("invalid window record")
+            app = window["app_id"]
+            if app is not None and not isinstance(app, str):
+                raise ValueError("invalid app identity")
+            if app == "dev.cagents.Cagents.Development":
+                identity = window.get("id")
+                if type(identity) is not int or identity < 0 or identity in ids:
+                    raise ValueError("invalid app window identity")
+                ids[identity] = window.get("pid")
+        if time.monotonic() >= deadline:
+            raise RuntimeError(deadline_error)
+        return ids
+    except subprocess.TimeoutExpired as error:
+        message = deadline_error if time.monotonic() >= deadline else observation_error
+        raise RuntimeError(message) from error
+    except (subprocess.SubprocessError, ValueError) as error:
+        raise RuntimeError(observation_error) from error
+
+
+def exited():
+    # Leave the group leader unreaped until every cleanup signal has been sent.
+    return os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+
+
+def owned_window(pid):
+    if type(pid) is not int or pid <= 0:
+        return False
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text().split(") ", 1)[1].split()
+        return fields[0] != "Z" and int(fields[2]) == child.pid
+    except FileNotFoundError:
+        return False
+
+
+for name in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+    signal.signal(name, interrupted)
+try:
+    deadline = time.monotonic() + 30
+    previous = app_windows(deadline)
+    if cancelled:
+        raise SystemExit(128 + cancelled)
+    if mode == "relaunch" and previous:
+        raise RuntimeError("close the app window before relaunching it")
+    if not owns_session():
+        raise RuntimeError("the native evidence session has ended")
+    # Adopt the runner's orphaned descendants so failure cleanup also reaps them.
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
+        raise OSError(ctypes.get_errno(), "could not supervise window descendants")
+    replay.write_text(owner)
+    # This invokes the same recorded-build run_app route as the initial window.
+    # No guard descriptor reaches the runner or UI.
+    launch_started = True
+    child = subprocess.Popen(
+        [tool, "--task", task, "__app", side,
+         "" if mode == "relaunch" else slot, stages],
+        stdin=subprocess.DEVNULL, start_new_session=True,
+    )
+    while True:
+        if cancelled:
+            raise SystemExit(128 + cancelled)
+        outcome = exited()
+        if outcome is not None:
+            status = outcome.si_status if outcome.si_code == os.CLD_EXITED else 128 + outcome.si_status
+            if not ready:
+                launch_failure = ("the relaunched app exited before its window appeared" if mode == "relaunch"
+                                  else "the app exited before its new window appeared")
+                print("native-evidence: " + launch_failure, file=sys.stderr)
+                status = status or 1
+            break
+        if not owns_session() or (state / "stop").exists() or (state / "failed").exists():
+            raise RuntimeError("the native evidence session is stopping")
+        if not ready:
+            current = app_windows(deadline)
+            added = {identity for identity in current.keys() - previous.keys()
+                     if owned_window(current[identity])}
+            if len(added) > 1:
+                raise RuntimeError("more than one new app window appeared; cannot identify this launch")
+            if added:
+                identity = added.pop()
+                window_temporary.write_text(json.dumps({
+                    "owner": owner, "session_pid": session_pid, "session_start": session_start,
+                    "slot": slot, "window_id": identity, "pid": current[identity],
+                    "log": str(Path(task) / "logs" / f"ui-{side}{'-' + slot if mode != 'relaunch' else ''}.log"),
+                }) + "\n")
+                window_temporary.replace(window_record)
+                ready = True
+                replay.unlink()
+                fcntl.flock(7, fcntl.LOCK_UN)
+                print(f"window ready: {slot}, id {identity}", flush=True)
+        time.sleep(0.1)
+except (OSError, RuntimeError) as error:
+    launch_failure = str(error)
+    print("native-evidence: " + str(error), file=sys.stderr)
+    status = 1
+finally:
+    try:
+        if child is not None:
+            # WNOWAIT pins this owned process group against PID reuse. Send all
+            # cleanup signals before reaping its leader, including on early exit.
+            for name in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+                signal.signal(name, signal.SIG_IGN)
+            try:
+                os.killpg(child.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            cleanup_deadline = time.monotonic() + 5
+            while exited() is None and time.monotonic() < cleanup_deadline:
+                time.sleep(0.05)
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            child.wait(timeout=5)
+            reap_deadline = time.monotonic() + 5
+            while True:
+                try:
+                    pid, _ = os.waitpid(-child.pid, os.WNOHANG)
+                except ChildProcessError:
+                    break
+                except InterruptedError:
+                    continue
+                if pid == 0:
+                    if time.monotonic() >= reap_deadline:
+                        raise RuntimeError("window descendants did not exit after bounded cleanup")
+                    time.sleep(0.05)
+    except Exception:
+        if owns_session():
+            if not (state / "failed").exists():
+                (state / "failed").write_text("window runner did not exit after bounded cleanup\n")
+            (state / "stop").touch()
+        raise
+    finally:
+        try:
+            if replay.read_text() == owner:
+                replay.unlink()
+        except FileNotFoundError:
+            pass
+        if ready:
+            try:
+                record = json.loads(window_record.read_text())
+                # The persistent slot guard remains held through cleanup; also
+                # leave any replacement session/launch record untouched.
+                if isinstance(record, dict) and (record.get("owner"), record.get("session_pid"), record.get("session_start")) == (owner, session_pid, session_start):
+                    window_record.unlink()
+            except (FileNotFoundError, json.JSONDecodeError):
+                pass
+        window_temporary.unlink(missing_ok=True)
+        # An empty primary relaunch must not leave the task holding the native
+        # lock. Pre-launch refusals and failed secondary windows stay isolated.
+        if mode == "relaunch" and launch_started and not ready and owns_session() and not (state / "stop").exists():
+            if not (state / "failed").exists():
+                message = launch_failure or "the relaunched app did not map its window"
+                (state / "failed").write_text(message + f"; see {Path(task) / 'logs' / f'ui-{side}.log'}\n")
+            (state / "stop").touch()
+sys.exit(status)
+WINDOW
 }
 
 cmd_start() {
@@ -1193,6 +1395,7 @@ case $command in
     build) cmd_build "$@" ;;
     start) cmd_start "$@" ;;
     relaunch) cmd_relaunch "$@" ;;
+    open-window) cmd_open_window "$@" ;;
     cli)
         side=$(current_side)
         load_side "$side" "$state/source"
