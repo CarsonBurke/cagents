@@ -435,7 +435,10 @@ stream_step() {
     # A later prompt can start while older input remains in the unlinked queue.
     # Share its current file offset with the helper before it reads live stdin.
     if [ "$stream_pending_open" = true ]; then exec 4<&5; else exec 4</dev/null; fi
-    /usr/bin/python3 - "$stream_directory" "$stream_delay" "$$" 4<&4 3<&0 <<'PYTHON' &
+    # POSIX shells may redirect an asynchronous command's stdin to /dev/null
+    # before applying its redirections. Capture live input in the parent first.
+    exec 3<&0
+    /usr/bin/python3 - "$stream_directory" "$stream_delay" "$$" 4<&4 3<&3 <<'PYTHON' &
 import ctypes
 import json
 import os
@@ -469,7 +472,8 @@ while True:
     buffer.extend(older)
 buffer.extend(pending.read_bytes())
 pending.write_bytes(b"")
-selector = selectors.DefaultSelector()
+# Poll also accepts regular-file input; epoll only accepts pollable devices.
+selector = selectors.PollSelector()
 selector.register(3, selectors.EVENT_READ)
 input_open = True
 status = 0
@@ -514,6 +518,7 @@ finally:
 sys.exit(status)
 PYTHON
     stream_pid=$!
+    exec 3<&-
     exec 4<&-
     if wait "$stream_pid"; then stream_status=0; else stream_status=$?; fi
     stream_pid=

@@ -15,6 +15,13 @@ import time
 import unittest
 
 SCRIPT = Path(__file__).resolve().parent / "fixtures/chat-composer-claude.sh"
+# Exercise another installed /bin/sh implementation without changing the
+# provider copy or relying on the workstation's default shell.
+PROVIDER_SHELL = os.environ.get("CAGENTS_FIXTURE_TEST_SHELL")
+
+
+def provider_command(script):
+    return ([PROVIDER_SHELL, str(script)] if PROVIDER_SHELL else [str(script)])
 
 
 def prompt(number):
@@ -30,7 +37,7 @@ class LiveProvider:
         copied.parent.mkdir(exist_ok=True)
         shutil.copy2(SCRIPT, copied)
         self.process = subprocess.Popen(
-            [str(copied)], cwd=case.project, stdin=subprocess.PIPE,
+            provider_command(copied), cwd=case.project, stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
             env={"HOME": str(case.root / "home"), "CLAUDE_CONFIG_DIR": str(case.config),
                  "PATH": f"{copied.parent}:/usr/bin:/bin", "LANG": "C.UTF-8"})
@@ -124,13 +131,20 @@ class Provider(unittest.TestCase):
         self.project = self.root / "project"
         self.project.mkdir()
 
-    def run_provider(self, *arguments, frames=(prompt(1),)):
+    def run_provider(self, *arguments, frames=(prompt(1),), file_input=False):
         started = time.monotonic()
-        result = subprocess.run(
-            [str(SCRIPT), *arguments], cwd=self.project, capture_output=True, text=True,
-            input="".join(json.dumps(frame) + "\n" for frame in frames), timeout=60,
-            env={"HOME": str(self.root / "home"), "CLAUDE_CONFIG_DIR": str(self.config),
-                 "PATH": "/usr/local/bin:/usr/bin:/bin"})
+        content = "".join(json.dumps(frame) + "\n" for frame in frames)
+        command = [*provider_command(SCRIPT), *arguments]
+        options = {"cwd": self.project, "capture_output": True, "text": True, "timeout": 60,
+                   "env": {"HOME": str(self.root / "home"), "CLAUDE_CONFIG_DIR": str(self.config),
+                           "PATH": "/usr/local/bin:/usr/bin:/bin"}}
+        if file_input:
+            source = self.root / "input.jsonl"
+            source.write_text(content)
+            with source.open() as stream:
+                result = subprocess.run(command, stdin=stream, **options)
+        else:
+            result = subprocess.run(command, input=content, **options)
         output = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
         return result, output, time.monotonic() - started
 
@@ -340,6 +354,36 @@ os.execv("/usr/bin/rm", ["/usr/bin/rm", *args])
         self.assertEqual([len(part) for part in live.deltas()], [16384, 16384, 7232])
         self.assertEqual(self.texts(live.output), [text])
         self.assertEqual(self.texts(self.history()), [text])
+        self.assertFalse(list(self.config.glob(".fixture-stream.*")))
+
+    def test_regular_file_input_preserves_streamed_unicode_and_eof(self):
+        text = "A漢🙂\n" * 10000
+        (self.config / "fixture-stream-reply").write_text("0.02\n")
+        (self.config / "fixture-reply.md").write_text(text)
+        result, output, _ = self.run_provider(file_input=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        deltas = [frame["event"]["delta"]["text"] for frame in output
+                  if frame.get("event", {}).get("delta", {}).get("type") == "text_delta"]
+        self.assertEqual("".join(deltas), text)
+        self.assertEqual(self.texts(output), [text])
+        self.assertEqual(self.texts(self.history()), [text])
+        self.assertFalse(list(self.config.glob(".fixture-stream.*")))
+
+    def test_regular_file_read_ahead_keeps_interrupts_and_followup_prompts(self):
+        (self.config / "fixture-stream-reply").write_text("0.5\n")
+        (self.config / "fixture-reply.md").write_text("An unseen answer.\n" * 40000)
+        interrupts = [{"type": "control_request", "request_id": f"stop-{turn}",
+                       "request": {"subtype": "interrupt"}} for turn in (1, 2)]
+        result, output, _ = self.run_provider(
+            frames=(prompt(1), interrupts[0], prompt(2), interrupts[1]), file_input=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([frame["response"]["request_id"] for frame in output
+                          if frame.get("type") == "control_response"], ["stop-1", "stop-2"])
+        self.assertEqual([frame["uuid"] for frame in self.history()
+                          if frame.get("type") == "user"], ["prompt-1", "prompt-2"])
+        self.assertEqual(self.texts(output), [])
+        self.assertEqual(self.texts(self.history()), [])
+        self.assertEqual(len([frame for frame in output if frame.get("type") == "result"]), 2)
         self.assertFalse(list(self.config.glob(".fixture-stream.*")))
 
     def test_stream_yields_control_and_preserves_complete_and_partial_read_ahead(self):
