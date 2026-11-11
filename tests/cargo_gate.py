@@ -790,6 +790,75 @@ while True:
         self.assertFalse(select.select([pidfd], [], [], 0)[0])
         self.assertTrue(self.slot_is_free())
 
+    def test_running_command_reaps_its_exited_adopted_descendants(self):
+        # A test may kill a provider after its holder dies, then wait for its
+        # process identity to disappear while the test command is still alive.
+        worker = self.root / "orphan.py"
+        worker.write_text("""
+import json, os, pathlib, subprocess, sys, time
+root = pathlib.Path(sys.argv[1])
+if sys.argv[2] == 'orphan':
+    (root / 'ready.tmp').write_text(str(os.getpid()))
+    (root / 'ready.tmp').rename(root / 'ready')
+elif sys.argv[2] == 'parent':
+    subprocess.Popen([sys.executable, __file__, str(root), 'orphan'], start_new_session=True)
+    while not (root / 'ready').exists():
+        time.sleep(0.01)
+    os._exit(0)
+else:
+    (root / 'primary').write_text(json.dumps({'pid': os.getpid(), 'supervisor': os.getppid()}))
+    subprocess.run([sys.executable, __file__, str(root), 'parent'], check=True)
+    (root / 'adopted').touch()
+    while not (root / 'release').exists():
+        time.sleep(0.01)
+    sys.exit(17)
+while True:
+    time.sleep(1)
+""")
+        child = subprocess.Popen(
+            [str(self.gate), "exec", sys.executable, str(worker), str(self.root), "primary"],
+            env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        self.children.append(child)
+
+        def finish_command():
+            # Even a failing assertion leaves cleanup to the live supervisor,
+            # which owns the primary and any adopted orphan's wait status.
+            if child.poll() is None:
+                child.send_signal(signal.SIGTERM)
+                child.wait(timeout=6)
+
+        self.addCleanup(finish_command)
+        self.wait_for((self.root / "adopted").exists, "orphan adoption")
+        primary = json.loads((self.root / "primary").read_text())
+        pid = int((self.root / "ready").read_text())
+        pidfd = os.pidfd_open(pid)
+        self.descendants.append((pid, pidfd))
+        stat = Path(f"/proc/{pid}/stat")
+        fields = stat.read_text().rsplit(")", 1)[1].split()
+        self.assertEqual(int(fields[1]), primary["supervisor"])
+        self.assertNotEqual(fields[0], "Z", "the adopted descendant must start alive")
+        self.assertFalse(self.slot_is_free())
+        signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+        self.wait_for(lambda: bool(select.select([pidfd], [], [], 0)[0]), "descendant exit")
+
+        def same_process():
+            try:
+                return stat.read_text().rsplit(")", 1)[1].split()[19] == fields[19]
+            except FileNotFoundError:
+                return False
+
+        try:
+            self.wait_for(lambda: not same_process(), "reaped adopted descendant")
+        except self.failureException:
+            self.fail(f"exited adopted descendant remains under supervisor {primary['supervisor']}: {stat.read_text()}")
+        self.assertIsNone(child.poll(), "reaping an orphan must preserve the primary")
+        self.assertFalse(self.slot_is_free(), "the running primary still owns its slot")
+        (self.root / "release").touch()
+        self.assertEqual(child.wait(timeout=5), 17)
+        self.assertTrue(self.slot_is_free())
+
     def test_cancellation_drains_children_after_a_resistant_parent_is_killed(self):
         child, pidfd = self.launch_descendant(resistant_primary=True)
         child.send_signal(signal.SIGTERM)

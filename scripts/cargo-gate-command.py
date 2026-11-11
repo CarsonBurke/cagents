@@ -161,6 +161,15 @@ def main():
         except ProcessLookupError:
             pass
 
+    def reap_adopted():
+        # Subreaping also makes us responsible for orphans that exit during
+        # a running command. Leave live services alone and retain the primary
+        # as cancellation's PID anchor until its final wait().
+        for value in children_path.read_text().split():
+            pid = int(value)
+            if pid != primary.pid:
+                os.waitpid(pid, os.WNOHANG)
+
     def drain():
         deadline = time.monotonic() + GRACE_SECONDS
         terminating = set()
@@ -206,6 +215,7 @@ def main():
             if admission_expired(admission_deadline):
                 drain()
                 return 124
+            reap_adopted()
             if primary_exited():
                 if cancellation_requested():
                     continue
