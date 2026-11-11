@@ -539,7 +539,10 @@ fn preserved_retry_authenticates_original_native_owner_without_reopening_paused_
         Handle::inspect_remote(&fixture.owners[0].record, fixture.proof.clone()).unwrap();
     assert_eq!(unchanged.source, adopted);
 
-    restore_ready_checkpoint(fixture.host(), &adopted, &ready).unwrap();
+    // Use the production Ready-to-Restoring startup transition, rather than
+    // admitting directly from this test's still-Ready in-memory checkpoint.
+    // The ordinary path must complete its owner restore and Ready publication.
+    crate::host::update_recovery::restore_ordinary(fixture.host()).unwrap();
     let current = {
         let state = fixture.host().lock().unwrap();
         assert_eq!(state.chats.len(), 1);
@@ -552,6 +555,32 @@ fn preserved_retry_authenticates_original_native_owner_without_reopening_paused_
         assert_eq!(record.session.proof.as_ref(), Some(&fixture.proof));
         record.session.clone()
     };
+    let store = crate::upgrade::handoff::Store::discover().unwrap();
+    assert!(store.load().unwrap().is_none());
+    let listed = current_roster(&fixture)
+        .1
+        .into_iter()
+        .find(|session| session.id == adopted.id)
+        .unwrap();
+    assert!(
+        store
+            .recovered_chats()
+            .unwrap()
+            .proves(&adopted, &listed, &fixture.proof)
+    );
+    let published: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            store
+                .path
+                .with_file_name("daemon-upgrade.ready-outcome.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        published["serving"],
+        serde_json::to_value(&fixture.proof).unwrap()
+    );
     let authenticated =
         Handle::inspect_remote(&fixture.owners[0].record, fixture.proof.clone()).unwrap();
     assert_eq!(authenticated.source, current);
@@ -871,7 +900,10 @@ fn settled_cold_host_keeps_real_actors_and_terminal_then_verifies_original_censu
             .iter()
             .any(|snapshot| snapshot.source == originally_paused)
     );
-    let model = crate::host::model::Registry::open().unwrap().model().unwrap();
+    let model = crate::host::model::Registry::open()
+        .unwrap()
+        .model()
+        .unwrap();
     let reference_retained = model.views.iter().any(|view| {
         view.panes.iter().any(|pane| {
             matches!(&pane.kind, crate::model::CardKind::Chat(session)

@@ -3345,6 +3345,9 @@ fn restore_upgrade_from(
         );
         return Ok(Vec::new());
     }
+    // Restoration records its progress on disk, but retained-owner admission
+    // must still use the exact Ready payload accepted at this boundary.
+    let ready_checkpoint = (checkpoint.phase == Phase::Ready).then(|| checkpoint.clone());
     checkpoint.phase = Phase::Restoring;
     store.save(&checkpoint)?;
     host.lock()
@@ -3415,8 +3418,8 @@ fn restore_upgrade_from(
             if crate::daemon::termination_requested() {
                 return Err(RESTORE_TERMINATED.to_owned());
             }
-            let restore = if checkpoint.phase == Phase::Ready {
-                super::chat::restore_ready_checkpoint(host, &chat.source, &checkpoint).map(|_| ())
+            let restore = if let Some(ready) = &ready_checkpoint {
+                super::chat::restore_ready_checkpoint(host, &chat.source, ready).map(|_| ())
             } else {
                 super::chat::restore_upgrade(host, chat)
             };
