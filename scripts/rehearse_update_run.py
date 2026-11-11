@@ -8,8 +8,10 @@ import json
 import os
 from pathlib import Path
 import re
+import select
 import shlex
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -17,6 +19,67 @@ import tarfile
 import time
 import tomllib
 import uuid
+
+
+def wait_native_lock(root, descriptor, parent_pid):
+    """Keep one blocking waiter; cancellation terminates and joins only it."""
+    root=Path(root).resolve()
+    if os.getppid()!=parent_pid:
+        return 75
+    marker=root/'.rehearse-update'
+    if marker.is_symlink() or marker.read_text().strip()!=str(root) or descriptor<3:
+        raise RuntimeError('native lock waiting requires an owned private root and inherited descriptor')
+    stop=root/'desktop/stop'
+    if stop.exists():
+        return 75
+    waiter=None
+    pidfd=None
+    previous={}
+    def interrupted(signum, frame):
+        raise SystemExit(128+signum)
+    try:
+        for signum in (signal.SIGTERM,signal.SIGINT,signal.SIGHUP):
+            previous[signum]=signal.signal(signum,interrupted)
+        # Do not let the child queue for the lock until its pidfd is secured.
+        # If pidfd setup fails, closing stdin makes the child exit without
+        # ever running flock; parent death also terminates it in the kernel.
+        gate=('import os,sys\nif os.getppid()!=int(sys.argv[2]): sys.exit(75)\n'
+              'if os.read(0,1)!=b"1": sys.exit(0)\nos.execlp("flock","flock",sys.argv[1])\n')
+        waiter=subprocess.Popen(['setpriv','--pdeathsig','TERM',sys.executable,'-c',gate,str(descriptor),str(os.getpid())],
+                                pass_fds=(descriptor,),stdin=subprocess.PIPE,stdout=subprocess.DEVNULL)
+        try:
+            pidfd=os.pidfd_open(waiter.pid)
+        except ProcessLookupError:
+            return 75 if stop.exists() else waiter.wait()
+        waiter.stdin.write(b'1')
+        waiter.stdin.close()
+        while waiter.poll() is None:
+            if stop.exists():
+                return 75
+            select.select([pidfd],[],[],.1)
+        return 75 if stop.exists() else waiter.wait()
+    finally:
+        # A second cancellation must not interrupt the child's join.
+        blocked=signal.pthread_sigmask(signal.SIG_BLOCK,previous)
+        try:
+            if waiter is not None:
+                if waiter.stdin is not None and not waiter.stdin.closed:
+                    try:
+                        waiter.stdin.close()
+                    except BrokenPipeError:
+                        pass
+                if waiter.poll() is None and pidfd is not None:
+                    try:
+                        signal.pidfd_send_signal(pidfd,signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                waiter.wait()
+            if pidfd is not None:
+                os.close(pidfd)
+        finally:
+            for signum,handler in previous.items():
+                signal.signal(signum,handler)
+            signal.pthread_sigmask(signal.SIG_SETMASK,blocked)
 
 
 def candidate_namespace_cli(root, archive_dir, version):
@@ -153,6 +216,18 @@ def terminal_cards(root, slot='main'):
                     "FROM cards c JOIN workspaces w ON w.workspace_id=c.workspace_id "
                     "JOIN terminal_recipes r ON r.card_id=c.card_id "
                     "WHERE c.kind_tag='terminal' AND c.existence_json=?",[json.dumps('open')])]
+
+
+def terminal_probe_command(session, token, receipt):
+    shell=Path(session['launch']['program']).name
+    if shell=='fish':
+        variable='$fish_pid'
+    elif shell in ('sh','bash','dash','zsh','ksh'):
+        variable='$$'
+    else:
+        raise RuntimeError(f'the issued terminal shell is unsupported by the output probe: {shell}')
+    return {'program':session['launch']['program'],'pid_variable':variable,
+            'command':f"umask 077; printf '{token} pid=%s\\n' \"{variable}\" | tee {shlex.quote(str(receipt))}\n"}
 
 
 def new_terminal_action_contract(evidence, version_root):
@@ -664,8 +739,10 @@ class Rehearsal:
         self.call('shot','new-terminal-opened',timeout=45)
         token='REHEARSAL_TERMINAL_'+uuid.uuid4().hex
         receipt=destination/'typed-output.txt'
-        command=f"umask 077; printf '{token} pid=%s\\n' \"$$\" | tee {shlex.quote(str(receipt))}\n"
+        probe=terminal_probe_command(shown['data']['terminal']['session'],token,receipt)
+        command=probe['command']
         evidence['token']=token
+        evidence['shell_probe']=probe
         evidence['typed_command']=command
         self.call('drive','type',command,timeout=30)
         deadline=time.monotonic()+15
@@ -1096,6 +1173,9 @@ def main():
     wait.add_argument('names',nargs='+')
     observe=commands.add_parser('observe')
     observe.add_argument('output')
+    lock=commands.add_parser('wait-native-lock')
+    lock.add_argument('--fd',type=int,required=True)
+    lock.add_argument('--parent-pid',type=int,required=True)
     args=parser.parse_args()
     if args.command == 'run' and args.expect_console_refusal and (not args.fail_new_daemon or args.no_console):
         parser.error('--expect-console-refusal requires --fail-new-daemon and a seeded console')
@@ -1107,6 +1187,8 @@ def main():
         parser.error('--expect-terminal-restart-failure requires --new-terminal-after-restore')
     rehearsal=Rehearsal(args.root,args.shell)
     try:
+        if args.command=='wait-native-lock':
+            return wait_native_lock(args.root,args.fd,args.parent_pid)
         if args.command=='wait':
             rehearsal.wait_windows(args.names)
             return 0

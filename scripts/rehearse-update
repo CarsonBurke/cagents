@@ -329,9 +329,13 @@ run_desktop() {
     local limit=$1
     exec 9>"$native_lock"
     printf 'waiting for the native lock %s\n' "$native_lock"
-    while ! flock -w 1 9; do
-        [ ! -e "$desktop/stop" ] || return 0
-    done
+    local lock_status=0
+    setpriv --pdeathsig TERM /usr/bin/python3 "$tool_root/scripts/rehearse_update_run.py" \
+        "$root" "$self" wait-native-lock --fd 9 --parent-pid "$BASHPID" || lock_status=$?
+    if [ "$lock_status" -ne 0 ]; then
+        [ "$lock_status" -eq 75 ] && [ -e "$desktop/stop" ] && return 0
+        die "native lock waiter exited $lock_status" "$lock_status"
+    fi
     [ ! -e "$desktop/stop" ] || return 0
     printf 'holding the native lock\n'
     : >"$desktop/locked"

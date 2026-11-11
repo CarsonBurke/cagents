@@ -18,6 +18,9 @@ import tempfile
 import tarfile
 import time
 import signal
+import select
+import struct
+import termios
 import shutil
 import unittest
 from unittest.mock import patch
@@ -575,6 +578,167 @@ class CandidateNamespace(unittest.TestCase):
                 records.namespace_source(root,terminals)
 
 
+class NativeLockWaiter(unittest.TestCase):
+    def waiting_child(self, peer):
+        deadline=time.monotonic()+5
+        while time.monotonic()<deadline:
+            self.assertIsNone(peer.poll())
+            try:
+                children=Path(f'/proc/{peer.pid}/task/{peer.pid}/children').read_text().split()
+                for name in children:
+                    p=Path('/proc')/name
+                    args=p.joinpath('cmdline').read_bytes().split(b'\0')
+                    if args and Path(args[0].decode()).name=='flock':
+                        stat=p.joinpath('stat').read_text().rsplit(')',1)[1].split()
+                        return int(name),int(stat[19])
+            except OSError:
+                pass
+            time.sleep(.02)
+        self.fail('the single blocking native-lock waiter did not enter flock')
+
+    def assert_child_gone(self, identity):
+        pid,start=identity
+        deadline=time.monotonic()+5
+        while time.monotonic()<deadline:
+            try:
+                stat=Path(f'/proc/{pid}/stat').read_text().rsplit(')',1)[1].split()
+                if int(stat[19])!=start:
+                    return
+            except OSError:
+                return
+            time.sleep(.02)
+        self.fail(f'owned lock waiter {pid}/{start} survived cancellation')
+
+    def exercise(self, mode):
+        with tempfile.TemporaryDirectory(prefix='ru-native-lock-',dir='/var/tmp') as temporary:
+            root=Path(temporary)
+            (root/'.rehearse-update').write_text(str(root)+'\n')
+            (root/'desktop').mkdir()
+            path=root/'native.lock'
+            with path.open('w') as holder,path.open('w') as inherited,path.open('w') as probe:
+                fcntl.flock(holder,fcntl.LOCK_EX)
+                command=[sys.executable,str(REPOSITORY/'scripts/rehearse_update_run.py'),str(root),str(SCRIPT),
+                         'wait-native-lock','--fd',str(inherited.fileno()),'--parent-pid',str(os.getpid())]
+                peer=subprocess.Popen(command,pass_fds=(inherited.fileno(),),stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE,text=True,start_new_session=True)
+                try:
+                    child=self.waiting_child(peer)
+                    child_pidfd=os.pidfd_open(child[0])
+                    time.sleep(1.2)
+                    self.assertEqual(self.waiting_child(peer),child)
+                    if mode=='acquire':
+                        fcntl.flock(holder,fcntl.LOCK_UN)
+                        output,error=peer.communicate(timeout=5)
+                        self.assertEqual(peer.returncode,0,output+error)
+                        self.assert_child_gone(child)
+                        with self.assertRaises(BlockingIOError):
+                            fcntl.flock(probe,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                        inherited.close()
+                    else:
+                        if mode=='stop':
+                            (root/'desktop/stop').touch()
+                        else:
+                            peer.send_signal(signal.SIGTERM if mode=='signal' else signal.SIGKILL)
+                        output,error=peer.communicate(timeout=5)
+                        self.assertEqual(peer.returncode,{'stop':75,'signal':143,'abandon':-signal.SIGKILL}[mode],output+error)
+                        if mode=='abandon':
+                            self.assertEqual(select.select([child_pidfd],[],[],5)[0],[child_pidfd])
+                            self.assertFalse(any(Path(f'/proc/{child[0]}/fd').glob('*')))
+                        else:
+                            self.assert_child_gone(child)
+                        fcntl.flock(holder,fcntl.LOCK_UN)
+                    # A forgotten child would later lock the inherited open
+                    # description, which remains open here after cancellation.
+                    for _ in range(2):
+                        fcntl.flock(probe,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                        fcntl.flock(probe,fcntl.LOCK_UN)
+                        time.sleep(.1)
+                finally:
+                    if 'child_pidfd' in locals():
+                        os.close(child_pidfd)
+                    if peer.poll() is None:
+                        os.killpg(peer.pid,signal.SIGKILL)
+                        peer.communicate(timeout=5)
+
+    def test_one_stable_waiter_transfers_the_lock_to_the_inherited_description(self):
+        self.exercise('acquire')
+
+    def test_stop_marker_cancels_and_joins_without_any_later_lock_grab(self):
+        self.exercise('stop')
+
+    def test_termination_cancels_and_joins_without_any_later_lock_grab(self):
+        self.exercise('signal')
+
+    def test_abandoned_supervisor_cannot_leave_a_future_lock_owner(self):
+        self.exercise('abandon')
+
+    def test_supervisor_refuses_an_already_missing_expected_parent(self):
+        with tempfile.TemporaryDirectory(prefix='ru-lock-parent-',dir='/var/tmp') as temporary:
+            root=Path(temporary)
+            (root/'.rehearse-update').write_text(str(root)+'\n')
+            with (root/'native.lock').open('w') as inherited:
+                result=subprocess.run([sys.executable,str(REPOSITORY/'scripts/rehearse_update_run.py'),str(root),str(SCRIPT),
+                    'wait-native-lock','--fd',str(inherited.fileno()),'--parent-pid',str(os.getpid()+10000000)],
+                    pass_fds=(inherited.fileno(),),capture_output=True,text=True,timeout=5)
+                self.assertEqual(result.returncode,75,result.stdout+result.stderr)
+
+    def test_parent_death_before_child_arms_pdeathsig_cannot_enter_flock(self):
+        with tempfile.TemporaryDirectory(prefix='ru-lock-arm-',dir='/var/tmp') as temporary:
+            root=Path(temporary)
+            (root/'.rehearse-update').write_text(str(root)+'\n')
+            (root/'desktop').mkdir();(root/'bin').mkdir()
+            ready,release=root/'ready',root/'release'
+            real_setpriv=shutil.which('setpriv')
+            shim=root/'bin/setpriv'
+            shim.write_text(f'#!{sys.executable}\nimport os,sys,time\nfrom pathlib import Path\n'
+                f'Path({str(ready)!r}).touch()\nwhile not Path({str(release)!r}).exists(): time.sleep(.01)\n'
+                f'os.execv({real_setpriv!r},[{real_setpriv!r},*sys.argv[1:]])\n')
+            shim.chmod(0o755)
+            path=root/'native.lock'
+            with path.open('w') as holder,path.open('w') as inherited,path.open('w') as probe:
+                fcntl.flock(holder,fcntl.LOCK_EX)
+                command=[sys.executable,str(REPOSITORY/'scripts/rehearse_update_run.py'),str(root),str(SCRIPT),
+                         'wait-native-lock','--fd',str(inherited.fileno()),'--parent-pid',str(os.getpid())]
+                peer=subprocess.Popen(command,pass_fds=(inherited.fileno(),),stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+                    text=True,start_new_session=True,env={**os.environ,'PATH':str(root/'bin')+':'+os.environ['PATH']})
+                child_fd=None
+                try:
+                    deadline=time.monotonic()+5
+                    child=None
+                    while time.monotonic()<deadline:
+                        self.assertIsNone(peer.poll())
+                        if ready.exists():
+                            children=Path(f'/proc/{peer.pid}/task/{peer.pid}/children').read_text().split()
+                            if children:
+                                child=int(children[0])
+                                fd=os.open(f'/proc/{child}/fd/0',os.O_RDONLY|os.O_NONBLOCK)
+                                try:
+                                    available=struct.unpack('I',fcntl.ioctl(fd,termios.FIONREAD,struct.pack('I',0)))[0]
+                                finally:
+                                    os.close(fd)
+                                if available==1:
+                                    break
+                        time.sleep(.02)
+                    else:self.fail('the lock child was not gated before its delayed prctl')
+                    child_fd=os.pidfd_open(child)
+                    peer.kill();peer.wait(timeout=5)
+                    release.touch()
+                    self.assertEqual(select.select([child_fd],[],[],5)[0],[child_fd])
+                    self.assertFalse(any(Path(f'/proc/{child}/fd').glob('*')))
+                    peer.communicate(timeout=5)
+                    fcntl.flock(holder,fcntl.LOCK_UN)
+                    fcntl.flock(probe,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                    fcntl.flock(probe,fcntl.LOCK_UN)
+                finally:
+                    release.touch()
+                    if peer.poll() is None:
+                        peer.kill();peer.communicate(timeout=5)
+                    if child_fd is not None:
+                        try:signal.pidfd_send_signal(child_fd,signal.SIGTERM)
+                        except ProcessLookupError:pass
+                        os.close(child_fd)
+
+
 class NativeTerminalAfterRestore(unittest.TestCase):
     def module(self):
         spec=importlib.util.spec_from_file_location('native_terminal_rehearsal',REPOSITORY/'scripts/rehearse_update_run.py')
@@ -664,6 +828,15 @@ class NativeTerminalAfterRestore(unittest.TestCase):
             path.write_text('[keyboard_shortcuts]\nnew_thread=["Ctrl+T"]\n')
             with self.assertRaisesRegex(RuntimeError,'unavailable'):
                 scenario.terminal_shortcut(root)
+
+    def test_output_probe_uses_the_issued_shell_syntax_and_refuses_unknown_programs(self):
+        scenario=self.module()
+        for program,variable in (('/usr/bin/fish','$fish_pid'),('/bin/bash','$$'),('/bin/sh','$$')):
+            probe=scenario.terminal_probe_command({'launch':{'program':program}},'TOKEN','/var/tmp/private/output.txt')
+            self.assertEqual(probe['pid_variable'],variable)
+            self.assertIn(f'"{variable}"',probe['command'])
+        with self.assertRaisesRegex(RuntimeError,'unsupported'):
+            scenario.terminal_probe_command({'launch':{'program':'/usr/bin/unknown-shell'}},'TOKEN','/var/tmp/private/output.txt')
 
     def test_terminal_card_is_bound_through_normalized_recipe_and_live_proof(self):
         scenario=self.module()
