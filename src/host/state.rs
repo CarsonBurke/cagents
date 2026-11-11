@@ -3128,6 +3128,16 @@ fn adopt_relaunched_agent(
 }
 
 pub(super) fn restore_orphaned_holders(host: &SharedHost) -> Result<(), String> {
+    restore_orphaned_holders_preserving(host, &Default::default())
+}
+
+/// A settled recovery can pause a console's chat while keeping its terminal.
+/// Those historical IDs remain eligible only for fresh holder authentication;
+/// the ordinary orphan route below never falls back to executing a recipe.
+pub(super) fn restore_orphaned_holders_preserving(
+    host: &SharedHost,
+    preserved: &std::collections::BTreeSet<TerminalId>,
+) -> Result<(), String> {
     let directory = crate::terminal::holder::directory()?;
     let proof = host
         .lock()
@@ -3141,7 +3151,7 @@ pub(super) fn restore_orphaned_holders(host: &SharedHost) -> Result<(), String> 
     )?;
     let stopped = crate::upgrade::floor::load()?;
     for record in records {
-        if stopped.blocks_terminal(record.terminal) {
+        if stopped.blocks_terminal(record.terminal) && !preserved.contains(&record.terminal) {
             continue;
         }
         if crate::daemon::termination_requested() {

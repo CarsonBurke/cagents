@@ -1,5 +1,6 @@
 //! Read-only evidence for one settled Prepared recovery. This module never
 //! reconstructs a receipt or adopts, attaches, resumes or starts a provider.
+pub(crate) mod cold;
 pub(crate) mod ready;
 use super::*;
 use crate::terminal_ipc::TerminalDescriptor;
@@ -7,6 +8,7 @@ use crate::terminal_ipc::TerminalDescriptor;
 pub(crate) struct VerifiedView {
     record: RecoveryRecord,
     issued_chats: Vec<super::super::handoff::Chat>,
+    cold: Option<cold::ColdView>,
 }
 
 #[derive(Deserialize)]
@@ -43,6 +45,29 @@ impl VerifiedView {
         if !pending.original_census_complete {
             return Err("The complete original recovery census is unavailable; retained state was not treated as usable recovery".into());
         }
+        let settled = classify_retained_prepared(checkpoint_path, target)?
+            .ok_or("The retained checkpoint has no exact settled recovery")?;
+        let cold = if &settled.witness.successor == serving {
+            None
+        } else {
+            Some(cold::ColdView::load(
+                checkpoint_path,
+                &settled,
+                serving,
+                target,
+                terminals,
+                chats,
+            )?)
+        };
+        let (record_serving, record_terminals, record_chats) = if cold.is_some() {
+            (
+                &settled.witness.successor,
+                settled.witness.adopted_terminals.as_slice(),
+                settled.witness.adopted_chats.as_slice(),
+            )
+        } else {
+            (serving, terminals, chats)
+        };
         let record = read_verified_record(
             checkpoint_path,
             &pending.checkpoint_hash,
@@ -51,9 +76,9 @@ impl VerifiedView {
             target,
             None,
             None,
-            serving,
-            terminals,
-            chats,
+            record_serving,
+            record_terminals,
+            record_chats,
         )?;
         let bytes = read_checkpoint(checkpoint_path)?
             .ok_or("The Prepared checkpoint disappeared while verifying issued lineage")?;
@@ -62,6 +87,7 @@ impl VerifiedView {
         Ok(Some(Self {
             record,
             issued_chats: issued.chats,
+            cold,
         }))
     }
 
@@ -88,11 +114,17 @@ impl VerifiedView {
     }
 
     pub(crate) fn proves_chat(&self, original: &Session, current: &Session) -> bool {
-        self.issued_chat(original)
-            && original.id == current.id
-            && current.proof.as_ref() == self.record.successor.as_ref()
-            && self.record.adopted_chats.contains(&original.id)
-            && self.record.adopted_chat_descriptors.contains(current)
+        if let Some(cold) = &self.cold {
+            // The authenticated holder may also have issued the intervening
+            // B/C descriptors. Their full aliases can prove a later census.
+            cold.proves_chat(original, current)
+        } else {
+            self.issued_chat(original)
+                && original.id == current.id
+                && current.proof.as_ref() == self.record.successor.as_ref()
+                && self.record.adopted_chats.contains(&original.id)
+                && self.record.adopted_chat_descriptors.contains(current)
+        }
     }
 
     pub(crate) fn paused_chat(&self, original: &Session) -> bool {
@@ -171,44 +203,142 @@ pub(super) mod tests {
         file.write_all(bytes).unwrap();
     }
 
-    struct Fixture {
-        _root: tempfile::TempDir,
-        checkpoint: PathBuf,
-        target: PathBuf,
-        source: Session,
-        current: Session,
-        record: RecoveryRecord,
+    pub(super) struct Fixture {
+        pub(super) _root: tempfile::TempDir,
+        pub(super) checkpoint: PathBuf,
+        pub(super) target: PathBuf,
+        pub(super) source: Session,
+        pub(super) current: Session,
+        pub(super) record: RecoveryRecord,
     }
 
     impl Fixture {
-        fn new(provider: Provider, adopted: bool) -> Self {
+        pub(super) fn new(provider: Provider, adopted: bool) -> Self {
             let root = tempfile::tempdir().unwrap();
             let source = source(provider, root.path());
+            let paused_peer = self::source(Provider::Claude, root.path());
+            let mut original_terminal = TerminalDescriptor::relaunchable(
+                TerminalId::new(),
+                LaunchRecipe {
+                    program: "/bin/sh".into(),
+                    arguments: vec![],
+                    working_directory: root.path().into(),
+                    environment: Default::default(),
+                    unset_environment: Default::default(),
+                },
+                None,
+            );
+            original_terminal.session.continuity = crate::model::TerminalContinuity::Live {
+                host_session_id: proof("source").host_session_id,
+                boot_id: proof("source").boot_id,
+                host_incarnation: proof("source").host_incarnation,
+            };
+            let mut adopted_terminal = original_terminal.clone();
+            adopted_terminal.session.continuity = crate::model::TerminalContinuity::Live {
+                host_session_id: proof("successor").host_session_id,
+                boot_id: proof("successor").boot_id,
+                host_incarnation: proof("successor").host_incarnation,
+            };
+            adopted_terminal
+                .upgrade_sources
+                .push(original_terminal.session.clone());
             let mut current = source.clone();
             current.proof = Some(proof("successor"));
-            let target = root.path().join("cagentsd");
-            write_private(&target, b"fixture daemon; never executed");
+            let prefix = root.path().join("install");
+            let bin = prefix.join("versions/fixture/bin");
+            fs::create_dir_all(&bin).unwrap();
+            write_private(
+                &prefix.join(".cagents-install-root"),
+                b"cagents install root\n",
+            );
+            for name in ["cagents", "cagents-ui", "cagentsd"] {
+                write_private(
+                    &bin.join(name),
+                    format!("fixture {name}; never executed").as_bytes(),
+                );
+            }
+            let target = fs::canonicalize(bin.join("cagentsd")).unwrap();
+            let state = prefix.join(".update");
+            fs::create_dir(&state).unwrap();
+            fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+            let job = uuid::Uuid::new_v4().to_string();
+            let request = b"exact private original fixture request";
+            write_private(&state.join(format!("{job}.request")), request);
+            let mut reviewed = DaemonImpact {
+                capability: crate::terminal_ipc::ShutdownCapability {
+                    proof: proof("source"),
+                    token: "fixture".into(),
+                    inventory_generation: 1,
+                    live_terminals: 0,
+                    background_subagents: 0,
+                    background_identity: String::new(),
+                    expires_at_unix_ms: 1,
+                },
+                policy: crate::update::impact::Policy::WhenIdle,
+                sessions: vec![crate::update::impact::SessionImpact {
+                    id: source.id,
+                    kind: SessionKind::NativeChat,
+                    title: String::new(),
+                    identity: "exact fixture actor".into(),
+                    disposition: crate::update::impact::Disposition::Continues,
+                    reason: String::new(),
+                    interrupted_subagents: vec![],
+                }],
+                blockers: vec![],
+            };
+            reviewed.capability.live_terminals = 1;
+            for (id, kind) in [
+                (paused_peer.id, SessionKind::NativeChat),
+                (original_terminal.session.id, SessionKind::Terminal),
+            ] {
+                reviewed
+                    .sessions
+                    .push(crate::update::impact::SessionImpact {
+                        id,
+                        kind,
+                        title: String::new(),
+                        identity: "exact additional fixture owner".into(),
+                        disposition: crate::update::impact::Disposition::Continues,
+                        reason: String::new(),
+                        interrupted_subagents: vec![],
+                    });
+            }
             let checkpoint = root.path().join("daemon-upgrade.json");
             let chat = super::super::super::handoff::Chat {
                 source: source.clone(),
                 launch: source.launch.clone(),
                 previous_sources: vec![],
             };
-            let bytes = serde_json::to_vec(&serde_json::json!({ "version":5, "proof":proof("source"), "phase":"Prepared", "terminals":[], "chats":[chat] })).unwrap();
+            let peer = super::super::super::handoff::Chat {
+                source: paused_peer.clone(),
+                launch: paused_peer.launch.clone(),
+                previous_sources: vec![],
+            };
+            let carried = super::super::super::handoff::Carried {
+                source: original_terminal.session.clone(),
+                previous_sources: vec![],
+                relaunches: vec![],
+                options: Default::default(),
+            };
+            let bytes = serde_json::to_vec(&serde_json::json!({ "version":5, "proof":proof("source"), "phase":"Prepared", "terminals":[], "carried":[carried], "preserve_carried":true, "chats":[chat, peer] })).unwrap();
             write_private(&checkpoint, &bytes);
             let census = Census {
-                chats: vec![source.clone()],
-                snapshots: vec![super::super::super::floor::StoppedSnapshot {
-                    source: source.clone(),
-                    snapshot: Default::default(),
-                    limitation: None,
-                }],
+                terminals: vec![original_terminal.session.clone()],
+                chats: vec![source.clone(), paused_peer.clone()],
+                snapshots: [source.clone(), paused_peer.clone()]
+                    .into_iter()
+                    .map(|source| super::super::super::floor::StoppedSnapshot {
+                        source,
+                        snapshot: Default::default(),
+                        limitation: None,
+                    })
+                    .collect(),
                 ..Default::default()
             };
             let capture = CapturedCensus {
-                producer: Some(CaptureProducer::ExplicitCensus {
-                    transaction: uuid::Uuid::new_v4().to_string(),
-                    census_hash: "a".repeat(64),
+                producer: Some(CaptureProducer::Acknowledged {
+                    job: job.clone(),
+                    request_hash: digest(request),
                 }),
                 source: proof("source"),
                 checkpoint_hash: Some(digest(&bytes)),
@@ -220,23 +350,30 @@ pub(super) mod tests {
                 &serde_json::to_vec(&capture).unwrap(),
             );
             let record = RecoveryRecord {
-                version: 1,
+                version: 2,
                 origin: Origin::AcknowledgedPrepare,
-                job: uuid::Uuid::new_v4().to_string(),
-                request_identity: "request".into(),
+                job,
+                request_identity: digest(&serde_json::to_vec(&reviewed).unwrap()),
+                job_request_hash: digest(request),
+                reviewed: Some(reviewed),
+                windows: vec![],
                 source: proof("source"),
                 checkpoint_hash: digest(&bytes),
                 census,
-                adopted_terminals: vec![],
+                adopted_terminals: vec![original_terminal.session.id],
                 adopted_chats: if adopted { vec![source.id] } else { vec![] },
                 adopted_chat_descriptors: if adopted {
                     vec![current.clone()]
                 } else {
                     vec![]
                 },
-                adopted_terminal_descriptors: vec![],
+                adopted_terminal_descriptors: vec![adopted_terminal],
                 paused_terminals: vec![],
-                paused_chats: if adopted { vec![] } else { vec![source.id] },
+                paused_chats: if adopted {
+                    vec![paused_peer.id]
+                } else {
+                    vec![source.id, paused_peer.id]
+                },
                 settled: true,
                 successor: Some(proof("successor")),
                 target_hash: executable_hash(&target).unwrap(),
@@ -255,7 +392,7 @@ pub(super) mod tests {
             fixture.save();
             fixture
         }
-        fn save(&self) {
+        pub(super) fn save(&self) {
             write_private(
                 &self
                     .checkpoint
@@ -263,12 +400,12 @@ pub(super) mod tests {
                 &serde_json::to_vec(&self.record).unwrap(),
             );
         }
-        fn load(&self, live: &[Session]) -> Result<Option<VerifiedView>, String> {
+        pub(super) fn load(&self, live: &[Session]) -> Result<Option<VerifiedView>, String> {
             VerifiedView::load_at(
                 &self.checkpoint,
                 &proof("successor"),
                 &self.target,
-                &[],
+                &self.record.adopted_terminal_descriptors,
                 live,
             )
         }

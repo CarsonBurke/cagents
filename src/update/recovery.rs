@@ -124,13 +124,31 @@ impl Census {
         }
         // A retained checkpoint is a source, even after its process exits.
         // Never replace that inventory with an empty socket observation.
-        inspect_pending(&std::env::current_exe()?, None)?;
+        let handled = inspect_pending_source(&std::env::current_exe()?, None)?;
         match observe() {
             Ok((source, terminals, chats, readiness)) => {
+                require_captured_owner(handled.as_ref(), Some(&source))?;
                 if readiness != StartupState::Ready {
                     return Err(invalid(
                         "The source daemon is not ready. Run `cagents --no-start daemon status` and inspect retained recovery before updating.",
                     ));
+                }
+                let checkpoint = checkpoint_status()?;
+                if handled.is_none()
+                    && checkpoint.as_ref().is_some_and(|status| {
+                        status.phase == crate::upgrade::handoff::Phase::Prepared
+                    })
+                {
+                    // A preparation may have appeared during the socket read.
+                    // Admit its serving replacement under the same strict
+                    // rule before recording the current source inventory.
+                    let now_handled = inspect_pending_source(&std::env::current_exe()?, None)?;
+                    require_captured_owner(now_handled.as_ref(), Some(&source))?;
+                    if now_handled.is_none() {
+                        return Err(invalid(
+                            "The Prepared checkpoint changed during census capture; its retained inventory was kept",
+                        ));
+                    }
                 }
                 let census = Self {
                     version: VERSION,
@@ -138,12 +156,23 @@ impl Census {
                     source: Some(source),
                     terminals: terminals.into_iter().map(|t| t.session).collect(),
                     chats,
-                    checkpoint_before: checkpoint_status()?.map(|s| s.digest),
+                    checkpoint_before: checkpoint.map(|s| s.digest),
                 };
                 census.validate()?;
                 Ok(census)
             }
             Err(error) => {
+                // A settled Prepared checkpoint never turns into an empty
+                // source merely because its verified replacement exits here.
+                require_captured_owner(handled.as_ref(), None)?;
+                if checkpoint_status()?
+                    .is_some_and(|status| status.phase == crate::upgrade::handoff::Phase::Prepared)
+                {
+                    inspect_pending(&std::env::current_exe()?, None)?;
+                    return Err(invalid(
+                        "The recovered daemon changed or exited during census capture; its retained source inventory was kept, and no empty census was created",
+                    ));
+                }
                 let paths =
                     crate::daemon::RuntimePaths::discover().map_err(|e| invalid(e.to_string()))?;
                 if !crate::daemon::HostLease::is_held(&paths).map_err(|e| invalid(e.to_string()))?
@@ -154,13 +183,22 @@ impl Census {
                         )
                     })
                 {
+                    let checkpoint = checkpoint_status()?;
+                    if checkpoint.as_ref().is_some_and(|status| {
+                        status.phase == crate::upgrade::handoff::Phase::Prepared
+                    }) {
+                        inspect_pending(&std::env::current_exe()?, None)?;
+                        return Err(invalid(
+                            "A Prepared checkpoint appeared during census capture; its source inventory was kept, and no empty census was created",
+                        ));
+                    }
                     Ok(Self {
                         version: VERSION,
                         transaction,
                         source: None,
                         terminals: vec![],
                         chats: vec![],
-                        checkpoint_before: checkpoint_status()?.map(|s| s.digest),
+                        checkpoint_before: checkpoint.map(|s| s.digest),
                     })
                 } else {
                     Err(error)
@@ -235,30 +273,36 @@ impl Census {
     }
     pub(crate) fn verify(&self) -> Result<Receipt, UpdateError> {
         match observe_with(|proof, terminals, chats, target| {
-            let lineage = crate::upgrade::handoff::Store::existing()
-                .and_then(|store| {
-                    store.map_or_else(|| Ok(Default::default()), |store| store.recovered_chats())
-                })
-                .map_err(invalid)?;
-            let prepared = if self.source.as_ref() == Some(proof) {
-                None
-            } else {
-                crate::upgrade::recovery::verified::VerifiedView::load(
-                    proof, target, terminals, chats,
-                )
-                .map_err(invalid)?
-            };
-            let paused_ready = if self.source.as_ref() != Some(proof) && prepared.is_none() {
-                crate::upgrade::recovery::verified::ready::ReadyView::load(
-                    proof, target, terminals, chats,
-                )
-                .map_err(invalid)?
-            } else {
-                None
-            };
-            Ok((lineage, prepared, paused_ready))
+            // Evidence failure must not discard the independently observed
+            // serving owner or skip the closing readiness/inventory fences.
+            let evidence = (|| -> Result<_, UpdateError> {
+                let lineage = crate::upgrade::handoff::Store::existing()
+                    .and_then(|store| {
+                        store
+                            .map_or_else(|| Ok(Default::default()), |store| store.recovered_chats())
+                    })
+                    .map_err(invalid)?;
+                let prepared = if self.source.as_ref() == Some(proof) {
+                    None
+                } else {
+                    crate::upgrade::recovery::verified::VerifiedView::load(
+                        proof, target, terminals, chats,
+                    )
+                    .map_err(invalid)?
+                };
+                let paused_ready = if self.source.as_ref() != Some(proof) && prepared.is_none() {
+                    crate::upgrade::recovery::verified::ready::ReadyView::load(
+                        proof, target, terminals, chats,
+                    )
+                    .map_err(invalid)?
+                } else {
+                    None
+                };
+                Ok((lineage, prepared, paused_ready))
+            })();
+            Ok(evidence)
         }) {
-            Ok(((proof, terminals, chats, readiness), (lineage, prepared, paused_ready))) => {
+            Ok(((proof, terminals, chats, readiness), Ok((lineage, prepared, paused_ready)))) => {
                 let mut outcome = compare_with_recovery(
                     self,
                     &proof,
@@ -275,6 +319,9 @@ impl Census {
                     };
                 }
                 self.receipt(outcome)
+            }
+            Ok((observation, Err(error))) => {
+                self.receipt(unverified_evidence(self, observation, error))
             }
             Err(error) => self.receipt(Outcome::Unverified {
                 serving: None,
@@ -572,6 +619,62 @@ fn read_inventory_with<E>(
     Ok(((proof, terminals, chats, readiness), evidence))
 }
 
+/// Report only the continuity directly present in the authenticated roster.
+/// Failed durable evidence cannot promote this diagnostic into a usable proof.
+fn unverified_evidence(census: &Census, observation: Observation, error: UpdateError) -> Outcome {
+    let (proof, terminals, chats, readiness) = observation;
+    let direct = compare_with_recovery(
+        census,
+        &proof,
+        &terminals,
+        &chats,
+        &Default::default(),
+        None,
+        None,
+    );
+    let (surviving_terminals, missing, unexpected, changed) = match direct {
+        Outcome::Unverified {
+            surviving_terminals,
+            missing,
+            unexpected,
+            changed,
+            ..
+        } => (surviving_terminals, missing, unexpected, changed),
+        Outcome::Usable { terminals, .. } => (terminals, vec![], vec![], vec![]),
+        _ => (
+            0,
+            census
+                .terminals
+                .iter()
+                .map(|terminal| terminal.id)
+                .collect(),
+            vec![],
+            vec![],
+        ),
+    };
+    let service = match &readiness {
+        StartupState::Ready => "Ready and answering".into(),
+        StartupState::Restoring { awaiting } => {
+            format!("answering while restoring {awaiting} owners")
+        }
+        StartupState::Retained { .. } => "answering in recovery-only mode".into(),
+    };
+    let detail = format!(
+        "The daemon is {service}; {surviving_terminals} of {} original terminals have verified continuity. Recovery lineage could not be verified: {error}. Inspect `cagents --no-start daemon status` and `cagents --no-start terminal list`; keep the checkpoint and saved panes.",
+        census.terminals.len()
+    );
+    Outcome::Unverified {
+        serving: Some(proof),
+        readiness: Some(readiness),
+        surviving_terminals,
+        expected_terminals: census.terminals.len(),
+        missing,
+        unexpected,
+        changed,
+        detail,
+    }
+}
+
 #[cfg(test)]
 fn compare(
     census: &Census,
@@ -593,7 +696,7 @@ fn compare_with_lineage(
     compare_with_recovery(census, proof, terminals, chats, lineage, None, None)
 }
 
-fn compare_with_recovery(
+pub(crate) fn compare_with_recovery(
     census: &Census,
     proof: &HostSessionProof,
     terminals: &[TerminalDescriptor],
@@ -762,15 +865,32 @@ pub(super) fn inspect_pending(
     candidate_cli: &Path,
     census: Option<&Path>,
 ) -> Result<(), UpdateError> {
+    inspect_pending_source(candidate_cli, census).map(|_| ())
+}
+
+fn inspect_pending_source(
+    candidate_cli: &Path,
+    census: Option<&Path>,
+) -> Result<Option<HostSessionProof>, UpdateError> {
     if crate::device::is_remote() {
         return Err(invalid("Update recovery requires the local service"));
     }
-    let mut pending = match census {
-        Some(path) => crate::upgrade::recovery::PendingRecovery::retain_installer_census(path),
-        None => crate::upgrade::recovery::PendingRecovery::inspect(),
-    }
-    .map_err(invalid)?;
+    let mut pending = crate::upgrade::recovery::PendingRecovery::inspect().map_err(invalid)?;
     if let Some(pending) = pending.as_mut() {
+        match serving_prepared(pending) {
+            PreparedService::HandledVerified { serving } => return Ok(Some(serving)),
+            PreparedService::RetainedUnverified(detail) => {
+                return Err(invalid(format!(
+                    "Current daemon readiness and the original inventory are unverified: {detail}. The retained checkpoint and recovery claim evidence were kept, and any serving daemon was left running. Run `cagents --no-start daemon status` and `cagents --no-start terminal list` to inspect the current service before another update"
+                )));
+            }
+            PreparedService::Unresolved => {}
+        }
+        if let Some(census) = census {
+            *pending = crate::upgrade::recovery::PendingRecovery::retain_installer_census(census)
+                .map_err(invalid)?
+                .ok_or_else(|| invalid("The Prepared checkpoint disappeared during inspection"))?;
+        }
         let recovered_path = if !pending.original_census_complete && census.is_none() {
             let path = retained_job_census(candidate_cli, pending)?;
             *pending = crate::upgrade::recovery::PendingRecovery::retain_installer_census(&path)
@@ -785,6 +905,106 @@ pub(super) fn inspect_pending(
             candidate_cli,
             census.or(recovered_path.as_deref()),
         )?);
+    }
+    Ok(None)
+}
+
+enum PreparedService {
+    Unresolved,
+    HandledVerified { serving: HostSessionProof },
+    RetainedUnverified(String),
+}
+
+/// Read settled history only through the actual kernel-authenticated serving
+/// executable. The history classifier supplies no replay or adoption authority.
+fn serving_prepared(pending: &crate::upgrade::recovery::PendingRecovery) -> PreparedService {
+    let claim_before = match pending.has_recovery_claim() {
+        Ok(present) => present,
+        Err(error) => return PreparedService::RetainedUnverified(error),
+    };
+    let mut classified = false;
+    let observed = observe_with(|_, _, _, target| {
+        let Some(store) = crate::upgrade::handoff::Store::existing().map_err(invalid)? else {
+            return Ok(None);
+        };
+        let settled =
+            match crate::upgrade::recovery::classify_retained_prepared(&store.path, target) {
+                Ok(Some(settled)) => settled,
+                Ok(None) | Err(_) => return Ok(None),
+            };
+        classified = true;
+        if settled.source != pending.source
+            || settled.census != pending.census
+            || settled.witness.checkpoint_hash != pending.checkpoint_hash
+            || settled.witness.target != target
+        {
+            return Err(invalid(
+                "The settled record differs from the retained original source",
+            ));
+        }
+        Census::from_pending(uuid::Uuid::new_v4().to_string(), pending)?
+            .verify()
+            .map(Some)
+    });
+    // A claim can appear while a daemon is settling. Recheck before offering
+    // a manual entry point which deliberately refuses any existing claim.
+    let claim_present = match pending.has_recovery_claim() {
+        Ok(present) => claim_before || present,
+        Err(error) => return PreparedService::RetainedUnverified(error),
+    };
+    match observed {
+        Ok(((proof, _, _, readiness), receipt)) => {
+            prepared_service_outcome(&pending.source, proof, readiness, receipt, claim_present)
+        }
+        Err(error) if classified || claim_present => {
+            PreparedService::RetainedUnverified(error.to_string())
+        }
+        Err(_) => PreparedService::Unresolved,
+    }
+}
+
+fn prepared_service_outcome(
+    source: &HostSessionProof,
+    observed: HostSessionProof,
+    readiness: StartupState,
+    classified_receipt: Option<Receipt>,
+    claim_present: bool,
+) -> PreparedService {
+    let Some(receipt) = classified_receipt else {
+        // Same-owner inventory equality cannot establish that a Prepared
+        // checkpoint was ever handled by a replacement.
+        return if claim_present {
+            PreparedService::RetainedUnverified(
+                "Retained recovery claim evidence exists, but an exact settled Ready service was not verified"
+                    .into(),
+            )
+        } else {
+            PreparedService::Unresolved
+        };
+    };
+    if observed != *source
+        && observed.is_complete()
+        && readiness == StartupState::Ready
+        && matches!(&receipt.outcome, Outcome::Usable { serving, .. } if *serving == observed)
+    {
+        PreparedService::HandledVerified { serving: observed }
+    } else {
+        PreparedService::RetainedUnverified(if receipt.usable() {
+            "The serving identity or readiness changed during verification".into()
+        } else {
+            receipt.failure().to_string()
+        })
+    }
+}
+
+fn require_captured_owner(
+    handled: Option<&HostSessionProof>,
+    observed: Option<&HostSessionProof>,
+) -> Result<(), UpdateError> {
+    if handled.is_some() && handled != observed {
+        return Err(invalid(
+            "The recovered daemon changed or exited during census capture; its retained source inventory was kept, and no empty census was created",
+        ));
     }
     Ok(())
 }
@@ -1281,6 +1501,96 @@ mod tests {
     }
 
     #[test]
+    fn update_recovery_pending_admission_requires_settled_history_and_verified_replacement() {
+        let original = terminal();
+        let expected = census(&original);
+        let same_owner = expected
+            .receipt(compare(&expected, &proof(), &[original], &[]))
+            .unwrap();
+        assert!(same_owner.usable());
+        assert!(matches!(
+            prepared_service_outcome(&proof(), proof(), StartupState::Ready, None, false),
+            PreparedService::Unresolved
+        ));
+        assert!(matches!(
+            prepared_service_outcome(&proof(), proof(), StartupState::Ready, None, true),
+            PreparedService::RetainedUnverified(_)
+        ));
+        assert!(matches!(
+            prepared_service_outcome(
+                &proof(),
+                proof(),
+                StartupState::Ready,
+                Some(same_owner),
+                true
+            ),
+            PreparedService::RetainedUnverified(_)
+        ));
+        // The serving incarnation can be the first replacement or a later
+        // cold owner. Both require their own verified current inventory.
+        for incarnation in ["replacement", "cold-replacement"] {
+            let mut serving = proof();
+            serving.host_incarnation = incarnation.into();
+            let verified = expected
+                .receipt(Outcome::Usable {
+                    serving: serving.clone(),
+                    terminals: 1,
+                    chats: 0,
+                    paused_terminals: vec![],
+                    paused_chats: vec![],
+                })
+                .unwrap();
+            assert!(matches!(
+                prepared_service_outcome(
+                    &proof(),
+                    serving.clone(),
+                    StartupState::Ready,
+                    Some(verified.clone()),
+                    true,
+                ),
+                PreparedService::HandledVerified { serving: accepted } if accepted == serving
+            ));
+            for (observed, readiness, receipt) in [
+                (proof(), StartupState::Ready, verified.clone()),
+                (
+                    serving.clone(),
+                    StartupState::Retained {
+                        detail: "restoration is incomplete".into(),
+                    },
+                    verified,
+                ),
+                (
+                    serving.clone(),
+                    StartupState::Ready,
+                    expected
+                        .unverified("An original owner was explicitly closed after recovery".into())
+                        .unwrap(),
+                ),
+            ] {
+                assert!(matches!(
+                    prepared_service_outcome(&proof(), observed, readiness, Some(receipt), true),
+                    PreparedService::RetainedUnverified(_)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn update_recovery_handled_capture_cannot_fall_back_to_empty_or_foreign_source() {
+        let mut serving = proof();
+        serving.host_incarnation = "replacement".into();
+        let mut foreign = serving.clone();
+        foreign.host_incarnation = "different-owner".into();
+        assert!(require_captured_owner(None, None).is_ok());
+        assert!(require_captured_owner(Some(&serving), Some(&serving)).is_ok());
+        let original = proof();
+        for observed in [None, Some(&foreign), Some(&original)] {
+            let error = require_captured_owner(Some(&serving), observed).unwrap_err();
+            assert!(error.to_string().contains("no empty census was created"));
+        }
+    }
+
+    #[test]
     fn update_recovery_allow_absent_cannot_hide_a_ready_checkpoint() {
         const PRIVATE: &str = "CAGENTS_TEST_ALLOW_ABSENT_READY_CHECKPOINT";
         if std::env::var_os(PRIVATE).is_none() {
@@ -1417,6 +1727,84 @@ mod tests {
             .is_err()
         );
         assert_eq!(source.calls, ["fence", "ready", "terminals", "chats"]);
+    }
+
+    #[test]
+    fn update_recovery_evidence_failure_keeps_serving_ready_and_direct_terminal_continuity() {
+        let original = terminal();
+        let mut expected = census(&original);
+        let missing = chat();
+        expected.chats.push(missing.clone());
+        let mut serving = proof();
+        serving.host_incarnation = "cold-e".into();
+        let mut current = original.clone();
+        current.session.continuity = TerminalContinuity::Live {
+            host_session_id: serving.host_session_id.clone(),
+            boot_id: serving.boot_id.clone(),
+            host_incarnation: serving.host_incarnation.clone(),
+        };
+        current.upgrade_sources.push(original.session);
+        let outcome = unverified_evidence(
+            &expected,
+            (serving.clone(), vec![current], vec![], StartupState::Ready),
+            invalid("The original accepted native owner is absent"),
+        );
+        assert!(
+            matches!(&outcome, Outcome::Unverified { serving:Some(owner), readiness:Some(StartupState::Ready), surviving_terminals:1, expected_terminals:1, missing:absent, changed, detail, .. }
+            if owner == &serving && absent == &[missing.id] && changed.is_empty()
+                && detail.contains("1 of 1 original terminals") && detail.contains("--no-start daemon status"))
+        );
+        assert!(!expected.receipt(outcome).unwrap().usable());
+    }
+
+    #[test]
+    fn update_recovery_evidence_failure_never_promotes_matching_direct_inventory() {
+        let original = terminal();
+        let expected = census(&original);
+        for readiness in [
+            StartupState::Ready,
+            StartupState::Restoring { awaiting: 1 },
+            StartupState::Retained {
+                detail: "original work retained".into(),
+            },
+        ] {
+            let outcome = unverified_evidence(
+                &expected,
+                (proof(), vec![original.clone()], vec![], readiness.clone()),
+                invalid("unsafe recovered lineage"),
+            );
+            assert!(
+                matches!(&outcome, Outcome::Unverified { serving:Some(owner), readiness:Some(observed), surviving_terminals:1, missing, changed, unexpected, .. }
+                if owner == &proof() && observed == &readiness && missing.is_empty() && changed.is_empty() && unexpected.is_empty())
+            );
+            assert!(!expected.receipt(outcome).unwrap().usable());
+        }
+    }
+
+    #[test]
+    fn update_recovery_evidence_error_still_checks_closing_inventory_fence() {
+        for mutate_between_lists in [false, true] {
+            let mut source = InventoryFixture {
+                proof: proof(),
+                generation: 7,
+                mutate_between_lists,
+                calls: vec![],
+            };
+            let observed = read_inventory_with(&mut source, |_, _, _, _| {
+                Ok(Err::<(), _>(invalid("unverified cold lineage")))
+            });
+            assert_eq!(observed.is_ok(), !mutate_between_lists);
+            assert_eq!(
+                source.calls,
+                ["fence", "ready", "terminals", "chats", "ready", "fence"]
+            );
+            if !mutate_between_lists {
+                let ((owner, _, _, readiness), evidence) = observed.unwrap();
+                assert_eq!(owner, proof());
+                assert_eq!(readiness, StartupState::Ready);
+                assert!(evidence.is_err());
+            }
+        }
     }
 
     #[test]

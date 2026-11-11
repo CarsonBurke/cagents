@@ -428,6 +428,10 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
                 recovered_prepared = true;
                 return Ok(());
             }
+            if update_recovery::restore_settled(&host).map_err(io::Error::other)? {
+                recovered_prepared = true;
+                return Ok(());
+            }
             chat::retained_actor::reconcile_previous_boot_history(&host)
                 .map_err(io::Error::other)?;
             let ready_capture =
