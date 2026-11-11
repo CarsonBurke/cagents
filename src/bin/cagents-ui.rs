@@ -131,7 +131,9 @@ pub(crate) fn main_with_before_start(
         Err(error) if cagents::instance::is_update_in_progress(error.as_ref()) => {
             // Expected coordinator ownership is not a crash. Preserve the
             // original public launch context in a capability-free payload.
-            if let Ok(Some(options)) = parse(&arguments) {
+            if let Ok(Some(options)) = parse(&arguments)
+                && options.restore_policy != cagents::instance::WindowRestorePolicy::ExistingOnly
+            {
                 let request = cagents::update::startup::Request::new(
                     options.new_window,
                     options.slot.map(str::to_owned),
@@ -190,7 +192,11 @@ fn report_startup_failure(message: &str, still_starting: bool) {
         message == cagents::instance::ApplicationLeaseError::AlreadyRunning.to_string();
     // A terminal run already prints the error. A desktop launch has none, so
     // without this the user double-clicks the icon and nothing happens.
-    if !already_running && !std::io::stderr().is_terminal() {
+    if !already_running
+        && !std::io::stderr().is_terminal()
+        && cagents::instance::window_restore_policy()
+            != cagents::instance::WindowRestorePolicy::ExistingOnly
+    {
         let _ = spawn_startup_error_dialog(message, still_starting);
     }
     // Reported last: the launcher kills this process as soon as it reads a
@@ -323,6 +329,7 @@ struct Options<'a> {
     source: Option<&'a str>,
     device: Option<&'a str>,
     device_window_scoped: bool,
+    restore_policy: cagents::instance::WindowRestorePolicy,
 }
 
 /// `Ok(None)` means the request was answered without opening a window, which
@@ -335,10 +342,14 @@ fn parse<'a>(arguments: &'a [String]) -> Result<Option<Options<'a>>, Box<dyn std
         source: None,
         device: None,
         device_window_scoped: false,
+        restore_policy: cagents::instance::WindowRestorePolicy::Ordinary,
     };
     while let Some(argument) = arguments.next() {
         match argument {
             "--new-window" => options.new_window = true,
+            cagents::instance::RESTORE_EXISTING_ONLY_ARGUMENT => {
+                options.restore_policy = cagents::instance::WindowRestorePolicy::ExistingOnly;
+            }
             "--device" => options.device = Some(arguments.next().ok_or("missing device name")?),
             "--device-window-scoped" => options.device_window_scoped = true,
             "--window" => options.slot = Some(arguments.next().ok_or("missing window name")?),
@@ -369,6 +380,33 @@ fn parse<'a>(arguments: &'a [String]) -> Result<Option<Options<'a>>, Box<dyn std
     Ok(Some(options))
 }
 
+#[cfg(test)]
+mod restore_policy_tests {
+    #[test]
+    fn recovery_window_flag_preserves_the_named_window_options() {
+        let arguments = [
+            "--restore-existing-only",
+            "--window",
+            "window-2",
+            "--from-window",
+            "primary",
+        ]
+        .map(str::to_owned);
+        let options = super::parse(&arguments).unwrap().unwrap();
+        assert_eq!(
+            options.restore_policy,
+            cagents::instance::WindowRestorePolicy::ExistingOnly
+        );
+        assert_eq!(options.slot, Some("window-2"));
+        assert_eq!(options.source, Some("primary"));
+        let ordinary = super::parse(&[]).unwrap().unwrap();
+        assert_eq!(
+            ordinary.restore_policy,
+            cagents::instance::WindowRestorePolicy::Ordinary
+        );
+    }
+}
+
 fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
     let Options {
         new_window,
@@ -376,7 +414,9 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
         source,
         device,
         device_window_scoped,
+        restore_policy,
     } = options;
+    cagents::instance::initialize_window_restore_policy(restore_policy)?;
     let _device_cleanup = cagents::device::Cleanup;
     cagents::device::select(device)?;
     cagents::device::prepare()?;
@@ -431,7 +471,14 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
         let (activation_tx, activation_rx) = async_channel::unbounded();
         let listener = cagents::instance::UiActivationListener::bind(activation_tx)?;
         if !fixture {
-            cagents::terminal::ensure_daemon_ready()?;
+            if restore_policy == cagents::instance::WindowRestorePolicy::ExistingOnly {
+                // A recovery relaunch observes the daemon the coordinator
+                // verified; it cannot autostart another one on a lost socket.
+                let socket = cagents::terminal_ipc::daemon_socket_path()?;
+                cagents::control::ControlClient::connect(&socket)?;
+            } else {
+                cagents::terminal::ensure_daemon_ready()?;
+            }
         }
         let restored = cagents::app::Cagents::load_startup()?;
         Ok((lease, (listener, activation_rx), restored))

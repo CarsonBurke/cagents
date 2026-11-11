@@ -43,11 +43,20 @@ pub(crate) fn run(
     let worker = acquire_lock(&state)?.into_file();
     let _reserved_worker = reserve_worker_descriptor(&worker)?;
     let mut guard = crate::instance::UiUpdateGuard::acquire()?;
+    // Arm Drop before any fallible close: reopening a saved recovery pane is
+    // an attachment, never permission to resume or start its provider.
+    guard.set_recovery_restore_only();
+    guard.set_fallback_executable(ui.clone());
     let before = candidate_stamp(&layout.version_root)?;
     // Re-observe AFTER taking the real fences. A settled recovery can be
     // verified without restarting or stopping the recognized serving owner.
     if verify(&pending, &daemon).is_ok() {
-        guard.relaunch_windows(&pending.windows, &ui)?;
+        // A pre-existing UI may have ordinary restore policy. Close and reopen
+        // it under the same guarded policy instead of merely activating it.
+        let current_windows = guard.prepare_windows(Duration::from_secs(45))?;
+        let windows = recovery_window_slots(&pending.windows, &current_windows);
+        guard.close_prepared_windows(&current_windows, Duration::from_secs(45))?;
+        guard.relaunch_windows(&windows, &ui)?;
         verify(&pending, &daemon)?;
         recovery::retire_current_service()?;
         let outcome = verify(&pending, &daemon)?;
@@ -69,13 +78,8 @@ pub(crate) fn run(
             "The selected checkpoint changed after acquiring recovery leases",
         ));
     }
-    let mut windows = pending.windows.clone();
     let current_windows = guard.prepare_windows(Duration::from_secs(45))?;
-    for slot in &current_windows {
-        if !windows.contains(slot) {
-            windows.push(slot.clone());
-        }
-    }
+    let windows = recovery_window_slots(&pending.windows, &current_windows);
     let id = uuid::Uuid::new_v4().to_string();
     let log_path = state.join(format!("{id}.log"));
     let log = private_create(&log_path)?;
@@ -102,7 +106,6 @@ pub(crate) fn run(
             ));
         }
         select_target(&layout)?;
-        guard.set_fallback_executable(ui.clone());
         guard.close_prepared_windows(&current_windows, Duration::from_secs(45))?;
         let timeout = crate::install_guard::daemon_start_timeout()?;
         let mut command = Command::new(&cli);
@@ -160,6 +163,16 @@ pub(crate) fn run(
             Err(invalid(job.message))
         }
     }
+}
+
+fn recovery_window_slots(pending: &[String], current: &[String]) -> Vec<String> {
+    let mut windows = pending.to_vec();
+    for slot in current {
+        if !windows.contains(slot) {
+            windows.push(slot.clone());
+        }
+    }
+    windows
 }
 
 fn verify(pending: &PendingRecovery, daemon: &Path) -> Result<recovery::Receipt, UpdateError> {
