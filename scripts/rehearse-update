@@ -23,11 +23,14 @@ DIR holds one private user. Its path must be short (sockets live below it).
   install DIR VERSION INSTALLER [INSTALLER-ARGS...]
                        Run INSTALLER (an install.sh) for the archive and
                        SHA256SUMS in DIR, as the private user.
+  stage DIR VERSION INSTALLER
+                       Stage a fresh candidate before seeding work; bind its
+                       verified archive and printed command in a receipt.
   run --old-dir DIR --old-version V --old-installer FILE
       --new-dir DIR --new-version V --new-installer FILE [OPTIONS]
                        Fresh-root scenario; always saves report.txt and stops.
                        --ceditor BIN_DIR, --answer TEXT (default yes), --yes,
-                       --working TEXT, --stop TEXT,
+                       --working TEXT, --stop TEXT, --require-working,
                        --upgrade-arg=--interrupt, --untitled 0|1|2, --no-codex,
                        --no-child, --ignore-term, --no-init, --exit-mid-turn,
                        --uncarryable, --unreachable, --reopen-existing-only,
@@ -44,7 +47,7 @@ DIR holds one private user. Its path must be short (sockets live below it).
                        console, named and untitled) and terminals through the
                        installed CLI.
   update DIR VERSION INSTALLER [--answer TEXT] [--working TEXT] [--stop TEXT]
-         [UPGRADE-ARGS...]
+         [--use-staged] [--require-working] [UPGRADE-ARGS...]
                        What scripts/install-local does after its build: stage
                        the archive with --stage-only, then run the staged
                        `cagents daemon upgrade` in a terminal (inside the
@@ -52,6 +55,9 @@ DIR holds one private user. Its path must be short (sockets live below it).
                        [Y/n] confirmation, --working at the working-agents
                        choice (empty waits for them) and --stop at the stop
                        list (empty cancels it).
+                       --use-staged verifies the exact earlier stage receipt
+                       without running the installer again. --require-working
+                       declines an ordinary review before any consent.
   desktop start [--limit SECONDS]
                        Start a headless desktop (KWin virtual + nested niri)
                        under the native lock. Windows open there.
@@ -224,6 +230,24 @@ cmd_seed() {
     /usr/bin/python3 "$tool_root/scripts/rehearse_update_run.py" "$root" "$self" seed "$@"
 }
 
+cmd_stage() {
+    require_init
+    local archive_dir=${1:?stage needs the archive directory} version=${2:?stage needs a version} installer=${3:?stage needs an install.sh}
+    [ "$#" -eq 3 ] || die 'stage takes exactly DIR VERSION INSTALLER' 2
+    [[ $version =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] || die 'stage needs a single version name' 2
+    archive_dir=$(realpath -- "$archive_dir")
+    installer=$(realpath -- "$installer")
+    local prefix=$user_home/.local/share/cagents-install transcript=$logs/stage-candidate.log status=0 original
+    [ ! -e "$prefix/versions/$version" ] && [ ! -L "$prefix/versions/$version" ] || die 'stage requires an absent candidate' 2
+    [ ! -e "$root/staged-candidate.json" ] && [ ! -L "$root/staged-candidate.json" ] || die 'stage receipt already exists' 2
+    original=$(readlink -f -- "$prefix/current")
+    cmd_install "$archive_dir" "$version" "$installer" --stage-only 2>&1 | tee "$transcript" || status=${PIPESTATUS[0]}
+    [ "$status" -eq 0 ] || return "$status"
+    [ "$(readlink -f -- "$prefix/current")" = "$original" ] || die 'staging changed current' 2
+    user_env /usr/bin/python3 "$tool_root/scripts/rehearse_update_run.py" "$root" "$self" staged-candidate \
+        "$archive_dir" "$version" "$installer" --record "$transcript"
+}
+
 # What scripts/install-local does once its archive is built: stage it, then run
 # the staged build's `daemon upgrade` in a terminal, as a person would. ANSWER
 # is typed at each confirmation, WORKING at the working-agents choice and STOP
@@ -232,25 +256,43 @@ cmd_update() {
     require_init
     local archive_dir=${1:?update needs the archive directory} version=${2:?update needs a version} installer=${3:?update needs an install.sh}
     shift 3
-    local answer= working= stop= fail_new_daemon=0 upgrade_args=()
+    local answer= working= stop= fail_new_daemon=0 use_staged=0 upgrade_args=() pty_args=()
     while [ "$#" -gt 0 ]; do
         case $1 in
             --fail-new-daemon) fail_new_daemon=1; shift ;;
+            --use-staged) use_staged=1; shift ;;
+            --require-working) pty_args+=(--require-working); shift ;;
             --answer) answer=${2?}; shift 2 ;;
             --working) working=${2?}; shift 2 ;;
             --stop) stop=${2?}; shift 2 ;;
             *) upgrade_args+=("$1"); shift ;;
         esac
     done
+    if [ "${#pty_args[@]}" -gt 0 ]; then
+        local arg
+        for arg in "${upgrade_args[@]}"; do
+            case $arg in --yes | --yes=*) die '--require-working forbids --yes' 2 ;; esac
+        done
+    fi
     local started=$SECONDS status=0 transcript
     transcript=$logs/update-$(date +%H%M%S).log
     local prefix=$user_home/.local/share/cagents-install
+    local staged_cli=$prefix/versions/$version/bin/cagents
+    if [ "$use_staged" -eq 1 ]; then
+        [ "$fail_new_daemon" -eq 0 ] || die '--use-staged cannot combine with --fail-new-daemon' 2
+        archive_dir=$(realpath -- "$archive_dir")
+        installer=$(realpath -- "$installer")
+        staged_cli=$(user_env /usr/bin/python3 "$tool_root/scripts/rehearse_update_run.py" "$root" "$self" staged-candidate \
+            "$archive_dir" "$version" "$installer") || return
+    fi
     if [ "$fail_new_daemon" -eq 1 ]; then
         [ ! -e "$prefix/versions/$version" ] || die 'startup failure requires an unstaged private candidate' 2
         archive_dir=$(user_env /usr/bin/python3 "$tool_root/scripts/rehearse_update_fault.py" \
             "$root" "$version" --archive-dir "$archive_dir")
     fi
-    if [[ $prefix/current -ef $prefix/versions/$version ]]; then
+    if [ "$use_staged" -eq 1 ]; then
+        printf '%s verified against the early stage receipt.\n' "$version" | tee -a "$transcript"
+    elif [[ $prefix/current -ef $prefix/versions/$version ]]; then
         printf '%s is already current; skipping staging.\n' "$version"
     elif [ -e "$prefix/versions/$version" ]; then
         die "$prefix/versions/$version exists but is not current; remove it to reinstall"
@@ -260,8 +302,8 @@ cmd_update() {
         [ "$stage_status" -eq 0 ] || return "$stage_status"
     fi
     printf 'staged after %ss\n' "$((SECONDS - started))" | tee -a "$transcript"
-    cmd_app_or_env /usr/bin/python3 "$tool_root/scripts/rehearse_update_pty.py" --answer "$answer" --working "$working" --stop "$stop" -- \
-        "$prefix/versions/$version/bin/cagents" daemon upgrade "${upgrade_args[@]}" \
+    cmd_app_or_env /usr/bin/python3 "$tool_root/scripts/rehearse_update_pty.py" --answer "$answer" --working "$working" --stop "$stop" "${pty_args[@]}" -- \
+        "$staged_cli" daemon upgrade "${upgrade_args[@]}" \
         2>&1 | tee -a "$transcript" || status=${PIPESTATUS[0]}
     printf 'daemon upgrade exited %s after %ss total\n' "$status" "$((SECONDS - started))" | tee -a "$transcript"
     return "$status"
@@ -670,6 +712,7 @@ command=${1:-}
 case $command in
     init) cmd_init ;;
     install) cmd_install "$@" ;;
+    stage) cmd_stage "$@" ;;
     update) cmd_update "$@" ;;
     seed) cmd_seed "$@" ;;
     run | scenario) /usr/bin/python3 "$tool_root/scripts/rehearse_update_run.py" "$root" "$self" run "$@" ;;

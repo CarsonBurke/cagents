@@ -52,6 +52,8 @@ def main():
                         help='typed at the working-agents choice; empty waits for them')
     parser.add_argument('--stop', default='',
                         help='typed at the destructive stop list; empty cancels')
+    parser.add_argument('--require-working', action='store_true',
+                        help='decline and fail if the first review is not the working-agents choice')
     parser.add_argument('--timeout', type=float, default=240)
     parser.add_argument('--review-root', type=Path)
     parser.add_argument('--review-output', type=Path)
@@ -62,6 +64,8 @@ def main():
         parser.error('a command and positive timeout are required')
     if bool(args.review_root) != bool(args.review_output):
         parser.error('--review-root and --review-output must be supplied together')
+    if args.require_working and any(arg=='--yes' or arg.startswith('--yes=') for arg in command):
+        parser.error('--require-working forbids --yes because it bypasses the actual working choice')
     pid, fd = pty.fork()
     if pid == 0:
         os.execvp(command[0], command)
@@ -69,6 +73,8 @@ def main():
     pending = b''
     timed_out = False
     prompt_count = 0
+    working_observed = False
+    case_invalid = False
     try:
         while True:
             if time.monotonic() >= deadline:
@@ -100,6 +106,12 @@ def main():
                     capture_review(args.review_root, args.review_output, prompt_count)
                 answer = (args.answer if match.group('confirm') else
                           args.working if match.group('working') else args.stop)
+                if args.require_working and prompt_count == 1 and not match.group('working'):
+                    case_invalid = True
+                    print('\nrehearse-update: case-invalid: required working-agents choice was not offered; declining', flush=True)
+                working_observed |= bool(match.group('working'))
+                if case_invalid:
+                    answer = '' if match.group('stop') else 'n'
                 print(f'\n[rehearsal prompt={match.group().decode(errors="replace").strip()!r} answer={answer!r}]', flush=True)
                 os.write(fd, answer.encode()+b'\n')
                 pending = pending[match.end():]
@@ -131,7 +143,10 @@ def main():
         finally:
             os.close(fd)
             signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
-    return 124 if timed_out else os.waitstatus_to_exitcode(status)
+    if args.require_working and not working_observed:
+        print('\nrehearse-update: case-invalid: no working-agents choice was observed', flush=True)
+        case_invalid = True
+    return 124 if timed_out else 2 if case_invalid else os.waitstatus_to_exitcode(status)
 
 
 if __name__ == '__main__':

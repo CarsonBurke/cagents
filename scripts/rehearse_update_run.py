@@ -15,6 +15,7 @@ import select
 import shlex
 import shutil
 import signal
+import stat
 import sqlite3
 import subprocess
 import sys
@@ -87,13 +88,28 @@ def wait_native_lock(root, descriptor, parent_pid):
 import rehearse_update_records as records
 
 
-def candidate_namespace_cli(root, archive_dir, version):
-    """Extract only the verified candidate CLI into the marked private root."""
+def private_candidate_root(root, version):
     root=Path(root).resolve()
     if (root/'.rehearse-update').is_symlink() or (root/'.rehearse-update').read_text().strip()!=str(root):
         raise RuntimeError('candidate probe requires a matching rehearsal root')
-    if not version or version in ('.','..') or '/' in version:
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._+-]*',version):
         raise RuntimeError('candidate probe requires a single version name')
+    return root
+
+
+def private_candidate(root, version):
+    root=private_candidate_root(root,version)
+    prefix=root/'home/.local/share/cagents-install'
+    marker=prefix/'.cagents-install-root'
+    if marker.is_symlink() or marker.read_text()!='cagents install root\n':
+        raise RuntimeError('candidate requires a marked private installation')
+    candidate=prefix/'versions'/version
+    if candidate.resolve()!=candidate:
+        raise RuntimeError('candidate path must not contain symlinks')
+    return root,prefix,candidate
+
+
+def verified_candidate_archive(archive_dir, version):
     archive_dir=Path(archive_dir)
     name=f'cagents-{version}-x86_64-unknown-linux-gnu.tar.gz'
     source=archive_dir/name
@@ -103,6 +119,80 @@ def candidate_namespace_cli(root, archive_dir, version):
               if len(line.split())==2 and line.split()[1].lstrip('*')==name]
     if expected!=[digest]:
         raise RuntimeError('candidate probe requires the checksum-verified archive')
+    return source,digest
+
+
+def file_digest(path):
+    with Path(path).open('rb') as stream:
+        return hashlib.file_digest(stream,'sha256').hexdigest()
+
+
+def candidate_tree(candidate):
+    """Bind the installer's normalized tree, including desktop integration files."""
+    result={}
+    for path in [candidate,*sorted(candidate.rglob('*'))]:
+        info=path.lstat()
+        mode=stat.S_IMODE(info.st_mode)
+        if info.st_uid!=os.getuid() or mode&0o022:
+            raise RuntimeError('candidate tree is not privately owned and immutable to other users')
+        if stat.S_ISDIR(info.st_mode):
+            entry={'kind':'directory','mode':mode}
+        elif stat.S_ISREG(info.st_mode) and info.st_nlink==1:
+            entry={'kind':'file','mode':mode,'sha256':file_digest(path)}
+        else:
+            raise RuntimeError('candidate tree contains a link or special file')
+        result[str(path.relative_to(candidate))]=entry
+    return result
+
+
+def candidate_versions(candidate, version):
+    for name in ('cagents','cagents-ui','cagentsd'):
+        result=subprocess.run([str(candidate/'bin'/name),'--version'],capture_output=True,text=True,timeout=10)
+        if result.returncode or result.stdout.strip()!=f'{name} {version}' or result.stderr.strip():
+            raise RuntimeError(f'staged {name} does not report the exact matched version')
+
+
+def staged_candidate(root, archive_dir, version, installer, *, record=False, transcript=None):
+    """A receipt authorizes reuse only of the exact checksum-bound fresh stage."""
+    root,prefix,candidate=private_candidate(root,version)
+    source,digest=verified_candidate_archive(archive_dir,version)
+    receipt=root/'staged-candidate.json'
+    cli=candidate/'bin/cagents'
+    command=[str(cli),'daemon','upgrade']
+    binding={'version':version,'archive':str(source.resolve()),'archive_sha256':digest,
+             'installer':str(Path(installer).resolve()),'installer_sha256':file_digest(installer),
+             'current':str((prefix/'current').resolve(strict=True)),
+             'command':command,'tree':candidate_tree(candidate)}
+    if record:
+        # The product installer prints this exact executable and invocation.
+        expected=f'Staged cagents {version}; current, running windows and daemon were preserved. Run "{cli}" daemon upgrade to apply it when ready.'
+        if Path(transcript).read_text().splitlines().count(expected)!=1:
+            raise RuntimeError('stage did not print the exact installed upgrade command')
+        with tarfile.open(source,'r:gz') as archive:
+            for name in ('cagents','cagents-ui','cagentsd'):
+                members=[m for m in archive.getmembers() if m.name==f'cagents-{version}/bin/{name}']
+                if len(members)!=1 or not members[0].isreg() or not 0<members[0].size<=2*1024**3:
+                    raise RuntimeError(f'archive requires one bounded regular {name}')
+                with archive.extractfile(members[0]) as stream:
+                    if hashlib.file_digest(stream,'sha256').hexdigest()!=binding['tree'][f'bin/{name}']['sha256']:
+                        raise RuntimeError(f'staged {name} differs from the checksum-verified archive')
+    else:
+        info=receipt.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or stat.S_IMODE(info.st_mode)!=0o600:
+            raise RuntimeError('unsafe staged candidate receipt')
+        if json.loads(receipt.read_text())!=binding:
+            raise RuntimeError('staged candidate or its archive, installer or current changed')
+    candidate_versions(candidate,version)
+    if record:
+        with open(receipt,'x',opener=lambda path,flags:os.open(path,flags,0o600)) as output:
+            output.write(json.dumps(binding,indent=2,sort_keys=True)+'\n')
+    return cli
+
+
+def candidate_namespace_cli(root, archive_dir, version):
+    """Extract only the verified candidate CLI into the marked private root."""
+    root=private_candidate_root(root,version)
+    source,digest=verified_candidate_archive(archive_dir,version)
     with tarfile.open(source,'r:gz') as archive:
         members=[member for member in archive.getmembers() if member.name==f'cagents-{version}/bin/cagents']
         if len(members)!=1 or not members[0].isreg() or not 0<members[0].size<=128*1024**2:
@@ -120,6 +210,40 @@ def candidate_namespace_cli(root, archive_dir, version):
                                        'member':members[0].name,'cli_sha256':cli_digest},indent=2,sort_keys=True)+'\n')
         manifest.chmod(0o600)
     return cli
+
+
+def active_working_contract(before, agents, serving, events, agent_id):
+    """Require the same still-running seeded parent, rather than an idle review."""
+    old=before['agents'].get(agent_id,{})
+    matches=[row for row in agents if row.get('agent',{}).get('id')==agent_id]
+    source=old.get('agent',{}).get('session',{}).get('Chat',{})
+    if (len(matches)!=1 or old.get('state')!='Running' or not old.get('run')
+            or matches[0].get('state')!='Running' or matches[0].get('run')!=old['run']
+            or matches[0].get('agent',{}).get('session')!=old['agent'].get('session')
+            or source.get('launch',{}).get('provider')!='Codex'
+            or not serving or serving!=before.get('serving')):
+        raise RuntimeError('case-invalid: original Codex agent/run is not actively Running on the source daemon')
+    threads={pane.get('content',{}).get('launch',{}).get('session_id')
+             for pane in records.panes(before).values()
+             if pane.get('session_id')==source.get('id') and pane.get('content',{}).get('proof')==serving}
+    threads.discard(None)
+    if len(threads)!=1:
+        raise RuntimeError('case-invalid: active Codex parent has no exact source-bound pane')
+    thread=next(iter(threads))
+    starts=[row for row in events if row.get('event')=='notification' and row.get('method')=='turn/started'
+            and row.get('thread_id')==thread and row.get('parent') is True]
+    if not starts or not starts[-1].get('turn_id') or not starts[-1].get('socket'):
+        raise RuntimeError('case-invalid: no exact started Codex parent receipt')
+    started=starts[-1]
+    original=[row for row in before.get('fixture_events',[]) if row.get('event')=='notification'
+              and row.get('method')=='turn/started' and row.get('thread_id')==thread and row.get('parent') is True]
+    if not original or original[-1]!=started:
+        raise RuntimeError('case-invalid: original seeded Codex parent turn was replaced')
+    matching=[row for row in events if row.get('parent') is True
+              and all(row.get(field)==started[field] for field in ('thread_id','turn_id','socket'))]
+    if any(row.get('method') in ('turn/completed','turn/interrupt') for row in matching):
+        raise RuntimeError('case-invalid: seeded Codex parent already completed or received an interrupt')
+    return {'agent_id':agent_id,'run':old['run'],'serving':serving,'parent':started,'observed_at':time.time()}
 
 
 def candidate_namespace_contract(evidence, old_version, new_version):
@@ -603,6 +727,28 @@ class Rehearsal:
             result=self.call('update',*args,timeout=300,check=False)
             monitor.command_exit=result[0]
             return result
+
+    def require_active_working(self):
+        output=self.root/'logs/pre-update-working.json'
+        evidence={}
+        try:
+            before=json.loads((self.root/'records/before/snapshot.json').read_text())
+            items=json.loads((self.root/'seeds.json').read_text())['items']
+            targets=[row['response']['data']['agent']['id'] for row in items if row['state']=='codex-chat']
+            if len(targets)!=1:
+                raise RuntimeError('case-invalid: working case requires exactly one seeded Codex chat')
+            _,agents=self.cli('--no-start','agent','list')
+            _,terminals=self.cli('--no-start','terminal','list','--all')
+            events=[json.loads(line) for line in (self.root/'logs/codex-provider.jsonl').read_text().splitlines() if line]
+            evidence.update(agents=agents,terminals=terminals,fixture_events=events)
+            evidence['active']=active_working_contract(before,agents['data']['agents'],
+                terminals['data'].get('proof'),events,targets[0])
+            evidence['valid']=True
+        except (RuntimeError,OSError,ValueError,KeyError,TypeError) as exc:
+            evidence.update(valid=False,error=str(exc))
+            raise RuntimeError(f'working-case preflight failed: {exc}') from exc
+        finally:
+            output.write_text(json.dumps(evidence,indent=2,sort_keys=True)+'\n')
 
     def mapped(self):
         _, output = self.call('wm', '-j', 'windows', timeout=20)
@@ -1364,6 +1510,8 @@ class Rehearsal:
             candidate_namespace_contract(evidence,args.old_version,args.new_version)
             if current.resolve()!=original_current:
                 raise RuntimeError('read-only candidate namespace probe changed current')
+            if not args.fail_new_daemon:
+                self.call('stage',args.new_dir,args.new_version,args.new_installer,timeout=180)
             self.call('desktop','start','--limit','900', timeout=None)
             self.call('launch','main')
             self.call('launch','second')
@@ -1384,8 +1532,13 @@ class Rehearsal:
             update_args += ['--working',args.working,'--stop',args.stop]
             if args.fail_new_daemon:
                 update_args.append('--fail-new-daemon')
+            else:
+                update_args.append('--use-staged')
             for flag in args.upgrade_arg:
                 update_args.append(flag)
+            if requires_working(args):
+                self.require_active_working()
+                update_args.append('--require-working')
             (self.root/'rehearsal-target.json').write_text(json.dumps({
                 'version':args.new_version,'working':args.working,'started':time.time()})+'\n')
             self.watch_checkpoint()
@@ -1539,6 +1692,11 @@ class Rehearsal:
         return int(bool(self.errors or failure or any(s['command'][0]=='compare' and s['exit'] for s in self.steps)))
 
 
+def requires_working(args):
+    return (getattr(args,'require_working',False) or args.working=='i' or args.codex_never_confirm_interrupt
+            or args.codex_never_confirm_close or args.require_prepared)
+
+
 def seed_options(parser):
     parser.add_argument('--untitled',type=int,choices=(0,1,2),default=2)
     parser.add_argument('--no-codex',action='store_true')
@@ -1569,6 +1727,7 @@ def main():
     run.add_argument('--answer',default='yes')
     run.add_argument('--yes',action='store_true')
     run.add_argument('--working',default='',help='typed at the working-agents choice; empty waits for them')
+    run.add_argument('--require-working',action='store_true',help='reject this case before updating unless the exact seeded Codex parent is still active; required for an intentional Enter/wait case')
     run.add_argument('--stop',default='',help='typed at the destructive stop list; empty cancels')
     run.add_argument('--upgrade-arg',action='append',default=[],help='use --upgrade-arg=--interrupt, for example')
     run.add_argument('--expect-console-refusal', action='store_true', help='with --fail-new-daemon, require console refusal before startup and preserve all work')
@@ -1592,7 +1751,15 @@ def main():
     lock=commands.add_parser('wait-native-lock')
     lock.add_argument('--fd',type=int,required=True)
     lock.add_argument('--parent-pid',type=int,required=True)
+    staged=commands.add_parser('staged-candidate')
+    staged.add_argument('archive_dir')
+    staged.add_argument('version')
+    staged.add_argument('installer')
+    staged.add_argument('--record',metavar='STAGE_LOG')
     args=parser.parse_args()
+    if args.command == 'run' and requires_working(args) and (args.yes or any(
+            flag=='--yes' or flag.startswith('--yes=') for flag in args.upgrade_arg)):
+        parser.error('working cases forbid --yes because the actual working choice must be observed')
     if args.command == 'run' and not 0 < args.codex_pause <= 300:
         parser.error('--codex-pause must be between 0 and 300 seconds')
     if args.command == 'run' and args.plain_restart and (args.expect_refusal or args.fail_new_daemon):
@@ -1605,8 +1772,14 @@ def main():
         parser.error('--new-terminal-after-restore requires --reopen-existing-only')
     if args.command == 'run' and args.expect_terminal_restart_failure and not args.new_terminal_after_restore:
         parser.error('--expect-terminal-restart-failure requires --new-terminal-after-restore')
+    if args.command == 'run' and args.require_working and args.no_codex:
+        parser.error('--require-working requires the seeded Codex chat')
     rehearsal=Rehearsal(args.root,args.shell)
     try:
+        if args.command=='staged-candidate':
+            print(staged_candidate(args.root,args.archive_dir,args.version,args.installer,
+                                   record=args.record is not None,transcript=args.record))
+            return 0
         if args.command=='wait-native-lock':
             return wait_native_lock(args.root,args.fd,args.parent_pid)
         if args.command=='wait':
