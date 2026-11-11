@@ -5000,6 +5000,51 @@ mod tests {
     }
 
     #[test]
+    fn scoped_admission_preserves_unrelated_active_channel_snapshot() {
+        let (mut app, source, destination, pane) = channel_move_fixture();
+        app.active_workspace = Some("/repo".into());
+        let mut next = pane.clone();
+        next.id = CardId::new();
+        if let CardKind::Browser(browser) = &mut next.kind {
+            browser.id = BrowserId::new();
+        }
+        app.workspace_model
+            .views
+            .iter_mut()
+            .find(|view| view.scope == Scope::Channel(source))
+            .unwrap()
+            .panes
+            .push(next.clone());
+        drop(app.reconcile_shared_views());
+        let saved = app
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == source)
+            .unwrap()
+            .clone();
+        let _ = app.workspace.reorder(next.id, 0).unwrap();
+        let _ = app.workspace.focus_without_scrolling(next.id);
+        let selected = HashSet::from([Scope::Channel(destination)]);
+        app.shared_views.initialized.remove(&Scope::Channel(destination));
+        app.shared_views.baseline.remove(&Scope::Channel(destination));
+
+        app.admit_existing_views_in(Some(&selected));
+
+        assert!(app.shared_views.initialized.contains(&Scope::Channel(destination)));
+        let current = app
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == source)
+            .unwrap();
+        assert_eq!(current.cards, saved.cards, "admission is a read-only eligibility check");
+        assert_eq!(current.focused, saved.focused);
+        assert_eq!(app.workspace.order().collect::<Vec<_>>(), [next.id, pane.id]);
+        assert_eq!(app.workspace.focused(), Some(next.id));
+    }
+
+    #[test]
     fn populated_admission_checks_the_current_strip_order_before_equality() {
         let (mut app, source, _, pane) = channel_move_fixture();
         app.active_workspace = Some("/repo".into());
