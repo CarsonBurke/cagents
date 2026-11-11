@@ -30,6 +30,23 @@ mod append;
 
 const CHAT_ATTACH_TIMEOUT: Duration = Duration::from_secs(70);
 
+fn restore_intent(intent: Intent, policy: crate::instance::WindowRestorePolicy) -> Intent {
+    if intent == Intent::Restore && policy == crate::instance::WindowRestorePolicy::ExistingOnly {
+        Intent::RestoreExisting
+    } else {
+        intent
+    }
+}
+
+fn chat_socket(intent: Intent) -> Result<std::path::PathBuf, StartFailure> {
+    if intent == Intent::RestoreExisting {
+        ipc::daemon_socket_path().map_err(|error| error.to_string().into())
+    } else {
+        crate::terminal::ensure_daemon_ready_for_explicit_action()
+            .map_err(|error| error.to_string().into())
+    }
+}
+
 fn start_failure(error: ipc::ProtocolError) -> StartFailure {
     StartFailure {
         message: error.message,
@@ -1184,8 +1201,10 @@ fn restore(
     mut session: Session,
     upgrade_recovery: &mut Option<(Session, Session)>,
     resumed_from: &mut Option<Session>,
-    retry_explicit_start: bool,
+    intent: Intent,
 ) -> Result<ClientRequest, StartFailure> {
+    let retry_explicit_start = intent == Intent::RetryStart;
+    let existing_only = intent == Intent::RestoreExisting;
     if session.proof.as_ref() == Some(proof) && !retry_explicit_start {
         return Ok(ClientRequest::ChatAttach { session });
     }
@@ -1358,6 +1377,12 @@ fn restore(
         return Err(StartFailure::retry(
             "This conversation was stopped for the update. Its saved files are kept; the transcript preview could not be attached. Nothing was restarted.",
         ));
+    }
+    if existing_only {
+        return Err(StartFailure::retry(format!(
+            "This recovery pane could not attach to an existing conversation. Its saved conversation is kept; use the pane's Start or Resume action to continue it explicitly. {}",
+            refusal.unwrap_or_else(|| "No exact daemon-owned conversation was available.".into())
+        )));
     }
     if matches!(
         session.native_continuity,
@@ -1892,10 +1917,11 @@ impl ClientHandle {
         selection: Option<String>,
         wake: impl Fn(Wake) + Send + Sync + 'static,
     ) -> Result<Self, StartFailure> {
+        let intent = restore_intent(intent, crate::instance::window_restore_policy());
         // A restore runs right after an application update has stopped the
         // daemon it is about to ask for, so it starts one for the same reason a
         // new conversation does instead of failing on an absent socket.
-        let socket = crate::terminal::ensure_daemon_ready().map_err(|e| e.to_string())?;
+        let socket = chat_socket(intent)?;
         let stream = connect_daemon(&socket)
             .map_err(|e| format!("Cannot connect to the proven chat daemon: {e}"))?;
         Self::connect_on(
@@ -1921,12 +1947,13 @@ impl ClientHandle {
         if UpgradeRecovery::candidate(&source, &expected).is_none() {
             return Err("The canonical chat is not an exact upgrade of the saved source".into());
         }
-        let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
+        let intent = restore_intent(Intent::Restore, crate::instance::window_restore_policy());
+        let socket = chat_socket(intent)?;
         let stream = connect_daemon(&socket).map_err(|error| error.to_string())?;
         Self::connect_on(
             stream,
             source,
-            Intent::Restore,
+            intent,
             None,
             false,
             None,
@@ -1944,7 +1971,7 @@ impl ClientHandle {
         if !super::is_account_recovery(&source, &replacement) {
             return Err("Account recovery changed the saved conversation".into());
         }
-        let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
+        let socket = chat_socket(Intent::Start)?;
         let stream = connect_daemon(&socket).map_err(|error| error.to_string())?;
         Self::connect_on(
             stream,
@@ -1968,7 +1995,7 @@ impl ClientHandle {
         if !super::is_account_recovery(&source, &replacement) {
             return Err("Account switch changed the saved conversation".into());
         }
-        let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
+        let socket = chat_socket(Intent::Start)?;
         let stream = connect_daemon(&socket).map_err(|error| error.to_string())?;
         Self::connect_on(
             stream,
@@ -2015,6 +2042,14 @@ impl ClientHandle {
         wake: impl Fn(Wake) + Send + Sync + 'static,
     ) -> Result<Self, StartFailure> {
         let retirement = ClientRetirement::for_client(session.id)?;
+        if intent == Intent::RestoreExisting
+            && (source.is_some()
+                || terminate_source
+                || selection.is_some()
+                || account_recovery.is_some())
+        {
+            return Err("Recovery restoration may only attach existing conversations".into());
+        }
         if intent == Intent::RetryStart
             && (source.is_some()
                 || terminate_source
@@ -2044,7 +2079,7 @@ impl ClientHandle {
             ));
         }
         if let Some(expected) = &upgrade_expected
-            && (intent != Intent::Restore
+            && (!matches!(intent, Intent::Restore | Intent::RestoreExisting)
                 || source.is_some()
                 || terminate_source
                 || selection.is_some()
@@ -2157,7 +2192,7 @@ impl ClientHandle {
                     session,
                     &mut upgrade_recovery,
                     &mut resumed_from,
-                    false,
+                    Intent::Restore,
                 )?
             } else {
                 resume_retained_claude(
@@ -2223,7 +2258,7 @@ impl ClientHandle {
                 session,
                 &mut upgrade_recovery,
                 &mut resumed_from,
-                intent == Intent::RetryStart,
+                intent,
             )?
         };
         if let ClientRequest::ChatStart { session, .. } = &request
@@ -2311,7 +2346,15 @@ impl ClientHandle {
                 ServerMessage::Error(error) if envelope.request_id == Some(attach_request) => {
                     #[cfg(feature = "ui")]
                     crate::daemon_health::frame(&stream, None, health_request);
-                    return Err(start_failure(error));
+                    let mut failure = start_failure(error);
+                    if intent == Intent::RestoreExisting {
+                        // An ordinary recovery attachment cannot enter the
+                        // account-recovery path, whose callback starts a
+                        // provider. Account changes remain explicit actions.
+                        failure.recovery = super::Recovery::Retry;
+                        failure.message.push_str(" This recovery pane only attaches existing conversations. Restore its account in Settings if needed, then choose Start or Resume explicitly; Retry only attempts attachment.");
+                    }
+                    return Err(failure);
                 }
                 _ => return Err("Daemon did not attach the exact native chat".into()),
             }
@@ -4101,7 +4144,7 @@ mod tests {
             source,
             &mut None,
             &mut resumed,
-            false,
+            Intent::Restore,
         );
         drop(client);
         (result, resumed, worker.join().unwrap())
@@ -4331,7 +4374,7 @@ mod tests {
                 source,
                 &mut None,
                 &mut None,
-                true,
+                Intent::RetryStart,
             );
             worker.join().unwrap();
             match state {
@@ -4356,6 +4399,19 @@ mod tests {
         live: &HostSessionProof,
         session: Session,
         answer: ServerMessage,
+    ) -> (
+        Result<ClientRequest, StartFailure>,
+        ClientRequest,
+        Option<(Session, Session)>,
+    ) {
+        negotiate_with_restore_policy(live, session, answer, false)
+    }
+
+    fn negotiate_with_restore_policy(
+        live: &HostSessionProof,
+        session: Session,
+        answer: ServerMessage,
+        existing_only: bool,
     ) -> (
         Result<ClientRequest, StartFailure>,
         ClientRequest,
@@ -4393,9 +4449,250 @@ mod tests {
             session,
             &mut recovery,
             &mut None,
-            false,
+            if existing_only {
+                Intent::RestoreExisting
+            } else {
+                Intent::Restore
+            },
         );
         (outcome, worker.join().unwrap(), recovery)
+    }
+
+    #[test]
+    fn recovery_restore_policy_leaves_explicit_provider_actions_unchanged() {
+        use crate::instance::WindowRestorePolicy::{ExistingOnly, Ordinary};
+        for intent in [Intent::Start, Intent::Resume, Intent::RetryStart] {
+            assert_eq!(restore_intent(intent, ExistingOnly), intent);
+            assert_eq!(restore_intent(intent, Ordinary), intent);
+        }
+        assert_eq!(
+            restore_intent(Intent::Restore, ExistingOnly),
+            Intent::RestoreExisting
+        );
+        assert_eq!(restore_intent(Intent::Restore, Ordinary), Intent::Restore);
+    }
+
+    #[test]
+    fn recovery_restore_does_not_autostart_a_missing_daemon() {
+        const CHILD: &str = "CAGENTS_TEST_RECOVERY_ATTACH_WITHOUT_DAEMON";
+        if std::env::var_os(CHILD).is_some() {
+            crate::instance::initialize_window_restore_policy(
+                crate::instance::WindowRestorePolicy::ExistingOnly,
+            )
+            .unwrap();
+            let paths = crate::daemon::RuntimePaths::discover().unwrap();
+            assert!(!paths.lock.exists());
+            // Eager background publishers and device/pane readers share this
+            // entrypoint; they must not create a daemon admission either.
+            let assert_socket_only = |result| match result {
+                Err(crate::terminal::HostedTerminalStartError::HostProtocol(
+                    crate::control::ControlError::Connect(error),
+                )) => assert!(matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                )),
+                other => panic!(
+                    "recovery must fail at the existing socket, before binary lookup or daemon admission: {other:?}"
+                ),
+            };
+            assert_socket_only(crate::terminal::ensure_daemon_ready());
+            assert!(!paths.lock.exists());
+            assert_socket_only(crate::terminal::ensure_daemon_ready_for(
+                crate::notifications::Application::Cagents,
+            ));
+            assert!(!paths.lock.exists());
+            let result = ClientHandle::connect(
+                stranded_claude(Some(CONVERSATION)),
+                Intent::Restore,
+                None,
+                false,
+                None,
+                |_| {},
+            );
+            let failure = result.err().expect("missing daemon must refuse attachment");
+            assert!(
+                failure
+                    .message
+                    .starts_with("Cannot connect to the proven chat daemon:")
+            );
+            assert!(
+                !paths.lock.exists(),
+                "a read-only recovery attachment tried daemon admission"
+            );
+            assert!(!paths.socket.exists());
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        for directory in ["home", "runtime", "config", "data", "cache"] {
+            std::fs::create_dir(root.path().join(directory)).unwrap();
+        }
+        let name = std::thread::current().name().unwrap().to_owned();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", &name, "--nocapture"])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", root.path().join("home"))
+            .env("XDG_RUNTIME_DIR", root.path().join("runtime"))
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .env("XDG_CACHE_HOME", root.path().join("cache"))
+            .env(CHILD, "1");
+        // Keep hosted authority: the exact socket-only error below must prove
+        // policy selection without relying on a separate lifecycle refusal.
+        if let Some(authority) = std::env::var_os(crate::agent_execution::AUTHORITY_ENV) {
+            command.env(crate::agent_execution::AUTHORITY_ENV, authority);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn recovery_restore_missing_claude_and_codex_never_prepare_or_start_a_provider() {
+        for provider in [
+            crate::agent::Provider::Claude,
+            crate::agent::Provider::Codex,
+        ] {
+            for named in [false, true] {
+                for proofless in [false, true] {
+                    let (stream, mut server) = UnixStream::pair().unwrap();
+                    let live = host_proof("recovery");
+                    let mut saved = if provider == crate::agent::Provider::Claude {
+                        stranded_claude(named.then_some(CONVERSATION))
+                    } else {
+                        let mut saved =
+                            omp_card(named.then_some(CONVERSATION), Some(host_proof("old")));
+                        saved.launch.provider = provider;
+                        saved.launch.recipe.program = "codex".into();
+                        saved
+                    };
+                    if proofless {
+                        saved.proof = None;
+                    }
+                    let expected = saved.clone();
+                    let worker = thread::spawn(move || {
+                        server
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        for step in 0..2 {
+                            let envelope: ClientEnvelope =
+                                ipc::read_frame(&mut server).unwrap().unwrap();
+                            let message = match (step, envelope.request) {
+                                (0, ClientRequest::Connect { .. }) => ServerMessage::Response {
+                                    response: ServerResponse::Connected {
+                                        proof: live.clone(),
+                                        resumed: vec![],
+                                    },
+                                },
+                                (1, ClientRequest::ChatList) if proofless => {
+                                    ServerMessage::Response {
+                                        response: ServerResponse::ChatListed { sessions: vec![] },
+                                    }
+                                }
+                                (1, ClientRequest::ResolveUpgradeChat { source })
+                                    if !proofless && source == expected =>
+                                {
+                                    ServerMessage::Error(ipc::ProtocolError::new(
+                                        ipc::ProtocolErrorCode::TerminalUnavailable,
+                                        "The exact retained holder is unavailable",
+                                        false,
+                                    ))
+                                }
+                                other => panic!(
+                                    "recovery must not prepare or start a provider: {other:?}"
+                                ),
+                            };
+                            ipc::write_frame(
+                                &mut server,
+                                &ServerEnvelope {
+                                    version: PROTOCOL_VERSION,
+                                    request_id: Some(envelope.request_id),
+                                    proof: live.clone(),
+                                    message,
+                                },
+                            )
+                            .unwrap();
+                        }
+                        let extra: Option<ClientEnvelope> = ipc::read_frame(&mut server).unwrap();
+                        assert!(
+                            extra.is_none(),
+                            "a missing recovery attachment sent an extra provider request"
+                        );
+                    });
+                    let result = ClientHandle::connect_on(
+                        stream,
+                        saved,
+                        Intent::RestoreExisting,
+                        None,
+                        false,
+                        None,
+                        None,
+                        None,
+                        |_| {},
+                    );
+                    let failure = result.err().expect("missing exact lineage must refuse");
+                    assert_eq!(failure.recovery, super::super::Recovery::Retry);
+                    assert!(failure.message.contains("Start or Resume"));
+                    worker.join().unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_restore_keeps_exact_live_and_issued_history_attachments() {
+        let live = host_proof("recovery");
+        let retained = stranded_claude(Some("6f1f6f1e-4a4b-4c4d-8e8f-909192939495"));
+        for history in [false, true] {
+            let mut saved = retained.clone();
+            if history {
+                saved.native_continuity = super::super::NativeContinuity::ReconnectOnly;
+            }
+            let mut current = saved.clone();
+            current.proof = Some(live.clone());
+            let (outcome, asked, _) = negotiate_with_restore_policy(
+                &live,
+                saved.clone(),
+                ServerMessage::Response {
+                    response: ServerResponse::UpgradeChatResolved {
+                        session: current.clone(),
+                    },
+                },
+                true,
+            );
+            assert!(
+                matches!(asked, ClientRequest::ResolveUpgradeChat { source } if source == saved)
+            );
+            assert!(
+                matches!(outcome, Ok(ClientRequest::ChatAttach { session }) if session == current)
+            );
+        }
+        let mut same_owner = retained;
+        same_owner.proof = Some(live.clone());
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let request = restore(
+            &mut client,
+            &mut FrameCodec::new(ipc::MAX_FRAME_BYTES),
+            &mut 2,
+            &live,
+            same_owner.clone(),
+            &mut None,
+            &mut None,
+            Intent::RestoreExisting,
+        )
+        .unwrap();
+        assert!(matches!(request, ClientRequest::ChatAttach { session } if session == same_owner));
+        drop(client);
+        assert!(
+            ipc::read_frame::<ClientEnvelope>(&mut server)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -4530,7 +4827,7 @@ mod tests {
             omp_card(Some(CONVERSATION), Some(live.clone())),
             &mut None,
             &mut None,
-            false,
+            Intent::Restore,
         )
         .expect("a live proof attaches");
         assert!(matches!(attach, ClientRequest::ChatAttach { .. }));

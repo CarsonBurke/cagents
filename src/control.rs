@@ -292,41 +292,61 @@ pub enum DaemonCommand {
     /// Validate inherited updater authority without probing daemon liveness.
     #[command(hide = true)]
     VerifyUpdateLease,
+    /// Save the authenticated pre-update service inventory without starting a daemon.
     #[command(hide = true)]
     CaptureUpdateCensus {
+        /// Write the private original service census to this new file.
         #[arg(long)]
         output: PathBuf,
-    },
-    #[command(hide = true)]
-    VerifyUpdateCensus {
-        #[arg(long, conflicts_with = "validate_only")]
-        retire: bool,
-        #[arg(long)]
-        require_absent: bool,
-        #[arg(long)]
-        validate_only: bool,
-        #[arg(long)]
-        require_original: bool,
-        #[arg(long)]
-        allow_absent: bool,
-        #[arg(long)]
-        census: PathBuf,
-        #[arg(long)]
-        outcome: PathBuf,
-    },
-    #[command(hide = true)]
-    InspectUpdateRecovery {
-        #[arg(long)]
-        census: PathBuf,
-        #[arg(long)]
-        outcome: PathBuf,
+        /// Use this installed target when inspecting pending recovery.
         #[arg(long)]
         candidate_cli: Option<PathBuf>,
     },
+    /// Verify daemon readiness and inventory against the original update census.
+    #[command(hide = true)]
+    VerifyUpdateCensus {
+        /// Retire exact settled recovery evidence after successful verification.
+        #[arg(long, conflicts_with = "validate_only")]
+        retire: bool,
+        /// Require authenticated absence of both the original and current daemon.
+        #[arg(long)]
+        require_absent: bool,
+        /// Validate the private census without probing or claiming readiness.
+        #[arg(long)]
+        validate_only: bool,
+        /// Require the original source to remain the verified serving owner.
+        #[arg(long)]
+        require_original: bool,
+        /// Accept verified absence when no source daemon was running.
+        #[arg(long)]
+        allow_absent: bool,
+        /// Read the private original service census from this file.
+        #[arg(long)]
+        census: PathBuf,
+        /// Save the verification receipt at this private output path.
+        #[arg(long)]
+        outcome: PathBuf,
+    },
+    /// Inspect retained update recovery and report its exact next step.
+    #[command(hide = true)]
+    InspectUpdateRecovery {
+        /// Read the private original service census from this file.
+        #[arg(long)]
+        census: PathBuf,
+        /// Save the typed recovery outcome at this private output path.
+        #[arg(long)]
+        outcome: PathBuf,
+        /// Name the complete installed target executable for recovery.
+        #[arg(long)]
+        candidate_cli: Option<PathBuf>,
+    },
+    /// Inspect pending Prepared recovery before starting another update.
     #[command(hide = true)]
     InspectPendingUpdateRecovery {
+        /// Name the complete installed target executable for recovery.
         #[arg(long)]
         candidate_cli: PathBuf,
+        /// Bind the original standalone census when it is not already complete.
         #[arg(long)]
         census: Option<PathBuf>,
     },
@@ -3642,8 +3662,11 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                 human: format!("{} daemon running ({})", instance::NAME, socket.display()),
             })
         }
-        DaemonCommand::CaptureUpdateCensus { output } => {
-            crate::update::recovery::capture_file(&output)
+        DaemonCommand::CaptureUpdateCensus {
+            output,
+            candidate_cli,
+        } => {
+            crate::update::recovery::capture_file_with_candidate(&output, candidate_cli.as_deref())
                 .map_err(|e| AppError::new("update_census", e))?;
             Ok(CommandOutput {
                 command: "daemon.capture_update_census",

@@ -2,7 +2,10 @@
 """Scenario orchestration for rehearse-update; all application commands use its private env."""
 import argparse
 import copy
+
+from collections import Counter
 from contextlib import closing
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -11,9 +14,139 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tarfile
 import time
 
 import rehearse_update_records as records
+
+
+def candidate_namespace_cli(root, archive_dir, version):
+    """Extract only the verified candidate CLI into the marked private root."""
+    root=Path(root).resolve()
+    if (root/'.rehearse-update').is_symlink() or (root/'.rehearse-update').read_text().strip()!=str(root):
+        raise RuntimeError('candidate probe requires a matching rehearsal root')
+    if not version or version in ('.','..') or '/' in version:
+        raise RuntimeError('candidate probe requires a single version name')
+    archive_dir=Path(archive_dir)
+    name=f'cagents-{version}-x86_64-unknown-linux-gnu.tar.gz'
+    source=archive_dir/name
+    with source.open('rb') as stream:
+        digest=hashlib.file_digest(stream,'sha256').hexdigest()
+    expected=[line.split()[0] for line in (archive_dir/'SHA256SUMS').read_text().splitlines()
+              if len(line.split())==2 and line.split()[1].lstrip('*')==name]
+    if expected!=[digest]:
+        raise RuntimeError('candidate probe requires the checksum-verified archive')
+    with tarfile.open(source,'r:gz') as archive:
+        members=[member for member in archive.getmembers() if member.name==f'cagents-{version}/bin/cagents']
+        if len(members)!=1 or not members[0].isreg() or not 0<members[0].size<=128*1024**2:
+            raise RuntimeError('candidate probe requires one bounded regular CLI')
+        destination=root/'candidate-namespace'
+        destination.mkdir(mode=0o700)
+        cli=destination/'cagents'
+        with archive.extractfile(members[0]) as stream, cli.open('xb') as output:
+            shutil.copyfileobj(stream,output)
+        cli.chmod(0o700)
+        with cli.open('rb') as stream:
+            cli_digest=hashlib.file_digest(stream,'sha256').hexdigest()
+        manifest=destination/'archive.json'
+        manifest.write_text(json.dumps({'archive':str(source.resolve()),'archive_sha256':digest,
+                                       'member':members[0].name,'cli_sha256':cli_digest},indent=2,sort_keys=True)+'\n')
+        manifest.chmod(0o600)
+    return cli
+
+
+def candidate_namespace_contract(evidence, old_version, new_version):
+    source=evidence['source']
+    expected=source.get('data',{})
+    snapshot=evidence['source_snapshot']
+    root=Path(snapshot['root'])
+    version_root=root/'home/.local/share/cagents-install/versions'/old_version
+    owner=[row for row in snapshot['processes'] if row.get('executable')==str(version_root/'bin/cagentsd')
+           and row.get('argv')==[str(version_root/'bin/cagentsd')] and row.get('pid',0)>1
+           and row.get('start_ticks',0)>0]
+    daemons=[row for row in snapshot['processes'] if Path(row.get('executable','')).name=='cagentsd'
+             and row.get('argv',[])[:1]==[row['executable']]]
+    census=evidence['census']
+    receipt=evidence['receipt']
+    proof=snapshot.get('serving')
+    outcome=receipt.get('outcome',{})
+    if (source.get('ok') is not True or expected.get('running') is not True
+            or expected.get('instance')!='production' or expected.get('daemon_version')!=old_version
+            or expected.get('socket')!=str(root/'rt/cagents/cagentsd.sock')
+            or evidence['candidate_version'].strip()!=f'cagents {new_version}'
+            or snapshot['errors'] or len(owner)!=1 or daemons!=owner
+            or not isinstance(proof,dict) or any(not isinstance(proof.get(field),str) or not proof[field]
+                for field in ('host_session_id','boot_id','host_incarnation'))
+            or census.get('source')!=proof or outcome.get('state')!='usable' or outcome.get('serving')!=proof
+            or census.get('transaction')!=receipt.get('transaction')
+            or evidence['census_digest']!=receipt.get('census_digest')):
+        raise RuntimeError('candidate does not observe the serving production baseline in the same namespace')
+    # A strict current-protocol status may reject a qualified frozen source.
+    # It proves neither absence nor presence; the successful read-only census
+    # and require-original verification above bind the actual Ready socket.
+    status=evidence['candidate_status']
+    if status['exit']==0:
+        actual=status['payload'].get('data',{})
+        if (status['payload'].get('ok') is not True or actual.get('running') is not True
+                or actual.get('instance')!='production' or actual.get('daemon_version')!=old_version
+                or actual.get('socket')!=expected['socket'] or actual.get('cli_version')!=new_version):
+            raise RuntimeError('candidate status disagrees with the serving production baseline')
+
+
+def provider_activity(root):
+    root=Path(root)
+    claude=(root/'home/.claude/fixture-launches').read_text().splitlines()
+    events=[json.loads(line) for line in (root/'logs/codex-provider.jsonl').read_text().splitlines()]
+    methods=Counter(event.get('method') for event in events)
+    listeners=[event for event in events if event.get('event')=='launch'
+               and any(arg=='--listen' or arg.startswith('--listen=') for arg in event.get('argv',[]))]
+    conversations={event['pid'] for event in listeners}
+    conversations.update(event['pid'] for event in events if event.get('method') in
+        ('thread/start','thread/resume','turn/start','turn/interrupt'))
+    launches=sum(event.get('event')=='launch' and event['pid'] in conversations for event in events)
+    return {'claude_chat_launches':len(claude),'codex_chat_launches':launches,
+            'codex_thread_starts':methods['thread/start'],'codex_turn_starts':methods['turn/start']}
+
+
+def existing_only_contract(before, after, activity_before, activity_after, version_root):
+    """A UI process replacement must leave serving owners and work untouched."""
+    version_root=Path(version_root)
+    if before['errors'] or after['errors'] or before.get('serving') != after.get('serving'):
+        raise RuntimeError('existing-only reopen changed daemon ownership or has incomplete evidence')
+    if activity_before != activity_after:
+        raise RuntimeError('existing-only reopen started a provider, conversation or turn')
+    def identities(snapshot, predicate):
+        return {(row['pid'],row['start_ticks']) for row in snapshot['processes'] if predicate(row)}
+    def image(product):
+        return lambda row: row.get('executable')==str(version_root/'bin'/product)
+    daemon=identities(before,image('cagentsd'))
+    if not daemon or daemon != identities(after,image('cagentsd')):
+        raise RuntimeError('existing-only reopen replaced a matched daemon process')
+    root=Path(before['root'])
+    providers={
+        'claude':lambda row: str(root/'bin/claude') in row.get('argv',[]),
+        'codex':lambda row: str(root/'libexec/codex/rehearsal-codex.py') in row.get('argv',[])
+            and any(arg=='--listen' or arg.startswith('--listen=') for arg in row['argv']),
+    }
+    stable={}
+    for provider,predicate in providers.items():
+        original=identities(before,predicate)
+        if not original or original != identities(after,predicate):
+            raise RuntimeError(f'existing-only reopen replaced the {provider} provider process')
+        stable[provider]=sorted(original)
+    child=identities(before,lambda row: row.get('role')=='long-lived-child')
+    if child != identities(after,lambda row: row.get('role')=='long-lived-child'):
+        raise RuntimeError('existing-only reopen lost the original terminal child')
+    is_ui=image('cagents-ui')
+    old_ui=identities(before,is_ui); new_ui=identities(after,is_ui)
+    ui_rows=[row for row in after['processes'] if is_ui(row)]
+    if (len(old_ui)!=2 or len(new_ui)!=2 or not old_ui.isdisjoint(new_ui)
+            or any('--restore-existing-only' not in row['argv'] for row in ui_rows)):
+        raise RuntimeError('the two replacement UI processes did not run with --restore-existing-only')
+    return {'serving':after['serving'],'daemon_processes':sorted(daemon),'provider_processes':stable,
+            'terminal_children':sorted(child),'ui_before':sorted(old_ui),'ui_after':sorted(new_ui),
+            'ui_processes':[{key:row[key] for key in ('pid','start_ticks','executable','argv')} for row in ui_rows],
+            'activity_before':activity_before,'activity_after':activity_after}
 
 
 def sidebar_channel_ref(observation, title):
@@ -249,9 +382,9 @@ class Rehearsal:
         _, response = self.cli('--no-start','channel','list')
         channels = response['data']['channels']
         originals = (json.loads((self.root/'ui-chats-before.json').read_text())
-                     if side == 'after' else [])
+                     if side != 'before' else [])
         snapshots = ([json.loads((self.root/'records'/name/'snapshot.json').read_text())
-                      for name in ('before','after')] if side == 'after' else None)
+                      for name in ('before','after')] if side != 'before' else None)
         evidence = []
         for item in targets:
             original = item['response']['data']['agent']
@@ -284,7 +417,7 @@ class Rehearsal:
                 # Keep hover labels away from subsequent navigation and shots.
                 self.call('drive','move','850,750',timeout=30)
                 required_thread = None
-                if side == 'after':
+                if side != 'before':
                     previous = next(view for view in originals
                                     if view['agent']==original['id'] and view['slot']==slot)
                     required_thread = previous['selection']['session']['launch']['session_id']
@@ -464,6 +597,44 @@ class Rehearsal:
         self.checkpoint_stop.set()
         self.checkpoint_thread.join(2)
         (self.root/'logs/checkpoint-observations.json').write_text(json.dumps(self.checkpoint_observations,indent=2)+'\n')
+
+    def reopen_existing_only(self, version):
+        self.call('record','existing-only-before',timeout=150)
+        before=json.loads((self.root/'records/existing-only-before/snapshot.json').read_text())
+        activity_before=provider_activity(self.root)
+        windows=self.mapped()
+        for slot in ('main','second'):
+            self.call('wm','action','close-window','--id',windows[slot]['id'])
+        old={row['pid']:row['start_ticks'] for row in before['processes']
+             if row.get('executable')==str(self.root/f'home/.local/share/cagents-install/versions/{version}/bin/cagents-ui')}
+        deadline=time.monotonic()+30
+        while time.monotonic()<deadline:
+            alive=False
+            for pid,start in old.items():
+                try:
+                    stat=Path(f'/proc/{pid}/stat').read_text().rsplit(')',1)[1].split()
+                    alive |= int(stat[19])==start and stat[0] not in ('Z','X')
+                except (OSError,ValueError,IndexError):
+                    pass
+            if not alive and not {'main','second'} & self.mapped().keys():
+                break
+            time.sleep(.1)
+        else:
+            raise RuntimeError('ordinary UI processes did not close before existing-only relaunch')
+        for slot in ('main','second'):
+            self.call('launch','--restore-existing-only',slot)
+        self.wait_windows(['main','second'],version=version)
+        self.capture_chats('existing-only')
+        self.call('record','existing-only-after',timeout=150)
+        after=json.loads((self.root/'records/existing-only-after/snapshot.json').read_text())
+        activity_after=provider_activity(self.root)
+        result=existing_only_contract(before,after,activity_before,activity_after,
+            self.root/f'home/.local/share/cagents-install/versions/{version}')
+        self.call('compare','existing-only-before','existing-only-after',timeout=30)
+        result['records']={'before':'records/existing-only-before/snapshot.json',
+                           'after':'records/existing-only-after/snapshot.json'}
+        result['views']={'before':'ui-chats-after.json','after':'ui-chats-existing-only.json'}
+        (self.root/'existing-only.json').write_text(json.dumps(result,indent=2,sort_keys=True)+'\n')
 
     def seed(self, args):
         evidence = []
@@ -655,6 +826,40 @@ class Rehearsal:
             (self.root/'codex-fixture.json').write_text(json.dumps(settings,sort_keys=True)+'\n')
             (self.root/'rehearsal-target.json').write_text(json.dumps({'version':args.new_version,'working':args.working})+'\n')
             self.call('install', args.old_dir, args.old_version, args.old_installer, timeout=180)
+            candidate=candidate_namespace_cli(self.root,args.new_dir,args.new_version)
+            current=self.root/'home/.local/share/cagents-install/current'
+            original_current=current.resolve()
+            _, source=self.cli('--no-start','daemon','status')
+            code, output=self.call('env',candidate,'--no-start','--json','daemon','status',check=False)
+            try:
+                observed=json.loads(output)
+            except ValueError:
+                observed={'raw':output}
+            _, version=self.call('env',candidate,'--version')
+            probe=self.root/'candidate-namespace.json'
+            evidence={'source':source,'candidate_status':{'exit':code,'payload':observed},
+                      'candidate_version':version,'current':str(original_current),
+                      'archive':json.loads((candidate.parent/'archive.json').read_text())}
+            probe.write_text(json.dumps(evidence,indent=2,sort_keys=True)+'\n')
+            probe.chmod(0o600)
+            _, terminals=self.cli('--no-start','terminal','list','--all')
+            baseline=candidate.parent/'baseline-terminals.json'
+            baseline.write_text(json.dumps(terminals,indent=2,sort_keys=True)+'\n')
+            baseline.chmod(0o600)
+            _, output=self.call('env','/usr/bin/python3',Path(__file__).with_name('rehearse_update_records.py'),
+                               'namespace-source',self.root,baseline)
+            evidence['source_snapshot']=json.loads(output)
+            census=candidate.parent/'census.json'
+            receipt=candidate.parent/'receipt.json'
+            self.call('env',candidate,'--no-start','--json','daemon','capture-update-census','--output',census)
+            self.call('env',candidate,'--no-start','--json','daemon','verify-update-census',
+                      '--require-original','--census',census,'--outcome',receipt)
+            evidence.update(census=json.loads(census.read_text()),receipt=json.loads(receipt.read_text()),
+                            census_digest=hashlib.sha256(census.read_bytes()).hexdigest())
+            probe.write_text(json.dumps(evidence,indent=2,sort_keys=True)+'\n')
+            candidate_namespace_contract(evidence,args.old_version,args.new_version)
+            if current.resolve()!=original_current:
+                raise RuntimeError('read-only candidate namespace probe changed current')
             self.call('desktop','start','--limit','900', timeout=None)
             self.call('launch','main')
             self.call('launch','second')
@@ -755,6 +960,8 @@ class Rehearsal:
             code, _ = self.call('compare','before','after',timeout=30,check=False)
             if code:
                 self.errors.append('comparison found regressions or missing evidence; see comparison step')
+            if args.reopen_existing_only and not self.errors:
+                self.reopen_existing_only(args.new_version)
         except Exception as exc:
             failure = str(exc)
             self.errors.append(failure)
@@ -785,7 +992,10 @@ class Rehearsal:
             receipt = self.root/'records/after/recovery-current.json'
             if receipt.exists():
                 report += ['', f'Fresh readiness and inventory verification: {receipt}', receipt.read_text()]
-            for side in ('before','after'):
+            policy=self.root/'existing-only.json'
+            if policy.exists():
+                report += ['',f'Existing-only UI process replacement: {policy}',policy.read_text()]
+            for side in ('before','after','existing-only'):
                 views = self.root/f'ui-chats-{side}.json'
                 if views.exists():
                     report += ['', f'Native chat selection evidence: {views}']
@@ -852,6 +1062,7 @@ def main():
     run.add_argument('--upgrade-arg',action='append',default=[],help='use --upgrade-arg=--interrupt, for example')
     run.add_argument('--expect-console-refusal', action='store_true', help='with --fail-new-daemon, require console refusal before startup and preserve all work')
     run.add_argument('--fail-new-daemon', action='store_true', help='fail private candidate startup; require old current, serving daemon and preserved work')
+    run.add_argument('--reopen-existing-only',action='store_true',help='after a healthy update reopen both UI windows with --restore-existing-only; require unchanged daemon, providers and work')
     run.add_argument('--reopen-timeout',type=float,default=45)
     run.add_argument('--expect-refusal',choices=('interrupt','cancel'),help='require the exact refusal and unchanged old service, install, windows and inventory')
     run.add_argument('--require-prepared',action='store_true',help='require this fresh job to reach source-bound Prepared before recovery')
@@ -872,6 +1083,8 @@ def main():
         parser.error('--plain-restart requires a successful recovery scenario')
     if args.command == 'run' and args.expect_console_refusal and (not args.fail_new_daemon or args.no_console):
         parser.error('--expect-console-refusal requires --fail-new-daemon and a seeded console')
+    if args.command == 'run' and args.reopen_existing_only and (args.fail_new_daemon or args.no_codex or args.ceditor):
+        parser.error('--reopen-existing-only requires a healthy update with Claude and Codex and no ceditor')
     rehearsal=Rehearsal(args.root,args.shell)
     try:
         if args.command=='wait':

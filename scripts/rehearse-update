@@ -30,10 +30,12 @@ DIR holds one private user. Its path must be short (sockets live below it).
                        --working TEXT, --stop TEXT,
                        --upgrade-arg=--interrupt, --untitled 0|1|2, --no-codex,
                        --no-child, --ignore-term, --no-init, --exit-mid-turn,
-                       --uncarryable, --unreachable. See run --help.
+                       --uncarryable, --unreachable, --reopen-existing-only.
+                       See run --help.
   compare A B          Compare record names, directories or snapshot JSON.
   cleanup              Stop everything and remove this marked root.
-  launch [main|NAME]   Open a named installed UI window on the desktop.
+  launch [--restore-existing-only] [main|NAME]
+                       Open a named installed UI window on the desktop.
   wm ARGS...           Private compositor IPC (niri msg).
   ceditor start DIR    Launch DIR/ceditor with its matched companions.
   seed [OPTIONS]       Open two projects and create channels, agents (chat and
@@ -161,6 +163,11 @@ cmd_init() {
     printf '%s\n' "$root" >"$root/.rehearse-update"
     mkdir -p -- "$bin" "$logs" "$root/records" "$root/shots" "$user_home"/{.claude,.codex,.config,.cache,.local/bin,.local/share,.local/state}
     mkdir -m 700 -p -- "$runtime"
+    # The fixture ignores probes in this counter; real chat starts append once.
+    [ ! -L "$user_home/.claude/fixture-launches" ] \
+        && { [ ! -e "$user_home/.claude/fixture-launches" ] || [ -f "$user_home/.claude/fixture-launches" ]; } \
+        || die 'fixture launch counter must be a regular private file' 2
+    (umask 077; touch -- "$user_home/.claude/fixture-launches")
     install -m 755 "$tool_root/tests/fixtures/chat-composer-claude.sh" "$bin/claude"
     install -m 755 "$tool_root/tests/fixtures/fixture-gh.sh" "$bin/gh"
     printf '#!/bin/sh\necho "curl: (7) the rehearsal has no network access" >&2\nexit 7\n' >"$bin/curl"
@@ -494,11 +501,19 @@ cmd_compare() {
 
 cmd_launch() {
     require_init
-    local slot=${1:-main} args=()
+    local existing_only=0
+    if [ "${1:-}" = --restore-existing-only ]; then existing_only=1; shift; fi
+    local slot=${1:-main} args=() program=$user_home/.local/bin/cagents
     [[ $slot =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]] || die 'invalid window name' 2
     [ "$slot" = main ] || args=(--window "$slot")
+    if [ "$existing_only" -eq 1 ]; then
+        program=$user_home/.local/share/cagents-install/current/bin/cagents-ui
+        args=(--restore-existing-only "${args[@]}")
+    else
+        args=(ui "${args[@]}")
+    fi
     # The display environment and private environment are retained by the UI.
-    (exec </dev/null; cmd_app "$user_home/.local/bin/cagents" ui "${args[@]}") >"$logs/ui-$slot.log" 2>&1 &
+    (exec </dev/null; cmd_app "$program" "${args[@]}") >"$logs/ui-$slot.log" 2>&1 &
     printf '%s\n' "$!" >"$root/ui-$slot.pid"
 }
 

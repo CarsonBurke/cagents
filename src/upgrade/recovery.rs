@@ -67,6 +67,20 @@ impl SnapshotCapture {
         source: Session,
         mut snapshot: crate::chat::Snapshot,
     ) -> Result<(), String> {
+        if [&source.launch.session_id, &snapshot.session_id]
+            .into_iter()
+            .flatten()
+            .any(|identity| identity.is_empty() || identity.len() > 1024)
+        {
+            return Err(
+                "The captured conversation identity is invalid; the source was not prepared".into(),
+            );
+        }
+        if let (Some(known), Some(captured)) = (&source.launch.session_id, &snapshot.session_id)
+            && known != captured
+        {
+            return Err("The captured conversation changed from its reviewed identity; the source was not prepared".into());
+        }
         snapshot.notification_preview = Default::default();
         let continuation = if source.launch.session_id.is_some() {
             "Resume explicitly to inspect whether the recorded conversation can continue."
@@ -646,6 +660,30 @@ pub(crate) fn capture_before_floor(
 }
 
 impl PendingRecovery {
+    /// Read-only job routing, never acknowledgement or automatic recovery
+    /// authority. Callers still bind the job's source and immutable request.
+    pub(crate) fn matches_retained_job(
+        &self,
+        job: &str,
+        request_bytes: &[u8],
+        census_bytes: &[u8],
+    ) -> bool {
+        match self.producer.as_ref() {
+            Some(CaptureProducer::Proposed {
+                job: captured,
+                request_hash,
+            })
+            | Some(CaptureProducer::Acknowledged {
+                job: captured,
+                request_hash,
+            }) => captured == job && *request_hash == digest(request_bytes),
+            Some(CaptureProducer::ExplicitCensus {
+                transaction,
+                census_hash,
+            }) => transaction == job && *census_hash == digest(census_bytes),
+            None => !self.original_census_complete,
+        }
+    }
     pub(crate) fn inspect() -> Result<Option<Self>, String> {
         let store = super::handoff::Store::discover()?;
         Self::inspect_at(&store.path)
@@ -1310,35 +1348,6 @@ impl CapturedPreparation {
 }
 
 impl Receipt {
-    pub(crate) fn target(&self) -> &Path {
-        &self.authority.target
-    }
-
-    /// Call only after the authenticated successor is Ready and the update's
-    /// final start/retry decisions are complete, while its fences remain held.
-    pub(crate) fn archive_verified(
-        &self,
-        serving: &HostSessionProof,
-        live_terminals: &[crate::terminal_ipc::TerminalDescriptor],
-        live_chats: &[Session],
-    ) -> Result<RecoveryOutcome, String> {
-        let outcome = self.verify(serving, live_terminals, live_chats)?;
-        let store = super::handoff::Store::discover()?;
-        let settled = match classify_retained_prepared(&store.path, self.target())? {
-            Some(settled) => settled,
-            None => archived_discovery(&store.path, self.target())?
-                .ok_or("Verified recovery no longer has its exact Prepared archive record")?,
-        };
-        settled.archive_completed(
-            serving,
-            live_terminals,
-            live_chats,
-            &outcome.paused_terminals,
-            &outcome.paused_chats,
-        )?;
-        Ok(outcome)
-    }
-
     pub(crate) fn release_daemon_reservation(&mut self) {
         self.daemon.take();
     }
@@ -1959,6 +1968,20 @@ fn require_absent_checkpoint(path: &Path) -> Result<(), String> {
     if read_checkpoint(path)?.is_some() {
         return Err("An earlier upgrade checkpoint already exists. Its bytes were preserved and this update did not prepare the source; resolve that checkpoint before attempting another preparation.".into());
     }
+    let directory = path.parent().ok_or("Upgrade checkpoint has no directory")?;
+    for entry in fs::read_dir(directory).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".checkpoint-retirement.")
+        {
+            return Err(format!(
+                "An earlier checkpoint remains in retirement custody at {}. Its bytes were preserved; inspect that evidence and the serving daemon before another preparation",
+                entry.path().display()
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -2436,7 +2459,20 @@ pub(crate) fn classify_retained_prepared(
     let record: RecoveryRecord = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
     let target = fs::canonicalize(daemon_binary).map_err(|e| e.to_string())?;
     validate_settled_record(&record, &checkpoint, checkpoint_path, &target)?;
-    let additional = match load_retirement(checkpoint_path, Some(&record.checkpoint_hash))? {
+    // Extra issued aliases are optional historical hints. The exact canonical
+    // checkpoint and original settled record above remain the strict proof;
+    // stale, unsafe or unsupported pointers must not veto their classification.
+    let history = scoped_retirement(
+        checkpoint_path,
+        &target,
+        Some(&record.source),
+        Some(&record.checkpoint_hash),
+    )
+    .unwrap_or_else(|error| {
+        tracing::warn!(%error, "optional prior retirement aliases were ignored");
+        None
+    });
+    let additional = match history {
         Some((retired, proof, _)) => {
             if proof.outcome_sha256 != digest(&bytes) {
                 return Err("Planned retirement changed the original outcome".into());
@@ -2456,11 +2492,15 @@ pub(crate) fn classify_retained_prepared(
 
 const ACTIVE_RECOVERY: &str = "daemon-upgrade.retirement-active.json";
 
-#[derive(Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 struct ActiveRecovery {
     version: u16,
     checkpoint_hash: String,
     retirement_hash: String,
+    #[serde(default)]
+    target: Option<PathBuf>,
+    #[serde(default)]
+    source: Option<HostSessionProof>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2511,7 +2551,11 @@ fn load_retirement(
     struct Scope {
         checkpoint_hash: String,
     }
-    let scope: Scope = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    let scope: Scope = match serde_json::from_slice(&bytes) {
+        Ok(scope) => scope,
+        Err(_) if expected.is_some() => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
     if expected.is_some_and(|hash| hash != scope.checkpoint_hash) {
         return Ok(None);
     }
@@ -2546,7 +2590,15 @@ fn load_retirement(
         return Err("Retirement's immutable original outcome changed".into());
     }
     let record: RecoveryRecord = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-    if record.checkpoint_hash != retired.checkpoint_hash
+    if active
+        .target
+        .as_ref()
+        .is_some_and(|target| record.target.as_ref() != Some(target))
+        || active
+            .source
+            .as_ref()
+            .is_some_and(|source| &record.source != source)
+        || record.checkpoint_hash != retired.checkpoint_hash
         || record.source != retired.source
         || record.job != retired.job
         || record.request_identity != retired.request_identity
@@ -2565,25 +2617,94 @@ fn load_retirement(
     Ok(Some((retired, proof, record)))
 }
 
-/// Metadata only; a single active retirement selects historical candidates for
-/// ordinary authenticated holder discovery. Any canonical checkpoint suppresses
-/// these hints, and another source's explicit stop always takes precedence.
-pub(crate) fn archived_discovery(
+/// Inspect only the routing envelope first. It can reject unrelated history,
+/// never establish continuity; matching candidates still undergo strict reads.
+fn scoped_retirement(
+    checkpoint: &Path,
+    target: &Path,
+    source: Option<&HostSessionProof>,
+    expected: Option<&str>,
+) -> Result<Option<(Retirement, ArchiveProof, RecoveryRecord)>, String> {
+    #[derive(Deserialize)]
+    struct Route {
+        #[serde(default)]
+        target: Option<PathBuf>,
+        #[serde(default)]
+        source: Option<HostSessionProof>,
+        #[serde(default)]
+        checkpoint_hash: Option<String>,
+        #[serde(default)]
+        retirement_hash: Option<String>,
+    }
+    let route = (|| {
+        let bytes = read_checkpoint(&checkpoint.with_file_name(ACTIVE_RECOVERY))?;
+        bytes
+            .map(|bytes| serde_json::from_slice::<Route>(&bytes).map_err(|e| e.to_string()))
+            .transpose()
+    })();
+    let Some(mut route) = (match route {
+        Ok(route) => route,
+        Err(_) => return Ok(None),
+    }) else {
+        return Ok(None);
+    };
+    if expected.is_some_and(|expected| route.checkpoint_hash.as_deref() != Some(expected)) {
+        return Ok(None);
+    }
+    if route.target.as_deref().is_some_and(|known| known != target)
+        || source.is_some_and(|source| route.source.as_ref().is_some_and(|known| known != source))
+    {
+        return Ok(None);
+    }
+    // Old v2 pointers lacked routing. A bounded projection of their outcome is
+    // still only a routing hint; missing or unparseable history is unrelated.
+    if route.target.is_none() || (source.is_some() && route.source.is_none()) {
+        let Some(hash) = route
+            .checkpoint_hash
+            .as_deref()
+            .filter(|hash| valid_hash(hash))
+        else {
+            return Ok(None);
+        };
+        let projection = read_checkpoint(&checkpoint.with_file_name(recovery_name(hash)))
+            .ok()
+            .flatten()
+            .and_then(|bytes| serde_json::from_slice::<Route>(&bytes).ok());
+        let Some(projection) = projection else {
+            return Ok(None);
+        };
+        if route.target.is_none() {
+            route.target = projection.target;
+        }
+        if route.source.is_none() {
+            route.source = projection.source;
+        }
+    }
+    if route.target.as_deref() != Some(target)
+        || source.is_some_and(|source| route.source.as_ref() != Some(source))
+    {
+        return Ok(None);
+    }
+    // Do not infer validity from the routing hash fields or caller identity.
+    let _ = route.retirement_hash;
+    load_retirement(checkpoint, route.checkpoint_hash.as_deref())
+}
+
+fn archived_discovery_strict(
     checkpoint: &Path,
     daemon: &Path,
+    source: Option<&HostSessionProof>,
 ) -> Result<Option<AlreadyRecovered>, String> {
     match fs::symlink_metadata(checkpoint) {
         Ok(_) => return Ok(None),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.to_string()),
     }
-    let Some((retired, proof, record)) = load_retirement(checkpoint, None)? else {
+    let target = fs::canonicalize(daemon).map_err(|e| e.to_string())?;
+    let Some((retired, proof, record)) = scoped_retirement(checkpoint, &target, source, None)?
+    else {
         return Ok(None);
     };
-    let target = fs::canonicalize(daemon).map_err(|e| e.to_string())?;
-    if record.target.as_deref() != Some(target.as_path()) {
-        return Ok(None);
-    }
     validate_settled_identity(&record, checkpoint, &target)?;
     Ok(Some(recovered_data(
         record,
@@ -2594,33 +2715,72 @@ pub(crate) fn archived_discovery(
     )))
 }
 
-/// Discover retirement metadata without completing retirement or granting
-/// execution authority. A canonical Prepared checkpoint keeps its strict
-/// classifier; only its absence permits archived metadata discovery.
+/// Optional proof metadata, consulted only after ordinary holder adoption.
+/// This never directs restoration, adoption, paused panes or provider starts.
+/// Broken, unsupported or unrelated history must never prevent normal startup.
+pub(crate) fn archived_discovery(
+    checkpoint: &Path,
+    daemon: &Path,
+) -> Result<Option<AlreadyRecovered>, String> {
+    Ok(
+        archived_discovery_strict(checkpoint, daemon, None).unwrap_or_else(|error| {
+            tracing::warn!(%error, "optional historical update evidence is unavailable");
+            None
+        }),
+    )
+}
+
+/// Strict matching history, without ever converting archive data into startup
+/// recipes, paused panes, preserve-ID exceptions or restoration authority.
 pub(crate) fn pending_retirement(
     checkpoint: &Path,
     daemon: &Path,
 ) -> Result<Option<AlreadyRecovered>, String> {
     match classify_retained_prepared(checkpoint, daemon)? {
         Some(recovered) => Ok(Some(recovered)),
-        None => archived_discovery(checkpoint, daemon),
+        None => archived_discovery_strict(checkpoint, daemon, None),
     }
 }
 
-/// Return read-only planned retirement evidence. The caller must independently
-/// read and hash every named file to prove that the archive move completed.
-/// A pointer for a different installed daemon version is unrelated history.
+/// Scope lookup to the caller's actual original census before strict history
+/// decoding. A completed A update cannot block verification of unrelated B.
+pub(crate) fn pending_retirement_for_source(
+    checkpoint: &Path,
+    daemon: &Path,
+    source: &HostSessionProof,
+) -> Result<Option<AlreadyRecovered>, String> {
+    if let Some(bytes) = read_checkpoint(checkpoint)? {
+        #[derive(Deserialize)]
+        struct Header {
+            phase: String,
+            #[serde(default)]
+            proof: Option<HostSessionProof>,
+        }
+        let header: Header = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        if header.phase != "Prepared" {
+            return Ok(None);
+        }
+        let proof = header
+            .proof
+            .ok_or("Prepared checkpoint has no source proof")?;
+        if &proof != source {
+            return Ok(None);
+        }
+        return classify_retained_prepared(checkpoint, daemon);
+    }
+    archived_discovery_strict(checkpoint, daemon, Some(source))
+}
+
+/// Strict read-only planned retirement evidence. Actual archive material and
+/// its hashes remain mandatory before the root verifier can report continuity.
 pub(crate) fn archived_proof(
     checkpoint: &Path,
     daemon: &Path,
 ) -> Result<Option<ArchiveProof>, String> {
-    let Some((_, proof, record)) = load_retirement(checkpoint, None)? else {
+    let target = fs::canonicalize(daemon).map_err(|e| e.to_string())?;
+    let Some((_, proof, record)) = scoped_retirement(checkpoint, &target, None, None)? else {
         return Ok(None);
     };
-    let target = fs::canonicalize(daemon).map_err(|e| e.to_string())?;
-    if record.target.as_deref() != Some(target.as_path()) {
-        return Ok(None);
-    }
     validate_settled_identity(&record, checkpoint, &target)?;
     Ok(Some(proof))
 }
@@ -2714,7 +2874,7 @@ impl AlreadyRecovered {
         let current = match classify_retained_prepared(&self.checkpoint_path, &self.daemon_binary)?
         {
             Some(current) => current,
-            None => archived_discovery(&self.checkpoint_path, &self.daemon_binary)?
+            None => archived_discovery_strict(&self.checkpoint_path, &self.daemon_binary, None)?
                 .ok_or("Recovery archival no longer has its exact settled record")?,
         };
         if current.checkpoint_hash != self.checkpoint_hash
@@ -2797,6 +2957,7 @@ impl AlreadyRecovered {
     /// restoration, and Ready. The live/paused counts below are mechanical
     /// safety checks; they do not establish that the user's recovery succeeded.
     /// Unrelated owners created since the original recovery are left alone.
+    #[cfg(test)]
     pub(crate) fn archive_completed(
         &self,
         serving: &HostSessionProof,
@@ -2805,6 +2966,27 @@ impl AlreadyRecovered {
         paused_terminals: &[TerminalId],
         paused_chats: &[TerminalId],
     ) -> Result<(), String> {
+        let guard = RetirementGuard::acquire(&self.checkpoint_path)?;
+        self.archive_completed_with(
+            &guard,
+            serving,
+            live_terminals,
+            live_chats,
+            paused_terminals,
+            paused_chats,
+        )
+    }
+
+    pub(crate) fn archive_completed_with(
+        &self,
+        guard: &RetirementGuard,
+        serving: &HostSessionProof,
+        live_terminals: &[crate::terminal_ipc::TerminalDescriptor],
+        live_chats: &[Session],
+        paused_terminals: &[TerminalId],
+        paused_chats: &[TerminalId],
+    ) -> Result<(), String> {
+        guard.matches(&self.checkpoint_path)?;
         self.validate_current_inventory(
             serving,
             live_terminals,
@@ -2858,8 +3040,353 @@ impl AlreadyRecovered {
             }
         }
         record.validate_additional_issued_chats(&additional)?;
-        commit_archive(&self.checkpoint_path, &record, &bytes, additional)
+        commit_archive(guard, &self.checkpoint_path, &record, &bytes, additional)
     }
+}
+
+/// Serializes retirement helpers only. Daemon checkpoint writers never take
+/// this guard, so callers may hold it across read-only socket proofs without
+/// introducing a daemon/control-lock cycle. It conveys no restore authority.
+pub(crate) struct RetirementGuard {
+    lock: File,
+    checkpoint: PathBuf,
+}
+impl RetirementGuard {
+    pub(crate) fn acquire(checkpoint: &Path) -> Result<Self, String> {
+        let directory = checkpoint
+            .parent()
+            .ok_or("Recovery storage has no directory")?;
+        validate_private_directory(directory)?;
+        let directory = fs::canonicalize(directory).map_err(|e| e.to_string())?;
+        let name = checkpoint
+            .file_name()
+            .ok_or("Recovery checkpoint has no name")?;
+        let path = directory.join(".daemon-upgrade.retirement.lock");
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)
+            .map_err(|e| e.to_string())?;
+        let metadata = lock.metadata().map_err(|e| e.to_string())?;
+        if !private_single_file(&metadata) {
+            return Err("Retirement lock is not a private regular file".into());
+        }
+        loop {
+            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                break;
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error.to_string());
+            }
+        }
+        let current = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+        if current.dev() != metadata.dev() || current.ino() != metadata.ino() {
+            return Err("Retirement lock changed while it was acquired".into());
+        }
+        sweep_archive_temporaries(&directory);
+        Ok(Self {
+            lock,
+            checkpoint: directory.join(name),
+        })
+    }
+    fn matches(&self, checkpoint: &Path) -> Result<(), String> {
+        let directory = fs::canonicalize(
+            checkpoint
+                .parent()
+                .ok_or("Recovery storage has no directory")?,
+        )
+        .map_err(|e| e.to_string())?;
+        if directory.join(
+            checkpoint
+                .file_name()
+                .ok_or("Recovery checkpoint has no name")?,
+        ) != self.checkpoint
+        {
+            return Err("Retirement guard belongs to different recovery storage".into());
+        }
+        let held = self.lock.metadata().map_err(|e| e.to_string())?;
+        let current = fs::symlink_metadata(directory.join(".daemon-upgrade.retirement.lock"))
+            .map_err(|e| e.to_string())?;
+        if !private_single_file(&held) || current.dev() != held.dev() || current.ino() != held.ino()
+        {
+            return Err("Retirement lock changed during verification".into());
+        }
+        Ok(())
+    }
+}
+
+fn private_single_file(metadata: &fs::Metadata) -> bool {
+    metadata.is_file()
+        && metadata.uid() == crate::daemon::current_uid()
+        && metadata.mode() & 0o077 == 0
+        && metadata.nlink() == 1
+}
+
+// Legacy writers did not lock temporary OFDs. Prove no same-UID process has
+// the inode open before unlinking, rather than guessing from age or a lock.
+#[cfg(test)]
+fn unopened_temporary(metadata: &fs::Metadata, own_fd: i32) -> bool {
+    unopened_temporary_at(metadata, own_fd, Path::new("/proc"))
+}
+
+fn unopened_temporary_at(metadata: &fs::Metadata, own_fd: i32, proc_root: &Path) -> bool {
+    let Ok(processes) = fs::read_dir(proc_root) else {
+        return false;
+    };
+    for entry in processes {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let process = entry.path();
+        // /proc/PID ownership changes for nondumpable processes. Only the
+        // kernel status Uid fields route same-user processes; uncertainty
+        // means potentially open, so old temporary evidence is retained.
+        let status = match File::open(process.join("status")) {
+            Ok(file) => {
+                let mut bytes = Vec::new();
+                if file.take(64 * 1024 + 1).read_to_end(&mut bytes).is_err()
+                    || bytes.len() > 64 * 1024
+                {
+                    return false;
+                }
+                bytes
+            }
+            Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => {
+                continue;
+            }
+            Err(_) => return false,
+        };
+        let Some(uids) = status_uids(&status) else {
+            return false;
+        };
+        if !uids.contains(&crate::daemon::current_uid()) {
+            continue;
+        }
+        let descriptors = match fs::read_dir(process.join("fd")) {
+            Ok(fd) => fd,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => return false,
+        };
+        for descriptor in descriptors {
+            let Ok(descriptor) = descriptor else {
+                return false;
+            };
+            if pid == std::process::id()
+                && descriptor
+                    .file_name()
+                    .to_str()
+                    .and_then(|s| s.parse::<i32>().ok())
+                    == Some(own_fd)
+            {
+                continue;
+            }
+            match fs::metadata(descriptor.path()) {
+                Ok(m) if m.dev() == metadata.dev() && m.ino() == metadata.ino() => return false,
+                Ok(_) => {}
+                Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => {}
+                Err(_) => return false,
+            }
+        }
+    }
+    true
+}
+
+fn status_uids(bytes: &[u8]) -> Option<[u32; 4]> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut fields = text
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))?
+        .split_ascii_whitespace();
+    let uids = [
+        fields.next()?.parse().ok()?,
+        fields.next()?.parse().ok()?,
+        fields.next()?.parse().ok()?,
+        fields.next()?.parse().ok()?,
+    ];
+    fields.next().is_none().then_some(uids)
+}
+
+fn sweep_archive_temporaries(directory: &Path) {
+    sweep_archive_temporaries_at(directory, Path::new("/proc"));
+}
+
+fn sweep_archive_temporaries_at(directory: &Path, proc_root: &Path) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    let mut candidates = 0;
+    let mut removed = false;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        // tempfile's six random ASCII characters only. In particular this
+        // excludes .recovery-capture-*, every checkpoint custody path, and all
+        // content-addressed permanent evidence.
+        let suffix = name
+            .strip_prefix(".recovery-")
+            .or_else(|| name.strip_prefix(".retirement-"));
+        if !suffix.is_some_and(|s| s.len() == 6 && s.bytes().all(|b| b.is_ascii_alphanumeric())) {
+            continue;
+        }
+        candidates += 1;
+        if candidates > 64 {
+            break;
+        }
+        let file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(entry.path())
+        {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let Ok(metadata) = file.metadata() else {
+            continue;
+        };
+        if !private_single_file(&metadata)
+            || metadata.len() > LIMIT
+            || !unopened_temporary_at(&metadata, file.as_raw_fd(), proc_root)
+        {
+            continue;
+        }
+        let Ok(current) = fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if current.dev() == metadata.dev()
+            && current.ino() == metadata.ino()
+            && private_single_file(&current)
+        {
+            match fs::remove_file(entry.path()) {
+                Ok(()) => removed = true,
+                Err(error) => {
+                    tracing::warn!(%error,"orphan retirement temporary could not be removed")
+                }
+            }
+        }
+    }
+    if removed && let Err(error) = sync_directory(directory) {
+        tracing::warn!(%error,"orphan retirement cleanup could not be synced");
+    }
+}
+
+fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+    let from = std::ffi::CString::new(from.as_os_str().as_bytes())?;
+    let to = std::ffi::CString::new(to.as_os_str().as_bytes())?;
+    if unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    } == 0
+    {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(test)]
+thread_local! { static ARCHIVE_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnMut(&str)>>> = const { std::cell::RefCell::new(None) }; }
+#[cfg(test)]
+fn archive_test_hook(stage: &str) {
+    ARCHIVE_TEST_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(stage);
+        }
+    });
+}
+
+/// Once renamed, this is checkpoint custody, never orphan scratch space.
+/// Any failed restore leaves the exact path available for inspection.
+fn archive_claimed_checkpoint(
+    checkpoint: &Path,
+    archive: &Path,
+    expected: &[u8],
+) -> Result<(), String> {
+    let custody = checkpoint.with_file_name(format!(
+        ".checkpoint-retirement.{}.{}.json",
+        digest(expected),
+        uuid::Uuid::new_v4()
+    ));
+    #[cfg(test)]
+    archive_test_hook("before-claim");
+    match rename_noreplace(checkpoint, &custody) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return if read_checkpoint(archive)?.as_deref() == Some(expected) {
+                Ok(())
+            } else {
+                Err("Checkpoint disappeared without its exact verified archive".into())
+            };
+        }
+        Err(error) => return Err(error.to_string()),
+    }
+    let directory = checkpoint
+        .parent()
+        .ok_or("Checkpoint custody has no directory")?;
+    // The custody entry must be durable before a crash can remove the only
+    // canonical name. It is intentionally never swept or replayed.
+    let result = (|| {
+        sync_directory(directory)?;
+        #[cfg(test)]
+        archive_test_hook("after-claim");
+        let bytes = read_checkpoint(&custody)?.ok_or("Claimed checkpoint disappeared")?;
+        if bytes != expected {
+            return Err("Canonical checkpoint changed before the archive claim".into());
+        }
+        super::handoff::validate_checkpoint_bytes(&bytes)?;
+        match rename_noreplace(&custody, archive) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if read_checkpoint(archive)?.as_deref() != Some(expected) {
+                    return Err("Archive destination contains different evidence".into());
+                }
+                // Both copies are fully verified and identical; only the
+                // duplicate claimed inode can now be discarded.
+                fs::remove_file(&custody).map_err(|e| e.to_string())?;
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+        sync_directory(directory)
+    })();
+    if let Err(error) = result {
+        if fs::symlink_metadata(&custody).is_ok() {
+            match rename_noreplace(&custody, checkpoint) {
+                Ok(()) => {
+                    sync_directory(directory)?;
+                    return Err(format!(
+                        "{error}; claimed bytes were safely restored to {}",
+                        checkpoint.display()
+                    ));
+                }
+                Err(restore) => {
+                    return Err(format!(
+                        "{error}; current checkpoint was kept and claimed evidence remains at {} (restore refused: {restore})",
+                        custody.display()
+                    ));
+                }
+            }
+        }
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn valid_hash(hash: &str) -> bool {
@@ -2893,25 +3420,69 @@ fn sync_directory(directory: &Path) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+fn publish_active_retirement(checkpoint: &Path, active: &ActiveRecovery) -> Result<(), String> {
+    let path = checkpoint.with_file_name(ACTIVE_RECOVERY);
+    let usable = match read_checkpoint(&path) {
+        Ok(None) => true,
+        Ok(Some(bytes)) => serde_json::from_slice::<ActiveRecovery>(&bytes).is_ok_and(|pointer| {
+            pointer.version == 2
+                && valid_hash(&pointer.checkpoint_hash)
+                && valid_hash(&pointer.retirement_hash)
+        }),
+        Err(_) => false,
+    };
+    let quarantine = if usable {
+        None
+    } else {
+        let retained =
+            checkpoint.with_file_name(format!(".retirement-pointer.{}.json", uuid::Uuid::new_v4()));
+        match rename_noreplace(&path, &retained) {
+            Ok(()) => {
+                sync_directory(
+                    checkpoint
+                        .parent()
+                        .ok_or("Retirement pointer has no directory")?,
+                )?;
+                Some(retained)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.to_string()),
+        }
+    };
+    atomic_metadata(&path, active).map_err(|error| match quarantine {
+        Some(ref path) => format!(
+            "{error}; previous pointer evidence was retained at {}",
+            path.display()
+        ),
+        None => error,
+    })
+}
+
 fn commit_archive(
+    guard: &RetirementGuard,
     checkpoint: &Path,
     record: &RecoveryRecord,
     outcome: &[u8],
     additional: Vec<Session>,
 ) -> Result<(), String> {
+    guard.matches(checkpoint)?;
     let archive = archive_path(checkpoint, &record.checkpoint_hash);
-    let prior = load_retirement(checkpoint, Some(&record.checkpoint_hash))?;
     let current = read_checkpoint(checkpoint)?;
+    let prior = if current.is_some() {
+        scoped_retirement(checkpoint,record.target.as_deref().ok_or("Settled target is missing")?,Some(&record.source),Some(&record.checkpoint_hash)).unwrap_or_else(|error| {tracing::warn!(%error,"unusable prior retirement pointer was ignored for an independently verified canonical checkpoint");None})
+    } else {
+        load_retirement(checkpoint, Some(&record.checkpoint_hash))?
+    };
     if let Some(bytes) = &current {
         if digest(bytes) != record.checkpoint_hash {
             return Err(
                 "Prepared checkpoint changed before archival; all evidence was preserved".into(),
             );
         }
-        if fs::symlink_metadata(&archive).is_ok() {
-            return Err(
-                "Prepared archive destination already exists; no checkpoint was moved".into(),
-            );
+        if fs::symlink_metadata(&archive).is_ok()
+            && read_checkpoint(&archive)?.as_ref() != Some(bytes)
+        {
+            return Err("Prepared archive destination contains different evidence; canonical bytes were kept".into());
         }
     } else {
         let (_, proof, _) = prior
@@ -2980,36 +3551,18 @@ fn commit_archive(
     {
         return Err("Original settled outcome changed before archival".into());
     }
-    atomic_metadata(
-        &checkpoint.with_file_name(ACTIVE_RECOVERY),
+    publish_active_retirement(
+        checkpoint,
         &ActiveRecovery {
             version: 2,
             checkpoint_hash: record.checkpoint_hash.clone(),
             retirement_hash,
+            target: record.target.clone(),
+            source: Some(record.source.clone()),
         },
     )?;
     if let Some(bytes) = current {
-        if read_checkpoint(checkpoint)?.as_ref() != Some(&bytes) {
-            return Err(
-                "Prepared checkpoint changed during archival; no checkpoint was moved".into(),
-            );
-        }
-        let from =
-            std::ffi::CString::new(checkpoint.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
-        let to =
-            std::ffi::CString::new(archive.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
-        if unsafe {
-            libc::renameat2(
-                libc::AT_FDCWD,
-                from.as_ptr(),
-                libc::AT_FDCWD,
-                to.as_ptr(),
-                libc::RENAME_NOREPLACE,
-            )
-        } != 0
-        {
-            return Err(io::Error::last_os_error().to_string());
-        }
+        archive_claimed_checkpoint(checkpoint, &archive, &bytes)?;
     }
     sync_directory(
         checkpoint
@@ -4186,6 +4739,83 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_capture_rejects_known_identity_change_without_mutating_prior_scope() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let preparation = preparation(root.path());
+        let source = Session {
+            id: preparation.authority.census.terminals[0].id,
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Claude,
+                recipe: preparation.authority.census.terminals[0].launch.clone(),
+                session_id: Some("original-thread".into()),
+            },
+            proof: Some(preparation.authority.source.clone()),
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: Default::default(),
+        };
+        let mut capture = SnapshotCapture::default();
+        capture
+            .push(
+                source.clone(),
+                crate::chat::Snapshot {
+                    session_id: source.launch.session_id.clone(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let original_used = capture.used;
+        assert!(
+            capture
+                .push(
+                    source.clone(),
+                    crate::chat::Snapshot {
+                        session_id: Some("other-thread".into()),
+                        ..Default::default()
+                    }
+                )
+                .is_err()
+        );
+        assert_eq!(capture.used, original_used);
+        let saved = capture.finish();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].source, source);
+        let mut unnamed = source.clone();
+        unnamed.launch.session_id = None;
+        let mut captured = SnapshotCapture::default();
+        captured
+            .push(
+                unnamed.clone(),
+                crate::chat::Snapshot {
+                    session_id: source.launch.session_id.clone(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let before = captured.used;
+        for invalid in [String::new(), "x".repeat(1025)] {
+            assert!(
+                captured
+                    .push(
+                        unnamed.clone(),
+                        crate::chat::Snapshot {
+                            session_id: Some(invalid),
+                            ..Default::default()
+                        }
+                    )
+                    .is_err()
+            );
+            assert_eq!(captured.used, before);
+        }
+        let saved = captured.finish();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(
+            saved[0].source, unnamed,
+            "capture retains the immutable issued descriptor; only later read-only binding can use this exact snapshot"
+        );
+    }
+
+    #[test]
     fn captured_pane_aliases_and_presentations_bind_the_exact_confirmed_allocation() {
         let root = tempfile::tempdir_in("/var/tmp").unwrap();
         let preparation = preparation(root.path());
@@ -4690,6 +5320,119 @@ mod tests {
         record
             .validate_additional_issued_chats(&[later.clone()])
             .unwrap();
+        let mut wrong_target = later.clone();
+        wrong_target.terminal.as_mut().unwrap().launch.program = "/foreign/bin/cagents".into();
+        assert!(
+            record
+                .validate_additional_issued_chats(&[wrong_target.clone()])
+                .is_err()
+        );
+        let mut wrong_receipt_target: RecoveryRecord =
+            serde_json::from_value(serde_json::to_value(&record).unwrap()).unwrap();
+        wrong_receipt_target.target = Some("/foreign/bin/cagentsd".into());
+        assert!(
+            wrong_receipt_target.validate_issued_chats().is_err(),
+            "descriptor normalization is limited to the receipt's exact target executable"
+        );
+        let immutable_copy: RecoveryRecord =
+            serde_json::from_value(serde_json::to_value(&record).unwrap()).unwrap();
+        let mut settled = recovered_data(
+            immutable_copy,
+            &root.path().join("pure-checkpoint.json"),
+            target.to_path_buf(),
+            vec![later.clone()],
+            "pure-outcome".into(),
+        );
+        assert!(current_recovered_chat(
+            &source,
+            &settled.normalized_chat(&later),
+            proof
+        ));
+        assert!(
+            !current_recovered_chat(&source, &settled.normalized_chat(&wrong_target), proof),
+            "current inventory cannot normalize another installed console binary"
+        );
+        let invalid: [fn(&mut Session); 11] = [
+            |chat| chat.launch.session_id = Some("foreign-thread".into()),
+            |chat| chat.proof = None,
+            |chat| chat.proof.as_mut().unwrap().boot_id = BootId::new("foreign-boot"),
+            |chat| chat.id = TerminalId::new(),
+            |chat| chat.launch.recipe.arguments.push("foreign".into()),
+            |chat| chat.terminal.as_mut().unwrap().launch.program = "/foreign/bin/cagents".into(),
+            |chat| {
+                chat.terminal.as_mut().unwrap().launch.arguments[2] =
+                    crate::model::AgentId::new().to_string()
+            },
+            |chat| {
+                chat.terminal
+                    .as_mut()
+                    .unwrap()
+                    .launch
+                    .arguments
+                    .push("foreign".into())
+            },
+            |chat| {
+                chat.terminal
+                    .as_mut()
+                    .unwrap()
+                    .launch
+                    .working_directory
+                    .push("foreign")
+            },
+            |chat| {
+                chat.terminal
+                    .as_mut()
+                    .unwrap()
+                    .launch
+                    .environment
+                    .insert("OTHER".into(), "foreign".into());
+            },
+            |chat| {
+                chat.terminal
+                    .as_mut()
+                    .unwrap()
+                    .launch
+                    .unset_environment
+                    .insert("OTHER".into());
+            },
+        ];
+        for (index, mutate) in invalid.into_iter().enumerate() {
+            let mut changed = later.clone();
+            mutate(&mut changed);
+            assert!(
+                record
+                    .validate_additional_issued_chats(&[changed.clone()])
+                    .is_err()
+            );
+            if index != 0 {
+                assert!(!current_recovered_chat(
+                    &source,
+                    &settled.normalized_chat(&changed),
+                    proof
+                ));
+            } else {
+                // /clear may preserve a real current owner, but its different
+                // thread cannot alias the original captured conversation.
+                assert!(current_recovered_chat(
+                    &source,
+                    &settled.normalized_chat(&changed),
+                    proof
+                ));
+                assert!(!captured_chat_alias(
+                    &census,
+                    &source,
+                    &settled.normalized_chat(&changed),
+                    proof
+                ));
+            }
+        }
+        settled.witness.adopted_terminals[0]
+            .upgrade_relaunches
+            .clear();
+        assert!(
+            !current_recovered_chat(&source, &settled.normalized_chat(&later), proof),
+            "current inventory retains the immutable source/relaunch proof"
+        );
         let mut foreign = later.clone();
         foreign
             .terminal
@@ -5437,6 +6180,7 @@ mod tests {
                 version: 2,
                 checkpoint_hash: earlier.checkpoint_hash,
                 retirement_hash: earlier_retirement_hash,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -5469,6 +6213,7 @@ mod tests {
                 version: 2,
                 checkpoint_hash: record.checkpoint_hash.clone(),
                 retirement_hash: planned_hash.clone(),
+                ..Default::default()
             },
         )
         .unwrap();
@@ -5533,6 +6278,500 @@ mod tests {
                 .is_none()
         );
         assert_eq!(fs::read(&archive).unwrap(), checkpoint_bytes);
+    }
+
+    struct SettledFiles {
+        root: tempfile::TempDir,
+        checkpoint: PathBuf,
+        target: PathBuf,
+        outcome: PathBuf,
+        record: RecoveryRecord,
+        checkpoint_bytes: Vec<u8>,
+        outcome_bytes: Vec<u8>,
+    }
+
+    fn settled_files() -> SettledFiles {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let preparation = preparation(root.path());
+        let checkpoint_bytes = checkpoint(&preparation, "Prepared");
+        let authority = preparation.authority.clone();
+        drop(preparation);
+        let prefix = root.path().join("install");
+        let bin = prefix.join("versions/fixture/bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(
+            prefix.join(".cagents-install-root"),
+            "cagents install root\n",
+        )
+        .unwrap();
+        for name in ["cagents", "cagents-ui", "cagentsd"] {
+            fs::write(bin.join(name), format!("private {name}")).unwrap();
+        }
+        let target = fs::canonicalize(bin.join("cagentsd")).unwrap();
+        let state = prefix.join(".update");
+        fs::create_dir(&state).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+        let request = b"original immutable request";
+        save(&state.join(format!("{}.request", authority.job)), request);
+        let mut successor = authority.source.clone();
+        successor.host_incarnation = HostIncarnation::new("settled-successor");
+        let record = RecoveryRecord {
+            version: 2,
+            origin: Origin::AcknowledgedPrepare,
+            job: authority.job,
+            request_identity: digest(
+                &serde_json::to_vec(authority.reviewed.as_ref().unwrap()).unwrap(),
+            ),
+            job_request_hash: digest(request),
+            reviewed: authority.reviewed,
+            windows: authority.windows,
+            source: authority.source,
+            checkpoint_hash: digest(&checkpoint_bytes),
+            census: authority.census,
+            adopted_terminals: Vec::new(),
+            adopted_chats: Vec::new(),
+            adopted_chat_descriptors: Vec::new(),
+            adopted_terminal_descriptors: Vec::new(),
+            paused_terminals: vec![authority.expected[0].1],
+            paused_chats: Vec::new(),
+            settled: true,
+            successor: Some(successor),
+            target_hash: executable_hash(&target).unwrap(),
+            target: Some(target.clone()),
+            #[cfg(feature = "host")]
+            authority: None,
+        };
+        let checkpoint = authority.checkpoint_path;
+        save(&checkpoint, &checkpoint_bytes);
+        let outcome = checkpoint.with_file_name(recovery_name(&record.checkpoint_hash));
+        let outcome_bytes = serde_json::to_vec(&record).unwrap();
+        save(&outcome, &outcome_bytes);
+        SettledFiles {
+            root,
+            checkpoint,
+            target,
+            outcome,
+            record,
+            checkpoint_bytes,
+            outcome_bytes,
+        }
+    }
+
+    fn complete_files(files: &SettledFiles) {
+        let recovered = pending_retirement(&files.checkpoint, &files.target)
+            .unwrap()
+            .unwrap();
+        recovered
+            .archive_completed(
+                files.record.successor.as_ref().unwrap(),
+                &[],
+                &[],
+                &files.record.paused_terminals,
+                &[],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn retained_job_routing_binds_the_producers_exact_job_and_capture() {
+        let files = settled_files();
+        let mut pending = PendingRecovery::inspect_at(&files.checkpoint)
+            .unwrap()
+            .unwrap();
+        assert!(pending.matches_retained_job("manual", b"request", b"census"));
+        pending.original_census_complete = true;
+        assert!(!pending.matches_retained_job("manual", b"request", b"census"));
+        for producer in [
+            CaptureProducer::Proposed {
+                job: "job".into(),
+                request_hash: digest(b"request"),
+            },
+            CaptureProducer::Acknowledged {
+                job: "job".into(),
+                request_hash: digest(b"request"),
+            },
+        ] {
+            pending.producer = Some(producer);
+            assert!(pending.matches_retained_job("job", b"request", b"census"));
+            assert!(!pending.matches_retained_job("foreign", b"request", b"census"));
+            assert!(!pending.matches_retained_job("job", b"changed", b"census"));
+        }
+        pending.producer = Some(CaptureProducer::ExplicitCensus {
+            transaction: "job".into(),
+            census_hash: digest(b"census"),
+        });
+        assert!(pending.matches_retained_job("job", b"request", b"census"));
+        assert!(!pending.matches_retained_job("job", b"request", b"changed"));
+        assert!(!pending.matches_retained_job("foreign", b"request", b"census"));
+    }
+
+    #[test]
+    fn historical_routing_ignores_other_target_and_source_before_strict_payloads() {
+        let files = settled_files();
+        complete_files(&files);
+        let pointer = files.checkpoint.with_file_name(ACTIVE_RECOVERY);
+        let bytes = read_checkpoint(&pointer).unwrap().unwrap();
+        let active: ActiveRecovery = serde_json::from_slice(&bytes).unwrap();
+        fs::remove_file(retirement_path(&files.checkpoint, &active.retirement_hash)).unwrap();
+        let other = files.target.with_file_name("other-cagentsd");
+        fs::write(&other, b"unrelated installed daemon").unwrap();
+        assert!(
+            archived_discovery(&files.checkpoint, &other)
+                .unwrap()
+                .is_none()
+        );
+        assert!(archived_proof(&files.checkpoint, &other).unwrap().is_none());
+        let mut source = files.record.source.clone();
+        source.host_incarnation = HostIncarnation::new("unrelated-source");
+        assert!(
+            pending_retirement_for_source(&files.checkpoint, &files.target, &source)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            pending_retirement_for_source(&files.checkpoint, &files.target, &files.record.source)
+                .is_err()
+        );
+        assert!(archived_proof(&files.checkpoint, &files.target).is_err());
+        assert!(
+            archived_discovery(&files.checkpoint, &files.target)
+                .unwrap()
+                .is_none()
+        );
+        save(&pointer, b"unsupported, incomplete unrelated history");
+        assert!(
+            archived_discovery(&files.checkpoint, &files.target)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            pending_retirement_for_source(&files.checkpoint, &files.target, &source)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(fs::read(&files.outcome).unwrap(), files.outcome_bytes);
+    }
+
+    #[test]
+    fn canonical_unrelated_source_never_decodes_stale_retirement() {
+        let files = settled_files();
+        save(
+            &files.checkpoint.with_file_name(ACTIVE_RECOVERY),
+            b"old malformed pointer",
+        );
+        let mut other = files.record.source.clone();
+        other.host_incarnation = HostIncarnation::new("new-source");
+        assert!(
+            pending_retirement_for_source(&files.checkpoint, &files.target, &other)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            classify_retained_prepared(&files.checkpoint, &files.target)
+                .unwrap()
+                .is_some()
+        );
+        fs::set_permissions(
+            files.checkpoint.with_file_name(ACTIVE_RECOVERY),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert!(
+            classify_retained_prepared(&files.checkpoint, &files.target)
+                .unwrap()
+                .is_some()
+        );
+        fs::remove_file(files.checkpoint.with_file_name(ACTIVE_RECOVERY)).unwrap();
+        std::os::unix::fs::symlink(
+            &files.outcome,
+            files.checkpoint.with_file_name(ACTIVE_RECOVERY),
+        )
+        .unwrap();
+        assert!(
+            classify_retained_prepared(&files.checkpoint, &files.target)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(fs::read(&files.checkpoint).unwrap(), files.checkpoint_bytes);
+    }
+
+    #[test]
+    fn archive_claim_validates_the_moved_inode_and_restores_changed_checkpoint() {
+        let files = settled_files();
+        let mut ready: serde_json::Value = serde_json::from_slice(&files.checkpoint_bytes).unwrap();
+        ready["phase"] = "Ready".into();
+        let ready = serde_json::to_vec(&ready).unwrap();
+        let canonical = files.checkpoint.clone();
+        let replacement = ready.clone();
+        ARCHIVE_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |stage| {
+                if stage == "before-claim" {
+                    let temp = canonical.with_file_name("new-ready.json");
+                    save(&temp, &replacement);
+                    fs::rename(temp, &canonical).unwrap();
+                }
+            }))
+        });
+        let archive = archive_path(&files.checkpoint, &files.record.checkpoint_hash);
+        let error =
+            archive_claimed_checkpoint(&files.checkpoint, &archive, &files.checkpoint_bytes)
+                .unwrap_err();
+        ARCHIVE_TEST_HOOK.with(|hook| hook.borrow_mut().take());
+        assert!(error.contains("safely restored"), "{error}");
+        assert_eq!(fs::read(&files.checkpoint).unwrap(), ready);
+        assert!(!archive.exists());
+        assert_eq!(fs::read(&files.outcome).unwrap(), files.outcome_bytes);
+    }
+
+    #[test]
+    fn archive_mismatch_retains_typed_custody_when_new_canonical_already_exists() {
+        let files = settled_files();
+        let mut ready: serde_json::Value = serde_json::from_slice(&files.checkpoint_bytes).unwrap();
+        ready["phase"] = "Ready".into();
+        let ready = serde_json::to_vec(&ready).unwrap();
+        let mut newer = ready.clone();
+        newer.push(b'\n');
+        let canonical = files.checkpoint.clone();
+        let moved = ready.clone();
+        let published = newer.clone();
+        ARCHIVE_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |stage| {
+                let bytes = if stage == "before-claim" {
+                    &moved
+                } else {
+                    &published
+                };
+                let temp = canonical.with_file_name("new-ready.json");
+                save(&temp, bytes);
+                fs::rename(temp, &canonical).unwrap();
+            }))
+        });
+        let archive = archive_path(&files.checkpoint, &files.record.checkpoint_hash);
+        let error =
+            archive_claimed_checkpoint(&files.checkpoint, &archive, &files.checkpoint_bytes)
+                .unwrap_err();
+        ARCHIVE_TEST_HOOK.with(|hook| hook.borrow_mut().take());
+        let custody = fs::read_dir(files.root.path())
+            .unwrap()
+            .flatten()
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".checkpoint-retirement.")
+            })
+            .unwrap()
+            .path();
+        assert!(error.contains(custody.to_str().unwrap()), "{error}");
+        assert_eq!(fs::read(&custody).unwrap(), ready);
+        assert_eq!(fs::read(&files.checkpoint).unwrap(), newer);
+        assert!(!archive.exists());
+        drop(RetirementGuard::acquire(&files.checkpoint).unwrap());
+        assert_eq!(
+            fs::read(&custody).unwrap(),
+            ready,
+            "custody must never be swept as scratch metadata"
+        );
+        fs::remove_file(&files.checkpoint).unwrap();
+        assert!(
+            require_absent_checkpoint(&files.checkpoint)
+                .unwrap_err()
+                .contains(custody.to_str().unwrap())
+        );
+    }
+
+    #[test]
+    fn concurrent_retirement_helpers_all_complete_idempotently() {
+        let files = settled_files();
+        let recovered = pending_retirement(&files.checkpoint, &files.target)
+            .unwrap()
+            .unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let handles = (0..4)
+            .map(|_| {
+                let recovered = recovered.clone();
+                let barrier = barrier.clone();
+                let serving = files.record.successor.clone().unwrap();
+                let paused = files.record.paused_terminals.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    recovered.archive_completed(&serving, &[], &[], &paused, &[])
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+        assert!(!files.checkpoint.exists());
+        let proof = archived_proof(&files.checkpoint, &files.target)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fs::read(proof.archive_path).unwrap(),
+            files.checkpoint_bytes
+        );
+        assert_eq!(fs::read(files.outcome).unwrap(), files.outcome_bytes);
+        assert_eq!(
+            fs::read_dir(files.root.path())
+                .unwrap()
+                .flatten()
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("daemon-upgrade.retirement."))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn identical_existing_archive_is_a_successful_no_clobber_retry() {
+        let files = settled_files();
+        let archive = archive_path(&files.checkpoint, &files.record.checkpoint_hash);
+        save(&archive, &files.checkpoint_bytes);
+        complete_files(&files);
+        assert!(!files.checkpoint.exists());
+        assert_eq!(fs::read(&archive).unwrap(), files.checkpoint_bytes);
+        assert_eq!(fs::read(&files.outcome).unwrap(), files.outcome_bytes);
+    }
+
+    #[test]
+    fn unknown_process_uid_or_uninspectable_same_user_retains_metadata() {
+        let files = settled_files();
+        let orphan = files.root.path().join(".recovery-Ab12Cd");
+        save(&orphan, b"unproven orphan");
+        let proc_root = files.root.path().join("proc-model");
+        let process = proc_root.join("123456");
+        fs::create_dir_all(&process).unwrap();
+        save(&process.join("status"), b"Uid: unknown\n");
+        sweep_archive_temporaries_at(files.root.path(), &proc_root);
+        assert!(
+            orphan.exists(),
+            "unknown status must not fall back to proc-directory ownership"
+        );
+        let uid = crate::daemon::current_uid();
+        save(
+            &process.join("status"),
+            format!("Uid:\t{uid}\t{uid}\t{uid}\t{uid}\n").as_bytes(),
+        );
+        save(&process.join("fd"), b"uninspectable descriptor directory");
+        sweep_archive_temporaries_at(files.root.path(), &proc_root);
+        assert!(
+            orphan.exists(),
+            "same-UID process with unavailable descriptors may still hold the file"
+        );
+        assert_eq!(
+            status_uids(format!("Uid:\t{uid}\t{uid}\t{uid}\t{uid}\n").as_bytes()),
+            Some([uid; 4])
+        );
+    }
+
+    #[test]
+    fn verified_new_canonical_quarantines_unsafe_history_without_losing_evidence() {
+        for symlink in [false, true] {
+            let files = settled_files();
+            let pointer = files.checkpoint.with_file_name(ACTIVE_RECOVERY);
+            let old_target = files.root.path().join("old-unrelated-pointer");
+            save(&old_target, b"unparseable unrelated historical metadata");
+            if symlink {
+                std::os::unix::fs::symlink(&old_target, &pointer).unwrap();
+            } else {
+                save(&pointer, b"unparseable unrelated historical metadata");
+                fs::set_permissions(&pointer, fs::Permissions::from_mode(0o644)).unwrap();
+            }
+            complete_files(&files);
+            let quarantine = fs::read_dir(files.root.path())
+                .unwrap()
+                .flatten()
+                .find(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".retirement-pointer.")
+                })
+                .unwrap()
+                .path();
+            if symlink {
+                assert_eq!(fs::read_link(&quarantine).unwrap(), old_target);
+            } else {
+                assert_eq!(
+                    fs::read(&quarantine).unwrap(),
+                    b"unparseable unrelated historical metadata"
+                );
+            }
+            assert_eq!(
+                fs::read(&old_target).unwrap(),
+                b"unparseable unrelated historical metadata"
+            );
+            let proof = archived_proof(&files.checkpoint, &files.target)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                fs::read(proof.archive_path).unwrap(),
+                files.checkpoint_bytes
+            );
+            assert_eq!(fs::read(&files.outcome).unwrap(), files.outcome_bytes);
+        }
+    }
+
+    #[test]
+    fn retirement_sweeps_only_closed_private_metadata_temporaries() {
+        let files = settled_files();
+        let active = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(files.root.path().join(".recovery-Ab12Cd"))
+            .unwrap();
+        let inspection = File::open(files.root.path().join(".recovery-Ab12Cd")).unwrap();
+        assert!(!unopened_temporary(
+            &inspection.metadata().unwrap(),
+            inspection.as_raw_fd()
+        ));
+        drop(inspection);
+        let proc_root = files.root.path().join("proc-model");
+        let process = proc_root.join(std::process::id().to_string());
+        fs::create_dir_all(process.join("fd")).unwrap();
+        let uid = crate::daemon::current_uid();
+        save(
+            &process.join("status"),
+            format!("Name:\ttest\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n").as_bytes(),
+        );
+        std::os::unix::fs::symlink(
+            format!("/proc/self/fd/{}", active.as_raw_fd()),
+            process.join("fd").join(active.as_raw_fd().to_string()),
+        )
+        .unwrap();
+        let orphan = files.root.path().join(".retirement-Ef34Gh");
+        save(&orphan, b"orphan metadata");
+        let capture = files.root.path().join(".recovery-capture-private");
+        save(&capture, b"active capture");
+        let custody = files
+            .root
+            .path()
+            .join(".checkpoint-retirement.private.json");
+        save(&custody, b"sole checkpoint custody");
+        let symlink = files.root.path().join(".recovery-Ij56Kl");
+        std::os::unix::fs::symlink(&capture, &symlink).unwrap();
+        let linked = files.root.path().join(".retirement-Mn78Op");
+        fs::hard_link(&capture, &linked).unwrap();
+        sweep_archive_temporaries_at(files.root.path(), &proc_root);
+        assert!(!orphan.exists());
+        assert!(files.root.path().join(".recovery-Ab12Cd").exists());
+        assert_eq!(fs::read(&capture).unwrap(), b"active capture");
+        assert_eq!(fs::read(&custody).unwrap(), b"sole checkpoint custody");
+        assert!(
+            fs::symlink_metadata(&symlink)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(linked.exists());
+        drop(active);
+        sweep_archive_temporaries_at(files.root.path(), &proc_root);
+        assert!(!files.root.path().join(".recovery-Ab12Cd").exists());
     }
 
     #[test]

@@ -192,9 +192,7 @@ impl Fixture {
         let mut state = HostState::new(self.proof.clone());
         state.enable_holder_recovery();
         state.register_client(0);
-        state.install_model(
-            crate::host::model::Registry::at(&self.root.join("registry.sqlite3")).unwrap(),
-        );
+        state.install_model(crate::host::model::Registry::open().unwrap());
         let host = Arc::new(HostLock::new(state));
         let broker = crate::host::notifications::Broker::start(
             &host,
@@ -541,7 +539,10 @@ fn preserved_retry_authenticates_original_native_owner_without_reopening_paused_
         Handle::inspect_remote(&fixture.owners[0].record, fixture.proof.clone()).unwrap();
     assert_eq!(unchanged.source, adopted);
 
-    restore_ready_checkpoint(fixture.host(), &adopted, &ready).unwrap();
+    // Use the production Ready-to-Restoring startup transition, rather than
+    // admitting directly from this test's still-Ready in-memory checkpoint.
+    // The ordinary path must complete its owner restore and Ready publication.
+    crate::host::update_recovery::restore_ordinary(fixture.host()).unwrap();
     let current = {
         let state = fixture.host().lock().unwrap();
         assert_eq!(state.chats.len(), 1);
@@ -554,6 +555,32 @@ fn preserved_retry_authenticates_original_native_owner_without_reopening_paused_
         assert_eq!(record.session.proof.as_ref(), Some(&fixture.proof));
         record.session.clone()
     };
+    let store = crate::upgrade::handoff::Store::discover().unwrap();
+    assert!(store.load().unwrap().is_none());
+    let listed = current_roster(&fixture)
+        .1
+        .into_iter()
+        .find(|session| session.id == adopted.id)
+        .unwrap();
+    assert!(
+        store
+            .recovered_chats()
+            .unwrap()
+            .proves(&adopted, &listed, &fixture.proof)
+    );
+    let published: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            store
+                .path
+                .with_file_name("daemon-upgrade.ready-outcome.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        published["serving"],
+        serde_json::to_value(&fixture.proof).unwrap()
+    );
     let authenticated =
         Handle::inspect_remote(&fixture.owners[0].record, fixture.proof.clone()).unwrap();
     assert_eq!(authenticated.source, current);
@@ -757,6 +784,41 @@ fn settled_cold_host_keeps_real_actors_and_terminal_then_verifies_original_censu
     store.save(&checkpoint).unwrap();
     let checkpoint_bytes = fs::read(&store.path).unwrap();
     fixture.save_paused(originally_paused.clone());
+    // A genuinely retained paused pane keeps its actual saved page referenced.
+    // Cold startup must not manufacture this reference from archive metadata.
+    let mut registry = crate::host::model::Registry::open().unwrap();
+    registry
+        .apply(&crate::workspace_model::ModelEdit::OpenProject {
+            repository: fixture.root.join("project"),
+            name: "Private recovery fixture".into(),
+            kind: crate::model::ProjectKind::Folder,
+        })
+        .unwrap();
+    let scope = crate::workspace_model::views::Scope::Worktree {
+        repository: fixture.root.join("project"),
+        path: fixture.root.join("project"),
+    };
+    let seeded = registry
+        .apply(&crate::workspace_model::ModelEdit::SeedView {
+            scope,
+            panes: vec![crate::workspace_model::views::Pane {
+                id: crate::model::CardId::new(),
+                title: "Retained paused fixture".into(),
+                user_title: None,
+                pending_terminal_start: false,
+                width_fraction: 1.0,
+                kind: crate::model::CardKind::Chat(originally_paused.clone()),
+                scope: None,
+            }],
+            closed: vec![],
+        })
+        .unwrap();
+    assert!(
+        seeded.changed,
+        "the paused-pane reference must be published in an open project"
+    );
+    drop(registry);
+
     // This owner really ended during the incomplete preparation. A live
     // unadopted helper is quarantined work, not a paused history success.
     crate::host::chat::process(
@@ -815,6 +877,42 @@ fn settled_cold_host_keeps_real_actors_and_terminal_then_verifies_original_censu
             .handle
             .actor_identity(),
         Some(actor.clone())
+    );
+    // The original receipt-bearing B recovery wrote this paused page before
+    // it settled. A later cold daemon may observe it, never reconstruct it
+    // from the immutable outcome if the person has since closed the pane.
+    let mut paused =
+        crate::upgrade::floor::Record::new(source.clone(), vec![originally_paused.clone()], vec![]);
+    paused.snapshots = census
+        .snapshots
+        .iter()
+        .filter(|snapshot| snapshot.source == originally_paused)
+        .cloned()
+        .collect();
+    paused.save().unwrap();
+    let retained = crate::upgrade::floor::record_for_source(&source)
+        .unwrap()
+        .unwrap();
+    assert!(retained.chats.contains(&originally_paused));
+    assert!(
+        retained
+            .snapshots
+            .iter()
+            .any(|snapshot| snapshot.source == originally_paused)
+    );
+    let model = crate::host::model::Registry::open()
+        .unwrap()
+        .model()
+        .unwrap();
+    let reference_retained = model.views.iter().any(|view| {
+        view.panes.iter().any(|pane| {
+            matches!(&pane.kind, crate::model::CardKind::Chat(session)
+                if session.id == originally_paused.id)
+        })
+    });
+    assert!(
+        reference_retained,
+        "B first recovery must retain a real saved paused-pane reference before settling"
     );
     let target = std::env::current_exe().unwrap();
     let outcome = crate::upgrade::recovery::fixture_settled_outcome(
@@ -977,7 +1075,16 @@ fn cold_host_hop(root: PathBuf, incarnation: &str) {
             !canonical,
             "completed recovery must use ordinary archived holder discovery"
         );
-        assert!(crate::host::update_recovery::restore_archived(fixture.host(), &[]).unwrap());
+        crate::host::update_recovery::restore_ordinary(fixture.host()).unwrap();
+        let ready = data
+            .checkpoint
+            .with_file_name("daemon-upgrade.ready-outcome.json");
+        let publication: serde_json::Value =
+            serde_json::from_slice(&fs::read(ready).unwrap()).unwrap();
+        assert_eq!(
+            publication["serving"],
+            serde_json::to_value(&fixture.proof).unwrap()
+        );
     }
     {
         let state = fixture.host().lock().unwrap();
@@ -1011,6 +1118,16 @@ fn cold_host_hop(root: PathBuf, incarnation: &str) {
         }
     }
     eprintln!("{incarnation}: cold host restoration settled; verifying original census");
+    let outcome: serde_json::Value = serde_json::from_slice(&data.outcome_bytes).unwrap();
+    let cold = data.checkpoint.with_file_name(format!(
+        "daemon-upgrade.cold-outcome.{}.json",
+        outcome["checkpoint_hash"].as_str().unwrap()
+    ));
+    let cold: serde_json::Value = serde_json::from_slice(&fs::read(cold).unwrap()).unwrap();
+    eprintln!(
+        "{incarnation}: exact cold-proof completeness: {}",
+        cold["completeness"]
+    );
     assert!(
         data.original_child.is_current(),
         "the exact original terminal child must survive every host process"
@@ -1040,7 +1157,38 @@ fn cold_host_hop(root: PathBuf, incarnation: &str) {
         );
         let retired = with_private_socket(&fixture, || {
             if incarnation == "cold-C" {
-                crate::update::recovery::retire_current_service()
+                // The cold-start helper and the final update verifier can
+                // discover the same pending retirement. Serialize the whole
+                // root proof so the loser observes durable completion rather
+                // than an intermediate canonical-custody window.
+                let results = thread::scope(|scope| {
+                    let first = scope.spawn(crate::update::recovery::retire_current_service);
+                    let second = scope.spawn(crate::update::recovery::retire_current_service);
+                    [first.join().unwrap(), second.join().unwrap()]
+                });
+                assert_eq!(
+                    results
+                        .iter()
+                        .filter(|result| matches!(
+                            result,
+                            Ok(crate::update::recovery::RetirementStatus::Completed)
+                        ))
+                        .count(),
+                    1,
+                    "{results:?}"
+                );
+                assert_eq!(
+                    results
+                        .iter()
+                        .filter(|result| matches!(
+                            result,
+                            Ok(crate::update::recovery::RetirementStatus::AlreadyCompleted)
+                        ))
+                        .count(),
+                    1,
+                    "{results:?}"
+                );
+                Ok(crate::update::recovery::RetirementStatus::Completed)
             } else {
                 crate::update::recovery::refresh_completed_service()
             }

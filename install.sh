@@ -520,6 +520,11 @@ DOWNLOAD_DIR=$(mktemp -d "$TEMP_ROOT/cagents-download.XXXXXX")
 INSTALL_STAGE=
 NEW_VERSION_DIR=
 NEW_VERSION_PREPARED=0
+NEW_VERSION_EXISTING=0
+NEW_VERSION_FRESH=0
+NEW_VERSION_RETAINED=0
+EXISTING_INSTALLED=0
+CANDIDATE_MARKER_MISMATCH=0
 PREPARED_MARKER_TEMP=
 CURRENT_TEMP=
 CURRENT_SWITCHED=0
@@ -638,11 +643,38 @@ inspect_update_recovery() {
         --census "$INSTALL_CENSUS_PATH" --outcome "$INSTALL_OUTCOME_PATH" \
         --candidate-cli "$NEW_VERSION_DIR/bin/cagents" >/dev/null
 }
+mark_retained_candidate() {
+    if [ "$NEW_VERSION_FRESH" -eq 1 ] && [ "$NEW_VERSION_PREPARED" -eq 0 ]; then
+        # This private marker permits only a later archive/tree revalidation.
+        # It grants neither recovery custody nor authority over a daemon.
+        retained_temp=$NEW_VERSION_DIR/.retained-marker.$$
+        if (umask 077; set -C; retained_marker_contents > "$retained_temp") \
+            && mv -Tf "$retained_temp" "$NEW_VERSION_DIR/$RETAINED_MARKER"; then
+            NEW_VERSION_RETAINED=1
+        else
+            rm -f "$retained_temp" || :
+            printf '%s: could not record retained-candidate retry metadata; keep the candidate for inspection\n' "$PROGRAM" >&2
+        fi
+    fi
+}
 retain_recovery_evidence() {
     RETAIN_RECOVERY=1
+    mark_retained_candidate
     recovery_executable=$(printf '%s' "$NEW_VERSION_DIR/bin/cagents" | sed "s/'/'\\\\''/g")
-    printf "%s: original terminal survival is unverified; kept the checkpoint, candidate and recovery evidence at %s and %s. Inspect with '%s' --no-start daemon status and '%s' --no-start terminal list.\n" \
+    printf "%s: terminal service readiness is unverified; retained the candidate and recovery evidence at %s and %s. Inspect with '%s' --no-start daemon status and '%s' --no-start terminal list.\n" \
         "$PROGRAM" "$NEW_VERSION_DIR" "$INSTALL_OUTCOME_PATH" "$recovery_executable" "$recovery_executable" >&2
+}
+print_candidate_start_command() {
+    recovery_executable=$(printf '%s' "$NEW_VERSION_DIR/bin/cagents" | sed "s/'/'\\\\''/g")
+    printf "%s: the selected daemon is not verified ready. Start it with '%s' daemon start, then inspect '%s' --no-start daemon status and '%s' --no-start terminal list.\n" \
+        "$PROGRAM" "$recovery_executable" "$recovery_executable" "$recovery_executable" >&2
+}
+inspect_pending_update_recovery() {
+    set -- daemon inspect-pending-update-recovery --candidate-cli "$NEW_VERSION_DIR/bin/cagents"
+    if [ -n "${CAGENTS_INSTALL_CENSUS_PATH:-}" ]; then
+        set -- "$@" --census "$INSTALL_CENSUS_PATH"
+    fi
+    installer_tool "$CANDIDATE_COORDINATOR" "$@" >/dev/null
 }
 cleanup() {
     cleanup_status=$?
@@ -667,7 +699,13 @@ cleanup() {
                 # including during launcher publication. Keep its installation.
                 TRANSACTION_COMMITTED=1
                 RETAIN_RECOVERY=1
-                if ! verify_update_census; then retain_recovery_evidence; fi
+                mark_retained_candidate
+                if ! verify_update_census; then
+                    # Unknown status can conceal Prepared recovery. Preserve
+                    # its exact shared-owner command instead of only status.
+                    inspect_update_recovery || :
+                    retain_recovery_evidence
+                fi
                 RECOVERY_OUTCOME_SETTLED=1
                 printf '%s: the original terminal service could not be verified; retained the candidate and recovery evidence instead of rewinding its binaries\n' \
                     "$PROGRAM" >&2
@@ -702,8 +740,24 @@ cleanup() {
         [ "$restored_schema" != none ] || restored_schema=$OLDEST_STORE_SCHEMA
         if ! installer_lease_tool "$NEW_VERSION_DIR/bin/cagents" daemon downgrade-store "$restored_schema" >/dev/null; then
             TRANSACTION_COMMITTED=1
-            printf '%s: could not convert the shared-model store back to schema %s, which the previous version reads; retained the new installation, which reads the store; inspect cagents daemon status before retrying\n' \
+            RETAIN_RECOVERY=1
+            mark_retained_candidate
+            printf '%s: could not convert the shared-model store back to schema %s, which the previous version reads; retained the new installation, which reads the store\n' \
                 "$PROGRAM" "$restored_schema" >&2
+            if inspect_update_recovery; then
+                if [ -z "${CAGENTS_DAEMON_LEASE_FD:-}" ] \
+                    && installer_tool "$NEW_VERSION_DIR/bin/cagents" daemon start >/dev/null \
+                    && verify_update_census; then
+                    RECOVERY_OUTCOME_SETTLED=1
+                else
+                    retain_recovery_evidence
+                    print_candidate_start_command
+                    RECOVERY_OUTCOME_SETTLED=1
+                fi
+            else
+                retain_recovery_evidence
+                RECOVERY_OUTCOME_SETTLED=1
+            fi
         fi
     fi
 
@@ -815,6 +869,7 @@ cleanup() {
     if [ "$TRANSACTION_COMMITTED" -eq 0 ] \
         && [ -n "$NEW_VERSION_DIR" ] && [ "$ROLLBACK_OK" -eq 1 ] \
         && [ "$NEW_VERSION_PREPARED" -eq 0 ] \
+        && [ "$NEW_VERSION_EXISTING" -eq 0 ] \
         && [ "$RETAIN_RECOVERY" -eq 0 ]; then
         rm -rf "$NEW_VERSION_DIR" || :
     fi
@@ -1094,34 +1149,57 @@ if [ -L "$PREFIX/versions" ] || { [ -e "$PREFIX/versions" ] && [ ! -d "$PREFIX/v
 fi
 mkdir -p "$PREFIX/versions"
 PREPARED_MARKER=.cagents-prepared-candidate-v1.json
+RETAINED_MARKER=.cagents-retained-candidate-v1.json
 prepared_marker_contents() {
     printf '{"version":1,"job":"%s","archive_sha256":"%s"}\n' "${1:-$candidate_job}" "$ACTUAL_HASH"
 }
-if [ -n "$PREPARED_CANDIDATE" ] \
-    || { [ -n "$PREPARE_CANDIDATE" ] && { [ -e "$PREFIX/versions/$VERSION" ] || [ -L "$PREFIX/versions/$VERSION" ]; }; }; then
+retained_marker_contents() {
+    printf '{"version":1,"archive_sha256":"%s"}\n' "$ACTUAL_HASH"
+}
+if [ -n "$PREPARED_CANDIDATE" ] || [ -e "$PREFIX/versions/$VERSION" ] || [ -L "$PREFIX/versions/$VERSION" ]; then
     prepared_root=$PREFIX/versions/$VERSION
     [ -d "$prepared_root" ] && [ ! -L "$prepared_root" ] \
         || fail 'the explicitly prepared candidate is missing or unsafe'
     prepared_marker=$prepared_root/$PREPARED_MARKER
-    [ -f "$prepared_marker" ] && [ ! -L "$prepared_marker" ] \
-        && [ "$(find "$prepared_marker" -maxdepth 0 -type f -uid "$(id -u)" -perm 0600 -print)" = "$prepared_marker" ] \
-        || fail 'the prepared candidate does not match this private job and verified archive'
-    if [ -n "$PREPARE_CANDIDATE" ]; then
-        # A new guarded job can adopt an unchanged, privately marked candidate
-        # left by cancellation. This grants no source or recovery authority.
-        previous_candidate_job=$(sed -n 's/^{"version":1,"job":"\([0-9a-f-]*\)","archive_sha256":"[0-9a-f]*"}$/\1/p' "$prepared_marker")
-        valid_candidate_job "$previous_candidate_job" \
-            || fail 'the previous prepared candidate marker is invalid'
-    else
-        previous_candidate_job=$candidate_job
+    if [ -e "$prepared_marker" ] || [ -L "$prepared_marker" ] || [ -n "$PREPARED_CANDIDATE" ]; then
+        [ -f "$prepared_marker" ] && [ ! -L "$prepared_marker" ] \
+            && [ "$(find "$prepared_marker" -maxdepth 0 -type f -uid "$(id -u)" -perm 0600 -print)" = "$prepared_marker" ] \
+            || fail 'the prepared candidate does not match this private job and verified archive'
+        if [ -z "$PREPARED_CANDIDATE" ]; then
+            # A new guarded job can adopt an unchanged, privately marked
+            # candidate. This grants no source or recovery authority.
+            previous_candidate_job=$(sed -n 's/^{"version":1,"job":"\([0-9a-f-]*\)","archive_sha256":"[0-9a-f]*"}$/\1/p' "$prepared_marker")
+            valid_candidate_job "$previous_candidate_job" \
+                || fail "the previous prepared candidate marker is invalid; inspect '$prepared_root/bin/cagents' --no-start daemon status"
+        else
+            previous_candidate_job=$candidate_job
+        fi
+        if [ "$(cat "$prepared_marker")" != "$(prepared_marker_contents "$previous_candidate_job")" ]; then
+            [ -z "$PREPARE_CANDIDATE$PREPARED_CANDIDATE" ] \
+                || fail 'the prepared candidate does not match this private job and verified archive'
+            CANDIDATE_MARKER_MISMATCH=1
+        fi
+        NEW_VERSION_PREPARED=1
     fi
-    [ "$(cat "$prepared_marker")" = "$(prepared_marker_contents "$previous_candidate_job")" ] \
-        || fail 'the prepared candidate does not match this private job and verified archive'
+    retained_marker=$prepared_root/$RETAINED_MARKER
+    if [ -e "$retained_marker" ] || [ -L "$retained_marker" ]; then
+        [ -f "$retained_marker" ] && [ ! -L "$retained_marker" ] \
+            && [ "$(find "$retained_marker" -maxdepth 0 -type f -uid "$(id -u)" -perm 0600 -print)" = "$retained_marker" ] \
+            || fail 'the retained candidate does not match this verified archive'
+        if [ "$(cat "$retained_marker")" != "$(retained_marker_contents)" ]; then
+            [ -z "$PREPARE_CANDIDATE$PREPARED_CANDIDATE" ] \
+                || fail 'the retained candidate does not match this verified archive'
+            CANDIDATE_MARKER_MISMATCH=1
+        fi
+        NEW_VERSION_RETAINED=1
+    fi
+    if [ "$NEW_VERSION_PREPARED" -eq 0 ] && [ "$NEW_VERSION_RETAINED" -eq 0 ]; then
+        [ -z "$PREPARE_CANDIDATE$PREPARED_CANDIDATE" ] \
+            || fail 'the prepared candidate does not match this private job and verified archive'
+        EXISTING_INSTALLED=1
+    fi
     NEW_VERSION_DIR=$prepared_root
-    NEW_VERSION_PREPARED=1
-else
-    [ ! -e "$PREFIX/versions/$VERSION" ] && [ ! -L "$PREFIX/versions/$VERSION" ] \
-        || fail "version $VERSION is already installed at $PREFIX"
+    NEW_VERSION_EXISTING=1
 fi
 if [ -z "$PREPARE_CANDIDATE" ]; then
     if [ -e "$PREFIX/current" ] && [ ! -L "$PREFIX/current" ]; then
@@ -1253,7 +1331,7 @@ chmod 0755 \
 find "$INSTALL_STAGE/$TOP_LEVEL/share" -type d -exec chmod 0755 {} +
 find "$INSTALL_STAGE/$TOP_LEVEL/share" -type f -exec chmod 0644 {} +
 
-if [ "$NEW_VERSION_PREPARED" -eq 1 ]; then
+if [ "$NEW_VERSION_EXISTING" -eq 1 ]; then
     # Re-extract the authenticated archive and repeat desktop normalization.
     # A private marker alone is not evidence that its executable tree survived.
     find "$INSTALL_STAGE/$TOP_LEVEL" -printf '%P\n' > "$DOWNLOAD_DIR/expected-tree"
@@ -1275,14 +1353,16 @@ if [ "$NEW_VERSION_PREPARED" -eq 1 ]; then
     # Pass untrusted existing names as argv, not lines: a newline in an extra
     # name must not split it into two apparently valid archive members.
     find "$NEW_VERSION_DIR" -mindepth 1 -exec sh -c '
-        prepared_root=$1 expected_root=$2 marker=$3
-        shift 3
+        prepared_root=$1 expected_root=$2 marker=$3 retained=$4
+        shift 4
         for actual do
             member=${actual#"$prepared_root/"}
-            [ "$member" = "$marker" ] && continue
+            { [ "$member" = "$marker" ] || [ "$member" = "$retained" ]; } && continue
             [ -e "$expected_root/$member" ] || exit 1
         done
-    ' cagents-prepared-tree "$NEW_VERSION_DIR" "$INSTALL_STAGE/$TOP_LEVEL" "$PREPARED_MARKER" {} + \
+    ' cagents-prepared-tree "$NEW_VERSION_DIR" "$INSTALL_STAGE/$TOP_LEVEL" \
+        "$( [ "$NEW_VERSION_PREPARED" -eq 0 ] || printf '%s' "$PREPARED_MARKER" )" \
+        "$( [ "$NEW_VERSION_RETAINED" -eq 0 ] || printf '%s' "$RETAINED_MARKER" )" {} + \
         || fail 'the prepared candidate contains unexpected entries'
     rm -rf "$INSTALL_STAGE"
 else
@@ -1293,10 +1373,11 @@ else
     NEW_VERSION_DIR=$PREFIX/versions/$VERSION
     mv -T "$INSTALL_STAGE/$TOP_LEVEL" "$NEW_VERSION_DIR"
     rmdir "$INSTALL_STAGE"
+    NEW_VERSION_FRESH=1
 fi
 INSTALL_STAGE=
 if [ -n "$PREPARE_CANDIDATE" ]; then
-    if [ "$NEW_VERSION_PREPARED" -eq 1 ]; then
+    if [ "$NEW_VERSION_EXISTING" -eq 1 ]; then
         PREPARED_MARKER_TEMP=$NEW_VERSION_DIR/.prepared-marker.$$
         (set -C; prepared_marker_contents > "$PREPARED_MARKER_TEMP") \
             || fail 'cannot prepare the new private candidate marker'
@@ -1321,6 +1402,20 @@ if [ "$STAGE_ONLY" -eq 1 ]; then
     printf 'Staged cagents %s; current, running windows and daemon were preserved. Run "%s/bin/cagents" daemon upgrade to apply it when ready.\n' "$VERSION" "$NEW_VERSION_DIR"
     exit 0
 fi
+
+# Before rejecting an already published version, expose any retained Prepared
+# recovery through the shared owner. Never replace its original census with a
+# fresh empty capture, and never call an existing version "success" by itself.
+if [ -z "${CAGENTS_DAEMON_LEASE_FD:-}" ]; then
+    if ! inspect_pending_update_recovery; then
+        RETAIN_RECOVERY=1
+        mark_retained_candidate
+        fail 'retained recovery requires the explicit command above; the candidate and original checkpoint were preserved'
+    fi
+fi
+[ "$CANDIDATE_MARKER_MISMATCH" -eq 0 ] \
+    || fail "the retained candidate archive differs; the existing tree was preserved. Inspect '$NEW_VERSION_DIR/bin/cagents' --no-start daemon status"
+[ "$EXISTING_INSTALLED" -eq 0 ] || fail "version $VERSION is already installed at $PREFIX; inspect '$NEW_VERSION_DIR/bin/cagents' --no-start daemon status before retrying"
 
 # A copy at a link path is compared with the finished candidate files, so the
 # rewritten desktop and autostart entries count, and with the current version.
@@ -1397,22 +1492,6 @@ ensure_link() {
 }
 
 
-# A standalone retry must discover retained Prepared recovery before a fresh
-# empty census can replace its original scope. The shared owner prints the
-# exact explicit recovery command; the shell does not interpret its payload.
-# A reviewed worker already owns its intentional Prepared transaction.
-if [ -z "${CAGENTS_DAEMON_LEASE_FD:-}" ]; then
-    set -- daemon inspect-pending-update-recovery \
-        --candidate-cli "$NEW_VERSION_DIR/bin/cagents"
-    if [ -n "${CAGENTS_INSTALL_CENSUS_PATH:-}" ]; then
-        set -- "$@" --census "$INSTALL_CENSUS_PATH"
-    fi
-    if ! installer_tool "$CANDIDATE_COORDINATOR" "$@" >/dev/null; then
-        RETAIN_RECOVERY=1
-        fail 'retained recovery requires the explicit command above; the candidate and original checkpoint were preserved'
-    fi
-fi
-
 # A reviewed worker supplies its pre-shutdown census. A standalone installer
 # captures the authenticated source before it can prepare or stop that source.
 if [ -n "${CAGENTS_INSTALL_CENSUS_PATH:-}" ]; then
@@ -1431,14 +1510,14 @@ if [ -n "${CAGENTS_INSTALL_CENSUS_PATH:-}" ]; then
     CENSUS_CAPTURED=1
 else
     installer_tool "$CANDIDATE_COORDINATOR" daemon capture-update-census \
-        --output "$INSTALL_CENSUS_PATH" >/dev/null \
+        --output "$INSTALL_CENSUS_PATH" --candidate-cli "$NEW_VERSION_DIR/bin/cagents" >/dev/null \
         || fail 'cannot capture the terminal inventory; the running service was not changed'
     CENSUS_CAPTURED=1
 fi
 # A fresh/absent-source file install may defer its first daemon start to login.
 # This discriminator is a private, authenticated absence proof, not a status
 # string or merely an empty inventory. Pending recovery cannot qualify.
-if [ "$RESTART_DAEMON" -eq 0 ] && [ "$STAGE_ONLY" -eq 0 ]; then
+if [ "$STAGE_ONLY" -eq 0 ]; then
     if verify_absent_census; then
         PREUPDATE_NO_SOURCE=1
     fi
@@ -1553,8 +1632,7 @@ if [ "$DAEMON_DEFERRED" -eq 1 ]; then
 elif DAEMON_START_ATTEMPTED=1 && installer_start_candidate >/dev/null; then
     :
 else
-    if [ "$PREUPDATE_NO_SOURCE" -eq 1 ] && [ "$RESTART_DAEMON" -eq 0 ] \
-        && [ "$STAGE_ONLY" -eq 0 ]; then
+    if [ "$PREUPDATE_NO_SOURCE" -eq 1 ] && [ "$STAGE_ONLY" -eq 0 ]; then
         if ! verify_absent_census; then
             # Startup can create a checkpoint or another service can appear.
             # Neither may be hidden by the earlier absence or pointer rollback.
@@ -1581,6 +1659,9 @@ if [ "$DAEMON_START_FAILED" -eq 0 ]; then
     if [ "$DAEMON_DEFERRED" -eq 0 ]; then DAEMON_STARTED=1; fi
 fi
 TRANSACTION_COMMITTED=1
+if [ "$NEW_VERSION_RETAINED" -eq 1 ]; then
+    rm -f "$NEW_VERSION_DIR/$RETAINED_MARKER"
+fi
 if command -v gtk-update-icon-cache >/dev/null 2>&1; then
     gtk-update-icon-cache --force --ignore-theme-index "$DATA_HOME/icons/hicolor" >/dev/null 2>&1 || :
 fi

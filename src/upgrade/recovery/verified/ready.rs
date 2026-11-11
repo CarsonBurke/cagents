@@ -101,12 +101,28 @@ fn captured_terminals(census: &Census) -> impl Iterator<Item = &TerminalSession>
     )
 }
 
-fn stopped_chat(record: &super::super::super::floor::Record, source: &Session) -> bool {
-    record.chats.contains(source) || record.aliases.contains(source)
-}
-
 impl ReadyView {
     pub(crate) fn load(
+        serving: &HostSessionProof,
+        target: &Path,
+        terminals: &[TerminalDescriptor],
+        chats: &[Session],
+    ) -> Result<Option<Self>, String> {
+        Self::load_discovered(None, serving, target, terminals, chats)
+    }
+
+    pub(crate) fn load_for_source(
+        expected_source: &HostSessionProof,
+        serving: &HostSessionProof,
+        target: &Path,
+        terminals: &[TerminalDescriptor],
+        chats: &[Session],
+    ) -> Result<Option<Self>, String> {
+        Self::load_discovered(Some(expected_source), serving, target, terminals, chats)
+    }
+
+    fn load_discovered(
+        expected_source: Option<&HostSessionProof>,
         serving: &HostSessionProof,
         target: &Path,
         terminals: &[TerminalDescriptor],
@@ -115,16 +131,18 @@ impl ReadyView {
         let Some(store) = super::super::super::handoff::Store::existing()? else {
             return Ok(None);
         };
-        Self::load_at(
+        Self::load_at_with(
             &store.path,
+            expected_source,
             serving,
             target,
             terminals,
             chats,
-            &super::super::super::floor::load()?,
+            super::Retention::load,
         )
     }
 
+    #[cfg(test)]
     fn load_at(
         checkpoint: &Path,
         serving: &HostSessionProof,
@@ -133,10 +151,84 @@ impl ReadyView {
         chats: &[Session],
         ledger: &super::super::super::floor::Ledger,
     ) -> Result<Option<Self>, String> {
-        let Some(bytes) = read_checkpoint(&checkpoint.with_file_name(FILE))? else {
-            return Ok(None);
+        Self::load_at_with(
+            checkpoint,
+            None,
+            serving,
+            target,
+            terminals,
+            chats,
+            |source| {
+                Ok(super::Retention(
+                    ledger
+                        .records
+                        .iter()
+                        .find(|record| &record.source == source)
+                        .cloned(),
+                ))
+            },
+        )
+    }
+
+    fn load_at_with(
+        checkpoint: &Path,
+        expected_source: Option<&HostSessionProof>,
+        serving: &HostSessionProof,
+        target: &Path,
+        terminals: &[TerminalDescriptor],
+        chats: &[Session],
+        mut read_retention: impl FnMut(&HostSessionProof) -> Result<super::Retention, String>,
+    ) -> Result<Option<Self>, String> {
+        let bytes = match read_checkpoint(&checkpoint.with_file_name(FILE)) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return Ok(None),
+            // An unsafe/unreadable optional file has no trustworthy source
+            // header. It grants no proof and cannot gate another source's own
+            // verified journal. Unscoped inspection remains fully strict.
+            Err(_) if expected_source.is_some() => return Ok(None),
+            Err(error) => return Err(error),
         };
-        let publication: Publication = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        let publication: Publication = if let Some(source) = expected_source {
+            // Route before decoding old payloads or opening their captures.
+            // Unknown data supplies no proof; a matching known header remains
+            // subject to the complete current schema and ownership checks.
+            let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                return Ok(None);
+            };
+            if value
+                .get("target")
+                .cloned()
+                .and_then(|value| serde_json::from_value::<PathBuf>(value).ok())
+                .is_some_and(|old| old != target)
+            {
+                return Ok(None);
+            }
+            let Some(partitions) = value
+                .get("partitions")
+                .and_then(serde_json::Value::as_array)
+            else {
+                return Ok(None);
+            };
+            let selected: Vec<_> = partitions
+                .iter()
+                .filter(|partition| {
+                    partition
+                        .get("source")
+                        .cloned()
+                        .and_then(|value| serde_json::from_value::<HostSessionProof>(value).ok())
+                        .as_ref()
+                        == Some(source)
+                })
+                .cloned()
+                .collect();
+            if selected.is_empty() {
+                return Ok(None);
+            }
+            value["partitions"] = selected.into();
+            serde_json::from_value(value).map_err(|error| error.to_string())?
+        } else {
+            serde_json::from_slice(&bytes).map_err(|error| error.to_string())?
+        };
         if publication.version != 1
             || !serving.is_complete()
             || publication.serving != *serving
@@ -163,11 +255,10 @@ impl ReadyView {
                     .ok_or("The exact original stopped-pane census is unavailable")?;
             let capture: CapturedCensus =
                 serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-            let stopped = ledger
-                .records
-                .iter()
-                .find(|record| record.source == partition.source)
-                .ok_or("The original stopped panes are no longer retained")?;
+            let retained = read_retention(&partition.source)?;
+            if retained.0.is_none() {
+                return Err("The original stopped panes are no longer retained".into());
+            }
             let chat_ids: BTreeSet<_> = partition.chats.iter().map(|chat| chat.id).collect();
             let terminal_ids: BTreeSet<_> = partition
                 .terminals
@@ -190,7 +281,7 @@ impl ReadyView {
                             .filter(|saved| saved.source == *source)
                             .count()
                             != 1
-                        || !stopped_chat(stopped, source)
+                        || !retained.chat(source)
                         || chats.iter().any(|current| current.id == source.id)
                 })
                 || partition.aliases.iter().any(|alias| {
@@ -202,7 +293,7 @@ impl ReadyView {
                     source.continuity.live_proof().as_ref() != Some(&partition.source)
                         || !captured_terminals(&capture.census)
                             .any(|known| same_terminal(known, source))
-                        || !stopped.terminals.contains(&source.id)
+                        || !retained.terminal(source)
                         || terminal_is_listed(source, terminals)
                 })
             {
@@ -245,21 +336,18 @@ pub(crate) fn publish(
     }
     let store = super::super::super::handoff::Store::discover()?;
     let mut partitions = Vec::new();
-    let ledger = super::super::super::floor::load()?;
     if let Some(ready) = ready
-        && let Some(stopped) = ledger
-            .records
-            .iter()
-            .find(|stopped| stopped.source == ready.capture.source)
+        && let Some(stopped) = super::super::super::floor::record_for_source(&ready.capture.source)?
     {
         let capture = ready.capture;
+        let retained = super::Retention(Some(stopped.clone()));
         let paused: Vec<_> = capture
             .census
             .chats
             .iter()
             .filter(|source| {
                 source.proof.as_ref() == Some(&stopped.source)
-                    && stopped_chat(&stopped, source)
+                    && retained.chat(source)
                     && !chats.iter().any(|current| current.id == source.id)
             })
             .cloned()
@@ -375,11 +463,12 @@ mod tests {
         let bytes = serde_json::to_vec(&capture).unwrap();
         let capture_file = bound_capture_path(&checkpoint, &checkpoint_hash);
         write_private(&capture_file, &bytes);
-        let stopped = super::super::super::super::floor::Record::new(
+        let mut stopped = super::super::super::super::floor::Record::new(
             proof("source"),
             vec![original.clone()],
             vec![],
         );
+        stopped.snapshots = capture.census.snapshots.clone();
         let ledger = super::super::super::super::floor::Ledger {
             records: vec![stopped],
         };
@@ -470,5 +559,177 @@ mod tests {
             !checkpoint.exists(),
             "reading paused history cannot create a checkpoint"
         );
+    }
+    #[test]
+    fn ready_proof_routes_requested_source_before_unrelated_payloads_and_retention() {
+        let directory = private_root();
+        let checkpoint = directory.path().join("daemon-upgrade.json");
+        let target = directory.path().join("cagentsd");
+        write_private(&target, b"fixture daemon; never executed");
+        let unrelated = serde_json::json!({ "version":999, "target":target, "partitions":[{
+            "source":proof("source-a"), "checkpoint_hash":"missing", "chats":"old malformed payload"
+        }] });
+        write_private(
+            &checkpoint.with_file_name(FILE),
+            &serde_json::to_vec(&unrelated).unwrap(),
+        );
+        assert!(
+            ReadyView::load_at_with(
+                &checkpoint,
+                Some(&proof("source-b")),
+                &proof("successor"),
+                &target,
+                &[],
+                &[],
+                |_| panic!("unrelated A must not read B retention")
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            ReadyView::load_at_with(
+                &checkpoint,
+                Some(&proof("source-a")),
+                &proof("successor"),
+                &target,
+                &[],
+                &[],
+                |_| panic!("matching malformed payload fails before retention")
+            )
+            .is_err()
+        );
+
+        let mut original = source(crate::agent::Provider::Claude, directory.path());
+        original.proof = Some(proof("source-b"));
+        let snapshot = super::super::super::super::floor::StoppedSnapshot {
+            source: original.clone(),
+            snapshot: Default::default(),
+            limitation: None,
+        };
+        let capture = CapturedCensus {
+            producer: Some(CaptureProducer::Acknowledged {
+                job: uuid::Uuid::new_v4().to_string(),
+                request_hash: "a".repeat(64),
+            }),
+            source: proof("source-b"),
+            checkpoint_hash: Some("b".repeat(64)),
+            census: Census {
+                chats: vec![original.clone()],
+                snapshots: vec![snapshot.clone()],
+                ..Default::default()
+            },
+            windows: vec![],
+        };
+        let bytes = serde_json::to_vec(&capture).unwrap();
+        write_private(&bound_capture_path(&checkpoint, &"b".repeat(64)), &bytes);
+        let partition = Partition {
+            source: proof("source-b"),
+            checkpoint_hash: "b".repeat(64),
+            capture_hash: digest(&bytes),
+            chats: vec![original.clone()],
+            aliases: vec![],
+            terminals: vec![],
+        };
+        let mut publication = serde_json::to_value(Publication {
+            version: 1,
+            serving: proof("successor"),
+            target: target.clone(),
+            target_hash: executable_hash(&target).unwrap(),
+            partitions: vec![partition],
+        })
+        .unwrap();
+        publication["partitions"]
+            .as_array_mut()
+            .unwrap()
+            .push(unrelated["partitions"][0].clone());
+        write_private(
+            &checkpoint.with_file_name(FILE),
+            &serde_json::to_vec(&publication).unwrap(),
+        );
+        let mut stopped = super::super::super::super::floor::Record::new(
+            proof("source-b"),
+            vec![original.clone()],
+            vec![],
+        );
+        stopped.snapshots.push(snapshot);
+        let view = ReadyView::load_at_with(
+            &checkpoint,
+            Some(&proof("source-b")),
+            &proof("successor"),
+            &target,
+            &[],
+            &[],
+            |requested| {
+                assert_eq!(requested, &proof("source-b"));
+                Ok(super::super::Retention(Some(stopped.clone())))
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert!(view.paused_chat(&original));
+        stopped.snapshots.clear();
+        assert!(
+            ReadyView::load_at_with(
+                &checkpoint,
+                Some(&proof("source-b")),
+                &proof("successor"),
+                &target,
+                &[],
+                &[],
+                |_| Ok(super::super::Retention(Some(stopped.clone())))
+            )
+            .is_err(),
+            "an immutable publication and capture cannot replace a removed current page"
+        );
+    }
+    #[test]
+    fn ready_source_routing_ignores_unsafe_or_symlinked_unrouteable_history() {
+        let directory = private_root();
+        let checkpoint = directory.path().join("daemon-upgrade.json");
+        let target = directory.path().join("cagentsd");
+        let publication = checkpoint.with_file_name(FILE);
+        let unrelated = serde_json::to_vec(&serde_json::json!({
+            "source":proof("source-a"), "partitions":[{"source":proof("source-a")}]
+        }))
+        .unwrap();
+        for symlinked in [false, true] {
+            if symlinked {
+                let old = directory.path().join("old-a.json");
+                write_private(&old, &unrelated);
+                std::os::unix::fs::symlink(old, &publication).unwrap();
+            } else {
+                write_private(&publication, &unrelated);
+                fs::set_permissions(&publication, fs::Permissions::from_mode(0o644)).unwrap();
+            }
+            for source in [proof("source-a"), proof("source-b")] {
+                assert!(
+                    ReadyView::load_at_with(
+                        &checkpoint,
+                        Some(&source),
+                        &proof("successor"),
+                        &target,
+                        &[],
+                        &[],
+                        |_| panic!("unrouteable data must never reach retained history")
+                    )
+                    .unwrap()
+                    .is_none(),
+                    "unknown unsafe data cannot supply any positive paused proof"
+                );
+            }
+            assert!(
+                ReadyView::load_at_with(
+                    &checkpoint,
+                    None,
+                    &proof("successor"),
+                    &target,
+                    &[],
+                    &[],
+                    |_| panic!("strict file refusal precedes retained history")
+                )
+                .is_err()
+            );
+            fs::remove_file(&publication).unwrap();
+        }
     }
 }

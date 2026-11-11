@@ -102,11 +102,16 @@ impl Registry {
             {
                 return Err("The stopped agent's pane acquired another owner; retained presentation was not overwritten".into());
             }
+            let before = view.clone();
             view.retired.retain(|retired| *retired != id);
             view.panes
                 .insert(saved.ordinal.min(view.panes.len()), saved.pane.clone());
             view.revision = super::views::store::next_revision(&transaction)?;
+            // Retiring the old pane removed its placement generation. This is
+            // a new canonical insertion, so issue its epoch in this same TX.
+            super::channel_work::placement::observe_view_transition(&transaction, &before, &view)?;
             super::views::store::store(&transaction, &view)?;
+            super::terminal_retention::sync_view_pins(&transaction, &view.panes)?;
             // Update only the exact stopped presentation. Runs, launch authority,
             // actor journals and retirement receipts remain as the old close left them.
             transaction.execute("UPDATE agents SET closed=0,record=json_set(record,'$.closed',json('false'),'$.process_end',?2) WHERE id=?1", params![saved.agent.to_string(), saved.session.id.to_string()]).map_err(|e| e.to_string())?;
@@ -224,6 +229,15 @@ mod tests {
         workspace_model::views::{Pane, Scope, View},
     };
 
+    fn store_view(db: &Connection, view: &View) {
+        let tx = db.unchecked_transaction().unwrap();
+        let before = super::super::views::read(&tx, &view.scope).unwrap();
+        super::super::channel_work::placement::observe_view_transition(&tx, &before, view).unwrap();
+        super::super::views::store::store(&tx, view).unwrap();
+        super::super::terminal_retention::sync_view_pins(&tx, &view.panes).unwrap();
+        tx.commit().unwrap();
+    }
+
     fn fixture() -> (Registry, Record, Agent) {
         let mut db = Connection::open_in_memory().unwrap();
         let tx = db.transaction().unwrap();
@@ -317,7 +331,7 @@ mod tests {
             ],
         )
         .unwrap();
-        super::super::views::store::store(&db, &view).unwrap();
+        store_view(&db, &view);
         db.execute(
             "INSERT INTO agent_runs VALUES('unfinished',?1,'user','test','{}','cancelled',1,'{}')",
             [agent.id.to_string()],
@@ -332,6 +346,39 @@ mod tests {
             agent,
         )
     }
+    fn paired_fixture() -> (Registry, Record, Agent) {
+        let (registry, mut record, mut agent) = fixture();
+        let mut session = record.chats[0].clone();
+        let proof = session.proof.as_ref().unwrap();
+        session.terminal = Some(crate::model::TerminalSession {
+            id: session.id,
+            launch: LaunchRecipe::shell("/work".into()).unwrap(),
+            transcript_path: None,
+            resume_hint: None,
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+            continuity: crate::model::TerminalContinuity::DetachedSameBoot {
+                host_session_id: proof.host_session_id.clone(),
+                boot_id: proof.boot_id.clone(),
+                host_incarnation: proof.host_incarnation.clone(),
+            },
+        });
+        agent.session = Some(HostedSession::Chat(session.clone()));
+        registry
+            .db
+            .execute(
+                "UPDATE agents SET record=?2 WHERE id=?1",
+                params![agent.id.to_string(), serde_json::to_string(&agent).unwrap()],
+            )
+            .unwrap();
+        let mut view = super::super::views::read(&registry.db, &agent.placement).unwrap();
+        view.panes[0].kind = CardKind::Chat(session.clone());
+        store_view(&registry.db, &view);
+        record.chats[0] = session;
+        (registry, record, agent)
+    }
+
     fn close_presentation(registry: &Registry, agent: &Agent) {
         registry.db.execute(
             "UPDATE agents SET closed=1,record=json_set(record,'$.closed',json('true')) WHERE id=?1",
@@ -342,7 +389,7 @@ mod tests {
         view.panes.retain(|pane| pane.id != id);
         view.retired.push(id);
         view.revision = super::super::views::store::next_revision(&registry.db).unwrap();
-        super::super::views::store::store(&registry.db, &view).unwrap();
+        store_view(&registry.db, &view);
     }
 
     #[test]
@@ -467,7 +514,7 @@ mod tests {
         alias.proof = None;
         alias.launch.session_id = None;
         let alias = alias.clone();
-        super::super::views::store::store(&registry.db, &view).unwrap();
+        store_view(&registry.db, &view);
         registry.capture_update_floor(&mut record).unwrap();
         assert_eq!(record.aliases, vec![alias]);
         assert_eq!(record.presentations[0].pane, view.panes[0]);
@@ -487,7 +534,7 @@ mod tests {
             unreachable!()
         };
         alias.id = TerminalId::new();
-        super::super::views::store::store(&registry.db, &view).unwrap();
+        store_view(&registry.db, &view);
         assert!(
             registry
                 .capture_update_floor(&mut foreign)
@@ -522,7 +569,7 @@ mod tests {
         let retired = CardId::new();
         view.panes = vec![left.clone(), kept.clone(), right.clone()];
         view.retired = vec![retired];
-        super::super::views::store::store(&registry.db, &view).unwrap();
+        store_view(&registry.db, &view);
         registry.capture_update_floor(&mut record).unwrap();
         assert_eq!(record.presentations[0].ordinal, 1);
         close_presentation(&registry, &agent);
@@ -552,13 +599,14 @@ mod tests {
 
     #[test]
     fn conflicting_resource_rolls_back_all_restores_and_keeps_them_unacknowledged() {
-        let (mut registry, mut record, agent) = fixture();
+        let (mut registry, mut record, agent) = paired_fixture();
         let mut second = agent.clone();
         second.id = AgentId::new();
         let Some(HostedSession::Chat(session)) = &mut second.session else {
             unreachable!()
         };
         session.id = TerminalId::new();
+        session.terminal.as_mut().unwrap().id = session.id;
         let session = session.clone();
         registry
             .db
@@ -577,7 +625,7 @@ mod tests {
         pane.id = CardId::from_uuid(second.id.as_uuid());
         pane.kind = CardKind::Chat(session.clone());
         view.panes.push(pane);
-        super::super::views::store::store(&registry.db, &view).unwrap();
+        store_view(&registry.db, &view);
         record.chats.push(session);
         registry.capture_update_floor(&mut record).unwrap();
         assert_eq!(record.presentations.len(), 2);
@@ -587,7 +635,18 @@ mod tests {
         let mut foreign = record.presentations[1].pane.clone();
         foreign.id = CardId::new();
         view.panes.push(foreign);
-        super::super::views::store::store(&registry.db, &view).unwrap();
+        store_view(&registry.db, &view);
+        let candidates = record
+            .chats
+            .iter()
+            .map(|chat| chat.terminal.as_ref().unwrap().id)
+            .collect();
+        let pins_before = registry.pinned_terminals(&candidates).unwrap();
+        assert_eq!(
+            pins_before.len(),
+            1,
+            "only the competing pane is pinned before recovery"
+        );
         assert!(
             registry
                 .restore_update_floor_inner(&mut record)
@@ -606,6 +665,30 @@ mod tests {
             })
             .unwrap();
         assert_eq!(closed, 2, "the earlier restore must roll back too");
+        assert_eq!(
+            registry.pinned_terminals(&candidates).unwrap(),
+            pins_before,
+            "the earlier restored terminal pin must roll back too"
+        );
+    }
+
+    #[test]
+    fn restored_paired_chat_repins_its_terminal_until_a_genuine_close() {
+        let (mut registry, mut record, agent) = paired_fixture();
+        let terminal = record.chats[0].terminal.as_ref().unwrap().id;
+        let candidates = std::collections::BTreeSet::from([terminal]);
+        assert_eq!(registry.pinned_terminals(&candidates).unwrap(), candidates);
+        registry.capture_update_floor(&mut record).unwrap();
+        registry.close_agent(&agent.origin, agent.id).unwrap();
+        assert!(registry.pinned_terminals(&candidates).unwrap().is_empty());
+        registry.restore_update_floor_inner(&mut record).unwrap();
+        assert_eq!(registry.pinned_terminals(&candidates).unwrap(), candidates);
+        assert!(registry.agent_process_ended(agent.id).unwrap());
+        registry.close_agent(&agent.origin, agent.id).unwrap();
+        assert!(registry.pinned_terminals(&candidates).unwrap().is_empty());
+        registry.restore_update_floor_inner(&mut record).unwrap();
+        assert!(registry.pinned_terminals(&candidates).unwrap().is_empty());
+        assert!(registry.agent(agent.id).unwrap().closed);
     }
 
     #[test]
@@ -638,10 +721,14 @@ mod tests {
             })
             .unwrap();
         assert_eq!(authorities, 0);
-        registry
-            .db
-            .execute("UPDATE agents SET closed=1", [])
-            .unwrap();
+        let closed = registry.close_agent(&agent.origin, agent.id).unwrap();
+        assert!(
+            closed.closed,
+            "a restored paused pane must retain normal close behavior"
+        );
+        let retired = super::super::views::read(&registry.db, &agent.placement).unwrap();
+        assert!(retired.panes.iter().all(|pane| pane.id != id));
+        assert!(retired.retired.contains(&id));
         registry.restore_update_floor_inner(&mut record).unwrap();
         let closed: bool = registry
             .db

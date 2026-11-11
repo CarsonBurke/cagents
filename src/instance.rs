@@ -27,6 +27,8 @@ use std::{
 };
 
 mod daemon_admission;
+#[doc(hidden)]
+pub mod ui_options;
 pub use daemon_admission::DaemonStillStarting;
 pub(crate) use daemon_admission::{
     AdmissionFence, DAEMON_FENCE_ENV, DaemonAdmissionGuard, LaunchFence, inherit_daemon_fence,
@@ -92,6 +94,34 @@ pub const UI_LAUNCH_RECOVERY_PROGRESS_PREFIX: &str = "recovering: ";
 
 pub const PRIMARY_WINDOW: &str = "primary";
 static WINDOW_SLOT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Recovery windows may display existing owners and retained history, while
+/// provider starts continue to require an explicit action in the pane.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WindowRestorePolicy {
+    #[default]
+    Ordinary,
+    ExistingOnly,
+}
+
+pub const RESTORE_EXISTING_ONLY_ARGUMENT: &str = "--restore-existing-only";
+static WINDOW_RESTORE_POLICY: OnceLock<WindowRestorePolicy> = OnceLock::new();
+
+/// Set once from this UI process's argv. A launch policy is never inherited by
+/// ordinary children through an environment marker.
+pub fn initialize_window_restore_policy(policy: WindowRestorePolicy) -> io::Result<()> {
+    let selected = WINDOW_RESTORE_POLICY.get_or_init(|| policy);
+    if *selected != policy {
+        return Err(io::Error::other(
+            "window restore policy already initialized",
+        ));
+    }
+    Ok(())
+}
+
+pub fn window_restore_policy() -> WindowRestorePolicy {
+    WINDOW_RESTORE_POLICY.get().copied().unwrap_or_default()
+}
 
 pub fn window_slot() -> &'static str {
     WINDOW_SLOT
@@ -1131,6 +1161,7 @@ pub struct UiUpdateGuard {
     prepared: Vec<String>,
     closed: Vec<String>,
     fallback_executable: Option<PathBuf>,
+    restore_policy: WindowRestorePolicy,
 }
 
 impl UiUpdateGuard {
@@ -1160,6 +1191,11 @@ impl UiUpdateGuard {
 
     pub fn set_fallback_executable(&mut self, executable: PathBuf) {
         self.fallback_executable = Some(executable);
+    }
+
+    /// Apply to every later launch, including Drop after a partial close.
+    pub(crate) fn set_recovery_restore_only(&mut self) {
+        self.restore_policy = WindowRestorePolicy::ExistingOnly;
     }
 
     pub fn has_running_windows(&self) -> io::Result<bool> {
@@ -1221,6 +1257,7 @@ impl UiUpdateGuard {
             prepared: Vec::new(),
             closed: Vec::new(),
             fallback_executable: None,
+            restore_policy: WindowRestorePolicy::Ordinary,
         })
     }
 
@@ -1307,7 +1344,9 @@ impl UiUpdateGuard {
         self.closed.clear();
         let mut errors = Vec::new();
         for slot in slots {
-            if let Err(error) = launch_window_at(executable, false, Some(slot), None) {
+            if let Err(error) =
+                launch_window_at(executable, false, Some(slot), None, self.restore_policy)
+            {
                 errors.push((slot.as_str(), error.to_string()));
             }
         }
@@ -1450,9 +1489,12 @@ impl Drop for UiUpdateGuard {
         let _ = self.release_launch_fence();
         for slot in &self.closed {
             if let Some(executable) = &self.fallback_executable {
-                let _ = launch_window_at(executable, false, Some(slot), None);
+                let _ = launch_window_at(executable, false, Some(slot), None, self.restore_policy);
             } else {
-                let _ = launch_window(false, Some(slot), None);
+                if let Ok(executable) = crate::companion::Product::Ui.beside_current() {
+                    let _ =
+                        launch_window_at(&executable, false, Some(slot), None, self.restore_policy);
+                }
             }
         }
         let _ = self._legacy_fence.unlock();
@@ -1462,7 +1504,13 @@ impl Drop for UiUpdateGuard {
 /// Starts another independent process using the same installed UI executable.
 pub fn launch_window(new_window: bool, slot: Option<&str>, source: Option<&str>) -> io::Result<()> {
     let executable = crate::companion::Product::Ui.beside_current()?;
-    launch_window_at(&executable, new_window, slot, source)
+    launch_window_at(
+        &executable,
+        new_window,
+        slot,
+        source,
+        WindowRestorePolicy::Ordinary,
+    )
 }
 
 /// Session ids belong to a daemon/device namespace. Never resolve a local
@@ -1514,6 +1562,7 @@ fn launch_window_at(
     new_window: bool,
     slot: Option<&str>,
     source: Option<&str>,
+    restore_policy: WindowRestorePolicy,
 ) -> io::Result<()> {
     if let Some(slot) = slot {
         validate_window_slot(slot)?;
@@ -1522,6 +1571,9 @@ fn launch_window_at(
         validate_window_slot(source)?;
     }
     let mut command = process::Command::new(executable);
+    if restore_policy == WindowRestorePolicy::ExistingOnly {
+        command.arg(RESTORE_EXISTING_ONLY_ARGUMENT);
+    }
     let device_name = match slot {
         Some(slot) => window_device_identity(&runtime_directory()?, slot, &crate::device::list()?)?,
         None => crate::device::selected().map(|device| device.name.clone()),
@@ -2719,11 +2771,96 @@ mod tests {
             prepared: Vec::new(),
             closed: Vec::new(),
             fallback_executable: None,
+            restore_policy: WindowRestorePolicy::Ordinary,
         };
         // A daemon-only update has no windows; the generic probe cannot tell
         // the guard's own shared fence from a legacy UI.
         assert!(verified_windows_in(runtime.path(), Path::new("/proc")).is_err());
         assert!(guard.verified_windows().unwrap().is_empty());
+    }
+
+    #[test]
+    fn recovery_guard_relaunch_and_drop_keep_attachment_policy_out_of_ordinary_launches() {
+        const CHILD: &str = "CAGENTS_TEST_RECOVERY_WINDOW_POLICY";
+        if env::var_os(CHILD).is_some() {
+            initialize_window_restore_policy(WindowRestorePolicy::ExistingOnly).unwrap();
+            let executable = PathBuf::from(env::var_os("CAGENTS_TEST_WINDOW_EXECUTABLE").unwrap());
+            let arguments = PathBuf::from(env::var_os("CAGENTS_TEST_WINDOW_ARGUMENTS").unwrap());
+            let mut guard = UiUpdateGuard::acquire().unwrap();
+            guard.set_recovery_restore_only();
+            guard.set_fallback_executable(executable.clone());
+            guard.closed.push(PRIMARY_WINDOW.into());
+            // Model a fallible recovery after a committed window close.
+            drop(guard);
+            let drop_arguments = fs::read_to_string(&arguments).unwrap();
+            assert!(
+                drop_arguments
+                    .lines()
+                    .any(|arg| arg == RESTORE_EXISTING_ONLY_ARGUMENT)
+            );
+
+            let mut guard = UiUpdateGuard::acquire().unwrap();
+            guard.set_recovery_restore_only();
+            guard
+                .relaunch_windows(&[PRIMARY_WINDOW.into()], &executable)
+                .unwrap();
+            let explicit_arguments = fs::read_to_string(&arguments).unwrap();
+            assert!(
+                explicit_arguments
+                    .lines()
+                    .any(|arg| arg == RESTORE_EXISTING_ONLY_ARGUMENT)
+            );
+
+            // A later ordinary launch from this same process has no recovery
+            // argv or environment policy to inherit.
+            launch_window_at(
+                &executable,
+                false,
+                Some(PRIMARY_WINDOW),
+                None,
+                WindowRestorePolicy::Ordinary,
+            )
+            .unwrap();
+            let ordinary_arguments = fs::read_to_string(&arguments).unwrap();
+            assert!(
+                !ordinary_arguments
+                    .lines()
+                    .any(|arg| arg == RESTORE_EXISTING_ONLY_ARGUMENT)
+            );
+            assert!(ordinary_arguments.contains("--window\nprimary\n"));
+            return;
+        }
+        let root = tempdir().unwrap();
+        for directory in ["home", "runtime", "config", "data", "cache"] {
+            fs::create_dir(root.path().join(directory)).unwrap();
+        }
+        let executable = root.path().join("fake-ui");
+        fs::write(&executable, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$CAGENTS_TEST_WINDOW_ARGUMENTS\"\nprintf 'ready\\n'\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let name = std::thread::current().name().unwrap().to_owned();
+        let output = process::Command::new(env::current_exe().unwrap())
+            .args(["--exact", &name, "--nocapture"])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", root.path().join("home"))
+            .env("XDG_RUNTIME_DIR", root.path().join("runtime"))
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .env("XDG_CACHE_HOME", root.path().join("cache"))
+            .env("CAGENTS_TEST_WINDOW_EXECUTABLE", &executable)
+            .env(
+                "CAGENTS_TEST_WINDOW_ARGUMENTS",
+                root.path().join("arguments"),
+            )
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -2927,6 +3064,7 @@ mod tests {
             prepared: Vec::new(),
             closed: Vec::new(),
             fallback_executable: None,
+            restore_policy: WindowRestorePolicy::Ordinary,
         };
         assert!(WindowLease::acquire_in(runtime.path(), true, None).is_err());
         drop(guard);
@@ -2979,6 +3117,7 @@ mod tests {
             prepared: Vec::new(),
             closed: Vec::new(),
             fallback_executable: None,
+            restore_policy: WindowRestorePolicy::Ordinary,
         };
         assert!(
             guard
@@ -3052,6 +3191,7 @@ mod tests {
             prepared: vec![],
             closed: vec![],
             fallback_executable: None,
+            restore_policy: WindowRestorePolicy::Ordinary,
         };
         let error = guard
             .prepare_and_close_windows_with_preflight(Duration::from_secs(5), |guard| {
@@ -3130,6 +3270,7 @@ mod tests {
             prepared: Vec::new(),
             closed: Vec::new(),
             fallback_executable: None,
+            restore_policy: WindowRestorePolicy::Ordinary,
         };
         let slots = guard.prepare_windows(Duration::from_secs(5)).unwrap();
         assert_eq!(slots.len(), 2);

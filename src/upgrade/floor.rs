@@ -482,7 +482,7 @@ fn load_at(directory: &Path) -> Result<Ledger, String> {
     Ok(ledger)
 }
 
-fn record_for_source(source: &HostSessionProof) -> Result<Option<Record>, String> {
+pub(crate) fn record_for_source(source: &HostSessionProof) -> Result<Option<Record>, String> {
     let directory = directory()?;
     let Some(root) = open_directory(&directory)? else {
         return Ok(None);

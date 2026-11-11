@@ -135,6 +135,13 @@ impl Census {
     }
 
     pub(crate) fn capture(transaction: String) -> Result<Self, UpdateError> {
+        Self::capture_with_candidate(transaction, None)
+    }
+
+    fn capture_with_candidate(
+        transaction: String,
+        candidate_cli: Option<&Path>,
+    ) -> Result<Self, UpdateError> {
         if crate::device::is_remote() {
             return Err(invalid("Update census requires the local service"));
         }
@@ -143,7 +150,7 @@ impl Census {
         }
         // A retained checkpoint is a source, even after its process exits.
         // Never replace that inventory with an empty socket observation.
-        let handled = inspect_pending_source(&std::env::current_exe()?, None)?;
+        let handled = inspect_capture_source(candidate_cli)?;
         match observe() {
             Ok((source, terminals, chats, readiness)) => {
                 require_captured_owner(handled.as_ref(), Some(&source))?;
@@ -161,7 +168,7 @@ impl Census {
                     // A preparation may have appeared during the socket read.
                     // Admit its serving replacement under the same strict
                     // rule before recording the current source inventory.
-                    let now_handled = inspect_pending_source(&std::env::current_exe()?, None)?;
+                    let now_handled = inspect_capture_source(candidate_cli)?;
                     require_captured_owner(now_handled.as_ref(), Some(&source))?;
                     if now_handled.is_none() {
                         return Err(invalid(
@@ -187,7 +194,7 @@ impl Census {
                 if checkpoint_status()?
                     .is_some_and(|status| status.phase == crate::upgrade::handoff::Phase::Prepared)
                 {
-                    inspect_pending(&std::env::current_exe()?, None)?;
+                    inspect_capture_source(candidate_cli)?;
                     return Err(invalid(
                         "The recovered daemon changed or exited during census capture; its retained source inventory was kept, and no empty census was created",
                     ));
@@ -206,7 +213,7 @@ impl Census {
                     if checkpoint.as_ref().is_some_and(|status| {
                         status.phase == crate::upgrade::handoff::Phase::Prepared
                     }) {
-                        inspect_pending(&std::env::current_exe()?, None)?;
+                        inspect_capture_source(candidate_cli)?;
                         return Err(invalid(
                             "A Prepared checkpoint appeared during census capture; its source inventory was kept, and no empty census was created",
                         ));
@@ -301,22 +308,32 @@ impl Census {
                             .map_or_else(|| Ok(Default::default()), |store| store.recovered_chats())
                     })
                     .map_err(invalid)?;
-                let prepared = if self.source.as_ref() == Some(proof) {
-                    None
-                } else {
-                    crate::upgrade::recovery::verified::VerifiedView::load(
-                        proof, target, terminals, chats,
-                    )
-                    .map_err(invalid)?
-                };
-                let paused_ready = if self.source.as_ref() != Some(proof) && prepared.is_none() {
-                    crate::upgrade::recovery::verified::ready::ReadyView::load(
-                        proof, target, terminals, chats,
+                let original_source = self.source.as_ref().filter(|source| *source != proof);
+                let prepared = if let Some(original_source) = original_source {
+                    crate::upgrade::recovery::verified::VerifiedView::load_for_source(
+                        original_source,
+                        proof,
+                        target,
+                        terminals,
+                        chats,
                     )
                     .map_err(invalid)?
                 } else {
                     None
                 };
+                let paused_ready =
+                    if let Some(original_source) = original_source.filter(|_| prepared.is_none()) {
+                        crate::upgrade::recovery::verified::ready::ReadyView::load_for_source(
+                            original_source,
+                            proof,
+                            target,
+                            terminals,
+                            chats,
+                        )
+                        .map_err(invalid)?
+                    } else {
+                        None
+                    };
                 Ok((lineage, prepared, paused_ready))
             })();
             Ok(evidence)
@@ -906,7 +923,63 @@ pub(crate) fn validate_file(path: &Path) -> Result<(), UpdateError> {
     Census::load(path).map(|_| ())
 }
 pub(crate) fn capture_file(output: &Path) -> Result<(), UpdateError> {
-    Census::capture(uuid::Uuid::new_v4().to_string())?.save(output)
+    capture_file_with_candidate(output, None)
+}
+
+pub(crate) fn capture_file_with_candidate(
+    output: &Path,
+    candidate_cli: Option<&Path>,
+) -> Result<(), UpdateError> {
+    Census::capture_with_candidate(uuid::Uuid::new_v4().to_string(), candidate_cli)?.save(output)
+}
+
+fn inspect_capture_source(
+    candidate_cli: Option<&Path>,
+) -> Result<Option<HostSessionProof>, UpdateError> {
+    match candidate_cli {
+        Some(candidate) => inspect_pending_source(candidate, None),
+        None => inspect_pending_source_inner(&std::env::current_exe()?, None, true),
+    }
+}
+
+pub(super) fn inspect_pending_current() -> Result<(), UpdateError> {
+    inspect_pending_caller(&std::env::current_exe()?)
+}
+
+pub(super) fn inspect_pending_caller(caller: &Path) -> Result<(), UpdateError> {
+    inspect_pending_source_inner(caller, None, true).map(|_| ())
+}
+
+pub(super) struct PendingCommandScope<'a> {
+    pub pending: crate::upgrade::recovery::PendingRecovery,
+    pub original: Option<&'a Path>,
+}
+
+/// A completed immutable capture must never be rebound by a later census.
+pub(super) fn pending_command_scope(
+    original: &Path,
+) -> Result<Option<PendingCommandScope<'_>>, UpdateError> {
+    let Some(mut pending) =
+        crate::upgrade::recovery::PendingRecovery::inspect().map_err(invalid)?
+    else {
+        return Ok(None);
+    };
+    let original = if pending.original_census_complete {
+        None
+    } else {
+        let source = pending.source.clone();
+        let hash = pending.checkpoint_hash.clone();
+        pending = crate::upgrade::recovery::PendingRecovery::retain_installer_census(original)
+            .map_err(invalid)?
+            .ok_or_else(|| invalid("The Prepared checkpoint disappeared during inspection"))?;
+        if pending.source != source || pending.checkpoint_hash != hash {
+            return Err(invalid(
+                "The Prepared checkpoint changed while binding its census; inspect retained recovery again before continuing",
+            ));
+        }
+        Some(original)
+    };
+    Ok(Some(PendingCommandScope { pending, original }))
 }
 
 pub(super) fn inspect_pending(
@@ -920,41 +993,71 @@ fn inspect_pending_source(
     candidate_cli: &Path,
     census: Option<&Path>,
 ) -> Result<Option<HostSessionProof>, UpdateError> {
+    inspect_pending_source_inner(candidate_cli, census, false)
+}
+
+fn inspect_pending_source_inner(
+    candidate_hint: &Path,
+    census: Option<&Path>,
+    require_retained_job: bool,
+) -> Result<Option<HostSessionProof>, UpdateError> {
     if crate::device::is_remote() {
         return Err(invalid("Update recovery requires the local service"));
     }
-    let mut pending = crate::upgrade::recovery::PendingRecovery::inspect().map_err(invalid)?;
-    if let Some(pending) = pending.as_mut() {
-        match serving_prepared(pending) {
-            PreparedService::HandledVerified { serving } => return Ok(Some(serving)),
-            PreparedService::RetainedUnverified(detail) => {
-                return Err(invalid(format!(
-                    "Current daemon readiness and the original inventory are unverified: {detail}. The retained checkpoint and recovery claim evidence were kept, and any serving daemon was left running. Run `cagents --no-start daemon status` and `cagents --no-start terminal list` to inspect the current service before another update"
-                )));
-            }
-            PreparedService::Unresolved => {}
+    let Some(mut pending) =
+        crate::upgrade::recovery::PendingRecovery::inspect().map_err(invalid)?
+    else {
+        return Ok(None);
+    };
+    match serving_prepared(&pending) {
+        PreparedService::HandledVerified { serving } => return Ok(Some(serving)),
+        PreparedService::RetainedUnverified(detail) => {
+            return Err(invalid(format!(
+                "Current daemon readiness and the original inventory are unverified: {detail}. Keep all evidence and inspect the private update log before manual recovery. A partial claim without a settled record intentionally cannot be retried because custody may already have transferred; the claim never permits replay. Any serving daemon was left running. Run `cagents --no-start daemon status` and `cagents --no-start terminal list` to inspect what survives"
+            )));
         }
-        if let Some(census) = census {
-            *pending = crate::upgrade::recovery::PendingRecovery::retain_installer_census(census)
-                .map_err(invalid)?
-                .ok_or_else(|| invalid("The Prepared checkpoint disappeared during inspection"))?;
-        }
-        let recovered_path = if !pending.original_census_complete && census.is_none() {
-            let path = retained_job_census(candidate_cli, pending)?;
-            *pending = crate::upgrade::recovery::PendingRecovery::retain_installer_census(&path)
-                .map_err(invalid)?
-                .ok_or_else(|| invalid("The Prepared checkpoint disappeared during inspection"))?;
-            Some(path)
+        PreparedService::Unresolved => {}
+    }
+    // An installed caller identifies the installation, not the replacement.
+    // A retry from old UI/CLI must use the exact private retained job target.
+    let retained =
+        if require_retained_job || (!pending.original_census_complete && census.is_none()) {
+            retained_job(candidate_hint, &pending)?
         } else {
+            // Standalone installs explicitly name their retained target. Old job
+            // history must not override it or gate an already bound capture.
             None
         };
-        return Err(pending_required(
-            pending,
-            candidate_cli,
-            census.or(recovered_path.as_deref()),
-        )?);
-    }
-    Ok(None)
+    let candidate = match &retained {
+        Some(job) => job.cli.as_path(),
+        None if require_retained_job => return Err(missing_retained_job()),
+        None => {
+            // This is the standalone installer's explicit retained target.
+            locate(candidate_hint)?;
+            candidate_hint
+        }
+    };
+    let bound_census = if !pending.original_census_complete {
+        let path = census
+            .or_else(|| retained.as_ref().map(|job| job.census.as_path()))
+            .ok_or_else(missing_retained_job)?;
+        let source = pending.source.clone();
+        let checkpoint_hash = pending.checkpoint_hash.clone();
+        pending = crate::upgrade::recovery::PendingRecovery::retain_installer_census(path)
+            .map_err(invalid)?
+            .ok_or_else(|| invalid("The Prepared checkpoint disappeared during inspection"))?;
+        if pending.source != source || pending.checkpoint_hash != checkpoint_hash {
+            return Err(invalid(
+                "The Prepared checkpoint changed while binding its census; inspect retained recovery again before continuing",
+            ));
+        }
+        Some(path)
+    } else {
+        // The immutable complete capture wins over a later, different census.
+        // It already supplies manual scope, so do not pass an unrelated --census.
+        None
+    };
+    Err(pending_required(&pending, candidate, bound_census)?)
 }
 
 enum PreparedService {
@@ -1100,6 +1203,11 @@ fn retire_service(trigger: RetirementTrigger) -> Result<RetirementStatus, Update
         let Some(store) = crate::upgrade::handoff::Store::existing().map_err(invalid)? else {
             return Ok(RetirementStatus::NotRequired);
         };
+        // Serialize discovery, the root proof and the mechanical move as one
+        // retirement attempt. A concurrent verifier cannot observe another
+        // caller's canonical-byte custody window and report a false failure.
+        let retirement_guard =
+            crate::upgrade::recovery::RetirementGuard::acquire(&store.path).map_err(invalid)?;
         let socket = crate::terminal_ipc::daemon_socket_path()?;
         let mut client = source::Client::connect(&socket).map_err(|e| invalid(e.to_string()))?;
         let generation = client.inventory_generation()?;
@@ -1204,7 +1312,14 @@ fn retire_service(trigger: RetirementTrigger) -> Result<RetirementStatus, Update
         // Mechanical archival cannot establish user success. It follows the
         // exact root receipt above while the authenticated client stays pinned.
         recovered
-            .archive_completed(&proof, &terminals, &chats, &paused_terminals, &paused_chats)
+            .archive_completed_with(
+                &retirement_guard,
+                &proof,
+                &terminals,
+                &chats,
+                &paused_terminals,
+                &paused_chats,
+            )
             .map_err(invalid)?;
         // Independently open the archived evidence through the same root
         // verifier. A planned pointer alone is not durable completion.
@@ -1252,56 +1367,94 @@ fn retirement_partition(
     }
 }
 
-/// Resolve one private, request-bound job, rather than searching by timestamps
-/// or borrowing another update's census. A retry cannot overwrite this scope.
-fn retained_job_census(
-    candidate_cli: &Path,
+struct RetainedJob {
+    cli: PathBuf,
+    census: PathBuf,
+}
+
+fn missing_retained_job() -> UpdateError {
+    invalid(
+        "A Prepared checkpoint is retained, but its exact target job or original census is unavailable. Nothing was restarted or recaptured. Keep the checkpoint and private update log; run the retained target's inspect-pending-update-recovery with --candidate-cli pointing to its installed bin/cagents and --census pointing to the failed install's original update-census.json",
+    )
+}
+
+/// Resolve the target from one private request-bound job, independently of the
+/// old caller's executable name/version and never by directory timestamps.
+fn retained_job(
+    caller: &Path,
     pending: &crate::upgrade::recovery::PendingRecovery,
-) -> Result<PathBuf, UpdateError> {
-    let missing = || {
-        invalid(
-            "A Prepared checkpoint is retained, but its complete original census is unavailable. Nothing was restarted or recaptured. Keep the checkpoint and the failed install's original private update-census.json; rerun the retained target's inspect-pending-update-recovery with --census pointing to that file before recovering",
-        )
+) -> Result<Option<RetainedJob>, UpdateError> {
+    let Ok(caller) = locate(caller) else {
+        return Ok(None);
     };
-    let layout = locate(candidate_cli).map_err(|_| missing())?;
-    let state = layout.prefix.join(".update");
-    let directory = fs::symlink_metadata(&state).map_err(|_| missing())?;
+    let state = caller.prefix.join(".update");
+    let directory = match fs::symlink_metadata(&state) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(missing_retained_job()),
+    };
     if !directory.is_dir()
         || directory.uid() != unsafe { libc::geteuid() }
         || directory.mode() & 0o077 != 0
     {
-        return Err(missing());
+        return Err(missing_retained_job());
     }
     let status_path = state.join("status.json");
-    let status_bytes = read_private(&status_path, JOB_STATE_LIMIT).map_err(|_| missing())?;
-    let job: UpdateJob = serde_json::from_slice(&status_bytes).map_err(|_| missing())?;
-    if uuid::Uuid::parse_str(&job.id).is_err() || job.version != layout.version {
-        return Err(missing());
+    if !status_path.try_exists()? {
+        return Ok(None);
     }
-    let request: UpdateRequest = serde_json::from_slice(
-        &read_private(&state.join(format!("{}.request", job.id)), JOB_STATE_LIMIT)
-            .map_err(|_| missing())?,
-    )
-    .map_err(|_| missing())?;
+    let status_bytes =
+        read_private(&status_path, JOB_STATE_LIMIT).map_err(|_| missing_retained_job())?;
+    let job: UpdateJob =
+        serde_json::from_slice(&status_bytes).map_err(|_| missing_retained_job())?;
+    if uuid::Uuid::parse_str(&job.id).is_err()
+        || !matches!(
+            Path::new(&job.version)
+                .components()
+                .collect::<Vec<_>>()
+                .as_slice(),
+            [std::path::Component::Normal(_)]
+        )
+    {
+        return Err(missing_retained_job());
+    }
+    let cli = caller
+        .prefix
+        .join("versions")
+        .join(&job.version)
+        .join("bin/cagents");
+    let target = locate(&cli).map_err(|_| missing_retained_job())?;
+    if target.prefix != caller.prefix || target.version != job.version {
+        return Err(missing_retained_job());
+    }
+    let request_bytes = read_private(&state.join(format!("{}.request", job.id)), JOB_STATE_LIMIT)
+        .map_err(|_| missing_retained_job())?;
+    let request: UpdateRequest =
+        serde_json::from_slice(&request_bytes).map_err(|_| missing_retained_job())?;
     let target_matches = match request {
         UpdateRequest::Installed { root } | UpdateRequest::InstalledFromTerminal { root } => root
             .canonicalize()
-            .is_ok_and(|root| root == layout.version_root),
+            .is_ok_and(|root| root == target.version_root),
         UpdateRequest::Release(release) | UpdateRequest::ReleaseFromTerminal(release) => {
             release.version == job.version
         }
     };
     let path = census_path(&state, &job.id);
-    let original = Census::load(&path).map_err(|_| missing())?;
+    let census_bytes = read_private(&path, JOB_STATE_LIMIT).map_err(|_| missing_retained_job())?;
+    let original: Census =
+        serde_json::from_slice(&census_bytes).map_err(|_| missing_retained_job())?;
+    original.validate().map_err(|_| missing_retained_job())?;
     if !target_matches
         || original.transaction != job.id
         || original.source.as_ref() != Some(&pending.source)
         || original.checkpoint_before.as_ref() == Some(&pending.checkpoint_hash)
+        || !pending.matches_retained_job(&job.id, &request_bytes, &census_bytes)
         || read_private(&status_path, JOB_STATE_LIMIT)? != status_bytes
+        || read_private(&path, JOB_STATE_LIMIT)? != census_bytes
     {
-        return Err(missing());
+        return Err(missing_retained_job());
     }
-    Ok(path)
+    Ok(Some(RetainedJob { cli, census: path }))
 }
 
 fn pending_required(
@@ -1348,13 +1501,24 @@ pub(crate) fn verify_file_with_candidate(
     if let Some(mut required) = permission.target_required() {
         permission.save(outcome)?;
         if let Some(candidate_cli) = candidate_cli {
-            let pending =
-                crate::upgrade::recovery::PendingRecovery::retain_installer_census(census)
-                    .map_err(invalid)?
-                    .ok_or_else(|| {
-                        invalid("The Prepared checkpoint disappeared during inspection")
-                    })?;
-            required.recovery_command = Some(pending.command(candidate_cli, Some(census)));
+            let Some(PendingCommandScope {
+                pending,
+                original: original_path,
+            }) = pending_command_scope(census)?
+            else {
+                return Err(invalid(
+                    "The Prepared checkpoint disappeared during inspection",
+                ));
+            };
+            if pending.checkpoint_hash != required.checkpoint_digest
+                || pending.source != required.source
+            {
+                return Err(invalid(
+                    "The Prepared checkpoint changed during inspection; its evidence was kept. Inspect the selected target again before recovering",
+                ));
+            }
+            locate(candidate_cli)?;
+            required.recovery_command = Some(pending.command(candidate_cli, original_path));
         }
         return Err(UpdateError::TargetRecoveryRequired(required));
     }

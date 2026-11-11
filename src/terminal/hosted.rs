@@ -1415,9 +1415,31 @@ pub fn ensure_daemon_ready_for(
     application: crate::notifications::Application,
 ) -> Result<PathBuf, HostedTerminalStartError> {
     let socket = daemon_socket_path().map_err(HostedTerminalStartError::SocketPath)?;
+    if crate::instance::window_restore_policy()
+        == crate::instance::WindowRestorePolicy::ExistingOnly
+    {
+        // Background readers and model publishers share this boundary. A
+        // recovery window cannot turn an ordinary reconnect into a new daemon.
+        verify_daemon_protocol(crate::control::ControlClient::connect(&socket))?;
+        return Ok(socket);
+    }
     if !crate::device::is_remote() {
         ensure_daemon_ready_at(&socket, application)?;
     }
+    Ok(socket)
+}
+
+/// Provider activation requested by a person, after an attach-only recovery.
+/// Its transport is separate from the window's automatic read-only readers.
+pub(crate) fn ensure_daemon_ready_for_explicit_action() -> Result<PathBuf, HostedTerminalStartError>
+{
+    if let Some(socket) = crate::device::socket_path_for_explicit_action()
+        .map_err(HostedTerminalStartError::SocketPath)?
+    {
+        return Ok(socket);
+    }
+    let socket = daemon_socket_path().map_err(HostedTerminalStartError::SocketPath)?;
+    ensure_daemon_ready_at(&socket, crate::notifications::Application::Cagents)?;
     Ok(socket)
 }
 

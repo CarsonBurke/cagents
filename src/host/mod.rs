@@ -441,69 +441,7 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
                 recovered_prepared = true;
                 return Ok(());
             }
-            chat::retained_actor::reconcile_previous_boot_history(&host)
-                .map_err(io::Error::other)?;
-            let ready_capture =
-                crate::upgrade::recovery::verified::ready::capture().map_err(io::Error::other)?;
-            let unattached = state::restore_upgrade(&host).map_err(io::Error::other)?;
-            if update_recovery::restore_archived(&host, &unattached).map_err(io::Error::other)? {
-                return Ok(());
-            }
-            state::restore_orphaned_holders(&host).map_err(io::Error::other)?;
-            if let Some(detail) = host
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .startup_recovery()
-            {
-                return Err(io::Error::other(detail.to_owned()));
-            }
-            chat::restore_orphaned_native(&host, &unattached).map_err(io::Error::other)?;
-            if let Some(detail) = host
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .startup_recovery()
-            {
-                return Err(io::Error::other(detail.to_owned()));
-            }
-            chat::retained_actor::reconcile_retired_actors(&host).map_err(io::Error::other)?;
-            chat::retained_actor::reconcile_startup_losses(&host).map_err(io::Error::other)?;
-            model::floor::restore_presentations().map_err(io::Error::other)?;
-            let retained_runs = chat::retained_actor::retained_runs(&host);
-            // A committed acceptance is not proof of provider delivery. Until a
-            // restored actor supplies exact run evidence, never authorize a resend.
-            if let Ok(registry) = agent_execution::registry(&host) {
-                registry
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .interrupt_unproven_agent_runs_except(
-                        crate::chat::now_ms().unwrap_or(0),
-                        &retained_runs,
-                    )
-                    .map_err(io::Error::other)?;
-            }
-            let (proof, terminals, chats) = {
-                let state = host.lock().unwrap_or_else(|p| p.into_inner());
-                let chats = state
-                    .chats
-                    .values()
-                    .map(|record| {
-                        let mut session = record.session.clone();
-                        session.launch.session_id = record.handle.session_id();
-                        session.native_continuity = record.handle.native_continuity();
-                        session
-                    })
-                    .collect::<Vec<_>>();
-                (state.proof().clone(), state.list(0), chats)
-            };
-            let executable = std::env::current_exe()?;
-            crate::upgrade::recovery::verified::ready::publish(
-                ready_capture,
-                &proof,
-                &executable,
-                &terminals,
-                &chats,
-            )
-            .map_err(io::Error::other)?;
+            update_recovery::restore_ordinary(&host).map_err(io::Error::other)?;
             Ok(())
         })();
         match restored {

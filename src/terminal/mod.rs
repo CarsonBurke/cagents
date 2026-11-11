@@ -25,6 +25,7 @@ mod worker;
 pub(crate) const SPAWN_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 pub use ipc::TerminalSpawnOptions;
 
+pub(crate) use hosted::ensure_daemon_ready_for_explicit_action;
 pub use hosted::{
     HostedTerminalHandle, HostedTerminalStartError, ensure_daemon_ready, ensure_daemon_ready_for,
 };

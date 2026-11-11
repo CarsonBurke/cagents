@@ -234,6 +234,21 @@ def recovery_evidence(out: Path, errors: list[str]) -> dict | None:
         return None
 
 
+def namespace_source(root: Path, terminals: Path) -> dict:
+    """Headless socket/owner evidence, without claiming any saved UI state."""
+    marker = root / '.rehearse-update'
+    if marker.is_symlink() or marker.read_text().strip() != str(root):
+        raise ValueError('namespace capture requires a matching private root')
+    response = json.loads(private_evidence(terminals))
+    proof = response.get('data', {}).get('proof')
+    if response.get('ok') is not True or not isinstance(proof, dict) or any(
+            not isinstance(proof.get(field), str) or not proof[field]
+            for field in ('host_session_id', 'boot_id', 'host_incarnation')):
+        raise ValueError('namespace capture requires the authenticated baseline socket proof')
+    errors: list[str] = []
+    return {'root': str(root), 'serving': proof, 'processes': processes(root, errors), 'errors': errors}
+
+
 def record(root: Path, out: Path, windows: Path | None) -> dict:
     errors: list[str] = []
     snapshot = {"schema": 1, "root": str(root), "errors": errors}
@@ -570,12 +585,19 @@ def main() -> int:
     recovery = commands.add_parser("prepare-recovery")
     recovery.add_argument("root", type=Path)
     recovery.add_argument("out", type=Path)
+    namespace = commands.add_parser("namespace-source")
+    namespace.add_argument("root", type=Path)
+    namespace.add_argument("terminals", type=Path)
     comparison = commands.add_parser("compare")
     comparison.add_argument("before", type=Path)
     comparison.add_argument("after", type=Path)
     comparison.add_argument("--json", action="store_true")
     args = parser.parse_args()
     try:
+        if args.command == "namespace-source":
+            snapshot = namespace_source(args.root.resolve(), args.terminals)
+            print(dump(snapshot), end="")
+            return int(bool(snapshot['errors']))
         if args.command == "prepare-recovery":
             return 0 if prepare_recovery(args.root.resolve(), args.out) else 1
         if args.command == "record":
