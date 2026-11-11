@@ -3633,6 +3633,10 @@ mod tests {
 
     #[test]
     fn scoped_launch_passes_reserved_lease_through_the_scope_launcher() {
+        #[cfg(target_os = "linux")]
+        if crate::retained_fixture::run_isolated() {
+            return;
+        }
         use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
         let launcher = root.path().join("systemd-run");
@@ -3657,6 +3661,10 @@ mod tests {
 
     #[test]
     fn systemd_scope_preserves_environment_arguments_and_isolates_cgroup() {
+        #[cfg(target_os = "linux")]
+        if crate::retained_fixture::run_isolated() {
+            return;
+        }
         use std::io::{Read, Seek};
 
         if !systemd_user_manager_available() {
