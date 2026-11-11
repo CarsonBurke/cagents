@@ -10807,6 +10807,68 @@ mod tests {
         save(&next_host).unwrap();
     }
 
+    /// Resume conversation reopens a saved Codex thread with a bare `unix://`
+    /// remote, and the daemon gives it a listener of its own when no shared
+    /// daemon serves it. The started thread saves over the reopened card; any
+    /// other change to its launch is still refused.
+    #[test]
+    fn a_reopened_codex_thread_saves_as_the_daemon_started_it() {
+        let directory = tempdir().unwrap();
+        let store =
+            StateStore::open(directory.path().join("chat.sqlite3"), boot("chat-boot")).unwrap();
+        let (mut workspace, begun) = agent_workspace(crate::agent::Provider::Codex);
+        let proof = begun.terminal.as_ref().unwrap().continuity.live_proof();
+        let mut reopened = begun.clone();
+        reopened
+            .launch
+            .recipe
+            .arguments
+            .extend(["--remote".into(), "unix://".into()]);
+        reopened.proof = None;
+        reopened.terminal = None;
+        reopened.id = TerminalId::new();
+        workspace.cards[0].kind = CardKind::Chat(reopened.clone());
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        let mut save = |session: &crate::chat::Session| {
+            let mut workspace = workspace.clone();
+            workspace.cards[0].kind = CardKind::Chat(session.clone());
+            lane.save(&store, &workspace)
+        };
+
+        let daemon_root = directory.path().join("daemon-tmp");
+        let mut own = reopened.clone();
+        assert!(
+            own.claim_owned_codex_listener_for_unserved_thread(
+                &daemon_root,
+                proof.as_ref().unwrap()
+            )
+        );
+        own.proof = proof.clone();
+        let mut other_thread = own.clone();
+        other_thread.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        assert!(matches!(
+            card_refusal(save(&other_thread), workspace.cards[0].id),
+            StoreError::InvalidState(_)
+        ));
+        let mut other_option = own.clone();
+        other_option.launch.recipe.arguments.push("--search".into());
+        assert!(matches!(
+            card_refusal(save(&other_option), workspace.cards[0].id),
+            StoreError::InvalidState(violation) if violation.message().contains("launch recipe")
+        ));
+        save(&own).unwrap();
+        let stored =
+            StateStore::open(directory.path().join("chat.sqlite3"), boot("chat-boot")).unwrap();
+        match stored.load_card(workspace.cards[0].id, None).unwrap() {
+            Some(CardState {
+                kind: CardKind::Chat(stored),
+                ..
+            }) => assert_eq!(stored, own),
+            other => panic!("the card is stored as the started thread: {other:?}"),
+        }
+    }
+
     #[test]
     fn terminal_listener_evidence_survives_legacy_migration_and_restore() {
         let directory = tempdir().unwrap();
