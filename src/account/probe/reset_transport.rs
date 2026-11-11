@@ -130,10 +130,24 @@ impl Client {
         {
             return Err("Claude reset availability could not be read".into());
         }
-        for field in ["cedar_ember", "juniper_tide"] {
-            if !body[field].is_object() && sessions[field].is_object() {
-                body[field] = sessions[field].clone();
-            }
+        let now = now_ms() / 1000;
+        // Claude Code asks at_wall for rejected-limit offers and uses the
+        // cedar_ember query for its anytime command. These are separate offer
+        // contexts, so an ineligible anytime block cannot veto a usable wall
+        // offer. Select the complete block, keeping its grant order/counts.
+        let wall_offer = sessions["cedar_ember"]["eligible"].as_bool() == Some(true)
+            && sessions["cedar_ember"]["at_limit"].as_bool() == Some(true)
+            && super::super::claude::parse_resets(
+                &json!({"cedar_ember":sessions["cedar_ember"]}),
+                now,
+            )
+            .iter()
+            .any(|reset| reset.is_available(now as i64));
+        if wall_offer || !body["cedar_ember"].is_object() {
+            body["cedar_ember"] = sessions["cedar_ember"].clone();
+        }
+        if sessions.get("juniper_tide").is_some() {
+            body["juniper_tide"] = sessions["juniper_tide"].clone();
         }
         Ok(super::super::claude::parse_resets(&body, now_ms() / 1000))
     }
@@ -398,5 +412,98 @@ mod tests {
                 .is_err(),
             "a stopped fixture cannot fall back to production"
         );
+    }
+}
+
+#[cfg(test)]
+mod offer_context_tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    fn server(responses: Vec<Value>) -> (Client, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let worker = std::thread::spawn(move || {
+            for (index, response) in responses.into_iter().enumerate() {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error)
+                            if error.kind() == io::ErrorKind::WouldBlock
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(10))
+                        }
+                        Err(error) => panic!("fake offer request did not arrive: {error}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|end| end == b"\r\n\r\n") {
+                    let mut chunk = [0_u8; 1024];
+                    let count = stream.read(&mut chunk).unwrap();
+                    assert!(count > 0 && request.len() < 16 * 1024);
+                    request.extend_from_slice(&chunk[..count]);
+                }
+                let request = String::from_utf8(request).unwrap();
+                assert!(request.starts_with(if index == 0 {
+                    "GET /api/oauth/usage?cedar_ember=1&skip_spend=1 "
+                } else {
+                    "GET /api/oauth/usage?at_wall=1&skip_spend=1 "
+                }));
+                let body = response.to_string();
+                write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+            }
+        });
+        (
+            Client {
+                base: format!("http://127.0.0.1:{port}"),
+                bearer: "cagents-fixture-only".into(),
+                organization: "00000000-0000-4000-8000-000000000001".into(),
+                version: "0.0.0-fixture".into(),
+                fixture: true,
+            },
+            worker,
+        )
+    }
+
+    fn offer(id: &str, eligible: bool, at_limit: bool, window: &str) -> Value {
+        json!({"cedar_ember":{"eligible":eligible,"at_limit":at_limit,"next_grant_id":id,
+            "grants":[{"id":id,"resets_left":2,"clears":[window],"usable_now":true,"use_requires_limit":false}]}})
+    }
+
+    #[tokio::test]
+    async fn different_reads_select_one_coherent_usable_offer_context() {
+        let (client, server) = server(vec![
+            offer("anytime", false, false, "seven_day"),
+            offer("wall", true, true, "seven_day_overage_included"),
+        ]);
+        let resets = client.inventory().await.unwrap();
+        server.join().unwrap();
+        assert_eq!(resets.len(), 1);
+        assert_eq!(resets[0].id, "cedar_ember/wall");
+        assert_eq!(resets[0].available_count, 2);
+        assert_eq!(
+            resets[0].scopes,
+            [super::super::super::ResetScope::Model("Fable".into())]
+        );
+        assert!(resets[0].is_available((now_ms() / 1000) as i64));
+        let (client, server) = self::server(vec![
+            offer("anytime", true, false, "seven_day"),
+            offer("wall", false, true, "seven_day_overage_included"),
+        ]);
+        let resets = client.inventory().await.unwrap();
+        server.join().unwrap();
+        assert_eq!(resets.len(), 1);
+        assert_eq!(resets[0].id, "cedar_ember/anytime");
+        assert_eq!(
+            resets[0].scopes,
+            [super::super::super::ResetScope::AccountWeekly]
+        );
+        assert!(resets[0].is_available((now_ms() / 1000) as i64));
     }
 }
