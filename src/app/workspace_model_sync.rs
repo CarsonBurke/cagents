@@ -3567,7 +3567,7 @@ mod tests {
 
     #[test]
     fn late_view_snapshot_preserves_observed_channel_and_project_removal() {
-        use crate::workspace_model::views::{Scope, View};
+        use crate::workspace_model::views::{Pane, Scope, View};
         for close_project in [false, true] {
             let (mut app, _, repository) = app_with_project();
             let channel = ChannelId::new();
@@ -3982,7 +3982,25 @@ mod tests {
         pane.scope = Some(path.clone());
         app.workspace_model.views[1].scope = scope.clone();
         app.workspace_model.views[1].panes = vec![pane.clone()];
-        app.workspace_model.views.push(View::empty(unrelated));
+        let sentinel = app.workspace.focused().unwrap();
+        assert_ne!(sentinel, pane.id);
+        let sentinel_pane = Pane::from_card(
+            app.card_state(sentinel).unwrap(),
+            app.durable.card_scopes.get(&sentinel).cloned(),
+        )
+        .unwrap();
+        let mut unrelated_view = View::empty(unrelated);
+        unrelated_view.panes.push(sentinel_pane.clone());
+        app.workspace_model.views.push(unrelated_view);
+        let channel = Arc::make_mut(&mut app.durable)
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == unrelated)
+            .unwrap();
+        channel.cards = vec![sentinel];
+        channel.focused = Some(sentinel);
+        app.shared_views
+            .initialize(Scope::Channel(unrelated), vec![sentinel_pane]);
         app.sidebar_model.projects[0].worktrees.push(
             crate::sidebar::SidebarWorktree::from_durable(
                 crate::model::WorktreeId::new(),

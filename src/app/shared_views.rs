@@ -4900,7 +4900,7 @@ mod tests {
 
     #[test]
     fn repository_path_change_uses_fresh_authority_without_rewriting_its_previous_scope() {
-        let (mut app, _, _, mut old) = channel_move_fixture();
+        let (mut app, _, _, mut old) = fixture();
         let project = app.durable.channels[0].project_id;
         let old_repository = PathBuf::from("/repo/.git");
         let old_path = PathBuf::from("/repo/previous-root");
@@ -4929,10 +4929,16 @@ mod tests {
         app.known_worktree_roots.insert(old_path.clone());
         let durable = Arc::make_mut(&mut app.durable);
         durable.active_channel = None;
-        for channel in &mut durable.channels {
-            channel.cards.clear();
-        }
+        durable.cards.push(CardState {
+            id: old.id,
+            generation: 0,
+            title: old.title.clone(),
+            width_fraction: old.width_fraction,
+            existence: Existence::Open,
+            kind: old.kind.clone(),
+        });
         durable.card_scopes.insert(old.id, old_path.clone());
+        app.cards.insert(old.id, CardRuntime::Completed);
         old.scope = Some(old_path.clone());
         let mut view = View::empty(old_scope.clone());
         view.panes.push(old.clone());
