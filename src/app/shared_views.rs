@@ -5191,6 +5191,67 @@ mod tests {
     }
 
     #[test]
+    fn admission_reads_mounted_order_without_reordering_unmounted_saved_members() {
+        let (mut app, source, _, first) = channel_move_fixture();
+        app.active_workspace = Some("/repo".into());
+        let mut second = first.clone();
+        second.id = CardId::new();
+        if let CardKind::Browser(browser) = &mut second.kind {
+            browser.id = BrowserId::new();
+        }
+        let scope = Scope::Channel(source);
+        app.workspace_model.views[0].panes.push(second.clone());
+        drop(app.reconcile_shared_views());
+        let _ = app.workspace.focus_without_scrolling(second.id);
+        app.workspace.request_close(first.id).unwrap();
+        let _ = app.workspace.commit_close(first.id).unwrap();
+        app.workspace_model.views[0].panes.swap(0, 1);
+        app.shared_views.initialized.remove(&scope);
+        app.shared_views.baseline.remove(&scope);
+
+        app.admit_existing_views_in(Some(&HashSet::from([scope.clone()])));
+
+        assert!(app.shared_views.initialized.contains(&scope));
+        assert_eq!(app.durable.channels[0].cards, [first.id, second.id]);
+        assert_eq!(app.workspace.order().collect::<Vec<_>>(), [second.id]);
+        assert_eq!(app.workspace.focused(), Some(second.id));
+        assert!(app.card_state(first.id).unwrap().existence.is_open());
+    }
+
+    #[test]
+    fn admission_leaves_closed_saved_members_for_ordinary_migration() {
+        let (mut app, source, _, first) = channel_move_fixture();
+        app.active_workspace = Some("/repo".into());
+        let scope = Scope::Channel(source);
+        let closed = CardId::new();
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.cards.push(CardState {
+            id: closed,
+            generation: 0,
+            title: "closed saved member".into(),
+            width_fraction: 0.5,
+            existence: super::super::project_ui::removed_existence("already closed"),
+            kind: first.kind.clone(),
+        });
+        durable.channels[0].cards.push(closed);
+        app.shared_views.initialized.remove(&scope);
+        app.shared_views.baseline.remove(&scope);
+
+        app.admit_existing_views_in(Some(&HashSet::from([scope.clone()])));
+
+        assert!(!app.shared_views.initialized.contains(&scope));
+        assert_eq!(app.durable.channels[0].cards, [first.id, closed]);
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        drop(app.reconcile_shared_views());
+        assert!(std::iter::from_fn(|| rx.try_recv().ok()).any(
+            |edit| matches!(edit, ModelEdit::SeedView { scope: seeded, .. } if seeded == scope)
+        ));
+        assert_eq!(app.durable.channels[0].cards, [first.id]);
+        assert!(!app.card_state(closed).unwrap().existence.is_open());
+    }
+
+    #[test]
     fn populated_admission_checks_the_current_strip_order_before_equality() {
         let (mut app, source, _, pane) = channel_move_fixture();
         app.active_workspace = Some("/repo".into());
