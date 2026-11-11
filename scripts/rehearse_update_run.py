@@ -3,6 +3,7 @@
 import argparse
 from collections import Counter
 from contextlib import closing
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -11,7 +12,55 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tarfile
 import time
+
+
+def candidate_namespace_cli(root, archive_dir, version):
+    """Extract only the verified candidate CLI into the marked private root."""
+    root=Path(root).resolve()
+    if (root/'.rehearse-update').is_symlink() or (root/'.rehearse-update').read_text().strip()!=str(root):
+        raise RuntimeError('candidate probe requires a matching rehearsal root')
+    if not version or version in ('.','..') or '/' in version:
+        raise RuntimeError('candidate probe requires a single version name')
+    archive_dir=Path(archive_dir)
+    name=f'cagents-{version}-x86_64-unknown-linux-gnu.tar.gz'
+    source=archive_dir/name
+    with source.open('rb') as stream:
+        digest=hashlib.file_digest(stream,'sha256').hexdigest()
+    expected=[line.split()[0] for line in (archive_dir/'SHA256SUMS').read_text().splitlines()
+              if len(line.split())==2 and line.split()[1].lstrip('*')==name]
+    if expected!=[digest]:
+        raise RuntimeError('candidate probe requires the checksum-verified archive')
+    with tarfile.open(source,'r:gz') as archive:
+        members=[member for member in archive.getmembers() if member.name==f'cagents-{version}/bin/cagents']
+        if len(members)!=1 or not members[0].isreg() or not 0<members[0].size<=128*1024**2:
+            raise RuntimeError('candidate probe requires one bounded regular CLI')
+        destination=root/'candidate-namespace'
+        destination.mkdir(mode=0o700)
+        cli=destination/'cagents'
+        with archive.extractfile(members[0]) as stream, cli.open('xb') as output:
+            shutil.copyfileobj(stream,output)
+        cli.chmod(0o700)
+        with cli.open('rb') as stream:
+            cli_digest=hashlib.file_digest(stream,'sha256').hexdigest()
+        manifest=destination/'archive.json'
+        manifest.write_text(json.dumps({'archive':str(source.resolve()),'archive_sha256':digest,
+                                       'member':members[0].name,'cli_sha256':cli_digest},indent=2,sort_keys=True)+'\n')
+        manifest.chmod(0o600)
+    return cli
+
+
+def candidate_namespace_contract(source, candidate, old_version, new_version):
+    expected=source.get('data',{})
+    actual=candidate.get('data',{})
+    if (source.get('ok') is not True or candidate.get('ok') is not True
+            or expected.get('running') is not True or actual.get('running') is not True
+            or expected.get('instance')!='production' or actual.get('instance')!='production'
+            or expected.get('daemon_version')!=old_version or actual.get('daemon_version')!=old_version
+            or not expected.get('socket') or actual.get('socket')!=expected['socket']
+            or actual.get('cli_version')!=new_version):
+        raise RuntimeError('candidate does not observe the serving production baseline in the same namespace')
 
 
 def provider_activity(root):
@@ -532,6 +581,19 @@ class Rehearsal:
         try:
             self.call('init')
             self.call('install', args.old_dir, args.old_version, args.old_installer, timeout=180)
+            candidate=candidate_namespace_cli(self.root,args.new_dir,args.new_version)
+            current=self.root/'home/.local/share/cagents-install/current'
+            original_current=current.resolve()
+            _, source=self.cli('--no-start','daemon','status')
+            _, output=self.call('env',candidate,'--no-start','--json','daemon','status')
+            observed=json.loads(output)
+            probe=self.root/'candidate-namespace.json'
+            probe.write_text(json.dumps({'source':source,'candidate':observed,'current':str(original_current),
+                                        'archive':json.loads((candidate.parent/'archive.json').read_text())},indent=2,sort_keys=True)+'\n')
+            probe.chmod(0o600)
+            candidate_namespace_contract(source,observed,args.old_version,args.new_version)
+            if current.resolve()!=original_current:
+                raise RuntimeError('read-only candidate namespace probe changed current')
             self.call('desktop','start','--limit','900', timeout=None)
             self.call('launch','main')
             self.call('launch','second')

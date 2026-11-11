@@ -457,6 +457,72 @@ class ChatViews(unittest.TestCase):
                     rehearsal.capture_chats('before')
 
 
+class CandidateNamespace(unittest.TestCase):
+    def module(self):
+        spec=importlib.util.spec_from_file_location('candidate_namespace_rehearsal',REPOSITORY/'scripts/rehearse_update_run.py')
+        scenario=importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(scenario)
+        return scenario
+
+    def test_candidate_must_observe_the_exact_serving_production_namespace(self):
+        scenario=self.module()
+        source={'ok':True,'data':{'instance':'production','running':True,'daemon_version':'old',
+                                  'socket':'/var/tmp/private/rt/cagents/cagentsd.sock','cli_version':'old'}}
+        candidate=copy.deepcopy(source)
+        candidate['data']['cli_version']='new'
+        scenario.candidate_namespace_contract(source,candidate,'old','new')
+        for field,value in (('instance','development'),('running',False),('daemon_version','new'),
+                            ('socket','/var/tmp/private/rt/cagents-development/cagentsd.sock'),('cli_version','wrong')):
+            with self.subTest(field=field):
+                changed=copy.deepcopy(candidate)
+                changed['data'][field]=value
+                with self.assertRaisesRegex(RuntimeError,'same namespace'):
+                    scenario.candidate_namespace_contract(source,changed,'old','new')
+
+    def test_probe_extracts_only_a_verified_regular_cli_inside_the_private_root(self):
+        scenario=self.module()
+        with tempfile.TemporaryDirectory(prefix='ru-namespace-') as temporary:
+            base=Path(temporary)
+            root,shared=base/'private',base/'shared'
+            root.mkdir();shared.mkdir()
+            (root/'.rehearse-update').write_text(str(root)+'\n')
+            archive=shared/'cagents-new-x86_64-unknown-linux-gnu.tar.gz'
+            payload=b'#!/bin/sh\nexit 0\n'
+            with tarfile.open(archive,'w:gz') as output:
+                info=tarfile.TarInfo('cagents-new/bin/cagents');info.size=len(payload)
+                output.addfile(info,io.BytesIO(payload))
+                other=tarfile.TarInfo('cagents-new/bin/cagentsd');other.size=100
+                output.addfile(other,io.BytesIO(b'x'*100))
+            digest=hashlib.sha256(archive.read_bytes()).hexdigest()
+            (shared/'SHA256SUMS').write_text(f'{digest}  {archive.name}\n')
+            cli=scenario.candidate_namespace_cli(root,shared,'new')
+            self.assertEqual(cli.read_bytes(),payload)
+            self.assertEqual(cli.stat().st_mode&0o777,0o700)
+            self.assertEqual({p.name for p in cli.parent.iterdir()},{'cagents','archive.json'})
+            manifest=json.loads((cli.parent/'archive.json').read_text())
+            self.assertEqual(manifest['archive_sha256'],digest)
+            self.assertEqual(manifest['cli_sha256'],hashlib.sha256(payload).hexdigest())
+            self.assertEqual((cli.parent/'archive.json').stat().st_mode&0o777,0o600)
+            (shared/'SHA256SUMS').write_text(f'{"0"*64}  {archive.name}\n')
+            with self.assertRaisesRegex(RuntimeError,'checksum-verified'):
+                scenario.candidate_namespace_cli(root,shared,'new')
+
+    def test_probe_refuses_a_linked_archive_cli(self):
+        scenario=self.module()
+        with tempfile.TemporaryDirectory(prefix='ru-namespace-link-') as temporary:
+            root=Path(temporary)
+            (root/'.rehearse-update').write_text(str(root)+'\n')
+            archive=root/'cagents-new-x86_64-unknown-linux-gnu.tar.gz'
+            with tarfile.open(archive,'w:gz') as output:
+                info=tarfile.TarInfo('cagents-new/bin/cagents')
+                info.type=tarfile.SYMTYPE;info.linkname='/usr/bin/false'
+                output.addfile(info)
+            digest=hashlib.sha256(archive.read_bytes()).hexdigest()
+            (root/'SHA256SUMS').write_text(f'{digest}  {archive.name}\n')
+            with self.assertRaisesRegex(RuntimeError,'regular CLI'):
+                scenario.candidate_namespace_cli(root,root,'new')
+
+
 class ExistingOnlyReopen(unittest.TestCase):
     def module(self):
         spec=importlib.util.spec_from_file_location('existing_only_rehearsal',REPOSITORY/'scripts/rehearse_update_run.py')
