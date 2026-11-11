@@ -28,7 +28,10 @@ mod tests {
         if let Ok(case) = std::env::var(CHILD) {
             instance::initialize_window_restore_policy(instance::WindowRestorePolicy::ExistingOnly)
                 .unwrap();
-            let mut app = crate::app::tests::context_inspector_test_app(case == "failure");
+            let mut app = crate::app::tests::context_inspector_test_app(matches!(
+                case.as_str(),
+                "failure" | "progress-report-failure"
+            ));
             app.startup_gate
                 .initial_panes
                 .capture(instance::window_launch_restore_policy(), &app.durable.cards);
@@ -70,6 +73,16 @@ mod tests {
                 }
                 "no-handshake" => {
                     drop(app.begin_startup_gate());
+                }
+                "progress-report-failure" => {
+                    app.startup_gate = startup_gate::State::fixture_opened();
+                    app.startup_gate
+                        .initial_panes
+                        .capture(instance::window_launch_restore_policy(), &app.durable.cards);
+                    drop(app.update(Message::StartupReported(Err("launcher pipe closed".into()))));
+                    assert!(app.startup_gate.fixture_verdict().2);
+                    let (card, terminal) = initial.unwrap();
+                    assert!(app.startup_gate.initial_panes.existing_only(card, terminal));
                 }
                 _ => unreachable!(),
             }
@@ -141,7 +154,12 @@ mod tests {
             std::fs::create_dir(root.path().join(leaf)).unwrap();
         }
         let name = std::thread::current().name().unwrap().to_owned();
-        for case in ["success", "failure", "no-handshake"] {
+        for case in [
+            "success",
+            "failure",
+            "no-handshake",
+            "progress-report-failure",
+        ] {
             let mut command = std::process::Command::new(std::env::current_exe().unwrap());
             command
                 .args(["--exact", &name, "--nocapture"])

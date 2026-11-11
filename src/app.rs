@@ -16869,6 +16869,7 @@ impl Application for Cagents {
                     if self.startup_gate.window_opened() {
                         // The updater may have timed out and retained this
                         // usable recovery window while closing its pipe.
+                        self.startup_report_failed();
                         self.status = Some(TransientNotice::warning(format!(
                             "The updater could not verify this window's recovery: {error}. Your chats and drafts remain available; verify them and save before updating again."
                         )));

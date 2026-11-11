@@ -1154,6 +1154,12 @@ impl Cagents {
         report(Err(reason))
     }
 
+    pub(super) fn startup_report_failed(&mut self) {
+        self.startup_gate.retire_inspections();
+        self.startup_gate.reported = true;
+        instance::finish_window_restore();
+    }
+
     pub(super) fn startup_panes_saved(
         &mut self,
         settings: Result<SettingsSaved, String>,
