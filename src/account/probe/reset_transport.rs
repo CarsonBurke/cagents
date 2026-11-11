@@ -252,8 +252,9 @@ impl Client {
             }
             json!({"program":"cedar_ember", "grant_id":grant, "request_id":key})
         } else if reset_id == "juniper_tide" {
-            // No request-id contract exists for this program. The caller
-            // journals it before sending and never submits this key twice.
+            // This API has no server idempotency contract and cannot be made
+            // idempotent by cagents. The local journal only prevents sending
+            // this operation twice; recovery rereads usage without another POST.
             json!({"program":"juniper_tide"})
         } else {
             return Err("This reset is no longer available".into());

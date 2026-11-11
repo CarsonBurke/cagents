@@ -81,6 +81,13 @@ a consume request. Keep the reported key for any deliberate retry of that same
 attempt; reuse both `--reset-id ID` and `--idempotency-key KEY` from the printed
 recovery command rather than creating a new operation.
 
+Claude's recurring session reset has no server idempotency contract; cagents
+cannot make that API idempotent. Its local request key only prevents submitting
+the same operation twice. After an uncertain result, recovery checks usage
+without sending another consume. While the UI retains that uncertain attempt,
+it permits a new confirmation only after observing a later available period.
+The durable protection applies to the original request key.
+
 Codex uses its supported app-server reset-credit methods. Claude Code does not
 expose a reset operation through its control protocol, so Claude reset inventory
 and consumption use the private endpoint its own client uses. The same probe
