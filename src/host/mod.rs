@@ -381,6 +381,9 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
             chat::retained_actor::reconcile_previous_boot_history(&host)
                 .map_err(io::Error::other)?;
             let unattached = state::restore_upgrade(&host).map_err(io::Error::other)?;
+            if update_recovery::restore_archived(&host, &unattached).map_err(io::Error::other)? {
+                return Ok(());
+            }
             state::restore_orphaned_holders(&host).map_err(io::Error::other)?;
             if let Some(detail) = host
                 .lock()

@@ -1298,6 +1298,27 @@ impl Survivors {
     }
 
     pub(super) fn verify_successor(&mut self, target_daemon: &Path) -> Result<(), UpdateError> {
+        self.verify_successor_inner(target_daemon, false)
+    }
+
+    /// Mechanical completion after the root recovery verifier has established
+    /// a fresh usable census. Core inventory counts alone do not authorize it.
+    /// No subsequent startup may receive the spent receipt.
+    pub(super) fn archive_recovered_successor(&mut self) -> Result<(), UpdateError> {
+        let Some(receipt) = &self.receipt else {
+            return Ok(());
+        };
+        let target = receipt.target().to_owned();
+        self.verify_successor_inner(&target, true)?;
+        self.receipt = None;
+        Ok(())
+    }
+
+    fn verify_successor_inner(
+        &mut self,
+        target_daemon: &Path,
+        archive: bool,
+    ) -> Result<(), UpdateError> {
         if crate::daemon::running_executable()
             .map_err(|error| invalid(error.to_string()))?
             .as_deref()
@@ -1335,11 +1356,13 @@ impl Survivors {
             let chats = client
                 .list_chats()
                 .map_err(|error| invalid(error.to_string()))?;
-            self.recovery_outcome = Some(
-                receipt
-                    .verify(client.proof(), &terminals, &chats)
-                    .map_err(invalid)?,
-            );
+            peer.verify(client.proof())?;
+            let outcome = if archive {
+                receipt.archive_verified(client.proof(), &terminals, &chats)
+            } else {
+                receipt.verify(client.proof(), &terminals, &chats)
+            };
+            self.recovery_outcome = Some(outcome.map_err(invalid)?);
         }
         peer.verify(client.proof())?;
         Ok(())

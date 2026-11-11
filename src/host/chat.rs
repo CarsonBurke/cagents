@@ -11,6 +11,7 @@ mod lost_agent_close_tests;
 mod lost_codex_owner_close_tests;
 mod native_cleanup;
 mod native_recovery;
+pub(super) use native_recovery::restore_ready_checkpoint;
 mod owned_listener;
 pub(super) use owned_listener::{
     Roots as CodexListenerRoots, keep_legacy_listeners_fresh as keep_legacy_codex_listeners_fresh,
