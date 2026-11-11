@@ -6,6 +6,118 @@ use crate::upgrade::{
 };
 use std::collections::BTreeSet;
 
+/// A settled outcome says only that this exact Prepared checkpoint has already
+/// been handled. It supplies no launch recipes or renewed execution authority.
+pub(super) fn restore_settled(host: &SharedHost) -> Result<bool, String> {
+    let store = Store::discover()?;
+    let daemon = std::env::current_exe().map_err(|error| error.to_string())?;
+    restore_settled_from(host, &store.path, &daemon)
+}
+
+pub(super) fn restore_settled_from(
+    host: &SharedHost,
+    checkpoint: &std::path::Path,
+    daemon: &std::path::Path,
+) -> Result<bool, String> {
+    let Some(settled) = recovery::classify_retained_prepared(checkpoint, daemon)? else {
+        return Ok(false);
+    };
+    tracing::info!(checkpoint = %checkpoint.display(),
+        "settled update checkpoint identified; adopting current holders and retaining paused history");
+    // Recreate missing history before accepting clients, including when its
+    // index was pruned after the first recovery. Invalid existing records refuse
+    // startup before any adoption. Every presentation
+    // was already handled before the outcome became settled; a cold restart
+    // must not undo a later genuine pane close.
+    let mut paused = paused_record(
+        settled.source.clone(),
+        &settled.census,
+        &settled.paused_chats,
+        settled.paused_terminals.clone(),
+    )?;
+    for presentation in &mut paused.presentations {
+        presentation.restored = true;
+    }
+    paused.save()?;
+    host.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .pause_update_terminals(&settled.paused_terminals);
+
+    let preserved = settled
+        .census
+        .terminal_ids()
+        .difference(&settled.paused_terminals.iter().copied().collect())
+        .copied()
+        .collect();
+    super::chat::retained_actor::reconcile_previous_boot_history(host)?;
+    state::restore_orphaned_holders_preserving(host, &preserved)?;
+    ensure_no_ambiguous_adoption(host)?;
+    // This scans and authenticates current holders, including owners created
+    // explicitly since the recovery. The historical census is not a live list.
+    let preserved_chats = settled
+        .census
+        .chats
+        .iter()
+        .map(|chat| chat.id)
+        .filter(|id| !settled.paused_chats.contains(id))
+        .collect();
+    super::chat::restore_orphaned_native_preserving(host, &[], &preserved_chats)?;
+    ensure_no_ambiguous_adoption(host)?;
+    super::chat::retained_actor::reconcile_retired_actors(host)?;
+    super::chat::retained_actor::reconcile_startup_losses(host)?;
+
+    let (terminals, chats) = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        (
+            state.terminals.keys().copied().collect::<BTreeSet<_>>(),
+            state
+                .chats
+                .iter()
+                .filter(|(_, record)| !record.handle.is_read_only_history())
+                .map(|(id, _)| *id)
+                .collect::<BTreeSet<_>>(),
+        )
+    };
+    let paused_terminals: Vec<_> = settled
+        .census
+        .terminal_ids()
+        .difference(&terminals)
+        .copied()
+        .collect();
+    let paused_chats: Vec<_> = settled
+        .census
+        .chats
+        .iter()
+        .filter(|chat| !chats.contains(&chat.id))
+        .map(|chat| chat.id)
+        .collect();
+    let mut paused = paused_record(
+        settled.source,
+        &settled.census,
+        &paused_chats,
+        paused_terminals.clone(),
+    )?;
+    for presentation in &mut paused.presentations {
+        presentation.restored = true;
+    }
+    paused.save()?;
+    host.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .pause_update_terminals(&paused_terminals);
+    super::model::floor::restore_presentations()?;
+    let retained_runs = super::chat::retained_actor::retained_runs(host);
+    if let Ok(registry) = super::agent_execution::registry(host) {
+        registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .interrupt_unproven_agent_runs_except(
+                crate::chat::now_ms().unwrap_or(0),
+                &retained_runs,
+            )?;
+    }
+    Ok(true)
+}
+
 /// Returns true only for the one startup carrying a validated recovery receipt.
 /// Ordinary startup keeps Prepared's existing refusal and replay guarantees.
 pub(super) fn restore(host: &SharedHost) -> Result<bool, String> {
@@ -209,6 +321,351 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    fn seed_managed_pane(
+        registry_path: &std::path::Path,
+        directory: &std::path::Path,
+        alias: &Session,
+    ) -> (
+        super::super::model::Registry,
+        crate::workspace_model::views::Pane,
+    ) {
+        let agent = crate::agent_execution::Agent {
+            id: crate::model::AgentId::new(),
+            name: None,
+            origin: crate::agent_execution::Origin::User,
+            spec: crate::agent_execution::Spec {
+                provider: crate::agent::Provider::Codex,
+                account: None,
+                target: crate::agent_execution::Target {
+                    repository: directory.to_owned(),
+                    directory: directory.to_owned(),
+                    placement: None,
+                },
+                surface: crate::agent_execution::Surface::Chat,
+                model: None,
+                permission_mode: None,
+                reasoning_effort: None,
+            },
+            placement: crate::workspace_model::views::Scope::Channel(crate::model::ChannelId::new()),
+            session: Some(crate::agent_execution::HostedSession::Chat(alias.clone())),
+            console: None,
+            created_ms: 1,
+            closed: false,
+        };
+        let pane = crate::workspace_model::views::Pane {
+            id: crate::model::CardId::from_uuid(agent.id.as_uuid()),
+            title: "Paused managed Codex".into(),
+            user_title: None,
+            pending_terminal_start: false,
+            width_fraction: 0.5,
+            kind: crate::model::CardKind::Chat(alias.clone()),
+            scope: Some(directory.to_owned()),
+        };
+        let mut registry = super::super::model::Registry::at(&registry_path).unwrap();
+        registry
+            .apply(&crate::workspace_model::ModelEdit::OpenProject {
+                repository: directory.to_owned(),
+                name: "Recovery fixture".into(),
+                kind: Default::default(),
+            })
+            .unwrap();
+        let crate::workspace_model::views::Scope::Channel(channel) = &agent.placement else {
+            unreachable!()
+        };
+        registry
+            .apply(&crate::workspace_model::ModelEdit::CreateChannel {
+                id: *channel,
+                repository: directory.to_owned(),
+                title: "Paused Codex".into(),
+                title_source: Default::default(),
+            })
+            .unwrap();
+        let db = rusqlite::Connection::open(&registry_path).unwrap();
+        db.execute(
+            "INSERT INTO agents(id,origin,record,session_id,closed) VALUES(?1,'user',?2,?3,0)",
+            rusqlite::params![
+                agent.id.to_string(),
+                serde_json::to_string(&agent).unwrap(),
+                alias.id.to_string()
+            ],
+        )
+        .unwrap();
+        drop(db);
+        registry
+            .apply(&crate::workspace_model::ModelEdit::SeedView {
+                scope: agent.placement.clone(),
+                panes: vec![pane.clone()],
+                closed: Vec::new(),
+            })
+            .unwrap();
+        (registry, pane)
+    }
+
+    #[test]
+    fn settled_prepared_restart_restores_history_without_replaying_its_provider() {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::PermissionsExt;
+
+        const ROOT: &str = "CAGENTS_SETTLED_RESTART_TEST_ROOT";
+        let root = if let Some(root) = std::env::var_os(ROOT) {
+            std::path::PathBuf::from(root)
+        } else {
+            let root = tempfile::tempdir_in("/var/tmp").unwrap();
+            for name in [
+                "home", "run", "data", "config", "cache", "project", "codex", "claude",
+            ] {
+                crate::secure_file::prepare_private_directory(&root.path().join(name)).unwrap();
+            }
+            let selector = std::thread::current().name().unwrap().to_owned();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &selector, "--nocapture", "--test-threads=1"])
+                .env(ROOT, root.path())
+                .env("HOME", root.path().join("home"))
+                .env("XDG_RUNTIME_DIR", root.path().join("run"))
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("XDG_CACHE_HOME", root.path().join("cache"))
+                .env("CODEX_HOME", root.path().join("codex"))
+                .env("CLAUDE_CONFIG_DIR", root.path().join("claude"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        };
+        let hash = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
+        let proof = |epoch| HostSessionProof {
+            host_session_id: HostSessionId::new("settled-restart"),
+            boot_id: crate::daemon::read_boot_id().unwrap(),
+            host_incarnation: HostIncarnation::new(epoch),
+        };
+        let provider_dir = root.join("provider");
+        crate::secure_file::prepare_private_directory(&provider_dir).unwrap();
+        let provider = provider_dir.join("codex");
+        let sentinel = root.join("provider-was-replayed");
+        fs::write(
+            &provider,
+            b"#!/bin/sh\nprintf replayed > \"$CAGENTS_RECOVERY_SENTINEL\"\nexit 91\n",
+        )
+        .unwrap();
+        fs::set_permissions(&provider, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut source = Session {
+            id: TerminalId::new(),
+            launch: chat::Launch {
+                provider: crate::agent::Provider::Codex,
+                recipe: LaunchRecipe {
+                    program: provider.to_string_lossy().into_owned(),
+                    arguments: vec!["--remote".into(), "unix://".into()],
+                    working_directory: root.join("project"),
+                    environment: [(
+                        "CAGENTS_RECOVERY_SENTINEL".into(),
+                        sentinel.to_string_lossy().into_owned(),
+                    )]
+                    .into(),
+                    unset_environment: Default::default(),
+                },
+                session_id: None,
+            },
+            proof: Some(proof("source")),
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: Default::default(),
+        };
+        assert!(source.claim_owned_codex_listener(&root.join("run"), &proof("source")));
+        let alias = source.clone();
+        source.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        let mut snapshots = recovery::SnapshotCapture::default();
+        snapshots
+            .push(
+                source.clone(),
+                chat::Snapshot {
+                    session_id: source.launch.session_id.clone(),
+                    title: Some("Paused across daemon restarts".into()),
+                    items: vec![Arc::new(chat::Item {
+                        id: "retained-page".into(),
+                        role: chat::Role::Assistant,
+                        content: chat::ItemContent::Text {
+                            text: "The captured page survived".into(),
+                            thinking: false,
+                            phase: Default::default(),
+                        },
+                        started_at: None,
+                        at: None,
+                    })],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let registry_path = crate::instance::project_dirs()
+            .unwrap()
+            .data_dir()
+            .join("workspace-model.sqlite3");
+        let (registry, pane) = seed_managed_pane(&registry_path, &root.join("project"), &alias);
+        let original_agent = registry.agent_for_session(source.id).unwrap().unwrap();
+        let mut presentation =
+            crate::upgrade::floor::Record::new(proof("source"), vec![source.clone()], Vec::new());
+        registry.capture_update_floor(&mut presentation).unwrap();
+        assert_eq!(presentation.aliases, vec![alias.clone()]);
+        assert_eq!(presentation.presentations[0].pane, pane);
+        drop(registry);
+        let census = recovery::Census {
+            chats: vec![source.clone()],
+            aliases: presentation.aliases,
+            presentations: presentation.presentations,
+            snapshots: snapshots.finish(),
+            ..Default::default()
+        };
+        let store = Store::discover().unwrap();
+        store
+            .save(&crate::upgrade::handoff::Checkpoint::new(
+                proof("source"),
+                Vec::new(),
+                Vec::new(),
+                vec![crate::upgrade::handoff::Chat {
+                    source: alias.clone(),
+                    previous_sources: Vec::new(),
+                    launch: source.launch.clone(),
+                }],
+            ))
+            .unwrap();
+        let checkpoint = fs::read(&store.path).unwrap();
+        let checkpoint_hash = hash(&checkpoint);
+        let prefix = root.join("install");
+        let bin = prefix.join("versions/0.1.3+local.settled/bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(
+            prefix.join(".cagents-install-root"),
+            b"cagents install root",
+        )
+        .unwrap();
+        for binary in ["cagents", "cagents-ui", "cagentsd"] {
+            fs::write(bin.join(binary), b"private matched binary").unwrap();
+        }
+        let daemon_binary = bin.join("cagentsd");
+        let updates = prefix.join(".update");
+        crate::secure_file::prepare_private_directory(&updates).unwrap();
+        let job = uuid::Uuid::new_v4().to_string();
+        let request =
+            serde_json::to_vec(&serde_json::json!({"Installed":{"root":bin.parent().unwrap()}}))
+                .unwrap();
+        let request_path = updates.join(format!("{job}.request"));
+        fs::write(&request_path, &request).unwrap();
+        fs::set_permissions(&request_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let reviewed = crate::update::impact::DaemonImpact {
+            capability: crate::terminal_ipc::ShutdownCapability {
+                proof: proof("source"),
+                token: "reviewed-before-prepare".into(),
+                inventory_generation: 1,
+                live_terminals: 1,
+                background_subagents: 0,
+                background_identity: String::new(),
+                expires_at_unix_ms: 100,
+            },
+            policy: crate::update::impact::Policy::WhenIdle,
+            sessions: vec![crate::update::impact::SessionImpact {
+                id: source.id,
+                kind: crate::update::impact::SessionKind::NativeChat,
+                title: "Paused Codex".into(),
+                identity: hash(&serde_json::to_vec(&source).unwrap()),
+                disposition: crate::update::impact::Disposition::Resumes,
+                reason: String::new(),
+                interrupted_subagents: Vec::new(),
+            }],
+            blockers: Vec::new(),
+        };
+        let settled = serde_json::json!({
+            "version":2, "job":job, "request_identity":hash(&serde_json::to_vec(&reviewed).unwrap()),
+            "job_request_hash":hash(&request), "reviewed":reviewed, "source":proof("source"),
+            "checkpoint_hash":checkpoint_hash, "census":census,
+            "adopted_terminals":[], "adopted_chats":[], "paused_terminals":[], "paused_chats":[source.id],
+            "settled":true, "successor":proof("first-recovery"),
+            "target":daemon_binary, "target_hash":hash(&fs::read(&daemon_binary).unwrap()),
+        });
+        let outcome = store
+            .path
+            .with_file_name(format!("daemon-upgrade.recovery.{checkpoint_hash}.json"));
+        let write_outcome = |value: &serde_json::Value| {
+            fs::write(&outcome, serde_json::to_vec(value).unwrap()).unwrap();
+            fs::set_permissions(&outcome, fs::Permissions::from_mode(0o600)).unwrap();
+        };
+        write_outcome(&settled);
+        let mut requested = alias.clone();
+        for epoch in ["cold-start", "subsequent-restart"] {
+            let mut initial = state::HostState::new(proof(epoch));
+            initial.install_model(super::super::model::Registry::open().unwrap());
+            let host = Arc::new(state::HostLock::new(initial));
+            assert!(restore_settled_from(&host, &store.path, &daemon_binary).unwrap());
+            assert!(matches!(
+                host.lock().unwrap().startup_state(),
+                crate::terminal_ipc::StartupState::Ready
+            ));
+            assert!(host.lock().unwrap().chats.is_empty());
+            let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+            let server_host = host.clone();
+            let server =
+                std::thread::spawn(move || super::super::client::serve(server, 1, server_host));
+            let client =
+                chat::client::ClientHandle::fixture_restore(client, requested.clone()).unwrap();
+            requested = client.session();
+            assert_eq!(requested.launch.session_id, source.launch.session_id);
+            assert_eq!(requested.proof, Some(proof(epoch)));
+            let handle = host.lock().unwrap().chats[&source.id].handle.clone();
+            let page = handle.snapshot(None).unwrap();
+            assert!(page.exited && page.read_only_reason.is_some());
+            assert!(page.items.iter().any(|item| matches!(&item.content, chat::ItemContent::Text { text, .. } if text == "The captured page survived")));
+            assert!(handle.is_read_only_history() && !handle.owns_work());
+            assert!(!sentinel.exists());
+            assert_eq!(fs::read(&store.path).unwrap(), checkpoint);
+            let registry = super::super::model::Registry::open().unwrap();
+            assert_eq!(
+                registry.agent_for_session(source.id).unwrap(),
+                Some(original_agent.clone())
+            );
+            let ledger = crate::upgrade::floor::load().unwrap();
+            assert_eq!(ledger.records[0].presentations[0].pane, pane);
+            assert!(ledger.records[0].presentations[0].restored);
+            handle.close().unwrap();
+            drop(client);
+            server.join().unwrap();
+        }
+        for changed in [
+            "unsettled",
+            "hash",
+            "source",
+            "inventory",
+            "request",
+            "target",
+        ] {
+            let mut invalid = settled.clone();
+            match changed {
+                "unsettled" => invalid["settled"] = false.into(),
+                "hash" => invalid["checkpoint_hash"] = "0".repeat(64).into(),
+                "source" => invalid["source"]["host_incarnation"] = "foreign".into(),
+                "inventory" => invalid["paused_chats"] = serde_json::json!([]),
+                "request" => invalid["job_request_hash"] = "0".repeat(64).into(),
+                "target" => invalid["target_hash"] = "0".repeat(64).into(),
+                _ => unreachable!(),
+            }
+            write_outcome(&invalid);
+            let host = Arc::new(state::HostLock::new(state::HostState::new(proof(
+                "refused",
+            ))));
+            assert!(
+                restore_settled_from(&host, &store.path, &daemon_binary).is_err(),
+                "{changed}"
+            );
+            assert!(host.lock().unwrap().terminals.is_empty());
+            assert!(host.lock().unwrap().chats.is_empty());
+            assert!(!sentinel.exists());
+            assert_eq!(fs::read(&store.path).unwrap(), checkpoint);
+        }
+    }
+
     #[test]
     fn captured_unnamed_managed_codex_pane_attaches_as_history_without_executing_its_provider() {
         const ROOT: &str = "CAGENTS_RECOVERY_HISTORY_TEST_ROOT";
@@ -292,76 +749,11 @@ mod tests {
             .unwrap();
         let mut alias = source.clone();
         alias.launch.session_id = None;
-        let agent = crate::agent_execution::Agent {
-            id: crate::model::AgentId::new(),
-            name: None,
-            origin: crate::agent_execution::Origin::User,
-            spec: crate::agent_execution::Spec {
-                provider: crate::agent::Provider::Codex,
-                account: None,
-                target: crate::agent_execution::Target {
-                    repository: root.join("project"),
-                    directory: root.join("project"),
-                    placement: None,
-                },
-                surface: crate::agent_execution::Surface::Chat,
-                model: None,
-                permission_mode: None,
-                reasoning_effort: None,
-            },
-            placement: crate::workspace_model::views::Scope::Channel(crate::model::ChannelId::new()),
-            session: Some(crate::agent_execution::HostedSession::Chat(alias.clone())),
-            console: None,
-            created_ms: 1,
-            closed: false,
-        };
-        let pane = crate::workspace_model::views::Pane {
-            id: crate::model::CardId::from_uuid(agent.id.as_uuid()),
-            title: "Paused managed Codex".into(),
-            user_title: None,
-            pending_terminal_start: false,
-            width_fraction: 0.5,
-            kind: crate::model::CardKind::Chat(alias.clone()),
-            scope: Some(root.join("project")),
-        };
-        let registry_path = root.join("registry.sqlite3");
-        let mut registry = super::super::model::Registry::at(&registry_path).unwrap();
-        registry
-            .apply(&crate::workspace_model::ModelEdit::OpenProject {
-                repository: root.join("project"),
-                name: "Recovery fixture".into(),
-                kind: Default::default(),
-            })
-            .unwrap();
-        let crate::workspace_model::views::Scope::Channel(channel) = &agent.placement else {
-            unreachable!()
-        };
-        registry
-            .apply(&crate::workspace_model::ModelEdit::CreateChannel {
-                id: *channel,
-                repository: root.join("project"),
-                title: "Paused Codex".into(),
-                title_source: Default::default(),
-            })
-            .unwrap();
-        let db = rusqlite::Connection::open(&registry_path).unwrap();
-        db.execute(
-            "INSERT INTO agents(id,origin,record,session_id,closed) VALUES(?1,'user',?2,?3,0)",
-            rusqlite::params![
-                agent.id.to_string(),
-                serde_json::to_string(&agent).unwrap(),
-                source.id.to_string()
-            ],
-        )
-        .unwrap();
-        drop(db);
-        registry
-            .apply(&crate::workspace_model::ModelEdit::SeedView {
-                scope: agent.placement.clone(),
-                panes: vec![pane.clone()],
-                closed: Vec::new(),
-            })
-            .unwrap();
+        let (registry, pane) = seed_managed_pane(
+            &root.join("registry.sqlite3"),
+            &root.join("project"),
+            &alias,
+        );
         let mut presentation =
             crate::upgrade::floor::Record::new(proof("old"), vec![source.clone()], Vec::new());
         registry.capture_update_floor(&mut presentation).unwrap();

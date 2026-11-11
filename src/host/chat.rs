@@ -56,6 +56,7 @@ use crate::{
 pub(super) use native_cleanup::{NativeClose, close_retained as close_retained_native};
 pub(super) use native_recovery::AdoptionFailures;
 pub(super) use native_recovery::restore_orphaned_native;
+pub(super) use native_recovery::restore_orphaned_native_preserving;
 use std::{
     collections::BTreeMap,
     sync::{Arc, Weak},

@@ -5,6 +5,8 @@ use crate::daemon::holder_registry::{self as registry, Kind};
 
 #[cfg(test)]
 mod paired_projection_tests;
+#[cfg(test)]
+mod settled_retry_tests;
 
 #[cfg(test)]
 thread_local! {
@@ -184,9 +186,19 @@ pub(super) fn restore_with_admission(
     host: &SharedHost,
     client: ClientId,
     source: &Session,
-    mut admission: Option<capacity::Reservation>,
+    admission: Option<capacity::Reservation>,
 ) -> Result<ServerResponse, String> {
-    if crate::upgrade::floor::load()?.blocks_id(source.id) {
+    restore_with_policy(host, client, source, admission, false)
+}
+
+fn restore_with_policy(
+    host: &SharedHost,
+    client: ClientId,
+    source: &Session,
+    mut admission: Option<capacity::Reservation>,
+    previously_adopted: bool,
+) -> Result<ServerResponse, String> {
+    if crate::upgrade::floor::load()?.blocks_id(source.id) && !previously_adopted {
         return Err(
             "This conversation was stopped for the update; its earlier provider is not attached"
                 .into(),
@@ -557,6 +569,18 @@ pub(in crate::host) fn restore_orphaned_native(
     host: &SharedHost,
     refused: &[TerminalId],
 ) -> Result<(), String> {
+    restore_orphaned_native_preserving(host, refused, &Default::default())
+}
+
+/// Retry historically adopted owners through the ordinary authentication path.
+/// A failed earlier restart may have saved their history in the floor ledger;
+/// that snapshot is not evidence that an original helper has stopped forever.
+/// Originally paused IDs never enter this set, and no recipe is executed.
+pub(in crate::host) fn restore_orphaned_native_preserving(
+    host: &SharedHost,
+    refused: &[TerminalId],
+    preserved: &std::collections::BTreeSet<TerminalId>,
+) -> Result<(), String> {
     let proof = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -565,7 +589,9 @@ pub(in crate::host) fn restore_orphaned_native(
     let directory = registry::directory(Kind::Native)?;
     let stopped = crate::upgrade::floor::load()?;
     for record in registry::recovery_candidates(&directory, &proof.boot_id, Kind::Native)? {
-        if stopped.blocks_id(record.terminal) || refused.contains(&record.terminal) {
+        if (stopped.blocks_id(record.terminal) && !preserved.contains(&record.terminal))
+            || refused.contains(&record.terminal)
+        {
             continue;
         }
         if host
@@ -585,11 +611,25 @@ pub(in crate::host) fn restore_orphaned_native(
                     continue;
                 }
             }
-            Handle::inspect_remote(&record, proof.clone())
-                .and_then(|inspection| restore(host, 0, &inspection.source))
+            Handle::inspect_remote(&record, proof.clone()).and_then(|inspection| {
+                restore_with_policy(
+                    host,
+                    0,
+                    &inspection.source,
+                    None,
+                    preserved.contains(&inspection.source.id),
+                )
+            })
         } else {
-            chat::native_holder::inspect(&record, &proof)
-                .and_then(|(recovery, _)| restore(host, 0, &recovery.source))
+            chat::native_holder::inspect(&record, &proof).and_then(|(recovery, _)| {
+                restore_with_policy(
+                    host,
+                    0,
+                    &recovery.source,
+                    None,
+                    preserved.contains(&recovery.source.id),
+                )
+            })
         };
         if let Err(error) = result {
             tracing::warn!(session = %record.terminal, %error, "retained native conversation could not be reattached; holder evidence preserved");
