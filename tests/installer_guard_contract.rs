@@ -828,7 +828,7 @@ fn external_installer_saves_closes_and_reopens_windows_even_on_failure() {
         let ui = bin.join("cagents-ui");
         fs::write(
             &ui,
-            "#!/bin/sh\ntest -z \"${CAGENTS_UI_UPDATE_GUARD_FD+x}${CAGENTS_INSTALL_RESULT_FD+x}${CAGENTS_ARCHIVE+x}${CAGENTS_CHECKSUMS+x}${CAGENTS_REPOSITORY+x}\" || exit 92\nprintf 'old %s\\n' \"$*\" > \"$HOME/reopened\"\nprintf 'ready\\n'\n",
+            "#!/bin/sh\ntest -z \"${CAGENTS_UI_UPDATE_GUARD_FD+x}${CAGENTS_INSTALL_RESULT_FD+x}${CAGENTS_ARCHIVE+x}${CAGENTS_CHECKSUMS+x}${CAGENTS_REPOSITORY+x}${CAGENTS_INSTALL_CENSUS_PATH+x}${CAGENTS_INSTALL_OUTCOME_PATH+x}${CAGENTS_UPDATE_RECOVERY_FD+x}\" || exit 92\nprintf 'old %s\\n' \"$*\" > \"$HOME/reopened\"\nprintf 'ready\\n'\n",
         )
         .unwrap();
         fs::set_permissions(&ui, fs::Permissions::from_mode(0o700)).unwrap();
@@ -861,6 +861,8 @@ fn external_installer_saves_closes_and_reopens_windows_even_on_failure() {
             .env_remove("CAGENTS_UI_UPDATE_GUARD_FD")
             .env("CAGENTS_ARCHIVE", "/stale/installer/archive")
             .env("CAGENTS_CHECKSUMS", "/stale/installer/checksums")
+            .env("CAGENTS_INSTALL_CENSUS_PATH", "/stale/installer/census")
+            .env("CAGENTS_INSTALL_OUTCOME_PATH", "/stale/installer/outcome")
             .env("CAGENTS_REPOSITORY", "fixture/source")
             .env("FIXTURE_REAL_CLI", &cli)
             .env("FIXTURE_PREFIX", &prefix)
@@ -979,7 +981,8 @@ assert len(sys.argv) == 3 and sys.argv[1] == '--inspect-upgrade-source'
 assert json.loads(sys.argv[2]) == {'protocol':int(os.environ['FIXTURE_SOURCE_PROTOCOL']),
     'proof':None, 'require_resumable':False, 'reconcile_retained':False}
 assert not any(key in os.environ for key in ['CAGENTS_INSTALL_RESULT_FD',
-    'CAGENTS_INSTALL_OWNER_CLI', 'CAGENTS_ARCHIVE', 'CAGENTS_CHECKSUMS', 'CAGENTS_REPOSITORY'])
+    'CAGENTS_INSTALL_OWNER_CLI', 'CAGENTS_ARCHIVE', 'CAGENTS_CHECKSUMS', 'CAGENTS_REPOSITORY',
+    'CAGENTS_INSTALL_CENSUS_PATH', 'CAGENTS_INSTALL_OUTCOME_PATH', 'CAGENTS_UPDATE_RECOVERY_FD'])
 fd=int(os.environ['CAGENTS_UI_UPDATE_GUARD_FD'])
 verified=subprocess.run([os.environ['FIXTURE_REAL_CLI'], 'verify-install-guard', '--stage-only'],
     pass_fds=(fd,), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -1345,7 +1348,8 @@ fn staged_candidate_startup_authenticates_the_inherited_coordinator_fence() {
     let candidate_status = run(None, None);
     assert!(candidate_status.status.success(), "{candidate_status:?}");
     let result: serde_json::Value = serde_json::from_slice(&candidate_status.stdout).unwrap();
-    assert_eq!(result["data"]["running"], true);
+    assert_eq!(result["data"]["running"], false);
+    assert_eq!(result["data"]["daemon_present"], true);
     assert_eq!(
         unsafe { libc::flock(legacy.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
         0
@@ -1661,11 +1665,9 @@ printf '%s\n' "$*"
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
-    assert!(
-        String::from_utf8(output.stdout)
-            .unwrap()
-            .contains("\"running\":true")
-    );
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["data"]["running"], false);
+    assert_eq!(status["data"]["daemon_present"], true);
     drop(candidate);
     drop(candidate_lock);
 }
@@ -1773,5 +1775,394 @@ fn sealed_anonymous_update_probe_does_not_require_installed_routing() {
         assert_eq!(response["ok"], true);
         assert_eq!(response["command"], "daemon.status");
         assert_eq!(response["data"]["running"], false);
+    }
+}
+
+#[test]
+fn staged_cli_handoff_starts_its_matched_daemon_after_the_old_owner_exits() {
+    let _fixture = OS_FIXTURE.lock().unwrap();
+    if !user_fixture::enter() {
+        return;
+    }
+    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let prefix = root.path().join("install");
+    for version in ["old", "new"] {
+        let bin = prefix.join("versions").join(version).join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        for name in ["cagents", "cagentsd", "cagents-ui"] {
+            fs::write(bin.join(name), "complete matched fixture").unwrap();
+        }
+    }
+    fs::write(
+        prefix.join(".cagents-install-root"),
+        "cagents install root\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("versions/new", prefix.join("current")).unwrap();
+    let new = prefix.join("versions/new/bin");
+    fs::copy(env!("CARGO_BIN_EXE_cagents"), new.join("cagents")).unwrap();
+    let marker = prefix.join("versions/new/.deferred-owner.json");
+    fs::write(&marker, r#"{"version":1,"owner_version":"old"}"#).unwrap();
+    fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
+    let runtime = root.path().join("runtime");
+    let daemon_dir = runtime.join(cagents::instance::RUNTIME_SUBDIRECTORY);
+    fs::create_dir_all(&daemon_dir).unwrap();
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&daemon_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let lock = file(&daemon_dir.join("cagentsd.lock"));
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    // The updater now owns the old daemon's lock inode, but its old metadata
+    // still names a process that has exited. Routing cannot authenticate that
+    // former executable as the current serving owner.
+    let mut old = Command::new("/bin/true").spawn().unwrap();
+    let old_pid = old.id();
+    assert!(old.wait().unwrap().success());
+    fs::write(
+        daemon_dir.join("cagentsd.lock"),
+        format!("{{\"pid\":{old_pid}}}"),
+    )
+    .unwrap();
+    // The real updater carries its UI admission fence as well as the daemon
+    // inventory lease. A user scope must remain selected with both present.
+    let application_lock = if cagents::instance::NAME == "development" {
+        "cagents-development-ui.lock"
+    } else {
+        "cagents-ui.lock"
+    };
+    let legacy = file(&runtime.join(application_lock));
+    assert_eq!(
+        unsafe { libc::flock(legacy.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) },
+        0
+    );
+    let update_path = runtime.join(format!("{application_lock}.update"));
+    let update = file(&update_path);
+    assert_eq!(
+        unsafe { libc::flock(update.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let scoped = root.path().join("scope-launched");
+    let fake_bin = root.path().join("fake-bin");
+    fs::create_dir(&fake_bin).unwrap();
+    fs::create_dir(runtime.join("systemd")).unwrap();
+    fs::write(runtime.join("systemd/private"), b"fixture manager presence").unwrap();
+    fs::write(fake_bin.join("systemd-run"), r#"#!/usr/bin/python3
+import fcntl, os, pathlib, sys
+assert sys.argv[1:3] == ['--user', '--scope']
+assert os.environ['CAGENTS_DAEMON_LAUNCH_FENCE_FD'] == '198'
+assert os.environ['CAGENTS_DAEMON_LEASE_FD'] == '199'
+for fd, path in [(198, 'CAGENTS_TEST_HANDOFF_UPDATE'), (199, 'CAGENTS_TEST_HANDOFF_LOCK')]:
+    actual, expected = os.fstat(fd), os.stat(os.environ[path])
+    assert (actual.st_dev, actual.st_ino) == (expected.st_dev, expected.st_ino)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+pathlib.Path(os.environ['CAGENTS_TEST_HANDOFF_SCOPED']).write_text('scope preserved update and daemon authority\n')
+arguments = sys.argv[sys.argv.index('--') + 1:]
+os.execv(arguments[0], arguments)
+"#).unwrap();
+    fs::set_permissions(
+        fake_bin.join("systemd-run"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let launched = root.path().join("successor-launched");
+    fs::write(
+        new.join("cagentsd"),
+        r#"#!/usr/bin/python3
+import fcntl, os, pathlib
+fd = int(os.environ['CAGENTS_DAEMON_LEASE_FD'])
+assert fd == 199
+assert not pathlib.Path('/proc/self/fd/3').exists()
+actual = os.fstat(fd)
+expected = os.stat(os.environ['CAGENTS_TEST_HANDOFF_LOCK'])
+assert (actual.st_dev, actual.st_ino) == (expected.st_dev, expected.st_ino)
+fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+pathlib.Path(os.environ['CAGENTS_TEST_HANDOFF_LAUNCHED']).write_text('matched daemon inherited lease\n')
+# This fixture verifies the actual CLI routing and inherited-fd transport. It
+# does not stand in for a restored host: fail deliberately before readiness.
+raise SystemExit(79)
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(new.join("cagentsd"), fs::Permissions::from_mode(0o700)).unwrap();
+    let run = |verb: &str, descriptor: Option<&File>, lease_marker: Option<&str>| {
+        let mut command = Command::new(new.join("cagents"));
+        command
+            .args(["--json", "daemon", verb])
+            .env("HOME", root.path())
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .env("XDG_CACHE_HOME", root.path().join("cache"))
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env(
+                "CAGENTS_TEST_HANDOFF_LOCK",
+                daemon_dir.join("cagentsd.lock"),
+            )
+            .env("CAGENTS_TEST_HANDOFF_LAUNCHED", &launched)
+            .env("CAGENTS_TEST_HANDOFF_UPDATE", &update_path)
+            .env("CAGENTS_TEST_HANDOFF_SCOPED", &scoped)
+            .env(
+                "PATH",
+                std::env::join_paths(std::iter::once(fake_bin.clone()).chain(
+                    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+                ))
+                .unwrap(),
+            )
+            .env_remove("CAGENTS_DEVELOPMENT_INSTANCE")
+            .env_remove("CAGENTS_DAEMON_LEASE_FD")
+            .env_remove("CAGENTS_DAEMON_LAUNCH_FENCE_FD")
+            .env("CAGENTS_UI_UPDATE_GUARD_FD", "197");
+        if let Some(marker) = lease_marker {
+            command.env("CAGENTS_DAEMON_LEASE_FD", marker);
+        }
+        let descriptor = descriptor.map(AsRawFd::as_raw_fd);
+        let lease_target = if lease_marker == Some("3") { 3 } else { 199 };
+        let update_descriptor = update.as_raw_fd();
+        // SAFETY: only descriptor syscalls run after fork. The test retains
+        // every source File until the real CLI and its matched helper settle.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::dup2(update_descriptor, 197) == -1
+                    || libc::fcntl(197, libc::F_SETFD, 0) == -1
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if let Some(descriptor) = descriptor {
+                    if libc::dup2(descriptor, lease_target) == -1
+                        || libc::fcntl(lease_target, libc::F_SETFD, 0) == -1
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                } else {
+                    libc::close(199);
+                }
+                Ok(())
+            });
+        }
+        command.output().unwrap()
+    };
+    let unrelated = file(&runtime.join("unrelated-lease"));
+    assert_eq!(
+        unsafe { libc::flock(unrelated.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let independent = File::open(daemon_dir.join("cagentsd.lock")).unwrap();
+    for verb in ["status", "start", "verify-update-lease"] {
+        for (descriptor, lease_marker) in [
+            (None, "199"),
+            (None, "3"),
+            (Some(&lock), "999"),
+            (Some(&unrelated), "199"),
+            (Some(&independent), "199"),
+            (Some(&unrelated), "3"),
+            (Some(&independent), "3"),
+        ] {
+            let output = run(verb, descriptor, Some(lease_marker));
+            assert!(
+                !output.status.success(),
+                "{verb} accepted malformed, missing, mismatched, or unheld lease authority: {output:?}"
+            );
+            assert!(!launched.exists(), "invalid authority launched a daemon");
+        }
+    }
+    let missing_verification = run("verify-update-lease", None, None);
+    assert!(!missing_verification.status.success());
+    for descriptor in ["3", "199"] {
+        let verified = run("verify-update-lease", Some(&lock), Some(descriptor));
+        assert!(verified.status.success(), "{verified:?}");
+        let reply: serde_json::Value = serde_json::from_slice(&verified.stdout).unwrap();
+        assert_eq!(reply["command"], "daemon.verify_update_lease");
+        assert_eq!(reply["data"]["inherited_lease"], true);
+        assert!(!launched.exists(), "lease verification started a daemon");
+    }
+    let status = run("status", Some(&lock), Some("199"));
+    assert!(status.status.success(), "{status:?}");
+    let response: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(response["data"]["running"], false);
+    assert_eq!(response["data"]["daemon_present"], false);
+    assert_eq!(response["data"]["inherited_lease"], true);
+    assert!(response["data"]["daemon_version"].is_null());
+    assert!(
+        !launched.exists(),
+        "read-only handoff status started a daemon"
+    );
+    // A held updater reservation is not a daemon even for an ordinary probe.
+    // Remove only this fixture's staged-routing marker so
+    // the former source identity does not independently refuse that control.
+    let parked_marker = marker.with_extension("parked");
+    fs::rename(&marker, &parked_marker).unwrap();
+    let ordinary_status = run("status", None, None);
+    fs::rename(&parked_marker, &marker).unwrap();
+    assert!(ordinary_status.status.success(), "{ordinary_status:?}");
+    let response: serde_json::Value = serde_json::from_slice(&ordinary_status.stdout).unwrap();
+    assert_eq!(response["data"]["running"], false);
+    assert_eq!(response["data"]["daemon_present"], false);
+    for marker in ["199", "3"] {
+        let status = run("status", Some(&lock), Some(marker));
+        assert!(status.status.success(), "{status:?}");
+        let response: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+        assert_eq!(response["data"]["inherited_lease"], true);
+        let started = run("start", Some(&lock), Some(marker));
+        assert!(
+            !started.status.success(),
+            "the fixture deliberately fails startup"
+        );
+        assert_eq!(
+            fs::read_to_string(&scoped).unwrap(),
+            "scope preserved update and daemon authority\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&launched).unwrap(),
+            "matched daemon inherited lease\n",
+            "the actual staged CLI must reach its own matched daemon"
+        );
+        assert!(
+            String::from_utf8_lossy(&started.stderr).contains("exited before becoming ready"),
+            "startup must report its actual matched child's failure: {started:?}"
+        );
+        fs::remove_file(&scoped).unwrap();
+        fs::remove_file(&launched).unwrap();
+    }
+    // Neither validation nor the failed daemon command may unlock the worker.
+    assert_eq!(
+        unsafe { libc::flock(independent.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
+fn private_census_validation_refuses_bad_input_and_never_claims_usability() {
+    let _serial = OS_FIXTURE.lock().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let runtime = root.path().join("runtime");
+    fs::create_dir(&runtime).unwrap();
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+    let malformed = root.path().join("malformed-census.json");
+    fs::write(&malformed, b"{}").unwrap();
+    fs::set_permissions(&malformed, fs::Permissions::from_mode(0o600)).unwrap();
+    let missing = root.path().join("missing-census.json");
+    let validate = |census: &Path| {
+        Command::new(env!("CARGO_BIN_EXE_cagents"))
+            .env_clear()
+            .env("HOME", root.path())
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .args([
+                "--json",
+                "--no-start",
+                "daemon",
+                "verify-update-census",
+                "--validate-only",
+                "--census",
+            ])
+            .arg(census)
+            .arg("--outcome")
+            .arg(root.path().join("outcome.json"))
+            .output()
+            .unwrap()
+    };
+    for census in [&malformed, &missing] {
+        let output = validate(census);
+        assert!(
+            !output.status.success(),
+            "invalid private evidence passed validation: {output:?}"
+        );
+        if let Ok(bytes) = fs::read(root.path().join("outcome.json")) {
+            let receipt: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_ne!(receipt["outcome"]["state"], "usable");
+        }
+        assert!(
+            fs::read_dir(&runtime).unwrap().next().is_none(),
+            "validation must not start a daemon"
+        );
+    }
+    let valid = root.path().join("valid-census.json");
+    fs::write(&valid, br#"{"version":1,"transaction":"00000000-0000-4000-8000-000000000001","source":null,"terminals":[],"chats":[],"checkpoint_before":null}"#).unwrap();
+    fs::set_permissions(&valid, fs::Permissions::from_mode(0o600)).unwrap();
+    let output = validate(&valid);
+    assert!(
+        output.status.success(),
+        "valid private evidence was rejected: {output:?}"
+    );
+    let reply: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(reply["data"]["validated"], true);
+    assert_eq!(reply["data"]["usable"], false);
+    assert!(fs::read_dir(&runtime).unwrap().next().is_none());
+}
+
+#[test]
+fn absent_source_tolerance_requires_original_absence_and_no_pending_snapshot() {
+    let _serial = OS_FIXTURE.lock().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let runtime = root.path().join("runtime");
+    fs::create_dir(&runtime).unwrap();
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+    let proof = serde_json::json!({
+        "host_session_id":"previous-source", "boot_id":"previous-boot",
+        "host_incarnation":"previous-incarnation"
+    });
+    for (name, source, checkpoint, accepted) in [
+        (
+            "absent",
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            true,
+        ),
+        ("previously-serving", proof, serde_json::Value::Null, false),
+        (
+            "pending-snapshot",
+            serde_json::Value::Null,
+            serde_json::json!("0".repeat(64)),
+            false,
+        ),
+    ] {
+        let census = root.path().join(format!("{name}-census.json"));
+        let outcome = root.path().join(format!("{name}-outcome.json"));
+        fs::write(
+            &census,
+            serde_json::to_vec(&serde_json::json!({
+                "version":1,"transaction":"00000000-0000-4000-8000-000000000001",
+                "source":source,"terminals":[],"chats":[],"checkpoint_before":checkpoint
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(&census, fs::Permissions::from_mode(0o600)).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_cagents"))
+            .env_clear()
+            .env("HOME", root.path())
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .args([
+                "--json",
+                "--no-start",
+                "daemon",
+                "verify-update-census",
+                "--require-absent",
+                "--census",
+            ])
+            .arg(&census)
+            .arg("--outcome")
+            .arg(&outcome)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.success(), accepted, "{name}: {output:?}");
+        if accepted {
+            let receipt: serde_json::Value =
+                serde_json::from_slice(&fs::read(&outcome).unwrap()).unwrap();
+            assert_eq!(receipt["outcome"]["state"], "no_source");
+        } else if outcome.exists() {
+            let receipt: serde_json::Value =
+                serde_json::from_slice(&fs::read(&outcome).unwrap()).unwrap();
+            assert_ne!(receipt["outcome"]["state"], "usable");
+            assert_ne!(receipt["outcome"]["state"], "no_source");
+        }
     }
 }

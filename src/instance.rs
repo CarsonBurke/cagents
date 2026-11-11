@@ -1,3 +1,6 @@
+#[cfg(test)]
+use crate::flock::fdinfo_owns_lock as fdinfo_owns_slot;
+use crate::flock::{flock_owner, process_owns_lock as process_owns_slot};
 use std::{
     env,
     fs::{self, File, OpenOptions},
@@ -24,10 +27,12 @@ use std::{
 };
 
 mod daemon_admission;
+#[doc(hidden)]
+pub mod ui_options;
 pub use daemon_admission::DaemonStillStarting;
 pub(crate) use daemon_admission::{
-    AdmissionFence, DAEMON_FENCE_ENV, DaemonAdmissionGuard, LaunchFence,
-    has_inherited_daemon_fence, inherit_daemon_fence,
+    AdmissionFence, DAEMON_FENCE_ENV, DaemonAdmissionGuard, LaunchFence, daemon_launch_is_updating,
+    inherit_daemon_fence,
 };
 
 use directories::ProjectDirs;
@@ -90,6 +95,64 @@ pub const UI_LAUNCH_RECOVERY_PROGRESS_PREFIX: &str = "recovering: ";
 
 pub const PRIMARY_WINDOW: &str = "primary";
 static WINDOW_SLOT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Recovery windows may display existing owners and retained history, while
+/// provider starts continue to require an explicit action in the pane.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WindowRestorePolicy {
+    #[default]
+    Ordinary,
+    ExistingOnly,
+}
+
+pub const RESTORE_EXISTING_ONLY_ARGUMENT: &str = "--restore-existing-only";
+struct WindowRestore {
+    launch: WindowRestorePolicy,
+    finished: AtomicBool,
+}
+static WINDOW_RESTORE_POLICY: OnceLock<WindowRestore> = OnceLock::new();
+
+/// Set once from this UI process's argv. A launch policy is never inherited by
+/// ordinary children through an environment marker.
+pub fn initialize_window_restore_policy(policy: WindowRestorePolicy) -> io::Result<()> {
+    let selected = WINDOW_RESTORE_POLICY.get_or_init(|| WindowRestore {
+        launch: policy,
+        finished: AtomicBool::new(false),
+    });
+    if selected.launch != policy {
+        return Err(io::Error::other(
+            "window restore policy already initialized",
+        ));
+    }
+    Ok(())
+}
+
+pub fn window_restore_policy() -> WindowRestorePolicy {
+    WINDOW_RESTORE_POLICY
+        .get()
+        .map_or(WindowRestorePolicy::Ordinary, |restore| {
+            if restore.finished.load(Ordering::Acquire) {
+                WindowRestorePolicy::Ordinary
+            } else {
+                restore.launch
+            }
+        })
+}
+
+pub(crate) fn window_launch_restore_policy() -> WindowRestorePolicy {
+    WINDOW_RESTORE_POLICY
+        .get()
+        .map_or(WindowRestorePolicy::Ordinary, |restore| restore.launch)
+}
+
+/// The startup gate reached its saved-pane verdict, including an incomplete
+/// recovery. Later work uses ordinary admission; already-issued pane tasks
+/// retain their explicitly captured attachment-only intent.
+pub(crate) fn finish_window_restore() {
+    if let Some(restore) = WINDOW_RESTORE_POLICY.get() {
+        restore.finished.store(true, Ordering::Release);
+    }
+}
 
 pub fn window_slot() -> &'static str {
     WINDOW_SLOT
@@ -1014,31 +1077,6 @@ pub(crate) fn verified_windows_for_daemon(
     Ok((windows, legacy))
 }
 
-fn flock_owner(line: &str, metadata: &fs::Metadata) -> Option<u32> {
-    let fields: Vec<_> = line.split_whitespace().collect();
-    if fields.len() != 8
-        || fields[1..4] != ["FLOCK", "ADVISORY", "WRITE"]
-        || fields[6..8] != ["0", "EOF"]
-    {
-        return None;
-    }
-    let identity: Vec<_> = fields[5].split(':').collect();
-    if identity.len() != 3
-        || u64::from_str_radix(identity[0], 16).is_err()
-        || u64::from_str_radix(identity[1], 16).is_err()
-        || identity[2].parse::<u64>().ok() != Some(metadata.ino())
-    {
-        return None;
-    }
-    fields[4].parse::<u32>().ok().filter(|pid| *pid > 1)
-}
-
-fn fdinfo_owns_slot(info: &str, pid: u32, metadata: &fs::Metadata) -> bool {
-    info.lines()
-        .filter_map(|line| line.strip_prefix("lock:"))
-        .any(|line| flock_owner(line, metadata) == Some(pid))
-}
-
 fn verified_windows_in(runtime: &Path, proc_root: &Path) -> io::Result<Vec<VerifiedWindow>> {
     let owners = verified_window_lease_owners_in(runtime, proc_root)?;
     // A legacy exclusive owner cannot be interpreted as absence. Stage-only
@@ -1120,21 +1158,6 @@ fn verified_window_lease_owners_in(
     Ok(owners)
 }
 
-fn process_owns_slot(process: &Path, pid: u32, expected: &fs::Metadata) -> io::Result<bool> {
-    Ok(fs::read_dir(process.join("fdinfo"))?
-        .filter_map(Result::ok)
-        .any(|entry| {
-            let descriptor = process.join("fd").join(entry.file_name());
-            let matches = |actual: fs::Metadata| {
-                actual.dev() == expected.dev() && actual.ino() == expected.ino()
-            };
-            fs::metadata(&descriptor).is_ok_and(&matches)
-                && fs::read_to_string(entry.path())
-                    .is_ok_and(|info| fdinfo_owns_slot(&info, pid, expected))
-                && fs::metadata(&descriptor).is_ok_and(matches)
-        }))
-}
-
 pub fn update_in_progress() -> bool {
     runtime_directory()
         .and_then(|runtime| {
@@ -1169,9 +1192,26 @@ pub struct UiUpdateGuard {
     prepared: Vec<String>,
     closed: Vec<String>,
     fallback_executable: Option<PathBuf>,
+    restore_policy: WindowRestorePolicy,
 }
 
 impl UiUpdateGuard {
+    /// Retain this exact exclusive fence through an authenticated recovery.
+    /// A plain File duplicate closes without explicitly unlocking its parent.
+    pub(crate) fn duplicate_for_recovery(&self) -> io::Result<(File, File)> {
+        let fence = self
+            .lock
+            .as_ref()
+            .ok_or_else(|| io::Error::other("update launch fence was released"))?
+            .try_clone()?;
+        Ok((fence, self._legacy_fence.try_clone()?))
+    }
+
+    /// Exact slots frozen by this update, for an explicitly authorized recovery.
+    pub(crate) fn prepared_window_slots(&self) -> &[String] {
+        &self.prepared
+    }
+
     /// The authenticated windows while this guard is held. Its shared legacy
     /// fence already excludes a legacy exclusive UI owner, so absence of
     /// window leases means no windows; probing legacy exclusivity again would
@@ -1182,6 +1222,11 @@ impl UiUpdateGuard {
 
     pub fn set_fallback_executable(&mut self, executable: PathBuf) {
         self.fallback_executable = Some(executable);
+    }
+
+    /// Apply to every later launch, including Drop after a partial close.
+    pub(crate) fn set_recovery_restore_only(&mut self) {
+        self.restore_policy = WindowRestorePolicy::ExistingOnly;
     }
 
     pub fn has_running_windows(&self) -> io::Result<bool> {
@@ -1243,6 +1288,7 @@ impl UiUpdateGuard {
             prepared: Vec::new(),
             closed: Vec::new(),
             fallback_executable: None,
+            restore_policy: WindowRestorePolicy::Ordinary,
         })
     }
 
@@ -1256,10 +1302,18 @@ impl UiUpdateGuard {
         timeout: Duration,
         preflight: impl FnOnce(&Self) -> io::Result<()>,
     ) -> io::Result<Vec<String>> {
+        let slots = self.prepare_windows(timeout)?;
+        preflight(self)?;
+        self.close_prepared_windows(&slots, timeout)?;
+        Ok(slots)
+    }
+
+    /// Flush and freeze windows while a candidate asks for destructive consent.
+    /// Dropping the guard cancels preparation without closing a window.
+    pub(crate) fn prepare_windows(&mut self, timeout: Duration) -> io::Result<Vec<String>> {
         let deadline = std::time::Instant::now() + timeout;
         let slots = running_window_slots(&self.runtime)?;
         for slot in &slots {
-            // Include a possibly timed-out participant in cancellation.
             self.prepared.push(slot.clone());
             update_window(
                 &self.runtime,
@@ -1268,14 +1322,17 @@ impl UiUpdateGuard {
                 deadline.saturating_duration_since(std::time::Instant::now()),
             )?;
         }
-        preflight(self)?;
-        if std::time::Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "Source inspection exceeded the window preparation allowance; source windows remain usable",
-            ));
-        }
-        for slot in &slots {
+        Ok(slots)
+    }
+
+    /// Human review has no window-RPC deadline. Closing gets its own budget.
+    pub(crate) fn close_prepared_windows(
+        &mut self,
+        slots: &[String],
+        timeout: Duration,
+    ) -> io::Result<()> {
+        let deadline = std::time::Instant::now() + timeout;
+        for slot in slots {
             // A lost ACK cannot prove that the UI did not accept an irreversible close.
             self.closed.push(slot.clone());
             update_window(
@@ -1295,7 +1352,21 @@ impl UiUpdateGuard {
             std::thread::sleep(Duration::from_millis(25));
         }
         self.prepared.clear();
-        Ok(slots)
+        Ok(())
+    }
+
+    /// Finish a staged update without reopening windows that never closed.
+    /// On a partial close, Drop cancels the remaining prepared windows and waits
+    /// for committed windows to exit before reopening only those slots.
+    pub(crate) fn relaunch_closed_windows(mut self, executable: &Path) -> io::Result<()> {
+        if self.prepared.is_empty() {
+            let closed = self.closed.clone();
+            self.relaunch_windows(&closed, executable)
+        } else {
+            self.set_fallback_executable(executable.to_owned());
+            drop(self);
+            Ok(())
+        }
     }
 
     pub fn relaunch_windows(mut self, slots: &[String], executable: &Path) -> io::Result<()> {
@@ -1304,7 +1375,9 @@ impl UiUpdateGuard {
         self.closed.clear();
         let mut errors = Vec::new();
         for slot in slots {
-            if let Err(error) = launch_window_at(executable, false, Some(slot), None) {
+            if let Err(error) =
+                launch_window_at(executable, false, Some(slot), None, self.restore_policy)
+            {
                 errors.push((slot.as_str(), error.to_string()));
             }
         }
@@ -1357,6 +1430,13 @@ pub(crate) fn relaunch_failure(windows: usize, errors: &[(&str, String)]) -> Str
 }
 
 pub(crate) const INSTALL_GUARD_ENV: &str = "CAGENTS_UI_UPDATE_GUARD_FD";
+pub(crate) fn update_recovery_fences() -> io::Result<(PathBuf, PathBuf)> {
+    let runtime = runtime_directory()?;
+    Ok((
+        runtime.join(format!("{APPLICATION_LOCK_FILE}.update")),
+        runtime.join(APPLICATION_LOCK_FILE),
+    ))
+}
 const INSTALL_GUARD_FD: i32 = 197;
 
 /// Verify the inherited open-file description owns the active exclusive fence.
@@ -1440,9 +1520,12 @@ impl Drop for UiUpdateGuard {
         let _ = self.release_launch_fence();
         for slot in &self.closed {
             if let Some(executable) = &self.fallback_executable {
-                let _ = launch_window_at(executable, false, Some(slot), None);
+                let _ = launch_window_at(executable, false, Some(slot), None, self.restore_policy);
             } else {
-                let _ = launch_window(false, Some(slot), None);
+                if let Ok(executable) = crate::companion::Product::Ui.beside_current() {
+                    let _ =
+                        launch_window_at(&executable, false, Some(slot), None, self.restore_policy);
+                }
             }
         }
         let _ = self._legacy_fence.unlock();
@@ -1452,7 +1535,13 @@ impl Drop for UiUpdateGuard {
 /// Starts another independent process using the same installed UI executable.
 pub fn launch_window(new_window: bool, slot: Option<&str>, source: Option<&str>) -> io::Result<()> {
     let executable = crate::companion::Product::Ui.beside_current()?;
-    launch_window_at(&executable, new_window, slot, source)
+    launch_window_at(
+        &executable,
+        new_window,
+        slot,
+        source,
+        WindowRestorePolicy::Ordinary,
+    )
 }
 
 /// Session ids belong to a daemon/device namespace. Never resolve a local
@@ -1504,6 +1593,7 @@ fn launch_window_at(
     new_window: bool,
     slot: Option<&str>,
     source: Option<&str>,
+    restore_policy: WindowRestorePolicy,
 ) -> io::Result<()> {
     if let Some(slot) = slot {
         validate_window_slot(slot)?;
@@ -1512,6 +1602,9 @@ fn launch_window_at(
         validate_window_slot(source)?;
     }
     let mut command = process::Command::new(executable);
+    if restore_policy == WindowRestorePolicy::ExistingOnly {
+        command.arg(RESTORE_EXISTING_ONLY_ARGUMENT);
+    }
     let device_name = match slot {
         Some(slot) => window_device_identity(&runtime_directory()?, slot, &crate::device::list()?)?,
         None => crate::device::selected().map(|device| device.name.clone()),
@@ -2709,11 +2802,96 @@ mod tests {
             prepared: Vec::new(),
             closed: Vec::new(),
             fallback_executable: None,
+            restore_policy: WindowRestorePolicy::Ordinary,
         };
         // A daemon-only update has no windows; the generic probe cannot tell
         // the guard's own shared fence from a legacy UI.
         assert!(verified_windows_in(runtime.path(), Path::new("/proc")).is_err());
         assert!(guard.verified_windows().unwrap().is_empty());
+    }
+
+    #[test]
+    fn recovery_guard_relaunch_and_drop_keep_attachment_policy_out_of_ordinary_launches() {
+        const CHILD: &str = "CAGENTS_TEST_RECOVERY_WINDOW_POLICY";
+        if env::var_os(CHILD).is_some() {
+            initialize_window_restore_policy(WindowRestorePolicy::ExistingOnly).unwrap();
+            let executable = PathBuf::from(env::var_os("CAGENTS_TEST_WINDOW_EXECUTABLE").unwrap());
+            let arguments = PathBuf::from(env::var_os("CAGENTS_TEST_WINDOW_ARGUMENTS").unwrap());
+            let mut guard = UiUpdateGuard::acquire().unwrap();
+            guard.set_recovery_restore_only();
+            guard.set_fallback_executable(executable.clone());
+            guard.closed.push(PRIMARY_WINDOW.into());
+            // Model a fallible recovery after a committed window close.
+            drop(guard);
+            let drop_arguments = fs::read_to_string(&arguments).unwrap();
+            assert!(
+                drop_arguments
+                    .lines()
+                    .any(|arg| arg == RESTORE_EXISTING_ONLY_ARGUMENT)
+            );
+
+            let mut guard = UiUpdateGuard::acquire().unwrap();
+            guard.set_recovery_restore_only();
+            guard
+                .relaunch_windows(&[PRIMARY_WINDOW.into()], &executable)
+                .unwrap();
+            let explicit_arguments = fs::read_to_string(&arguments).unwrap();
+            assert!(
+                explicit_arguments
+                    .lines()
+                    .any(|arg| arg == RESTORE_EXISTING_ONLY_ARGUMENT)
+            );
+
+            // A later ordinary launch from this same process has no recovery
+            // argv or environment policy to inherit.
+            launch_window_at(
+                &executable,
+                false,
+                Some(PRIMARY_WINDOW),
+                None,
+                WindowRestorePolicy::Ordinary,
+            )
+            .unwrap();
+            let ordinary_arguments = fs::read_to_string(&arguments).unwrap();
+            assert!(
+                !ordinary_arguments
+                    .lines()
+                    .any(|arg| arg == RESTORE_EXISTING_ONLY_ARGUMENT)
+            );
+            assert!(ordinary_arguments.contains("--window\nprimary\n"));
+            return;
+        }
+        let root = tempdir().unwrap();
+        for directory in ["home", "runtime", "config", "data", "cache"] {
+            fs::create_dir(root.path().join(directory)).unwrap();
+        }
+        let executable = root.path().join("fake-ui");
+        fs::write(&executable, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$CAGENTS_TEST_WINDOW_ARGUMENTS\"\nprintf 'ready\\n'\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let name = std::thread::current().name().unwrap().to_owned();
+        let output = process::Command::new(env::current_exe().unwrap())
+            .args(["--exact", &name, "--nocapture"])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", root.path().join("home"))
+            .env("XDG_RUNTIME_DIR", root.path().join("runtime"))
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .env("XDG_CACHE_HOME", root.path().join("cache"))
+            .env("CAGENTS_TEST_WINDOW_EXECUTABLE", &executable)
+            .env(
+                "CAGENTS_TEST_WINDOW_ARGUMENTS",
+                root.path().join("arguments"),
+            )
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -2917,6 +3095,7 @@ mod tests {
             prepared: Vec::new(),
             closed: Vec::new(),
             fallback_executable: None,
+            restore_policy: WindowRestorePolicy::Ordinary,
         };
         assert!(WindowLease::acquire_in(runtime.path(), true, None).is_err());
         drop(guard);
@@ -2969,6 +3148,7 @@ mod tests {
             prepared: Vec::new(),
             closed: Vec::new(),
             fallback_executable: None,
+            restore_policy: WindowRestorePolicy::Ordinary,
         };
         assert!(
             guard
@@ -3042,6 +3222,7 @@ mod tests {
             prepared: vec![],
             closed: vec![],
             fallback_executable: None,
+            restore_policy: WindowRestorePolicy::Ordinary,
         };
         let error = guard
             .prepare_and_close_windows_with_preflight(Duration::from_secs(5), |guard| {
@@ -3060,6 +3241,100 @@ mod tests {
             );
             worker.join().unwrap();
         }
+    }
+
+    #[test]
+    fn relaunch_closed_windows_cancels_open_prepared_windows_and_preserves_their_leases() {
+        let runtime = tempdir().unwrap();
+        let lock = owned_lock(
+            &runtime
+                .path()
+                .join(format!("{APPLICATION_LOCK_FILE}.update")),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+        .unwrap();
+        let legacy =
+            owned_lock(&runtime.path().join(APPLICATION_LOCK_FILE), libc::LOCK_SH).unwrap();
+        let mut leases = Vec::new();
+        let mut workers = Vec::new();
+        for slot in [PRIMARY_WINDOW, "window-2"] {
+            leases.push(
+                owned_lock(&runtime.path().join(slot_lock_name(slot)), libc::LOCK_EX).unwrap(),
+            );
+            let listener =
+                std::os::unix::net::UnixListener::bind(runtime.path().join(slot_socket_name(slot)))
+                    .unwrap();
+            listener.set_nonblocking(true).unwrap();
+            workers.push(std::thread::spawn(move || {
+                let mut actions = Vec::new();
+                for _ in 0..2 {
+                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    let stream = loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => break stream,
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                assert!(
+                                    std::time::Instant::now() < deadline,
+                                    "prepared window was not cancelled"
+                                );
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                            Err(error) => panic!("window accept: {error}"),
+                        }
+                    };
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(1)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(1)))
+                        .unwrap();
+                    actions.push(read_capped_line(&stream).unwrap());
+                    writeln!(&stream, "ok").unwrap();
+                }
+                actions
+            }));
+        }
+        let mut guard = UiUpdateGuard {
+            lock: Some(lock),
+            runtime: runtime.path().into(),
+            _legacy_fence: legacy,
+            prepared: Vec::new(),
+            closed: Vec::new(),
+            fallback_executable: None,
+            restore_policy: WindowRestorePolicy::Ordinary,
+        };
+        let slots = guard.prepare_windows(Duration::from_secs(5)).unwrap();
+        assert_eq!(slots.len(), 2);
+        // A cancelled stop prompt and a failure before commit both arrive here:
+        // the original windows are still running and must simply unfreeze.
+        guard
+            .relaunch_closed_windows(&runtime.path().join("must-not-launch"))
+            .unwrap();
+        for worker in workers {
+            assert_eq!(worker.join().unwrap(), ["update-prepare", "update-cancel"]);
+        }
+        assert_eq!(running_window_slots(runtime.path()).unwrap(), slots);
+        for slot in &slots {
+            assert!(
+                owned_lock(
+                    &runtime.path().join(slot_lock_name(slot)),
+                    libc::LOCK_EX | libc::LOCK_NB,
+                )
+                .is_err(),
+                "the original window lost its lease"
+            );
+        }
+        assert!(
+            owned_lock(
+                &runtime
+                    .path()
+                    .join(format!("{APPLICATION_LOCK_FILE}.update")),
+                libc::LOCK_EX | libc::LOCK_NB,
+            )
+            .is_ok(),
+            "the cancelled update retained the launch fence"
+        );
+        drop(leases);
     }
 
     #[test]

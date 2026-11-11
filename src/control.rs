@@ -289,8 +289,84 @@ pub enum DaemonCommand {
     Start,
     /// Report whether the daemon is running.
     Status,
-    /// Finish a staged installation through the same reviewed update flow as the app.
+    /// Validate inherited updater authority without probing daemon liveness.
+    #[command(hide = true)]
+    VerifyUpdateLease,
+    /// Save the authenticated pre-update service inventory without starting a daemon.
+    #[command(hide = true)]
+    CaptureUpdateCensus {
+        /// Write the private original service census to this new file.
+        #[arg(long)]
+        output: PathBuf,
+        /// Use this installed target when inspecting pending recovery.
+        #[arg(long)]
+        candidate_cli: Option<PathBuf>,
+    },
+    /// Verify daemon readiness and inventory against the original update census.
+    #[command(hide = true)]
+    VerifyUpdateCensus {
+        /// Retire exact settled recovery evidence after successful verification.
+        #[arg(long, conflicts_with = "validate_only")]
+        retire: bool,
+        /// Require authenticated absence of both the original and current daemon.
+        #[arg(long)]
+        require_absent: bool,
+        /// Validate the private census without probing or claiming readiness.
+        #[arg(long)]
+        validate_only: bool,
+        /// Require the original source to remain the verified serving owner.
+        #[arg(long)]
+        require_original: bool,
+        /// Accept verified absence when no source daemon was running.
+        #[arg(long)]
+        allow_absent: bool,
+        /// Read the private original service census from this file.
+        #[arg(long)]
+        census: PathBuf,
+        /// Save the verification receipt at this private output path.
+        #[arg(long)]
+        outcome: PathBuf,
+    },
+    /// Inspect retained update recovery and report its exact next step.
+    #[command(hide = true)]
+    InspectUpdateRecovery {
+        /// Read the private original service census from this file.
+        #[arg(long)]
+        census: PathBuf,
+        /// Save the typed recovery outcome at this private output path.
+        #[arg(long)]
+        outcome: PathBuf,
+        /// Name the complete installed target executable for recovery.
+        #[arg(long)]
+        candidate_cli: Option<PathBuf>,
+    },
+    /// Inspect pending Prepared recovery before starting another update.
+    #[command(hide = true)]
+    InspectPendingUpdateRecovery {
+        /// Name the complete installed target executable for recovery.
+        #[arg(long)]
+        candidate_cli: PathBuf,
+        /// Bind the original standalone census when it is not already complete.
+        #[arg(long)]
+        census: Option<PathBuf>,
+    },
+    /// Recover retained owners from this candidate's exact Prepared checkpoint.
+    RecoverUpdate {
+        /// SHA256 of the checkpoint named by the failed update.
+        #[arg(long)]
+        checkpoint: String,
+        /// Authorize recovery of this checkpoint without starting providers.
+        #[arg(long)]
+        yes: bool,
+        /// The original private census retained by a standalone installer.
+        #[arg(long)]
+        census: Option<PathBuf>,
+    },
+    /// Update to a release or finish a staged installation through the app's reviewed flow.
     Upgrade {
+        /// Download and update to this release instead of a staged installation.
+        #[arg(long, value_name = "VERSION")]
+        version: Option<String>,
         /// Approve the displayed impact without an interactive prompt.
         #[arg(long)]
         yes: bool,
@@ -1076,6 +1152,167 @@ impl ControlClient {
         }
     }
 
+    /// Keep one attachment while an updater observes an already listed owner.
+    /// Old source protocols expose parent-turn state only in their resident
+    /// snapshot. Attach once, then read only publications newer than the last
+    /// observed generation; repeatedly attaching could recover history.
+    pub(crate) fn observe_update_chat(
+        &mut self,
+        session: crate::chat::Session,
+    ) -> Result<crate::chat::Snapshot, ControlError> {
+        self.observe_update_chat_until(session, Instant::now() + IO_TIMEOUT)
+    }
+
+    pub(crate) fn observe_update_chat_until(
+        &mut self,
+        session: crate::chat::Session,
+        deadline: Instant,
+    ) -> Result<crate::chat::Snapshot, ControlError> {
+        let id = session.id;
+        self.attached_chats.insert(id);
+        let snapshot = match self.request_with_deadline(
+            ClientRequest::ChatAttach {
+                session: session.clone(),
+            },
+            deadline,
+        )? {
+            ServerResponse::ChatAttached {
+                session: attached,
+                snapshot,
+            } if attached == session => snapshot,
+            response => return Err(unexpected_response("the observed chat's owner", &response)),
+        };
+        match self.request_with_deadline(
+            ClientRequest::ChatVisibility {
+                chat_id: id,
+                visible: true,
+            },
+            deadline,
+        )? {
+            ServerResponse::Accepted => Ok(snapshot),
+            response => Err(unexpected_response("chat observation admission", &response)),
+        }
+    }
+
+    pub(crate) fn read_update_chat(
+        &mut self,
+        chat_id: TerminalId,
+        generation: u64,
+    ) -> Result<Option<crate::chat::Snapshot>, ControlError> {
+        self.read_update_chat_until(chat_id, generation, Instant::now() + IO_TIMEOUT)
+    }
+
+    pub(crate) fn read_update_chat_until(
+        &mut self,
+        chat_id: TerminalId,
+        generation: u64,
+        deadline: Instant,
+    ) -> Result<Option<crate::chat::Snapshot>, ControlError> {
+        match self.request_with_deadline(
+            ClientRequest::ChatRead {
+                chat_id,
+                after_generation: Some(generation),
+            },
+            deadline,
+        )? {
+            ServerResponse::ChatSnapshot {
+                chat_id: actual,
+                snapshot,
+            } if actual == chat_id => Ok(snapshot),
+            ServerResponse::ChatUpdate {
+                chat_id: actual,
+                update,
+            } if actual == chat_id
+                && update.base_generation == generation
+                && update.metadata.generation > generation =>
+            {
+                // A presentation delta carries complete current metadata for
+                // the parent and children. The update wait needs no transcript
+                // reconstruction, but must still enforce the delta's base.
+                Ok(Some(update.metadata))
+            }
+            response => Err(unexpected_response(
+                "the observed chat's publication",
+                &response,
+            )),
+        }
+    }
+
+    /// The update-only source boundary uses only these qualified, non-launching
+    /// operations. Every request shares its caller's absolute quiescence budget.
+    pub(crate) fn update_quiescence_request(
+        &mut self,
+        request: ClientRequest,
+        deadline: Instant,
+    ) -> Result<ServerResponse, ControlError> {
+        if !matches!(
+            &request,
+            ClientRequest::ChatList
+                | ClientRequest::UpgradeImpact { .. }
+                | ClientRequest::ChatCommand {
+                    command: crate::chat::Command::Interrupt
+                        | crate::chat::Command::StopSubagent { .. },
+                    ..
+                }
+                | ClientRequest::Agent {
+                    operation: crate::agent_execution::Operation::Directory(
+                        crate::agent_execution::directory::Scope::All
+                    ),
+                    ..
+                }
+                | ClientRequest::Agent {
+                    operation: crate::agent_execution::Operation::Control {
+                        command: crate::agent_execution::Control::Interrupt {
+                            including_subagents: false
+                        },
+                        ..
+                    },
+                    ..
+                }
+        ) {
+            return Err(ControlError::Configure(io::Error::other(
+                "Unqualified update quiescence operation",
+            )));
+        }
+        self.request_with_deadline(request, deadline)
+    }
+
+    /// Capture a listed chat's transcript immediately before acting on it.
+    /// This can recover source history, so it must never be used for polling.
+    pub(crate) fn capture_chat_snapshot(
+        &mut self,
+        session: crate::chat::Session,
+    ) -> Result<crate::chat::Snapshot, ControlError> {
+        let id = session.id;
+        self.attached_chats.insert(id);
+        let result = match self.request_strict(ClientRequest::ChatAttach {
+            session: session.clone(),
+        }) {
+            Ok(ServerResponse::ChatAttached {
+                session: attached,
+                snapshot,
+            }) if attached == session => Ok(snapshot),
+            Ok(response) => Err(unexpected_response(
+                "the reviewed chat's history",
+                &response,
+            )),
+            Err(error @ ControlError::Remote { .. }) => {
+                self.attached_chats.remove(&id);
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        let detached = self.request_strict(ClientRequest::ChatDetach { chat_id: id });
+        if matches!(detached, Ok(ServerResponse::Detached)) {
+            self.attached_chats.remove(&id);
+        }
+        match detached {
+            Ok(ServerResponse::Detached) => result,
+            Ok(response) => Err(unexpected_response("chat history detachment", &response)),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Closes a native chat this client did not open.
     ///
     /// The daemon honours a close only from an attached client, so this
@@ -1089,19 +1326,39 @@ impl ControlClient {
     /// close removes it - the interrupt the close delivers is itself reported
     /// as activity - so they are expected between the requests' responses.
     pub fn close_chat(&mut self, session: crate::chat::Session) -> Result<(), ControlError> {
+        self.close_attached_chat(session, |_| true).map(|_| ())
+    }
+
+    /// The updater keeps the source's final transcript page after its own
+    /// confirmed teardown, including output produced during interruption.
+    pub(crate) fn close_chat_with_snapshot(
+        &mut self,
+        session: crate::chat::Session,
+    ) -> Result<crate::chat::Snapshot, ControlError> {
+        let reviewed = session.clone();
+        self.close_attached_chat(session, |attached| attached == &reviewed)
+    }
+
+    fn close_attached_chat(
+        &mut self,
+        session: crate::chat::Session,
+        accepts_attachment: impl Fn(&crate::chat::Session) -> bool,
+    ) -> Result<crate::chat::Snapshot, ControlError> {
         let chat_id = session.id;
         // The daemon subscribes this connection before it answers the
         // attachment, so the chat's notifications can arrive ahead of that
         // answer.
         self.attached_chats.insert(chat_id);
         let closed = match self.request_strict(ClientRequest::ChatAttach { session }) {
-            Ok(ServerResponse::ChatAttached { .. }) => self
+            Ok(ServerResponse::ChatAttached {
+                session: attached, ..
+            }) if accepts_attachment(&attached) => self
                 .request_with_deadline(
                     ClientRequest::ChatClose { chat_id },
                     Instant::now() + CHAT_CLOSE_TIMEOUT,
                 )
                 .and_then(|response| match response {
-                    ServerResponse::ChatClosed { .. } => Ok(()),
+                    ServerResponse::ChatClosed { snapshot, .. } => Ok(snapshot),
                     response => Err(unexpected_response("a native chat close", &response)),
                 }),
             Ok(response) => Err(unexpected_response("a native chat attachment", &response)),
@@ -1115,7 +1372,7 @@ impl ControlClient {
         let detached = match &closed {
             // The daemon removed the chat, and every notification about it,
             // before answering.
-            Ok(()) => true,
+            Ok(_) => true,
             // The daemon answered, so the connection is still in step and can
             // stop the notifications of a chat it did not close.
             Err(ControlError::Remote { .. } | ControlError::UnexpectedResponse { .. }) => matches!(
@@ -1439,7 +1696,14 @@ impl ControlClient {
 
     /// Answered during startup recovery, when other requests are refused.
     pub fn startup_state(&mut self) -> Result<terminal::ipc::StartupState, ControlError> {
-        match self.request_strict(ClientRequest::StartupState)? {
+        self.startup_state_with_deadline(Instant::now() + IO_TIMEOUT)
+    }
+
+    pub(crate) fn startup_state_with_deadline(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<terminal::ipc::StartupState, ControlError> {
+        match self.request_with_deadline(ClientRequest::StartupState, deadline)? {
             ServerResponse::StartupState(state) => Ok(state),
             response => Err(unexpected_response("daemon startup state", &response)),
         }
@@ -1936,6 +2200,7 @@ impl ControlClient {
             ServerMessage::ChatChanged { chat_id }
             | ServerMessage::ChatObserved { chat_id, .. }
             | ServerMessage::ChatActivity { chat_id, .. }
+            | ServerMessage::ChatAccountUsage { chat_id, .. }
             | ServerMessage::ChatLimit { chat_id, .. }
                 if self.attached_chats.contains(&chat_id) => {}
             ServerMessage::Redraw { terminal_id, .. }
@@ -2427,6 +2692,10 @@ where
     let wants_json = arguments
         .iter()
         .any(|argument| argument.as_os_str() == OsStr::new("--json"));
+    if let Err(error) = crate::daemon::lease_handoff::initialize_inherited_lease() {
+        emit_error(wants_json, &AppError::new("daemon_startup", error));
+        return ExitCode::FAILURE;
+    }
     let cli = match Cli::try_parse_from(arguments.clone()) {
         Ok(cli) => cli,
         Err(error)
@@ -2490,6 +2759,11 @@ where
                 | DaemonCommand::Start
                 | DaemonCommand::Stop { .. }
                 | DaemonCommand::Preflight
+                | DaemonCommand::CaptureUpdateCensus { .. }
+                | DaemonCommand::VerifyUpdateCensus { .. }
+                | DaemonCommand::InspectUpdateRecovery { .. }
+                | DaemonCommand::InspectPendingUpdateRecovery { .. }
+                | DaemonCommand::RecoverUpdate { .. }
                 | DaemonCommand::PrepareUpgrade { .. }
                 | DaemonCommand::Upgrade { .. }
                 | DaemonCommand::AbandonUpgrade { .. }
@@ -2529,6 +2803,11 @@ where
             TopCommand::Daemon {
                 command: DaemonCommand::Bridge
                     | DaemonCommand::Upgrade { .. }
+                    | DaemonCommand::RecoverUpdate { .. }
+                    | DaemonCommand::InspectPendingUpdateRecovery { .. }
+                    | DaemonCommand::InspectUpdateRecovery { .. }
+                    | DaemonCommand::CaptureUpdateCensus { .. }
+                    | DaemonCommand::VerifyUpdateCensus { .. }
                     | DaemonCommand::AbandonUpgrade { .. }
                     | DaemonCommand::StopForRebuild { .. }
                     | DaemonCommand::StoreSchema
@@ -2798,6 +3077,13 @@ fn routes_to_staged_owner(command: &TopCommand) -> bool {
         TopCommand::Completions { .. }
             | TopCommand::Diagnostics
             | TopCommand::Gh { .. }
+            // A paired console already has its exact daemon endpoint and
+            // opaque execution authority. It starts during daemon restore,
+            // while the updater still holds the installation launch fence.
+            | TopCommand::Agent {
+                command: AgentCommand::Console { .. }
+            }
+
             | TopCommand::CoordinateInstall { .. }
             | TopCommand::VerifyInstallGuard { .. }
             | TopCommand::RecordDeferredInstall { .. }
@@ -2805,6 +3091,12 @@ fn routes_to_staged_owner(command: &TopCommand) -> bool {
             | TopCommand::RestartWindows { .. }
             | TopCommand::Daemon {
                 command: DaemonCommand::ProtocolVersion
+                    | DaemonCommand::VerifyUpdateLease
+                    | DaemonCommand::CaptureUpdateCensus { .. }
+                    | DaemonCommand::VerifyUpdateCensus { .. }
+                    | DaemonCommand::InspectUpdateRecovery { .. }
+                    | DaemonCommand::InspectPendingUpdateRecovery { .. }
+                    | DaemonCommand::RecoverUpdate { .. }
                     | DaemonCommand::StopForRebuild { .. }
                     | DaemonCommand::Upgrade { .. }
                     | DaemonCommand::StoreSchema
@@ -3317,7 +3609,12 @@ fn printable(text: &str) -> String {
 }
 
 fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
-    if crate::device::is_remote() && matches!(command, DaemonCommand::Upgrade { .. }) {
+    if crate::device::is_remote()
+        && matches!(
+            command,
+            DaemonCommand::Upgrade { .. } | DaemonCommand::RecoverUpdate { .. }
+        )
+    {
         return Err(AppError::new(
             "device",
             "run installation upgrades in a terminal on the selected device",
@@ -3328,9 +3625,16 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
             "bridge",
             "stdio bridge must run before command output",
         )),
-        DaemonCommand::Upgrade { yes, interrupt } => {
-            let job = crate::update::upgrade_installed(yes, interrupt)
-                .map_err(|error| AppError::new("update", error))?;
+        DaemonCommand::Upgrade {
+            version,
+            yes,
+            interrupt,
+        } => {
+            let job = match version {
+                Some(version) => crate::update::upgrade_release(&version, yes, interrupt),
+                None => crate::update::upgrade_installed(yes, interrupt),
+            }
+            .map_err(|error| AppError::new("update", error))?;
             Ok(CommandOutput {
                 command: "daemon.upgrade",
                 human: job.message.clone(),
@@ -3358,9 +3662,135 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                 human: format!("{} daemon running ({})", instance::NAME, socket.display()),
             })
         }
+        DaemonCommand::CaptureUpdateCensus {
+            output,
+            candidate_cli,
+        } => {
+            crate::update::recovery::capture_file_with_candidate(&output, candidate_cli.as_deref())
+                .map_err(|e| AppError::new("update_census", e))?;
+            Ok(CommandOutput {
+                command: "daemon.capture_update_census",
+                data: json!({"captured":true}),
+                human: "Pre-update service census saved".into(),
+            })
+        }
+        DaemonCommand::VerifyUpdateCensus {
+            retire,
+            census,
+            outcome,
+            allow_absent,
+            require_original,
+            validate_only,
+            require_absent,
+        } => {
+            if validate_only {
+                crate::update::recovery::validate_file(&census)
+                    .map_err(|e| AppError::new("update_census", e))?;
+                return Ok(CommandOutput {
+                    command: "daemon.verify_update_census",
+                    data: json!({"validated":true,"usable":false}),
+                    human: "Private census validated; daemon readiness has not been verified"
+                        .into(),
+                });
+            }
+            let receipt = if retire {
+                crate::update::recovery::verify_file_retiring(
+                    &census,
+                    &outcome,
+                    allow_absent,
+                    require_original,
+                    require_absent,
+                )
+            } else {
+                crate::update::recovery::verify_file(
+                    &census,
+                    &outcome,
+                    false,
+                    allow_absent,
+                    require_original,
+                    require_absent,
+                )
+            }
+            .map_err(|e| AppError::new("update_recovery", e))?;
+            Ok(CommandOutput {
+                command: "daemon.verify_update_census",
+                data: serde_json::to_value(&receipt)
+                    .map_err(|e| AppError::new("update_recovery", e))?,
+                human: match &receipt.outcome {
+                    crate::update::recovery::Outcome::NoSource => {
+                        "No source daemon was running; staging preserved that state".into()
+                    }
+                    crate::update::recovery::Outcome::Usable {
+                        terminals,
+                        chats,
+                        paused_terminals,
+                        paused_chats,
+                        ..
+                    } if !paused_terminals.is_empty() || !paused_chats.is_empty() => format!(
+                        "Daemon ready; {terminals} terminals and {chats} native chats serving; {} terminals and {} native chats retained as paused panes",
+                        paused_terminals.len(),
+                        paused_chats.len()
+                    ),
+                    _ => "Daemon ready; original terminal inventory verified".into(),
+                },
+            })
+        }
+        DaemonCommand::InspectUpdateRecovery {
+            census,
+            outcome,
+            candidate_cli,
+        } => {
+            let receipt = crate::update::recovery::verify_file_with_candidate(
+                &census,
+                &outcome,
+                candidate_cli.as_deref(),
+            )
+            .map_err(|e| AppError::new("update_recovery", e))?;
+            Ok(CommandOutput {
+                command: "daemon.inspect_update_recovery",
+                data: serde_json::to_value(receipt)
+                    .map_err(|e| AppError::new("update_recovery", e))?,
+                human: "Checkpoint permits one ordinary startup attempt".into(),
+            })
+        }
+        DaemonCommand::InspectPendingUpdateRecovery {
+            candidate_cli,
+            census,
+        } => {
+            crate::update::inspect_pending_recovery(&candidate_cli, census.as_deref())
+                .map_err(|error| AppError::new("update_recovery", error))?;
+            Ok(CommandOutput {
+                command: "daemon.inspect_pending_update_recovery",
+                data: json!({"pending":false}),
+                human: "No pending update recovery".into(),
+            })
+        }
+        DaemonCommand::RecoverUpdate {
+            checkpoint,
+            yes,
+            census,
+        } => {
+            let report = crate::update::recover_pending(&checkpoint, yes, census.as_deref())
+                .map_err(|error| AppError::new("update_recovery", error))?;
+            Ok(CommandOutput {
+                command: "daemon.recover_update",
+                data: json!({"verified":true,"report":report}),
+                human: report,
+            })
+        }
+        DaemonCommand::VerifyUpdateLease => {
+            let inherited = crate::daemon::lease_handoff::has_inherited_lease()
+                .map_err(|error| AppError::new("daemon_lease", error))?;
+            if !inherited {
+                return Err(AppError::new("daemon_lease", "no inherited update lease"));
+            }
+            Ok(CommandOutput {
+                command: "daemon.verify_update_lease",
+                data: json!({ "inherited_lease": true }),
+                human: "Update lease verified".into(),
+            })
+        }
         DaemonCommand::Status => {
-            let paths = crate::daemon::RuntimePaths::discover()
-                .map_err(|error| AppError::new("socket_path", error))?;
             let selected_socket =
                 daemon_socket_path().map_err(|error| AppError::new("socket_path", error))?;
             let socket = &selected_socket;
@@ -3376,16 +3806,27 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                         io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
                     ) =>
                 {
-                    crate::daemon::HostLease::is_held(&paths)
-                        .map_err(|error| AppError::new("daemon_status", error))?
+                    // A reservation can belong to the updater or a probe itself.
+                    // Only an authenticated serving handshake establishes running.
+                    false
                 }
                 Err(error) => return Err(AppError::new("protocol", error)),
             };
+            let daemon_present = running
+                || crate::daemon::daemon_process_alive_at(&crate::daemon::RuntimePaths {
+                    directory: socket.parent().unwrap_or(Path::new("/")).to_owned(),
+                    lock: socket.with_file_name("cagentsd.lock"),
+                    socket: socket.clone(),
+                })
+                .map_err(|error| AppError::new("daemon_status", error))?;
             let mut data = json!({
                 "instance": instance::NAME,
                 "running": running,
+                "daemon_present": daemon_present,
                 "socket": socket,
                 "daemon_version": daemon_version,
+                "inherited_lease": crate::daemon::lease_handoff::has_inherited_lease()
+                    .map_err(|error| AppError::new("daemon_status", error))?,
                 "cli_version": crate::version()
             });
             let mut human = if running {
@@ -3393,6 +3834,13 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                     "{} daemon {} running ({}); cli {}",
                     instance::NAME,
                     daemon_version.as_deref().unwrap_or("starting"),
+                    socket.display(),
+                    crate::version()
+                )
+            } else if daemon_present {
+                format!(
+                    "{} daemon is starting or stopping ({}); cli {}",
+                    instance::NAME,
                     socket.display(),
                     crate::version()
                 )
@@ -3618,16 +4066,24 @@ fn run_store_maintenance(arguments: &[&str]) -> Result<String, AppError> {
     let daemon = crate::companion::Product::Daemon
         .beside_current()
         .map_err(|error| AppError::new("daemon_executable", error.to_string()))?;
-    let output = Command::new(&daemon)
-        .args(arguments)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| {
-            AppError::new(
-                "daemon_executable",
-                format!("cannot run {}: {error}", daemon.display()),
-            )
-        })?;
+    run_store_maintenance_at(&daemon, arguments)
+}
+
+fn run_store_maintenance_at(daemon: &Path, arguments: &[&str]) -> Result<String, AppError> {
+    let mut command = Command::new(daemon);
+    command.args(arguments).stdin(Stdio::null());
+    crate::install_guard::sanitize_child_environment(&mut command);
+    // SAFETY: the hook only seals descriptors before explicit forwarding.
+    unsafe { command.pre_exec(crate::daemon::seal_inherited_descriptors) };
+    crate::instance::inherit_daemon_fence(&mut command)
+        .and_then(|()| crate::daemon::lease_handoff::inherit_daemon_lease(&mut command))
+        .map_err(|error| AppError::new("daemon_startup", error))?;
+    let output = command.output().map_err(|error| {
+        AppError::new(
+            "daemon_executable",
+            format!("cannot run {}: {error}", daemon.display()),
+        )
+    })?;
     if !output.status.success() {
         let message = String::from_utf8_lossy(&output.stderr);
         let message = message.trim().trim_start_matches("cagentsd: ");
@@ -4712,6 +5168,209 @@ fn emit_error(json_output: bool, error: &AppError) {
 mod tests {
     use super::ControlError;
 
+    #[cfg(feature = "host")]
+    #[test]
+    fn inherited_store_maintenance_forwards_reservation_to_matched_daemon() {
+        use std::os::{
+            fd::AsRawFd,
+            unix::{fs::OpenOptionsExt, process::CommandExt},
+        };
+        use std::process::Command;
+
+        const CHILD: &str = "CAGENTS_TEST_INHERITED_STORE_MAINTENANCE";
+        if std::env::var_os(CHILD).is_some() {
+            crate::daemon::lease_handoff::initialize_inherited_lease().unwrap();
+            let daemon = std::env::var_os("CAGENTS_TEST_RETAINED_ACTOR_HELPER").unwrap();
+            let paths = crate::daemon::RuntimePaths::discover().unwrap();
+            let metadata = std::fs::read(&paths.lock).unwrap();
+            for args in [&["--stored-schema"][..], &["--downgrade-store", "22"][..]] {
+                assert_eq!(
+                    super::run_store_maintenance_at(daemon.as_ref(), args).unwrap(),
+                    ""
+                );
+                assert_eq!(std::fs::read(&paths.lock).unwrap(), metadata);
+                assert!(crate::daemon::HostLease::is_held(&paths).unwrap());
+            }
+            let proof = crate::model::HostSessionProof {
+                host_session_id: "maintenance-successor".into(),
+                boot_id: crate::daemon::read_boot_id().unwrap(),
+                host_incarnation: "maintenance-successor".into(),
+            };
+            let _successor = crate::daemon::HostLease::acquire_with_handoff(
+                &paths,
+                &proof,
+                crate::daemon::lease_handoff::clone_inherited_lease().unwrap(),
+            )
+            .unwrap();
+            let error =
+                super::run_store_maintenance_at(daemon.as_ref(), &["--stored-schema"]).unwrap_err();
+            assert!(
+                error.message.contains("a cagents daemon is running"),
+                "{}",
+                error.message
+            );
+            return;
+        }
+        if !crate::daemon::isolated_handoff_coordinator() {
+            return;
+        }
+        // A reaped source supplies genuine exit evidence before any descriptor
+        // is opened; no unrelated fixture can inherit the reservation.
+        let mut source = Command::new("/bin/true").spawn().unwrap();
+        let source_pid = source.id();
+        source.wait().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let runtime = root.path().join("runtime");
+        let directory = runtime.join(crate::instance::runtime_subdirectory());
+        std::fs::create_dir_all(&directory).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(directory.join("cagentsd.lock"))
+            .unwrap();
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+        std::fs::write(
+            directory.join("cagentsd.lock"),
+            format!("{{\"pid\":{source_pid}}}"),
+        )
+        .unwrap();
+        for descriptor in [3, 199] {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", "control::tests::inherited_store_maintenance_forwards_reservation_to_matched_daemon", "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env("XDG_RUNTIME_DIR", &runtime)
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env(crate::daemon::lease_handoff::DAEMON_LEASE_ENV, descriptor.to_string());
+            let source = lock.as_raw_fd();
+            // SAFETY: only descriptor syscalls run in the forked child.
+            unsafe {
+                command.pre_exec(move || {
+                    crate::daemon::seal_inherited_descriptors()?;
+                    if libc::dup2(source, descriptor) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::fcntl(descriptor, libc::F_SETFD, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let output = command.output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            std::fs::write(
+                directory.join("cagentsd.lock"),
+                format!("{{\"pid\":{source_pid}}}"),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn inherited_daemon_lease_is_not_a_serving_daemon() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        const CHILD: &str = "CAGENTS_TEST_INHERITED_STATUS";
+        if let Ok(descriptor) = std::env::var(CHILD) {
+            use std::os::fd::{AsRawFd, FromRawFd};
+            let descriptor: i32 = descriptor.parse().unwrap();
+            crate::daemon::lease_handoff::initialize_inherited_lease().unwrap();
+            let output = super::execute_daemon(super::DaemonCommand::Status).unwrap();
+            assert_eq!(output.data["running"], false);
+            assert_eq!(output.data["inherited_lease"], true);
+            assert!(output.data["daemon_version"].is_null());
+            assert!(!output.human.contains("running"));
+            let verified = super::execute_daemon(super::DaemonCommand::VerifyUpdateLease).unwrap();
+            assert_eq!(verified.data["inherited_lease"], true);
+            // Startup seals either transport even without a child sealing hook.
+            assert_ne!(
+                unsafe { libc::fcntl(descriptor, libc::F_GETFD) } & libc::FD_CLOEXEC,
+                0
+            );
+            assert!(
+                std::process::Command::new("/bin/sh")
+                    .args([
+                        "-c",
+                        "test ! -e /proc/self/fd/199 && test ! -e /proc/self/fd/3"
+                    ])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            if descriptor == 3 {
+                // The installer's low slot grants no authority to overwrite a
+                // different resource already present in the daemon's slot.
+                assert_eq!(unsafe { libc::fcntl(199, libc::F_GETFD) }, -1);
+                let unrelated = std::fs::File::open("/dev/null").unwrap();
+                assert_eq!(unsafe { libc::dup2(unrelated.as_raw_fd(), 199) }, 199);
+                let reserved = unsafe { std::fs::File::from_raw_fd(199) };
+                let error = crate::daemon::lease_handoff::inherit_daemon_lease(
+                    &mut std::process::Command::new("/bin/true"),
+                )
+                .unwrap_err();
+                assert_eq!(error.raw_os_error(), Some(libc::EBUSY));
+                drop(reserved);
+            }
+            // Repeated queries use the startup result, not fd/path inspection.
+            let paths = crate::daemon::RuntimePaths::discover().unwrap();
+            std::fs::rename(&paths.lock, paths.lock.with_extension("saved")).unwrap();
+            assert!(crate::daemon::lease_handoff::has_inherited_lease().unwrap());
+            return;
+        }
+        for descriptor in [3, 199] {
+            let runtime = tempfile::tempdir().unwrap();
+            let directory = runtime.path().join(crate::instance::runtime_subdirectory());
+            std::fs::create_dir(&directory).unwrap();
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let paths = crate::daemon::RuntimePaths {
+                socket: directory.join(crate::terminal_ipc::SOCKET_FILE_NAME),
+                lock: directory.join("cagentsd.lock"),
+                directory,
+            };
+            let mut lock = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(&paths.lock)
+                .unwrap();
+            use std::io::Write;
+            write!(lock, "{{\"pid\":{}}}", std::process::id()).unwrap();
+            drop(lock);
+            let handoff =
+                crate::daemon::lease_handoff::LeaseHandoff::wait(&paths, std::process::id())
+                    .unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "control::tests::inherited_daemon_lease_is_not_a_serving_daemon",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, descriptor.to_string())
+                .env("XDG_RUNTIME_DIR", runtime.path())
+                .env("XDG_CONFIG_HOME", runtime.path().join("config"))
+                .env("XDG_STATE_HOME", runtime.path().join("state"))
+                .env("HOME", runtime.path());
+            if descriptor == 3 {
+                handoff.inherit_for_installer(&mut command).unwrap();
+            } else {
+                handoff.inherit(&mut command).unwrap();
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        }
+    }
+
     #[test]
     fn a_daemon_refusal_reaches_a_person_as_its_own_sentence() {
         let refusal = ControlError::Remote {
@@ -4750,6 +5409,162 @@ mod tests {
         // The installer asks the replacement it names, never a staged owner.
         assert!(!routed(&["cagents", "daemon", "store-schema"]));
         assert!(!routed(&["cagents", "daemon", "downgrade-store", "22"]));
+    }
+
+    #[test]
+    fn final_recovery_retirement_uses_the_explicit_verifier_and_never_validation_only() {
+        use clap::Parser;
+        let argv = [
+            "cagents",
+            "--no-start",
+            "daemon",
+            "verify-update-census",
+            "--census",
+            "/private/original-census.json",
+            "--outcome",
+            "/private/outcome.json",
+            "--retire",
+        ];
+        let parsed = super::Cli::try_parse_from(argv).unwrap();
+        assert!(matches!(
+            &parsed.command,
+            super::TopCommand::Daemon {
+                command: super::DaemonCommand::VerifyUpdateCensus { retire: true, .. }
+            }
+        ));
+        assert!(!super::routes_to_staged_owner(&parsed.command));
+        assert!(!super::staged_command_requires_daemon(&parsed.command));
+        let mut contradictory = argv.to_vec();
+        contradictory.push("--validate-only");
+        assert!(super::Cli::try_parse_from(contradictory).is_err());
+    }
+
+    #[test]
+    fn pending_recovery_uses_the_exact_candidate_without_autostart_or_owner_routing() {
+        use clap::Parser;
+        for argv in [
+            vec![
+                "cagents",
+                "--no-start",
+                "daemon",
+                "recover-update",
+                "--checkpoint",
+                "abcd",
+                "--yes",
+            ],
+            vec![
+                "cagents",
+                "daemon",
+                "inspect-pending-update-recovery",
+                "--candidate-cli",
+                "/private/candidate/bin/cagents",
+            ],
+        ] {
+            let command = super::Cli::try_parse_from(argv).unwrap().command;
+            assert!(!super::routes_to_staged_owner(&command));
+            assert!(!super::staged_command_requires_daemon(&command));
+        }
+        // Confirmation and the exact hash are checked before installation or
+        // daemon state can be opened, even when a person omits --no-start.
+        let error = super::execute_daemon(super::DaemonCommand::RecoverUpdate {
+            checkpoint: "abcd".into(),
+            yes: true,
+            census: None,
+        })
+        .err()
+        .expect("an incomplete hash cannot authorize recovery");
+        assert_eq!(error.kind, "update_recovery");
+        assert!(error.message.contains("--checkpoint SHA256 --yes"));
+    }
+
+    #[test]
+    fn paired_console_attaches_without_staged_install_routing_or_daemon_recovery() {
+        use clap::Parser;
+        const CHILD: &str = "CAGENTS_TEST_CONSOLE_ENTRY_ROUTE";
+        let name = thread::current().name().unwrap().to_owned();
+        if std::env::var(CHILD).as_deref() != Ok(name.as_str()) {
+            let root = tempfile::tempdir().unwrap();
+            for leaf in ["home", "runtime", "config", "data", "cache"] {
+                std::fs::create_dir(root.path().join(leaf)).unwrap();
+            }
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", root.path().join("home"))
+                .env("XDG_RUNTIME_DIR", root.path().join("runtime"))
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .env("XDG_CACHE_HOME", root.path().join("cache"))
+                .env(CHILD, &name)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "console entry child failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("Open consoles through agent spawn --surface terminal")
+            );
+            return;
+        }
+        // Model the installed updater's exclusive launch fence at the actual
+        // entry-point hook. Reaching it would reject this console before its
+        // existing-only capability check, exactly as the installed build did.
+        assert_eq!(
+            run_from_with_staged_lookup(
+                [
+                    "cagents",
+                    "--json",
+                    "--no-start",
+                    "agent",
+                    "console",
+                    "abcdef00-0000-4000-8000-000000000001",
+                ],
+                |_, _| panic!("paired console consulted the staged installation launch fence"),
+            ),
+            ExitCode::FAILURE
+        );
+        let console = super::Cli::try_parse_from([
+            "cagents",
+            "agent",
+            "console",
+            "abcdef00-0000-4000-8000-000000000001",
+        ])
+        .unwrap()
+        .command;
+        assert!(!super::routes_to_staged_owner(&console));
+        assert!(!super::staged_command_requires_daemon(&console));
+        let user = super::Cli::try_parse_from(["cagents", "agent", "list"])
+            .unwrap()
+            .command;
+        assert!(super::routes_to_staged_owner(&user));
+        assert!(super::staged_command_requires_daemon(&user));
+    }
+
+    #[test]
+    fn release_upgrade_preserves_the_selected_version_and_review_options() {
+        use clap::Parser;
+        let command = super::Cli::try_parse_from([
+            "cagents",
+            "daemon",
+            "upgrade",
+            "--version",
+            "0.2.3",
+            "--yes",
+            "--interrupt",
+        ])
+        .unwrap()
+        .command;
+        assert!(!super::routes_to_staged_owner(&command));
+        assert!(
+            matches!(command, super::TopCommand::Daemon { command: super::DaemonCommand::Upgrade {
+            version: Some(version), yes: true, interrupt: true,
+        }} if version == "0.2.3")
+        );
     }
 
     /// A hosted session stops a development daemon with a runtime of its own,
@@ -5486,6 +6301,83 @@ mod tests {
         );
         drop(client);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn update_source_confirm_preserves_every_shutdown_outcome() {
+        for protocol in crate::update::source::current_client_protocols() {
+            let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+            let pinned = proof("source", "boot", "incarnation");
+            let capability = ShutdownCapability {
+                proof: pinned.clone(),
+                token: "reviewed-inventory".into(),
+                inventory_generation: 9,
+                live_terminals: 2,
+                background_subagents: 0,
+                background_identity: String::new(),
+                expires_at_unix_ms: i64::MAX,
+            };
+            let outcomes = vec![
+                ShutdownOutcome::InventoryChanged { current_count: 3 },
+                ShutdownOutcome::Expired,
+                ShutdownOutcome::InvalidCapability,
+                ShutdownOutcome::AlreadyShuttingDown,
+                ShutdownOutcome::DaemonRestarted,
+                ShutdownOutcome::EmptyRequired { current_count: 2 },
+                ShutdownOutcome::ConfirmationRequired { current_count: 2 },
+                ShutdownOutcome::Accepted {
+                    live_terminals_before: 2,
+                    termination_requested: true,
+                },
+            ];
+            let responses = outcomes.clone();
+            let expected_capability = capability.clone();
+            let server = thread::spawn(move || {
+                let connect: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                assert_eq!(connect.version, protocol);
+                let mut connected = connected_envelope(1, pinned.clone(), pinned.clone());
+                connected.version = protocol;
+                write_frame(&mut server_stream, &connected).unwrap();
+                for outcome in responses {
+                    let request: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                    assert_eq!(request.version, protocol);
+                    assert_eq!(
+                        request.request,
+                        ClientRequest::ShutdownV1 {
+                            version: SHUTDOWN_VERSION,
+                            operation: ShutdownOperation::Confirm {
+                                capability: expected_capability.clone(),
+                            },
+                        }
+                    );
+                    write_frame(
+                        &mut server_stream,
+                        &ServerEnvelope {
+                            version: protocol,
+                            request_id: Some(request.request_id),
+                            proof: pinned.clone(),
+                            message: ServerMessage::Response {
+                                response: ServerResponse::ShutdownOutcome(outcome),
+                            },
+                        },
+                    )
+                    .unwrap();
+                }
+            });
+            let mut client = ControlClient::from_stream_at_source_protocol(
+                client_stream,
+                Instant::now() + Duration::from_secs(5),
+                protocol,
+            )
+            .unwrap();
+            for outcome in outcomes {
+                assert_eq!(
+                    client.confirm_shutdown(capability.clone()).unwrap(),
+                    outcome
+                );
+            }
+            server.join().unwrap();
+        }
     }
 
     fn parsed_confirm<const N: usize>(arguments: [&str; N]) -> Option<Option<String>> {
@@ -6897,6 +7789,191 @@ mod tests {
                 "request-id" => matches!(result, Err(ControlError::RequestIdMismatch { .. })),
                 _ => unreachable!(),
             });
+            drop(client);
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn update_captures_chat_history_once_and_detaches_before_the_stop() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let pinned = proof("session", "boot", "incarnation");
+        let session = crate::chat::Session {
+            id: TerminalId::new(),
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Codex,
+                recipe: LaunchRecipe {
+                    program: "codex".into(),
+                    arguments: vec![],
+                    working_directory: "/work".into(),
+                    environment: Default::default(),
+                    unset_environment: Default::default(),
+                },
+                session_id: Some("recorded".into()),
+            },
+            proof: Some(pinned.clone()),
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: Default::default(),
+        };
+        let peer_session = session.clone();
+        let server = thread::spawn(move || {
+            let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            write_frame(
+                &mut server_stream,
+                &connected_envelope(1, pinned.clone(), pinned.clone()),
+            )
+            .unwrap();
+            let respond = |stream: &mut UnixStream, request_id, response| {
+                write_frame(
+                    stream,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(request_id),
+                        proof: pinned.clone(),
+                        message: ServerMessage::Response { response },
+                    },
+                )
+                .unwrap();
+            };
+            {
+                let attach: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                assert_eq!(
+                    attach.request,
+                    ClientRequest::ChatAttach {
+                        session: peer_session.clone()
+                    }
+                );
+                respond(
+                    &mut server_stream,
+                    attach.request_id,
+                    ServerResponse::ChatAttached {
+                        session: peer_session.clone(),
+                        snapshot: crate::chat::Snapshot {
+                            ready: true,
+                            busy: true,
+                            ..Default::default()
+                        },
+                    },
+                );
+                let detach: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                assert_eq!(
+                    detach.request,
+                    ClientRequest::ChatDetach {
+                        chat_id: peer_session.id
+                    }
+                );
+                respond(
+                    &mut server_stream,
+                    detach.request_id,
+                    ServerResponse::Detached,
+                );
+            }
+        });
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        let snapshot = client.capture_chat_snapshot(session.clone()).unwrap();
+        assert!(snapshot.ready);
+        assert!(snapshot.busy);
+        assert!(!client.attached_chats.contains(&session.id));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn update_never_closes_a_replaced_chat_descriptor() {
+        for exact_review in [false, true] {
+            let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+            let pinned = proof("session", "boot", "incarnation");
+            let source = crate::chat::Session {
+                id: TerminalId::new(),
+                launch: crate::chat::Launch {
+                    provider: crate::agent::Provider::Claude,
+                    recipe: LaunchRecipe {
+                        program: "fake-claude".into(),
+                        arguments: vec![],
+                        working_directory: "/work".into(),
+                        environment: Default::default(),
+                        unset_environment: Default::default(),
+                    },
+                    session_id: Some("reviewed".into()),
+                },
+                proof: Some(pinned.clone()),
+                terminal: None,
+                owned_codex_listener: None,
+                native_continuity: Default::default(),
+            };
+            let mut replaced = source.clone();
+            replaced.launch.session_id = Some("replacement".into());
+            let chat_id = source.id;
+            let server = thread::spawn(move || {
+                let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                write_frame(
+                    &mut server_stream,
+                    &connected_envelope(1, pinned.clone(), pinned.clone()),
+                )
+                .unwrap();
+                let attach: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                assert!(matches!(attach.request, ClientRequest::ChatAttach { .. }));
+                write_frame(
+                    &mut server_stream,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(attach.request_id),
+                        proof: pinned.clone(),
+                        message: ServerMessage::Response {
+                            response: ServerResponse::ChatAttached {
+                                session: replaced,
+                                snapshot: Default::default(),
+                            },
+                        },
+                    },
+                )
+                .unwrap();
+                let detach: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                assert_eq!(
+                    detach.request,
+                    if exact_review {
+                        ClientRequest::ChatDetach { chat_id }
+                    } else {
+                        ClientRequest::ChatClose { chat_id }
+                    }
+                );
+                write_frame(
+                    &mut server_stream,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(detach.request_id),
+                        proof: pinned,
+                        message: ServerMessage::Response {
+                            response: if exact_review {
+                                ServerResponse::Detached
+                            } else {
+                                ServerResponse::ChatClosed {
+                                    chat_id,
+                                    snapshot: Default::default(),
+                                }
+                            },
+                        },
+                    },
+                )
+                .unwrap();
+                assert!(
+                    read_frame::<ClientEnvelope>(&mut server_stream)
+                        .unwrap()
+                        .is_none()
+                );
+            });
+            let mut client = ControlClient::from_stream(client_stream).unwrap();
+            if exact_review {
+                assert!(matches!(
+                    client.close_chat_with_snapshot(source),
+                    Err(ControlError::UnexpectedResponse { .. })
+                ));
+            } else {
+                client
+                    .close_chat(source)
+                    .expect("ordinary pane close accepts an authenticated resolved alias");
+            }
+            assert!(client.attached_chats.is_empty());
             drop(client);
             server.join().unwrap();
         }

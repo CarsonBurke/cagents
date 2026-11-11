@@ -70,6 +70,7 @@ pub mod file_manager;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub(crate) mod file_url;
 mod filesystem_recovery_context;
+mod flock;
 pub mod fs_safety;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub(crate) mod git_watch;

@@ -2738,6 +2738,220 @@ mod tests {
     }
 
     #[test]
+    fn replacement_console_waits_for_the_daemons_initial_listener_and_handshake() {
+        use crate::terminal_ipc::{
+            ClientEnvelope, PROTOCOL_VERSION, ServerEnvelope, ServerMessage, ServerResponse,
+            read_frame, write_frame,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("daemon.sock");
+        let server_socket = socket.clone();
+        let server = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(30));
+            let listener = std::os::unix::net::UnixListener::bind(server_socket).unwrap();
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+            thread::sleep(Duration::from_millis(30));
+            let proof = crate::model::HostSessionProof {
+                host_session_id: crate::model::HostSessionId::new("console"),
+                boot_id: crate::model::BootId::new("console"),
+                host_incarnation: crate::model::HostIncarnation::new("restored"),
+            };
+            write_frame(
+                &mut stream,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(request.request_id),
+                    proof: proof.clone(),
+                    message: ServerMessage::Response {
+                        response: ServerResponse::Connected {
+                            proof,
+                            resumed: Vec::new(),
+                        },
+                    },
+                },
+            )
+            .unwrap();
+        });
+        connect_console(&socket, Instant::now() + Duration::from_secs(2)).unwrap();
+        server.join().unwrap();
+        assert!(!console_connection_transient(
+            &ControlError::UnsupportedVersion { actual: 1 }
+        ));
+        assert!(!console_connection_transient(&ControlError::ProofMismatch));
+    }
+
+    #[test]
+    fn replacement_console_connection_has_a_bounded_startup_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let start = Instant::now();
+        assert!(
+            connect_console(
+                &root.path().join("absent.sock"),
+                start + Duration::from_millis(30)
+            )
+            .is_err()
+        );
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn replacement_console_waits_for_its_exact_startup_owner_then_reads_console_rpc() {
+        use crate::terminal_ipc::{
+            ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage,
+            ServerResponse, read_frame, write_frame,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let paths = crate::daemon::RuntimePaths {
+            directory: root.path().into(),
+            socket: root.path().join("daemon.sock"),
+            lock: root.path().join("cagentsd.lock"),
+        };
+        let proof = crate::model::HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("console"),
+            boot_id: crate::daemon::read_boot_id().unwrap(),
+            host_incarnation: crate::model::HostIncarnation::new("slow-startup"),
+        };
+        let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&paths.socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let peer = proof.clone();
+        let server = thread::spawn(move || {
+            // Later unrelated restores outlast both the initial grace and
+            // multiple handshake attempts. This is the actual RPC codec.
+            thread::sleep(Duration::from_millis(180));
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                assert!(
+                    Instant::now() < deadline,
+                    "the startup console never reconnected"
+                );
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(error) => panic!("{error}"),
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let Ok(Some(request)) = read_frame::<ClientEnvelope>(&mut stream) else {
+                    continue;
+                };
+                // Discard attempts which ended before the daemon began serving.
+                stream.set_nonblocking(true).unwrap();
+                let mut byte = [0u8; 1];
+                if matches!(std::io::Read::read(&mut stream, &mut byte), Ok(0)) {
+                    continue;
+                }
+                stream.set_nonblocking(false).unwrap();
+                if write_frame(
+                    &mut stream,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(request.request_id),
+                        proof: peer.clone(),
+                        message: ServerMessage::Response {
+                            response: ServerResponse::Connected {
+                                proof: peer.clone(),
+                                resumed: Vec::new(),
+                            },
+                        },
+                    },
+                )
+                .is_err()
+                {
+                    continue;
+                }
+                let Ok(Some(request)) = read_frame::<ClientEnvelope>(&mut stream) else {
+                    continue;
+                };
+                assert!(matches!(
+                    request.request,
+                    ClientRequest::Agent {
+                        operation: crate::agent_execution::Operation::Console {
+                            command: crate::agent_execution::ConsoleCommand::Read { .. },
+                            ..
+                        },
+                        ..
+                    }
+                ));
+                write_frame(
+                    &mut stream,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(request.request_id),
+                        proof: peer,
+                        message: ServerMessage::Response {
+                            response: ServerResponse::Agent(
+                                crate::agent_execution::Reply::Console(None),
+                            ),
+                        },
+                    },
+                )
+                .unwrap();
+                break;
+            }
+        });
+        let started = Instant::now();
+        let startup = ConsoleStartup {
+            deadline: started + Duration::from_millis(20),
+            owner: Some((paths.lock, proof)),
+            attempt_timeout: Duration::from_millis(30),
+        };
+        let mut client = startup.connect(&paths.socket).unwrap();
+        let response = client
+            .agent(
+                Authority::default(),
+                crate::agent_execution::Operation::Console {
+                    agent: AgentId::new(),
+                    command: crate::agent_execution::ConsoleCommand::Read {
+                        after_generation: None,
+                        after_run: None,
+                    },
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            response,
+            crate::agent_execution::Reply::Console(None)
+        ));
+        assert!(started.elapsed() > Duration::from_millis(180));
+        server.join().unwrap();
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn replacement_console_stops_waiting_when_its_exact_startup_owner_leaves() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = crate::daemon::RuntimePaths {
+            directory: root.path().into(),
+            socket: root.path().join("absent.sock"),
+            lock: root.path().join("cagentsd.lock"),
+        };
+        let proof = crate::model::HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("console"),
+            boot_id: crate::daemon::read_boot_id().unwrap(),
+            host_incarnation: crate::model::HostIncarnation::new("gone-startup"),
+        };
+        let lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+        let startup = ConsoleStartup {
+            deadline: Instant::now() + Duration::from_secs(45),
+            owner: Some((paths.lock, proof)),
+            attempt_timeout: Duration::from_millis(30),
+        };
+        let reader = thread::spawn(move || startup.connect(&paths.socket).is_err());
+        thread::sleep(Duration::from_millis(80));
+        drop(lease);
+        let stopped = Instant::now();
+        assert!(reader.join().unwrap());
+        assert!(stopped.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
     fn console_refusal_names_no_protocol_code() {
         let refusal = console_refusal(&ControlError::Remote {
             code: crate::terminal::ipc::ProtocolErrorCode::InvalidRequest,
@@ -3353,6 +3567,108 @@ mod tests {
     }
 }
 
+/// Replacement views start while the daemon is restoring behind its listener.
+/// Pin the same endpoint and let its handshake wait for that restore; only
+/// connection setup and reads are retried, never a prompt or control command.
+struct ConsoleStartup {
+    deadline: Instant,
+    owner: Option<(std::path::PathBuf, crate::model::HostSessionProof)>,
+    attempt_timeout: Duration,
+}
+
+impl ConsoleStartup {
+    fn capture(socket: &Path) -> Result<Self, AppError> {
+        let owner = std::env::var(crate::agent_execution::CONSOLE_STARTUP_OWNER_ENV)
+            .ok()
+            .map(|value| -> Result<_, AppError> {
+                let proof = serde_json::from_str(&value)
+                    .map_err(|error| AppError::new("agent_console", error))?;
+                let paths = crate::daemon::RuntimePaths::discover()
+                    .map_err(|error| AppError::new("agent_console", error))?;
+                if paths.socket != socket {
+                    return Err(AppError::new(
+                        "agent_console",
+                        "The console startup owner belongs to another terminal service",
+                    ));
+                }
+                Ok((paths.lock, proof))
+            })
+            .transpose()?;
+        Ok(Self {
+            deadline: Instant::now() + Duration::from_secs(45),
+            owner,
+            attempt_timeout: Duration::from_secs(1),
+        })
+    }
+
+    fn pending(&self) -> bool {
+        self.owner.as_ref().map_or_else(
+            || Instant::now() < self.deadline,
+            |(lock, proof)| crate::daemon::lease_owner(lock, proof).is_ok(),
+        )
+    }
+
+    fn connect(&self, socket: &Path) -> Result<ControlClient, ControlError> {
+        loop {
+            if !self.pending() {
+                return Err(ControlError::ConnectionClosed);
+            }
+            let deadline = self
+                .owner
+                .as_ref()
+                .map_or(self.deadline, |_| Instant::now() + self.attempt_timeout);
+            let connected = super::connect_control_socket(
+                socket,
+                deadline.saturating_duration_since(Instant::now()),
+            )
+            .map_err(ControlError::Connect)
+            .and_then(|stream| ControlClient::from_stream_with_deadline(stream, deadline));
+            match connected {
+                Ok(client)
+                    if self
+                        .owner
+                        .as_ref()
+                        .is_some_and(|(_, proof)| client.proof() != proof) =>
+                {
+                    return Err(ControlError::ProofMismatch);
+                }
+                Err(error) if self.pending() && console_connection_transient(&error) => {
+                    thread::sleep(Duration::from_millis(100));
+                }
+                result => return result,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+fn connect_console(socket: &Path, deadline: Instant) -> Result<ControlClient, ControlError> {
+    ConsoleStartup {
+        deadline,
+        owner: None,
+        attempt_timeout: Duration::from_secs(1),
+    }
+    .connect(socket)
+}
+
+fn console_connection_transient(error: &ControlError) -> bool {
+    match error {
+        ControlError::ConnectionClosed | ControlError::ReplyTimeout { .. } => true,
+        ControlError::Connect(error)
+        | ControlError::Frame(crate::terminal_ipc::FrameError::Io(error)) => matches!(
+            error.kind(),
+            io::ErrorKind::NotFound
+                | io::ErrorKind::ConnectionRefused
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::BrokenPipe
+                | io::ErrorKind::TimedOut
+                | io::ErrorKind::WouldBlock
+                | io::ErrorKind::Interrupted
+        ),
+        _ => false,
+    }
+}
+
 fn run_console(agent: AgentId) -> Result<CommandOutput, AppError> {
     use crate::agent_execution::ConsoleCommand;
     use std::io::{BufRead, Write};
@@ -3364,7 +3680,11 @@ fn run_console(agent: AgentId) -> Result<CommandOutput, AppError> {
         ));
     }
     let socket = terminal::ipc::daemon_socket_path().map_err(|e| AppError::new("daemon", e))?;
-    let mut client = ControlClient::connect(&socket).map_err(protocol_error)?;
+    let startup = ConsoleStartup::capture(&socket)?;
+    if startup.owner.is_some() {
+        println!("Reconnecting to the agent console…");
+    }
+    let mut client = startup.connect(&socket).map_err(protocol_error)?;
     let (sender, input) = std::sync::mpsc::sync_channel(8);
     thread::Builder::new()
         .name("console-input".into())
@@ -3401,7 +3721,6 @@ fn run_console(agent: AgentId) -> Result<CommandOutput, AppError> {
     println!(
         "Agent console: type a prompt to send it.\n/interrupt [--including-subagents] stops the current work. /quit leaves the console; the agent keeps running.\nThis shows one line per step, without command output or tool details.\n"
     );
-    let startup = Instant::now() + Duration::from_secs(10);
     let mut generation = None;
     let mut transcript = ConsoleTranscript::default();
     let mut last_run = None;
@@ -3468,10 +3787,18 @@ fn run_console(agent: AgentId) -> Result<CommandOutput, AppError> {
             }
             Err(ControlError::Remote { message, .. })
                 if generation.is_none()
-                    && Instant::now() < startup
+                    && startup.pending()
                     && (message.contains("not attached yet")
                         || message.contains("no longer live")
                         || message.contains("paired provider console is unavailable")) => {}
+            Err(error)
+                if generation.is_none()
+                    && startup.pending()
+                    && console_connection_transient(&error) =>
+            {
+                client = startup.connect(&socket).map_err(protocol_error)?;
+                continue;
+            }
             Err(error) => return Err(protocol_error(error)),
         }
         match input.recv_timeout(Duration::from_millis(250)) {

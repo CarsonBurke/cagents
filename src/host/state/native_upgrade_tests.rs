@@ -415,20 +415,45 @@ fn committed_upgrade_shutdown_preserves_real_native_owner_even_if_final_save_fai
                     .is_none(),
                 "old-alias retry must retire the exact current adopted authority too"
             );
-            let proof = restarted.lock().unwrap().proof().clone();
-            let receipt = crate::chat::native_holder::closed_source(&source, &proof).unwrap();
-            assert!(receipt.as_ref().is_some_and(|(_, paired)| *paired));
-            assert!(!record.root.is_current());
-            let mut unrelated = source.clone();
+            let final_proof = restarted.lock().unwrap().proof().clone();
+            let receipt = crate::chat::native_holder::closed_source(&source, &final_proof).unwrap();
+            assert!(
+                receipt.as_ref().is_some_and(|(_, paired)| *paired),
+                "the exact issued source retains its completed paired close proof"
+            );
+            let mut unrelated = source;
             unrelated.launch.session_id = Some("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".into());
             assert!(
-                crate::chat::native_holder::closed_source(&unrelated, &proof)
+                crate::chat::native_holder::closed_source(&unrelated, &final_proof)
                     .unwrap()
-                    .is_none()
+                    .is_none(),
+                "a close receipt must not authorize a changed conversation"
             );
-            // An unrelated receipt grants no close authority. Once nothing
-            // can still run, the lost-execution route settles this descriptor
-            // independently and preserves the original exact close receipt.
+            let receipts = || {
+                let mut files = fs::read_dir(registry::directory(Kind::Native).unwrap())
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "closed"))
+                    .map(|entry| (entry.file_name(), fs::read(entry.path()).unwrap()))
+                    .collect::<Vec<_>>();
+                files.sort_by(|a, b| a.0.cmp(&b.0));
+                files
+            };
+            let receipts_before = receipts();
+            assert!(!receipts_before.is_empty());
+            let authority_before = serde_json::to_vec(
+                &execution
+                    .lock()
+                    .unwrap()
+                    .retained_agent_authority_source(id)
+                    .unwrap(),
+            )
+            .unwrap();
+            let model_before =
+                serde_json::to_vec(&execution.lock().unwrap().model().unwrap()).unwrap();
+            // The pane's Close may independently acknowledge a no-op once
+            // every owner and delegated capability is gone. That is not
+            // permission to borrow another conversation's retained receipt.
             assert!(matches!(
                 super::super::client::process_request(
                     &restarted,
@@ -442,15 +467,28 @@ fn committed_upgrade_shutdown_preserves_real_native_owner_even_if_final_save_fai
                 crate::terminal::ipc::ServerResponse::Accepted
             ));
             assert!(
-                crate::chat::native_holder::closed_source(&unrelated, &proof)
+                crate::chat::native_holder::closed_source(&unrelated, &final_proof)
                     .unwrap()
                     .is_none()
             );
+            assert_eq!(receipts(), receipts_before);
             assert_eq!(
-                crate::chat::native_holder::closed_source(&source, &proof).unwrap(),
-                receipt,
-                "settling an ended descriptor must preserve the unrelated receipt"
+                serde_json::to_vec(
+                    &execution
+                        .lock()
+                        .unwrap()
+                        .retained_agent_authority_source(id)
+                        .unwrap()
+                )
+                .unwrap(),
+                authority_before
             );
+            assert_eq!(
+                serde_json::to_vec(&execution.lock().unwrap().model().unwrap()).unwrap(),
+                model_before
+            );
+            assert!(restarted.lock().unwrap().chats.is_empty());
+            assert!(!record.root.is_current() && !record.holder.is_current());
         } else {
             // Model the already-published failed local adapter from an older
             // daemon: closing it must also reclaim the independently retained

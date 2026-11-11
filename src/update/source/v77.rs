@@ -682,9 +682,7 @@ mod tests {
                 impact::DaemonImpact::from(postcard::from_bytes::<Impact>(&body).unwrap()),
                 expected
             );
-            for protocol in super::super::protocols()
-                .filter(|&protocol| !super::super::current_client_supports(protocol))
-            {
+            for protocol in [68, 77] {
                 let bytes = frozen_response(protocol, 2, &proof(), 9, &body);
                 let (header, decoded) =
                     header_at_protocol(&bytes, 2, Some(&proof()), protocol).unwrap();
@@ -708,7 +706,7 @@ mod tests {
             assert_eq!(discovered_version(&bytes).unwrap(), version);
             assert!(postcard::from_bytes::<ServerEnvelope>(&bytes).is_err());
         }
-        for version in [0u16, 78, 119, 127, u16::MAX] {
+        for version in [0u16, 68, 77, 78, 119, 127, 128, 160, 165, u16::MAX] {
             if version != crate::terminal_ipc::PROTOCOL_VERSION {
                 assert!(discovered_version(&postcard::to_stdvec(&version).unwrap()).is_err());
             }
@@ -719,168 +717,125 @@ mod tests {
 
     #[cfg(feature = "host")]
     #[test]
-    fn authenticated_legacy_preview_keeps_consent_and_preparation_separate() {
-        for protocol in super::super::protocols()
-            .filter(|&protocol| !super::super::current_client_supports(protocol))
-        {
-            for (ready, fail_preview) in [(false, false), (true, false), (false, true)] {
-                authenticated_legacy_preview(protocol, ready, fail_preview);
-            }
-        }
-    }
-
-    #[cfg(feature = "host")]
-    fn authenticated_legacy_preview(protocol: u16, ready: bool, fail_preview: bool) {
-        use std::os::unix::net::UnixListener;
-        let directory = tempfile::tempdir().unwrap();
-        let socket = directory.path().join("cagentsd.sock");
-        let paths = crate::daemon::RuntimePaths {
-            directory: directory.path().to_owned(),
-            socket: socket.clone(),
-            lock: directory.path().join("cagentsd.lock"),
-        };
-        let mut pinned = proof();
-        pinned.boot_id = crate::daemon::read_boot_id().unwrap();
-        let expected_proof = pinned.clone();
-        let _lease = crate::daemon::HostLease::acquire(&paths, &pinned).unwrap();
-        let listener = UnixListener::bind(&socket).unwrap();
-        let mut expected = impact();
-        expected.capability.proof = pinned.clone();
-        expected.policy = impact::Policy::WhenIdle;
-        expected.sessions[0].disposition = if ready {
-            impact::Disposition::Resumes
-        } else {
-            impact::Disposition::WaitsForIdle
-        };
-        expected.sessions[0].interrupted_subagents.clear();
-        let answer = expected.clone();
-        let reviewed = expected.clone();
-        let worker = std::thread::spawn(move || {
-            let (mut discovery, _) = listener.accept().unwrap();
-            let bytes = read(&mut discovery, Instant::now() + Duration::from_secs(2)).unwrap();
-            let request: ClientEnvelope = postcard::from_bytes(&bytes).unwrap();
-            assert_eq!(request.version, crate::terminal_ipc::PROTOCOL_VERSION);
+    fn unqualified_165_refuses_after_discovery_without_preparing_or_writing_state() {
+        use std::{fs, os::unix::net::UnixListener, process::Command, process::Stdio, thread};
+        const ROOT: &str = "CAGENTS_UNQUALIFIED_SOURCE_TEST_ROOT";
+        const TEST: &str = "update::source::v77::tests::unqualified_165_refuses_after_discovery_without_preparing_or_writing_state";
+        if let Some(root) = std::env::var_os(ROOT) {
+            let root = std::path::PathBuf::from(root);
+            let paths = crate::daemon::RuntimePaths {
+                directory: root.clone(),
+                socket: root.join("cagentsd.sock"),
+                lock: root.join("cagentsd.lock"),
+            };
+            let mut source = proof();
+            source.boot_id = crate::daemon::read_boot_id().unwrap();
+            let _lease = crate::daemon::HostLease::acquire(&paths, &source).unwrap();
+            let listener = UnixListener::bind(&paths.socket).unwrap();
+            fs::write(root.join("ready"), []).unwrap();
+            let (mut stream, _) = listener.accept().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let request: ClientEnvelope =
+                postcard::from_bytes(&read(&mut stream, deadline).unwrap()).unwrap();
             assert!(
                 matches!(request.request, ClientRequest::Connect { expected_host: None, ref resume } if resume.is_empty())
             );
-            // Header only is sufficient for discovery; a deliberately foreign
-            // error body must never be decoded as a current error DTO.
-            let mut old_error = postcard::to_stdvec(&protocol).unwrap();
-            old_error.extend_from_slice(&[255, 255, 255]);
-            write(
-                &mut discovery,
-                &old_error,
-                Instant::now() + Duration::from_secs(2),
-            )
-            .unwrap();
-            drop(discovery);
-            let (mut stream, _) = listener.accept().unwrap();
-            let bytes = read(&mut stream, Instant::now() + Duration::from_secs(2)).unwrap();
-            assert_eq!(bytes, frozen_request(protocol, 1, None, 0, &[0, 0]));
-            let mut connected = Vec::new();
-            frozen_proof(&pinned, &mut connected);
-            connected.push(0); // Empty resumed terminal inventory.
-            let connected = frozen_response(protocol, 1, &pinned, 0, &connected);
-            write(
-                &mut stream,
-                &connected,
-                Instant::now() + Duration::from_secs(2),
-            )
-            .unwrap();
-            let bytes = read(&mut stream, Instant::now() + Duration::from_secs(2)).unwrap();
-            assert_eq!(bytes, frozen_request(protocol, 2, Some(&pinned), 36, &[0]));
-            if fail_preview {
-                return;
-            }
-            let response = frozen_response(protocol, 2, &pinned, 9, &frozen_impact(&answer));
-            write(
-                &mut stream,
-                &response,
-                Instant::now() + Duration::from_secs(2),
-            )
-            .unwrap();
-            if ready {
-                let bytes = read(&mut stream, Instant::now() + Duration::from_secs(2)).unwrap();
-                let mut confirmed = frozen_impact(&reviewed);
-                confirmed.push(0); // No unsolicited relaunch.
-                assert_eq!(
-                    bytes,
-                    frozen_request(protocol, 3, Some(&pinned), 37, &confirmed)
-                );
-                let receipt = frozen_response(protocol, 3, &pinned, 17, &[1, 1]);
-                write(
-                    &mut stream,
-                    &receipt,
-                    Instant::now() + Duration::from_secs(2),
-                )
-                .unwrap();
-            }
+            let mut reply = postcard::to_stdvec(&165u16).unwrap();
+            reply.extend_from_slice(&[255, 255, 255]);
+            write(&mut stream, &reply, deadline).unwrap();
             stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
-            let mut byte = [0];
             assert_eq!(
-                stream.read(&mut byte).unwrap(),
+                stream.read(&mut [0]).unwrap(),
                 0,
-                "busy preview cannot prepare or retry"
+                "discovery must not send preparation"
             );
-        });
-        let mut client = super::super::Client::connect(&socket).unwrap();
-        assert_eq!(client.protocol(), protocol);
-        assert_eq!(client.proof(), &expected_proof);
-        // Exercise the same production entry decision used by apply_installed,
-        // including its formerly earlier already-running branch, using the
-        // actual authenticated source rather than the discovery header.
-        let layout = |version: &str| crate::update::InstallLayout {
-            prefix: "/owned/install".into(),
-            version_root: Path::new("/owned/install/versions").join(version),
-            version: version.into(),
-        };
-        let current = layout("new");
-        let previous = layout("old");
-        assert_eq!(
-            super::super::super::installed_candidate_version(
-                &current,
-                &current.version_root,
-                Some(&previous),
-                client.protocol(),
-                Some(client.proof()),
-            )
-            .unwrap(),
-            "new"
-        );
-        if fail_preview {
-            let error = client
-                .upgrade_impact(impact::Policy::WhenIdle)
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains("read-only update preview"), "{error}");
-            assert!(
-                error.contains("does not checkpoint or stop sessions"),
-                "{error}"
+            listener.set_nonblocking(true).unwrap();
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                io::ErrorKind::WouldBlock,
+                "unqualified source must not receive an authenticated control connection"
             );
-            drop(client);
-            worker.join().unwrap();
+            fs::write(root.join("observed"), b"Connect only").unwrap();
+            // Stay alive with the original lease until the parent finishes its
+            // read-only assertions and closes this owned child's input pipe.
+            assert_eq!(io::stdin().read(&mut [0]).unwrap(), 0);
             return;
         }
-        let observed = client.upgrade_impact(impact::Policy::WhenIdle).unwrap();
-        assert_eq!(observed, expected);
-        assert_eq!(observed.ready(), ready);
-        if ready {
-            assert_eq!(
-                client.prepare_confirmed_upgrade(observed, false).unwrap(),
-                (1, 1)
-            );
-        } else {
-            assert!(client.prepare_confirmed_upgrade(observed, false).is_err());
+        struct OwnedMock(std::process::Child);
+        impl Drop for OwnedMock {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
         }
-        drop(client);
-        worker.join().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let state = root.join("state");
+        fs::create_dir(&state).unwrap();
+        let retained = state.join("retained-checkpoint.json");
+        let registry = state.join("workspace.sqlite3");
+        fs::write(&retained, b"immutable existing checkpoint evidence").unwrap();
+        fs::write(&registry, b"immutable registry evidence").unwrap();
+        let snapshot = || {
+            let mut files = fs::read_dir(&state)
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    (entry.file_name(), fs::read(entry.path()).unwrap())
+                })
+                .collect::<Vec<_>>();
+            files.sort_by(|a, b| a.0.cmp(&b.0));
+            files
+        };
+        let before = snapshot();
+        let mut child = OwnedMock(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(ROOT, root)
+                .env("XDG_DATA_HOME", &state)
+                .env("XDG_CONFIG_HOME", &state)
+                .env("XDG_RUNTIME_DIR", root)
+                .stdin(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let wait_for = |path: &Path| {
+            while !path.exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "mock source did not reach {}",
+                    path.display()
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        };
+        wait_for(&root.join("ready"));
+        let error = super::super::Client::connect(&root.join("cagentsd.sock"))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("uses protocol 165"), "{error}");
+        assert!(
+            error.contains("--no-start daemon stop --require-empty"),
+            "{error}"
+        );
+        wait_for(&root.join("observed"));
+        assert_eq!(fs::read(root.join("observed")).unwrap(), b"Connect only");
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "refusal must keep the source alive"
+        );
+        assert_eq!(snapshot(), before);
+        assert!(!state.join("daemon-upgrade.json").exists());
+        drop(child.0.stdin.take());
+        assert!(child.0.wait().unwrap().success());
     }
 
-    /// The candidate line (128) is spoken with this release's types, so the
-    /// messages an update exchanges with it must keep the variant positions
-    /// that line published. Moving one would silently mis-decode its replies.
+    /// Preserve the historical candidate line's frozen byte oracle. A
+    /// recorded layout alone does not qualify it as a live update source.
     #[test]
     fn update_messages_keep_the_candidate_lines_variant_positions() {
         let tag = |bytes: Vec<u8>| bytes[0];

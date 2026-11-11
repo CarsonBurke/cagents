@@ -7,8 +7,11 @@ import subprocess
 import sys
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 import uuid
+from unittest import mock
+
 
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -59,6 +62,19 @@ class ListenerTests(unittest.TestCase):
 
 
 class PersistenceTests(unittest.TestCase):
+    def start_paused(self, scenario, home):
+        replies = scenario.request({"id": 2, "method": "turn/start", "params": {
+            "threadId": scenario.thread}}, str(home))
+        generations = scenario.playback(replies)
+        pause = next(index for index, reply in enumerate(replies) if "_sleep" in reply)
+        scenario.play(replies[:pause], lambda _: None, threading.Lock(), generations)
+        return replies[pause + 1:], generations
+
+    def interrupt(self, scenario, thread, home):
+        replies = scenario.request({"id": 3, "method": "turn/interrupt", "params": {
+            "threadId": thread, "turnId": scenario._latest(thread)["id"]}}, str(home))
+        scenario.play(replies, lambda _: None, threading.Lock(), scenario.playback(replies))
+
     def test_resume_restores_exact_thread_and_history_across_listener_restart(self):
         with tempfile.TemporaryDirectory() as directory:
             storage = Path(directory) / "state"
@@ -66,8 +82,8 @@ class PersistenceTests(unittest.TestCase):
             first.request({"id": 1, "method": "thread/start"}, directory)
             first.request({"id": 2, "method": "turn/start", "params": {"threadId": first.thread}}, directory)
             restarted = adapter.scenario_class(peer, storage, Path("/first/control.sock"))()
-            self.assertEqual((restarted.thread, restarted.child, restarted.latest),
-                             (first.thread, first.child, first.latest))
+            self.assertEqual(restarted.state(), first.state())
+
             successor = adapter.scenario_class(peer, storage, Path("/second/control.sock"))()
             self.assertNotEqual(successor.thread, first.thread)
             resumed = successor.request({"id": 3, "method": "thread/resume",
@@ -75,6 +91,91 @@ class PersistenceTests(unittest.TestCase):
             self.assertEqual(resumed["thread"]["id"], first.thread)
             self.assertEqual(resumed["initialTurnsPage"]["data"], [first.latest])
             self.assertEqual(successor.child, first.child)
+
+    def test_observed_completion_is_saved_without_a_later_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Path(directory) / "state"
+            first = adapter.scenario_class(peer, storage, Path("/first/control.sock"))()
+            remaining, generations = self.start_paused(first, directory)
+            first.play(remaining, lambda _: None, threading.Lock(), generations)
+            restarted = adapter.scenario_class(peer, storage, Path("/first/control.sock"))()
+            self.assertEqual(restarted.state(), first.state())
+            for thread in (first.thread, first.child):
+                resumed = restarted.request({"id": 4, "method": "thread/resume", "params": {
+                    "threadId": thread}}, directory)[0]["result"]
+                self.assertEqual(resumed["thread"]["status"]["type"], "idle")
+                self.assertEqual(resumed["initialTurnsPage"]["data"][0]["status"], "completed")
+
+    def test_interrupted_parent_and_running_child_survive_listener_replacement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Path(directory) / "state"
+            first = adapter.scenario_class(peer, storage, Path("/first/control.sock"))()
+            remaining, generations = self.start_paused(first, directory)
+            self.interrupt(first, first.thread, directory)
+            replacement = adapter.scenario_class(peer, storage, Path("/second/control.sock"))()
+            parent = replacement.request({"id": 4, "method": "thread/resume", "params": {
+                "threadId": first.thread}}, directory)[0]["result"]
+            self.assertEqual(parent["initialTurnsPage"]["data"][0]["status"], "interrupted")
+            child = replacement.request({"id": 5, "method": "thread/resume", "params": {
+                "threadId": first.child}}, directory)[0]["result"]
+            self.assertEqual(child["thread"]["status"]["type"], "active")
+            self.assertEqual(child["initialTurnsPage"]["data"][0]["status"], "inProgress")
+            # Explicitly stop the child in the still-owning original listener;
+            # queued frames then cannot overwrite either terminal outcome.
+            self.interrupt(first, first.child, directory)
+            first.play(remaining, lambda _: None, threading.Lock(), generations)
+            final = adapter.scenario_class(peer, storage, Path("/third/control.sock"))()
+            final.request({"id": 6, "method": "thread/resume", "params": {
+                "threadId": first.thread}}, directory)
+            self.assertEqual(final.latest["status"], "interrupted")
+            self.assertEqual(final.child_latest["status"], "interrupted")
+            states = [item["agentsStates"][final.child]["status"] for item in final.latest["items"]
+                      if item["type"] == "collabAgentToolCall"]
+            self.assertEqual(states, ["interrupted", "interrupted"])
+
+    def test_unconfirmed_interrupt_survives_listener_replacement(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {
+                "CAGENTS_TOOL_ROWS_NEVER_CONFIRM_INTERRUPT": "1"}):
+            storage = Path(directory) / "state"
+            first = adapter.scenario_class(peer, storage, Path("/first/control.sock"))()
+            remaining, _ = self.start_paused(first, directory)
+            self.interrupt(first, first.thread, directory)
+            replacement = adapter.scenario_class(peer, storage, Path("/first/control.sock"))()
+            self.assertEqual(replacement.state(), first.state())
+            sent = []
+            replacement.play(remaining, sent.append, threading.Lock(), replacement.playback(remaining))
+            self.assertEqual(replacement.latest["status"], "inProgress")
+            self.assertFalse(any(frame.get("method") == "turn/completed"
+                                 and frame["params"]["threadId"] == first.thread for frame in sent))
+
+    def test_loading_named_history_fences_playback_of_the_previous_allocation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Path(directory) / "state"
+            first = adapter.scenario_class(peer, storage, Path("/first/control.sock"))()
+            remaining, generations = self.start_paused(first, directory)
+            other = adapter.scenario_class(peer, storage, Path("/other/control.sock"))()
+            self.start_paused(other, directory)
+            self.interrupt(other, other.thread, directory)
+            self.interrupt(other, other.child, directory)
+            first.request({"id": 4, "method": "thread/resume", "params": {
+                "threadId": other.thread}}, directory)
+            sent = []
+            first.play(remaining, sent.append, threading.Lock(), generations)
+            self.assertEqual(sent, [])
+            self.assertEqual(first.state(), other.state())
+
+    def test_legacy_parent_only_state_does_not_invent_a_child_completion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Path(directory) / "state"
+            first = adapter.scenario_class(peer, storage, Path("/first/control.sock"))()
+            self.start_paused(first, directory)
+            legacy = first.state()
+            del legacy["child_latest"]
+            for path in storage.glob("*.json"):
+                path.write_text(json.dumps(legacy))
+            restarted = adapter.scenario_class(peer, storage, Path("/first/control.sock"))()
+            self.assertEqual(restarted.latest, first.latest)
+            self.assertIsNone(restarted.child_latest)
 
     def test_probe_listener_does_not_replace_conversation_state(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -101,7 +202,9 @@ class StdioProbeTests(unittest.TestCase):
                       {"id": 3, "method": "account/rateLimits/read"},
                       {"id": 4, "method": "model/list", "params": {"limit": 100}}]
             result = subprocess.run([sys.executable, "-I", str(FIXTURES / "rehearsal-codex.py"), "app-server"],
-                                    env={**os.environ, "CAGENTS_TOOL_ROWS_FIXTURE_ROOT": str(root),
+                                    env={"PATH": "/usr/bin:/bin", "HOME": str(home),
+                                         "CAGENTS_TOOL_ROWS_FIXTURE_ROOT": str(root),
+
                                          "CODEX_HOME": str(home), "XDG_RUNTIME_DIR": str(runtime)},
                                     input="".join(json.dumps(frame) + "\n" for frame in frames),
                                     text=True, capture_output=True, timeout=5)

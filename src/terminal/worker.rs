@@ -2080,21 +2080,33 @@ impl TerminalHandle {
         let outcome = result
             .recv_timeout(std::time::Duration::from_secs(3))
             .unwrap_or_else(|error| TerminalCloseResult::Unknown(error.to_string()));
-        if matches!(outcome, TerminalCloseResult::Unknown(_))
-            && matches!(
-                *self
-                    .inner
-                    .published
-                    .archive
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner()),
-                ArchivePhase::Frozen { .. }
-            )
-        {
-            return match self.shutdown() {
-                Ok(()) => TerminalCloseResult::Closed,
-                Err(error) => TerminalCloseResult::Unknown(error.to_string()),
-            };
+        if matches!(outcome, TerminalCloseResult::Unknown(_)) {
+            // An adopted root can already be reaped when preparation tries to
+            // capture its live process identity. A checked close may then run
+            // before the queued exit report and PTY EOF finish publication.
+            // Give that ordinary completion the remainder of the close budget;
+            // neither the failed inspection nor elapsed time proves release.
+            let published = &self.inner.published;
+            let mut archive = published.archive.lock().unwrap_or_else(|p| p.into_inner());
+            while matches!(*archive, ArchivePhase::Live | ArchivePhase::Preparing) {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let (next, _) = published
+                    .archive_ready
+                    .wait_timeout(archive, remaining)
+                    .unwrap_or_else(|p| p.into_inner());
+                archive = next;
+            }
+            let frozen = matches!(*archive, ArchivePhase::Frozen { .. });
+            drop(archive);
+            if frozen {
+                return match self.shutdown() {
+                    Ok(()) => TerminalCloseResult::Closed,
+                    Err(error) => TerminalCloseResult::Unknown(error.to_string()),
+                };
+            }
         }
         if outcome == TerminalCloseResult::Closed {
             // Completion is not reported until the owner has released its PTY.
@@ -2945,6 +2957,13 @@ impl Worker {
             }
         }
         command.env_remove(crate::agent_execution::AUTHORITY_ENV);
+        command.env_remove(crate::agent_execution::CONSOLE_STARTUP_OWNER_ENV);
+        if let Some(proof) = &config.console_startup_owner {
+            command.env(
+                crate::agent_execution::CONSOLE_STARTUP_OWNER_ENV,
+                serde_json::to_string(proof).map_err(|error| error.to_string())?,
+            );
+        }
         if let Some(token) = config.agent_authority.token() {
             command.env(crate::agent_execution::AUTHORITY_ENV, token);
         }
@@ -3927,7 +3946,7 @@ impl Worker {
                             .and_then(crate::model::agent_recovery::recipe_from_hint).is_some()
                             && !self.agent_process.as_ref().is_some_and(|process| family.only_agent_tree(process.pid))
                         {
-                            return Err("Terminal also owns unrelated background jobs; finish or close them before upgrading".into());
+                            return Err("Terminal also owns unrelated background jobs that cannot be checkpointed".into());
                         }
                         Ok(UpgradeSnapshot {
                             hint: self.resume_hint.clone(),
@@ -4813,7 +4832,9 @@ impl Worker {
             || !self.commands.is_empty()
             || !self.retained_commands.is_empty()
         {
-            return Err("Terminal input or control is still pending; let it finish or cancel input before upgrading".into());
+            return Err(
+                "Terminal input or control is still pending and cannot be checkpointed".into(),
+            );
         }
         Ok(())
     }
@@ -6481,6 +6502,88 @@ mod tests {
             TerminalRetirement::Released
         ));
         assert!(handle.worker_joined_for_test());
+    }
+
+    #[test]
+    fn checked_close_waits_for_an_adopted_reaped_roots_exact_release() {
+        if isolated_retirement_worker_case() {
+            return;
+        }
+        let proof = retirement_test_proof();
+        let paths = crate::daemon::RuntimePaths::discover().unwrap();
+        let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+        let mut source = shell_session("printf 'already-reaped-console'; exit 1");
+        source.continuity = crate::model::TerminalContinuity::DetachedSameBoot {
+            host_session_id: proof.host_session_id.clone(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: proof.host_incarnation.clone(),
+        };
+        let config = TerminalConfig {
+            holder_recovery: Some(crate::terminal::holder::Recovery {
+                source: source.clone(),
+                previous_sources: Vec::new(),
+                relaunches: Vec::new(),
+                options: super::super::TerminalSpawnOptions::default(),
+                execution_environment: None,
+                execution_recipe: None,
+            }),
+            ..TerminalConfig::default()
+        };
+        let (commands, receiver) = command_channel(1);
+        let (events, event_receiver) = crossbeam_channel::unbounded();
+        let published = Arc::new(PublishedState::new(true, Arc::new(|_| {})));
+        let owner = joins::JoinOwner::new(published.clone(), joins::reserve().unwrap());
+        let handle = TerminalHandle {
+            inner: Arc::new(HandleInner {
+                commands,
+                events: event_receiver,
+                published: published.clone(),
+                worker: owner.clone(),
+            }),
+        };
+        let (ready, initialized) = crossbeam_channel::bounded(1);
+        let (begin, admitted) = crossbeam_channel::bounded(1);
+        let worker_owner = owner.clone();
+        let worker_source = source.clone();
+        let worker_published = published.clone();
+        owner.install(thread::spawn(move || {
+            let _body = joins::BodyCompletion(worker_owner);
+            let (mut worker, _) = Worker::start(
+                worker_source,
+                config,
+                None,
+                receiver,
+                events,
+                worker_published,
+            )
+            .unwrap();
+            assert!(worker.child.exited_within(Duration::from_secs(5)).unwrap());
+            // Adoption after this actual exit cannot capture a live root.
+            // Keep its real pending exit report and PTY output for the worker.
+            worker.child_identity = None;
+            ready.send(()).unwrap();
+            admitted.recv().unwrap();
+            worker.run();
+        }));
+        initialized.recv_timeout(Duration::from_secs(5)).unwrap();
+        let expected = handle.holder_identity().unwrap().clone();
+        let closer = handle.clone();
+        let close_source = source.clone();
+        let close_proof = proof.clone();
+        let result = thread::spawn(move || closer.close_with_receipt(&close_source, &close_proof));
+        wait_for_retirement_fact(|| published.priority_close.lock().unwrap().is_some());
+        begin.send(()).unwrap();
+        result.join().unwrap().unwrap();
+        assert!(handle.is_completed());
+        assert!(
+            crate::terminal::holder::cleanup::confirmed_with_role(
+                &source,
+                &expected,
+                &proof,
+                published.original_holder_role.get(),
+            )
+            .unwrap()
+        );
     }
 
     #[test]

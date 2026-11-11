@@ -1,6 +1,7 @@
 //! Bounded source qualification after source windows flush, before close.
 //! Stores remain read-only. Exact retained providers missing from startup
 //! discovery may be authenticated through Resolve; no launch recipe is run.
+mod console;
 mod current;
 mod v68;
 mod v77;
@@ -9,7 +10,7 @@ pub(super) use current::Client as InspectionClient;
 
 use crate::install_guard::SourceInspectionRequest as Request;
 use crate::update::source_inspection::{
-    InspectedPane, SavedOutcome, SourceInspection, StoppedKind, StoppedWindow,
+    ConsoleCapability, InspectedPane, SavedOutcome, SourceInspection, StoppedKind, StoppedWindow,
 };
 use crate::{
     chat::Session,
@@ -27,6 +28,9 @@ use std::{
 pub(super) const ARGUMENT: &str = "--inspect-upgrade-source";
 
 pub(super) fn entry() -> Option<Result<(), String>> {
+    if let Some(result) = retain_floor_entry() {
+        return Some(result);
+    }
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     if arguments
         .first()
@@ -121,8 +125,8 @@ fn connect(request: &Request, deadline: Instant) -> Result<Reader, InspectionFai
 const UNCHECKED: &str = "could not be checked before the update";
 const CHAT_RECOVERY: &str = "Choose Resume conversation in the new tab (+) menu";
 const TERMINAL_RECOVERY: &str = "Press Reconnect in the pane to check the saved terminal";
-const CONSOLE_REASON: &str = "keeps running in its terminal; its chat panel disconnects";
-const CONSOLE_RECOVERY: &str = "Choose Resume conversation in the new tab (+) menu afterwards";
+const CONSOLE_REFUSAL: &str = "This update cannot keep a running agent console connected. Finish or close the console, then retry.";
+const CONSOLE_UNSAFE: &str = "its console cannot reconnect safely after the update";
 
 fn stop_unchecked(
     inspection: &mut SourceInspection,
@@ -335,6 +339,12 @@ fn inspect(request: Request) -> Result<SourceInspection, String> {
             proof,
             request.require_resumable,
         );
+        record_live_console_outcomes(
+            &mut inspection,
+            &terminals,
+            proof,
+            request.require_resumable,
+        );
         let matched_cli = crate::companion::Product::Cli
             .beside_current()
             .map_err(|_| InspectionFailure::ConsoleHelper)?;
@@ -352,16 +362,14 @@ fn inspect(request: Request) -> Result<SourceInspection, String> {
             }
             if request.require_resumable
                 && session.terminal.as_ref().is_some_and(|terminal| {
-                    terminal.continuity.can_resume_live(proof)
-                        && qualify_terminal(terminal, &terminals, proof).is_ok()
-                        && qualify_console_migration(terminal, &matched_cli).is_err()
+                    crate::agent_execution::console_agent(&terminal.launch).is_some()
                 })
             {
-                console_keeps_running(
-                    &mut inspection,
-                    session.id,
-                    crate::update::impact::SessionKind::NativeChat,
-                );
+                let qualified =
+                    qualify_terminal(session.terminal.as_ref().unwrap(), &terminals, proof).is_ok()
+                        && validate_live_chat(session, true).is_ok()
+                        && console::qualify(session, &matched_cli, proof).is_ok();
+                record_console_outcome(&mut inspection, session.id, qualified);
             } else if validate_live_chat(session, request.require_resumable).is_err() {
                 inspection.stop(
                     session.id,
@@ -375,16 +383,18 @@ fn inspect(request: Request) -> Result<SourceInspection, String> {
             check_deadline(deadline).map_err(|_| InspectionFailure::TimedOut)?;
             if request.require_resumable
                 && !inventory.iter().any(|chat| chat.id == terminal.session.id)
-                && terminal.session.continuity.can_resume_live(proof)
-                && qualify_console_migration(&terminal.session, &matched_cli).is_err()
+                && terminal_requires_migration(&terminal.session, &proof.boot_id)
+                && crate::agent_execution::console_agent(&terminal.session.launch).is_some()
             {
-                console_keeps_running(
-                    &mut inspection,
+                inspection.stop(
                     terminal.session.id,
-                    crate::update::impact::SessionKind::Terminal,
+                    StoppedKind::Terminal,
+                    CONSOLE_UNSAFE,
+                    "Reopen the agent after the update",
                 );
             }
         }
+
         for (_, kind) in &saved {
             check_deadline(deadline).map_err(|_| InspectionFailure::TimedOut)?;
             match kind {
@@ -463,9 +473,36 @@ fn inspect(request: Request) -> Result<SourceInspection, String> {
         }
         Ok(())
     })();
-    if let Err(reason) = inspect_live {
+    finish_live_inspection(
+        inspection,
+        inspect_live,
+        &saved,
+        &checked_saved,
+        &current_boot,
+    )
+}
+
+fn finish_live_inspection(
+    mut inspection: SourceInspection,
+    result: Result<(), InspectionFailure>,
+    saved: &[(crate::model::CardId, CardKind)],
+    checked_saved: &HashSet<crate::model::TerminalId>,
+    current_boot: &crate::model::BootId,
+) -> Result<SourceInspection, String> {
+    // Refusal is derived from the exact reviewed capability, never another
+    // argv, provider, path or protocol eligibility check. A future qualified
+    // reconnect producer changes review and preflight together.
+    if inspection
+        .details
+        .console_capabilities
+        .values()
+        .any(|review| review.capability == ConsoleCapability::Blocked)
+    {
+        return Err(CONSOLE_REFUSAL.into());
+    }
+    if let Err(reason) = result {
         inspection_failure(&mut inspection, reason);
-        stop_unchecked(&mut inspection, &saved, &checked_saved, &current_boot);
+        stop_unchecked(&mut inspection, saved, checked_saved, current_boot);
     }
     Ok(inspection)
 }
@@ -554,21 +591,6 @@ fn record_live_panes(
             replaces_service,
         );
     }
-}
-
-fn console_keeps_running(
-    inspection: &mut SourceInspection,
-    id: crate::model::TerminalId,
-    kind: crate::update::impact::SessionKind,
-) {
-    inspection.details.panes.insert(
-        id,
-        InspectedPane {
-            kind,
-            outcome: SavedOutcome::KeepsRunning,
-            detail: format!("{CONSOLE_REASON}. {CONSOLE_RECOVERY}."),
-        },
-    );
 }
 
 /// The operation that failed owns its user-facing classification. Compatibility
@@ -1834,25 +1856,55 @@ fn check_deadline(deadline: Instant) -> Result<(), String> {
     Ok(())
 }
 
-/// A console's issued recipe is not permission to replay a different installed
-/// CLI. Even an unchanged path cannot prove that its existing ControlClient
-/// survives the source daemon stopping. Defer until an exact, typed migration
-/// route qualifies both the accepted console and its retained provider.
-fn qualify_console_migration(
-    terminal: &crate::model::TerminalSession,
-    matched_cli: &Path,
-) -> Result<(), &'static str> {
-    if crate::agent_execution::console_agent(&terminal.launch).is_none() {
-        return Ok(());
+/// Record accepted live consoles before exact destination qualification.
+/// A replacement begins Blocked; the same review producer promotes qualified
+/// pairs to Reconnects. Keeping the source needs no migration capability.
+fn record_live_console_outcomes(
+    inspection: &mut SourceInspection,
+    terminals: &[v77::Terminal],
+    proof: &HostSessionProof,
+    require_resumable: bool,
+) {
+    for terminal in terminals {
+        if terminal.session.continuity.can_resume_live(proof)
+            && crate::agent_execution::console_agent(&terminal.session.launch).is_some()
+        {
+            record_console_outcome(
+                inspection,
+                terminal.session.id,
+                if require_resumable {
+                    ConsoleCapability::Blocked
+                } else {
+                    ConsoleCapability::Continues
+                },
+            );
+        }
     }
-    if Path::new(&terminal.launch.program) != matched_cli {
-        return Err(
-            "its accepted console belongs to a different matched CLI installation; this pairing cannot migrate yet",
-        );
-    }
-    Err(
-        "its accepted console has no qualified reconnection across daemon replacement; this pairing cannot migrate yet",
-    )
+}
+
+/// One review producer for both direct continuity and qualified reconnection.
+/// The console-relaunch implementation's existing boolean qualifier can feed
+/// this function directly: true records Reconnects, false records Blocked.
+/// Preflight consumes the recorded capability without requalifying the pane.
+fn record_console_outcome(
+    inspection: &mut SourceInspection,
+    id: crate::model::TerminalId,
+    capability: impl Into<ConsoleCapability>,
+) {
+    let kind = inspection
+        .details
+        .panes
+        .get(&id)
+        .map(|pane| pane.kind)
+        .or_else(|| {
+            inspection
+                .details
+                .console_capabilities
+                .get(&id)
+                .map(|review| review.kind)
+        })
+        .unwrap_or(crate::update::impact::SessionKind::NativeChat);
+    inspection.record_console_outcome(id, kind, capability);
 }
 
 // A foreground process hint is an observation of the retained PTY, not an
@@ -1947,7 +1999,7 @@ mod tests {
         assert!(current::supports_protocol(156));
         assert_eq!(
             source::protocols().collect::<Vec<_>>(),
-            [68, 77, 128, 156, crate::terminal_ipc::PROTOCOL_VERSION]
+            [156, crate::terminal_ipc::PROTOCOL_VERSION]
         );
     }
 
@@ -2068,8 +2120,14 @@ mod tests {
 
     #[test]
     fn live_inspection_failure_keeps_one_readable_reason() {
-        let mut inspection = SourceInspection::default();
-        inspection_failure(&mut inspection, InspectionFailure::ServiceUnavailable);
+        let inspection = finish_live_inspection(
+            SourceInspection::default(),
+            Err(InspectionFailure::ServiceUnavailable),
+            &[],
+            &HashSet::new(),
+            &current_boot(),
+        )
+        .unwrap();
         assert_eq!(
             inspection.details.notices,
             [
@@ -2118,54 +2176,184 @@ mod tests {
     }
 
     #[test]
-    fn accepted_console_migration_defers_even_when_the_cli_path_is_unchanged() {
-        let matched = Path::new("/installed/new/bin/cagents");
-        let recipe = crate::model::LaunchRecipe {
-            program: matched.to_string_lossy().into_owned(),
-            arguments: vec![
-                "agent".into(),
-                "console".into(),
-                crate::model::AgentId::new().to_string(),
-            ],
-            working_directory: "/private-directory".into(),
-            environment: [("PRIVATE_ACCOUNT".into(), "never-print-this".into())].into(),
-            unset_environment: Default::default(),
-        };
-        let mut terminal =
-            crate::terminal_ipc::TerminalDescriptor::relaunchable(TerminalId::new(), recipe, None)
-                .session;
-        let same_path = qualify_console_migration(&terminal, matched).unwrap_err();
-        assert!(same_path.contains("no qualified reconnection"));
-        terminal.launch.program = "/installed/old/bin/cagents".into();
-        let older = qualify_console_migration(&terminal, matched).unwrap_err();
-        assert!(older.contains("different matched CLI installation"));
-        for error in [same_path, older] {
+    fn reviewed_blocked_console_is_fatal_but_both_allowed_capabilities_pass() {
+        let id = TerminalId::new();
+        let boot = current_boot();
+        for capability in [ConsoleCapability::Continues, ConsoleCapability::Reconnects] {
             let mut inspection = SourceInspection::default();
-            console_keeps_running(
-                &mut inspection,
-                terminal.id,
-                crate::update::impact::SessionKind::Terminal,
+            record_console_outcome(&mut inspection, id, capability);
+            let inspection =
+                finish_live_inspection(inspection, Ok(()), &[], &HashSet::new(), &boot).unwrap();
+            assert_eq!(
+                inspection.details.console_capabilities[&id].capability,
+                capability
+            );
+            assert_eq!(
+                inspection.details.panes[&id].outcome,
+                SavedOutcome::KeepsRunning
             );
             assert!(inspection.stopped.is_empty());
-            let pane = &inspection.details.panes[&terminal.id];
-            assert_eq!(pane.outcome, SavedOutcome::KeepsRunning);
-            assert_eq!(
-                pane.detail,
-                "keeps running in its terminal; its chat panel disconnects. Choose Resume conversation in the new tab (+) menu afterwards."
-            );
-            assert!(!error.contains("private-directory"));
-            assert!(!error.contains("never-print-this"));
-            assert!(!error.contains("/installed"));
         }
-        terminal.launch.arguments = vec!["--login".into()];
-        assert!(qualify_console_migration(&terminal, matched).is_ok());
-        terminal.launch.arguments = vec![
-            "--remote".into(),
-            "unix://owned-listener".into(),
-            "resume".into(),
-            "exact-thread".into(),
-        ];
-        assert!(qualify_console_migration(&terminal, matched).is_ok());
+        // The floor reconnection qualifier's existing bool call feeds exactly
+        // the same producer; no independent admission rule needs updating.
+        let mut qualified = SourceInspection::default();
+        record_console_outcome(&mut qualified, id, true);
+        assert!(finish_live_inspection(qualified, Ok(()), &[], &HashSet::new(), &boot).is_ok());
+        let mut blocked = SourceInspection::default();
+        record_console_outcome(&mut blocked, id, false);
+        assert_eq!(
+            blocked.details.console_capabilities[&id].capability,
+            ConsoleCapability::Blocked
+        );
+        assert!(!blocked.details.panes.contains_key(&id));
+        assert!(blocked.stopped.is_empty());
+        assert_eq!(
+            finish_live_inspection(blocked, Ok(()), &[], &HashSet::new(), &boot).unwrap_err(),
+            CONSOLE_REFUSAL
+        );
+    }
+
+    #[test]
+    fn qualified_console_replaces_blocked_policy_without_losing_kind_or_generic_stops() {
+        use crate::update::impact::SessionKind;
+        let boot = current_boot();
+        for kind in [SessionKind::NativeChat, SessionKind::Terminal] {
+            for independent_stop in [false, true] {
+                let id = TerminalId::new();
+                let mut inspection = SourceInspection::default();
+                inspection.details.panes.insert(
+                    id,
+                    InspectedPane {
+                        kind,
+                        outcome: SavedOutcome::KeepsRunning,
+                        detail: String::new(),
+                    },
+                );
+                if independent_stop {
+                    inspection.stop(
+                        id,
+                        match kind {
+                            SessionKind::NativeChat => StoppedKind::Chat,
+                            SessionKind::Terminal => StoppedKind::Terminal,
+                        },
+                        "independent pane problem",
+                        "recover this pane separately",
+                    );
+                }
+                let stopped = inspection.stopped.clone();
+                record_console_outcome(&mut inspection, id, false);
+                assert_eq!(inspection.details.console_capabilities[&id].kind, kind);
+                assert_eq!(
+                    inspection.details.console_capabilities[&id].capability,
+                    ConsoleCapability::Blocked
+                );
+                assert!(!inspection.details.panes.contains_key(&id));
+                assert_eq!(inspection.stopped, stopped);
+                // This is the floor producer's exact existing call. It must
+                // replace Blocked policy and restore the correct presentation.
+                record_console_outcome(&mut inspection, id, true);
+                let inspection =
+                    finish_live_inspection(inspection, Ok(()), &[], &HashSet::new(), &boot)
+                        .unwrap();
+                assert_eq!(inspection.details.console_capabilities[&id].kind, kind);
+                assert_eq!(
+                    inspection.details.console_capabilities[&id].capability,
+                    ConsoleCapability::Reconnects
+                );
+                assert_eq!(inspection.details.panes[&id].kind, kind);
+                assert_eq!(
+                    inspection.details.panes[&id].outcome,
+                    SavedOutcome::KeepsRunning
+                );
+                assert_eq!(inspection.stopped, stopped);
+            }
+        }
+    }
+
+    #[test]
+    fn live_console_review_blocks_replacement_but_keeps_compatible_updates_and_shells() {
+        let proof = session().proof.unwrap();
+        let mut console = crate::terminal_ipc::TerminalDescriptor::relaunchable(
+            TerminalId::new(),
+            LaunchRecipe {
+                program: "/installed/old/bin/cagents".into(),
+                arguments: vec![
+                    "agent".into(),
+                    "console".into(),
+                    crate::model::AgentId::new().to_string(),
+                ],
+                working_directory: "/private-directory".into(),
+                environment: [("PRIVATE_ACCOUNT".into(), "never-print-this".into())].into(),
+                unset_environment: Default::default(),
+            },
+            None,
+        );
+        console.session.continuity = crate::model::TerminalContinuity::Live {
+            host_session_id: proof.host_session_id.clone(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: proof.host_incarnation.clone(),
+        };
+        for is_chat in [false, true] {
+            let mut chat = session();
+            chat.id = console.session.id;
+            chat.terminal = Some(console.session.clone());
+            let chats = if is_chat { vec![chat] } else { Vec::new() };
+            let roster = vec![v77::Terminal::from(console.clone())];
+            for requires_migration in [false, true] {
+                let mut inspection = SourceInspection::default();
+                record_live_panes(&mut inspection, &chats, &roster, &proof, requires_migration);
+                record_live_console_outcomes(&mut inspection, &roster, &proof, requires_migration);
+                let result = finish_live_inspection(
+                    inspection,
+                    Ok(()),
+                    &[],
+                    &HashSet::new(),
+                    &proof.boot_id,
+                );
+                if requires_migration {
+                    assert_eq!(result.unwrap_err(), CONSOLE_REFUSAL);
+                } else {
+                    let inspected = result.unwrap();
+                    assert_eq!(
+                        inspected.details.console_capabilities[&console.session.id].capability,
+                        ConsoleCapability::Continues
+                    );
+                    assert!(inspected.stopped.is_empty());
+                }
+            }
+        }
+        let inactive = crate::terminal_ipc::TerminalDescriptor::relaunchable(
+            console.session.id,
+            console.session.launch.clone(),
+            None,
+        );
+        let mut foreign = console.clone();
+        foreign.session.continuity = crate::model::TerminalContinuity::Live {
+            host_session_id: proof.host_session_id.clone(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: HostIncarnation::new("other-owner"),
+        };
+        for terminal in [inactive, foreign] {
+            let mut inspection = SourceInspection::default();
+            record_live_console_outcomes(&mut inspection, &[terminal.into()], &proof, true);
+            assert!(inspection.details.console_capabilities.is_empty());
+        }
+        // Ordinary live shells do not require agent-console reconnection.
+        console.session.launch.program = "bash".into();
+        console.session.launch.arguments = vec!["--login".into()];
+        let roster = vec![v77::Terminal::from(console.clone())];
+        let mut inspection = SourceInspection::default();
+        record_live_panes(&mut inspection, &[], &roster, &proof, true);
+        record_live_console_outcomes(&mut inspection, &roster, &proof, true);
+        let inspected =
+            finish_live_inspection(inspection, Ok(()), &[], &HashSet::new(), &proof.boot_id)
+                .unwrap();
+        assert!(inspected.details.console_capabilities.is_empty());
+        assert_eq!(
+            inspected.details.panes[&console.session.id].outcome,
+            SavedOutcome::KeepsRunning
+        );
+        assert!(inspected.stopped.is_empty());
     }
 
     pub(super) fn session() -> Session {
@@ -4033,5 +4221,183 @@ fn validate_live_chat(session: &Session, require_resumable: bool) -> Result<(), 
         handoff::validate_chat_source(session, &session.launch)
     } else {
         Ok(())
+    }
+}
+
+/// The updater passes private source recipes through an inherited sealed fd,
+/// never through process arguments. Capture precedes any old-daemon close.
+fn retain_floor_entry() -> Option<Result<(), String>> {
+    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if arguments.first().is_none_or(|argument| {
+        argument != "--retain-update-floor" && argument != "--capture-update-floor"
+    }) {
+        return None;
+    }
+    Some((|| {
+        crate::instance::validate_stage_guard().map_err(
+            |_| "Retaining stopped panes requires the active authenticated update fence",
+        )?;
+        if arguments.len() != 2 {
+            return Err("Invalid stopped update pane arguments".into());
+        }
+        let file = std::fs::File::open(&arguments[1]).map_err(|e| e.to_string())?;
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        file.take(8 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        if bytes.len() > 8 * 1024 * 1024 {
+            return Err("Stopped update panes exceed their limit".into());
+        }
+        let mut record: crate::upgrade::floor::Record =
+            serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        let capturing = arguments[0] == "--capture-update-floor";
+        if !capturing {
+            if record
+                .snapshots
+                .iter()
+                .any(|saved| !record.chats.contains(&saved.source))
+                || record
+                    .presentations
+                    .iter()
+                    .any(|pane| !record.contains_capture_source(&pane.session))
+                || record
+                    .aliases
+                    .iter()
+                    .any(|alias| !record.contains_capture_source(alias))
+            {
+                return Err("Stopped pane evidence does not match its acknowledged source".into());
+            }
+            return record.save();
+        }
+        if !record.presentations.is_empty()
+            || !record.snapshots.is_empty()
+            || !record.aliases.is_empty()
+        {
+            return Err("Stopped pane capture cannot import caller evidence".into());
+        }
+        let mut budget = crate::persistence::MigrationInspectionBudget::new(
+            Instant::now() + Duration::from_secs(30),
+        );
+        for path in crate::instance::window_database_paths().map_err(|error| error.to_string())? {
+            if let Ok(panes) =
+                crate::persistence::read_labeled_migration_sessions_with_budget(&path, &mut budget)
+            {
+                for pane in panes {
+                    if let CardKind::Chat(saved) = pane.kind {
+                        if record
+                            .chats
+                            .iter()
+                            .any(|source| crate::upgrade::floor::same_allocation(source, &saved))
+                            && !record.aliases.contains(&saved)
+                        {
+                            record.aliases.push(saved);
+                        }
+                    }
+                }
+            }
+        }
+        super::model::floor::capture_presentations(&mut record)?;
+        // ChatClose returns its final snapshot itself. A service shutdown has
+        // no per-chat acknowledgement, so capture that page immediately before
+        // stopping it. No capture is durable until an action is acknowledged.
+        if record.service_stopped && !record.chats.is_empty() {
+            let socket = crate::terminal_ipc::daemon_socket_path().map_err(|e| e.to_string())?;
+            let mut client = crate::update::source::Client::connect(&socket).ok();
+            if let Some(client) = &client
+                && (client.proof() != &record.source || client.protocol() != record.protocol)
+            {
+                return Err("The source changed before its transcript capture".into());
+            }
+            for source in record.chats.clone() {
+                let captured = client
+                    .as_mut()
+                    .ok_or_else(|| {
+                        "The old service could not provide its transcript preview".to_owned()
+                    })
+                    .and_then(|client| {
+                        client
+                            .capture_chat_snapshot(source.clone())
+                            .map_err(|error| error.to_string())
+                    });
+                match captured {
+                    Ok(snapshot) => record.acknowledge_snapshot(&source, snapshot)?,
+                    Err(error) => record.snapshots.push(stopped_snapshot(&source, Err(error))),
+                }
+            }
+        }
+        let bytes = record.encode_capture()?;
+        io::stdout()
+            .lock()
+            .write_all(&bytes)
+            .map_err(|error| error.to_string())
+    })())
+}
+
+fn stopped_snapshot(
+    source: &Session,
+    captured: Result<crate::chat::Snapshot, String>,
+) -> crate::upgrade::floor::StoppedSnapshot {
+    match captured {
+        Ok(snapshot) => crate::upgrade::floor::StoppedSnapshot {
+            source: source.clone(), snapshot, limitation: None,
+        },
+        Err(_) => crate::upgrade::floor::StoppedSnapshot {
+            source: source.clone(),
+            snapshot: crate::chat::Snapshot {
+                session_id: source.launch.session_id.clone(), exited: true, ..Default::default()
+            },
+            limitation: Some(if source.launch.session_id.is_some() {
+                "The old service could not provide a transcript preview. The saved conversation is kept; Resume loads its full history."
+            } else {
+                "The old service could not provide a transcript preview, and no conversation was recorded. Start a new conversation to continue."
+            }.into()),
+        },
+    }
+}
+
+#[cfg(test)]
+mod floor_capture_tests {
+    #[test]
+    fn an_unattachable_source_still_gets_a_stopped_snapshot() {
+        let source = crate::chat::Session {
+            id: crate::model::TerminalId::new(),
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Claude,
+                recipe: crate::model::LaunchRecipe {
+                    program: "claude".into(),
+                    arguments: vec![],
+                    working_directory: "/work".into(),
+                    environment: Default::default(),
+                    unset_environment: Default::default(),
+                },
+                session_id: None,
+            },
+            proof: None,
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: Default::default(),
+        };
+        let saved = super::stopped_snapshot(&source, Err("attachment refused".into()));
+        assert_eq!(saved.source, source);
+        assert!(saved.snapshot.exited);
+        assert!(
+            saved
+                .limitation
+                .as_ref()
+                .unwrap()
+                .contains("no conversation was recorded")
+        );
+        assert!(!saved.limitation.as_ref().unwrap().contains("Resume loads"));
+        let mut recorded = source;
+        recorded.launch.session_id = Some("recorded".into());
+        let saved = super::stopped_snapshot(&recorded, Err("attachment refused".into()));
+        assert!(
+            saved
+                .limitation
+                .as_ref()
+                .unwrap()
+                .contains("Resume loads its full history")
+        );
     }
 }

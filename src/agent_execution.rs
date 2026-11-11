@@ -36,6 +36,9 @@ pub const LIMITED_REFUSAL: &str = "This agent is stopped by a usage limit";
 pub const LIMITED_ADVICE: &str =
     "Send it once the limit resets, or leave it with `cagents send`, which holds it until then.";
 pub const AUTHORITY_ENV: &str = "CAGENTS_AGENT_AUTHORITY";
+/// Ephemeral launcher proof for a console waiting for daemon startup. It is
+/// never a capability, durable launch recipe, or permission to send a prompt.
+pub(crate) const CONSOLE_STARTUP_OWNER_ENV: &str = "CAGENTS_CONSOLE_STARTUP_OWNER";
 
 /// Presentation routing only. Daemon ownership additionally requires its
 /// private exact console recipe and the issued paired session descriptor.

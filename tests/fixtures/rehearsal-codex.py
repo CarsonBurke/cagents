@@ -81,16 +81,18 @@ def scenario_class(peer, storage, listener):
             descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
             with os.fdopen(descriptor) as stream:
                 state = json.load(stream)
-            if set(state) != {"thread", "child", "latest"}:
+            if (not {"thread", "child", "latest"} <= set(state)
+                    or set(state) - {"thread", "child", "latest", "child_latest", "interrupting"}):
                 raise ValueError("invalid persisted rehearsal app-server state")
             thread_path(state["thread"])
             thread_path(state["child"])
-            if state["latest"] is not None and not isinstance(state["latest"], dict):
-                raise ValueError("invalid persisted rehearsal turn")
-            self.thread, self.child, self.latest = state["thread"], state["child"], state["latest"]
+            for turn in (state["latest"], state.get("child_latest")):
+                if turn is not None and not isinstance(turn, dict):
+                    raise ValueError("invalid persisted rehearsal turn")
+            self.restore(state)
 
         def save(self):
-            state = {"thread": self.thread, "child": self.child, "latest": self.latest}
+            state = self.state()
             for path in (index, thread_path(self.thread), thread_path(self.child)):
                 temporary = storage / f".state-{uuid.uuid4()}.tmp"
                 descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -101,6 +103,13 @@ def scenario_class(peer, storage, listener):
                     temporary.replace(path)
                 finally:
                     temporary.unlink(missing_ok=True)
+
+        def observe(self, notification, generations=None):
+            accepted = super().observe(notification, generations)
+            if accepted and notification.get("method") in (
+                    "turn/started", "turn/completed", "item/started", "item/completed"):
+                self.save()
+            return accepted
 
         def request(self, frame, codex_home):
             if frame.get("method") == "thread/resume":

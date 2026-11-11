@@ -650,6 +650,13 @@ impl Registry {
             )
             .map_err(|e| e.to_string())?;
         }
+        // Exact provider retirement also ends a pending view replacement.
+        // Its console intent must never revive an explicitly closed agent.
+        tx.execute(
+            "DELETE FROM console_relaunches WHERE actor=?1",
+            [actor.to_string()],
+        )
+        .map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())
     }
 
