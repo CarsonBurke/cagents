@@ -90,9 +90,10 @@ def reviewed_inventory(output, directory, baseline, from_version, to_version):
         raise RuntimeError('prompt confirmation crossed update jobs')
     preview = jobs[0]['confirmation']['preview']
     header = f'Update cagents {from_version} -> {to_version}'
-    if output.count(header) != 1:
+    headers = list(re.finditer(rf'^{re.escape(header)}\r?$', output, re.M))
+    if len(headers) != 1:
         raise RuntimeError('transcript did not show the exact source and selected target once')
-    body = output.split(header, 1)[1].split('[rehearsal prompt=', 1)[0]
+    body = output[headers[0].end():].split('[rehearsal prompt=', 1)[0]
     sessions = (preview.get('daemon') or {}).get('sessions', [])
     ids = set(preview.get('labels', {})) | set(preview.get('review_details', {}).get('panes', {}))
     ids.update(row['id'] for row in sessions)

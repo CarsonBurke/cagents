@@ -29,7 +29,11 @@ class RetryAdmission(unittest.TestCase):
         self.assertEqual(retry.review_prompts(header + confirm, True)[0]['kind'], 'confirm')
         accepted = confirm.replace("answer='no'", "answer='yes'")
         self.assertEqual(retry.review_prompts(header + accepted, False)[0]['answer'], 'yes')
+        idle = "[rehearsal prompt='Enter: review what stops   n: cancel' answer='yes']\n"
+        self.assertEqual(retry.review_prompts(header + idle, False)[0]['kind'], 'confirm')
+        self.assertEqual(retry.review_prompts(header + idle.replace("answer='yes'", "answer='no'"), True)[0]['kind'], 'confirm')
         for bad in (header, header + header + confirm, header + accepted,
+                    header + idle.replace("answer='yes'", "answer='i'"),
                     header + "[rehearsal prompt='unrecognized' answer='no']\n"):
             with self.subTest(bad=bad), self.assertRaises(RuntimeError):
                 retry.review_prompts(bad, True)
@@ -50,6 +54,10 @@ class RetryAdmission(unittest.TestCase):
             changed = copy.deepcopy(snapshot)
             changed['agents']['a']['run'] = 'new-run'
             with self.assertRaisesRegex(RuntimeError, 'accepted agent run'):
+                retry.workload_preserved(snapshot, changed)
+            changed = copy.deepcopy(snapshot)
+            changed['terminals']['extra'] = {}
+            with self.assertRaisesRegex(RuntimeError, 'membership'):
                 retry.workload_preserved(snapshot, changed)
 
     def test_console_relaunch_uses_each_hops_real_source_receipt(self):
@@ -81,10 +89,6 @@ class RetryAdmission(unittest.TestCase):
         retry.workload_identities(before, after)
         with self.assertRaisesRegex(RuntimeError, 'workload preservation failed'):
             retry.workload_preserved(before, after)
-            changed = copy.deepcopy(snapshot)
-            changed['terminals']['extra'] = {}
-            with self.assertRaisesRegex(RuntimeError, 'membership'):
-                retry.workload_preserved(snapshot, changed)
 
 
 class RawJobs(unittest.TestCase):
@@ -181,7 +185,9 @@ class ReviewEvidence(unittest.TestCase):
             retry.write_json(path, raw)
             body = 'Update cagents old -> new\n2 windows close and reopen.\n  Keep running (1)\n  Working now (1)\n    Chat\n[rehearsal prompt='
             self.assertEqual(retry.reviewed_inventory(body, folder, baseline, 'old', 'new'), 'actual-job')
+            self.assertEqual(retry.reviewed_inventory(body.replace('\n', '\r\n'), folder, baseline, 'old', 'new'), 'actual-job')
             for bad in (body.replace('new', 'other'), body.replace('  Working now (1)\n    Chat\n', ''),
+                        body.replace('-> new', '-> new-wrong'), body.replace('cagents old', 'cagents old-wrong'),
                         body.replace('    Chat\n', ''), body.replace('2 windows close and reopen.\n', '')):
                 with self.subTest(body=bad), self.assertRaises(RuntimeError):
                     retry.reviewed_inventory(bad, folder, baseline, 'old', 'new')

@@ -1625,6 +1625,21 @@ class Pty(unittest.TestCase):
         self.assertEqual(result.stdout.count("[rehearsal prompt="), 3)
         self.assertIn("all three answered", result.stdout)
 
+    def test_idle_stop_review_uses_ordinary_consent_before_typed_stop(self):
+        for answer in ('yes', 'no'):
+            with self.subTest(answer=answer):
+                result = self.run_peer(
+                    "import sys,time; tty=open('/dev/tty','r'); "
+                    "sys.stdout.write('Enter: review what stops'); sys.stdout.flush(); "
+                    "time.sleep(.05); sys.stdout.write('   n: cancel\\n'); sys.stdout.flush(); "
+                    f"assert tty.readline().strip() == {answer!r}; "
+                    + ("sys.stdout.write('Type \\\"stop\\\" to stop these and update. Anything else cancels.\\n'); "
+                       "sys.stdout.flush(); assert tty.readline().strip() == 'stop'; " if answer == 'yes' else '')
+                    + "print('idle review answered')", '--answer', answer, '--working', 'i', '--stop', 'stop', '--timeout', '1')
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(result.stdout.count('[rehearsal prompt='), 2 if answer == 'yes' else 1)
+                self.assertIn('idle review answered', result.stdout)
+
     def test_stop_list_is_cancelled_unless_asked(self):
         result = self.run_peer(
             "import sys; tty=open('/dev/tty','r'); "

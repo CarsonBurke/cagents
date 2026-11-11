@@ -17,7 +17,8 @@ import stat
 # agents are mid-turn, and the typed destructive confirmation. Each ends where
 # the updater starts reading its answer.
 PROMPTS = re.compile(
-    rb'(?P<confirm>[^\r\n]*(?:\[y/N\]|\[Y/n\])[ \t]*)'
+    rb'(?P<confirm>(?:[^\r\n]*(?:\[y/N\]|\[Y/n\])[ \t]*'
+    rb'|[^\r\n]*Enter: review what stops[ \t]+n: cancel[ \t]*\r?\n))'
     rb'|(?P<working>[^\r\n]*i: interrupt them now[^\r\n]*n: cancel[ \t]*\r?\n)'
     rb'|(?P<stop>[^\r\n]*Anything else cancels\.[ \t]*\r?\n)')
 
