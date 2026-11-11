@@ -55,6 +55,21 @@ struct ScopeDiscovery<'a> {
     worktree_cards: Vec<(&'a CardState, &'a Path)>,
 }
 
+/// Preserve durable-card order within each logical resource. Canonical and
+/// pending ownership use separate indexes because their alias sets differ.
+fn unowned_aliases<'a>(
+    cards: impl Iterator<Item = &'a CardState>,
+    owned: &HashSet<CardId>,
+) -> HashMap<views::ResourceIdentity, Vec<&'a CardState>> {
+    let mut aliases = HashMap::<_, Vec<_>>::new();
+    for card in cards.filter(|card| card.existence.is_open() && !owned.contains(&card.id)) {
+        if let Some(resource) = views::resource_identity(&card.kind) {
+            aliases.entry(resource).or_default().push(card);
+        }
+    }
+    aliases
+}
+
 /// Whole descriptors can contain concurrently changed metadata even for the
 /// same process. Retry only while the complete base is still authoritative;
 /// the daemon must also enforce this fence when it applies the operation.
@@ -79,9 +94,9 @@ fn can_retry_source_fields(before: &Pane, current: &Pane) -> bool {
 pub(super) fn blocked_managed_view_scopes(
     model: &crate::workspace_model::WorkspaceModel,
     views: &[View],
+    display_index: &views::ManagedDisplayIndex<'_>,
 ) -> HashSet<Scope> {
     let mut blocked = HashSet::new();
-    let display_index = views::ManagedDisplayIndex::new(model);
     let managed = model
         .agents
         .iter()
@@ -1739,11 +1754,31 @@ impl Cagents {
         if candidates.is_empty() {
             return;
         }
-        // Eligibility must see an active strip's current order/focus, not the
-        // preceding durable snapshot. This is one immutable eligibility pass;
-        // canonical projection below gets its own fresh publication baseline.
-        self.snapshot_workspace_scope();
-        let projected = self.local_views_in(selected);
+        // Eligibility reads the mounted order without taking a durable save
+        // snapshot. A repository's admission must not snapshot another scope
+        // or scan every saved card to normalize unrelated channel membership.
+        let mut projected = self.local_views_in(selected);
+        if self.active_workspace.is_some()
+            && self.durable.active_channel.is_some_and(|id| {
+                selected.is_none_or(|selected| selected.contains(&Scope::Channel(id)))
+            })
+            && let Some((id, order)) = self.active_channel_order()
+        {
+            let scope = Scope::Channel(id);
+            if let Some(members) = projected.cards.get_mut(&scope) {
+                let positions = order
+                    .iter()
+                    .enumerate()
+                    .map(|(index, id)| (*id, index))
+                    .collect::<HashMap<_, _>>();
+                projected
+                    .panes
+                    .get_mut(&scope)
+                    .unwrap()
+                    .sort_by_key(|pane| positions[&pane.id]);
+                *members = order;
+            }
+        }
         let mut pending_scopes = HashSet::new();
         for (_, source, change) in &self.shared_views.pending {
             pending_scopes.insert(source.clone());
@@ -1891,12 +1926,7 @@ impl Cagents {
             .iter()
             .flat_map(|view| view.panes.iter().map(|pane| pane.id))
             .collect::<HashSet<_>>();
-        let alias_candidates = self
-            .durable
-            .cards
-            .iter()
-            .filter(|card| card.existence.is_open() && !owned.contains(&card.id))
-            .collect::<Vec<_>>();
+        let alias_candidates = unowned_aliases(self.durable.cards.iter(), &owned);
         for view in &self.workspace_model.views {
             for pane in &view.panes {
                 owners
@@ -1905,9 +1935,10 @@ impl Cagents {
                     .insert(view.scope.clone());
                 // A canonical rekey can retire an unowned local alias in a
                 // different scope; its source baseline must settle too.
-                for alias in alias_candidates
-                    .iter()
-                    .filter(|card| views::same_resource(&card.kind, &pane.kind))
+                for alias in views::resource_identity(&pane.kind)
+                    .and_then(|resource| alias_candidates.get(&resource))
+                    .into_iter()
+                    .flatten()
                 {
                     let aliases = owners.get(&alias.id).cloned().unwrap_or_default();
                     owners.entry(pane.id).or_default().extend(aliases);
@@ -2168,7 +2199,9 @@ impl Cagents {
         owned: &HashSet<CardId>,
         selected: Option<&HashSet<Scope>>,
     ) {
-        self.shared_views.blocked = blocked_managed_view_scopes(&self.workspace_model, views);
+        let display_index = views::ManagedDisplayIndex::new(&self.workspace_model);
+        self.shared_views.blocked =
+            blocked_managed_view_scopes(&self.workspace_model, views, &display_index);
         let mut attention_owners: HashMap<_, usize> = HashMap::new();
         for pane in views.iter().flat_map(|view| &view.panes) {
             if let Some(resource) = attention_resource(&pane.kind) {
@@ -2178,18 +2211,14 @@ impl Cagents {
         // Decide which whole views can project before retiring any local alias.
         // Otherwise a later blocked pane could leave an earlier adoption without
         // the canonical descriptor required by its persistence checkpoint.
-        let alias_candidates = self
-            .durable
-            .cards
-            .iter()
-            .filter(|card| card.existence.is_open() && !owned.contains(&card.id))
-            .collect::<Vec<_>>();
+        let alias_candidates = unowned_aliases(self.durable.cards.iter(), owned);
         let mut adoptions = Vec::new();
         for view in views {
             for shared in &view.panes {
-                let aliases = alias_candidates
-                    .iter()
-                    .filter(|card| views::same_resource(&card.kind, &shared.kind))
+                let aliases = views::resource_identity(&shared.kind)
+                    .and_then(|resource| alias_candidates.get(&resource))
+                    .into_iter()
+                    .flatten()
                     .map(|card| card.id)
                     .collect::<Vec<_>>();
                 for alias in aliases {
@@ -3218,6 +3247,63 @@ mod tests {
             .initialized
             .extend([Scope::Channel(a), Scope::Channel(b)]);
         (app, a, b, pane)
+    }
+
+    #[test]
+    fn alias_index_preserves_order_and_resource_kind_while_excluding_owned_and_closed_cards() {
+        let (_, _, _, browser) = fixture();
+        let (_, _, _, chat) = retained_chat_move_fixture();
+        let terminal = fresh_terminal_session(LaunchRecipe::shell("/repo".into()).unwrap());
+        let shared_id = terminal.id;
+        let mut kinds = vec![
+            browser.kind,
+            CardKind::Terminal(terminal),
+            chat.kind,
+            CardKind::Settings,
+        ];
+        if let CardKind::Browser(browser) = &mut kinds[0] {
+            browser.id = BrowserId::from_uuid(shared_id.as_uuid());
+        }
+        if let CardKind::Chat(chat) = &mut kinds[2] {
+            chat.id = shared_id;
+        }
+        let mut cards = Vec::new();
+        let mut owned = HashSet::new();
+        let mut expected = Vec::new();
+        for kind in &kinds {
+            let mut matching = Vec::new();
+            for index in 0..4 {
+                let id = CardId::new();
+                cards.push(CardState {
+                    id,
+                    generation: 0,
+                    title: "alias".into(),
+                    width_fraction: 0.5,
+                    existence: if index == 2 {
+                        super::super::project_ui::removed_existence("closed alias")
+                    } else {
+                        Existence::Open
+                    },
+                    kind: kind.clone(),
+                });
+                if index == 3 {
+                    owned.insert(id);
+                } else if index < 2 && !matches!(kind, CardKind::Settings) {
+                    matching.push(id);
+                }
+            }
+            expected.push(matching);
+        }
+        let aliases = unowned_aliases(cards.iter(), &owned);
+        for (kind, expected) in kinds.iter().zip(expected) {
+            let actual = views::resource_identity(kind)
+                .and_then(|resource| aliases.get(&resource))
+                .into_iter()
+                .flatten()
+                .map(|card| card.id)
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected);
+        }
     }
 
     fn channel_move_fixture() -> (Cagents, ChannelId, ChannelId, Pane) {
@@ -4908,10 +4994,14 @@ mod tests {
     fn measure_desktop_startup_reconciliation() {
         use super::super::workspace_model_sync::ModelUpdate;
         fn cpu_ns() -> u64 {
-            let mut value = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-            assert_eq!(unsafe {
-                libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut value)
-            }, 0);
+            let mut value = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            assert_eq!(
+                unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut value) },
+                0
+            );
             value.tv_sec as u64 * 1_000_000_000 + value.tv_nsec as u64
         }
         let (mut app, model) = desktop_inventory_fixture();
@@ -4922,10 +5012,18 @@ mod tests {
         for _ in 0..8 {
             drop(app.apply_workspace_model_update(ModelUpdate::Read(model.clone())));
         }
-        println!("desktop_reconciliation views={} cards={} panes={} reads=8 cpu_ns={} wall_ns={}",
-            model.views.len(), app.durable.cards.len(),
-            model.views.iter().map(|view| view.panes.len()).sum::<usize>(),
-            cpu_ns() - cpu, wall.elapsed().as_nanos());
+        println!(
+            "desktop_reconciliation views={} cards={} panes={} reads=8 cpu_ns={} wall_ns={}",
+            model.views.len(),
+            app.durable.cards.len(),
+            model
+                .views
+                .iter()
+                .map(|view| view.panes.len())
+                .sum::<usize>(),
+            cpu_ns() - cpu,
+            wall.elapsed().as_nanos()
+        );
         assert_eq!(app.durable.cards.len(), 555);
         assert_eq!(app.workspace_model.views, model.views);
     }
@@ -5060,21 +5158,35 @@ mod tests {
         let _ = app.workspace.reorder(next.id, 0).unwrap();
         let _ = app.workspace.focus_without_scrolling(next.id);
         let selected = HashSet::from([Scope::Channel(destination)]);
-        app.shared_views.initialized.remove(&Scope::Channel(destination));
-        app.shared_views.baseline.remove(&Scope::Channel(destination));
+        app.shared_views
+            .initialized
+            .remove(&Scope::Channel(destination));
+        app.shared_views
+            .baseline
+            .remove(&Scope::Channel(destination));
 
         app.admit_existing_views_in(Some(&selected));
 
-        assert!(app.shared_views.initialized.contains(&Scope::Channel(destination)));
+        assert!(
+            app.shared_views
+                .initialized
+                .contains(&Scope::Channel(destination))
+        );
         let current = app
             .durable
             .channels
             .iter()
             .find(|channel| channel.id == source)
             .unwrap();
-        assert_eq!(current.cards, saved.cards, "admission is a read-only eligibility check");
+        assert_eq!(
+            current.cards, saved.cards,
+            "admission is a read-only eligibility check"
+        );
         assert_eq!(current.focused, saved.focused);
-        assert_eq!(app.workspace.order().collect::<Vec<_>>(), [next.id, pane.id]);
+        assert_eq!(
+            app.workspace.order().collect::<Vec<_>>(),
+            [next.id, pane.id]
+        );
         assert_eq!(app.workspace.focused(), Some(next.id));
     }
 

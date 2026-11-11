@@ -1069,9 +1069,9 @@ impl Cagents {
         // Admission uses this incoming snapshot, not a blocked flag left by a
         // previous projection. Defer fresh actors while their scope is truly
         // blocked, before creating a local card or attachment Task.
-        self.shared_views.blocked =
-            super::shared_views::blocked_managed_view_scopes(&model, &model.views);
         let display_index = crate::workspace_model::views::ManagedDisplayIndex::new(&model);
+        self.shared_views.blocked =
+            super::shared_views::blocked_managed_view_scopes(&model, &model.views, &display_index);
         let mut new_managed_panes = Vec::new();
         let mut adopted_scopes = HashSet::new();
         for agent in &model.agents {
