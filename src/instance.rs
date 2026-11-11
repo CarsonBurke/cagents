@@ -27,6 +27,8 @@ use std::{
 };
 
 mod daemon_admission;
+#[doc(hidden)]
+pub mod ui_options;
 pub use daemon_admission::DaemonStillStarting;
 pub(crate) use daemon_admission::{
     AdmissionFence, DAEMON_FENCE_ENV, DaemonAdmissionGuard, LaunchFence, inherit_daemon_fence,
