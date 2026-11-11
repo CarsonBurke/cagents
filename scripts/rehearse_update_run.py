@@ -230,6 +230,22 @@ def terminal_probe_command(session, token, receipt):
             'command':f"umask 077; printf '{token} pid=%s\\n' \"{variable}\" | tee {shlex.quote(str(receipt))}\n"}
 
 
+def terminal_live_proof(continuity):
+    if not isinstance(continuity,dict) or len(continuity)!=1:
+        return None
+    proof=continuity.get('live',continuity.get('detached_same_boot'))
+    if not isinstance(proof,dict) or any(not isinstance(proof.get(field),str) or not proof[field]
+            for field in ('host_session_id','boot_id','host_incarnation')):
+        return None
+    return proof
+
+
+def same_serving_terminal(left, right, proof):
+    return (terminal_live_proof(left.get('continuity'))==proof
+            and terminal_live_proof(right.get('continuity'))==proof
+            and {**left,'continuity':{'live':proof}}=={**right,'continuity':{'live':proof}})
+
+
 def new_terminal_action_contract(evidence, version_root):
     version_root=Path(version_root)
     def ui(snapshot):
@@ -255,15 +271,16 @@ def new_terminal_action_contract(evidence, version_root):
             or census.get('source')!=proof or outcome.get('state')!='usable' or outcome.get('serving')!=proof
             or receipt.get('transaction')!=census.get('transaction')
             or receipt.get('census_digest')!=evidence['census_digest']
-            or terminal not in census.get('terminals',[])):
+            or not any(same_serving_terminal(terminal,row,proof) for row in census.get('terminals',[]))):
         raise RuntimeError('the new terminal has no verified Ready daemon and exact live descriptor')
     card=evidence['selected_card']
     if (not card['focused'] or card['card'] in evidence['cards_before_input']
             or card['terminal_id']!=terminal.get('id') or card['recipe']!=terminal.get('launch')
-            or card['continuity']!={'live':proof} or terminal.get('continuity')!={'live':proof}):
+            or terminal_live_proof(card['continuity'])!=proof or terminal_live_proof(terminal.get('continuity'))!=proof):
         raise RuntimeError('the native user action did not focus a newly issued terminal card')
     line=evidence['output_line']
-    if (line not in evidence['terminal_snapshot'].get('data',{}).get('snapshot',{}).get('lines',[])
+    snapshot=evidence['terminal_snapshot'].get('data',{}).get('snapshot',{})
+    if (snapshot.get('terminal_id')!=terminal.get('id') or line not in snapshot.get('lines',[])
             or line!=f"{evidence['token']} pid={evidence['shell_pid']}"):
         raise RuntimeError('the typed shell command did not produce the exact terminal output')
     shells=[row for row in evidence['after_processes']['processes']
@@ -771,8 +788,10 @@ class Rehearsal:
                         save()
                     code, shown=self.cli('--no-start','terminal','show',selected['terminal_id'],check=False)
                     actual=shown.get('data',{}).get('terminal',{}).get('session',{})
-                    if (not code and actual.get('continuity')=={'live':shown.get('data',{}).get('proof')}
-                            and selected['continuity']==actual['continuity'] and selected['recipe']==actual['launch']):
+                    if (not code and isinstance(shown.get('data',{}).get('proof'),dict)
+                            and terminal_live_proof(actual.get('continuity'))==shown.get('data',{}).get('proof')
+                            and terminal_live_proof(selected['continuity'])==shown.get('data',{}).get('proof')
+                            and selected['recipe']==actual['launch']):
                         if expect_failure:
                             raise RuntimeError('the expected before failure instead opened a live terminal')
                         break

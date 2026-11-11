@@ -769,7 +769,7 @@ class NativeTerminalAfterRestore(unittest.TestCase):
             'receipt':{'transaction':'tx','census_digest':'digest','outcome':{'state':'usable','serving':new}},
             'selected_card':{'focused':True,'card':'new-card','terminal_id':'new-terminal','recipe':session['launch'],'continuity':{'live':new}},
             'cards_before_input':['old-card'],'token':'UNIQUE_OUTPUT','output_line':'UNIQUE_OUTPUT pid=500','shell_pid':500,
-            'terminal_snapshot':{'data':{'snapshot':{'lines':['$ command','UNIQUE_OUTPUT pid=500']}}},
+            'terminal_snapshot':{'data':{'snapshot':{'terminal_id':'new-terminal','lines':['$ command','UNIQUE_OUTPUT pid=500']}}},
             'activity_before':copy.deepcopy(activity),'activity_after':copy.deepcopy(activity)}
 
     def test_normal_action_requires_native_focus_real_shell_and_new_ready_owner(self):
@@ -791,9 +791,35 @@ class NativeTerminalAfterRestore(unittest.TestCase):
         changed=copy.deepcopy(evidence);changed['activity_after']['codex_turn_starts']=2;cases.append(changed)
         changed=copy.deepcopy(evidence);changed['activity_after']['claude_user_prompts']=2;cases.append(changed)
         changed=copy.deepcopy(evidence);changed['terminal_snapshot']['data']['snapshot']['lines']=['printf UNIQUE_OUTPUT pid=500'];cases.append(changed)
+        changed=copy.deepcopy(evidence);changed['terminal_snapshot']['data']['snapshot']['terminal_id']='foreign';cases.append(changed)
         for changed in cases:
             with self.subTest(evidence=changed),self.assertRaises(RuntimeError):
                 scenario.new_terminal_action_contract(changed,version)
+
+    def test_live_and_detached_terminal_variants_require_the_entire_current_proof(self):
+        scenario=self.module()
+        for shown_state in ('live','detached_same_boot'):
+            for captured_state in ('live','detached_same_boot'):
+                version,evidence=self.evidence()
+                proof=evidence['terminal']['data']['proof']
+                evidence['terminal']['data']['terminal']['session']=copy.deepcopy(evidence['terminal']['data']['terminal']['session'])
+                evidence['terminal']['data']['terminal']['session']['continuity']={shown_state:proof}
+                evidence['census']['terminals'][0]['continuity']={captured_state:proof}
+                with self.subTest(shown=shown_state,captured=captured_state):
+                    scenario.new_terminal_action_contract(evidence,version)
+        for field in ('host_session_id','boot_id','host_incarnation'):
+            version,evidence=self.evidence()
+            proof=evidence['terminal']['data']['proof']
+            evidence['selected_card']['continuity']={'detached_same_boot':{**proof,field:'stale'}}
+            with self.subTest(stale=field),self.assertRaises(RuntimeError):
+                scenario.new_terminal_action_contract(evidence,version)
+        for mutation in ('non-live','foreign-terminal','changed-recipe'):
+            version,evidence=self.evidence()
+            if mutation=='non-live':evidence['terminal']['data']['terminal']['session']['continuity']={'relaunch_available':{}}
+            elif mutation=='foreign-terminal':evidence['census']['terminals']=[{**evidence['census']['terminals'][0],'id':'foreign'}]
+            else:evidence['census']['terminals']=[{**evidence['census']['terminals'][0],'launch':{'program':'/usr/bin/foreign'}}]
+            with self.subTest(mutation=mutation),self.assertRaises(RuntimeError):
+                scenario.new_terminal_action_contract(evidence,version)
 
     def test_expected_before_failure_requires_typed_failure_and_absent_daemon(self):
         scenario=self.module()
