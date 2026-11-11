@@ -389,7 +389,11 @@ fn coordinated_release_mode(
     let orphan_bundle = coordinator == "bundle-orphan" || restart == Some("handoff-orphan-ui");
     let recovery_bundle = handoff || orphan_bundle;
     let bundle_forwarded = handoff && publish_failure.is_none() && !orphan_bundle;
-    let maintenance = restart == Some("handoff-maintenance-failure");
+    let downgrade_refusal = matches!(
+        restart,
+        Some("empty-downgrade-refusal" | "empty-downgrade-refusal-fails")
+    );
+    let maintenance = restart == Some("handoff-maintenance-failure") || downgrade_refusal;
     let bootstrap = restart == Some("handoff-bootstrap");
     let direct_bash = restart == Some("handoff-bash");
     let pending_standalone = matches!(
@@ -502,7 +506,8 @@ case "$*" in
     fi
     ;;
   'daemon capture-update-census --output '*)
-    [ "$CLI" = new ] && [ "$#" -eq 4 ] || exit 98
+    [ "$CLI" = new ] && [ "$#" -eq 6 ] && [ "$5" = --candidate-cli ] || exit 98
+    [ "$6" = "$FIXTURE_PREFIX/versions/9.9.9/bin/cagents" ] || exit 98
     if [ "$FIXTURE_RESTART" = census-capture-failure ]; then
       printf 'The source did not provide an authenticated terminal census.\n' >&2
       exit 1
@@ -595,7 +600,7 @@ case "$*" in
     ;;
   '--json daemon status')
     [ "$#" -eq 3 ] || exit 98
-    if [ "$CLI" = new ] && { [ "$FIXTURE_RESTART" = start-unknown ] || [ "$FIXTURE_RESTART" = empty-start-unknown ]; }; then exit 9; fi
+    if [ "$CLI" = new ] && { [ "$FIXTURE_RESTART" = start-unknown ] || [ "$FIXTURE_RESTART" = empty-start-unknown ] || [ "$FIXTURE_RESTART" = prepared-status-unknown ]; }; then exit 9; fi
     if [ "$CLI" = new ] && [ "$FIXTURE_COMPATIBLE" = false ] &&
        [ "$(cat "$FIXTURE_RUNNING" 2>/dev/null)" = old ]; then exit 9; fi
     if [ -e "$FIXTURE_RUNNING" ]; then running=true; else running=false; fi
@@ -628,6 +633,7 @@ case "$*" in
   'daemon downgrade-store 22')
     [ "$CLI" = new ] && [ "$FIXTURE_MAINTENANCE" = true ] || exit 98
     printf 'new:downgrade:22\n' >> "$FIXTURE_ACTIONS"
+    case "$FIXTURE_RESTART" in empty-downgrade-refusal*) exit 7 ;; esac
     ;;
   'daemon --help')
     [ "$#" -eq 2 ] || exit 98
@@ -676,6 +682,13 @@ case "$*" in
   'daemon start')
     [ "$#" -eq 2 ] || exit 98
     printf '%s:start\n' "$CLI" >> "$FIXTURE_ACTIONS"
+    case "$CLI:$FIXTURE_RESTART" in
+      new:empty-downgrade-refusal-fails) exit 4 ;;
+      new:empty-downgrade-refusal)
+        if [ ! -e "$FIXTURE_START_FAILED_ONCE" ]; then touch "$FIXTURE_START_FAILED_ONCE"; exit 4; fi
+        ;;
+      new:prepared-status-unknown) exit 4 ;;
+    esac
     if [ "$CLI" = new ] && [ "$FIXTURE_ORDINARY_START_FAILURE" = true ]; then
       if [ "$FIXTURE_FIRST_START_CHECKPOINT" = true ]; then
         printf 'startup-created-checkpoint\n' > "$FIXTURE_CHECKPOINT"
@@ -1028,7 +1041,14 @@ exec sh "$@""#,
     }
     if matches!(
         restart,
-        Some("empty" | "empty-start-failure" | "empty-start-unknown" | "empty-recovery-unready")
+        Some(
+            "empty"
+                | "empty-start-failure"
+                | "empty-start-unknown"
+                | "empty-recovery-unready"
+                | "empty-downgrade-refusal"
+                | "empty-downgrade-refusal-fails"
+        )
     ) {
         command.arg("--require-empty-daemon");
     }
@@ -1247,6 +1267,10 @@ with open(os.environ['FIXTURE_LEASE_PATH'], 'r+') as contender:
         .env("FIXTURE_PENDING", home.path().join("pending"))
         .env("FIXTURE_CHECKPOINT", &checkpoint)
         .env("FIXTURE_RESTORED", &restored)
+        .env(
+            "FIXTURE_START_FAILED_ONCE",
+            home.path().join("start-failed-once"),
+        )
         .env("FIXTURE_PREFIX", &prefix)
         .env("FIXTURE_COMPATIBLE", compatible.to_string())
         .env("FIXTURE_RESTART", restart.unwrap_or_default())
@@ -1574,6 +1598,63 @@ with open(os.environ['FIXTURE_LEASE_PATH'], 'r+') as contender:
         assert!(!String::from_utf8_lossy(&output.stdout).contains("your sessions are ready"));
         return;
     }
+    if downgrade_refusal {
+        assert!(!output.status.success(), "{output:?}");
+        assert_eq!(
+            fs::read_link(prefix.join("current")).unwrap(),
+            Path::new("versions/9.9.9")
+        );
+        assert_eq!(
+            fs::read_to_string(&actions).unwrap(),
+            "require-empty\nnew:schema\nnew:start\nnew:downgrade:22\nnew:start\n"
+        );
+        assert!(!checkpoint.exists());
+        assert!(prefix.join("versions/9.9.9/bin/cagents").exists());
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&fs::read(&outcome).unwrap()).unwrap();
+        if restart == Some("empty-downgrade-refusal") {
+            assert_eq!(fs::read_to_string(&running).unwrap(), "new\n");
+            assert_eq!(receipt["outcome"]["state"], "usable");
+        } else {
+            assert!(!running.exists());
+            assert_ne!(receipt["outcome"]["state"], "usable");
+            assert!(String::from_utf8_lossy(&output.stderr).contains(&format!(
+                "'{}' daemon start",
+                prefix.join("versions/9.9.9/bin/cagents").display()
+            )));
+        }
+        assert!(
+            prefix
+                .join("versions/9.9.9/.cagents-retained-candidate-v1.json")
+                .exists()
+        );
+        return;
+    }
+    if restart == Some("prepared-status-unknown") {
+        assert!(!output.status.success(), "{output:?}");
+        assert_eq!(
+            fs::read_link(prefix.join("current")).unwrap(),
+            Path::new("versions/9.9.9")
+        );
+        assert!(!running.exists());
+        assert_eq!(
+            fs::read_to_string(&checkpoint).unwrap(),
+            "exact-conversation-and-shells\n"
+        );
+        let actions = fs::read_to_string(&actions).unwrap();
+        assert_eq!(
+            actions,
+            "old:help\nold:prepare\nold:draining\nold:stopped\nnew:start\n"
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains(&format!(
+            "'{}' --no-start daemon recover-update --checkpoint fixture-digest --yes --census",
+            prefix.join("versions/9.9.9/bin/cagents").display()
+        )));
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&fs::read(&outcome).unwrap()).unwrap();
+        assert_eq!(receipt["outcome"]["state"], "needs_target_recovery");
+        return;
+    }
     if restart == Some("pre-switch-recovery") {
         assert!(!output.status.success(), "{output:?}");
         assert_eq!(
@@ -1717,7 +1798,7 @@ with open(os.environ['FIXTURE_LEASE_PATH'], 'r+') as contender:
         }
         let diagnostic = String::from_utf8_lossy(&output.stderr);
         assert!(
-            diagnostic.contains("original terminal survival is unverified"),
+            diagnostic.contains("terminal service readiness is unverified"),
             "{diagnostic}"
         );
         assert!(
@@ -2321,6 +2402,33 @@ fn ordinary_no_current_or_absent_source_installs_keep_files_when_first_start_fai
     for coordinator in ["first-start-failure", "absent-start-failure"] {
         coordinated_release_mode(true, 0, None, None, None, coordinator, false);
     }
+}
+
+#[test]
+fn explicit_restart_without_a_source_keeps_files_when_first_start_fails() {
+    for coordinator in ["first-start-failure", "absent-start-failure"] {
+        coordinated_release_mode(
+            true,
+            0,
+            None,
+            Some("no-source-explicit"),
+            None,
+            coordinator,
+            false,
+        );
+    }
+}
+
+#[test]
+fn standalone_downgrade_refusal_restarts_the_selected_candidate_or_prints_exact_start_command() {
+    for mode in ["empty-downgrade-refusal", "empty-downgrade-refusal-fails"] {
+        upgrade_fixture(true, 0, None, Some(mode));
+    }
+}
+
+#[test]
+fn unknown_replacement_status_still_exposes_the_prepared_recovery_command() {
+    upgrade_fixture(true, 7, None, Some("prepared-status-unknown"));
 }
 
 #[test]

@@ -59,21 +59,27 @@ elif args[0] == 'verify-install-guard':
         print('application windows have not finished closing', file=sys.stderr)
         sys.exit(1)
 elif args[:2] == ['daemon', 'capture-update-census']:
-    assert args[2] == '--output' and len(args) == 4
+    assert args[2] == '--output' and args[4] == '--candidate-cli' and len(args) == 6
+    assert pathlib.Path(args[5]).is_file()
     record('census-capture')
     pathlib.Path(args[3]).write_text(json.dumps({'version': 1, 'transaction': '00000000-0000-4000-8000-000000000001',
-                                               'source': None, 'terminals': [], 'chats': [], 'checkpoint_before': None}, separators=(',', ':')))
+                                               'source': None, 'terminals': [], 'chats': [],
+                                               'checkpoint_before': os.environ.get('FIXTURE_CHECKPOINT_BEFORE')}, separators=(',', ':')))
 elif args[:2] == ['daemon', 'inspect-pending-update-recovery']:
     assert args[2] == '--candidate-cli' and len(args) in (4, 6)
     if len(args) == 6:
         assert args[4] == '--census'
     record('pending-inspect')
+    if os.environ.get('FIXTURE_PENDING_RECOVERY'):
+        print(f"Run '{args[3]}' --no-start daemon recover-update --checkpoint " + 'a' * 64 + ' --yes', file=sys.stderr)
+        sys.exit(1)
 elif args[:2] in (['daemon', 'verify-update-census'], ['daemon', 'inspect-update-recovery']):
     import hashlib
     assert args[2] == '--census' and args[4] == '--outcome'
     census_path, outcome_path = pathlib.Path(args[3]), pathlib.Path(args[5])
     census = json.loads(census_path.read_text())
-    assert census == {'version': 1, 'transaction': '00000000-0000-4000-8000-000000000001', 'source': None, 'terminals': [], 'chats': [], 'checkpoint_before': None}
+    assert census == {'version': 1, 'transaction': '00000000-0000-4000-8000-000000000001', 'source': None, 'terminals': [], 'chats': [],
+                      'checkpoint_before': os.environ.get('FIXTURE_CHECKPOINT_BEFORE')}
     assert not census_path.stat().st_mode & 0o077
     if args[1] == 'inspect-update-recovery':
         assert args[6] == '--candidate-cli' and len(args) == 8
@@ -108,7 +114,7 @@ elif args[:2] in (['daemon', 'verify-update-census'], ['daemon', 'inspect-update
                        detail='fixture-only service authorization or readiness is unverified')
     outcome_path.write_text(json.dumps({'version': 1, 'transaction': census['transaction'],
         'census_digest': hashlib.sha256(census_path.read_bytes()).hexdigest(),
-        'outcome': outcome, 'checkpoint_before': None}))
+        'outcome': outcome, 'checkpoint_before': census['checkpoint_before']}))
     if not accepted:
         print('Terminal readiness is unverified; inspect --no-start daemon status and --no-start terminal list.', file=sys.stderr)
         sys.exit(1)
@@ -127,7 +133,8 @@ elif args == ['--json', 'daemon', 'status']:
                      separators=(',', ':')))
 elif args == ['daemon', 'start']:
     record('daemon-start-fixture')
-    if os.environ.get('FIXTURE_DAEMON_START_FAILS'):
+    starts = sum(json.loads(line)['event'] == 'daemon-start-fixture' for line in log.read_text().splitlines())
+    if os.environ.get('FIXTURE_DAEMON_START_FAILS') and (not os.environ.get('FIXTURE_FAIL_FIRST_DAEMON_START') or starts == 1):
         sys.exit(1)
     pathlib.Path(os.environ['FIXTURE_DAEMON_STATE']).write_text('ready\n')
 elif args[:2] in (['daemon', 'store-schema'], ['daemon', 'downgrade-store']) \
@@ -438,6 +445,7 @@ os.execv({real_tar!r}, [{real_tar!r}, *args])
         copy = self.place_copy(member, (previous / member).read_bytes())
         before = copy.stat()
         self.environment["FIXTURE_DAEMON_START_FAILS"] = "1"
+        self.environment["FIXTURE_CHECKPOINT_BEFORE"] = "a" * 64
         result = self.install("--restart-daemon")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("replacement daemon startup failed", result.stderr)
@@ -457,7 +465,9 @@ os.execv({real_tar!r}, [{real_tar!r}, *args])
 
     def failed_update(self, **environment):
         self.installed_cli(guarded=True)
-        self.environment.update(FIXTURE_DAEMON_START_FAILS="1", **environment)
+        # These store-conversion fixtures retain an already Ready checkpoint.
+        # They cannot qualify for the fresh/empty installation exception.
+        self.environment.update(FIXTURE_DAEMON_START_FAILS="1", FIXTURE_CHECKPOINT_BEFORE="a" * 64, **environment)
         result = self.install("--restart-daemon")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("replacement daemon startup failed", result.stderr)
@@ -559,6 +569,78 @@ os.execv({real_tar!r}, [{real_tar!r}, *args])
         self.environment["FIXTURE_DAEMON_START_FAILS"] = "1"
         self.assert_files_installed_for_login(self.install())
 
+    def test_explicit_restart_without_a_source_keeps_files_and_login_autostart_after_failed_start(self):
+        self.environment['FIXTURE_DAEMON_START_FAILS'] = '1'
+        self.assert_files_installed_for_login(self.install('--restart-daemon'))
+
+    def test_downgrade_refusal_starts_the_selected_candidate_and_verifies_ready(self):
+        result, conversion = self.failed_update(FIXTURE_DOWNGRADE_FAILS='1', FIXTURE_FAIL_FIRST_DAEMON_START='1')
+        self.assertEqual(conversion[-2:], [('downgrade-store', 'candidate', '22'), ('daemon-start-fixture', None, None)])
+        self.assertEqual(os.readlink(self.prefix / 'current'), f'versions/{VERSION}')
+        self.assertTrue(Path(self.environment['FIXTURE_DAEMON_STATE']).exists())
+        receipt_paths = list(self.downloads.glob('*/update-outcome.json'))
+        self.assertEqual(len(receipt_paths), 1)
+        self.assertEqual(json.loads(receipt_paths[0].read_text())['outcome']['state'], 'usable')
+
+    def test_downgrade_refusal_with_failed_restart_prints_the_exact_selected_start_command(self):
+        result, _ = self.failed_update(FIXTURE_DOWNGRADE_FAILS='1')
+        command = f"'{self.prefix / 'versions' / VERSION / 'bin/cagents'}' daemon start"
+        self.assertIn(command, result.stderr)
+        self.assertEqual(os.readlink(self.prefix / 'current'), f'versions/{VERSION}')
+        self.assertFalse(Path(self.environment['FIXTURE_DAEMON_STATE']).exists())
+
+    def test_same_version_pending_recovery_is_reported_before_already_installed_or_capture(self):
+        first = self.install()
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.calls.unlink()
+        self.environment.update(CAGENTS_UI_UPDATE_GUARD_FD='fixture-only', FIXTURE_PENDING_RECOVERY='1')
+        retry = self.install('--restart-daemon')
+        self.assertNotEqual(retry.returncode, 0)
+        self.assertIn(f"'{self.prefix / 'versions' / VERSION / 'bin/cagents'}' --no-start daemon recover-update", retry.stderr)
+        self.assertNotIn('already installed', retry.stderr)
+        self.assertEqual([e['event'] for e in self.events()], ['verify', 'pending-inspect'])
+
+    def test_retained_failed_candidate_can_resume_the_same_version_after_revalidation(self):
+        self.failed_update(FIXTURE_DOWNGRADE_FAILS='1')
+        candidate = self.prefix / 'versions' / VERSION
+        inode = (candidate / 'bin/cagents').stat().st_ino
+        marker = candidate / '.cagents-retained-candidate-v1.json'
+        self.assertEqual(marker.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(json.loads(marker.read_text()), {'version': 1, 'archive_sha256': hashlib.sha256(self.archive.read_bytes()).hexdigest()})
+        self.calls.unlink()
+        self.environment.pop('FIXTURE_DAEMON_START_FAILS')
+        self.environment.pop('FIXTURE_DOWNGRADE_FAILS')
+        self.environment['CAGENTS_UI_UPDATE_GUARD_FD'] = 'fixture-only'
+        retried = self.install('--restart-daemon')
+        self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
+        self.assertEqual((candidate / 'bin/cagents').stat().st_ino, inode)
+        self.assertTrue(Path(self.environment['FIXTURE_DAEMON_STATE']).exists())
+        self.assertFalse(marker.exists(), 'a verified completed install clears failure bookkeeping')
+
+    def test_standalone_retry_can_resume_a_verified_prepared_candidate(self):
+        candidate = self.prepare_candidate()
+        inode = (candidate / 'bin/cagents').stat().st_ino
+        self.environment.pop('FIXTURE_WINDOWS_PREPARED')
+        result = self.install('--restart-daemon')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((candidate / 'bin/cagents').stat().st_ino, inode)
+        self.assertEqual(os.readlink(self.prefix / 'current'), f'versions/{VERSION}')
+
+    def test_pending_recovery_precedes_repacked_archive_marker_mismatch(self):
+        self.failed_update(FIXTURE_DOWNGRADE_FAILS='1')
+        # Repack identical bytes with different tar metadata, as install-local
+        # may do. The existing executable tree still matches the new archive.
+        item = self.payload / 'bin/cagents'
+        os.utime(item, (item.stat().st_atime, item.stat().st_mtime + 5))
+        self.package()
+        self.calls.unlink()
+        self.environment.update(CAGENTS_UI_UPDATE_GUARD_FD='fixture-only', FIXTURE_PENDING_RECOVERY='1')
+        retry = self.install('--restart-daemon')
+        self.assertNotEqual(retry.returncode, 0)
+        self.assertIn('daemon recover-update --checkpoint', retry.stderr)
+        self.assertNotIn('archive differs', retry.stderr)
+        self.assertEqual([e['event'] for e in self.events()], ['verify', 'pending-inspect'])
+
     def prepare_candidate(self, *, serving=False):
         self.installed_cli(guarded=True)
         self.environment['CAGENTS_UI_UPDATE_GUARD_FD'] = 'fixture-only'
@@ -655,15 +737,15 @@ os.execv({real_tar!r}, [{real_tar!r}, *args])
                 (candidate / 'unexpected').unlink(missing_ok=True)
                 (candidate / 'bin\nshare').unlink(missing_ok=True)
 
-    def test_prepared_candidate_cannot_be_claimed_by_an_ordinary_install(self):
+    def test_unmarked_existing_candidate_cannot_be_claimed_by_an_ordinary_install(self):
         candidate = self.prepare_candidate()
         self.environment.pop('FIXTURE_WINDOWS_PREPARED')
+        (candidate / '.cagents-prepared-candidate-v1.json').unlink()
         result = self.install()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('already installed', result.stderr)
         self.assertEqual(os.readlink(self.prefix / 'current'), 'versions/old')
         self.assertTrue(candidate.exists())
-        (candidate / '.cagents-prepared-candidate-v1.json').unlink()
         unmarked = self.install('--prepare-candidate', JOB)
         self.assertNotEqual(unmarked.returncode, 0)
         self.assertIn('does not match this private job', unmarked.stderr)
