@@ -3567,7 +3567,7 @@ mod tests {
 
     #[test]
     fn late_view_snapshot_preserves_observed_channel_and_project_removal() {
-        use crate::workspace_model::views::{Pane, Scope, View};
+        use crate::workspace_model::views::{Scope, View};
         for close_project in [false, true] {
             let (mut app, _, repository) = app_with_project();
             let channel = ChannelId::new();
@@ -3966,7 +3966,7 @@ mod tests {
 
     #[test]
     fn repository_refresh_relocates_managed_display_into_a_worktree_without_changing_its_source() {
-        use crate::workspace_model::views::{Scope, View};
+        use crate::workspace_model::views::{Pane, Scope, View};
         let (mut app, agent, mut pane, unrelated) = managed_display_fixture();
         let mut original_only = app.workspace_model.clone();
         original_only.views.clear();
