@@ -1,6 +1,7 @@
 //! Exact initial panes retain attachment-only intent until their first result.
 //! Finishing the window's startup must not change an already-issued request.
 use super::*;
+use crate::chat;
 
 #[derive(Default)]
 pub(super) struct InitialPanes {
