@@ -9,6 +9,41 @@ pub(crate) struct VerifiedView {
     record: RecoveryRecord,
     issued_chats: Vec<super::super::handoff::Chat>,
     cold: Option<cold::ColdView>,
+    retained: Retention,
+}
+
+#[derive(Clone, Default)]
+struct Retention(Option<super::super::floor::Record>);
+
+impl Retention {
+    fn load(source: &HostSessionProof) -> Result<Self, String> {
+        super::super::floor::record_for_source(source).map(Self)
+    }
+
+    fn chat(&self, original: &Session) -> bool {
+        let Some(record) = &self.0 else {
+            return false;
+        };
+        original.proof.as_ref() == Some(&record.source)
+            && record.chats.iter().any(|source| {
+                (source == original
+                    || (record.aliases.contains(original)
+                        && super::super::floor::same_allocation(source, original)))
+                    && record
+                        .snapshots
+                        .iter()
+                        .filter(|saved| saved.source == *source)
+                        .count()
+                        == 1
+            })
+    }
+
+    fn terminal(&self, original: &TerminalSession) -> bool {
+        self.0.as_ref().is_some_and(|record| {
+            original.continuity.live_proof().as_ref() == Some(&record.source)
+                && record.terminals.contains(&original.id)
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -116,6 +151,27 @@ impl VerifiedView {
         Self::load_at(&store.path, serving, target, terminals, chats)
     }
 
+    pub(crate) fn load_for_source(
+        expected_source: &HostSessionProof,
+        serving: &HostSessionProof,
+        target: &Path,
+        terminals: &[TerminalDescriptor],
+        chats: &[Session],
+    ) -> Result<Option<Self>, String> {
+        let Some(store) = super::super::handoff::Store::existing()? else {
+            return Ok(None);
+        };
+        Self::load_at_with(
+            &store.path,
+            Some(expected_source),
+            serving,
+            target,
+            terminals,
+            chats,
+            Retention::load,
+        )
+    }
+
     fn load_at(
         checkpoint_path: &Path,
         serving: &HostSessionProof,
@@ -123,9 +179,37 @@ impl VerifiedView {
         terminals: &[TerminalDescriptor],
         chats: &[Session],
     ) -> Result<Option<Self>, String> {
-        let Some(settled) = pending_retirement(checkpoint_path, target)? else {
+        Self::load_at_with(
+            checkpoint_path,
+            None,
+            serving,
+            target,
+            terminals,
+            chats,
+            Retention::load,
+        )
+    }
+
+    fn load_at_with(
+        checkpoint_path: &Path,
+        expected_source: Option<&HostSessionProof>,
+        serving: &HostSessionProof,
+        target: &Path,
+        terminals: &[TerminalDescriptor],
+        chats: &[Session],
+        read_retention: impl FnOnce(&HostSessionProof) -> Result<Retention, String>,
+    ) -> Result<Option<Self>, String> {
+        let settled = match expected_source {
+            Some(source) => pending_retirement_for_source(checkpoint_path, target, source)?,
+            None => pending_retirement(checkpoint_path, target)?,
+        };
+        let Some(settled) = settled else {
             return Ok(None);
         };
+        if expected_source.is_some_and(|source| source != &settled.source) {
+            return Ok(None);
+        }
+        let retained = read_retention(&settled.source)?;
         let bytes = checkpoint_bytes(checkpoint_path, target, &settled)?;
         let cold = if &settled.witness.successor == serving {
             None
@@ -137,6 +221,7 @@ impl VerifiedView {
                 target,
                 terminals,
                 chats,
+                &retained,
             )?)
         };
         let (record_serving, record_terminals, record_chats) = if cold.is_some() {
@@ -171,6 +256,7 @@ impl VerifiedView {
             record,
             issued_chats: issued.chats,
             cold,
+            retained,
         }))
     }
 
@@ -211,12 +297,15 @@ impl VerifiedView {
     }
 
     pub(crate) fn paused_chat(&self, original: &Session) -> bool {
-        self.issued_chat(original) && self.record.paused_chats.contains(&original.id)
+        self.issued_chat(original)
+            && self.record.paused_chats.contains(&original.id)
+            && self.retained.chat(original)
     }
 
     pub(crate) fn paused_terminal(&self, original: &TerminalSession) -> bool {
         original.continuity.live_proof().as_ref() == Some(&self.record.source)
             && self.record.paused_terminals.contains(&original.id)
+            && self.retained.terminal(original)
             && self
                 .record
                 .census
@@ -310,6 +399,7 @@ pub(super) mod tests {
         pub(super) source: Session,
         pub(super) current: Session,
         pub(super) record: RecoveryRecord,
+        pub(super) retained: Retention,
     }
 
     impl Fixture {
@@ -480,6 +570,24 @@ pub(super) mod tests {
                 #[cfg(feature = "host")]
                 authority: None,
             };
+            let mut retained = super::super::super::floor::Record::new(
+                record.source.clone(),
+                record
+                    .census
+                    .chats
+                    .iter()
+                    .filter(|source| record.paused_chats.contains(&source.id))
+                    .cloned()
+                    .collect(),
+                record.paused_terminals.clone(),
+            );
+            retained.snapshots = record
+                .census
+                .snapshots
+                .iter()
+                .filter(|saved| record.paused_chats.contains(&saved.source.id))
+                .cloned()
+                .collect();
             let fixture = Self {
                 _root: root,
                 checkpoint,
@@ -487,6 +595,7 @@ pub(super) mod tests {
                 source,
                 current,
                 record,
+                retained: Retention(Some(retained)),
             };
             fixture.save();
             fixture
@@ -531,13 +640,66 @@ pub(super) mod tests {
                 .unwrap()
                 .unwrap()
         }
-        pub(super) fn load(&self, live: &[Session]) -> Result<Option<VerifiedView>, String> {
-            VerifiedView::load_at(
+        pub(super) fn load_current(
+            &self,
+            serving: &HostSessionProof,
+            terminals: &[TerminalDescriptor],
+            chats: &[Session],
+        ) -> Result<Option<VerifiedView>, String> {
+            VerifiedView::load_at_with(
                 &self.checkpoint,
-                &proof("successor"),
+                None,
+                serving,
                 &self.target,
+                terminals,
+                chats,
+                |_| Ok(self.retained.clone()),
+            )
+        }
+        pub(super) fn load_for_source(
+            &self,
+            source: &HostSessionProof,
+            serving: &HostSessionProof,
+            terminals: &[TerminalDescriptor],
+            chats: &[Session],
+        ) -> Result<Option<VerifiedView>, String> {
+            VerifiedView::load_at_with(
+                &self.checkpoint,
+                Some(source),
+                serving,
+                &self.target,
+                terminals,
+                chats,
+                |_| Ok(self.retained.clone()),
+            )
+        }
+        pub(super) fn load(&self, live: &[Session]) -> Result<Option<VerifiedView>, String> {
+            self.load_current(
+                &proof("successor"),
                 &self.record.adopted_terminal_descriptors,
                 live,
+            )
+        }
+        pub(super) fn publish_cold(
+            &self,
+            settled: &AlreadyRecovered,
+            serving: &HostSessionProof,
+            terminals: &[TerminalDescriptor],
+            chats: &[Session],
+            aliases: &std::collections::BTreeMap<
+                TerminalId,
+                Vec<super::super::super::handoff::ChatSource>,
+            >,
+        ) -> Result<(), String> {
+            cold::publish_with_retention(
+                &self.checkpoint,
+                &self.target,
+                settled,
+                serving,
+                terminals,
+                chats,
+                aliases,
+                &self.retained,
             )
         }
     }
@@ -729,5 +891,138 @@ pub(super) mod tests {
             "an existing canonical checkpoint prevents falling through to unrelated archived scope"
         );
         assert!(archive.archive_path.exists());
+    }
+    #[test]
+    fn paused_native_requires_current_retained_page_even_with_immutable_settled_outcome() {
+        let mut fixture = Fixture::new(Provider::Claude, true);
+        let paused = fixture.record.census.chats[1].clone();
+        assert!(
+            fixture
+                .load(&[fixture.current.clone()])
+                .unwrap()
+                .unwrap()
+                .paused_chat(&paused)
+        );
+        let original_outcome = fs::read(
+            fixture
+                .checkpoint
+                .with_file_name(recovery_name(&fixture.record.checkpoint_hash)),
+        )
+        .unwrap();
+        fixture.retained.0.as_mut().unwrap().snapshots.clear();
+        let view = fixture.load(&[fixture.current.clone()]).unwrap().unwrap();
+        assert!(!view.paused_chat(&paused));
+        assert!(view.proves_chat(&fixture.source, &fixture.current));
+        assert!(
+            matches!(crate::update::recovery::compare_with_recovery(&root_census(&fixture), &proof("successor"), &fixture.record.adopted_terminal_descriptors,
+            &[fixture.current.clone()], &Default::default(), Some(&view), None),
+            crate::update::recovery::Outcome::Unverified { serving:Some(_), surviving_terminals:1, missing, .. } if missing.contains(&paused.id))
+        );
+        assert_eq!(
+            fs::read(
+                fixture
+                    .checkpoint
+                    .with_file_name(recovery_name(&fixture.record.checkpoint_hash))
+            )
+            .unwrap(),
+            original_outcome
+        );
+        assert!(
+            fixture.retained.0.as_ref().unwrap().snapshots.is_empty(),
+            "a proof probe cannot recreate the closed page"
+        );
+    }
+
+    #[test]
+    fn paused_terminal_requires_current_retained_marker_for_exact_source() {
+        let mut fixture = Fixture::new(Provider::Claude, true);
+        let terminal = fixture.record.census.terminals[0].clone();
+        fixture.record.adopted_terminals.clear();
+        fixture.record.adopted_terminal_descriptors.clear();
+        fixture.record.paused_terminals.push(terminal.id);
+        fixture
+            .retained
+            .0
+            .as_mut()
+            .unwrap()
+            .terminals
+            .push(terminal.id);
+        fixture.save();
+        assert!(
+            fixture
+                .load(&[fixture.current.clone()])
+                .unwrap()
+                .unwrap()
+                .paused_terminal(&terminal)
+        );
+        fixture.retained.0.as_mut().unwrap().terminals.clear();
+        let view = fixture.load(&[fixture.current.clone()]).unwrap().unwrap();
+        assert!(!view.paused_terminal(&terminal));
+        assert!(
+            matches!(crate::update::recovery::compare_with_recovery(&root_census(&fixture), &proof("successor"), &[],
+            &[fixture.current.clone()], &Default::default(), Some(&view), None),
+            crate::update::recovery::Outcome::Unverified { missing, .. } if missing.contains(&terminal.id))
+        );
+    }
+
+    #[test]
+    fn requested_source_b_uses_own_issued_proof_despite_unrelated_broken_archive_a() {
+        let fixture = Fixture::new(Provider::Claude, true);
+        let archive = fixture.archive();
+        let serving = proof("normal-ready-d");
+        let mut current = fixture.current.clone();
+        current.proof = Some(serving.clone());
+        let mut terminal = fixture.record.adopted_terminal_descriptors[0].clone();
+        let source_terminal = terminal.session.clone();
+        terminal.upgrade_sources.push(source_terminal.clone());
+        terminal.session.continuity = crate::model::TerminalContinuity::Live {
+            host_session_id: serving.host_session_id.clone(),
+            boot_id: serving.boot_id.clone(),
+            host_incarnation: serving.host_incarnation.clone(),
+        };
+        let store = super::super::super::handoff::Store::open(fixture.checkpoint.parent().unwrap())
+            .unwrap();
+        store
+            .record_recovered(&[super::super::super::handoff::RecoveredChat {
+                evidence: super::super::super::handoff::Chat {
+                    source: fixture.current.clone(),
+                    launch: fixture.current.launch.clone(),
+                    previous_sources: vec![],
+                },
+                replacement: current.clone(),
+                aliases: vec![],
+            }])
+            .unwrap();
+        let own_lineage = store.recovered_chats().unwrap();
+        let expected: crate::update::recovery::Census = serde_json::from_value(serde_json::json!({
+            "version":1,"transaction":uuid::Uuid::new_v4().to_string(),"source":proof("successor"),
+            "terminals":[source_terminal],"chats":[fixture.current.clone()],"checkpoint_before":null,
+        })).unwrap();
+        write_private(&archive.archive_path, b"unrelated A archive is corrupt");
+        fs::remove_file(&archive.outcome_path).unwrap();
+        let unrelated = fixture
+            .load_for_source(
+                &proof("successor"),
+                &serving,
+                &[terminal.clone()],
+                &[current.clone()],
+            )
+            .unwrap();
+        assert!(unrelated.is_none());
+        assert!(
+            fixture
+                .load_for_source(
+                    &proof("source"),
+                    &serving,
+                    &[terminal.clone()],
+                    &[current.clone()]
+                )
+                .is_err(),
+            "matching A still needs strict actual evidence"
+        );
+        assert!(
+            matches!(crate::update::recovery::compare_with_recovery(&expected, &serving, &[terminal], &[current], &own_lineage, unrelated.as_ref(), None),
+            crate::update::recovery::Outcome::Usable { terminals:1,chats:1,paused_chats,.. } if paused_chats.is_empty())
+        );
     }
 }

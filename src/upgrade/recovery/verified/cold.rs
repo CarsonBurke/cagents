@@ -19,6 +19,8 @@ enum Incomplete {
     RosterOwnership,
     OriginalDescriptors,
     PausedPartitionChanged,
+    PausedChatNotRetained { id: TerminalId },
+    PausedTerminalNotRetained { id: TerminalId },
     AcceptedChat { id: TerminalId },
     AcceptedTerminal { id: TerminalId },
 }
@@ -65,6 +67,7 @@ fn complete(
     terminals: &[TerminalDescriptor],
     chats: &[Session],
     aliases: &Aliases,
+    retained: &super::Retention,
 ) -> Result<(), Incomplete> {
     let terminal_ids: BTreeSet<_> = terminals.iter().map(|item| item.session.id).collect();
     let chat_ids: BTreeSet<_> = chats.iter().map(|item| item.id).collect();
@@ -89,6 +92,33 @@ fn complete(
             .any(|id| terminal_ids.contains(id))
     {
         return Err(Incomplete::PausedPartitionChanged);
+    }
+    for source in settled
+        .census
+        .chats
+        .iter()
+        .filter(|source| settled.paused_chats.contains(&source.id))
+    {
+        if !retained.chat(source) {
+            return Err(Incomplete::PausedChatNotRetained { id: source.id });
+        }
+    }
+    for source in settled
+        .census
+        .terminals
+        .iter()
+        .chain(
+            settled
+                .census
+                .chats
+                .iter()
+                .filter_map(|chat| chat.terminal.as_ref()),
+        )
+        .filter(|source| settled.paused_terminals.contains(&source.id))
+    {
+        if !retained.terminal(source) {
+            return Err(Incomplete::PausedTerminalNotRetained { id: source.id });
+        }
     }
     let expected_chats: BTreeSet<_> = settled
         .census
@@ -204,6 +234,7 @@ impl ColdView {
         target: &Path,
         terminals: &[TerminalDescriptor],
         chats: &[Session],
+        retained: &super::Retention,
     ) -> Result<Self, String> {
         let bytes =
             read_checkpoint(&checkpoint.with_file_name(name(&settled.witness.checkpoint_hash)))?
@@ -226,6 +257,7 @@ impl ColdView {
             &publication.terminals,
             &publication.chats,
             &publication.aliases,
+            retained,
         )
         .map_err(|reason| format!("Current settled-recovery lineage is unverified: {reason:?}"))?;
         if publication.chats.len() != chats.len()
@@ -272,13 +304,30 @@ pub(crate) fn publish(
     chats: &[Session],
     aliases: &Aliases,
 ) -> Result<(), String> {
+    let retained = super::Retention::load(&settled.source)?;
+    publish_with_retention(
+        checkpoint, target, settled, serving, terminals, chats, aliases, &retained,
+    )
+}
+
+#[cfg(any(feature = "host", test))]
+pub(super) fn publish_with_retention(
+    checkpoint: &Path,
+    target: &Path,
+    settled: &AlreadyRecovered,
+    serving: &HostSessionProof,
+    terminals: &[TerminalDescriptor],
+    chats: &[Session],
+    aliases: &Aliases,
+    retained: &super::Retention,
+) -> Result<(), String> {
     let current = pending_retirement(checkpoint, target)?
         .ok_or("The exact settled Prepared or archived outcome disappeared before publication")?;
     super::checkpoint_bytes(checkpoint, target, &current)?;
     if current.witness != settled.witness {
         return Err("The original settled recovery changed before publication".into());
     }
-    let completeness = match complete(settled, serving, terminals, chats, aliases) {
+    let completeness = match complete(settled, serving, terminals, chats, aliases, retained) {
         Ok(()) => Completeness::Verified,
         Err(reason) => Completeness::Unverified { reason },
     };
@@ -391,36 +440,17 @@ mod tests {
                     adopted(&fixture, incarnation, &prior_chats, &prior_terminals);
                 if incarnation == "cold-d" {
                     assert!(
-                        super::super::VerifiedView::load_at(
-                            &fixture.checkpoint,
-                            &serving,
-                            &fixture.target,
-                            &terminals,
-                            &chats
-                        )
-                        .is_err(),
+                        fixture.load_current(&serving, &terminals, &chats).is_err(),
                         "a positive C observation cannot stand in for a fresh D publication"
                     );
                 }
-                publish(
-                    &fixture.checkpoint,
-                    &fixture.target,
-                    &settled,
-                    &serving,
-                    &terminals,
-                    &chats,
-                    &aliases,
-                )
-                .unwrap();
-                let view = super::super::VerifiedView::load_at(
-                    &fixture.checkpoint,
-                    &serving,
-                    &fixture.target,
-                    &terminals,
-                    &chats,
-                )
-                .unwrap()
-                .unwrap();
+                fixture
+                    .publish_cold(&settled, &serving, &terminals, &chats, &aliases)
+                    .unwrap();
+                let view = fixture
+                    .load_current(&serving, &terminals, &chats)
+                    .unwrap()
+                    .unwrap();
                 assert!(view.proves_chat(&fixture.source, &chats[0]));
                 assert!(
                     view.proves_chat(&fixture.current, &chats[0]),
@@ -473,25 +503,11 @@ mod tests {
                         .insert("ACCOUNT".into(), "foreign".into());
                 }
             }
-            publish(
-                &fixture.checkpoint,
-                &fixture.target,
-                &settled,
-                &serving,
-                &terminals,
-                &chats,
-                &aliases,
-            )
-            .unwrap();
+            fixture
+                .publish_cold(&settled, &serving, &terminals, &chats, &aliases)
+                .unwrap();
             assert!(
-                super::super::VerifiedView::load_at(
-                    &fixture.checkpoint,
-                    &serving,
-                    &fixture.target,
-                    &terminals,
-                    &chats
-                )
-                .is_err(),
+                fixture.load_current(&serving, &terminals, &chats).is_err(),
                 "mutation {mutation}"
             );
         }
@@ -509,28 +525,14 @@ mod tests {
             &[],
             &fixture.record.adopted_terminal_descriptors,
         );
-        publish(
-            &fixture.checkpoint,
-            &fixture.target,
-            &settled,
-            &serving,
-            &terminals,
-            &chats,
-            &aliases,
-        )
-        .unwrap();
+        fixture
+            .publish_cold(&settled, &serving, &terminals, &chats, &aliases)
+            .unwrap();
         // Closing the old native owner is legitimate. Publishing the remaining
         // authenticated service succeeds without reopening or changing history.
-        publish(
-            &fixture.checkpoint,
-            &fixture.target,
-            &settled,
-            &serving,
-            &terminals,
-            &[],
-            &aliases,
-        )
-        .unwrap();
+        fixture
+            .publish_cold(&settled, &serving, &terminals, &[], &aliases)
+            .unwrap();
         let bytes = read_checkpoint(
             &fixture
                 .checkpoint
@@ -544,16 +546,7 @@ mod tests {
         );
         assert_eq!(observation.terminals, terminals);
         assert!(observation.chats.is_empty());
-        assert!(
-            super::super::VerifiedView::load_at(
-                &fixture.checkpoint,
-                &serving,
-                &fixture.target,
-                &terminals,
-                &[]
-            )
-            .is_err()
-        );
+        assert!(fixture.load_current(&serving, &terminals, &[]).is_err());
         assert!(matches!(
             compare_with_recovery(
                 &root_census(&fixture),
@@ -596,25 +589,13 @@ mod tests {
                 settled.witness, witness,
                 "later display aliases cannot change original raw outcome identity"
             );
-            publish(
-                &fixture.checkpoint,
-                &fixture.target,
-                &settled,
-                &serving,
-                &terminals,
-                &chats,
-                &aliases,
-            )
-            .unwrap();
-            let view = super::super::VerifiedView::load_at(
-                &fixture.checkpoint,
-                &serving,
-                &fixture.target,
-                &terminals,
-                &chats,
-            )
-            .unwrap()
-            .unwrap();
+            fixture
+                .publish_cold(&settled, &serving, &terminals, &chats, &aliases)
+                .unwrap();
+            let view = fixture
+                .load_current(&serving, &terminals, &chats)
+                .unwrap()
+                .unwrap();
             assert!(
                 matches!(compare_with_recovery(&root_census(&fixture), &serving, &terminals, &chats, &Default::default(), Some(&view), None),
                 Outcome::Usable { terminals:1, chats:1, paused_chats, .. } if paused_chats == fixture.record.paused_chats)
@@ -629,15 +610,10 @@ mod tests {
                 )
                 .unwrap();
             assert!(
-                super::super::VerifiedView::load_at(
-                    &fixture.checkpoint,
-                    &serving,
-                    &fixture.target,
-                    &terminals,
-                    &chats
-                )
-                .unwrap()
-                .is_some(),
+                fixture
+                    .load_current(&serving, &terminals, &chats)
+                    .unwrap()
+                    .is_some(),
                 "appending retirement metadata must not invalidate the current exact cold observation"
             );
             assert_eq!(fs::read(&archive.archive_path).unwrap(), checkpoint);
@@ -646,5 +622,38 @@ mod tests {
             prior_chats.extend(chats);
             prior_terminals.extend(terminals);
         }
+    }
+    #[test]
+    fn cold_proof_does_not_recreate_closed_paused_page_or_claim_it_survives() {
+        let mut fixture = Fixture::new(Provider::Claude, true);
+        let settled = pending_retirement(&fixture.checkpoint, &fixture.target)
+            .unwrap()
+            .unwrap();
+        let (serving, terminals, chats, aliases) = adopted(
+            &fixture,
+            "cold-c",
+            &[],
+            &fixture.record.adopted_terminal_descriptors,
+        );
+        let paused = fixture.record.paused_chats[0];
+        fixture.retained.0.as_mut().unwrap().snapshots.clear();
+        fixture
+            .publish_cold(&settled, &serving, &terminals, &chats, &aliases)
+            .unwrap();
+        let bytes = read_checkpoint(
+            &fixture
+                .checkpoint
+                .with_file_name(name(&settled.witness.checkpoint_hash)),
+        )
+        .unwrap()
+        .unwrap();
+        let publication: Publication = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            matches!(publication.completeness, Completeness::Unverified {reason:Incomplete::PausedChatNotRetained {id}} if id == paused)
+        );
+        assert!(fixture.load_current(&serving, &terminals, &chats).is_err());
+        assert!(fixture.retained.0.as_ref().unwrap().snapshots.is_empty());
+        assert_eq!(publication.terminals.len(), 1);
+        assert_eq!(publication.chats.len(), 1);
     }
 }

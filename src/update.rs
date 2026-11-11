@@ -434,7 +434,7 @@ enum UpdateRequest {
 }
 
 pub fn apply(release: &Release) -> Result<UpdateJob, UpdateError> {
-    inspect_pending_recovery(&std::env::current_exe()?, None)?;
+    recovery::inspect_pending_current()?;
     let installation = Installation::detect()?;
     if stable_version(&release.version)? <= installed_version(&installation.version)? {
         return Err(invalid(
@@ -453,11 +453,7 @@ pub fn apply_installed(executable: &Path) -> Result<UpdateJob, UpdateError> {
 }
 
 fn apply_installed_from(executable: &Path, terminal: bool) -> Result<UpdateJob, UpdateError> {
-    let candidate_cli = executable
-        .parent()
-        .ok_or_else(unsupported_install)?
-        .join("cagents");
-    inspect_pending_recovery(&candidate_cli, None)?;
+    recovery::inspect_pending_current()?;
     let mut installation = running_installation()?;
     let layout = locate(&std::env::current_exe()?)?;
     let served = served_version_root(&layout)?;
@@ -550,7 +546,7 @@ pub fn upgrade_installed(yes: bool, interrupt: bool) -> Result<UpdateJob, Update
     let _interrupt = cancellation::Interrupt::install()?;
     // An interrupted preparation has its own immutable source census. Do not
     // route this retry through old `current` or construct a fresh empty source.
-    inspect_pending_recovery(&std::env::current_exe()?, None)?;
+    recovery::inspect_pending_current()?;
     let layout = locate(&std::env::current_exe()?)?;
     let candidate = served_version_root(&layout)?.join("bin/cagents-ui");
     if cancellation::requested() {
@@ -566,7 +562,7 @@ pub fn upgrade_release(
     interrupt: bool,
 ) -> Result<UpdateJob, UpdateError> {
     let _interrupt = cancellation::Interrupt::install()?;
-    inspect_pending_recovery(&std::env::current_exe()?, None)?;
+    recovery::inspect_pending_current()?;
     let installation = Installation::detect()?;
     let parsed = stable_version(version)?;
     let tag = format!("v{parsed}");
@@ -1060,15 +1056,7 @@ fn start_job(
     version: &str,
     request: &UpdateRequest,
 ) -> Result<UpdateJob, UpdateError> {
-    let candidate = match request {
-        UpdateRequest::Installed { root } | UpdateRequest::InstalledFromTerminal { root } => {
-            root.join("bin/cagents")
-        }
-        UpdateRequest::Release(_) | UpdateRequest::ReleaseFromTerminal(_) => {
-            std::env::current_exe()?
-        }
-    };
-    inspect_pending_recovery(&candidate, None)?;
+    recovery::inspect_pending_current()?;
     let state = installation.state_dir()?;
     let lock = acquire_lock(&state)?;
     let id = uuid::Uuid::new_v4().to_string();
@@ -2177,10 +2165,24 @@ fn finish_handoff(
                 eprintln!("Could not save target recovery request: {error}");
             }
             let original = recovery::census_path(state, &job.id);
-            match crate::upgrade::recovery::PendingRecovery::retain_installer_census(&original) {
-                Ok(Some(pending)) => {
-                    required.recovery_command =
-                        Some(pending.command(&target.join("bin/cagents"), Some(&original)));
+            match recovery::pending_command_scope(&original) {
+                Ok(Some(scope)) => {
+                    if scope.pending.checkpoint_hash != required.checkpoint_digest
+                        || scope.pending.source != required.source
+                    {
+                        return report_recovery_failure(
+                            state,
+                            job,
+                            invalid(
+                                "The Prepared checkpoint changed before target recovery; keep the retained evidence and inspect it before recovering",
+                            ),
+                        );
+                    }
+                    required.recovery_command = Some(
+                        scope
+                            .pending
+                            .command(&target.join("bin/cagents"), scope.original),
+                    );
                 }
                 Ok(None) => {
                     return report_recovery_failure(
@@ -5063,7 +5065,7 @@ if os.environ['CAGENTS_TEST_RECOVERY_FAILURE']=='start-nonzero-with-service': sy
                 )
             );
             assert!(command.contains("daemon recover-update --checkpoint"));
-            assert!(command.contains("--yes --census"));
+            assert!(command.contains("--yes"));
             assert_eq!(fs::read(path).unwrap(), bytes);
             assert!(
                 lease.is_none(),
@@ -5079,13 +5081,74 @@ if os.environ['CAGENTS_TEST_RECOVERY_FAILURE']=='start-nonzero-with-service': sy
             // the empty socket. No fresh empty census or worker is created.
             let retry = root.path().join("retry-census.json");
             assert!(matches!(
-                recovery::capture_file(&retry),
+                recovery::capture_file_with_candidate(
+                    &retry,
+                    Some(&root.path().join("versions/new/bin/cagents"))
+                ),
                 Err(UpdateError::TargetRecoveryRequired(_))
             ));
             assert!(!retry.exists());
+            // Retry entrypoints can run the old UI, old CLI, or a temporary
+            // installer coordinator. Only the retained request chooses target.
+            let old_bin = root.path().join("versions/old/bin");
+            fs::create_dir_all(&old_bin).unwrap();
+            for executable in ["cagents", "cagentsd", "cagents-ui"] {
+                fs::write(old_bin.join(executable), b"old matched fixture").unwrap();
+            }
+            for caller in [old_bin.join("cagents-ui"), old_bin.join("cagents")] {
+                let Err(UpdateError::TargetRecoveryRequired(required)) =
+                    recovery::inspect_pending_caller(&caller)
+                else {
+                    panic!("old caller must resolve the retained job target")
+                };
+                let command = required.recovery_command.unwrap();
+                assert!(command.starts_with(&format!(
+                    "'{}' --no-start daemon recover-update",
+                    root.path().join("versions/new/bin/cagents").display()
+                )));
+                assert!(!command.contains("versions/old"));
+                assert!(!command.contains("cagents-ui"));
+            }
+            // A new, non-original census must not rebind the complete capture
+            // or turn an actionable recovery into a dead-end mismatch.
+            let state = root.path().join(".update");
+            let bin = root.path().join("versions/new/bin");
+            let pending = crate::upgrade::recovery::PendingRecovery::inspect()
+                .unwrap()
+                .unwrap();
+            let non_original = root.path().join("non-original-census.json");
+            let mut different: serde_json::Value =
+                serde_json::from_slice(&fs::read(recovery::census_path(&state, &job.id)).unwrap())
+                    .unwrap();
+            different["transaction"] = serde_json::json!(uuid::Uuid::new_v4().to_string());
+            different["terminals"] = serde_json::json!([]);
+            let different: recovery::Census = serde_json::from_value(different).unwrap();
+            different.save(&non_original).unwrap();
+            let Err(UpdateError::TargetRecoveryRequired(required)) =
+                inspect_pending_recovery(&bin.join("cagents"), Some(&non_original))
+            else {
+                panic!("complete pending scope must remain actionable")
+            };
+            assert!(
+                !required
+                    .recovery_command
+                    .unwrap()
+                    .contains("non-original-census")
+            );
+            let preserved = crate::upgrade::recovery::PendingRecovery::inspect()
+                .unwrap()
+                .unwrap();
+            assert_eq!(preserved.census, pending.census);
+            assert_eq!(
+                fs::read(crate::upgrade::handoff::Store::discover().unwrap().path).unwrap(),
+                bytes
+            );
             assert!(matches!(
+                // This fixture itself runs outside an installation. The public
+                // entry cannot guess a target from its supplied UI path; the
+                // managed old UI/CLI routes are exercised above.
                 apply_installed_from(&root.path().join("versions/new/bin/cagents-ui"), true),
-                Err(UpdateError::TargetRecoveryRequired(_))
+                Err(UpdateError::Invalid(_))
             ));
             let original = recovery::census_path(root.path(), &job.id);
             assert!(matches!(

@@ -296,6 +296,8 @@ pub enum DaemonCommand {
     CaptureUpdateCensus {
         #[arg(long)]
         output: PathBuf,
+        #[arg(long)]
+        candidate_cli: Option<PathBuf>,
     },
     #[command(hide = true)]
     VerifyUpdateCensus {
@@ -3642,8 +3644,11 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                 human: format!("{} daemon running ({})", instance::NAME, socket.display()),
             })
         }
-        DaemonCommand::CaptureUpdateCensus { output } => {
-            crate::update::recovery::capture_file(&output)
+        DaemonCommand::CaptureUpdateCensus {
+            output,
+            candidate_cli,
+        } => {
+            crate::update::recovery::capture_file_with_candidate(&output, candidate_cli.as_deref())
                 .map_err(|e| AppError::new("update_census", e))?;
             Ok(CommandOutput {
                 command: "daemon.capture_update_census",
