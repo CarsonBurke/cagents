@@ -1948,6 +1948,16 @@ original census again through the public command. Both windows must reopen the
 paused history and console without starting provider work. The original
 recovered views and records remain under `recovered/`.
 
+Comparison qualifications use the shared update census verifier's fresh usable
+outcome, bound to this job and the original census bytes. That outcome can
+account for a paused conversation; it cannot excuse a missing pane, changed
+thread or recipe, replacement run, or unrelated daemon. A history presentation
+must match the exact source projection, and a console relaunch must retain its
+pane and Running run while selecting this successful job's target executable.
+Cancellation additionally needs the typed interruption choice and its matching
+accepted parent-turn receipt. Raw changes remain in the report alongside each
+qualified disposition.
+
 Optional problem states each have their own switch:
 
 - `--no-init`: a Claude peer that accepts work without reporting a session ID.
