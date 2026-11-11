@@ -484,26 +484,24 @@ mod flow_tests {
         record.aliases.push(stale.clone());
         // Retained adoption can consult this index before Prepared recovery
         // publishes its paused record in the same daemon process.
-        let before_publication = crate::upgrade::floor::display_snapshot();
+        let before_publication = crate::upgrade::floor::load().unwrap();
         assert!(before_publication.resume_source(&stale).is_none());
         record.save().unwrap();
         assert!(before_publication.resume_source(&stale).is_none());
         assert!(
-            crate::upgrade::floor::display_snapshot()
+            crate::upgrade::floor::load()
+                .unwrap()
                 .resume_source(&stale)
                 .is_some()
         );
-        let published = crate::upgrade::floor::display_snapshot();
+        let published = crate::upgrade::floor::load().unwrap();
         let invalid = crate::instance::project_dirs()
             .unwrap()
             .data_local_dir()
             .join("daemon-upgrade/update-floor/invalid.json");
         std::fs::write(&invalid, b"{").unwrap();
-        assert!(record.save().is_err());
-        assert!(Arc::ptr_eq(
-            &published,
-            &crate::upgrade::floor::display_snapshot()
-        ));
+        assert!(crate::upgrade::floor::load().is_err());
+        assert!(published.resume_source(&stale).is_some());
         std::fs::remove_file(&invalid).unwrap();
         let path = std::fs::read_dir(invalid.parent().unwrap())
             .unwrap()
@@ -516,11 +514,6 @@ mod flow_tests {
         assert!(
             crate::upgrade::floor::load()
                 .unwrap()
-                .resume_source(&stale)
-                .is_none()
-        );
-        assert!(
-            crate::upgrade::floor::display_snapshot()
                 .resume_source(&stale)
                 .is_none()
         );

@@ -159,12 +159,19 @@ impl Cagents {
                     ));
                     return Task::none();
                 }
-                let Some(placement) = self.workspace_model.agent_view_scope(&agent).cloned() else {
+                let history = crate::upgrade::floor::load().ok();
+                let display = crate::workspace_model::views::ManagedDisplayIndex::with_history(
+                    &self.workspace_model,
+                    history.as_ref(),
+                )
+                .resolve(&agent);
+                let Some(display) = display else {
                     self.status = Some(TransientNotice::warning(
                         "This agent's exact pane is no longer available in a single view. Its result remains available in run history.",
                     ));
                     return Task::none();
                 };
+                let placement = display.scope.clone();
                 let selected = match &placement {
                     crate::agent_execution::Placement::Channel(id) => {
                         let Some(channel) = self
@@ -196,7 +203,7 @@ impl Cagents {
                     }
                 };
                 let adopted = self
-                    .adopt_execution_agent(&agent)
+                    .adopt_execution_agent_display(&agent, display)
                     .unwrap_or_else(Task::none);
                 Task::batch([
                     adopted,

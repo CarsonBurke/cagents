@@ -459,8 +459,16 @@ mod tests {
             }],
             ..Default::default()
         };
-        let index = crate::workspace_model::views::ManagedDisplayIndex::new(&model);
+        let action_history = crate::upgrade::floor::load().unwrap();
+        let index = crate::workspace_model::views::ManagedDisplayIndex::with_history(
+            &model,
+            Some(&action_history),
+        );
         let reads = crate::upgrade::floor::index_reads_for_test();
+        assert!(
+            !crate::workspace_model::views::ManagedDisplayIndex::new(&model)
+                .permits_projection(&agent, &reader)
+        );
         for _ in 0..100 {
             assert!(index.permits_projection(&agent, &reader));
             assert_eq!(index.resolve(&agent).unwrap().pane, Some(reader.clone()));
@@ -511,7 +519,10 @@ mod tests {
             panes: vec![reader.clone()],
             retired: Vec::new(),
         });
-        let ambiguous = crate::workspace_model::views::ManagedDisplayIndex::new(&model);
+        let ambiguous = crate::workspace_model::views::ManagedDisplayIndex::with_history(
+            &model,
+            Some(&action_history),
+        );
         assert!(!ambiguous.permits_projection(&agent, &reader));
         assert!(ambiguous.resolve(&agent).is_none());
         assert_eq!(

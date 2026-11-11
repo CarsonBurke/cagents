@@ -111,16 +111,17 @@ pub fn managed_display(
 
 /// Build once per incoming model, then resolve each managed actor in constant
 /// time. Repeated agent adoption never rescans every saved pane per actor.
-pub struct ManagedDisplayIndex<'a> {
+pub struct ManagedDisplayIndex<'a, 'history> {
     owners: std::collections::HashMap<CardId, Option<(&'a Scope, &'a Pane)>>,
     retired: std::collections::HashSet<CardId>,
     resources: std::collections::HashMap<
         (u8, crate::model::TerminalId),
         std::collections::HashSet<CardId>,
     >,
+    history: Option<&'history crate::upgrade::floor::Ledger>,
 }
 
-impl<'a> ManagedDisplayIndex<'a> {
+impl<'a, 'history> ManagedDisplayIndex<'a, 'history> {
     pub fn new(model: &'a super::WorkspaceModel) -> Self {
         let mut owners = std::collections::HashMap::new();
         let mut retired = std::collections::HashSet::new();
@@ -142,6 +143,19 @@ impl<'a> ManagedDisplayIndex<'a> {
             owners,
             retired,
             resources,
+            history: None,
+        }
+    }
+
+    /// The caller reads current evidence for this action and owns it until the
+    /// admission pass finishes. Projection itself performs no filesystem work.
+    pub(crate) fn with_history(
+        model: &'a super::WorkspaceModel,
+        history: Option<&'history crate::upgrade::floor::Ledger>,
+    ) -> Self {
+        Self {
+            history,
+            ..Self::new(model)
         }
     }
 
@@ -155,7 +169,7 @@ impl<'a> ManagedDisplayIndex<'a> {
     ) -> bool {
         let id = CardId::from_uuid(agent.id.as_uuid());
         let matches = |pane: &Pane| {
-            managed_pane_matches(agent, pane)
+            managed_pane_matches(agent, pane, self.history)
                 || matches!(&pane.kind, CardKind::Terminal(current)
                     if ended_managed_terminal_matches(agent, current))
         };
@@ -319,7 +333,7 @@ impl<'a> ManagedDisplayIndex<'a> {
             return None;
         }
         if let Some((scope, pane)) = owner {
-            if !managed_pane_matches(agent, pane) {
+            if !managed_pane_matches(agent, pane, self.history) {
                 return None;
             }
             return Some(*scope);
@@ -396,7 +410,11 @@ pub fn archived_console_matches(
     original == *current
 }
 
-pub(crate) fn managed_pane_matches(agent: &crate::agent_execution::Agent, pane: &Pane) -> bool {
+fn managed_pane_matches(
+    agent: &crate::agent_execution::Agent,
+    pane: &Pane,
+    history: Option<&crate::upgrade::floor::Ledger>,
+) -> bool {
     use crate::agent_execution::HostedSession;
     if let CardKind::Terminal(current) = &pane.kind
         && archived_console_matches(agent, current)
@@ -438,7 +456,7 @@ pub(crate) fn managed_pane_matches(agent: &crate::agent_execution::Agent, pane: 
     // the agent's execution descriptor and accepted run remain unchanged.
     match (&agent.session, &current) {
         (Some(HostedSession::Chat(original)), HostedSession::Chat(current)) => {
-            crate::upgrade::floor::display_snapshot().history_replacement(original, current)
+            history.is_some_and(|ledger| ledger.history_replacement(original, current))
         }
         _ => false,
     }

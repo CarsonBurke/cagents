@@ -51,7 +51,7 @@ pub(crate) struct Presentation {
     pub restored: bool,
 }
 
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub(crate) struct Ledger {
     pub records: Vec<Record>,
 }
@@ -153,8 +153,7 @@ impl Record {
         {
             return Err("Stopped update panes have no exact source proof".into());
         }
-        record.write_to(&root)?;
-        load().map(|_| ())
+        record.write_to(&root)
     }
 
     fn file_name(&self) -> Result<String, String> {
@@ -356,32 +355,9 @@ fn directory() -> Result<PathBuf, String> {
 /// daemon or window survives, so a process startup snapshot is not authoritative.
 /// Transcript payloads are skipped; rendering uses its attached snapshot instead.
 pub(crate) fn load() -> Result<Ledger, String> {
-    // Serialize reads and publication without holding the display lock over
-    // filesystem work. An earlier read cannot overwrite a later local save.
-    static LOADER: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _loader = LOADER.lock().unwrap_or_else(|poison| poison.into_inner());
     #[cfg(test)]
     INDEX_READS.with(|reads| reads.set(reads.get() + 1));
-    let ledger = load_at(&directory()?)?;
-    *display_index()
-        .write()
-        .unwrap_or_else(|poison| poison.into_inner()) = std::sync::Arc::new(ledger.clone());
-    Ok(ledger)
-}
-
-fn display_index() -> &'static std::sync::RwLock<std::sync::Arc<Ledger>> {
-    static INDEX: std::sync::OnceLock<std::sync::RwLock<std::sync::Arc<Ledger>>> =
-        std::sync::OnceLock::new();
-    INDEX.get_or_init(|| std::sync::RwLock::new(std::sync::Arc::new(Ledger::default())))
-}
-
-/// Presentation reads the last published index without filesystem work.
-/// Recovery and lineage decisions call load() for current durable evidence.
-pub(crate) fn display_snapshot() -> std::sync::Arc<Ledger> {
-    display_index()
-        .read()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .clone()
+    load_at(&directory()?)
 }
 
 #[cfg(test)]

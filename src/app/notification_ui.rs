@@ -830,7 +830,13 @@ impl Cagents {
                         .iter()
                         .any(|notice| notice.id == *id && !notice.acknowledged)
                 });
-                let (unread, failed) = self.notification_attention_updates(&snapshot);
+                let history = if snapshot.notices.is_empty() {
+                    None
+                } else {
+                    crate::upgrade::floor::load().ok()
+                };
+                let (unread, failed) =
+                    self.notification_attention_updates(&snapshot, history.as_ref());
                 self.sidebar_state.set_failed_updates(failed);
                 for card in unread {
                     self.observe_agent_update_for_card(card);
@@ -960,7 +966,11 @@ impl Cagents {
             } => {
                 if self.notification_ui.session_activation == Some(session)
                     && self.notification_ui.activation_generation == generation
-                    && self.resolved_activation_agent(session).is_none()
+                    && {
+                        let history = crate::upgrade::floor::load().ok();
+                        self.resolved_activation_agent(session, history.as_ref())
+                            .is_none()
+                    }
                     && !self
                         .durable
                         .cards
@@ -1053,7 +1063,8 @@ impl Cagents {
         }
         // A scheduled agent can remain headless in this window. Only this
         // explicit user activation may mount its exact authenticated descriptor.
-        let managed = self.resolved_activation_agent(session);
+        let history = crate::upgrade::floor::load().ok();
+        let managed = self.resolved_activation_agent(session, history.as_ref());
         if managed.is_none()
             && self.workspace_model.agents.iter().any(|agent| {
                 !agent.closed
@@ -1167,13 +1178,14 @@ impl Cagents {
     fn notification_attention_updates(
         &self,
         snapshot: &Snapshot,
+        history: Option<&crate::upgrade::floor::Ledger>,
     ) -> (BTreeSet<CardId>, BTreeSet<CardId>) {
         let mut unread = BTreeSet::new();
         let mut failed = BTreeSet::new();
         if snapshot.notices.is_empty() {
             return (unread, failed);
         }
-        let cards = self.notification_attention_cards();
+        let cards = self.notification_attention_cards(history);
         for notice in &snapshot.notices {
             if notice.acknowledged || self.notification_ui.acknowledged.contains(&notice.id) {
                 continue;
@@ -1196,8 +1208,18 @@ impl Cagents {
     /// Journal and workspace-model watches are independent. Reconsider retained
     /// unread evidence after canonical pane/scope reconciliation, without
     /// waiting for a second journal snapshot or adopting/reading a pane.
+    #[cfg(test)]
     pub(super) fn reproject_notification_unread(&mut self) {
-        let (cards, failed) = self.notification_attention_updates(&self.notification_ui.snapshot);
+        let history = crate::upgrade::floor::load().ok();
+        self.reproject_notification_unread_with_history(history.as_ref());
+    }
+
+    pub(super) fn reproject_notification_unread_with_history(
+        &mut self,
+        history: Option<&crate::upgrade::floor::Ledger>,
+    ) {
+        let (cards, failed) =
+            self.notification_attention_updates(&self.notification_ui.snapshot, history);
         let failed_changed = self.sidebar_state.set_failed_updates(failed);
         if cards.is_empty() && !failed_changed {
             return;
@@ -1211,7 +1233,10 @@ impl Cagents {
     /// Attribution grants no adoption, focus, startup, persistence or read.
     /// Local inventory-only sessions must be unique. Any raw managed member
     /// fences that fallback, including rejected/ambiguous canonical ownership.
-    fn notification_attention_cards(&self) -> HashMap<TerminalId, Option<CardId>> {
+    fn notification_attention_cards(
+        &self,
+        history: Option<&crate::upgrade::floor::Ledger>,
+    ) -> HashMap<TerminalId, Option<CardId>> {
         let mut cards = HashMap::new();
         for card in self
             .durable
@@ -1245,7 +1270,10 @@ impl Cagents {
                     .or_insert(Some(agent));
             }
         }
-        let index = crate::workspace_model::views::ManagedDisplayIndex::new(&self.workspace_model);
+        let index = crate::workspace_model::views::ManagedDisplayIndex::with_history(
+            &self.workspace_model,
+            history,
+        );
         for (session, owner) in owners {
             let canonical = owner.and_then(|agent| {
                 let resolved = self.resolved_agent_display(agent, session, &index)?;
@@ -1269,7 +1297,11 @@ impl Cagents {
         cards
     }
 
-    fn resolved_activation_agent(&self, session: TerminalId) -> Option<ManagedActivation> {
+    fn resolved_activation_agent(
+        &self,
+        session: TerminalId,
+        history: Option<&crate::upgrade::floor::Ledger>,
+    ) -> Option<ManagedActivation> {
         if self.workspace_model.identity == crate::workspace_model::NO_REGISTRY {
             return None;
         }
@@ -1290,7 +1322,10 @@ impl Cagents {
         if owners.next().is_some() {
             return None;
         }
-        let index = crate::workspace_model::views::ManagedDisplayIndex::new(&self.workspace_model);
+        let index = crate::workspace_model::views::ManagedDisplayIndex::with_history(
+            &self.workspace_model,
+            history,
+        );
         self.resolved_agent_display(agent, session, &index)
     }
 
@@ -1298,7 +1333,7 @@ impl Cagents {
         &self,
         agent: &crate::agent_execution::Agent,
         session: TerminalId,
-        index: &crate::workspace_model::views::ManagedDisplayIndex<'_>,
+        index: &crate::workspace_model::views::ManagedDisplayIndex<'_, '_>,
     ) -> Option<ManagedActivation> {
         use crate::agent_execution::Placement;
         if self.workspace_model.identity == crate::workspace_model::NO_REGISTRY {
@@ -3171,7 +3206,7 @@ mod tests {
         alias.id = CardId::new();
         let alias_id = alias.id;
         Arc::make_mut(&mut app.durable).cards.push(alias);
-        let (unread, failed) = app.notification_attention_updates(&snapshot);
+        let (unread, failed) = app.notification_attention_updates(&snapshot, None);
         assert!(unread.is_empty());
         assert!(failed.is_empty());
         app.reproject_notification_unread();

@@ -947,6 +947,14 @@ impl Cagents {
         if self.workspace_model.identity == NO_REGISTRY {
             return Task::none();
         }
+        let history = crate::upgrade::floor::load().ok();
+        self.reconcile_workspace_model_with_history(history.as_ref())
+    }
+
+    fn reconcile_workspace_model_with_history(
+        &mut self,
+        history: Option<&crate::upgrade::floor::Ledger>,
+    ) -> Task<Message> {
         // Taken rather than cloned: reconciling needs `&mut self` for the
         // window's own store, and the model is put back untouched.
         let model = std::mem::take(&mut self.workspace_model);
@@ -1030,8 +1038,9 @@ impl Cagents {
         // previous projection. Defer fresh actors while their scope is truly
         // blocked, before creating a local card or attachment Task.
         self.shared_views.blocked =
-            super::shared_views::blocked_managed_view_scopes(&model, &model.views);
-        let display_index = crate::workspace_model::views::ManagedDisplayIndex::new(&model);
+            super::shared_views::blocked_managed_view_scopes(&model, &model.views, history);
+        let display_index =
+            crate::workspace_model::views::ManagedDisplayIndex::with_history(&model, history);
         let mut new_managed_panes = Vec::new();
         for agent in &model.agents {
             // Scheduled agents stay headless until an explicit history or
@@ -1075,7 +1084,7 @@ impl Cagents {
         // Fence canonical evidence and finish projecting authoritative pane
         // sources before reconciliation persists. Publishing earlier would mix
         // old descriptors with newly received pending-start flags.
-        tasks.push(self.reconcile_shared_views());
+        tasks.push(self.reconcile_shared_views_with_history(history));
         if changed {
             self.refresh_sidebar_channels();
             tasks.push(self.sync_chrome());
@@ -1087,11 +1096,17 @@ impl Cagents {
 
     /// Adoption records the daemon's exact descriptor without launching a
     /// replacement, switching channels, or taking focus from current work.
+    #[cfg(test)]
     pub(super) fn adopt_execution_agent(
         &mut self,
         agent: &crate::agent_execution::Agent,
     ) -> Option<Task<Message>> {
-        let display = crate::workspace_model::views::managed_display(&self.workspace_model, agent)?;
+        let history = crate::upgrade::floor::load().ok();
+        let display = crate::workspace_model::views::ManagedDisplayIndex::with_history(
+            &self.workspace_model,
+            history.as_ref(),
+        )
+        .resolve(agent)?;
         self.adopt_execution_agent_display(agent, display)
     }
 

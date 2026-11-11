@@ -79,9 +79,10 @@ fn can_retry_source_fields(before: &Pane, current: &Pane) -> bool {
 pub(super) fn blocked_managed_view_scopes(
     model: &crate::workspace_model::WorkspaceModel,
     views: &[View],
+    history: Option<&crate::upgrade::floor::Ledger>,
 ) -> HashSet<Scope> {
     let mut blocked = HashSet::new();
-    let display_index = views::ManagedDisplayIndex::new(model);
+    let display_index = views::ManagedDisplayIndex::with_history(model, history);
     let managed = model
         .agents
         .iter()
@@ -1669,6 +1670,14 @@ impl Cagents {
     }
 
     pub(super) fn reconcile_shared_views(&mut self) -> Task<Message> {
+        let history = crate::upgrade::floor::load().ok();
+        self.reconcile_shared_views_with_history(history.as_ref())
+    }
+
+    pub(super) fn reconcile_shared_views_with_history(
+        &mut self,
+        history: Option<&crate::upgrade::floor::Ledger>,
+    ) -> Task<Message> {
         self.publish_unpublished_local_chats();
         // A watcher snapshot can announce the destination before the explicit
         // transfer response arrives. Rebase before either snapshot projects.
@@ -1741,7 +1750,7 @@ impl Cagents {
             .iter()
             .flat_map(|view| view.panes.iter().map(|pane| pane.id))
             .collect::<HashSet<_>>();
-        self.prepare_shared_aliases(&views, &owned);
+        self.prepare_shared_aliases(&views, &owned, history);
         // Root discovery is immutable during this projection, so index it once
         // over owned paths that outlive each mutable view update. Keep only
         // owned card paths too, and refresh the panes each view changes before
@@ -1836,15 +1845,21 @@ impl Cagents {
                 tasks.push(self.add_default_pane(path, settings::DefaultPane::Terminal));
             }
         }
-        self.reproject_notification_unread();
+        self.reproject_notification_unread_with_history(history);
         tasks.push(self.release_held_terminals());
         // Restored shared panes queued for an attach wait for the registry.
         tasks.push(self.attach_next_restored_agent());
         Task::batch(tasks)
     }
 
-    fn prepare_shared_aliases(&mut self, views: &[View], owned: &HashSet<CardId>) {
-        self.shared_views.blocked = blocked_managed_view_scopes(&self.workspace_model, views);
+    fn prepare_shared_aliases(
+        &mut self,
+        views: &[View],
+        owned: &HashSet<CardId>,
+        history: Option<&crate::upgrade::floor::Ledger>,
+    ) {
+        self.shared_views.blocked =
+            blocked_managed_view_scopes(&self.workspace_model, views, history);
         let mut attention_owners: HashMap<_, usize> = HashMap::new();
         for pane in views.iter().flat_map(|view| &view.panes) {
             if let Some(resource) = attention_resource(&pane.kind) {
