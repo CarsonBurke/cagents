@@ -415,17 +415,74 @@ fn committed_upgrade_shutdown_preserves_real_native_owner_even_if_final_save_fai
                     .is_none(),
                 "old-alias retry must retire the exact current adopted authority too"
             );
+            let final_proof = restarted.lock().unwrap().proof().clone();
+            assert!(
+                crate::chat::native_holder::closed_source(&source, &final_proof)
+                    .unwrap()
+                    .is_some(),
+                "the exact issued source retains its completed close proof"
+            );
             let mut unrelated = source;
             unrelated.launch.session_id = Some("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".into());
             assert!(
+                crate::chat::native_holder::closed_source(&unrelated, &final_proof)
+                    .unwrap()
+                    .is_none(),
+                "a close receipt must not authorize a changed conversation"
+            );
+            let receipts = || {
+                let mut files = fs::read_dir(registry::directory(Kind::Native).unwrap())
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "closed"))
+                    .map(|entry| (entry.file_name(), fs::read(entry.path()).unwrap()))
+                    .collect::<Vec<_>>();
+                files.sort_by(|a, b| a.0.cmp(&b.0));
+                files
+            };
+            let receipts_before = receipts();
+            assert!(!receipts_before.is_empty());
+            let authority_before = serde_json::to_vec(
+                &execution
+                    .lock()
+                    .unwrap()
+                    .retained_agent_authority_source(id)
+                    .unwrap(),
+            )
+            .unwrap();
+            let model_before =
+                serde_json::to_vec(&execution.lock().unwrap().model().unwrap()).unwrap();
+            // The pane's Close may independently acknowledge a no-op once
+            // every owner and delegated capability is gone. That is not
+            // permission to borrow another conversation's retained receipt.
+            assert!(matches!(
                 super::super::client::process_request(
                     &restarted,
                     0,
                     crate::terminal::ipc::ClientRequest::ChatCloseRetained { session: unrelated }
                 )
-                .is_err(),
-                "a close receipt must not authorize a changed conversation"
+                .unwrap()
+                .0,
+                crate::terminal::ipc::ServerResponse::Accepted
+            ));
+            assert_eq!(receipts(), receipts_before);
+            assert_eq!(
+                serde_json::to_vec(
+                    &execution
+                        .lock()
+                        .unwrap()
+                        .retained_agent_authority_source(id)
+                        .unwrap()
+                )
+                .unwrap(),
+                authority_before
             );
+            assert_eq!(
+                serde_json::to_vec(&execution.lock().unwrap().model().unwrap()).unwrap(),
+                model_before
+            );
+            assert!(restarted.lock().unwrap().chats.is_empty());
+            assert!(!record.root.is_current() && !record.holder.is_current());
         } else {
             // Model the already-published failed local adapter from an older
             // daemon: closing it must also reclaim the independently retained
