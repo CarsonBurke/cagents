@@ -102,6 +102,71 @@ class UsageResetFixture(unittest.TestCase):
         self.assertEqual(self.claim("account-fixture", "another-key")[1]["result"], "already_used")
         self.assertEqual(self.read(self.claude)["consume_count"], 1)
 
+    def test_next_grant_selection_preserves_state_and_service_rejects_the_other_scope(self):
+        before = self.read(self.claude)
+        server = FIXTURE.server(self.root)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        self.addCleanup(connection.close)
+        headers = {"Authorization": f"Bearer {FIXTURE.FAKE_TOKEN}", "Content-Type": "application/json"}
+        for name, identifier, other, scopes in (
+                ("account", "account-fixture", "fable-fixture", ["five_hour", "seven_day"]),
+                ("fable", "fable-fixture", "account-fixture", ["seven_day_overage_included"])):
+            with self.subTest(selection=name):
+                FIXTURE.configure_next_grant(self.root, name)
+                expected = json.loads(json.dumps(before))
+                expected["usage"]["rate_limits"]["cedar_ember"]["next_grant_id"] = identifier
+                self.assertEqual(self.read(self.claude), expected)
+                connection.request("GET", "/api/oauth/usage?cedar_ember=1&skip_spend=1", headers=headers)
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                program = json.loads(response.read())["cedar_ember"]
+                self.assertEqual(program["next_grant_id"], identifier)
+                selected = next(item for item in program["grants"] if item["id"] == identifier)
+                self.assertEqual(selected["clears"], scopes)
+                self.assertEqual([item["resets_left"] for item in program["grants"]], [2, 1])
+                connection.request("POST", f"/api/organizations/{FIXTURE.ORGANIZATION}/reset_rate_limits",
+                                   json.dumps({"program": "cedar_ember", "grant_id": other,
+                                               "request_id": f"wrong-scope-{name}"}), headers=headers)
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(json.loads(response.read()), {"result": "ineligible", "reason": "not_next_grant"})
+                self.assertEqual(self.read(self.claude), expected)
+
+    def test_next_grant_selection_refuses_invalid_unmarked_or_unavailable_state(self):
+        before = self.read(self.claude)
+        with self.assertRaisesRegex(ValueError, "unknown next fixture grant"):
+            FIXTURE.configure_next_grant(self.root, "invent-another-grant")
+        self.assertEqual(self.read(self.claude), before)
+        (self.root / ".cagents-reset-fixture").unlink()
+        with self.assertRaisesRegex(ValueError, "private fixture marker"):
+            FIXTURE.configure_next_grant(self.root, "account")
+        self.assertEqual(self.read(self.claude), before)
+        for unavailable in ("missing", "exhausted", "paused", "unusable", "ineligible"):
+            with self.subTest(unavailable=unavailable), tempfile.TemporaryDirectory(prefix="usage-reset-grant-") as directory:
+                root = Path(directory)
+                FIXTURE.seed(root)
+                home = root / "home/.claude"
+                with FIXTURE.state_file(home) as state:
+                    program = state["usage"]["rate_limits"]["cedar_ember"]
+                    selected = next(item for item in program["grants"] if item["id"] == "account-fixture")
+                    if unavailable == "missing":
+                        program["grants"].remove(selected)
+                    elif unavailable == "exhausted":
+                        selected["resets_left"] = 0
+                    elif unavailable == "paused":
+                        selected["paused"] = True
+                    elif unavailable == "unusable":
+                        selected["usable_now"] = False
+                    else:
+                        program["eligible"] = False
+                before = self.read(home)
+                with self.assertRaisesRegex(ValueError, "fixture grant is unavailable"):
+                    FIXTURE.configure_next_grant(root, "account")
+                self.assertEqual(self.read(home), before)
+
     def test_codex_no_credit_and_same_key_replay(self):
         params = {"idempotencyKey": "codex-key"}
         first = FIXTURE.consume_codex(self.codex, params)

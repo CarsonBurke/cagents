@@ -4,7 +4,7 @@
 set -euo pipefail
 here=$(cd -- "$(dirname -- "$0")/../.." && pwd)
 evidence() { "${CAGENTS_EVIDENCE_TOOL:-$here/scripts/native-evidence}" "$@"; }
-command=${1:?usage: usage-reset-scene.sh seed|serve|mode PROVIDER MODE|plan NAME}
+command=${1:?usage: usage-reset-scene.sh seed|serve|mode PROVIDER MODE|plan NAME|next-grant NAME}
 case $command in
     seed)
         evidence env sh -c 'exec /usr/bin/python3 "$1" seed "$CAGENTS_EVIDENCE_FIXTURE"' sh "$here/tests/fixtures/usage-reset-fixture.py"
@@ -42,6 +42,11 @@ case $command in
         plan=${2:?name pro, max5x, max20x, ultra or unknown}
         evidence env sh -c 'exec /usr/bin/python3 "$1" plan "$CAGENTS_EVIDENCE_FIXTURE" "$2"' sh \
             "$here/tests/fixtures/usage-reset-fixture.py" "$plan"
+        ;;
+    next-grant)
+        grant=${2:?name fable or account}
+        evidence env sh -c 'exec /usr/bin/python3 "$1" next-grant "$CAGENTS_EVIDENCE_FIXTURE" "$2"' sh \
+            "$here/tests/fixtures/usage-reset-fixture.py" "$grant"
         ;;
     *) echo "unknown reset scene command: $command" >&2; exit 2 ;;
 esac

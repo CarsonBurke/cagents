@@ -404,6 +404,23 @@ def configure(root, provider, mode):
                 credit["status"] = "redeemed"
 
 
+def configure_next_grant(root, name):
+    identifiers = {"fable": "fable-fixture", "account": "account-fixture"}
+    if name not in identifiers:
+        raise ValueError("unknown next fixture grant: use fable or account")
+    root = private_directory(root)
+    marker = root / ".cagents-reset-fixture"
+    if not marker.is_file() or marker.is_symlink():
+        raise ValueError("grant selection requires the private fixture marker")
+    with state_file(root / "home/.claude") as state:
+        program = state["usage"]["rate_limits"]["cedar_ember"]
+        item = next((item for item in program["grants"] if item["id"] == identifiers[name]), None)
+        if (not program.get("eligible") or item is None or item["resets_left"] <= 0
+                or not item.get("usable_now") or item.get("paused")):
+            raise ValueError("selected fixture grant is unavailable")
+        program["next_grant_id"] = item["id"]
+
+
 def configure_plan(root, name):
     if name not in PLAN_VARIANTS:
         raise ValueError("unknown fixture plan: use pro, max5x, max20x, ultra or unknown")
@@ -441,7 +458,7 @@ def configure_plan(root, name):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("seed", "serve", "mode", "plan"))
+    parser.add_argument("command", choices=("seed", "serve", "mode", "plan", "next-grant"))
     parser.add_argument("root", type=Path)
     parser.add_argument("provider", nargs="?")
     parser.add_argument("mode", nargs="?")
@@ -452,6 +469,8 @@ def main():
         configure(args.root, args.provider, args.mode)
     elif args.command == "plan":
         configure_plan(args.root, args.provider)
+    elif args.command == "next-grant":
+        configure_next_grant(args.root, args.provider)
     else:
         http = server(args.root)
         print(json.dumps({"url": f"http://127.0.0.1:{http.server_port}",

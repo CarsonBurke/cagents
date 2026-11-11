@@ -252,6 +252,13 @@ Codex then fails a turn only while ordinary usage is blocked; after a fake
 reset it emits an ordinary completed assistant reply, so the native flow can
 verify that work continues. Mode changes share the service's state lock.
 
+For Claude scope confirmations, `usage-reset-scene.sh next-grant fable|account`
+selects one of the two existing grants as the next eligible grant. The account
+grant clears both Session and Weekly; the Fable grant clears only its model
+window. The selector preserves usage, counts, claims and identity, and rejects
+missing, exhausted, paused or unusable grants. It does not submit a consume;
+the service continues to reject a consume for any grant that is not next.
+
 For Claude plan-label evidence, `usage-reset-scene.sh plan NAME` accepts
 `pro`, `max5x`, `max20x`, `ultra` or `unknown`. It changes the fake profile's
 `organization.plan_display_name`, its tier/type metadata, the debug marker's
