@@ -349,6 +349,11 @@ fn paused_history_notification_attaches_without_execution_and_preserves_live_gua
         let destination = ChannelId::new();
         let mut local = app.durable.channels[0].clone();
         local.id = destination;
+        // This template is now populated, unlike the pre-adoption fixture.
+        // A fresh destination must not duplicate the source's membership:
+        // doing so correctly makes adoption consider it already in place.
+        local.cards.clear();
+        local.focused = None;
         Arc::make_mut(&mut app.durable).channels.push(local);
         let mut shared = app.workspace_model.channels[0].clone();
         shared.id = destination;
@@ -356,16 +361,43 @@ fn paused_history_notification_attaches_without_execution_and_preserves_live_gua
         app.workspace_model.views[0].scope =
             crate::agent_execution::Placement::Channel(destination);
         app.workspace_model.sequence += 1;
+        assert_eq!(
+            app.durable
+                .channels
+                .iter()
+                .filter(|channel| channel.cards.contains(&card))
+                .map(|channel| channel.id)
+                .collect::<Vec<_>>(),
+            [agent.channel().unwrap()],
+            "only the source owns the card before the authoritative move"
+        );
         drop(app.update_notifications(Action::Activated(Target::Session(source.id))));
         assert_eq!(app.durable.active_channel, Some(destination));
         assert_eq!(app.workspace.focused(), Some(card));
-        assert_eq!(*daemon.attached.lock().unwrap(), [reader]);
-        assert!(daemon.forbidden.lock().unwrap().is_empty());
+        assert_eq!(
+            app.durable
+                .channels
+                .iter()
+                .filter(|channel| channel.cards.contains(&card))
+                .map(|channel| channel.id)
+                .collect::<Vec<_>>(),
+            [destination],
+            "adoption must transfer membership rather than duplicate it"
+        );
+        assert_eq!(app.workspace_model.agents, [original_agent], "{case}");
+        let attached = daemon.attached.clone();
+        let forbidden = daemon.forbidden.clone();
+        // Include requests observed while the real client and fixture finish,
+        // rather than inspecting counters before background readers stop.
+        drop(app);
+        drop(daemon);
+        assert_eq!(*attached.lock().unwrap(), [reader]);
+        assert!(forbidden.lock().unwrap().is_empty());
     } else {
         drop(task);
         assert_eq!(*app.durable, *before, "{case}");
         assert!(!app.chat_start_pending(card), "{case}");
         assert!(!app.cards.contains_key(&card), "{case}");
+        assert_eq!(app.workspace_model.agents, [original_agent], "{case}");
     }
-    assert_eq!(app.workspace_model.agents, [original_agent], "{case}");
 }
