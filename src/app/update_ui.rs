@@ -417,6 +417,7 @@ impl Cagents {
                     widget::selectable_text(item.label.as_str())
                         .size(design::TEXT_HEADING)
                         .font(design::heading_font())
+                        .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
                         .width(Length::Fill)
                         .into(),
                     notice_detail(stop_activity(item.kind, &item.running)),
