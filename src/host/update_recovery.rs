@@ -29,15 +29,26 @@ pub(super) fn restore_settled_from(
     // startup before any adoption. Every presentation
     // was already handled before the outcome became settled; a cold restart
     // must not undo a later genuine pane close.
-    let mut paused = paused_record(
+    let mut history = paused_record(
         settled.source.clone(),
         &settled.census,
-        &settled.paused_chats,
-        settled.paused_terminals.clone(),
+        &settled
+            .census
+            .chats
+            .iter()
+            .map(|chat| chat.id)
+            .collect::<Vec<_>>(),
+        Vec::new(),
     )?;
-    for presentation in &mut paused.presentations {
+    retain_settled_aliases(host, &settled, &mut history)?;
+    for presentation in &mut history.presentations {
         presentation.restored = true;
     }
+    let paused = history_subset(
+        &history,
+        &settled.paused_chats,
+        settled.paused_terminals.clone(),
+    );
     paused.save()?;
     host.lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -91,15 +102,7 @@ pub(super) fn restore_settled_from(
         .filter(|chat| !chats.contains(&chat.id))
         .map(|chat| chat.id)
         .collect();
-    let mut paused = paused_record(
-        settled.source,
-        &settled.census,
-        &paused_chats,
-        paused_terminals.clone(),
-    )?;
-    for presentation in &mut paused.presentations {
-        presentation.restored = true;
-    }
+    let paused = history_subset(&history, &paused_chats, paused_terminals.clone());
     paused.save()?;
     host.lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -116,6 +119,170 @@ pub(super) fn restore_settled_from(
             )?;
     }
     Ok(true)
+}
+
+fn history_subset(
+    history: &crate::upgrade::floor::Record,
+    ids: &[crate::model::TerminalId],
+    terminals: Vec<crate::model::TerminalId>,
+) -> crate::upgrade::floor::Record {
+    let mut record = history.clone();
+    record.chats.retain(|chat| ids.contains(&chat.id));
+    record
+        .snapshots
+        .retain(|snapshot| ids.contains(&snapshot.source.id));
+    record.aliases.retain(|alias| ids.contains(&alias.id));
+    record
+        .presentations
+        .retain(|presentation| ids.contains(&presentation.session.id));
+    record.terminals = terminals;
+    record
+}
+
+/// Capture display aliases before orphan reconciliation can retire a missing
+/// holder. The settled receipt bounds the immutable recipe; the registry is
+/// read in one snapshot and neither Agents nor execution authorities change.
+fn retain_settled_aliases(
+    host: &SharedHost,
+    settled: &recovery::AlreadyRecovered,
+    history: &mut crate::upgrade::floor::Record,
+) -> Result<(), String> {
+    use crate::agent_execution::HostedSession;
+    let mut ledger = crate::upgrade::floor::load()?;
+    // Preserve a previously confirmed identity across successive cold starts.
+    for known in &mut history.chats {
+        if known.launch.session_id.is_none()
+            && let Some(previous) = ledger
+                .records
+                .iter()
+                .filter(|record| record.source == history.source)
+                .flat_map(|record| &record.chats)
+                .find(|previous| {
+                    let mut bound = known.clone();
+                    bound.launch.session_id = previous.launch.session_id.clone();
+                    bound == **previous
+                })
+        {
+            bind_history_identity(
+                known,
+                &mut history.snapshots,
+                &mut history.aliases,
+                previous.launch.session_id.clone(),
+            );
+        }
+    }
+    let registry = super::agent_execution::registry(host)?;
+    let model = registry.lock().unwrap_or_else(|p| p.into_inner()).model()?;
+    // Reconstruct exact read-only display lineage even when its disk index was
+    // pruned. These proposals are action-local evidence, never saved until a
+    // unique canonical pane also matches. Only the durable Agent can supply a
+    // conversation identity missing from the immutable checkpoint.
+    let mut proposed = history.clone();
+    for agent in model.agents.iter().filter(|agent| !agent.closed) {
+        let Some(HostedSession::Chat(current)) = &agent.session else {
+            continue;
+        };
+        let Some(known) = proposed
+            .chats
+            .iter_mut()
+            .find(|known| known.id == current.id)
+        else {
+            continue;
+        };
+        if !settled.history_alias(known, agent.id, current) {
+            continue;
+        }
+        if known.launch.session_id.is_none() {
+            bind_history_identity(
+                known,
+                &mut proposed.snapshots,
+                &mut proposed.aliases,
+                current.launch.session_id.clone(),
+            );
+        }
+        if !proposed.aliases.contains(current) {
+            proposed.aliases.push(current.clone());
+        }
+    }
+    ledger.records.push(proposed);
+    let index =
+        crate::workspace_model::views::ManagedDisplayIndex::with_history(&model, Some(&ledger));
+    for agent in &model.agents {
+        if agent.closed {
+            continue;
+        }
+        let Some(HostedSession::Chat(current)) = &agent.session else {
+            continue;
+        };
+        let Some(known) = history
+            .chats
+            .iter_mut()
+            .find(|known| known.id == current.id)
+        else {
+            continue;
+        };
+        if !settled.history_alias(known, agent.id, current) {
+            continue;
+        }
+        let Some(display) = index.resolve(agent) else {
+            continue;
+        };
+        let Some(pane) = display.pane else { continue };
+        if known.launch.session_id.is_none() {
+            bind_history_identity(
+                known,
+                &mut history.snapshots,
+                &mut history.aliases,
+                current.launch.session_id.clone(),
+            );
+        }
+        if !history.aliases.contains(current) {
+            history.aliases.push(current.clone());
+        }
+        if let crate::model::CardKind::Chat(alias) = pane.kind {
+            let mut bound = alias.clone();
+            if bound.launch.session_id.is_none() {
+                bound.launch.session_id = current.launch.session_id.clone();
+            }
+            if ((bound.launch.session_id == current.launch.session_id
+                && settled.history_alias(known, agent.id, &bound))
+                || ledger.history_replacement(current, &alias))
+                && !history.aliases.contains(&alias)
+            {
+                history.aliases.push(alias);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn bind_history_identity(
+    known: &mut crate::chat::Session,
+    snapshots: &mut [crate::upgrade::floor::StoppedSnapshot],
+    aliases: &mut Vec<crate::chat::Session>,
+    identity: Option<String>,
+) {
+    if identity.is_none() || known.launch.session_id == identity {
+        return;
+    }
+    let original = known.clone();
+    known.launch.session_id = identity.clone();
+    for snapshot in snapshots
+        .iter_mut()
+        .filter(|snapshot| snapshot.source == original)
+    {
+        snapshot.source = known.clone();
+        snapshot.snapshot.session_id = identity.clone();
+        if let Some(limitation) = &mut snapshot.limitation {
+            *limitation = limitation.replace(
+                "No conversation identity was recorded; start a new conversation explicitly to continue.",
+                "The conversation identity was confirmed after capture. Resume explicitly to inspect whether it can continue.",
+            );
+        }
+    }
+    if !aliases.contains(&original) {
+        aliases.push(original);
+    }
 }
 
 /// Returns true only for the one startup carrying a validated recovery receipt.
@@ -334,7 +501,7 @@ mod tests {
             name: None,
             origin: crate::agent_execution::Origin::User,
             spec: crate::agent_execution::Spec {
-                provider: crate::agent::Provider::Codex,
+                provider: alias.launch.provider,
                 account: None,
                 target: crate::agent_execution::Target {
                     repository: directory.to_owned(),
@@ -403,6 +570,29 @@ mod tests {
 
     #[test]
     fn settled_prepared_restart_restores_history_without_replaying_its_provider() {
+        settled_restart_case(false, false, false);
+    }
+
+    #[test]
+    fn settled_prepared_restart_keeps_the_latest_adopted_chat_as_a_history_alias() {
+        settled_restart_case(true, false, false);
+    }
+
+    #[test]
+    fn settled_prepared_restart_keeps_identity_confirmed_after_capture() {
+        settled_restart_case(true, true, false);
+    }
+
+    #[test]
+    fn settled_prepared_restart_rejects_identity_guessed_by_a_pane() {
+        settled_restart_case(true, true, true);
+    }
+
+    fn settled_restart_case(
+        previously_adopted: bool,
+        confirmed_after_capture: bool,
+        unconfirmed: bool,
+    ) {
         use sha2::{Digest, Sha256};
         use std::os::unix::fs::PermissionsExt;
 
@@ -446,7 +636,12 @@ mod tests {
         };
         let provider_dir = root.join("provider");
         crate::secure_file::prepare_private_directory(&provider_dir).unwrap();
-        let provider = provider_dir.join("codex");
+        let provider_kind = if previously_adopted {
+            crate::agent::Provider::Claude
+        } else {
+            crate::agent::Provider::Codex
+        };
+        let provider = provider_dir.join(provider_kind.executable());
         let sentinel = root.join("provider-was-replayed");
         fs::write(
             &provider,
@@ -457,10 +652,14 @@ mod tests {
         let mut source = Session {
             id: TerminalId::new(),
             launch: chat::Launch {
-                provider: crate::agent::Provider::Codex,
+                provider: provider_kind,
                 recipe: LaunchRecipe {
                     program: provider.to_string_lossy().into_owned(),
-                    arguments: vec!["--remote".into(), "unix://".into()],
+                    arguments: if previously_adopted {
+                        Vec::new()
+                    } else {
+                        vec!["--remote".into(), "unix://".into()]
+                    },
                     working_directory: root.join("project"),
                     environment: [(
                         "CAGENTS_RECOVERY_SENTINEL".into(),
@@ -474,11 +673,23 @@ mod tests {
             proof: Some(proof("source")),
             terminal: None,
             owned_codex_listener: None,
-            native_continuity: Default::default(),
+            native_continuity: if previously_adopted {
+                chat::NativeContinuity::RetainedClaudeActor { protocol: 2 }
+            } else {
+                Default::default()
+            },
         };
-        assert!(source.claim_owned_codex_listener(&root.join("run"), &proof("source")));
-        let alias = source.clone();
-        source.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        if !previously_adopted {
+            assert!(source.claim_owned_codex_listener(&root.join("run"), &proof("source")));
+        }
+        let mut alias = source.clone();
+        let confirmed = (!unconfirmed).then(|| uuid::Uuid::new_v4().to_string());
+        if !confirmed_after_capture {
+            source.launch.session_id = confirmed.clone();
+        }
+        if previously_adopted {
+            alias = source.clone();
+        }
         let mut snapshots = recovery::SnapshotCapture::default();
         snapshots
             .push(
@@ -506,7 +717,7 @@ mod tests {
             .data_dir()
             .join("workspace-model.sqlite3");
         let (registry, pane) = seed_managed_pane(&registry_path, &root.join("project"), &alias);
-        let original_agent = registry.agent_for_session(source.id).unwrap().unwrap();
+        let mut original_agent = registry.agent_for_session(source.id).unwrap().unwrap();
         let mut presentation =
             crate::upgrade::floor::Record::new(proof("source"), vec![source.clone()], Vec::new());
         registry.capture_update_floor(&mut presentation).unwrap();
@@ -578,11 +789,16 @@ mod tests {
             }],
             blockers: Vec::new(),
         };
+        let (adopted_chats, paused_chats) = if previously_adopted {
+            (vec![source.id], Vec::new())
+        } else {
+            (Vec::new(), vec![source.id])
+        };
         let settled = serde_json::json!({
             "version":2, "job":job, "request_identity":hash(&serde_json::to_vec(&reviewed).unwrap()),
             "job_request_hash":hash(&request), "reviewed":reviewed, "source":proof("source"),
             "checkpoint_hash":checkpoint_hash, "census":census,
-            "adopted_terminals":[], "adopted_chats":[], "paused_terminals":[], "paused_chats":[source.id],
+            "adopted_terminals":[], "adopted_chats":adopted_chats, "paused_terminals":[], "paused_chats":paused_chats,
             "settled":true, "successor":proof("first-recovery"),
             "target":daemon_binary, "target_hash":hash(&fs::read(&daemon_binary).unwrap()),
         });
@@ -594,7 +810,110 @@ mod tests {
             fs::set_permissions(&outcome, fs::Permissions::from_mode(0o600)).unwrap();
         };
         write_outcome(&settled);
+        let settled_bytes = fs::read(&outcome).unwrap();
         let mut requested = alias.clone();
+        if previously_adopted {
+            requested = source.clone();
+            requested.launch.session_id = confirmed.clone();
+            requested.proof = Some(proof("first-recovery"));
+            let mut registry = super::super::model::Registry::open().unwrap();
+            assert!(
+                registry
+                    .adopt_authenticated_agent_session(
+                        &[crate::agent_execution::HostedSession::Chat(alias.clone())],
+                        &crate::agent_execution::HostedSession::Chat(requested.clone()),
+                    )
+                    .unwrap()
+            );
+            original_agent = registry.agent_for_session(source.id).unwrap().unwrap();
+            assert_eq!(
+                original_agent.session,
+                Some(crate::agent_execution::HostedSession::Chat(
+                    requested.clone()
+                ))
+            );
+            let mutations: [fn(&mut Session); 4] = [
+                |session| session.launch.session_id = Some("unrelated-conversation".into()),
+                |session| session.native_continuity = Default::default(),
+                |session| {
+                    session
+                        .launch
+                        .recipe
+                        .arguments
+                        .push("changed-recipe".into())
+                },
+                |session| session.proof = None,
+            ];
+            let classified = recovery::classify_retained_prepared(&store.path, &daemon_binary)
+                .unwrap()
+                .unwrap();
+            let replace_pane =
+                |registry: &mut super::super::model::Registry,
+                 replacement: crate::workspace_model::views::Pane| {
+                    let model = registry.model().unwrap();
+                    let view = model
+                        .views
+                        .iter()
+                        .find(|view| view.scope == original_agent.placement)
+                        .unwrap();
+                    let before = view
+                        .panes
+                        .iter()
+                        .find(|pane| pane.id == replacement.id)
+                        .unwrap()
+                        .clone();
+                    registry
+                        .apply(&crate::workspace_model::ModelEdit::ChangeView {
+                            scope: view.scope.clone(),
+                            expected_revision: view.revision,
+                            operation: uuid::Uuid::new_v4(),
+                            change: crate::workspace_model::views::Change::Update {
+                                before,
+                                pane: replacement,
+                            },
+                        })
+                        .unwrap();
+                };
+            for mutate in mutations {
+                let mut invalid = requested.clone();
+                mutate(&mut invalid);
+                let mut replaced = pane.clone();
+                replaced.kind = crate::model::CardKind::Chat(invalid.clone());
+                replace_pane(&mut registry, replaced);
+                let mut initial = state::HostState::new(proof("alias-validation"));
+                initial.install_model(super::super::model::Registry::open().unwrap());
+                let host = Arc::new(state::HostLock::new(initial));
+                let mut captured = paused_record(
+                    proof("source"),
+                    &classified.census,
+                    &[source.id],
+                    Vec::new(),
+                )
+                .unwrap();
+                retain_settled_aliases(&host, &classified, &mut captured).unwrap();
+                assert!(!captured.aliases.contains(&invalid));
+                assert_eq!(
+                    registry.agent_for_session(source.id).unwrap(),
+                    Some(original_agent.clone())
+                );
+            }
+            let mut current_pane = pane.clone();
+            let mut saved = requested.clone();
+            if confirmed_after_capture {
+                saved.launch.session_id = None;
+            }
+            current_pane.kind = crate::model::CardKind::Chat(saved);
+            replace_pane(&mut registry, current_pane);
+        }
+        if unconfirmed {
+            // The pane mutations above cannot invent a conversation for an
+            // unconfirmed Agent. The normal client intentionally asks for a
+            // fresh conversation in this case rather than attaching a writer.
+            assert!(!sentinel.exists());
+            assert_eq!(fs::read(&store.path).unwrap(), checkpoint);
+            assert_eq!(fs::read(&outcome).unwrap(), settled_bytes);
+            return;
+        }
         for epoch in ["cold-start", "subsequent-restart"] {
             let mut initial = state::HostState::new(proof(epoch));
             initial.install_model(super::super::model::Registry::open().unwrap());
@@ -609,18 +928,45 @@ mod tests {
             let server_host = host.clone();
             let server =
                 std::thread::spawn(move || super::super::client::serve(server, 1, server_host));
-            let client =
-                chat::client::ClientHandle::fixture_restore(client, requested.clone()).unwrap();
+            let client = match chat::client::ClientHandle::fixture_restore(
+                client,
+                requested.clone(),
+            ) {
+                Ok(client) => client,
+                Err(failure) => {
+                    host.lock().unwrap().register_client(2);
+                    let indexed = crate::upgrade::floor::load()
+                        .unwrap()
+                        .resume_source(&requested)
+                        .is_some();
+                    let resolution =
+                        super::super::chat::upgrade_resolution::resolve(&host, 2, &requested);
+                    panic!(
+                        "real client restore failed: {failure:?}; exact alias indexed={indexed}; direct resolution={resolution:?}"
+                    );
+                }
+            };
             requested = client.session();
-            assert_eq!(requested.launch.session_id, source.launch.session_id);
+            assert_eq!(requested.launch.session_id, confirmed);
             assert_eq!(requested.proof, Some(proof(epoch)));
             let handle = host.lock().unwrap().chats[&source.id].handle.clone();
             let page = handle.snapshot(None).unwrap();
             assert!(page.exited && page.read_only_reason.is_some());
+            if confirmed_after_capture && confirmed.is_some() {
+                assert_eq!(page.session_id, confirmed);
+                assert!(
+                    !page
+                        .read_only_reason
+                        .as_ref()
+                        .unwrap()
+                        .contains("No conversation identity")
+                );
+            }
             assert!(page.items.iter().any(|item| matches!(&item.content, chat::ItemContent::Text { text, .. } if text == "The captured page survived")));
             assert!(handle.is_read_only_history() && !handle.owns_work());
             assert!(!sentinel.exists());
             assert_eq!(fs::read(&store.path).unwrap(), checkpoint);
+            assert_eq!(fs::read(&outcome).unwrap(), settled_bytes);
             let registry = super::super::model::Registry::open().unwrap();
             assert_eq!(
                 registry.agent_for_session(source.id).unwrap(),
@@ -632,6 +978,36 @@ mod tests {
             handle.close().unwrap();
             drop(client);
             server.join().unwrap();
+            if previously_adopted && epoch == "cold-start" {
+                let mut registry = super::super::model::Registry::open().unwrap();
+                let model = registry.model().unwrap();
+                let view = model
+                    .views
+                    .iter()
+                    .find(|view| view.scope == original_agent.placement)
+                    .unwrap();
+                let before = view
+                    .panes
+                    .iter()
+                    .find(|current| current.id == pane.id)
+                    .unwrap()
+                    .clone();
+                let mut replacement = before.clone();
+                replacement.kind = crate::model::CardKind::Chat(requested.clone());
+                registry
+                    .apply(&crate::workspace_model::ModelEdit::ChangeView {
+                        scope: view.scope.clone(),
+                        expected_revision: view.revision,
+                        operation: uuid::Uuid::new_v4(),
+                        change: crate::workspace_model::views::Change::Update {
+                            before,
+                            pane: replacement,
+                        },
+                    })
+                    .unwrap();
+                crate::upgrade::floor::prune_unreferenced(&BTreeSet::new()).unwrap();
+                assert!(crate::upgrade::floor::load().unwrap().records.is_empty());
+            }
         }
         for changed in [
             "unsettled",
@@ -646,7 +1022,10 @@ mod tests {
                 "unsettled" => invalid["settled"] = false.into(),
                 "hash" => invalid["checkpoint_hash"] = "0".repeat(64).into(),
                 "source" => invalid["source"]["host_incarnation"] = "foreign".into(),
-                "inventory" => invalid["paused_chats"] = serde_json::json!([]),
+                "inventory" => {
+                    invalid["paused_chats"] = serde_json::json!([]);
+                    invalid["adopted_chats"] = serde_json::json!([]);
+                }
                 "request" => invalid["job_request_hash"] = "0".repeat(64).into(),
                 "target" => invalid["target_hash"] = "0".repeat(64).into(),
                 _ => unreachable!(),

@@ -3858,6 +3858,8 @@ pub(super) fn resolve_upgrade(
     host: &SharedHost,
     source: &Session,
 ) -> Result<Session, ProtocolError> {
+    let stopped_history =
+        crate::upgrade::floor::load().is_ok_and(|ledger| ledger.resume_source(source).is_some());
     let (sources, evidence, session) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let record = state.chats.get(&source.id).ok_or_else(|| unavailable(
@@ -3865,8 +3867,7 @@ pub(super) fn resolve_upgrade(
                 "The exact upgraded provider is unavailable. Its recovery evidence was retained; reopen this conversation from the provider's saved sessions."
             )))?;
         if !record.handle.owns_work()
-            && !((source.is_saved_claude_history()
-                || crate::upgrade::floor::load().is_ok_and(|ledger| ledger.blocks_chat(source)))
+            && !((stopped_history || source.is_saved_claude_history())
                 && record.handle.is_read_only_history())
         {
             return Err(unavailable(

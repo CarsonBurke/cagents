@@ -1300,6 +1300,75 @@ pub(crate) struct AlreadyRecovered {
     pub census: Census,
     pub paused_terminals: Vec<TerminalId>,
     pub paused_chats: Vec<TerminalId>,
+    target: PathBuf,
+}
+
+impl AlreadyRecovered {
+    /// Saved display lineage for an owner previously adopted by this outcome.
+    /// This comparison neither authenticates a live worker nor permits dispatch.
+    pub(crate) fn history_alias(
+        &self,
+        known: &Session,
+        agent: crate::model::AgentId,
+        candidate: &Session,
+    ) -> bool {
+        let Some(proof) = candidate.proof.as_ref().filter(|proof| proof.is_complete()) else {
+            return false;
+        };
+        if proof.boot_id != self.source.boot_id
+            || self.paused_chats.contains(&known.id)
+            || candidate
+                .launch
+                .session_id
+                .as_ref()
+                .is_some_and(|id| id.is_empty() || id.len() > 1024)
+        {
+            return false;
+        }
+        let original = self
+            .census
+            .chats
+            .iter()
+            .find(|source| source.id == known.id);
+        let Some(original) = original else {
+            return false;
+        };
+        let mut bound = original.clone();
+        if bound.launch.session_id.is_none() {
+            bound.launch.session_id = known.launch.session_id.clone();
+        }
+        if bound != *known {
+            return false;
+        }
+        if known
+            .terminal
+            .as_ref()
+            .and_then(|terminal| crate::agent_execution::console_agent(&terminal.launch))
+            .is_some_and(|owner| owner != agent)
+        {
+            return false;
+        }
+        let mut normalized = candidate.clone();
+        if let (Some(before), Some(after)) = (&known.terminal, &mut normalized.terminal)
+            && before.launch.program != after.launch.program
+        {
+            if known.launch.provider != crate::agent::Provider::Claude
+                || !matches!(
+                    known.native_continuity,
+                    crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 }
+                )
+                || crate::agent_execution::console_agent(&before.launch) != Some(agent)
+                || Path::new(&after.launch.program)
+                    != self
+                        .target
+                        .with_file_name(crate::companion::Product::Cli.file_name())
+            {
+                return false;
+            }
+            after.launch.program.clone_from(&before.launch.program);
+        }
+        recovered_chat(known, &normalized, proof)
+    }
 }
 
 /// Recognize a completed recovery without changing its retained checkpoint.
@@ -1382,7 +1451,7 @@ pub(crate) fn classify_retained_prepared(
         fence_path: PathBuf::new(),
         legacy_path: PathBuf::new(),
         daemon_path: PathBuf::new(),
-        target,
+        target: target.clone(),
         target_hash: record.target_hash,
     };
     if validate_checkpoint(&authority, &checkpoint)? != "Prepared" {
@@ -1393,6 +1462,7 @@ pub(crate) fn classify_retained_prepared(
         census: record.census,
         paused_terminals: record.paused_terminals,
         paused_chats: record.paused_chats,
+        target,
     }))
 }
 
@@ -2419,6 +2489,65 @@ mod tests {
             target
         ));
         assert!(!verified_chat(&census, &chat, &serving, &[], target));
+
+        let settled = AlreadyRecovered {
+            source: preparation.authority.source.clone(),
+            census: census.clone(),
+            paused_terminals: Vec::new(),
+            paused_chats: Vec::new(),
+            target: target.to_owned(),
+        };
+        let agent = crate::agent_execution::console_agent(&known.launch).unwrap();
+        assert!(settled.history_alias(&source, agent, &chat));
+        let invalid: [fn(&mut Session); 9] = [
+            |chat| chat.launch.session_id = Some("unrelated-thread".into()),
+            |chat| chat.proof = None,
+            |chat| chat.id = TerminalId::new(),
+            |chat| chat.launch.recipe.arguments.push("different".into()),
+            |chat| chat.terminal.as_mut().unwrap().launch.program = "/wrong/bin/cagents".into(),
+            |chat| {
+                chat.terminal
+                    .as_mut()
+                    .unwrap()
+                    .launch
+                    .arguments
+                    .push("different".into())
+            },
+            |chat| {
+                chat.terminal
+                    .as_mut()
+                    .unwrap()
+                    .launch
+                    .working_directory
+                    .push("different")
+            },
+            |chat| {
+                chat.terminal
+                    .as_mut()
+                    .unwrap()
+                    .launch
+                    .environment
+                    .insert("OTHER".into(), "value".into());
+            },
+            |chat| {
+                chat.terminal
+                    .as_mut()
+                    .unwrap()
+                    .launch
+                    .unset_environment
+                    .insert("OTHER".into());
+            },
+        ];
+        for mutate in invalid {
+            let mut changed = chat.clone();
+            mutate(&mut changed);
+            assert!(!settled.history_alias(&source, agent, &changed));
+        }
+        assert!(!settled.history_alias(&source, crate::model::AgentId::new(), &chat));
+        let mut unchanged_program = chat.clone();
+        unchanged_program.terminal.as_mut().unwrap().launch.program = known.launch.program.clone();
+        assert!(settled.history_alias(&source, agent, &unchanged_program));
+        assert!(!settled.history_alias(&source, crate::model::AgentId::new(), &unchanged_program));
 
         let mut changed = actual.clone();
         changed.upgrade_relaunches.clear();
