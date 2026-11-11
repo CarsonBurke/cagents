@@ -568,6 +568,11 @@ mod tests {
 
     #[test]
     fn paused_record_never_learns_missing_identity_from_later_alias() {
+        let proof = |epoch: &str| HostSessionProof {
+            host_session_id: "snapshot-only-fixture".into(),
+            boot_id: "private-test-boot".into(),
+            host_incarnation: epoch.into(),
+        };
         let source = Session {
             id: TerminalId::new(),
             launch: chat::Launch {
