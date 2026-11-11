@@ -48,11 +48,31 @@ class Scenario(peer.Scenario):
         elif method == "account/read":
             result = {"account": {"type": "chatgpt", "email": "codex@fixture.invalid", "planType": "plus"}}
         elif method == "turn/start":
+            if frame.get("params", {}).get("threadId") != self.thread:
+                return [{"id": identifier, "error": {"code": -32602, "message": "Prompt the fixture thread"}}]
+            with reset.state_file(home) as state:
+                allowed = state["limits"].get("ordinaryUsageAllowed") is True
             turn = str(uuid.uuid4())
-            return [{"id": identifier, "result": {"turn": {"id": turn, "status": "inProgress", "items": []}}},
-                    {"method": "turn/started", "params": {"threadId": self.thread, "turn": {"id": turn, "status": "inProgress", "items": []}}},
-                    {"method": "turn/completed", "params": {"threadId": self.thread, "turn": {
-                        "id": turn, "status": "failed", "items": [], "error": {"message": "You've hit your usage limit", "codexErrorInfo": "usageLimitExceeded"}}}}]
+            started = {"id": turn, "status": "inProgress", "items": []}
+            responses = [{"id": identifier, "result": {"turn": started}},
+                         {"method": "turn/started", "params": {"threadId": self.thread, "turn": started}}]
+            if allowed:
+                answer = {"id": f"fixture-reset-answer-{turn}", "type": "agentMessage",
+                          "text": "The fixture task can continue.", "phase": None}
+                responses.extend([
+                    {"method": "item/started", "params": {"threadId": self.thread, "turnId": turn,
+                                                           "item": {**answer, "text": ""}}},
+                    {"method": "item/agentMessage/delta", "params": {"threadId": self.thread,
+                                                                    "turnId": turn, "itemId": answer["id"],
+                                                                    "delta": answer["text"]}},
+                    {"method": "item/completed", "params": {"threadId": self.thread, "turnId": turn,
+                                                             "item": answer}}])
+                self.latest = {"id": turn, "status": "completed", "items": [answer]}
+            else:
+                self.latest = {"id": turn, "status": "failed", "items": [],
+                               "error": {"message": "You've hit your usage limit", "codexErrorInfo": "usageLimitExceeded"}}
+            responses.append({"method": "turn/completed", "params": {"threadId": self.thread, "turn": self.latest}})
+            return responses
         else:
             return super().request(frame, codex_home)
         return [{"id": identifier, "result": result}]

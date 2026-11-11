@@ -4,6 +4,7 @@ import http.client
 import importlib.util
 import json
 import os
+import select
 from pathlib import Path
 import subprocess
 import tempfile
@@ -233,6 +234,87 @@ class UsageResetFixture(unittest.TestCase):
         self.assertEqual(FIXTURE.consume_codex(self.codex, {"idempotencyKey": "depleted"})[0], {"outcome": "noCredit"})
         self.assertEqual(self.read(self.claude)["consume_count"], 0)
         self.assertEqual(self.read(self.codex)["consume_count"], 0)
+
+    def test_limited_mode_preserves_remaining_credits_and_prior_claims(self):
+        self.claim()
+        FIXTURE.consume_codex(self.codex, {"idempotencyKey": "first"})
+        before_claude, before_codex = self.read(self.claude), self.read(self.codex)
+        for provider in ("claude", "codex"):
+            FIXTURE.configure(self.root, provider, "limited")
+        claude, codex = self.read(self.claude), self.read(self.codex)
+        for before, after in ((before_claude, claude), (before_codex, codex)):
+            self.assertEqual(after["consume_count"], 1)
+            self.assertEqual(after["consume_count"], before["consume_count"])
+            self.assertEqual(after["claims"], before["claims"])
+        limits = claude["usage"]["rate_limits"]
+        self.assertEqual(limits["model_scoped"][0]["utilization"], 100)
+        self.assertEqual(limits["cedar_ember"]["grants"], before_claude["usage"]["rate_limits"]["cedar_ember"]["grants"])
+        self.assertEqual(limits["juniper_tide"], before_claude["usage"]["rate_limits"]["juniper_tide"])
+        self.assertFalse(codex["limits"]["ordinaryUsageAllowed"])
+        self.assertEqual([codex["limits"]["rateLimits"][window]["usedPercent"] for window in ("primary", "secondary")], [100, 100])
+        self.assertEqual(codex["limits"]["rateLimitResetCredits"], before_codex["limits"]["rateLimitResetCredits"])
+
+    def test_codex_turn_recovers_after_each_reset_and_keeps_completed_history(self):
+        peer = SOURCE.with_name("codex-usage-resets.py")
+        process = subprocess.Popen(["/usr/bin/python3", "-I", str(peer), "app-server"],
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   bufsize=0, env={**os.environ, "CAGENTS_USAGE_RESETS_FIXTURE_ROOT": str(self.root),
+                                                   "CODEX_HOME": str(self.codex)})
+        buffered = bytearray()
+
+        def send(identifier, method, params=None, turn=False):
+            process.stdin.write((json.dumps({"id": identifier, "method": method, "params": params or {}}) + "\n").encode())
+            process.stdin.flush()
+            frames = []
+            while True:
+                while b"\n" not in buffered:
+                    ready, _, _ = select.select([process.stdout], [], [], 5)
+                    self.assertTrue(ready, "fake Codex did not answer within five seconds")
+                    part = os.read(process.stdout.fileno(), 8192)
+                    self.assertTrue(part, "fake Codex exited before answering")
+                    buffered.extend(part)
+                line, _, remaining = buffered.partition(b"\n")
+                buffered[:] = remaining
+                frame = json.loads(line)
+                frames.append(frame)
+                if (turn and frame.get("method") == "turn/completed") or (not turn and frame.get("id") == identifier):
+                    return frames
+
+        try:
+            send(1, "initialize")
+            thread = send(2, "thread/start")[0]["result"]["thread"]["id"]
+            first = send(3, "turn/start", {"threadId": thread}, turn=True)
+            self.assertEqual(first[-1]["params"]["turn"]["status"], "failed")
+            self.assertEqual(send(4, "account/rateLimitResetCredit/consume", {"idempotencyKey": "recover-first"})[0]["result"], {"outcome": "reset"})
+            recovered = send(5, "turn/start", {"threadId": thread}, turn=True)
+            self.assertEqual(recovered[-1]["params"]["turn"]["status"], "completed")
+            item = next(frame["params"]["item"] for frame in recovered if frame.get("method") == "item/completed")
+            self.assertEqual((item["type"], item["text"]), ("agentMessage", "The fixture task can continue."))
+            history = send(6, "thread/turns/list", {"threadId": thread})[0]["result"]["data"]
+            self.assertEqual(history[0]["items"], [item])
+            FIXTURE.configure(self.root, "codex", "limited")
+            limited = send(7, "turn/start", {"threadId": thread}, turn=True)
+            self.assertEqual(limited[-1]["params"]["turn"]["status"], "failed")
+            self.assertEqual(self.read(self.codex)["consume_count"], 1)
+            self.assertEqual(send(8, "account/rateLimitResetCredit/consume", {"idempotencyKey": "recover-second"})[0]["result"], {"outcome": "reset"})
+            last = send(9, "turn/start", {"threadId": thread}, turn=True)
+            self.assertEqual(last[-1]["params"]["turn"]["status"], "completed")
+            reading = send(10, "account/rateLimits/read")[0]["result"]
+            self.assertEqual(reading["rateLimitResetCredits"]["availableCount"], 0)
+            self.assertTrue(reading["ordinaryUsageAllowed"])
+            self.assertEqual(self.read(self.codex)["consume_count"], 2)
+        finally:
+            process.stdin.close()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+                raise
+            finally:
+                process.stdout.close()
+                process.stderr.close()
+        self.assertEqual(process.returncode, 0)
 
     def test_modes_require_the_marked_fixture_before_writing(self):
         before = self.read(self.claude)

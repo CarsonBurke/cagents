@@ -330,7 +330,7 @@ def server(root):
 
 
 def configure(root, provider, mode):
-    if provider not in ("claude", "codex") or mode not in ("success", "error", "disconnect", "unconfirmed", "depleted"):
+    if provider not in ("claude", "codex") or mode not in ("success", "error", "disconnect", "unconfirmed", "depleted", "limited"):
         raise ValueError("unknown reset fixture provider or mode")
     if mode == "unconfirmed" and provider != "claude":
         raise ValueError("unconfirmed is a Claude-only mode")
@@ -339,8 +339,8 @@ def configure(root, provider, mode):
     if not marker.is_file() or marker.is_symlink():
         raise ValueError("reset mode requires the private fixture marker")
     with state_file(root / "home" / ("." + provider)) as state:
-        state["mode"] = "success" if mode == "depleted" else mode
-        if mode != "depleted":
+        state["mode"] = "success" if mode in ("depleted", "limited") else mode
+        if mode not in ("depleted", "limited"):
             return
         if provider == "claude":
             limits = state["usage"]["rate_limits"]
@@ -348,12 +348,14 @@ def configure(root, provider, mode):
                 if model["display_name"] == "Fable":
                     model["utilization"] = 100
             program = limits["cedar_ember"]
+            program["at_limit"] = True
+            program["exhausted"] = ["seven_day_overage_included"]
+            if mode == "limited":
+                return
             for item in program["grants"]:
                 item["resets_left"] = 0
                 item["usable_now"] = False
             program["next_grant_id"] = None
-            program["at_limit"] = True
-            program["exhausted"] = ["seven_day_overage_included"]
             limits["juniper_tide"]["available"] = False
             limits["juniper_tide"]["next_available_at"] = RESET_AT
         else:
@@ -361,6 +363,8 @@ def configure(root, provider, mode):
             limits["ordinaryUsageAllowed"] = False
             for window in ("primary", "secondary"):
                 limits["rateLimits"][window]["usedPercent"] = 100
+            if mode == "limited":
+                return
             limits["rateLimitResetCredits"]["availableCount"] = 0
             for credit in limits["rateLimitResetCredits"]["credits"]:
                 credit["status"] = "redeemed"

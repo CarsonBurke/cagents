@@ -245,7 +245,12 @@ start with the same counts. For a limited account without a reset action, use
 `mode claude depleted` or `mode codex depleted`: these set the relevant window
 to 100% and all reset counts to zero, without submitting a consume. Claude
 turn frames are refreshed too, so the Fable card stays limited without an
-available reset. Mode changes share the service's state lock.
+available reset. To hit the limit again while retaining the remaining resets,
+use `mode claude limited` or `mode codex limited`. This updates the relevant
+usage windows without changing reset counts, prior claims or consume counts.
+Codex then fails a turn only while ordinary usage is blocked; after a fake
+reset it emits an ordinary completed assistant reply, so the native flow can
+verify that work continues. Mode changes share the service's state lock.
 
 The service and Codex peer share `fixture-reset-state.json` files guarded by
 file locks. Their offline contracts run with
