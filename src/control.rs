@@ -292,43 +292,61 @@ pub enum DaemonCommand {
     /// Validate inherited updater authority without probing daemon liveness.
     #[command(hide = true)]
     VerifyUpdateLease,
+    /// Save the authenticated pre-update service inventory without starting a daemon.
     #[command(hide = true)]
     CaptureUpdateCensus {
+        /// Write the private original service census to this new file.
         #[arg(long)]
         output: PathBuf,
+        /// Use this installed target when inspecting pending recovery.
         #[arg(long)]
         candidate_cli: Option<PathBuf>,
     },
+    /// Verify daemon readiness and inventory against the original update census.
     #[command(hide = true)]
     VerifyUpdateCensus {
+        /// Retire exact settled recovery evidence after successful verification.
         #[arg(long, conflicts_with = "validate_only")]
         retire: bool,
+        /// Require authenticated absence of both the original and current daemon.
         #[arg(long)]
         require_absent: bool,
+        /// Validate the private census without probing or claiming readiness.
         #[arg(long)]
         validate_only: bool,
+        /// Require the original source to remain the verified serving owner.
         #[arg(long)]
         require_original: bool,
+        /// Accept verified absence when no source daemon was running.
         #[arg(long)]
         allow_absent: bool,
+        /// Read the private original service census from this file.
         #[arg(long)]
         census: PathBuf,
+        /// Save the verification receipt at this private output path.
         #[arg(long)]
         outcome: PathBuf,
     },
+    /// Inspect retained update recovery and report its exact next step.
     #[command(hide = true)]
     InspectUpdateRecovery {
+        /// Read the private original service census from this file.
         #[arg(long)]
         census: PathBuf,
+        /// Save the typed recovery outcome at this private output path.
         #[arg(long)]
         outcome: PathBuf,
+        /// Name the complete installed target executable for recovery.
         #[arg(long)]
         candidate_cli: Option<PathBuf>,
     },
+    /// Inspect pending Prepared recovery before starting another update.
     #[command(hide = true)]
     InspectPendingUpdateRecovery {
+        /// Name the complete installed target executable for recovery.
         #[arg(long)]
         candidate_cli: PathBuf,
+        /// Bind the original standalone census when it is not already complete.
         #[arg(long)]
         census: Option<PathBuf>,
     },
