@@ -4760,9 +4760,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn complete_model_echo_reuses_one_projection_at_desktop_inventory_scale() {
-        use super::super::workspace_model_sync::ModelUpdate;
+    fn desktop_inventory_fixture() -> (Cagents, crate::workspace_model::WorkspaceModel) {
         let (mut app, _, _, template) = fixture();
         let repository = PathBuf::from("/repo/.git");
         let project = app.durable.channels[0].project_id;
@@ -4858,6 +4856,13 @@ mod tests {
                 .sum::<usize>(),
             122
         );
+        (app, model)
+    }
+
+    #[test]
+    fn complete_model_echo_reuses_one_projection_at_desktop_inventory_scale() {
+        use super::super::workspace_model_sync::ModelUpdate;
+        let (mut app, mut model) = desktop_inventory_fixture();
         let (tx, rx) = async_channel::unbounded();
         app.workspace_model_tx = tx;
         let before = app.durable.clone();
@@ -4894,6 +4899,35 @@ mod tests {
         drop(app.apply_workspace_model_update(ModelUpdate::Read(model)));
         assert_eq!(app.card_state(id).unwrap().title, "Remote title");
         assert_eq!(app.durable.cards.len(), 555);
+    }
+
+    /// Process-fresh synchronous reducer cost; excludes task execution, providers
+    /// and compositor presentation. Run each revision with --profile dev-runtime.
+    #[test]
+    #[ignore = "manual paired fw16 performance measurement"]
+    fn measure_desktop_startup_reconciliation() {
+        use super::super::workspace_model_sync::ModelUpdate;
+        fn cpu_ns() -> u64 {
+            let mut value = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            assert_eq!(unsafe {
+                libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut value)
+            }, 0);
+            value.tv_sec as u64 * 1_000_000_000 + value.tv_nsec as u64
+        }
+        let (mut app, model) = desktop_inventory_fixture();
+        let (tx, _rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        let wall = Instant::now();
+        let cpu = cpu_ns();
+        for _ in 0..8 {
+            drop(app.apply_workspace_model_update(ModelUpdate::Read(model.clone())));
+        }
+        println!("desktop_reconciliation views={} cards={} panes={} reads=8 cpu_ns={} wall_ns={}",
+            model.views.len(), app.durable.cards.len(),
+            model.views.iter().map(|view| view.panes.len()).sum::<usize>(),
+            cpu_ns() - cpu, wall.elapsed().as_nanos());
+        assert_eq!(app.durable.cards.len(), 555);
+        assert_eq!(app.workspace_model.views, model.views);
     }
 
     #[test]
