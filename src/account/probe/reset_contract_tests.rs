@@ -108,10 +108,45 @@ for line in sys.stdin:
     };
     let claude_identity = identity("fixture@example.test");
     let codex_identity = identity("codex@fixture.invalid");
-    let first = run(claude.clone(), None, true).await;
+    let cache_directory = root.join("production-cache");
+    crate::secure_file::prepare_private_directory(&cache_directory).unwrap();
+    let cache = Some(Cache::at(&cache_directory));
+    // Keep cache publication blocked after the fake provider answers. A
+    // returned Answered must mean both publication and probe-lock release
+    // finished, so an immediate refresh cannot collide with its own write.
+    let publication_lock =
+        crate::instance::owned_lock(&cache_directory.join("account-usage.lock"), libc::LOCK_EX)
+            .unwrap();
+    let mut first = Box::pin(run(claude.clone(), cache.clone(), true));
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), &mut first)
+            .await
+            .is_err(),
+        "Answered returned before cache publication finished"
+    );
+    assert!(cache.as_ref().unwrap().load(now_ms()).is_empty());
+    drop(publication_lock);
+    let first = first.await;
+
     let Outcome::Answered { snapshot, .. } = first else {
         panic!("fake Claude usage read failed: {first:?}")
     };
+    let published = cache
+        .as_ref()
+        .unwrap()
+        .load(now_ms())
+        .remove(&claude.cache_key().unwrap())
+        .unwrap();
+    assert_eq!(published.snapshot, snapshot);
+    assert!(
+        cache
+            .as_ref()
+            .unwrap()
+            .try_probe_lock(&claude.lock_name())
+            .unwrap()
+            .is_some(),
+        "a completed probe still held admission"
+    );
     assert_eq!(
         snapshot
             .resets
@@ -123,14 +158,50 @@ for line in sys.stdin:
     change_state(&root, "claude", |state| {
         state["mode"] = "unconfirmed".into()
     });
-    let response = consume(
+    let other_reader = cache
+        .as_ref()
+        .unwrap()
+        .try_probe_lock(&claude.lock_name())
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(
+            run(claude.clone(), cache.clone(), false).await,
+            Outcome::Busy
+        ),
+        "background probes should not wait"
+    );
+    let timed_out = run_forced(
+        claude.clone(),
+        cache.clone(),
+        None,
+        Duration::from_millis(75),
+    )
+    .await;
+    assert!(
+        matches!(timed_out, Outcome::Failed(_)),
+        "a held read lock must respect the explicit-refresh deadline"
+    );
+    let mut pending_reset = Box::pin(consume(
         claude.clone(),
         "cedar_ember/fable-fixture".into(),
         "claude-success".into(),
         claude_identity.clone(),
-        None,
-    )
-    .await;
+        cache.clone(),
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(75), &mut pending_reset)
+            .await
+            .is_err(),
+        "explicit reset preflight should await the other reader"
+    );
+    assert_eq!(
+        state(&root, "claude")["consume_count"],
+        0,
+        "waiting for read admission must not send a consume"
+    );
+    drop(other_reader);
+    let response = pending_reset.await;
     assert_eq!(
         response.status,
         ConsumeStatus::Unconfirmed,
@@ -164,7 +235,7 @@ for line in sys.stdin:
         "cedar_ember/fable-fixture".into(),
         "claude-success".into(),
         claude_identity.clone(),
-        None,
+        cache.clone(),
     )
     .await;
     assert_eq!(
@@ -177,7 +248,7 @@ for line in sys.stdin:
         "cedar_ember/fable-fixture".into(),
         "claude-service-unavailable".into(),
         claude_identity.clone(),
-        None,
+        cache.clone(),
     )
     .await;
     assert_eq!(fresh.status, ConsumeStatus::Unavailable);
@@ -188,7 +259,7 @@ for line in sys.stdin:
         "cedar_ember/fable-fixture".into(),
         "claude-success".into(),
         claude_identity.clone(),
-        None,
+        cache.clone(),
     )
     .await;
     assert_eq!(
@@ -207,7 +278,7 @@ for line in sys.stdin:
         "cedar_ember/fable-fixture".into(),
         "claude-lost-reply".into(),
         claude_identity.clone(),
-        None,
+        cache.clone(),
     )
     .await;
     assert_eq!(response.status, ConsumeStatus::Unconfirmed, "{response:?}");
@@ -225,7 +296,7 @@ for line in sys.stdin:
         "cedar_ember/fable-fixture".into(),
         "claude-lost-reply".into(),
         claude_identity.clone(),
-        None,
+        cache.clone(),
     )
     .await;
     assert_eq!(
@@ -243,7 +314,7 @@ for line in sys.stdin:
         "cedar_ember/account-fixture".into(),
         "claude-account".into(),
         claude_identity.clone(),
-        None,
+        cache.clone(),
     )
     .await;
     assert_eq!(response.status, ConsumeStatus::Reset, "{response:?}");
@@ -272,7 +343,7 @@ for line in sys.stdin:
         "cedar_ember/account-fixture".into(),
         "claude-empty".into(),
         claude_identity.clone(),
-        None,
+        cache.clone(),
     )
     .await;
     assert_eq!(response.status, ConsumeStatus::NoCredit);
@@ -300,7 +371,7 @@ for line in sys.stdin:
         "cedar_ember/account-fixture".into(),
         "changed-login".into(),
         claude_identity.clone(),
-        None,
+        cache.clone(),
     )
     .await;
     assert_eq!(response.status, ConsumeStatus::Unavailable);
@@ -371,7 +442,7 @@ for line in sys.stdin:
         "juniper_tide".into(),
         "claude-session-lost-reply".into(),
         claude_identity.clone(),
-        None,
+        cache.clone(),
     )
     .await;
     assert_eq!(response.status, ConsumeStatus::Unconfirmed, "{response:?}");
@@ -409,7 +480,7 @@ for line in sys.stdin:
         "juniper_tide".into(),
         "claude-session-lost-reply".into(),
         claude_identity,
-        None,
+        cache.clone(),
     )
     .await;
     assert_eq!(response.status, ConsumeStatus::Unconfirmed);
@@ -420,7 +491,7 @@ for line in sys.stdin:
         "session resets without server idempotency can never be resubmitted"
     );
 
-    let first = run(codex.clone(), None, true).await;
+    let first = run(codex.clone(), cache.clone(), true).await;
     let Outcome::Answered { snapshot, .. } = first else {
         panic!("fake Codex usage read failed: {first:?}")
     };
@@ -439,7 +510,7 @@ for line in sys.stdin:
         one.into(),
         "codex-success".into(),
         codex_identity.clone(),
-        None,
+        cache.clone(),
     )
     .await;
     assert_eq!(response.status, ConsumeStatus::Reset, "{response:?}");
@@ -457,7 +528,7 @@ for line in sys.stdin:
         two.into(),
         "codex-lost-reply".into(),
         codex_identity.clone(),
-        None,
+        cache.clone(),
     )
     .await;
     assert_eq!(response.status, ConsumeStatus::Unconfirmed, "{response:?}");
@@ -468,7 +539,7 @@ for line in sys.stdin:
         two.into(),
         "codex-lost-reply".into(),
         codex_identity.clone(),
-        None,
+        cache.clone(),
     )
     .await;
     assert_eq!(response.status, ConsumeStatus::Reset, "{response:?}");
@@ -478,7 +549,7 @@ for line in sys.stdin:
         two.into(),
         "codex-empty".into(),
         codex_identity.clone(),
-        None,
+        cache.clone(),
     )
     .await;
     assert_eq!(response.status, ConsumeStatus::NoCredit);
@@ -499,7 +570,7 @@ for line in sys.stdin:
         two.into(),
         "claude-lost-reply".into(),
         codex_identity,
-        None,
+        cache.clone(),
     )
     .await;
     assert_eq!(response.status, ConsumeStatus::Unavailable);
