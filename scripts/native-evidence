@@ -39,8 +39,7 @@ both use the same fixture data and selected providers.
                   once no build or session has used them for 12 hours, or 1
                   hour while the disk is low.
   start SIDE [--width PX] [--height PX] [--keep-state] [--wait-lock SECONDS] [--limit SECONDS]
-        [--portal gtk|kde|gnome|cosmic]
-        [--codex tool-rows|child-errors|terminal-escape | --codex-executable ABSOLUTE_PATH]
+        [--portal gtk|kde|gnome|cosmic] [--codex tool-rows|child-errors|terminal-escape]
         [--instance NAME]
                   Take the native lock and start a headless session at the
                   requested logical width and height (default 1500x900). The lock is
@@ -48,7 +47,7 @@ both use the same fixture data and selected providers.
                   --portal runs xdg-desktop-portal with that backend inside the
                   session, so the app's file chooser opens there for drive to
                   operate. --codex installs that offline Codex app-server peer
-                  as the fixture's codex. --codex-executable instead copies a
+                  as the fixture's codex. --codex-executable ABSOLUTE_PATH copies a
                   real ELF into the isolated fixture, without its config or
                   credentials. With neither option, Codex is not installed.
   cli ARGS...     Run this side's cagents CLI in the fixture environment.
