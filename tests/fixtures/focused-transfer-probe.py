@@ -159,43 +159,52 @@ def pane_key(pane):
         "id", "title", "user_title", "pending_terminal_start", "width_fraction", "kind", "scope"
     }, "Incomplete pane descriptor")
     identifier(pane["id"])
+    require(isinstance(pane["title"], str)
+            and (pane["user_title"] is None or isinstance(pane["user_title"], str))
+            and type(pane["pending_terminal_start"]) is bool
+            and (pane["scope"] is None or isinstance(pane["scope"], str)), "Invalid pane field types")
     width = pane["width_fraction"]
     require(type(width) in (int, float) and math.isfinite(width) and width > 0, "Invalid pane width")
     kind = pane["kind"]
-    require(isinstance(kind, dict) and len(kind) == 1, "Invalid pane kind")
-    variant, payload = next(iter(kind.items()))
-    require(variant in ("Browser", "Terminal", "Chat", "PullRequests", "Repository")
-            and isinstance(payload, dict), "Unsupported pane descriptor")
-    if variant == "Browser":
-        identifier(payload["id"])
-    # Rust stores width as f64 but compares it as f32. Optional serde fields
-    # omitted by CardKind and present as null in wire_kind represent one value.
-    def without_null(value):
-        if isinstance(value, dict):
-            return {key: without_null(item) for key, item in value.items() if item is not None}
-        if isinstance(value, list):
-            return [without_null(item) for item in value]
-        return value
-    result = without_null(pane)
+    # Pane's human-readable serde branch and canonical SQLite descriptor both
+    # use CardKind's internal tag. The external enum is the binary IPC format;
+    # accepting that shape here would conceal a producer/consumer mismatch.
+    require(isinstance(kind, dict) and kind.get("kind") in (
+        "browser", "terminal", "chat", "pull_requests", "repository"
+    ), "Invalid canonical JSON pane kind")
+    if kind["kind"] in ("browser", "terminal", "chat"):
+        identifier(kind["id"])
+    if kind["kind"] == "browser":
+        require(set(kind) == {"kind", "id", "current_url", "history", "history_index", "scroll_x", "scroll_y", "fidelity"},
+                "Incomplete browser descriptor")
+        require(isinstance(kind["current_url"], str) and bool(kind["current_url"])
+                and isinstance(kind["history"], list)
+                and all(isinstance(url, str) and url for url in kind["history"]), "Invalid browser URL/history types")
+        unsigned(kind["history_index"])
+        require(kind["fidelity"] in ("url_only", "history_and_scroll"), "Invalid browser fidelity")
+        require(all(type(kind[name]) in (int, float) and math.isfinite(kind[name]) for name in ("scroll_x", "scroll_y")),
+                "Invalid browser scroll types")
+    # Rust stores width as f64 but compares it as f32. Keep every other JSON
+    # field and type; no cross-format or omitted/null normalization is needed.
+    result = dict(pane)
     result["width_fraction"] = struct.pack("!f", width).hex()
-    return result
+    return json.dumps(result, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
 def observed_pane(row):
     require(row["descriptor_format"] == 1, "Unknown canonical descriptor format")
     descriptor = decode(row["descriptor"])
-    tag = descriptor.pop("kind", None)
-    variants = {"browser": "Browser", "terminal": "Terminal", "chat": "Chat",
-                "pull_requests": "PullRequests", "repository": "Repository"}
-    require(tag in variants, "Unknown canonical pane kind")
+    require(isinstance(descriptor, dict), "Invalid canonical descriptor")
+    tag = descriptor.get("kind")
+    require(tag in ("browser", "terminal", "chat", "pull_requests", "repository"), "Unknown canonical pane kind")
     require(tag == row["kind"], "Pane kind contradicts its descriptor")
-    if tag == "browser":
-        require(descriptor["id"] == row["resource"], "Browser resource identity changed")
+    resource = identifier(descriptor["id"]) if tag in ("browser", "terminal", "chat") else None
+    require(resource == row["resource"], "Canonical resource identity changed")
     require(row["pending_terminal_start"] in (0, 1), "Invalid pending-start flag")
     return dict(id=row["id"], title=row["title"], user_title=row["user_title"],
                 pending_terminal_start=bool(row["pending_terminal_start"]),
                 width_fraction=row["width_fraction"], scope=row["filing"],
-                kind={variants[tag]: descriptor})
+                kind=descriptor)
 
 
 def registry_observation(marker, phase, root, deadline):
@@ -318,7 +327,7 @@ def store_observation(entry, marker, phase, root, deadline):
             card = rows(db, "SELECT workspace_id,existence_json,kind_tag FROM cards WHERE card_id=?", (pane["id"],))
             require(len(card) == 1 and tuple(card[0]) == (workspace, '"open"', "browser"), "Source browser card identity changed")
             browser = rows(db, "SELECT browser_id FROM browser_restore WHERE card_id=?", (pane["id"],))
-            require(len(browser) == 1 and browser[0][0] == pane["kind"]["Browser"]["id"], "Local browser payload identity changed")
+            require(len(browser) == 1 and browser[0][0] == pane["kind"]["id"], "Local browser payload identity changed")
         return dict(role=entry["role"], path=entry["path"], device=entry["device"], inode=entry["inode"],
                     workspace_id=workspace, project_id=project, worktree_id=worktree,
                     source_cards=channel["cards"], source_focused=channel["focused"],
@@ -379,7 +388,7 @@ def observe(root, prepared, phase, before=None, timeout=5):
         pane_ids = [pane["id"] for pane in scope["panes"]]
         require(len(pane_ids) == len(set(pane_ids)) and len(scope["retired"]) == len(set(scope["retired"]))
                 and not set(pane_ids).intersection(scope["retired"]), "Duplicate or stale scope identities")
-    require(all(set(pane["kind"]) == {"Browser"} and pane["scope"] is None for pane in source["panes"]), "Source must contain two unfiled browser panes")
+    require(all(pane["kind"]["kind"] == "browser" and pane["scope"] is None for pane in source["panes"]), "Source must contain two unfiled browser panes")
     require(not ({marker["moved"], marker["sibling"]} & {pane["id"] for pane in destination["panes"]}), "Destination already contains a source identity")
     go = prepared.with_suffix(".go")
     expected_go = dict(schema=1, event="focused_transfer_go", nonce=marker["nonce"],

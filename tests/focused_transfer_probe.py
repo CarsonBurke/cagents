@@ -19,6 +19,7 @@ import uuid
 
 PROBE_PATH = Path(__file__).resolve().parent / "fixtures/focused-transfer-probe.py"
 PROBE = runpy.run_path(str(PROBE_PATH))
+CAPTURE = json.loads((PROBE_PATH.parent / "focused-transfer-producer.json").read_text())
 
 
 def uid():
@@ -43,78 +44,58 @@ class FocusedTransferProbe(unittest.TestCase):
         self.root = self.task / "fixture"
         self.data = self.root / "data/cagents-development"
         (self.data / "windows/window-2").mkdir(parents=True)
-        self.repository = self.root / "project"
-        self.destination = self.repository / "linked"
-        self.destination.mkdir(parents=True)
+        self.repository = self.root / "project/.git"
+        self.repository.mkdir(parents=True)
+        self.destination = self.root / "project"
         self.registry = self.data / "workspace-model.sqlite3"
         self.stores = [self.data / "sessions.sqlite3", self.data / "windows/window-2/sessions.sqlite3"]
         self.prepared = self.task / "prepared.json"
         self.before = self.task / "before.json"
-        self.moved, self.sibling, self.occupant, self.channel, self.registry_id = [uid() for _ in range(5)]
-        self.workspace_ids = [uid(), uid()]
-        self.project_ids = [uid(), uid()]
-        self.worktree_ids = [uid(), uid()]
-        self.panes = {value: dict(id=value, title=name, user_title=name,
-                                 pending_terminal_start=False, width_fraction=0.5,
-                                 kind={"Browser": dict(id=uid(), current_url="about:blank", history=[],
-                                                       history_index=0, scroll_x=0.0, scroll_y=0.0, fidelity="url_only")},
-                                 scope=None)
-                      for value, name in [(self.moved, "Moved"), (self.sibling, "Sibling"), (self.occupant, "Existing") ]}
-        self.panes[self.occupant]["scope"] = str(self.destination)
-        with writable(self.registry) as db:
-            db.executescript("""
-                CREATE TABLE metadata(key INTEGER PRIMARY KEY, identity TEXT);
-                CREATE TABLE channels(id TEXT PRIMARY KEY,repository TEXT,title TEXT,title_source INTEGER);
-                CREATE TABLE view_scopes(id INTEGER PRIMARY KEY,channel TEXT,repository TEXT,worktree TEXT,revision INTEGER);
-                CREATE TABLE panes(id TEXT PRIMARY KEY,scope INTEGER,position INTEGER,title TEXT,user_title TEXT,
-                    width_fraction REAL,pending_terminal_start INTEGER,filing TEXT,kind TEXT,resource TEXT,
-                    descriptor_format INTEGER,descriptor TEXT);
-                CREATE TABLE retired_panes(scope INTEGER,pane TEXT,ordinal INTEGER);
-            """)
-            db.execute("INSERT INTO metadata VALUES(0,?)", (self.registry_id,))
-            db.execute("INSERT INTO channels VALUES(?,?,?,2)", (self.channel, str(self.repository), "Focused transfer proof"))
-            db.execute("INSERT INTO view_scopes VALUES(10,?,NULL,NULL,7)", (self.channel,))
-            db.execute("INSERT INTO view_scopes VALUES(20,NULL,?,?,8)", (str(self.repository), str(self.destination)))
-            self.put_pane(db, self.sibling, 10, 1)
-            self.put_pane(db, self.moved, 10, 2)
-            self.put_pane(db, self.occupant, 20, 1)
+        self.marker = self.rebase(copy.deepcopy(CAPTURE["prepared"]))
+        self.moved, self.sibling = self.marker["moved"], self.marker["sibling"]
+        self.occupant = self.marker["destination"]["panes"][0]["id"]
+        self.channel = self.marker["source"]["channel"]
+        self.registry_id = self.marker["registry"]["identity"]
+        self.panes = {pane["id"]: pane for scope in ("source", "destination") for pane in self.marker[scope]["panes"]}
+        # Use actual captured table definitions and rows, including normalized
+        # browser_restore and the common-.git project identity. Only private
+        # paths and filesystem identities are rebased. The stopped capture was
+        # not a valid pre-go focus state: controlled selections below establish
+        # test preconditions rather than relabel the failed native evidence.
+        for relative, database in CAPTURE["databases"].items():
+            with writable(self.root / relative) as db:
+                db.execute("PRAGMA user_version=" + str(database["user_version"]))
+                for table, captured in database["tables"].items():
+                    db.execute(captured["sql"])
+                    for original in captured["rows"]:
+                        row = self.rebase(original)
+                        columns = ",".join(row)
+                        db.execute("INSERT INTO " + table + " (" + columns + ") VALUES (" + ",".join("?" for _ in row) + ")", tuple(row.values()))
+        self.workspace_ids, self.project_ids, self.worktree_ids = [], [], []
         for index, path in enumerate(self.stores):
-            workspace, project = self.workspace_ids[index], self.project_ids[index]
             with writable(path) as db:
-                db.executescript("""
-                    PRAGMA user_version=13;
-                    CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT);
-                    CREATE TABLE workspaces(workspace_id TEXT PRIMARY KEY,existence_json TEXT,focused_card_id TEXT);
-                    CREATE TABLE projects(project_id TEXT PRIMARY KEY,repository_json TEXT,existence_json TEXT);
-                    CREATE TABLE worktrees(worktree_id TEXT PRIMARY KEY,project_id TEXT,path_json TEXT,existence_json TEXT);
-                    CREATE TABLE cards(card_id TEXT PRIMARY KEY,workspace_id TEXT,existence_json TEXT,kind_tag TEXT);
-                    CREATE TABLE browser_restore(card_id TEXT PRIMARY KEY,browser_id TEXT);
-                """)
-                db.execute("INSERT INTO workspaces VALUES(?,?,?)", (workspace, '"open"', self.moved if index == 0 else self.occupant))
-                db.execute("INSERT INTO projects VALUES(?,?,?)", (project, json.dumps(str(self.repository)), '"open"'))
-                db.execute("INSERT INTO worktrees VALUES(?,?,?,?)", (self.worktree_ids[index], project, json.dumps(str(self.destination)), '"open"'))
-                for pane in self.panes.values():
-                    db.execute("INSERT INTO cards VALUES(?,?,?,?)", (pane["id"], workspace, '"open"', "browser"))
-                    db.execute("INSERT INTO browser_restore VALUES(?,?)", (pane["id"], pane["kind"]["Browser"]["id"]))
-                values = dict(threads=[dict(id=self.channel, project_id=project, title="Focused transfer proof",
-                                           title_source="Manual", cards=[self.sibling, self.moved], focused=self.moved)],
-                              active_thread=self.channel if index == 0 else None,
-                              active_worktree=None if index == 0 else str(self.destination),
-                              worktree_focus={str(self.destination): self.occupant},
-                              card_scopes={self.occupant: str(self.destination)},
-                              workspace_model_identity=self.registry_id)
-                for name, value in values.items():
-                    db.execute("INSERT INTO metadata VALUES(?,?)", (f"workspace:{workspace}:navigation:{name}", json.dumps(value)))
-        self.marker = dict(schema=1, event="focused_transfer_prepared", nonce=uid(), fixture_root=str(self.root),
-                           namespace="cagents-development", registry=dict(path=str(self.registry), identity=self.registry_id, **self.identity(self.registry)),
-                           stores=[dict(role=role, path=str(path), **self.identity(path)) for role, path in zip(PROBE["ROLES"], self.stores)],
-                           source=dict(channel=self.channel, title="Focused transfer proof", repository=str(self.repository),
-                                       scope={"Channel": self.channel}, revision=7,
-                                       panes=[self.panes[self.sibling], self.panes[self.moved]], retired=[]),
-                           destination=dict(scope={"Worktree": dict(repository=str(self.repository), path=str(self.destination))},
-                                            revision=8, panes=[self.panes[self.occupant]], retired=[]),
-                           sibling=self.sibling, moved=self.moved)
+                self.workspace_ids.append(db.execute("SELECT workspace_id FROM workspaces").fetchone()[0])
+                self.project_ids.append(db.execute("SELECT project_id FROM projects").fetchone()[0])
+                self.worktree_ids.append(db.execute("SELECT worktree_id FROM worktrees").fetchone()[0])
+                db.execute("UPDATE workspaces SET focused_card_id=?", (self.moved if index == 0 else self.occupant,))
+            self.metadata(index, "threads", lambda channels: [{**channel, "focused": self.moved} for channel in channels])
+            self.metadata(index, "active_thread", lambda _: self.channel if index == 0 else None)
+        with writable(self.registry) as db:
+            self.source_scope = db.execute("SELECT id FROM view_scopes WHERE channel=?", (self.channel,)).fetchone()[0]
+            self.destination_scope = db.execute("SELECT id FROM view_scopes WHERE repository=? AND worktree=?", (str(self.repository), str(self.destination))).fetchone()[0]
+        self.marker["registry"].update(self.identity(self.registry))
+        for entry, path in zip(self.marker["stores"], self.stores):
+            entry.update(self.identity(path))
         self.write_marker()
+
+    def rebase(self, value):
+        if isinstance(value, dict):
+            return {key: self.rebase(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self.rebase(item) for item in value]
+        if isinstance(value, str):
+            return value.replace(CAPTURE["prepared"]["fixture_root"], str(self.root))
+        return value
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -123,13 +104,6 @@ class FocusedTransferProbe(unittest.TestCase):
     def identity(path):
         info = path.stat()
         return dict(device=info.st_dev, inode=info.st_ino)
-
-    def put_pane(self, db, pane_id, scope, position):
-        pane = self.panes[pane_id]
-        payload = pane["kind"]["Browser"]
-        db.execute("INSERT INTO panes VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                   (pane_id, scope, position, pane["title"], pane["user_title"], pane["width_fraction"],
-                    0, pane["scope"], "browser", payload["id"], 1, json.dumps(dict(kind="browser", **payload))))
 
     def write_marker(self):
         self.prepared.write_text(json.dumps(self.marker))
@@ -155,9 +129,10 @@ class FocusedTransferProbe(unittest.TestCase):
         self.before.write_text(json.dumps(self.observe()))
         self.go()
         with writable(self.registry) as db:
-            db.execute("UPDATE panes SET scope=20,position=2 WHERE id=?", (self.moved,))
+            db.execute("UPDATE panes SET scope=?,position=(SELECT max(position)+1048576 FROM panes WHERE scope=?) WHERE id=?",
+                       (self.destination_scope, self.destination_scope, self.moved))
             db.execute("UPDATE view_scopes SET revision=revision+2")
-            db.execute("INSERT INTO retired_panes VALUES(10,?,0)", (self.moved,))
+            db.execute("INSERT INTO retired_panes(scope,pane,ordinal,retired_at_unix_ms) VALUES(?,?,0,0)", (self.source_scope, self.moved))
         for index, path in enumerate(self.stores):
             def change(channels):
                 channels[0]["cards"] = [self.sibling]
@@ -182,6 +157,71 @@ class FocusedTransferProbe(unittest.TestCase):
         self.assertEqual(proof["stores"][0]["global_focused"], self.moved)
         self.assertEqual(proof["stores"][1]["source_focused"], self.moved)
         self.assertTrue(proof["stores"][1]["destination_selected"])
+
+    def test_literal_producer_panes_match_captured_canonical_rows(self):
+        prepared = CAPTURE["prepared"]
+        registry = CAPTURE["databases"]["data/cagents-development/workspace-model.sqlite3"]
+        captured = {row["id"]: row for row in registry["tables"]["panes"]["rows"]}
+        for scope in (prepared["source"], prepared["destination"]):
+            for pane in scope["panes"]:
+                with self.subTest(pane=pane["id"]):
+                    self.assertEqual(pane["kind"]["kind"], "browser")
+                    self.assertEqual(PROBE["pane_key"](pane), PROBE["pane_key"](PROBE["observed_pane"](captured[pane["id"]])))
+
+    def test_captured_window_browser_payload_is_normalized_separately(self):
+        prepared = CAPTURE["prepared"]
+        for relative, database in CAPTURE["databases"].items():
+            if relative.endswith("workspace-model.sqlite3"):
+                continue
+            cards = {row["card_id"]: row for row in database["tables"]["cards"]["rows"]}
+            browsers = {row["card_id"]: row for row in database["tables"]["browser_restore"]["rows"]}
+            for pane in prepared["source"]["panes"]:
+                card, browser = cards[pane["id"]], browsers[pane["id"]]
+                self.assertEqual(card["kind_tag"], "browser")
+                self.assertIsNone(card["content_json"])
+                self.assertEqual(browser["browser_id"], pane["kind"]["id"])
+                self.assertEqual(pane["kind"]["history"], [])
+                self.assertEqual(json.loads(browser["history_json"]), ["about:blank"])
+
+    def test_binary_enum_shape_is_refused_by_the_json_consumer(self):
+        pane = copy.deepcopy(self.marker["source"]["panes"][0])
+        payload = dict(pane["kind"])
+        payload.pop("kind")
+        pane["kind"] = {"Browser": payload}
+        self.marker["source"]["panes"][0] = pane
+        self.write_marker()
+        with self.assertRaisesRegex(PROBE["Refused"], "canonical JSON pane kind"):
+            self.observe()
+
+    def test_actual_browser_dto_keeps_strict_identity_types_and_resource(self):
+        pane = self.marker["source"]["panes"][0]
+        for name, bad in (("id", None), ("history_index", True), ("scroll_x", False), ("fidelity", "unknown")):
+            with self.subTest(name=name):
+                changed = copy.deepcopy(pane)
+                changed["kind"][name] = bad
+                with self.assertRaises(PROBE["Refused"]):
+                    PROBE["pane_key"](changed)
+        changed = copy.deepcopy(pane)
+        changed["pending_terminal_start"] = 0
+        with self.assertRaisesRegex(PROBE["Refused"], "field types"):
+            PROBE["pane_key"](changed)
+        with writable(self.registry) as db:
+            db.execute("UPDATE panes SET resource=? WHERE id=?", (uid(), self.moved))
+        with self.assertRaisesRegex(PROBE["Refused"], "resource identity"):
+            self.observe()
+
+    def test_stopped_native_capture_remains_an_invalid_before_selection(self):
+        # The failed native artifact was stopped without completing the focus
+        # setup. Repairing its DTO parser must not turn that state into proof.
+        relative = "data/cagents-development/sessions.sqlite3"
+        captured = CAPTURE["databases"][relative]["tables"]
+        with writable(self.stores[0]) as db:
+            db.execute("UPDATE workspaces SET focused_card_id=?", (captured["workspaces"]["rows"][0]["focused_card_id"],))
+            for original in captured["metadata"]["rows"]:
+                row = self.rebase(original)
+                db.execute("UPDATE metadata SET value=? WHERE key=?", (row["value"], row["key"]))
+        with self.assertRaisesRegex(PROBE["Refused"], "Source membership/focus"):
+            self.observe()
 
     def test_after_and_reopened_require_exact_sibling_focus_and_destination_ownership(self):
         self.transfer()
@@ -278,7 +318,7 @@ class FocusedTransferProbe(unittest.TestCase):
             self.observe("after", self.before)
         with writable(self.registry) as db:
             db.execute("UPDATE panes SET filing=NULL WHERE id=?", (self.moved,))
-            db.execute("UPDATE view_scopes SET revision=7 WHERE id=10")
+            db.execute("UPDATE view_scopes SET revision=? WHERE id=?", (self.marker["source"]["revision"], self.source_scope))
         with self.assertRaisesRegex(PROBE["Refused"], "revision"):
             self.observe("after", self.before)
 
