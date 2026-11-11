@@ -985,6 +985,15 @@ impl Cagents {
     }
 
     fn local_views_in(&self, selected: Option<&HashSet<Scope>>) -> LocalViews {
+        let topology = self.view_scope_topology(self.indexed_worktree_roots());
+        self.local_views_with_topology(selected, &topology)
+    }
+
+    fn local_views_with_topology<'a>(
+        &'a self,
+        selected: Option<&HashSet<Scope>>,
+        topology: &ViewScopeTopology<'a>,
+    ) -> LocalViews {
         #[cfg(test)]
         self.shared_views
             .local_projection_count
@@ -998,7 +1007,7 @@ impl Cagents {
         let ScopeDiscovery {
             mut scopes,
             worktree_cards,
-        } = self.discover_view_scopes();
+        } = self.discover_view_scopes_with(topology);
         if let Some(selected) = selected {
             scopes.retain(|scope| selected.contains(scope));
         }
@@ -1763,6 +1772,14 @@ impl Cagents {
     }
 
     fn admit_existing_views_in(&mut self, selected: Option<&HashSet<Scope>>) {
+        self.admit_existing_views_with_topology(selected, None);
+    }
+
+    fn admit_existing_views_with_topology(
+        &mut self,
+        selected: Option<&HashSet<Scope>>,
+        topology: Option<&ViewScopeTopology<'_>>,
+    ) {
         if self.workspace_model.identity == crate::workspace_model::NO_REGISTRY {
             return;
         }
@@ -1790,7 +1807,10 @@ impl Cagents {
         // Eligibility reads the mounted order without taking a durable save
         // snapshot. A repository's admission must not snapshot another scope
         // or scan every saved card to normalize unrelated channel membership.
-        let mut projected = self.local_views_in(selected);
+        let mut projected = match topology {
+            Some(topology) => self.local_views_with_topology(selected, topology),
+            None => self.local_views_in(selected),
+        };
         if self.active_workspace.is_some()
             && self.durable.active_channel.is_some_and(|id| {
                 selected.is_none_or(|selected| selected.contains(&Scope::Channel(id)))
@@ -1884,7 +1904,17 @@ impl Cagents {
         repository: &Path,
         additional: &HashSet<Scope>,
     ) -> HashSet<Scope> {
-        let discovery = self.discover_view_scopes();
+        let topology = self.view_scope_topology(self.indexed_worktree_roots());
+        self.repository_view_scopes_with_topology(repository, additional, &topology)
+    }
+
+    fn repository_view_scopes_with_topology(
+        &self,
+        repository: &Path,
+        additional: &HashSet<Scope>,
+        topology: &ViewScopeTopology<'_>,
+    ) -> HashSet<Scope> {
+        let discovery = self.discover_view_scopes_with(topology);
         let projects = self
             .sidebar_model
             .projects
@@ -2037,11 +2067,16 @@ impl Cagents {
         // A watcher snapshot can announce the destination before the explicit
         // transfer response arrives. Rebase before either snapshot projects.
         self.retarget_transferred_pane_updates(None);
-        let selected = repository
-            .map(|(repository, adopted)| self.repository_view_scopes(repository, adopted));
+        let root_paths = self.worktree_root_paths();
+        let topology = self.view_scope_topology(worktree_ui::WorktreeRoots::new(
+            root_paths.iter().map(PathBuf::as_path),
+        ));
+        let selected = repository.map(|(repository, adopted)| {
+            self.repository_view_scopes_with_topology(repository, adopted, &topology)
+        });
         let selected = selected.as_ref();
         self.shared_views.prune_restoration_requests(&self.durable);
-        self.admit_existing_views_in(selected);
+        self.admit_existing_views_with_topology(selected, Some(&topology));
         // A delayed tombstone must not borrow a newer local actor's identity.
         // Record only raw authoritative panes, never the pending overlay below.
         let local_cards = self
@@ -2124,8 +2159,7 @@ impl Cagents {
         // over owned paths that outlive each mutable view update. Keep only
         // owned card paths too, and refresh the panes each view changes before
         // visiting the next one.
-        let root_paths = self.worktree_root_paths();
-        let roots = worktree_ui::WorktreeRoots::new(root_paths.iter().map(PathBuf::as_path));
+        let roots = &topology.roots;
         let mut local_worktrees = CardWorktrees::default();
         for card in self
             .durable
@@ -2133,7 +2167,7 @@ impl Cagents {
             .iter()
             .filter(|card| card.existence.is_open())
         {
-            if let Some(path) = self.unchanneled_card_worktree_indexed(card, &roots) {
+            if let Some(path) = self.unchanneled_card_worktree_indexed(card, roots) {
                 local_worktrees.insert(card.id, path.to_owned());
             }
         }
@@ -2184,7 +2218,7 @@ impl Cagents {
                 for pane in &view.panes {
                     if let Some(path) = self
                         .card_state(pane.id)
-                        .and_then(|card| self.unchanneled_card_worktree_indexed(card, &roots))
+                        .and_then(|card| self.unchanneled_card_worktree_indexed(card, roots))
                     {
                         local_worktrees.insert(pane.id, path.to_owned());
                     } else {
@@ -2201,7 +2235,7 @@ impl Cagents {
         // Held reported titles stay held: publishing them on every view
         // acknowledgment would publish each title again as its own echo.
         self.save_workspace_with_view_publication(|app| {
-            let projected = app.local_views_in(selected);
+            let projected = app.local_views_with_topology(selected, &topology);
             for scope in projected_scopes {
                 app.shared_views.baseline.insert(
                     scope.clone(),
@@ -5082,6 +5116,25 @@ mod tests {
             value.tv_sec as u64 * 1_000_000_000 + value.tv_nsec as u64
         }
         let (mut app, model) = desktop_inventory_fixture();
+        // Include the historical checkout inventory in the root/authority
+        // indexes, even though its saved panes are closed.
+        for view in &model.views {
+            if let Scope::Worktree { path, .. } = &view.scope {
+                app.known_worktree_roots.insert(path.clone());
+                app.sidebar_model.projects[0]
+                    .worktrees
+                    .push(crate::sidebar::SidebarWorktree::new(
+                        WorktreeId::new(),
+                        path.clone(),
+                        None,
+                        false,
+                        false,
+                        None,
+                        None,
+                        None,
+                    ));
+            }
+        }
         let (tx, _rx) = async_channel::unbounded();
         app.workspace_model_tx = tx;
         let wall = Instant::now();
@@ -5098,6 +5151,21 @@ mod tests {
                 .iter()
                 .map(|view| view.panes.len())
                 .sum::<usize>(),
+            cpu_ns() - cpu,
+            wall.elapsed().as_nanos()
+        );
+        let wall = Instant::now();
+        let cpu = cpu_ns();
+        for _ in 0..8 {
+            drop(
+                app.reconcile_shared_views_for_repository(Path::new("/repo/.git"), &HashSet::new()),
+            );
+        }
+        println!(
+            "desktop_repository_reconciliation views={} cards={} roots={} passes=8 cpu_ns={} wall_ns={}",
+            model.views.len(),
+            app.durable.cards.len(),
+            app.known_worktree_roots.len(),
             cpu_ns() - cpu,
             wall.elapsed().as_nanos()
         );
