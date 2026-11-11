@@ -1129,6 +1129,14 @@ impl Cagents {
                         activation.display.clone(),
                         activation.session.clone(),
                     )
+                    .or_else(|| {
+                        self.adopt_execution_agent_history_display(
+                            &activation.agent,
+                            activation.display.clone(),
+                            activation.session.clone(),
+                            history.as_ref(),
+                        )
+                    })
                     .unwrap_or_else(Task::none);
                 self.refresh_sidebar_channels();
                 self.persist();
@@ -1146,11 +1154,21 @@ impl Cagents {
             ) {
                 return Task::none();
             }
-            let Some(task) = self.adopt_execution_agent_activation_display(
-                &activation.agent,
-                activation.display,
-                activation.session,
-            ) else {
+            let Some(task) = self
+                .adopt_execution_agent_activation_display(
+                    &activation.agent,
+                    activation.display.clone(),
+                    activation.session.clone(),
+                )
+                .or_else(|| {
+                    self.adopt_execution_agent_history_display(
+                        &activation.agent,
+                        activation.display,
+                        activation.session,
+                        history.as_ref(),
+                    )
+                })
+            else {
                 return Task::none();
             };
             adopted = task;
@@ -1425,6 +1443,8 @@ pub(super) fn card_session(card: &CardState) -> Option<TerminalId> {
 
 #[cfg(test)]
 mod tests {
+    mod paused_history;
+
     use super::*;
     use crate::agent::Provider;
 

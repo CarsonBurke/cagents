@@ -1174,7 +1174,12 @@ impl Cagents {
             }
             None => agent.session.clone()?,
         };
-        self.adopt_execution_agent_resolved_session(agent, display, session)
+        self.adopt_execution_agent_resolved_session(
+            agent,
+            display,
+            session,
+            crate::chat::Intent::Restore,
+        )
     }
 
     pub(super) fn adopt_execution_agent_activation_display(
@@ -1207,7 +1212,58 @@ impl Cagents {
         if !owned || !saved_matches {
             return None;
         }
-        self.adopt_execution_agent_resolved_session(agent, display, session)
+        self.adopt_execution_agent_resolved_session(
+            agent,
+            display,
+            session,
+            crate::chat::Intent::Restore,
+        )
+    }
+
+    /// An exact stopped transcript may have a successor reader without a live
+    /// execution successor. This grants display/attachment only; it never
+    /// changes the managed agent's execution descriptor or resumes its provider.
+    pub(super) fn adopt_execution_agent_history_display(
+        &mut self,
+        agent: &crate::agent_execution::Agent,
+        display: crate::workspace_model::views::ManagedDisplay,
+        session: crate::agent_execution::HostedSession,
+        history: Option<&crate::upgrade::floor::Ledger>,
+    ) -> Option<Task<Message>> {
+        use crate::agent_execution::HostedSession;
+        let history = history?;
+        let (Some(HostedSession::Chat(original)), HostedSession::Chat(reader)) =
+            (&agent.session, &session)
+        else {
+            return None;
+        };
+        let pane = display.pane.as_ref()?;
+        if !original
+            .proof
+            .as_ref()
+            .is_some_and(HostSessionProof::is_complete)
+            || self.workspace_model.identity == NO_REGISTRY
+            || pane.id != CardId::from_uuid(agent.id.as_uuid())
+            || pane.kind != CardKind::Chat(reader.clone())
+            || !history.history_replacement(original, reader)
+            || !self.workspace_model.agents.contains(agent)
+        {
+            return None;
+        }
+        let canonical = crate::workspace_model::views::ManagedDisplayIndex::with_history(
+            &self.workspace_model,
+            Some(history),
+        )
+        .resolve(agent)?;
+        if canonical != display {
+            return None;
+        }
+        self.adopt_execution_agent_resolved_session(
+            agent,
+            display,
+            session,
+            crate::chat::Intent::RestoreExisting,
+        )
     }
 
     fn adopt_execution_agent_resolved_session(
@@ -1215,6 +1271,7 @@ impl Cagents {
         agent: &crate::agent_execution::Agent,
         display: crate::workspace_model::views::ManagedDisplay,
         session: crate::agent_execution::HostedSession,
+        intent: crate::chat::Intent,
     ) -> Option<Task<Message>> {
         let placement = &display.scope;
         if !session.has_complete_proof()
@@ -1382,7 +1439,7 @@ impl Cagents {
         // newly adopted chat Loading there would never subscribe to its actor.
         let attach = match &session {
             crate::agent_execution::HostedSession::Chat(session) => {
-                self.open_chat(card_id, session.clone(), crate::chat::Intent::Restore)
+                self.open_chat(card_id, session.clone(), intent)
             }
             crate::agent_execution::HostedSession::Terminal(_) => Task::none(),
         };
