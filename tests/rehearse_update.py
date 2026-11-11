@@ -8,7 +8,7 @@ import copy
 import hashlib
 import json
 import fcntl
-from contextlib import closing
+from contextlib import closing, contextmanager
 import os
 from pathlib import Path
 import sqlite3
@@ -21,6 +21,7 @@ import signal
 import select
 import struct
 import termios
+import threading
 import shutil
 import unittest
 from unittest.mock import patch
@@ -737,6 +738,243 @@ class NativeLockWaiter(unittest.TestCase):
                         try:signal.pidfd_send_signal(child_fd,signal.SIGTERM)
                         except ProcessLookupError:pass
                         os.close(child_fd)
+
+
+class WindowCloseTracing(unittest.TestCase):
+    @contextmanager
+    def private_locked_process(self, sanitized=False):
+        """A copied sleep models only process/lease ownership, never an application."""
+        with tempfile.TemporaryDirectory(prefix='ru-window-trace-',dir='/var/tmp') as temporary:
+            root=Path(temporary)
+            (root/'.rehearse-update').write_text(str(root)+'\n')
+            (root/'rt').mkdir()
+            executable=root/'home/.local/share/cagents-install/versions/fixture/bin/cagents-ui'
+            executable.parent.mkdir(parents=True)
+            shutil.copyfile(shutil.which('sleep'),executable)
+            executable.chmod(0o700)
+            slot=root/'rt/cagents-ui.lock.primary'
+            owner=slot.open('w')
+            fcntl.flock(owner,fcntl.LOCK_EX)
+            peer=subprocess.Popen([executable,'60'],pass_fds=(owner.fileno(),),
+                env={} if sanitized else {**os.environ,'HOME':str(root/'home'),'XDG_RUNTIME_DIR':str(root/'rt')})
+            try:
+                fields=(Path('/proc')/str(peer.pid)/'stat').read_text().rsplit(')',1)[1].split()
+                row={'pid':peer.pid,'start_ticks':int(fields[19]),'executable':str(executable),
+                     'argv':[str(executable),'60']}
+                before=root/'records/before/snapshot.json'
+                before.parent.mkdir(parents=True)
+                before.write_text(json.dumps({'processes':[row]}))
+                yield root,slot,owner,peer,row
+            finally:
+                if peer.poll() is None:
+                    peer.terminate()
+                peer.wait(timeout=5)
+                owner.close()
+
+    def test_real_window_lease_observation_cannot_retain_or_acquire_the_lock(self):
+        with self.private_locked_process() as (root,slot,owner,peer,row):
+            with records.WindowCloseMonitor(root) as monitor:
+                first=json.loads((root/'window-close-trace.jsonl').read_text().splitlines()[1])
+                sampled=next(item for item in first['snapshot']['processes'] if item['pid']==peer.pid)
+                self.assertTrue(sampled['original_ui'])
+                self.assertTrue(any('FLOCK' in item['fdinfo'] for item in sampled['slot_descriptors']))
+                self.assertEqual(first['snapshot']['slots'][0]['inode'],slot.stat().st_ino)
+                peer.terminate();peer.wait(timeout=5);owner.close()
+                # This succeeds while the observer and its pidfd are still alive.
+                with slot.open('r') as probe:
+                    fcntl.flock(probe,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                self.assertTrue(monitor.thread.is_alive())
+                descriptors=list(monitor.pidfds)
+            self.assertFalse(monitor.thread.is_alive())
+            self.assertTrue(monitor.output.closed)
+            for descriptor in descriptors:
+                with self.assertRaises(OSError):os.fstat(descriptor)
+
+    def test_original_slot_identity_survives_path_replacement(self):
+        with self.private_locked_process() as (root,slot,owner,peer,row):
+            first=records.window_close_snapshot(root,[row])
+            old=slot.stat().st_ino
+            slot.unlink();slot.touch()
+            self.assertNotEqual(slot.stat().st_ino,old)
+            second=records.window_close_snapshot(root,[row],original_slots=first['slots'])
+            process=next(item for item in second['processes'] if item['pid']==peer.pid)
+            self.assertTrue(any(item['inode']==old and 'FLOCK' in item['fdinfo']
+                                for item in process['slot_descriptors']))
+            self.assertEqual(second['original_slots'][0]['inode'],old)
+            self.assertEqual(second['slots'][0]['inode'],slot.stat().st_ino)
+
+    def test_sanitized_inheritor_is_found_by_its_actual_private_slot_descriptor(self):
+        with self.private_locked_process(sanitized=True) as (root,slot,owner,peer,row):
+            self.assertNotIn(peer.pid,[item['pid'] for item in records.processes(root,require_seeded_child=False)])
+            captured=records.window_close_snapshot(root,[])
+            process=next(item for item in captured['processes'] if item['pid']==peer.pid)
+            self.assertEqual(process['discovery'],'matching_private_slot_descriptor')
+            self.assertTrue(any('FLOCK' in item['fdinfo'] for item in process['slot_descriptors']))
+
+    def test_kernel_lock_identity_excludes_foreign_devices_and_binds_btrfs_bridge(self):
+        slot={'device':os.makedev(1,2),'inode':123}
+        local='1: FLOCK ADVISORY WRITE 42 01:02:123 0 EOF'
+        foreign='2: FLOCK ADVISORY WRITE 43 01:03:123 0 EOF'
+        btrfs='3: FLOCK ADVISORY WRITE 42 00:45:123 0 EOF'
+        self.assertEqual(records.traced_kernel_locks([local,foreign,btrfs],[slot],[]),[local])
+        descriptor={**slot,'fdinfo':'ino:\t123\nlock: 1: FLOCK ADVISORY WRITE 42 00:45:123 0 EOF'}
+        self.assertEqual(records.traced_kernel_locks([local,foreign,btrfs],[slot],[descriptor]),[local,btrfs])
+        descriptor['device']=os.makedev(1,9)
+        self.assertEqual(records.traced_kernel_locks([local,foreign,btrfs],[slot],[descriptor]),[local])
+
+    def test_reused_process_diagnostics_are_discarded(self):
+        with self.private_locked_process() as (root,slot,owner,peer,row):
+            identity=(row['start_ticks'],row['executable'])
+            original=records.trace_process_identity
+            calls=[]
+            def identity_read(path):
+                if path==Path('/proc')/str(peer.pid):
+                    calls.append(path)
+                    return identity if len(calls)==1 else (identity[0]+1,identity[1])
+                return original(path)
+            with patch.object(records,'trace_process_identity',side_effect=identity_read):
+                captured=records.window_close_snapshot(root,[row])
+            process=next(item for item in captured['processes'] if item['pid']==peer.pid)
+            self.assertEqual(process['state'],'ended_or_reused')
+            self.assertNotIn('threads',process)
+            self.assertNotIn('slot_descriptors',process)
+
+    def test_reused_descriptor_is_not_attributed_to_the_slot(self):
+        with self.private_locked_process() as (root,slot,owner,peer,row):
+            target=Path('/proc')/str(peer.pid)/'fd'/str(owner.fileno())
+            original=Path.stat
+            reads=[]
+            def metadata(path,*args,**kwargs):
+                value=original(path,*args,**kwargs)
+                if path==target:
+                    reads.append(path)
+                    if len(reads)>1:
+                        changed=list(value);changed[2]+=1
+                        return os.stat_result(changed)
+                return value
+            with patch.object(Path,'stat',metadata):
+                captured=records.window_close_snapshot(root,[row])
+            process=next(item for item in captured['processes'] if item['pid']==peer.pid)
+            self.assertGreaterEqual(len(reads),2)
+            self.assertEqual(process['slot_descriptors'],[])
+
+    def test_body_exception_cancels_and_joins_the_observer(self):
+        with self.private_locked_process() as (root,slot,owner,peer,row):
+            ready=threading.Event()
+            monitor=records.WindowCloseMonitor(root)
+            def observe():
+                ready.set()
+                monitor.stop.wait(5)
+            with patch.object(monitor,'observe',side_effect=observe):
+                with self.assertRaisesRegex(RuntimeError,'update failed'):
+                    with monitor:
+                        self.assertTrue(ready.wait(2))
+                        raise RuntimeError('update failed')
+            self.assertFalse(monitor.thread.is_alive())
+            self.assertTrue(monitor.stop.is_set())
+            self.assertTrue(monitor.output.closed)
+            events=[json.loads(line)['event'] for line in (root/'window-close-trace.jsonl').read_text().splitlines()]
+            self.assertEqual(events[-1],'update_command_exited')
+
+    def test_thread_start_failure_closes_every_pinned_pidfd(self):
+        with self.private_locked_process() as (root,slot,owner,peer,row):
+            monitor=records.WindowCloseMonitor(root)
+            descriptors=[]
+            original_open=os.pidfd_open
+            def opened(pid):
+                descriptor=original_open(pid)
+                descriptors.append(descriptor)
+                return descriptor
+            with patch.object(records.os,'pidfd_open',side_effect=opened), \
+                    patch.object(threading.Thread,'start',side_effect=RuntimeError('thread start failed')):
+                with self.assertRaisesRegex(RuntimeError,'thread start failed'):
+                    monitor.__enter__()
+            self.assertTrue(monitor.output.closed)
+            self.assertTrue(monitor.stop.is_set())
+            self.assertTrue(descriptors)
+            for descriptor in descriptors:
+                with self.assertRaises(OSError):os.fstat(descriptor)
+
+    def test_interruption_during_exit_still_cancels_and_joins_before_reraising(self):
+        with self.private_locked_process() as (root,slot,owner,peer,row):
+            ready,release=threading.Event(),threading.Event()
+            monitor=records.WindowCloseMonitor(root)
+            def observe():
+                ready.set()
+                monitor.stop.wait(5)
+                release.wait(2)
+            waited=monitor.finished.wait
+            interruptions=[]
+            def interrupted_wait(timeout):
+                if not interruptions:
+                    interruptions.append(True);release.set()
+                    raise KeyboardInterrupt()
+                return waited(timeout)
+            with patch.object(monitor,'observe',side_effect=observe), \
+                    patch.object(monitor.finished,'wait',side_effect=interrupted_wait):
+                with self.assertRaises(KeyboardInterrupt):
+                    with monitor:
+                        self.assertTrue(ready.wait(2))
+            self.assertTrue(monitor.finished.is_set())
+            self.assertFalse(monitor.thread.is_alive())
+            self.assertTrue(monitor.output.closed)
+            self.assertEqual(monitor.pidfds,[])
+
+    def test_failed_post_pin_identity_check_closes_and_excludes_the_pidfd(self):
+        with self.private_locked_process() as (root,slot,owner,peer,row):
+            monitor=records.WindowCloseMonitor(root)
+            identity=(row['start_ticks'],row['executable'])
+            opened=os.pidfd_open(peer.pid)
+            with patch.object(records,'trace_process_identity',side_effect=[identity,(identity[0]+1,identity[1])]), \
+                    patch.object(records.os,'pidfd_open',return_value=opened), \
+                    patch.object(records,'window_close_snapshot',return_value={'slots':[]}):
+                with monitor:
+                    self.assertEqual(monitor.pidfds,[])
+                    self.assertEqual(monitor.pinned,[])
+                    with self.assertRaises(OSError):os.fstat(opened)
+            begin=json.loads((root/'window-close-trace.jsonl').read_text().splitlines()[0])
+            self.assertIn('pin_error',begin['pinned'][0])
+            self.assertNotIn('pidfd_pinned',begin['pinned'][0])
+
+    def test_phase_milestones_are_observed_without_asserting_commit_ack(self):
+        with tempfile.TemporaryDirectory(prefix='ru-trace-timeline-',dir='/var/tmp') as temporary:
+            root=Path(temporary)
+            status=root/'home/.local/share/cagents-install/.update/status.json'
+            status.parent.mkdir(parents=True)
+            status.write_text(json.dumps({'id':'job','phase':'ClosingWindows'}))
+            monitor=records.WindowCloseMonitor(root)
+            monitor.output=io.StringIO()
+            clock=[0]
+            reasons=[]
+            def advance(_):
+                clock[0]+=1
+                if clock[0]>45:monitor.stop.set()
+            with patch.object(records.time,'monotonic',side_effect=lambda:clock[0]), \
+                    patch.object(monitor.stop,'wait',side_effect=advance), \
+                    patch.object(monitor,'sample',side_effect=reasons.append):
+                monitor.observe()
+            for seconds in (1,5,15,40,45):
+                self.assertIn(f'ClosingWindows+{seconds}s (not a commit ACK timestamp)',reasons)
+            events=[json.loads(line) for line in monitor.output.getvalue().splitlines()]
+            self.assertEqual(events[0]['event'],'phase')
+            self.assertEqual(events[-1]['event'],'observer_stopped')
+
+    def test_trace_size_and_private_root_bounds(self):
+        with tempfile.TemporaryDirectory(prefix='ru-trace-bound-',dir='/var/tmp') as temporary:
+            root=Path(temporary)
+            with self.assertRaises(FileNotFoundError):
+                records.WindowCloseMonitor(root).__enter__()
+            self.assertFalse((root/'window-close-trace.jsonl').exists())
+            monitor=records.WindowCloseMonitor(root)
+            monitor.output=io.StringIO()
+            monitor.write({'event':'sample','snapshot':'x'*(512*1024)})
+            self.assertEqual(json.loads(monitor.output.getvalue())['event'],'sample_truncated')
+            monitor.bytes=16*1024*1024-1024
+            monitor.write({'event':'sample','snapshot':'x'*2048})
+            self.assertTrue(monitor.stop.is_set())
+            size=len(monitor.output.getvalue())
+            monitor.write({'event':'ignored_after_bound'})
+            self.assertEqual(len(monitor.output.getvalue()),size)
 
 
 class NativeTerminalAfterRestore(unittest.TestCase):

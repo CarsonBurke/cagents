@@ -4,6 +4,7 @@ import argparse
 from collections import Counter
 from contextlib import closing
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -519,6 +520,16 @@ class Rehearsal:
         except ValueError:
             data = {'raw': output}
         return code, data
+
+    def observed_update(self, *args):
+        spec=importlib.util.spec_from_file_location('rehearsal_window_monitor',
+            Path(__file__).with_name('rehearse_update_records.py'))
+        records=importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(records)
+        with records.WindowCloseMonitor(self.root) as monitor:
+            result=self.call('update',*args,timeout=300,check=False)
+            monitor.command_exit=result[0]
+            return result
 
     def mapped(self):
         _, output = self.call('wm', '-j', 'windows', timeout=20)
@@ -1155,7 +1166,7 @@ class Rehearsal:
                 update_args.append('--fail-new-daemon')
             for flag in args.upgrade_arg:
                 update_args.append(flag)
-            code, _ = self.call('update',args.new_dir,args.new_version,args.new_installer,*update_args,timeout=300,check=False)
+            code, _ = self.observed_update(args.new_dir,args.new_version,args.new_installer,*update_args)
             if args.fail_new_daemon:
                 if not code:
                     self.errors.append('forced daemon startup failure unexpectedly succeeded')
