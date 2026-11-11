@@ -120,6 +120,30 @@ fn encoded_size(value: &impl Serialize, limit: usize) -> Result<usize, String> {
     Ok(count.used)
 }
 
+// ChatList retains the terminal descriptor issued to a paired native view;
+// List projects attachment state for its own connection and may enrich a
+// resume hint. Normalize those observations only while both descriptors still
+// prove the same complete live daemon owner. Preserve every identity field.
+fn same_captured_terminal(
+    left: &TerminalSession,
+    right: &TerminalSession,
+    source: &HostSessionProof,
+) -> bool {
+    if left == right {
+        return true;
+    }
+    if !source.is_complete()
+        || left.continuity.live_proof().as_ref() != Some(source)
+        || right.continuity.live_proof().as_ref() != Some(source)
+    {
+        return false;
+    }
+    let mut projected = left.clone();
+    projected.continuity = right.continuity.clone();
+    projected.resume_hint = right.resume_hint.clone();
+    projected == *right
+}
+
 impl Census {
     pub(crate) fn terminal_ids(&self) -> BTreeSet<TerminalId> {
         self.terminals
@@ -186,18 +210,19 @@ impl Census {
                                 .live_proof()
                                 .as_ref()
                                 .is_some_and(|proof| proof != source)
-                            || self
-                                .terminals
-                                .iter()
-                                .any(|known| known.id == terminal.id && known != terminal)
+                            || self.terminals.iter().any(|known| {
+                                known.id == terminal.id
+                                    && !same_captured_terminal(known, terminal, source)
+                            })
                     })
             })
             || self.terminals.iter().any(|item| {
                 chats.contains(&item.id)
-                    && !self
-                        .chats
-                        .iter()
-                        .any(|chat| chat.terminal.as_ref() == Some(item))
+                    && !self.chats.iter().any(|chat| {
+                        chat.terminal
+                            .as_ref()
+                            .is_some_and(|paired| same_captured_terminal(paired, item, source))
+                    })
             })
         {
             return Err(
@@ -2552,6 +2577,134 @@ mod tests {
             validate_ready_scope(&duplicate_review, &serde_json::to_vec(&original).unwrap())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn paired_census_accepts_only_same_live_owner_attachment_and_hint_projections() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let preparation = preparation(root.path());
+        let proof = &preparation.authority.source;
+        let mut census = preparation.authority.census.clone();
+        let mut paired = census.terminals[0].clone();
+        paired.continuity = TerminalContinuity::Live {
+            host_session_id: proof.host_session_id.clone(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: proof.host_incarnation.clone(),
+        };
+        paired.resume_hint = Some("original issued observation".into());
+        census.terminals[0].resume_hint = Some("later worker observation".into());
+        let chat = Session {
+            id: paired.id,
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Codex,
+                recipe: paired.launch.clone(),
+                session_id: Some("confirmed-thread".into()),
+            },
+            proof: Some(proof.clone()),
+            terminal: Some(paired),
+            owned_codex_listener: None,
+            native_continuity: Default::default(),
+        };
+        let mut snapshots = SnapshotCapture::default();
+        snapshots.push(chat.clone(), Default::default()).unwrap();
+        census.chats = vec![chat];
+        census.snapshots = snapshots.finish();
+        let original = census.clone();
+        census.validate_evidence(proof).unwrap();
+        assert_eq!(
+            census, original,
+            "projection comparison must not rewrite captured descriptors"
+        );
+        let mut reversed = census.clone();
+        let listed = reversed.terminals[0].continuity.clone();
+        reversed.terminals[0].continuity = reversed.chats[0]
+            .terminal
+            .as_ref()
+            .unwrap()
+            .continuity
+            .clone();
+        reversed.chats[0].terminal.as_mut().unwrap().continuity = listed;
+        reversed.snapshots[0].source = reversed.chats[0].clone();
+        reversed.validate_evidence(proof).unwrap();
+        for mutation in [
+            "id",
+            "program",
+            "arguments",
+            "directory",
+            "environment",
+            "unset",
+            "listener",
+            "origin",
+            "predecessor",
+            "transcript",
+            "foreign-proof",
+            "incomplete-proof",
+            "nonlive",
+        ] {
+            let mut changed = census.clone();
+            let paired = changed.chats[0].terminal.as_mut().unwrap();
+            match mutation {
+                "id" => paired.id = TerminalId::new(),
+                "program" => paired.launch.program = "/different/provider".into(),
+                "arguments" => paired.launch.arguments.push("different".into()),
+                "directory" => paired.launch.working_directory = "/different".into(),
+                "environment" => {
+                    paired
+                        .launch
+                        .environment
+                        .insert("CODEX_HOME".into(), "/different".into());
+                }
+                "unset" => {
+                    paired.launch.unset_environment.insert("CODEX_HOME".into());
+                }
+                "listener" => {
+                    paired.owned_codex_listener = Some(crate::chat::OwnedCodexListener {
+                        socket: "/different/control.sock".into(),
+                        allocator: proof.clone(),
+                    })
+                }
+                "origin" => paired.recovery_origin = Some(TerminalId::new()),
+                "predecessor" => paired.predecessor = Some(TerminalId::new()),
+                "transcript" => paired.transcript_path = Some("/different/transcript".into()),
+                "foreign-proof" | "incomplete-proof" => {
+                    paired.continuity = TerminalContinuity::Live {
+                        host_session_id: proof.host_session_id.clone(),
+                        boot_id: proof.boot_id.clone(),
+                        host_incarnation: HostIncarnation::new(if mutation == "foreign-proof" {
+                            "different"
+                        } else {
+                            ""
+                        }),
+                    }
+                }
+                "nonlive" => {
+                    paired.continuity = TerminalContinuity::RelaunchAvailable {
+                        recipe: paired.launch.clone(),
+                        last_exit: None,
+                    }
+                }
+                _ => unreachable!(),
+            }
+            changed.snapshots[0].source = changed.chats[0].clone();
+            assert!(
+                changed.validate_evidence(proof).is_err(),
+                "accepted changed {mutation}"
+            );
+        }
+        let mut nonlive = census.terminals[0].clone();
+        nonlive.continuity = TerminalContinuity::RelaunchAvailable {
+            recipe: nonlive.launch.clone(),
+            last_exit: None,
+        };
+        assert!(same_captured_terminal(&nonlive, &nonlive, proof));
+        let mut different_hint = nonlive.clone();
+        different_hint.resume_hint = Some("different nonlive observation".into());
+        assert!(!same_captured_terminal(&nonlive, &different_hint, proof));
+        assert!(!same_captured_terminal(
+            &nonlive,
+            &census.terminals[0],
+            proof
+        ));
     }
 
     #[test]
