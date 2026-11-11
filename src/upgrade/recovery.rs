@@ -67,6 +67,20 @@ impl SnapshotCapture {
         source: Session,
         mut snapshot: crate::chat::Snapshot,
     ) -> Result<(), String> {
+        if [&source.launch.session_id, &snapshot.session_id]
+            .into_iter()
+            .flatten()
+            .any(|identity| identity.is_empty() || identity.len() > 1024)
+        {
+            return Err(
+                "The captured conversation identity is invalid; the source was not prepared".into(),
+            );
+        }
+        if let (Some(known), Some(captured)) = (&source.launch.session_id, &snapshot.session_id)
+            && known != captured
+        {
+            return Err("The captured conversation changed from its reviewed identity; the source was not prepared".into());
+        }
         snapshot.notification_preview = Default::default();
         let continuation = if source.launch.session_id.is_some() {
             "Resume explicitly to inspect whether the recorded conversation can continue."
@@ -4725,6 +4739,83 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_capture_rejects_known_identity_change_without_mutating_prior_scope() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let preparation = preparation(root.path());
+        let source = Session {
+            id: preparation.authority.census.terminals[0].id,
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Claude,
+                recipe: preparation.authority.census.terminals[0].launch.clone(),
+                session_id: Some("original-thread".into()),
+            },
+            proof: Some(preparation.authority.source.clone()),
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: Default::default(),
+        };
+        let mut capture = SnapshotCapture::default();
+        capture
+            .push(
+                source.clone(),
+                crate::chat::Snapshot {
+                    session_id: source.launch.session_id.clone(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let original_used = capture.used;
+        assert!(
+            capture
+                .push(
+                    source.clone(),
+                    crate::chat::Snapshot {
+                        session_id: Some("other-thread".into()),
+                        ..Default::default()
+                    }
+                )
+                .is_err()
+        );
+        assert_eq!(capture.used, original_used);
+        let saved = capture.finish();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].source, source);
+        let mut unnamed = source.clone();
+        unnamed.launch.session_id = None;
+        let mut captured = SnapshotCapture::default();
+        captured
+            .push(
+                unnamed.clone(),
+                crate::chat::Snapshot {
+                    session_id: source.launch.session_id.clone(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let before = captured.used;
+        for invalid in [String::new(), "x".repeat(1025)] {
+            assert!(
+                captured
+                    .push(
+                        unnamed.clone(),
+                        crate::chat::Snapshot {
+                            session_id: Some(invalid),
+                            ..Default::default()
+                        }
+                    )
+                    .is_err()
+            );
+            assert_eq!(captured.used, before);
+        }
+        let saved = captured.finish();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(
+            saved[0].source, unnamed,
+            "capture retains the immutable issued descriptor; only later read-only binding can use this exact snapshot"
+        );
+    }
+
+    #[test]
     fn captured_pane_aliases_and_presentations_bind_the_exact_confirmed_allocation() {
         let root = tempfile::tempdir_in("/var/tmp").unwrap();
         let preparation = preparation(root.path());
@@ -5229,6 +5320,119 @@ mod tests {
         record
             .validate_additional_issued_chats(&[later.clone()])
             .unwrap();
+        let mut wrong_target = later.clone();
+        wrong_target.terminal.as_mut().unwrap().launch.program = "/foreign/bin/cagents".into();
+        assert!(
+            record
+                .validate_additional_issued_chats(&[wrong_target.clone()])
+                .is_err()
+        );
+        let mut wrong_receipt_target: RecoveryRecord =
+            serde_json::from_value(serde_json::to_value(&record).unwrap()).unwrap();
+        wrong_receipt_target.target = Some("/foreign/bin/cagentsd".into());
+        assert!(
+            wrong_receipt_target.validate_issued_chats().is_err(),
+            "descriptor normalization is limited to the receipt's exact target executable"
+        );
+        let immutable_copy: RecoveryRecord =
+            serde_json::from_value(serde_json::to_value(&record).unwrap()).unwrap();
+        let mut settled = recovered_data(
+            immutable_copy,
+            &root.path().join("pure-checkpoint.json"),
+            target.to_path_buf(),
+            vec![later.clone()],
+            "pure-outcome".into(),
+        );
+        assert!(current_recovered_chat(
+            &source,
+            &settled.normalized_chat(&later),
+            proof
+        ));
+        assert!(
+            !current_recovered_chat(&source, &settled.normalized_chat(&wrong_target), proof),
+            "current inventory cannot normalize another installed console binary"
+        );
+        let invalid: [fn(&mut Session); 11] = [
+            |chat| chat.launch.session_id = Some("foreign-thread".into()),
+            |chat| chat.proof = None,
+            |chat| chat.proof.as_mut().unwrap().boot_id = BootId::new("foreign-boot"),
+            |chat| chat.id = TerminalId::new(),
+            |chat| chat.launch.recipe.arguments.push("foreign".into()),
+            |chat| chat.terminal.as_mut().unwrap().launch.program = "/foreign/bin/cagents".into(),
+            |chat| {
+                chat.terminal.as_mut().unwrap().launch.arguments[2] =
+                    crate::model::AgentId::new().to_string()
+            },
+            |chat| {
+                chat.terminal
+                    .as_mut()
+                    .unwrap()
+                    .launch
+                    .arguments
+                    .push("foreign".into())
+            },
+            |chat| {
+                chat.terminal
+                    .as_mut()
+                    .unwrap()
+                    .launch
+                    .working_directory
+                    .push("foreign")
+            },
+            |chat| {
+                chat.terminal
+                    .as_mut()
+                    .unwrap()
+                    .launch
+                    .environment
+                    .insert("OTHER".into(), "foreign".into());
+            },
+            |chat| {
+                chat.terminal
+                    .as_mut()
+                    .unwrap()
+                    .launch
+                    .unset_environment
+                    .insert("OTHER".into());
+            },
+        ];
+        for (index, mutate) in invalid.into_iter().enumerate() {
+            let mut changed = later.clone();
+            mutate(&mut changed);
+            assert!(
+                record
+                    .validate_additional_issued_chats(&[changed.clone()])
+                    .is_err()
+            );
+            if index != 0 {
+                assert!(!current_recovered_chat(
+                    &source,
+                    &settled.normalized_chat(&changed),
+                    proof
+                ));
+            } else {
+                // /clear may preserve a real current owner, but its different
+                // thread cannot alias the original captured conversation.
+                assert!(current_recovered_chat(
+                    &source,
+                    &settled.normalized_chat(&changed),
+                    proof
+                ));
+                assert!(!captured_chat_alias(
+                    &census,
+                    &source,
+                    &settled.normalized_chat(&changed),
+                    proof
+                ));
+            }
+        }
+        settled.witness.adopted_terminals[0]
+            .upgrade_relaunches
+            .clear();
+        assert!(
+            !current_recovered_chat(&source, &settled.normalized_chat(&later), proof),
+            "current inventory retains the immutable source/relaunch proof"
+        );
         let mut foreign = later.clone();
         foreign
             .terminal

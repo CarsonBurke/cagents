@@ -434,6 +434,29 @@ fn paused_record(
         .filter(|presentation| paused.chats.contains(&presentation.session))
         .cloned()
         .collect();
+    // Frozen descriptors can precede the provider's identity notification.
+    // Only the immutable captured page may fill that missing identity; later
+    // Agent, pane and receipt descriptors cannot teach history another thread.
+    for (source, saved) in paused.chats.iter_mut().zip(&mut paused.snapshots) {
+        if source.launch.session_id.is_none()
+            && let Some(identity) = saved.snapshot.session_id.clone()
+        {
+            if identity.is_empty() || identity.len() > 1024 {
+                return Err("The captured conversation identity is invalid".into());
+            }
+            if !paused.aliases.contains(source) {
+                paused.aliases.push(source.clone());
+            }
+            source.launch.session_id = Some(identity);
+            saved.source = source.clone();
+            if let Some(reason) = &mut saved.limitation {
+                *reason = reason.replace(
+                    "No conversation identity was recorded; start a new conversation explicitly to continue.",
+                    "Resume explicitly to inspect whether the recorded conversation can continue.",
+                );
+            }
+        }
+    }
     Ok(paused)
 }
 
@@ -543,11 +566,51 @@ mod tests {
         (registry, pane)
     }
 
+    #[test]
+    fn paused_record_never_learns_missing_identity_from_later_alias() {
+        let source = Session {
+            id: TerminalId::new(),
+            launch: chat::Launch {
+                provider: crate::agent::Provider::Claude,
+                recipe: LaunchRecipe {
+                    program: "claude".into(),
+                    arguments: vec![],
+                    working_directory: "/fixture".into(),
+                    environment: Default::default(),
+                    unset_environment: Default::default(),
+                },
+                session_id: None,
+            },
+            proof: Some(proof("source")),
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: chat::NativeContinuity::RetainedClaudeActor { protocol: 2 },
+        };
+        let mut later = source.clone();
+        later.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        let census = recovery::Census {
+            chats: vec![source.clone()],
+            aliases: vec![later.clone()],
+            snapshots: vec![crate::upgrade::floor::StoppedSnapshot {
+                source: source.clone(),
+                snapshot: Default::default(),
+                limitation: None,
+            }],
+            ..Default::default()
+        };
+        let paused = paused_record(proof("source"), &census, &[source.id], vec![]).unwrap();
+        assert_eq!(paused.chats, vec![source.clone()]);
+        assert_eq!(paused.snapshots[0].source, source);
+        assert!(paused.chats[0].launch.session_id.is_none());
+        assert!(!paused.aliases.contains(&later));
+    }
+
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum SettledCase {
         OrdinaryClose,
         CanonicalClose,
         MissingAdopted,
+        CapturedIdentity,
     }
 
     #[test]
@@ -573,6 +636,14 @@ mod tests {
     #[test]
     fn settled_prepared_restart_never_turns_missing_adopted_claude_into_history() {
         settled_restart_case(crate::agent::Provider::Claude, SettledCase::MissingAdopted);
+    }
+
+    #[test]
+    fn settled_prepared_restart_binds_missing_identity_only_from_captured_page() {
+        settled_restart_case(
+            crate::agent::Provider::Claude,
+            SettledCase::CapturedIdentity,
+        );
     }
 
     fn settled_restart_case(provider_kind: crate::agent::Provider, case: SettledCase) {
@@ -667,12 +738,16 @@ mod tests {
                 provider_version: "0.100.0".into(),
             };
         }
+        let history_source = source.clone();
+        if case == SettledCase::CapturedIdentity {
+            source.launch.session_id = None;
+        }
         let mut snapshots = recovery::SnapshotCapture::default();
         snapshots
             .push(
                 source.clone(),
                 chat::Snapshot {
-                    session_id: source.launch.session_id.clone(),
+                    session_id: history_source.launch.session_id.clone(),
                     title: Some("Paused across daemon restarts".into()),
                     items: vec![Arc::new(chat::Item {
                         id: "retained-page".into(),
@@ -894,7 +969,7 @@ mod tests {
                     .resume_source(&requested)
                     .is_none()
             );
-            assert!(crate::upgrade::floor::snapshot(&source).is_err());
+            assert!(crate::upgrade::floor::snapshot(&history_source).is_err());
             let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
             let server_host = host.clone();
             let server =
@@ -906,7 +981,7 @@ mod tests {
             assert_eq!(failure.recovery, chat::Recovery::Retry);
             server.join().unwrap();
             assert!(crate::upgrade::floor::load().unwrap().records.is_empty());
-            assert!(crate::upgrade::floor::snapshot(&source).is_err());
+            assert!(crate::upgrade::floor::snapshot(&history_source).is_err());
             assert_eq!(fs::read(&store.path).unwrap(), checkpoint);
             assert_eq!(fs::read(&outcome).unwrap(), outcome_before);
             assert!(!sentinel.exists());
@@ -916,11 +991,13 @@ mod tests {
             crate::upgrade::floor::load()
                 .unwrap()
                 .resume_source(&requested),
-            Some(&source)
+            Some(&history_source)
         );
         assert_eq!(
-            crate::upgrade::floor::snapshot(&source).unwrap().source,
-            source
+            crate::upgrade::floor::snapshot(&history_source)
+                .unwrap()
+                .source,
+            history_source
         );
 
         // A different confirmed thread cannot borrow the captured page even
@@ -952,7 +1029,10 @@ mod tests {
             std::thread::spawn(move || super::super::client::serve(server, 1, server_host));
         let client =
             chat::client::ClientHandle::fixture_restore(client, requested.clone()).unwrap();
-        assert_eq!(client.session().launch.session_id, source.launch.session_id);
+        assert_eq!(
+            client.session().launch.session_id,
+            history_source.launch.session_id
+        );
         assert_eq!(client.session().proof, Some(proof("cold-start")));
         let handle = host.lock().unwrap().chats[&source.id].handle.clone();
         let page = handle.snapshot(None).unwrap();
@@ -960,7 +1040,10 @@ mod tests {
         assert!(page.items.iter().any(|item| matches!(&item.content, chat::ItemContent::Text { text, .. } if text == "The captured page survived")));
         assert!(handle.is_read_only_history() && !handle.owns_work());
         assert!(!sentinel.exists());
-        let archived = if case == SettledCase::OrdinaryClose {
+        let archived = if matches!(
+            case,
+            SettledCase::OrdinaryClose | SettledCase::CapturedIdentity
+        ) {
             let verified = recovery::classify_retained_prepared(&store.path, &daemon_binary)
                 .unwrap()
                 .unwrap();
@@ -1014,13 +1097,13 @@ mod tests {
         );
         drop(registry);
         // The history exists until ordinary startup's production pruning pass.
-        assert!(crate::upgrade::floor::snapshot(&source).is_ok());
+        assert!(crate::upgrade::floor::snapshot(&history_source).is_ok());
         if case == SettledCase::CanonicalClose {
             // Production pruning removes the genuinely closed paused page.
             // The still-canonical settled Prepared file must never recreate it.
             model::floor::restore_presentations().unwrap();
             assert!(crate::upgrade::floor::load().unwrap().records.is_empty());
-            assert!(crate::upgrade::floor::snapshot(&source).is_err());
+            assert!(crate::upgrade::floor::snapshot(&history_source).is_err());
             let mut initial = state::HostState::new(proof("closed-canonical-restart"));
             initial.install_model(super::super::model::Registry::open().unwrap());
             let host = Arc::new(state::HostLock::new(initial));
@@ -1055,7 +1138,7 @@ mod tests {
                     .resume_source(&requested)
                     .is_none()
             );
-            assert!(crate::upgrade::floor::snapshot(&source).is_err());
+            assert!(crate::upgrade::floor::snapshot(&history_source).is_err());
             assert_eq!(fs::read(&store.path).unwrap(), checkpoint);
             assert_eq!(fs::read(&outcome).unwrap(), outcome_before);
             assert!(!sentinel.exists());
@@ -1145,7 +1228,7 @@ mod tests {
                     .is_none()
             );
             assert!(
-                crate::upgrade::floor::snapshot(&source).is_err(),
+                crate::upgrade::floor::snapshot(&history_source).is_err(),
                 "closed paused page must not be recreated from archived metadata"
             );
             assert_eq!(
