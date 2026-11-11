@@ -106,6 +106,25 @@ mod tests {
                 !tracker.existing_only(user_created.id, terminal),
                 "new user panes in the initial echo remain ordinary"
             );
+            // A first authoritative snapshot can replace the cached source
+            // session with the update's issued successor under the same card.
+            let mut cached = late.clone();
+            let CardKind::Terminal(source) = &mut cached.kind else {
+                unreachable!()
+            };
+            source.id = TerminalId::new();
+            let cached_terminal = source.id;
+            let mut replaced = InitialPanes::default();
+            replaced.capture(instance::window_launch_restore_policy(), [&cached]);
+            replaced.capture_views(vec![scope.clone()]);
+            replaced.observe_initial_view(&view, [&cached]);
+            assert!(replaced.existing_only(late.id, terminal));
+            assert!(!replaced.existing_only(late.id, cached_terminal));
+            replaced.settled(late.id, cached_terminal);
+            assert!(
+                replaced.existing_only(late.id, terminal),
+                "an old cached attempt cannot settle the issued successor"
+            );
             tracker.settled(late.id, terminal);
             tracker.capture_views(vec![scope]);
             tracker.observe_initial_view(&view, &[]);
@@ -202,31 +221,35 @@ mod tests {
 }
 
 impl InitialPanes {
-    pub(super) fn capture(&mut self, policy: instance::WindowRestorePolicy, cards: &[CardState]) {
+    pub(super) fn capture<'a>(
+        &mut self,
+        policy: instance::WindowRestorePolicy,
+        cards: impl IntoIterator<Item = &'a CardState>,
+    ) {
         if std::mem::replace(&mut self.captured, true)
             || policy != instance::WindowRestorePolicy::ExistingOnly
         {
             return;
         }
         self.recovery = true;
-        self.original_cards.extend(cards.iter().map(|card| card.id));
-        self.panes.extend(cards.iter().filter_map(|card| {
+        for card in cards {
+            self.original_cards.insert(card.id);
             if !card.existence.is_open() {
-                return None;
+                continue;
             }
             let session = match &card.kind {
                 CardKind::Chat(session) if !session.is_unstarted() => session.id,
                 CardKind::Terminal(session) if !terminal_ended(session) => session.id,
-                _ => return None,
+                _ => continue,
             };
-            Some((
+            self.panes.insert(
                 card.id,
                 InitialPane {
                     session,
                     settled: false,
                 },
-            ))
-        }));
+            );
+        }
     }
 
     pub(super) fn capture_views(&mut self, scopes: Vec<crate::workspace_model::views::Scope>) {
@@ -236,10 +259,10 @@ impl InitialPanes {
         self.pending_views.extend(scopes);
     }
 
-    pub(super) fn observe_initial_view(
+    pub(super) fn observe_initial_view<'a>(
         &mut self,
         view: &crate::workspace_model::views::View,
-        local: &[CardState],
+        local: impl IntoIterator<Item = &'a CardState>,
     ) {
         if !self.pending_views.remove(&view.scope) {
             return;
@@ -247,7 +270,7 @@ impl InitialPanes {
         // A local pane created after launch is a user action even if its
         // first registry echo arrives in this scope's initial snapshot.
         let new_local: HashSet<_> = local
-            .iter()
+            .into_iter()
             .filter(|card| !self.original_cards.contains(&card.id))
             .map(|card| card.id)
             .collect();
@@ -260,10 +283,17 @@ impl InitialPanes {
                 CardKind::Terminal(session) if !terminal_ended(session) => session.id,
                 _ => continue,
             };
-            self.panes.entry(pane.id).or_insert(InitialPane {
-                session,
-                settled: false,
-            });
+            // The first authoritative view owns the initial descriptor. It
+            // may name an issued successor to the cached session. Any attempt
+            // already issued for the cache keeps its captured intent, and its
+            // result cannot settle this new exact key.
+            self.panes.insert(
+                pane.id,
+                InitialPane {
+                    session,
+                    settled: false,
+                },
+            );
         }
     }
 

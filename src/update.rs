@@ -10,6 +10,8 @@ mod handoff;
 mod installed;
 mod pending_recovery;
 pub(crate) mod recovery;
+#[cfg(all(feature = "ui", feature = "development"))]
+mod review_fixture;
 pub use recovery::TargetRecoveryRequired;
 pub(crate) mod source;
 pub use confirmation::{Choice as UpdateChoice, Confirmation as UpdateConfirmation, decide};
@@ -514,7 +516,7 @@ fn installed_candidate_version(
     let replaces_daemon = source_proof.is_some()
         && (source_protocol != crate::terminal_ipc::PROTOCOL_VERSION
             || daemon.is_some_and(|owner| owner.version_root != served));
-    if served == window.version_root && !replaces_daemon {
+    if !replaces_daemon && served == window.version_root {
         return Err(invalid("the installed application is already running"));
     }
     served
@@ -1175,6 +1177,12 @@ pub fn status() -> Result<Option<UpdateJob>, UpdateError> {
 /// installation failure as a warning in every subsequently installed window.
 #[cfg(feature = "ui")]
 pub(crate) fn status_for_ui() -> Result<Option<UpdateJob>, UpdateError> {
+    #[cfg(feature = "development")]
+    if let Some(root) = std::env::var_os("CAGENTS_EVIDENCE_FIXTURE")
+        && let Some(job) = review_fixture::read(Path::new(&root))?
+    {
+        return Ok(Some(job));
+    }
     let Some(job) = status()? else {
         return Ok(None);
     };
@@ -1531,6 +1539,7 @@ fn perform_update(
         "Saving and closing all application windows",
     )?;
     let mut guard = crate::instance::UiUpdateGuard::acquire()?;
+    crate::install_guard::preflight_editor_companions(Some(staged.identity.protocol))?;
     confirmation::check_cancelled(state, job)?;
     let windows = guard.prepare_windows(Duration::from_secs(45))?;
     {
@@ -1550,7 +1559,7 @@ fn perform_update(
         )
         .map_err(io::Error::other)?
         .with_inspection(&inspected);
-        if !confirmed.preserves_consent(&latest) {
+        if !confirmed.preserves_consent(&context.apply(latest)) {
             return Err(invalid(
                 "Session ownership changed during pane inspection; existing windows were kept open",
             ));

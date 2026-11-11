@@ -2803,7 +2803,8 @@ fn unnamed_actor_adopts_without_forging_pane_writer_authority_before_first_provi
             width_fraction: 1.0,
             existence: crate::model::Existence::Open,
             kind: crate::model::CardKind::Chat(source.clone()),
-        }],
+        }]
+        .into(),
         focused: Some(pane),
         ..Default::default()
     };

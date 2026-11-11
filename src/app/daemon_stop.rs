@@ -143,7 +143,7 @@ impl Application for DaemonStop {
             widget::column::with_children(vec![
                 crate::design::display("Stop daemon?").into(),
                 crate::design::title(format!(
-                    "Stop {} hosted terminal/chat sessions and {} running background subagents",
+                    "Stop {} hosted terminal/chat sessions and {} background subagents",
                     self.capability.live_terminals, self.capability.background_subagents
                 ))
                 .into(),

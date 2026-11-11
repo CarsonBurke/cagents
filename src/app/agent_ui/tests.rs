@@ -26,7 +26,7 @@ fn restored_omp_attaches_for_background_metadata_without_opening_or_replaying() 
     let mut control = super::super::tests::terminal_card_state();
     control.kind = CardKind::Settings;
     app.durable = Arc::new(WorkspaceState {
-        cards: vec![control.clone(), original.clone()],
+        cards: vec![control.clone(), original.clone()].into(),
         focused: Some(control.id),
         ..Default::default()
     });

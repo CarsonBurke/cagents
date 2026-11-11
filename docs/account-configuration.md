@@ -94,7 +94,9 @@ between turns. The daemon fences the exact idle actor, transfers only that
 conversation's transcript to the alternate home, and requires the provider
 to confirm the same conversation before saving the change and sending the
 untouched message. Busy conversations, queued work, approvals and other live
-owners prevent switching. A failed or partially executed turn is never replayed.
+owners prevent switching. A background subagent that is still running, or
+waiting on its own background work, also prevents it: the message stays unsent,
+and the conversation names the subagent to stop from its tab first. A failed or partially executed turn is never replayed.
 Missing, divergent or unsupported history pauses the switch and preserves the
 unsent message and original saved conversation. Omp handles its own account
 rotation. Shell terminals retain their launch homes for their lifetime.

@@ -2596,12 +2596,21 @@ fn updated_codex_agent_answers_through_its_relaunched_server() {
     const THREAD: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     let (host, mut request, path) = fixture();
     let root = path.parent().unwrap().to_owned();
-    let processes = root.join("upgrade-process-census");
+    // This service fixture owns its daemon and provider stubs. An unrelated
+    // process with unreadable invocation/environment data is not an input to
+    // its relaunch contract. Keep real kernel data for the service and the
+    // exact providers this test tracks.
+    let processes = root.join("processes");
     std::fs::create_dir(&processes).unwrap();
+    std::os::unix::fs::symlink(
+        format!("/proc/{}", std::process::id()),
+        processes.join(std::process::id().to_string()),
+    )
+    .unwrap();
     let program = root.join("bin/codex");
     std::fs::write(
         &program,
-        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > \"$HOME/../codex-arguments\"\nprintf '%s\\n' \"$$\" > \"$HOME/../codex-pid\"\nprintf 'launch\\n' >> \"$HOME/../codex-launches\"\nexec /bin/sleep 60\n",
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > \"$HOME/../codex-arguments\"\n/bin/cat \"/proc/$$/stat\" >> \"$HOME/../codex-processes\"\nprintf 'launch\\n' >> \"$HOME/../codex-launches\"\nexec /bin/sleep 60\n",
     )
     .unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -2610,6 +2619,7 @@ fn updated_codex_agent_answers_through_its_relaunched_server() {
     };
     spec.provider = Provider::Codex;
     // Each server the daemon launches: its methods in order and its prompts.
+    let (listener_finished, listener_closed) = std::sync::mpsc::sync_channel(1);
     let server_root = root.clone();
     let server = std::thread::spawn(move || {
         let mut served = Vec::new();
@@ -2703,6 +2713,12 @@ fn updated_codex_agent_answers_through_its_relaunched_server() {
                     websocket.send(tungstenite::Message::Text(json!({"method":"turn/completed","params":{"threadId":THREAD,"turn":{"id":format!("turn-{launch}"),"status":"completed","items":[{"id":format!("answer-{launch}"),"type":"agentMessage","text":answer}]}}}).to_string().into())).unwrap();
                 }
             }
+            // The stand-in lives in this thread, independently of the stub
+            // process the daemon stops. Its listener must finish closing too
+            // before the next daemon can decide whether to join or relaunch.
+            drop(websocket);
+            drop(listener);
+            listener_finished.send(launch).unwrap();
             served.push((methods, prompts));
         }
         served
@@ -2723,30 +2739,38 @@ fn updated_codex_agent_answers_through_its_relaunched_server() {
     );
     // The previous daemon prepares its checkpoint and stops; its successor
     // restores the checkpoint from the same registry.
-    let update = |host: SharedHost, incarnation: &str| {
+    let update = |host: SharedHost, incarnation: &str, previous_launch: usize| {
         let providers = host
             .lock()
             .unwrap()
             .chats
             .values()
             .map(|record| record.handle.clone())
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|handle| {
-                let pid = std::fs::read_to_string(root.join("codex-pid"))
-                    .unwrap()
-                    .trim()
-                    .parse()
-                    .unwrap();
-                let process = crate::daemon::holder_registry::Process::read(pid).unwrap();
-                assert!(
-                    process.is_current(),
-                    "the fixture server must still be live"
-                );
-                (handle, process)
-            })
             .collect::<Vec<_>>();
-        assert_eq!(providers.len(), 1);
+        assert_eq!(providers.len(), 1, "the fixture owns exactly one provider");
+        // A local holder-backed runtime does not populate provider_process().
+        // The controlled stub records its own kernel identity before exec,
+        // which retains PID/start, so this also detects death or PID reuse
+        // between launch and this proof rather than trusting a PID alone.
+        let recorded = std::fs::read_to_string(root.join("codex-processes")).unwrap();
+        let recorded = recorded.lines().collect::<Vec<_>>();
+        assert_eq!(
+            recorded.len(),
+            previous_launch,
+            "one exact process per launch"
+        );
+        let stat = recorded[previous_launch - 1];
+        let pid = stat.split_whitespace().next().unwrap().parse().unwrap();
+        let (_, start) = crate::model::agent_recovery::process_identity(stat.as_bytes())
+            .expect("the fixture recorded a complete kernel process identity");
+        let provider = crate::daemon::holder_registry::Process { pid, start };
+        assert_eq!(
+            crate::daemon::holder_registry::Process::read(provider.pid).unwrap(),
+            provider,
+            "the fixture server changed before entering its process roster"
+        );
+        let entry = processes.join(provider.pid.to_string());
+        std::os::unix::fs::symlink(format!("/proc/{}", provider.pid), &entry).unwrap();
         let control_gate = host.lock().unwrap().control_gate.clone();
         let control = control_gate.write().unwrap();
         let capability = host
@@ -2762,16 +2786,35 @@ fn updated_codex_agent_answers_through_its_relaunched_server() {
         for terminal in shutdown {
             let _ = terminal.shutdown();
         }
-        // This test exercises server relaunch and answer continuity. Prove
-        // its actual provider stopped before using the controlled census;
-        // unrelated desktop processes cannot affect that fixture evidence.
-        for (handle, process) in providers {
+        for handle in providers {
             assert!(handle.is_completed(), "the provider teardown must complete");
-            assert!(
-                process.reaped(),
-                "owned Codex server was not reaped: {process:?}"
-            );
         }
+        // Removal is justified by this original process's actual retirement,
+        // not by assuming that shutdown succeeded or by hiding it from the
+        // scan. Reaping may follow the worker's exit proof asynchronously.
+        assert!(
+            provider.reaped(),
+            "the original fixture server was not reaped"
+        );
+        match crate::daemon::holder_registry::Process::read(provider.pid) {
+            Ok(current) => assert_ne!(
+                current, provider,
+                "the original server still survives the daemon shutdown"
+            ),
+            Err(error) => assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::NotFound,
+                "cannot prove the original fixture server ended: {error}"
+            ),
+        }
+        std::fs::remove_file(entry).unwrap();
+        assert_eq!(
+            listener_closed
+                .recv_timeout(Duration::from_secs(20))
+                .expect("the original fixture listener did not close"),
+            previous_launch,
+            "the close acknowledgment belongs to the exact previous server"
+        );
         drop(host);
         let proof = HostSessionProof {
             host_session_id: HostSessionId::new(format!("{incarnation}-execution-fixture")),
@@ -2790,7 +2833,7 @@ fn updated_codex_agent_answers_through_its_relaunched_server() {
     };
     let mut host = host;
     for (launch, incarnation) in [(2, "first-update"), (3, "second-update")] {
-        let (successor, proof) = update(host, incarnation);
+        let (successor, proof) = update(host, incarnation, launch - 1);
         host = successor;
         let (agent, _) = status(&host, &Authority::default(), accepted.agent.id).unwrap();
         let Some(HostedSession::Chat(relaunched)) = agent.session else {
@@ -2814,7 +2857,21 @@ fn updated_codex_agent_answers_through_its_relaunched_server() {
         assert_eq!(after.result.text, format!("CODEX_SERVER_{launch}_ANSWER"));
     }
     close(&host, &Authority::default(), accepted.agent.id).unwrap();
+    assert_eq!(
+        listener_closed
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the last fixture listener did not close"),
+        3
+    );
     let served = server.join().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("codex-processes"))
+            .unwrap()
+            .lines()
+            .count(),
+        3,
+        "only the three expected provider processes were launched"
+    );
     assert_eq!(served[0].1, 1);
     for (methods, prompts) in &served[1..] {
         assert!(
@@ -3834,10 +3891,27 @@ fn an_owner_answers_and_interrupts_only_its_own_active_run() {
     let [asked] = asked.as_slice() else {
         panic!("{asked:?}")
     };
-    assert_eq!(
-        status(&host, &owner, agent).unwrap().1.state,
-        State::Waiting
-    );
+    // Requests can become visible in the actor before its activity observer
+    // commits the corresponding run state to the registry.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let waiting = loop {
+        let (_, latest) = status(&host, &owner, agent).unwrap();
+        assert_eq!(latest.id, accepted.run.id, "another run replaced the owner");
+        assert!(
+            !latest.state.is_terminal(),
+            "the permission request's run settled before waiting: {latest:?}"
+        );
+        if latest.state == State::Waiting {
+            break latest;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the permission request's run never waited: {latest:?}; requests: {:?}",
+            process(&host, owner.clone(), Operation::Requests(agent))
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(waiting.state, State::Waiting);
     let error = control(answer(&asked.id, "always", Vec::new())).unwrap_err();
     assert!(error.contains("accepts the actions allow, deny"), "{error}");
     let error = control(answer(

@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -66,7 +68,7 @@ STUBS = {
                 observe)
                     [ ! -e "$STUB_LOG/observe-error" ] || exit 1
                     if [ -e "$STUB_LOG/observe-malformed" ]; then printf 'invalid'; exit 0; fi
-                    if [ -e "$STUB_LOG/ui-absent" ]; then printf '{"window":null}\\n'; exit 0; fi
+                    if [ -e "$STUB_LOG/ui-absent" ]; then printf 'nested session has no windows\\n' >&2; exit 1; fi
                     if [ -e "$STUB_LOG/cropped" ]; then
                         printf '{"window":{"size":[900,600]},"output":{"logical":{"width":900,"height":561}},"text":"'
                     else
@@ -84,7 +86,7 @@ STUBS = {
         if [ -n "${cmd:-}" ]; then
             [ -z "${STUB_APP_FAILS:-}" ] || exit 3
             mkdir -p "$root"
-            sh -c "$cmd" >>"$STUB_LOG/app-output" 2>&1 &
+            NIRI_SOCKET=stub-niri sh -c "$cmd" >>"$STUB_LOG/app-output" 2>&1 &
             # The real harness waits for a window that a failed runner never shows.
             [ ! -e "$STUB_LOG/harness-waits" ] || exec sleep 200
             # Nor does it report ready until the app is up, unless told not to wait.
@@ -100,6 +102,28 @@ STUBS = {
         if [ -n "${shot:-}" ]; then
             mkdir -p "$STUB_TASK/niri/shots"
             printf png > "$STUB_TASK/niri/shots/$shot.png"
+        fi
+    """,
+    "niri": """
+        #!/bin/bash
+        printf '%s\\n' "$*" >> "$STUB_LOG/niri"
+        [ "${NESTED_MARKER:-}" = nested ] || exit 91
+        [ "$*" = 'msg --json windows' ] || exit 92
+        [ ! -e "$STUB_LOG/niri-error" ] || exit 1
+        if [ -e "$STUB_LOG/niri-malformed" ]; then printf invalid; exit 0; fi
+        if [ -e "$STUB_LOG/niri-object" ]; then printf '{"window":null}'; exit 0; fi
+        if [ -e "$STUB_LOG/niri-scalar" ]; then printf false; exit 0; fi
+        if [ -e "$STUB_LOG/niri-missing-app" ]; then printf '[{}]'; exit 0; fi
+        if [ -e "$STUB_LOG/niri-scalar-record" ]; then printf '[true]'; exit 0; fi
+        if [ -e "$STUB_LOG/niri-invalid-app" ]; then printf '[{"app_id":17}]'; exit 0; fi
+        if [ -e "$STUB_LOG/ui-absent" ]; then
+            if [ -e "$STUB_LOG/other-window" ]; then
+                printf '[{"id":2,"app_id":"example.Other"}]'
+            else
+                printf '[]'
+            fi
+        else
+            printf '[{"id":1,"app_id":"dev.cagents.Cagents.Development"}]'
         fi
     """,
     "magick": """
@@ -608,6 +632,20 @@ class Evidence(unittest.TestCase):
         self.assertTrue(live_lock_held(self.native_lock))
         self.run_tool("stop")
 
+    def test_named_instances_are_shared_by_the_runner_and_cli_and_stay_pinned(self) -> None:
+        self.built()
+        self.run_tool("start", "after", "--instance", "native-review")
+        self.assertIn("--instance native-review --in-session", (self.logs / "runner").read_text())
+        instance = self.run_tool("env", "sh", "-c", 'printf %s "$CAGENTS_DEVELOPMENT_INSTANCE"')
+        self.assertEqual(instance.stdout, "native-review")
+        self.run_tool("stop")
+        changed = self.run_tool("start", "after", "--instance", "other-review", check=False)
+        self.assertEqual(changed.returncode, 2)
+        self.assertIn("already selected another instance", changed.stderr)
+        self.run_tool("start", "after")
+        self.assertIn("--instance native-review --in-session", (self.logs / "runner").read_text())
+        self.run_tool("stop")
+
     def test_the_repositorys_own_runner_starts_through_the_session_cargo(self) -> None:
         checkout = self.checkout("after")
         shutil.copytree(REPOSITORY / "scripts", checkout / "scripts", dirs_exist_ok=True)
@@ -618,7 +656,7 @@ class Evidence(unittest.TestCase):
         self.run_tool("build", "after", str(checkout))
         built = (self.logs / "cargo").read_text()
         metadata = (self.logs / "cargo-metadata").read_text()
-        started = self.run_tool("start", "after", check=False)
+        started = self.run_tool("start", "after", "--instance", "native-review", check=False)
         self.assertEqual(started.returncode, 0, (self.logs / "app-output").read_text())
         for _ in range(100):
             if (self.logs / "ui-ran").exists():
@@ -844,7 +882,8 @@ class Evidence(unittest.TestCase):
         (self.task / "niri" / "session.rc").write_text("0")
         (self.logs / "ui-absent").touch()
         before = (self.logs / "runner").read_text()
-        for marker in ("observe-error", "observe-malformed"):
+        for marker in ("niri-error", "niri-malformed", "niri-object", "niri-scalar",
+                       "niri-missing-app", "niri-scalar-record", "niri-invalid-app"):
             with self.subTest(marker=marker):
                 failed = self.logs / marker
                 failed.touch()
@@ -858,9 +897,18 @@ class Evidence(unittest.TestCase):
         self.run_tool("stop")
 
     def test_relaunch_keeps_the_session_and_replays_only_the_built_products(self) -> None:
+        self.assert_relaunch_keeps_built_products()
+
+    def test_relaunch_ignores_unrelated_compositor_windows(self) -> None:
+        (self.logs / "other-window").touch()
+        self.assert_relaunch_keeps_built_products()
+
+    def assert_relaunch_keeps_built_products(self) -> None:
         self.built()
         self.run_tool("start", "after")
         original_pid = int((self.logs / "ui-pid").read_text())
+        # A previous runner receipt cannot establish that the current window closed.
+        (self.task / "niri" / "session.rc").write_text("0")
         refused = self.run_tool("relaunch", check=False)
         self.assertNotEqual(refused.returncode, 0)
         self.assertIn("close the app window", refused.stderr)
@@ -883,6 +931,7 @@ class Evidence(unittest.TestCase):
                 time.sleep(0.05)
             else:
                 self.fail("relaunched UI did not appear: " + output.read_text())
+            self.assertIn("msg --json windows", (self.logs / "niri").read_text())
             self.assertFalse(self.lock_is_free(self.native_lock))
             self.assertEqual((self.logs / "cargo").read_text(), cargo_before)
             self.assertEqual((self.task / "fixture" / "home" / ".claude").stat().st_ino, identity)
@@ -984,6 +1033,23 @@ class Evidence(unittest.TestCase):
         result = self.run_tool("start", "after", "--portal", "xdg", check=False)
         self.assertEqual(result.returncode, 2)
         self.assertIn("unknown portal backend: xdg; use gtk, kde, gnome or cosmic", result.stderr)
+        self.assertTrue(self.lock_is_free(self.native_lock))
+
+    def test_zero_wait_takes_a_free_lock_without_waiter_scheduling(self) -> None:
+        self.built()
+        real_flock = shutil.which("flock", path=self.env["PATH"])
+        self.assertIsNotNone(real_flock)
+        # Starting a helper is not instantaneous. A zero-wait request must
+        # still try the idle lock before deciding its budget expired.
+        write_executable(self.bin / "flock", f"""
+            #!/bin/sh
+            sleep 0.05
+            exec {shlex.quote(real_flock)} "$@"
+        """)
+        self.run_tool("start", "after", "--wait-lock", "0")
+        self.assertFalse(self.lock_is_free(self.native_lock))
+        self.assertNotIn(str(self.native_lock), (self.logs / "kwin-fds").read_text())
+        self.run_tool("stop")
         self.assertTrue(self.lock_is_free(self.native_lock))
 
     def test_start_reports_a_busy_lock_without_starting(self) -> None:
@@ -1142,6 +1208,307 @@ class Evidence(unittest.TestCase):
         (fixture / "home" / ".config" / "fixture-forge").touch()
         return fixture
 
+    def test_plain_and_offline_codex_sessions_install_only_the_requested_peer(self) -> None:
+        self.built()
+        self.run_tool("start", "after")
+        fixture = self.task / "fixture"
+        self.assertFalse((fixture / "bin" / "codex").exists())
+        self.assertNotEqual(self.fixture_shell("command -v codex", check=False).returncode, 0)
+        self.run_tool("stop")
+
+        self.run_tool("start", "after", "--codex", "tool-rows")
+        # What each peer checks before serving, with no step of the agent's own.
+        self.assertEqual(fixture.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(self.fixture_shell("codex --version").stdout,
+                         "codex-cli 0.162.0 (offline tool-rows fixture)\n")
+        served = self.fixture_shell(
+            'socket="$XDG_RUNTIME_DIR/codex-test.sock"; '
+            'codex app-server --listen "unix://$socket" 2>"$XDG_RUNTIME_DIR/codex-test.log" & peer=$!; '
+            'for _ in $(seq 100); do [ -S "$socket" ] && break; kill -0 "$peer" 2>/dev/null || break; sleep 0.1; done; '
+            'if [ -S "$socket" ]; then echo listening; else cat "$XDG_RUNTIME_DIR/codex-test.log"; fi; '
+            'kill "$peer" 2>/dev/null; wait "$peer" 2>/dev/null; :')
+        self.assertEqual(served.stdout, "listening\n", served.stderr)
+        self.assertTrue((fixture / "home" / ".codex").is_dir())
+        self.run_tool("stop")
+
+        # The other peers, and the plain fixture again: each start installs afresh.
+        self.run_tool("start", "after", "--codex", "child-errors")
+        self.assertIn("child", self.fixture_shell("codex --version").stdout)
+        self.run_tool("stop")
+        self.run_tool("start", "after", "--codex", "terminal-escape")
+        self.assertIn("terminal", self.fixture_shell("codex --version").stdout)
+        self.run_tool("stop")
+        self.run_tool("start", "after")
+        self.assertFalse((fixture / "bin" / "codex").exists())
+        self.assertFalse((fixture / "libexec" / "codex").exists())
+
+    def test_codex_peer_preserves_an_explicit_narrow_viewport(self) -> None:
+        self.built()
+        self.run_tool("start", "after", "--width", "900", "--height", "800",
+                      "--codex", "tool-rows")
+        self.assertIn("size=900,800", (self.logs / "kwinrules").read_text())
+        self.assertIn("--width 900 --height 800", (self.logs / "kwin").read_text())
+        self.assertEqual(self.fixture_shell("codex --version").stdout,
+                         "codex-cli 0.162.0 (offline tool-rows fixture)\n")
+        self.run_tool("stop")
+
+    def test_an_unknown_codex_peer_is_refused_before_the_lock(self) -> None:
+        self.built()
+        result = self.run_tool("start", "after", "--codex", "codex", check=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("unknown Codex peer: codex; use tool-rows, child-errors or terminal-escape", result.stderr)
+        self.assertTrue(self.lock_is_free(self.native_lock))
+
+    def codex_elf(self, name: str = "real codex") -> Path:
+        # false is an ELF that fails if executed. Validation only reads it;
+        # these contracts never launch a real provider or compile a binary.
+        source = self.root / name
+        shutil.copyfile("/usr/bin/false", source)
+        source.chmod(0o755)
+        return source
+
+    def test_real_codex_is_copied_without_credentials_or_privileged_metadata(self) -> None:
+        self.built()
+        source = self.codex_elf("codex '$(not-a-command)")
+        source.chmod(0o6755)
+        os.setxattr(source, "user.cagents-fixture", b"not copied")
+        original = source.read_bytes()
+        identity = source.stat()
+        (source.parent / "auth.json").write_text("invented credential, not fixture data")
+        self.run_tool("start", "after", "--width", "900", "--height", "750",
+                      "--codex-executable", str(source))
+        fixture = self.task / "fixture"
+        installed = fixture / "libexec/codex/codex"
+        self.assertEqual(installed.read_bytes(), original)
+        self.assertEqual(installed.stat().st_mode & 0o7777, 0o755)
+        self.assertNotIn("user.cagents-fixture", os.listxattr(installed))
+        self.assertNotIn("security.capability", os.listxattr(installed))
+        self.assertNotEqual(installed.stat().st_ino, identity.st_ino)
+        self.assertEqual(source.stat().st_ino, identity.st_ino)
+        self.assertEqual(source.stat().st_mode, identity.st_mode)
+        self.assertEqual(source.read_bytes(), original)
+        self.assertEqual((fixture / "bin/codex").resolve(), installed)
+        self.assertFalse((fixture / "home/.codex/auth.json").exists())
+        receipt = json.loads((self.task / "session/codex-executable-installed.json").read_text())
+        self.assertEqual(receipt["source_path"], str(source))
+        self.assertEqual(receipt["source_identity"]["inode"], identity.st_ino)
+        self.assertEqual(receipt["sha256"], hashlib.sha256(original).hexdigest())
+        self.assertEqual(receipt["installed_sha256"], receipt["sha256"])
+        self.assertEqual(receipt["installed_identity"]["inode"], installed.stat().st_ino)
+        self.assertEqual(receipt["installed_identity"]["mode"], 0o755)
+        self.assertIn("size=900,750", (self.logs / "kwinrules").read_text())
+        inherited = (self.logs / "runner-env").read_text()
+        self.assertIn(f"HOME={fixture}/home\n", inherited)
+        self.assertNotIn("/must/not/reach/the/fixture", inherited)
+        self.run_tool("stop")
+
+        # Neither a named peer nor a plain start inherits the real executable.
+        self.run_tool("start", "after", "--codex", "tool-rows")
+        self.assertIn("offline tool-rows fixture", self.fixture_shell("codex --version").stdout)
+        self.assertFalse((self.task / "session/codex-executable-installed.json").exists())
+        self.run_tool("stop")
+        self.run_tool("start", "after")
+        self.assertFalse((fixture / "bin/codex").exists())
+        self.assertFalse((fixture / "libexec/codex").exists())
+
+    def test_real_codex_and_a_named_instance_keep_the_same_private_environment(self) -> None:
+        self.built()
+        source = self.codex_elf()
+        self.run_tool("start", "after", "--instance", "real-codex-review",
+                      "--codex-executable", str(source))
+        self.assertIn("--instance real-codex-review --in-session", (self.logs / "runner").read_text())
+        instance = self.fixture_shell('printf %s "$CAGENTS_DEVELOPMENT_INSTANCE"')
+        self.assertEqual(instance.stdout, "real-codex-review")
+        installed = self.task / "fixture/libexec/codex/codex"
+        self.assertEqual(installed.read_bytes(), source.read_bytes())
+        receipt = json.loads((self.task / "session/codex-executable-installed.json").read_text())
+        self.assertEqual(receipt["installed_sha256"], hashlib.sha256(source.read_bytes()).hexdigest())
+        self.assertEqual((self.task / "fixture/bin/codex").resolve(), installed)
+        self.run_tool("stop")
+
+    def test_invalid_real_codex_is_refused_before_waiting_or_spawning(self) -> None:
+        self.built()
+        non_elf = self.root / "script"
+        non_elf.write_text("#!/bin/sh\nexit 0\n")
+        non_elf.chmod(0o755)
+        not_executable = self.codex_elf("not-executable")
+        not_executable.chmod(0o644)
+        unreadable = self.codex_elf("unreadable")
+        unreadable.chmod(0o111)
+        fifo = self.root / "fifo"
+        os.mkfifo(fifo)
+        cases = [
+            ("relative/codex", "absolute path"),
+            (str(non_elf), "ELF executable"),
+            (str(not_executable), "executable file"),
+            (str(self.root), "regular file"),
+            (str(fifo), "regular file"),
+            (str(self.root / "missing"), "No such file"),
+        ]
+        if os.geteuid() != 0:
+            cases.append((str(unreadable), "Permission denied"))
+        with self.native_lock.open("a") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            for source, message in cases:
+                with self.subTest(source=source):
+                    result = self.run_tool("start", "after", "--wait-lock", "0",
+                                           "--codex-executable", source, check=False)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn(message, result.stderr)
+                    self.assertNotIn("waiting for the native session", result.stdout)
+        self.assertFalse((self.logs / "kwin").exists())
+
+    def test_real_codex_and_an_offline_peer_are_mutually_exclusive(self) -> None:
+        self.built()
+        source = self.codex_elf()
+        for options in (("--codex", "tool-rows", "--codex-executable", str(source)),
+                        ("--codex-executable", str(source), "--codex", "tool-rows")):
+            with self.subTest(options=options):
+                result = self.run_tool("start", "after", *options, check=False)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("mutually exclusive", result.stderr)
+                self.assertNotIn("waiting for the native session", result.stdout)
+        self.assertTrue(self.lock_is_free(self.native_lock))
+        self.assertFalse((self.logs / "kwin").exists())
+
+    def test_queued_real_codex_uses_the_validated_snapshot(self) -> None:
+        self.built()
+        source = self.codex_elf()
+        original = source.read_bytes()
+        with self.native_lock.open("a") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            child = subprocess.Popen(
+                [str(SCRIPT), "start", "after", "--wait-lock", "30",
+                 "--codex-executable", str(source)], env=self.env,
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            self.addCleanup(lambda: child.poll() is not None or child.terminate())
+            snapshot = self.task / "session/codex-executable.json"
+            for _ in range(100):
+                if snapshot.exists() or child.poll() is not None:
+                    break
+                time.sleep(0.05)
+            self.assertTrue(snapshot.exists())
+            self.assertFalse((self.logs / "kwin").exists())
+            source.write_text("original path replaced while queued")
+            fcntl.flock(held, fcntl.LOCK_UN)
+        stdout, stderr = child.communicate(timeout=30)
+        self.assertEqual(child.returncode, 0, stdout + stderr)
+        installed = self.task / "fixture/libexec/codex/codex"
+        self.assertEqual(installed.read_bytes(), original)
+        receipt = json.loads((self.task / "session/codex-executable-installed.json").read_text())
+        self.assertEqual(receipt["installed_sha256"], hashlib.sha256(original).hexdigest())
+
+    @unittest.skipIf(os.geteuid() == 0, "root bypasses owner execute permission")
+    def test_real_codex_execute_permission_follows_the_opened_inode(self) -> None:
+        denied = self.codex_elf("owner-cannot-execute")
+        denied.chmod(0o645)  # Other execute bits do not grant the owner X_OK.
+        self.assertFalse(os.access(denied, os.X_OK))
+        allowed = self.codex_elf("executable-replacement")
+        source = self.root / "selected-codex"
+        source.symlink_to(denied)
+        snapshot = self.task / "session/codex-executable"
+        receipt = self.task / "session/codex-executable.json"
+        # Exercise the real copy helper with a deterministic pathname race.
+        # Only the symlink changes: the opened target's identity stays fixed.
+        copy_code = SCRIPT.read_text().split("copy_codex_executable() {", 1)[1]
+        copy_code = copy_code.split("<<'PY'\n", 1)[1].split("\nPY\n}", 1)[0]
+        seam = """
+from pathlib import Path
+import os
+import sys
+code, source, allowed, destination, receipt = sys.argv[1:]
+source, allowed = Path(source), Path(allowed)
+real_access = os.access
+def replaced_access(path, mode, *args, **kwargs):
+    source.unlink()
+    source.symlink_to(allowed)
+    return real_access(path, mode, *args, **kwargs)
+os.access = replaced_access
+sys.argv = ["copy", str(source), destination, receipt]
+exec(compile(code, "native-evidence copy helper", "exec"))
+"""
+        result = subprocess.run(
+            ["/usr/bin/python3", "-c", seam, copy_code, str(source), str(allowed),
+             str(snapshot), str(receipt)], capture_output=True, text=True, timeout=5,
+        )
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("must name an executable file", result.stderr)
+        self.assertEqual(source.resolve(), allowed)
+        self.assertFalse(snapshot.exists())
+        self.assertFalse(receipt.exists())
+
+    def test_a_changed_queued_codex_snapshot_is_refused_before_the_compositor(self) -> None:
+        self.built()
+        source = self.codex_elf()
+        with self.native_lock.open("a") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            child = subprocess.Popen(
+                [str(SCRIPT), "start", "after", "--wait-lock", "30",
+                 "--codex-executable", str(source)], env=self.env,
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            self.addCleanup(lambda: child.poll() is not None or child.terminate())
+            receipt = self.task / "session/codex-executable.json"
+            for _ in range(100):
+                if receipt.exists() or child.poll() is not None:
+                    break
+                time.sleep(0.05)
+            self.assertTrue(receipt.exists())
+            snapshot = self.task / "session/codex-executable"
+            with snapshot.open("r+b") as changed:
+                changed.seek(-1, os.SEEK_END)
+                byte = changed.read(1)[0]
+                changed.seek(-1, os.SEEK_END)
+                changed.write(bytes([byte ^ 1]))
+            fcntl.flock(held, fcntl.LOCK_UN)
+        stdout, stderr = child.communicate(timeout=30)
+        self.assertNotEqual(child.returncode, 0, stdout + stderr)
+        self.assertIn("Codex snapshot changed before installation",
+                      (self.task / "logs/session-after.log").read_text())
+        self.assertFalse((self.logs / "kwin").exists())
+        self.assertFalse((self.task / "fixture/bin/codex").exists())
+        self.assertFalse((self.task / "fixture/libexec/codex").exists())
+
+    def test_a_malformed_queued_codex_receipt_cannot_disable_verification(self) -> None:
+        self.built()
+        source = self.codex_elf()
+        for malformed in ({}, [], None,
+                          {"snapshot_identity": [], "sha256": "0" * 64},
+                          {"snapshot_identity": {}, "sha256": 64},
+                          {"snapshot_identity": {}, "sha256": "g" * 64},
+                          {"snapshot_identity": {}, "sha256": "0" * 63}):
+            with self.subTest(receipt=malformed):
+                with self.native_lock.open("a") as held:
+                    fcntl.flock(held, fcntl.LOCK_EX)
+                    child = subprocess.Popen(
+                        [str(SCRIPT), "start", "after", "--wait-lock", "30",
+                         "--codex-executable", str(source)], env=self.env,
+                        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE, text=True,
+                    )
+                    self.addCleanup(lambda: child.poll() is not None or child.terminate())
+                    receipt = self.task / "session/codex-executable.json"
+                    for _ in range(100):
+                        if receipt.exists() or child.poll() is not None:
+                            break
+                        time.sleep(0.05)
+                    self.assertTrue(receipt.exists())
+                    receipt.write_text(json.dumps(malformed))
+                    fcntl.flock(held, fcntl.LOCK_UN)
+                try:
+                    stdout, stderr = child.communicate(timeout=30)
+                    self.assertNotEqual(child.returncode, 0, stdout + stderr)
+                    self.assertIn("Codex snapshot receipt is invalid",
+                                  (self.task / "logs/session-after.log").read_text())
+                    self.assertFalse((self.logs / "kwin").exists())
+                    self.assertFalse((self.task / "fixture/bin/codex").exists())
+                    self.assertFalse((self.task / "fixture/libexec/codex").exists())
+                finally:
+                    self.run_tool("stop", check=False)
+                    receipt.unlink(missing_ok=True)
+                    (self.task / "logs/session-after.log").unlink(missing_ok=True)
+
     def test_the_fixture_has_no_forge_or_network_until_switched_on(self) -> None:
         self.built()
         self.run_tool("start", "after")
@@ -1248,7 +1615,7 @@ class Evidence(unittest.TestCase):
 
     def test_the_forge_seeds_owner_avatars_into_the_apps_cache(self) -> None:
         self.built()
-        self.run_tool("start", "after")
+        self.run_tool("start", "after", "--instance", "avatar-evidence")
         fixture = self.switch_forge_on()
         seed = fixture / "avatars" / "Octo-Org.image"
         seed.write_bytes(b"\x89PNG\r\n\x1a\nseeded")
@@ -1258,7 +1625,9 @@ class Evidence(unittest.TestCase):
         self.fixture_shell("gh repo view --json nameWithOwner,url")
 
         # The path avatar.rs reads under the development storage name, owner lower-cased.
-        cached = fixture / "cache" / "cagents-development" / "github-avatars" / "github.com-octo-org.image"
+        instance = self.fixture_shell('printf %s "$CAGENTS_DEVELOPMENT_INSTANCE"').stdout
+        self.assertTrue(instance)
+        cached = fixture / "cache" / f"cagents-development-{instance}" / "github-avatars" / "github.com-octo-org.image"
         self.assertEqual(cached.read_bytes(), seed.read_bytes())
         # Under its seven-day freshness, so the app does not try to download it.
         self.assertLess(time.time() - cached.stat().st_mtime, 60)
@@ -1550,13 +1919,30 @@ class RemoteEvidence(unittest.TestCase):
         steps = self.root / "steps.sh"
         steps.write_text('evidence drive click "Open repository"\nevidence shot "home-$SIDE"\n')
         self.run_tool("pair", "--before", str(before), "--after", str(after),
-                      "--steps", str(steps), "--width", "1200", "--height", "800", "--portal", "gtk")
+                      "--steps", str(steps), "--width", "1200", "--height", "800", "--portal", "gtk",
+                      "--codex", "tool-rows")
         self.assertTrue((self.task / "shots" / "before-home-before.webp").exists())
         self.assertTrue((self.task / "shots" / "after-home-after.webp").exists())
         calls = self.tool_calls()
-        self.assertIn("start before --width 1200 --height 800 --portal gtk", calls)
+        self.assertIn("start before --width 1200 --height 800 --portal gtk --codex tool-rows", calls)
         self.assertIn("drive click Open repository", calls)
         self.assertEqual(calls.count("stop"), 2)
+
+    def test_pair_forwards_a_real_codex_host_path_without_shell_evaluation(self) -> None:
+        before = self.repository("before", {"src.rs": "old\n"})
+        after = self.repository("after", {"src.rs": "new\n"})
+        steps = self.root / "steps.sh"
+        steps.write_text('evidence shot "real-$SIDE"\n')
+        marker = self.root / "must-not-be-created"
+        executable = f"/a path/codex '$(touch {marker})"
+        self.run_tool("pair", "--before", str(before), "--after", str(after),
+                      "--steps", str(steps), "--width", "900", "--height", "750",
+                      "--codex-executable", executable, "--instance", "real-codex-review")
+        calls = self.tool_calls()
+        for side in ("before", "after"):
+            self.assertIn(f"start {side} --width 900 --height 750 --codex-executable {executable}"
+                          " --instance real-codex-review", calls)
+        self.assertFalse(marker.exists())
 
     def test_steps_name_the_fixture_on_the_host(self) -> None:
         before = self.repository("before", {"src.rs": "old\n"})

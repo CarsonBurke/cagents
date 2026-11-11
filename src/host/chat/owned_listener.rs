@@ -84,6 +84,16 @@ impl Roots {
             .any(|root| session.claim_owned_codex_listener(root, allocator))
     }
 
+    /// Points a begun Codex thread's bare `--remote` at a listener of its own
+    /// at the current root. Its bare remote names no earlier allocation.
+    pub(crate) fn claim_for_unserved_thread(
+        &self,
+        session: &mut crate::chat::Session,
+        allocator: &crate::model::HostSessionProof,
+    ) -> bool {
+        session.claim_owned_codex_listener_for_unserved_thread(&self.current, allocator)
+    }
+
     /// Whether `socket` is the listener this daemon allocates for `id`.
     pub(crate) fn allocates(&self, id: crate::model::TerminalId, socket: &Path) -> bool {
         self.each().any(|root| {
@@ -438,6 +448,29 @@ mod tests {
             format!("unix://{}", socket.display())
         );
         assert!(roots.allocates(new.id, &socket));
+    }
+
+    #[test]
+    fn a_reopened_thread_is_allocated_under_the_runtime_directory() {
+        let roots = layout();
+        let mut reopened = codex(&["resume", "thread", "--remote", "unix://"], Some("thread"));
+        assert!(
+            !roots.claim(&mut reopened.clone(), &allocator()),
+            "a begun thread's bare remote is not claimed as a new thread's"
+        );
+        assert!(roots.claim_for_unserved_thread(&mut reopened, &allocator()));
+        let socket = Path::new("/run/user/1000/cagents/codex")
+            .join(format!("cagents-codex-{}", reopened.id))
+            .join("control.sock");
+        assert_eq!(
+            reopened.owned_codex_listener.as_ref().unwrap().socket,
+            socket
+        );
+        assert_eq!(
+            reopened.launch.recipe.arguments[3],
+            format!("unix://{}", socket.display())
+        );
+        assert!(roots.allocates(reopened.id, &socket));
     }
 
     #[test]

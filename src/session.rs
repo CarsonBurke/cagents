@@ -3418,7 +3418,8 @@ mod tests {
                         last_exit: None,
                     },
                 }),
-            }],
+            }]
+            .into(),
         }
     }
 

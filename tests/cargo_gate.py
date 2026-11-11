@@ -1841,12 +1841,49 @@ class AdmissionTimeout(unittest.TestCase):
                 self.fixture.assert_preflight_unslotted(self.fixture.calls())
 
     def test_one_budget_covers_cumulative_hooks_and_seed_is_not_fail_soft_on_expiry(self):
-        # Two seconds, so a loaded host still reaches the seed hook within the budget.
-        self.reset(delays={"metadata":0.7, "guard":0.7, "seed":1.2})
+        # Advance only admission time, not cleanup's real monotonic clock. The
+        # contract is one deadline across hooks, regardless of host scheduling.
+        root = self.fixture.root
+        clock = root / "admission-clock"
+        temporary = clock.with_suffix(".tmp")
+        temporary.write_text("0")
+        temporary.replace(clock)
+        helper = root / "cargo-gate-command.py"
+        source = helper.read_text().replace(
+            "import time\n",
+            "import time\nfrom pathlib import Path\n"
+            f"time.monotonic_ns = lambda: int(Path({str(clock)!r}).read_text())\n",
+            1,
+        )
+        parsed = "        admission_deadline = positive_integer(arguments[1])\n"
+        self.assertEqual(source.count(parsed), 1)
+        source = source.replace(parsed, parsed +
+            '        os.environ["FIXTURE_ADMISSION_DEADLINE"] = str(admission_deadline)\n')
+        helper.write_text(source)
+        for name in ("bin/cargo", "build-disk-guard", "seed-build-dir"):
+            tool = root / name
+            source = tool.read_text()
+            self.assertEqual(source.count("record(event)\n"), 1)
+            source = source.replace("record(event)\n",
+                'event["admission_deadline"] = os.environ.get("FIXTURE_ADMISSION_DEADLINE")\n'
+                'record(event)\n'
+                'advance = config.get("clock_ns", {}).get(phase)\n'
+                'if advance is not None:\n'
+                '    clock = root / "admission-clock"\n'
+                '    temporary = clock.with_suffix(".tmp")\n'
+                '    temporary.write_text(str(advance))\n'
+                '    temporary.replace(clock)\n'
+                '    if phase == "seed":\n'
+                '        while True: time.sleep(0.01)\n')
+            tool.write_text(source)
+        self.reset(clock_ns={"metadata":700_000_000, "guard":1_400_000_000,
+                             "seed":2_600_000_000})
         process = self.fixture.start(environment=self.fixture.env | {self.setting:"2"})
         _stdout, stderr = process.communicate("", timeout=8)
         self.assert_timeout(process, stderr)
-        self.assertEqual([event["phase"] for event in self.fixture.calls()], ["metadata", "guard", "seed"])
+        calls = self.fixture.calls()
+        self.assertEqual([event["phase"] for event in calls], ["metadata", "guard", "seed"])
+        self.assertEqual({event["admission_deadline"] for event in calls}, {"2000000000"})
 
     def test_queue_base_and_no_fit_expiry_withdraws_owned_waiter_and_preserves_holder(self):
         for kind in ("queue", "base", "memory", "cpu-pressure", "cpu-settle"):
@@ -1990,6 +2027,45 @@ class HostRegistry(TwoSlots):
         self.env["CAGENTS_BUILD_REGISTRY"] = str(self.registry)
         self.other = self.env | {"CAGENTS_BUILD_LOCK": str(self.root / "other.lock"),
                                  "CAGENTS_BUILD_SLOTS": "1"}
+
+    def test_memory_wait_names_host_and_all_reservations_with_a_free_slot(self):
+        env = self.with_memory(8) | {"CAGENTS_BUILD_WAIT_PRIORITY_SECS": "0"}
+        self.held_elsewhere(f"{os.getpid()} {8 * 2**20}\n0\n{{lock}}\n")
+        with self.assertRaises(subprocess.TimeoutExpired) as expired:
+            self.build(1, timeout=2, env=env)
+        errors = expired.exception.stderr or ""
+        if isinstance(errors, bytes):
+            errors = errors.decode()
+        self.assertIn("waiting for memory on", errors)
+        self.assertIn("GiB available, running builds reserve", errors)
+        self.assertIn("this build expects 1.0 GiB", errors)
+        self.assertEqual(errors.count("waiting for memory on"), 1)
+
+    def test_legacy_waiter_records_keep_normal_fifo_priority(self):
+        env = self.with_memory(8) | {"CAGENTS_BUILD_WAIT_PRIORITY_SECS": "1"}
+        self.held_elsewhere(f"{os.getpid()} {8 * 2**20}\n0\n{{lock}}\n")
+        other = self.registry / "wait-offload-legacy"
+        identity = f"{os.getpid()} {start_time(os.getpid())}"
+        other.write_text(f"{identity} {uptime() - 60} {uptime()}\n")
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.build(1, timeout=3, env=env)
+
+    def test_urgent_rank_applies_only_to_eligible_room_waiters(self):
+        env = self.with_memory(8) | {"CAGENTS_BUILD_WAIT_PRIORITY_SECS": "1"}
+        self.held_elsewhere(f"{os.getpid()} {8 * 2**20}\n0\n{{lock}}\n")
+        other = self.registry / "wait-offload-other"
+        identity = f"{os.getpid()} {start_time(os.getpid())}"
+        # Urgent wins against an older ordinary waiter without bypassing its age.
+        other.write_text(f"{identity} {uptime() - 60} {uptime()}\nnormal\n")
+        result = self.build(1, timeout=10, env=env | {"CAGENTS_BUILD_PRIORITY": "urgent"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # An eligible urgent waiter blocks an ordinary one even when newer.
+        other.write_text(f"{identity} {uptime() - 2} {uptime()}\nurgent\n")
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.build(1, timeout=3, env=env)
+        # A not-yet-eligible urgent record cannot block an eligible ordinary one.
+        other.write_text(f"{identity} {uptime() + 60} {uptime()}\nurgent\n")
+        self.assertEqual(self.build(1, timeout=10, env=env).returncode, 0)
 
     def test_a_build_in_another_family_is_priced_beside_this_one(self):
         self.hold(1, env=self.other)
@@ -2596,6 +2672,22 @@ class CpuPressureAdmission(TwoSlots):
         sed.chmod(0o700)
         temporary = self.root / "start-tmp"
         temporary.mkdir(exist_ok=True)
+        registry = self.root / "start-registry"
+        registry.mkdir(exist_ok=True)
+        publish_release = self.root / "release-published-refusal"
+        publish_release.unlink(missing_ok=True)
+        # Force cancellation after the atomic rename but before mv returns.
+        # Ownership must already be recorded when the shell runs its trap.
+        move = binary / "mv"
+        move.write_text(
+            "#!/usr/bin/python3\nimport pathlib,subprocess,sys,time\n"
+            "status = subprocess.call(['/usr/bin/mv', *sys.argv[1:]])\n"
+            "destination = pathlib.Path(sys.argv[-1])\n"
+            f"if not status and destination.parent == pathlib.Path({str(registry)!r}) and destination.name.startswith('wait-gate-'):\n"
+            f"    while not pathlib.Path({str(publish_release)!r}).exists(): time.sleep(0.01)\n"
+            "sys.exit(status)\n"
+        )
+        move.chmod(0o700)
         command = self.root / "start-command"
         command.unlink(missing_ok=True)
         self.report("0.00")
@@ -2609,7 +2701,7 @@ class CpuPressureAdmission(TwoSlots):
             "CAGENTS_BUILD_MEMORY_PRESSURE": "0",
             "CAGENTS_BUILD_CPU_SETTLE_SECS": "60",
             "CAGENTS_BUILD_CPU_PRESSURE_FILE": str(self.pressure),
-            "CAGENTS_BUILD_COST_GIB": "7", "CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS": "1",
+            "CAGENTS_BUILD_COST_GIB": "7", "CAGENTS_BUILD_REGISTRY": str(registry),
             "CAGENTS_BUILD_REMOTE": "local", "CAGENTS_BUILD_INSTALLED_GATE": "",
         }
         now = self.uptime()
@@ -2631,8 +2723,28 @@ class CpuPressureAdmission(TwoSlots):
                 start_new_session=True,
             )
             try:
+                # Observe the decision, not whether startup fits a one-second
+                # budget. Dedicated AdmissionTimeout cases cover expiry.
+                def refusals():
+                    return [path for path in registry.glob("wait-gate-*")
+                            if not path.name.endswith(".new")]
+
+                deadline = time.monotonic() + 10
+                while process.poll() is None and not refusals():
+                    self.assertLess(time.monotonic(), deadline, "no admission decision")
+                    time.sleep(0.01)
+                refused = refusals()
+                if waits:
+                    self.assertTrue(refused, "fresh holder did not refuse admission")
+                    self.assertEqual(int(refused[0].read_text().split()[0]), process.pid)
+                    self.assertFalse(command.exists())
+                    process.send_signal(signal.SIGTERM)
+                    publish_release.touch()
+                else:
+                    self.assertFalse(refused, "fixture with room refused admission")
                 _stdout, stderr = process.communicate(timeout=5)
             finally:
+                publish_release.touch()
                 if process.poll() is None:
                     process.send_signal(signal.SIGTERM)
                 process.communicate(timeout=5)
@@ -2645,9 +2757,8 @@ class CpuPressureAdmission(TwoSlots):
                 with (self.root / name).open("a") as probe:
                     fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
             self.assertFalse((self.root / "slot.lock.cost").exists())
-            self.assertEqual((process.returncode, command.exists()), (124, False) if waits else (0, True), stderr)
-            if waits:
-                self.assertIn("admission", stderr.lower())
+            self.assertEqual((process.returncode, command.exists()), (143, False) if waits else (0, True), stderr)
+            self.assertFalse(list(registry.glob("wait-gate-*")), "refusal record leaked")
         finally:
             for holder in holders:
                 holder.close()

@@ -15,35 +15,43 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
-/// A bounded executor that the whole application shares. Each libtest thread
-/// is its own application, so a concurrent test can neither take nor release
-/// this test's capacity. Call it on the UI thread; a permit keeps its
-/// semaphore alive on whichever thread it drops.
-macro_rules! application_capacity {
-    ($permits:expr) => {{
+/// A value the whole application shares, such as an admission queue. Each
+/// libtest thread is its own application, so a concurrent test can neither
+/// take nor release what this test holds. Call it on the UI thread and keep
+/// the returned `Arc`; it stays valid on whichever thread it moves to.
+macro_rules! application_shared {
+    ($shared:ty, $init:expr) => {{
         #[cfg(not(test))]
-        let capacity = {
-            static CAPACITY: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
-                std::sync::OnceLock::new();
-            CAPACITY
-                .get_or_init(|| Arc::new(tokio::sync::Semaphore::new($permits)))
-                .clone()
+        let shared = {
+            static SHARED: std::sync::OnceLock<Arc<$shared>> = std::sync::OnceLock::new();
+            SHARED.get_or_init(|| Arc::new($init)).clone()
         };
         #[cfg(test)]
-        let capacity = {
+        let shared = {
             thread_local! {
-                static CAPACITY: Arc<tokio::sync::Semaphore> =
-                    Arc::new(tokio::sync::Semaphore::new($permits));
+                static SHARED: Arc<$shared> = Arc::new($init);
             }
-            CAPACITY.with(Arc::clone)
+            SHARED.with(Arc::clone)
         };
-        capacity
+        shared
     }};
+}
+
+/// A bounded executor that the whole application shares, under the same
+/// per-test-thread rule as `application_shared`. A permit keeps its semaphore
+/// alive on whichever thread it drops.
+macro_rules! application_capacity {
+    ($permits:expr) => {
+        application_shared!(
+            tokio::sync::Semaphore,
+            tokio::sync::Semaphore::new($permits)
+        )
+    };
 }
 
 /// A zeroed atomic the whole application shares, such as which selection owns
 /// the keyboard, under the same per-test-thread rule as
-/// `application_capacity`. The returned reference may be stored and used from
+/// `application_shared`. The returned reference may be stored and used from
 /// any thread. Each test thread leaks one cell.
 macro_rules! application_atomic {
     ($vis:vis fn $name:ident() -> $atomic:ident) => {
@@ -742,6 +750,20 @@ fn draft_start_backend() -> Option<(String, String, String)> {
     })
 }
 
+/// Why sending cannot move a conversation to another account yet: a
+/// background subagent holds it, which the daemon would refuse to close.
+fn account_switch_hold(snapshot: &chat::Snapshot) -> Option<String> {
+    let hold = snapshot.work_hold();
+    let held = hold.subagents();
+    (!held.is_empty()).then(|| {
+        format!(
+            "Sending would move this conversation to another account, but it can't move while background work is still going. {} Stop {} in the conversation, then send again.",
+            held.detail(),
+            held.where_to_stop()
+        )
+    })
+}
+
 /// The account home `session` launches its provider in, as its launch names it.
 fn chat_account_home(session: &chat::Session) -> Option<&str> {
     let variable = account::home_variable(session.launch.provider)?;
@@ -990,6 +1012,7 @@ impl ChangeToken {
             chat::ToolStatus::Failed => 2,
             chat::ToolStatus::Denied => 3,
             chat::ToolStatus::Stopped => 4,
+            chat::ToolStatus::Waiting => 5,
         }
     }
     /// Folds a number into a digest so a field that is not a string still
@@ -1242,6 +1265,7 @@ fn status_word(status: chat::ToolStatus) -> &'static str {
         chat::ToolStatus::Failed => "Failed",
         chat::ToolStatus::Denied => "Denied",
         chat::ToolStatus::Stopped => "Stopped",
+        chat::ToolStatus::Waiting => "Waiting on background work",
     }
 }
 
@@ -4523,11 +4547,23 @@ impl Runtime {
         let start = resume.unwrap_or(0).min(items.len());
         let end = resume.map_or(items.len(), |_| start.saturating_add(128).min(items.len()));
         let mut stopped = false;
-        // Admit the newest item first so the currently streaming answer does
-        // not wait behind a full historical window. Remaining history keeps
-        // deterministic source order; the cursor stores this metadata order.
-        for position in start..end {
-            let index = if position == 0 { newest } else { position - 1 };
+        // Admit the rows a returning reader's saved window showed first, then
+        // from the newest item back: the streaming answer and the rows a
+        // reader at the latest edge sees come next, and admission that runs
+        // out leaves the oldest history waiting. The cursor stores the
+        // newest-back position; the saved window's rows lead every pass, and
+        // are cheap to pass over once staged.
+        let reading = self.scroll_memory.reading_rows(context.as_deref());
+        let returning: Vec<usize> = (0..items.len())
+            .rev()
+            .filter(|&index| reading.contains(&items[index].id))
+            .map(|index| newest - index)
+            .collect();
+        let walk = returning.iter().copied().chain(
+            (start..end).filter(|&position| !reading.contains(&items[newest - position].id)),
+        );
+        for position in walk {
+            let index = newest - position;
             let item = &items[index];
             let report = matches!(
                 &item.content,
@@ -4669,6 +4705,18 @@ impl Runtime {
                         theme,
                         |old, new| known_append(handle.as_ref(), &self.logical_prose, old, new),
                     );
+                    // The answer being written, then the rows the reader
+                    // returns to, then everything else from the newest back.
+                    self.preparation.rank(
+                        &item.id,
+                        if growing {
+                            0
+                        } else if reading.contains(&item.id) {
+                            1
+                        } else {
+                            2 + position as u64
+                        },
+                    );
                     // A presentation that reaches further into the same
                     // revision of a long message is not an append when its
                     // window starts elsewhere, but what is shown stays true
@@ -4705,7 +4753,14 @@ impl Runtime {
                     cached.reader_memory = self.scroll_memory.clone();
                     cached.reader_context.clone_from(&context);
                     if self.preparation.was_deferred() {
-                        self.preparation.defer(position);
+                        // A saved row that waits is met again at the head of
+                        // the next pass; the newest-back walk resumes where
+                        // this pass's own range starts.
+                        self.preparation.defer(if reading.contains(&item.id) {
+                            start
+                        } else {
+                            position
+                        });
                         if resume.is_some() {
                             stopped = true;
                             break;
@@ -4784,8 +4839,8 @@ impl Runtime {
             presentation_changed = true;
         }
         let today = chat::now_ms().and_then(|now| chat::local_time((now / 1000) as i64));
-        for position in start..end {
-            let index = if position == 0 { newest } else { position - 1 };
+        for position in returning.iter().copied().chain(start..end) {
+            let index = newest - position;
             let item = &items[index];
             if let Some(cached) = cache.get_mut(&item.id)
                 && cached.stamp.as_ref().map(|stamp| stamp.0) != item.at
@@ -9172,10 +9227,13 @@ impl Cagents {
         terminate_source: bool,
         upgrade_admission: Option<chat::Session>,
     ) -> Task<Message> {
+        let initial_session = upgrade_admission
+            .as_ref()
+            .map_or(session.id, |canonical| canonical.id);
         let intent = self
             .startup_gate
             .initial_panes
-            .chat_intent(card, session.id, intent);
+            .chat_intent(card, initial_session, intent);
         if intent == chat::Intent::Start
             && source.is_none()
             && !terminate_source
@@ -10924,9 +10982,13 @@ impl Cagents {
                     }
                     return Task::none();
                 }
-                self.startup_gate
-                    .initial_panes
-                    .settled(target.card, attempt.session.id);
+                self.startup_gate.initial_panes.settled(
+                    target.card,
+                    attempt
+                        .upgrade_admission
+                        .as_ref()
+                        .map_or(attempt.session.id, |canonical| canonical.id),
+                );
                 if result.is_err() && attempt.upgrade_admission.is_some() {
                     // Unproved lineage cannot bind the saved Content to the
                     // canonical actor. Keep it as an inert copy and leave
@@ -12133,6 +12195,17 @@ impl Cagents {
                             task,
                             self.handle_chat_ui(Action::Submit(target, mode)),
                         ]);
+                    }
+                    // The daemon closes the conversation before moving it, and
+                    // a conversation that looks finished can still hold a
+                    // subagent, perhaps indefinitely. Say which, and keep the
+                    // message, rather than send it on the account that needs
+                    // replacing or attempt a switch the daemon refuses.
+                    if let Some(runtime) = self.chat_runtime_mut(target)
+                        && let Some(refusal) = account_switch_hold(&runtime.snapshot)
+                    {
+                        runtime.error = Some(refusal);
+                        return Task::none();
                     }
                     return self.change_chat_account(
                         target.card,
@@ -17981,6 +18054,71 @@ mod tests {
                 .environment
                 .contains_key(account::routing::AUTOMATIC_MARKER)
         );
+    }
+
+    #[test]
+    fn automatic_account_switch_names_the_subagent_holding_the_conversation() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let alternate = app.account_ui.add_managed_fixture(Provider::Codex, 105);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let now = crate::chat::now_ms().unwrap();
+        for (id, allowed) in [
+            (Account::system(Provider::Codex).id(), false),
+            (alternate.clone(), true),
+        ] {
+            let (owner, ticket) = app.account_ui.begin_probe_for_test(
+                &id,
+                crate::account::schedule::Trigger::Focus,
+                now,
+            );
+            let _ = app.update(Message::AccountUi(crate::app::account_ui::Action::Probed {
+                owner,
+                ticket,
+                id,
+                outcome: account::probe::Outcome::Answered {
+                    identity: None,
+                    catalog: None,
+                    snapshot: account::codex::parse_rate_limits(
+                        &serde_json::json!({"ordinaryUsageAllowed": allowed}),
+                        now,
+                    ),
+                },
+            }));
+        }
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime
+            .session
+            .launch
+            .recipe
+            .environment
+            .insert(account::routing::AUTOMATIC_MARKER.into(), "1".into());
+        runtime.replace_draft(text_editor::Content::with_text("Keep this message"));
+        Arc::make_mut(&mut runtime.snapshot).subagents = vec![chat::Subagent {
+            id: "toolu_dev_server".into(),
+            kind: "general-purpose".into(),
+            description: "Run the dev server".into(),
+            status: chat::ToolStatus::Waiting,
+            model: None,
+            waiting: false,
+            detail: String::new(),
+            background: true,
+            items: Vec::new(),
+        }];
+        let (_, generation, _) = app
+            .automatic_chat_account(target, PromptMode::Send)
+            .expect("the limited account would be replaced");
+        assert!(generation.is_some(), "the conversation is live");
+        drop(app.update(Message::ChatUi(Action::Submit(target, PromptMode::Send))));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(
+            runtime.error.as_deref(),
+            Some(
+                "Sending would move this conversation to another account, but it can't move while background work is still going. Background subagent \u{201c}Run the dev server\u{201d} is waiting on its own background work, which may not finish on its own. Stop it from its tab in the conversation, then send again."
+            )
+        );
+        assert_eq!(runtime.composer.text().trim(), "Keep this message");
+        assert!(!app.chat_start_pending(card), "no switch was attempted");
     }
 
     /// A new conversation, which runs nothing until its first message is
@@ -28555,7 +28693,7 @@ mod tests {
         };
         app.durable = Arc::new(WorkspaceState {
             focused: Some(id),
-            cards: vec![card],
+            cards: vec![card].into(),
             ..WorkspaceState::default()
         });
         app.workspace = Cagents::rebuild_workspace(&app.durable);

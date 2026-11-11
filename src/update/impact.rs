@@ -20,6 +20,12 @@ pub enum SessionKind {
     NativeChat,
 }
 
+/// A source refuses to carry a conversation whose provider stopped without
+/// confirming its work settled, and asks for it to be closed. Every source
+/// line since the candidate line (128) reports it in exactly these words, so
+/// the updater can recognize the one blocker that closing resolves.
+pub const STOPPED_WITH_UNSETTLED_WORK: &str = "Its provider stopped but may still hold unfinished work. Close this conversation to release it.";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Disposition {
@@ -46,6 +52,68 @@ pub struct SessionImpact {
     pub interrupted_subagents: Vec<String>,
 }
 
+/// Safe presentation shared by the native dialog, copied details and terminal
+/// review. Transport diagnostics remain in the source impact, not this model.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SessionReview {
+    pub id: TerminalId,
+    pub kind: SessionKind,
+    pub title: String,
+    pub disposition: Disposition,
+    pub reason: String,
+}
+
+impl SessionImpact {
+    pub fn review(&self) -> SessionReview {
+        let reason = match self.disposition {
+            Disposition::Continues => match self.kind {
+                SessionKind::Terminal => "The terminal and its running processes stay alive.".into(),
+                SessionKind::NativeChat => "The conversation and its running work stay alive.".into(),
+            },
+            Disposition::Resumes => "Restarts on its recorded conversation.".into(),
+            Disposition::WaitsForIdle => {
+                let tasks = self.interrupted_subagents.len();
+                if tasks == 0 {
+                    "Finishing its turn; the update waits.".into()
+                } else {
+                    let noun = if tasks == 1 { "task" } else { "tasks" };
+                    format!("Finishing its turn; interrupting now also stops {tasks} background {noun}; background work will not resume automatically.")
+                }
+            },
+            Disposition::Interrupted => {
+                let tasks = self.interrupted_subagents.len();
+                if tasks == 0 {
+                    "Its current turn is interrupted.".into()
+                } else {
+                    let noun = if tasks == 1 { "task" } else { "tasks" };
+                    format!("Its current turn and {tasks} background {noun} stop; background work will not resume automatically.")
+                }
+            }
+            Disposition::ResumePicker => "Its conversation cannot reopen automatically.".into(),
+            Disposition::Blocked => match self.reason.as_str() {
+                "Its turn finished, but background agents are still running. Review stopping them to continue the update." => "Its turn finished, but background agents are still running. Review stopping them to continue the update.".into(),
+                STOPPED_WITH_UNSETTLED_WORK => "Its provider stopped with unfinished work. Close this conversation before updating.".into(),
+                "Finish the pending return to terminal or close this conversation." => "Finish returning to the terminal or close this conversation before updating.".into(),
+                "Its provider is not ready yet. This clears on its own once it finishes starting; close the conversation if it does not." => "Its provider is still starting. Wait for it to finish, then try the update again.".into(),
+                "Its provider has not reported which conversation it is running, so it cannot be resumed after the update. Send it a message or close it." => "Its conversation has not been recorded yet. Send it a message or close it before updating.".into(),
+                "This terminal cannot preserve its live process through this update; finish it or close it before updating." => "Its running processes cannot be preserved through this update. Finish their work or close this terminal before updating.".into(),
+                "The paired console cannot preserve its live process through this update." => "Its terminal cannot keep running through this update. Finish its work or close it before updating.".into(),
+                _ => match self.kind {
+                    SessionKind::Terminal => "Its terminal could not be prepared for this update. Let its work finish, then try again; close the terminal if the problem continues.".into(),
+                    SessionKind::NativeChat => "Its conversation could not be prepared for this update. Let its work finish, then try again; close the conversation if the problem continues.".into(),
+                },
+            },
+        };
+        SessionReview {
+            id: self.id,
+            kind: self.kind,
+            title: self.title.clone(),
+            disposition: self.disposition,
+            reason,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonImpact {
     pub capability: ShutdownCapability,
@@ -69,6 +137,38 @@ impl Disposition {
 }
 
 impl DaemonImpact {
+    /// Compatibility protocols carry free-form diagnostics. Only known fixed
+    /// messages have specific recovery instructions; never echo unknown text.
+    pub fn review_notices(&self) -> Vec<String> {
+        let mut notices = Vec::new();
+        for blocker in &self.blockers {
+            let notice = match blocker.as_str() {
+                "Wait for native provider cleanup to finish." => {
+                    "A conversation is still closing. Wait for it to finish before updating."
+                }
+                "Wait for starting sessions to finish opening." => {
+                    "Wait for starting sessions to finish opening."
+                }
+                "Finish saving the pending return to terminal." => {
+                    "Finish saving the pending return to terminal."
+                }
+                "Additional agent launches must settle before updating" => {
+                    "Agents are still starting. Wait for them to finish opening before updating."
+                }
+                "Additional automation prechecks must settle before updating" => {
+                    "Scheduled work is still being checked. Wait for it to finish before updating."
+                }
+                _ => {
+                    "The update could not confirm that running work can be preserved. Let pending work finish, check that conversations and terminals respond, then try the update again."
+                }
+            };
+            if !notices.iter().any(|existing| existing == notice) {
+                notices.push(notice.to_owned());
+            }
+        }
+        notices
+    }
+
     /// Whether something has to be resolved by hand before the update can
     /// install. A conversation the update waits on is not that.
     pub fn blocked(&self) -> bool {
@@ -329,7 +429,7 @@ mod tests {
         assert!(!preview.preserves_consent(&changed));
         changed = preview.clone();
         changed.stopped[0].label = "Renamed".into();
-        assert!(preview.preserves_consent(&changed));
+        assert!(!preview.preserves_consent(&changed));
     }
 
     #[test]
@@ -416,6 +516,7 @@ impl Preview {
             &observed.stopped_windows,
         ) && self.labels.details.console_capabilities
             == observed.labels.details.console_capabilities
+            && super::review::Review::from(self) == super::review::Review::from(observed)
             && self.candidate == observed.candidate
             && self.replaces_daemon == observed.replaces_daemon
             && match (&self.daemon, &observed.daemon) {

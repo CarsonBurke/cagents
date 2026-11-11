@@ -155,7 +155,8 @@ impl RestoreFixture {
                         worktree: worktree_path,
                     }),
                 },
-            ],
+            ]
+            .into(),
             focused: Some(browser_card_id),
         };
 

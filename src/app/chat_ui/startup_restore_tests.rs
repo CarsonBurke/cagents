@@ -124,3 +124,38 @@ fn explicit_chat_actions_retire_only_their_initial_pane_and_new_panes_restore_no
             .existing_only(original_card, original.id)
     );
 }
+
+#[test]
+fn initial_canonical_upgrade_keeps_existing_only_for_the_authoritative_successor() {
+    let (mut app, card, source) = initial_chat();
+    let mut canonical = source.clone();
+    canonical.id = TerminalId::new();
+    let scope = crate::workspace_model::views::Scope::Channel(crate::model::ChannelId::new());
+    app.startup_gate
+        .initial_panes
+        .capture_views(vec![scope.clone()]);
+    let mut view = crate::workspace_model::views::View::empty(scope);
+    let mut authoritative = app.card_state(card).unwrap().clone();
+    authoritative.kind = CardKind::Chat(canonical.clone());
+    view.panes
+        .push(crate::workspace_model::views::Pane::from_card(&authoritative, None).unwrap());
+    app.startup_gate
+        .initial_panes
+        .observe_initial_view(&view, &app.durable.cards);
+    app.card_state_mut(card).unwrap().kind = CardKind::Chat(canonical.clone());
+
+    drop(app.start_shared_chat_upgrade(card, source, canonical.clone()));
+    let (target, intent) = scheduled(&app, card);
+    assert_eq!(intent, chat::Intent::RestoreExisting);
+    drop(app.handle_chat_ui(Action::Ready(
+        target,
+        Ready(Arc::new(Mutex::new(Some(Err(chat::StartFailure::retry(
+            "canonical owner unavailable",
+        )))))),
+    )));
+    assert!(
+        !app.startup_gate
+            .initial_panes
+            .existing_only(card, canonical.id)
+    );
+}
