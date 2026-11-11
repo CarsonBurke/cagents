@@ -4761,6 +4761,44 @@ mod tests {
     }
 
     #[test]
+    fn pending_insert_keeps_raw_alias_dependency_without_retiring_overlay_ownership() {
+        let (mut app, source, destination, alias) = channel_move_fixture();
+        let mut canonical = alias.clone();
+        canonical.id = CardId::new();
+        app.workspace_model.views[0].panes.clear();
+        app.workspace_model.views[1].panes.push(canonical.clone());
+        app.shared_views.pending.push((
+            uuid::Uuid::new_v4(),
+            Scope::Channel(source),
+            Change::Insert {
+                pane: alias.clone(),
+                before: None,
+            },
+        ));
+        let selected = app.repository_view_scopes(
+            Path::new("/unrelated"),
+            &HashSet::from([Scope::Channel(destination)]),
+        );
+        assert!(selected.contains(&Scope::Channel(source)));
+        let mut overlay = app.workspace_model.views.clone();
+        overlay[0].apply(&app.shared_views.pending[0].2).unwrap();
+        let owned = overlay
+            .iter()
+            .flat_map(|view| view.panes.iter().map(|pane| pane.id))
+            .collect::<HashSet<_>>();
+
+        app.prepare_shared_aliases_in(&overlay, &owned, Some(&selected));
+
+        assert!(app.card_state(alias.id).unwrap().existence.is_open());
+        assert_eq!(app.durable.channels[0].cards, [alias.id]);
+        assert!(
+            !app.card_state(canonical.id)
+                .is_some_and(|card| card.existence.is_open())
+        );
+        assert_eq!(app.shared_views.pending.len(), 1);
+    }
+
+    #[test]
     fn repository_loads_project_only_their_affected_views() {
         let (mut app, unrelated, _, pane) = channel_move_fixture();
         let baseline = app.shared_views.baseline[&Scope::Channel(unrelated)].clone();
