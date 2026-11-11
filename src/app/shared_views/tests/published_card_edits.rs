@@ -57,7 +57,13 @@ fn accept_local_view(app: &mut Cagents, scope: &Scope) -> View {
     };
     let mut view = View::empty(*channel);
     view.revision = 2;
-    view.panes = app.local_views().panes.remove(scope).unwrap();
+    view.panes = app
+        .local_views()
+        .0
+        .into_iter()
+        .find(|view| &view.scope == scope)
+        .unwrap()
+        .panes;
     app.workspace_model.views = vec![view.clone()];
     app.shared_views.pending.clear();
     view

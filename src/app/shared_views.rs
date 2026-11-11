@@ -6,12 +6,20 @@ use crate::workspace_model::{
     views::{self, Change, Pane, Scope, View},
 };
 
-/// One immutable projection for a publication pass. Scope discovery includes
-/// historical directories, but their cards never become open shared panes.
-struct LocalViews {
-    scopes: Vec<Scope>,
-    cards: HashMap<Scope, Vec<CardId>>,
-    panes: HashMap<Scope, Vec<Pane>>,
+/// One scope's immutable projection for a publication pass. Keep the rows in
+/// discovery order instead of hashing every historical path into parallel maps.
+struct LocalView {
+    scope: Scope,
+    cards: Vec<CardId>,
+    panes: Vec<Pane>,
+}
+
+struct LocalViews(Vec<LocalView>);
+
+impl LocalViews {
+    fn by_scope(&self) -> HashMap<&Scope, &LocalView> {
+        self.0.iter().map(|view| (&view.scope, view)).collect()
+    }
 }
 
 /// Each open card's worktree during one projection, with how many cards
@@ -126,6 +134,8 @@ pub(super) struct State {
     local_projection_count: std::cell::Cell<usize>,
     #[cfg(test)]
     view_projection_count: std::cell::Cell<usize>,
+    #[cfg(test)]
+    local_projection_entries: std::cell::Cell<usize>,
     /// The daemon answered this window without a shared model to give.
     pub(super) registry_unavailable: bool,
     baseline: HashMap<Scope, Vec<Pane>>,
@@ -948,23 +958,20 @@ impl Cagents {
             .map(|card| (card.id, card))
             .collect::<HashMap<_, _>>();
         let ScopeDiscovery {
-            mut scopes,
+            scopes,
             worktree_cards,
         } = self.discover_view_scopes();
-        if let Some(selected) = selected {
-            scopes.retain(|scope| selected.contains(scope));
-        }
         let mut by_path = HashMap::<&Path, Vec<CardId>>::new();
         for (card, path) in worktree_cards {
             if card.existence.is_open() && !card.kind.is_utility() {
                 by_path.entry(path).or_default().push(card.id);
             }
         }
-        let mut members = self
+        let channels = self
             .durable
             .channels
             .iter()
-            .map(|channel| (Scope::Channel(channel.id), channel.cards.clone()))
+            .map(|channel| (channel.id, &channel.cards))
             .collect::<HashMap<_, _>>();
         let pending = self
             .workspace_model
@@ -974,15 +981,68 @@ impl Cagents {
             .filter(|pane| pane.pending_terminal_start)
             .map(|pane| pane.id)
             .collect::<HashSet<_>>();
-        let mut panes = HashMap::new();
-        for scope in &scopes {
-            if let Scope::Worktree { path, .. } = scope {
-                members.insert(
-                    scope.clone(),
-                    by_path.get(path.as_path()).cloned().unwrap_or_default(),
-                );
+        let occupied = self
+            .workspace_model
+            .views
+            .iter()
+            .filter(|view| {
+                !view.panes.is_empty()
+                    || view
+                        .retired
+                        .iter()
+                        .any(|id| cards.get(id).is_some_and(|card| card.existence.is_open()))
+            })
+            .map(|view| &view.scope)
+            .collect::<HashSet<_>>();
+        let mut intentions = HashSet::new();
+        for (_, scope, change) in &self.shared_views.pending {
+            intentions.insert(scope);
+            if let Change::Transfer { destination, .. } = change {
+                intentions.insert(destination);
             }
-            let projected = members[scope]
+        }
+        // Ordered adoption/restoration snapshots can carry custody not yet
+        // represented by a live local member. Keep their complete projection.
+        let ordered = !self.shared_views.adoptions.is_empty()
+            || !self.shared_views.restorations.is_empty()
+            || !self.shared_views.chat_adoptions.is_empty();
+        let mut projected = Vec::new();
+        for scope in scopes {
+            if selected.is_some_and(|selected| !selected.contains(&scope)) {
+                continue;
+            }
+            let members = match &scope {
+                Scope::Channel(id) => channels
+                    .get(id)
+                    .map(|cards| (*cards).clone())
+                    .unwrap_or_default(),
+                Scope::Worktree { path, .. } => {
+                    by_path.get(path.as_path()).cloned().unwrap_or_default()
+                }
+            };
+            // An admitted, inactive historical worktree with no local member,
+            // canonical pane, live retirement, baseline or pending intention
+            // has nothing to publish. Absence/uninitialized views still migrate;
+            // an authoritative empty view is never removed from the model.
+            if let Scope::Worktree { path, .. } = &scope
+                && members.is_empty()
+                && self.active_workspace.as_ref() != Some(path)
+                && self.shared_views.deferred_default.as_ref() != Some(path)
+                && !self.shared_views.creating_default
+                && !ordered
+                && self.shared_views.initialized.contains(&scope)
+                && !self.shared_views.seeding.contains(&scope)
+                && self
+                    .shared_views
+                    .baseline
+                    .get(&scope)
+                    .is_some_and(Vec::is_empty)
+                && !occupied.contains(&scope)
+                && !intentions.contains(&scope)
+            {
+                continue;
+            }
+            let panes = members
                 .iter()
                 .filter_map(|id| {
                     if self.shared_views.retained.contains(id)
@@ -994,23 +1054,27 @@ impl Cagents {
                     let mut pane =
                         Pane::from_card(cards.get(id)?, self.durable.card_scopes.get(id).cloned())?;
                     pane.user_title = self.chrome_ui.user_titles.get(id).cloned();
-                    self.hold_reported_title(scope, &mut pane);
+                    self.hold_reported_title(&scope, &mut pane);
                     pane.pending_terminal_start = matches!(pane.kind, CardKind::Terminal(_))
                         && (self.durable.pending_terminal_creations.contains(id)
                             || pending.contains(id));
-                    if let Scope::Worktree { path, .. } = scope {
+                    if let Scope::Worktree { path, .. } = &scope {
                         pane.scope = Some(path.clone());
                     }
                     Some(pane)
                 })
                 .collect();
-            panes.insert(scope.clone(), projected);
+            projected.push(LocalView {
+                scope,
+                cards: members,
+                panes,
+            });
         }
-        LocalViews {
-            scopes,
-            cards: members,
-            panes,
-        }
+        #[cfg(test)]
+        self.shared_views
+            .local_projection_entries
+            .set(self.shared_views.local_projection_entries.get() + projected.len());
+        LocalViews(projected)
     }
 
     fn pane_move_lifecycle_pending(&self, card: CardId) -> bool {
@@ -1338,17 +1402,16 @@ impl Cagents {
         {
             return;
         }
-        let LocalViews {
-            scopes,
-            cards,
-            mut panes,
-        } = projected;
+        let LocalViews(projected) = projected;
         // Publishing only queues edits, so the model's views stay put: find
         // each scope's first view by lookup rather than a scan per scope.
-        let mut needed = scopes.iter().collect::<HashSet<_>>();
-        let desired = panes
-            .values()
-            .flatten()
+        let mut needed = projected
+            .iter()
+            .map(|view| &view.scope)
+            .collect::<HashSet<_>>();
+        let desired = projected
+            .iter()
+            .flat_map(|view| &view.panes)
             .map(|pane| pane.id)
             .collect::<HashSet<_>>();
         for (scope, previous) in &self.shared_views.baseline {
@@ -1368,7 +1431,9 @@ impl Cagents {
             .iter()
             .flat_map(|(scope, panes)| panes.iter().map(|pane| (pane.id, scope.clone())))
             .collect::<HashMap<_, _>>();
-        for (destination, desired) in &panes {
+        for local in &projected {
+            let destination = &local.scope;
+            let desired = &local.panes;
             for (index, pane) in desired.iter().enumerate() {
                 if let Some(source) = previous_owners
                     .get(&pane.id)
@@ -1413,7 +1478,12 @@ impl Cagents {
                 }
             }
         }
-        for scope in scopes {
+        for LocalView {
+            scope,
+            cards,
+            panes,
+        } in projected
+        {
             if self.shared_views.blocked.contains(&scope) {
                 continue;
             }
@@ -1421,7 +1491,6 @@ impl Cagents {
             {
                 continue;
             }
-            let panes = panes.remove(&scope).unwrap_or_default();
             if !self.shared_views.initialized.contains(&scope) {
                 if self.shared_views.seeding.insert(scope.clone()) {
                     // Only close IDs belonging to this host view. Other views'
@@ -1513,7 +1582,7 @@ impl Cagents {
                 });
             }
             self.shared_views.baseline.insert(scope.clone(), panes);
-            let defaults = cards[&scope]
+            let defaults = cards
                 .iter()
                 .copied()
                 .filter(|id| self.shared_views.defaults.contains_key(id))
@@ -1556,11 +1625,11 @@ impl Cagents {
             let cards = self.local_view_cards(&scope);
             let panes = self.local_view_panes(&scope);
             self.rebase_seeded_attachments(&scope, &panes);
-            self.publish_projected_view_changes(LocalViews {
-                scopes: vec![scope.clone()],
-                cards: HashMap::from([(scope.clone(), cards)]),
-                panes: HashMap::from([(scope, panes)]),
-            });
+            self.publish_projected_view_changes(LocalViews(vec![LocalView {
+                scope,
+                cards,
+                panes,
+            }]));
         }
     }
 
@@ -1744,6 +1813,7 @@ impl Cagents {
         // canonical projection below gets its own fresh publication baseline.
         self.snapshot_workspace_scope();
         let projected = self.local_views_in(selected);
+        let projected_by_scope = projected.by_scope();
         let mut pending_scopes = HashSet::new();
         for (_, source, change) in &self.shared_views.pending {
             pending_scopes.insert(source.clone());
@@ -1760,11 +1830,11 @@ impl Cagents {
             {
                 continue;
             }
-            let (Some(members), Some(panes)) =
-                (projected.cards.get(&scope), projected.panes.get(&scope))
-            else {
+            let Some(local) = projected_by_scope.get(&scope) else {
                 continue;
             };
+            let members = &local.cards;
+            let panes = &local.panes;
             if !members.iter().copied().eq(panes.iter().map(|pane| pane.id))
                 || *panes != self.workspace_model.views[index].panes
             {
@@ -2138,11 +2208,23 @@ impl Cagents {
         // acknowledgment would publish each title again as its own echo.
         self.save_workspace_with_view_publication(|app| {
             let projected = app.local_views_in(selected);
+            let projected_by_scope = projected.by_scope();
             for scope in projected_scopes {
-                app.shared_views.baseline.insert(
-                    scope.clone(),
-                    projected.panes.get(&scope).cloned().unwrap_or_default(),
-                );
+                let panes = projected_by_scope.get(&scope).map(|view| &view.panes);
+                // Sparse historical rows already have an empty admitted
+                // baseline. Avoid cloning and rehashing their path keys.
+                if panes.is_none()
+                    && app
+                        .shared_views
+                        .baseline
+                        .get(&scope)
+                        .is_some_and(Vec::is_empty)
+                {
+                    continue;
+                }
+                app.shared_views
+                    .baseline
+                    .insert(scope, panes.cloned().unwrap_or_default());
             }
             app.publish_projected_view_changes(projected);
         });
@@ -3143,6 +3225,7 @@ mod tests {
     mod history_start;
     mod published_card_edits;
     mod startup_admission;
+    mod startup_projection;
     mod startup_terminals;
 
     use super::*;
@@ -4861,9 +4944,17 @@ mod tests {
         let (tx, rx) = async_channel::unbounded();
         app.workspace_model_tx = tx;
         let before = app.durable.clone();
-        for _ in 0..8 {
+        for pass in 0..8 {
             app.shared_views.local_projection_count.set(0);
+            app.shared_views.local_projection_entries.set(0);
             drop(app.apply_workspace_model_update(ModelUpdate::Read(model.clone())));
+            if pass > 0 {
+                assert_eq!(
+                    app.shared_views.local_projection_entries.get(),
+                    30,
+                    "settled empty history needs no local projection rows"
+                );
+            }
             assert_eq!(
                 app.shared_views.local_projection_count.get(),
                 1,
@@ -5454,9 +5545,23 @@ mod tests {
             .map(|scope| (scope.clone(), app.local_view_panes(scope)))
             .collect::<HashMap<_, _>>();
         let reference_elapsed = started.elapsed();
-        assert_eq!(batched.scopes, scopes);
+        assert_eq!(
+            batched
+                .0
+                .iter()
+                .map(|view| view.scope.clone())
+                .collect::<Vec<_>>(),
+            scopes
+        );
         assert_eq!(app.local_view_scopes(), scopes);
-        assert_eq!(batched.panes, reference);
+        assert_eq!(
+            batched
+                .0
+                .iter()
+                .map(|view| (view.scope.clone(), view.panes.clone()))
+                .collect::<HashMap<_, _>>(),
+            reference
+        );
         for card in app.durable.cards.iter().step_by(17) {
             let listing = scopes
                 .iter()
@@ -5465,12 +5570,14 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(app.local_scopes_listing(card.id), listing);
         }
-        assert!(batched.panes[&Scope::Channel(channel)][0].pending_terminal_start);
+        let batched = batched.by_scope();
+        assert!(batched[&Scope::Channel(channel)].panes[0].pending_terminal_start);
         assert!(
-            batched.panes[&Scope::Worktree {
+            batched[&Scope::Worktree {
                 repository,
                 path: paths[1023].clone(),
             }]
+                .panes
                 .is_empty()
         );
         eprintln!(
