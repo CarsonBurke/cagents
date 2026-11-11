@@ -13,6 +13,7 @@ import uuid
 from unittest import mock
 
 
+
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 
@@ -82,6 +83,7 @@ class PersistenceTests(unittest.TestCase):
             first.request({"id": 2, "method": "turn/start", "params": {"threadId": first.thread}}, directory)
             restarted = adapter.scenario_class(peer, storage, Path("/first/control.sock"))()
             self.assertEqual(restarted.state(), first.state())
+
             successor = adapter.scenario_class(peer, storage, Path("/second/control.sock"))()
             self.assertNotEqual(successor.thread, first.thread)
             resumed = successor.request({"id": 3, "method": "thread/resume",
@@ -202,6 +204,7 @@ class StdioProbeTests(unittest.TestCase):
             result = subprocess.run([sys.executable, "-I", str(FIXTURES / "rehearsal-codex.py"), "app-server"],
                                     env={"PATH": "/usr/bin:/bin", "HOME": str(home),
                                          "CAGENTS_TOOL_ROWS_FIXTURE_ROOT": str(root),
+
                                          "CODEX_HOME": str(home), "XDG_RUNTIME_DIR": str(runtime)},
                                     input="".join(json.dumps(frame) + "\n" for frame in frames),
                                     text=True, capture_output=True, timeout=5)

@@ -1,3 +1,6 @@
+#[cfg(test)]
+use crate::flock::fdinfo_owns_lock as fdinfo_owns_slot;
+use crate::flock::{flock_owner, process_owns_lock as process_owns_slot};
 use std::{
     env,
     fs::{self, File, OpenOptions},
@@ -1013,31 +1016,6 @@ pub(crate) fn verified_windows_for_daemon(
     Ok((windows, legacy))
 }
 
-fn flock_owner(line: &str, metadata: &fs::Metadata) -> Option<u32> {
-    let fields: Vec<_> = line.split_whitespace().collect();
-    if fields.len() != 8
-        || fields[1..4] != ["FLOCK", "ADVISORY", "WRITE"]
-        || fields[6..8] != ["0", "EOF"]
-    {
-        return None;
-    }
-    let identity: Vec<_> = fields[5].split(':').collect();
-    if identity.len() != 3
-        || u64::from_str_radix(identity[0], 16).is_err()
-        || u64::from_str_radix(identity[1], 16).is_err()
-        || identity[2].parse::<u64>().ok() != Some(metadata.ino())
-    {
-        return None;
-    }
-    fields[4].parse::<u32>().ok().filter(|pid| *pid > 1)
-}
-
-fn fdinfo_owns_slot(info: &str, pid: u32, metadata: &fs::Metadata) -> bool {
-    info.lines()
-        .filter_map(|line| line.strip_prefix("lock:"))
-        .any(|line| flock_owner(line, metadata) == Some(pid))
-}
-
 fn verified_windows_in(runtime: &Path, proc_root: &Path) -> io::Result<Vec<VerifiedWindow>> {
     let owners = verified_window_lease_owners_in(runtime, proc_root)?;
     // A legacy exclusive owner cannot be interpreted as absence. Stage-only
@@ -1119,21 +1097,6 @@ fn verified_window_lease_owners_in(
     Ok(owners)
 }
 
-fn process_owns_slot(process: &Path, pid: u32, expected: &fs::Metadata) -> io::Result<bool> {
-    Ok(fs::read_dir(process.join("fdinfo"))?
-        .filter_map(Result::ok)
-        .any(|entry| {
-            let descriptor = process.join("fd").join(entry.file_name());
-            let matches = |actual: fs::Metadata| {
-                actual.dev() == expected.dev() && actual.ino() == expected.ino()
-            };
-            fs::metadata(&descriptor).is_ok_and(&matches)
-                && fs::read_to_string(entry.path())
-                    .is_ok_and(|info| fdinfo_owns_slot(&info, pid, expected))
-                && fs::metadata(&descriptor).is_ok_and(matches)
-        }))
-}
-
 pub fn update_in_progress() -> bool {
     runtime_directory()
         .and_then(|runtime| {
@@ -1180,6 +1143,11 @@ impl UiUpdateGuard {
             .ok_or_else(|| io::Error::other("update launch fence was released"))?
             .try_clone()?;
         Ok((fence, self._legacy_fence.try_clone()?))
+    }
+
+    /// Exact slots frozen by this update, for an explicitly authorized recovery.
+    pub(crate) fn prepared_window_slots(&self) -> &[String] {
+        &self.prepared
     }
 
     /// The authenticated windows while this guard is held. Its shared legacy

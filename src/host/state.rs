@@ -582,6 +582,14 @@ impl HostState {
         self.model = Some(registry);
     }
 
+    /// Another connection to the shared-model store, for work that must not
+    /// hold the host lock while it writes.
+    pub(super) fn independent_model(&self) -> Option<Result<super::model::Registry, String>> {
+        self.model
+            .as_ref()
+            .map(super::model::Registry::execution_connection)
+    }
+
     /// How many hosted agents are working, and how many are waiting on the
     /// user, across running terminals and native conversations.
     pub(super) fn agent_tally(&self) -> crate::tray::AgentTally {
@@ -2978,6 +2986,21 @@ pub(super) fn restore_upgrade(host: &SharedHost) -> Result<Vec<TerminalId>, Stri
     )
 }
 
+/// Lifecycle fixtures that prove their owned providers stopped can supply a
+/// controlled census without depending on unrelated protected host processes.
+#[cfg(test)]
+pub(in crate::host) fn restore_upgrade_with_process_fixture(
+    host: &SharedHost,
+    processes: &std::path::Path,
+) -> Result<Vec<TerminalId>, String> {
+    restore_upgrade_from(
+        host,
+        crate::upgrade::handoff::Store::discover()?,
+        processes,
+        holder_directory().ok().as_deref(),
+    )
+}
+
 /// An acknowledged incomplete update authorizes attaching its original holder
 /// only. In particular, missing holders never fall back to a launch recipe.
 pub(in crate::host) fn adopt_prepared_terminal(
@@ -3322,7 +3345,6 @@ fn restore_upgrade_from(
         );
         return Ok(Vec::new());
     }
-    let ready_checkpoint = (checkpoint.phase == Phase::Ready).then(|| checkpoint.clone());
     checkpoint.phase = Phase::Restoring;
     store.save(&checkpoint)?;
     host.lock()
@@ -3393,8 +3415,8 @@ fn restore_upgrade_from(
             if crate::daemon::termination_requested() {
                 return Err(RESTORE_TERMINATED.to_owned());
             }
-            let restore = if let Some(ready) = &ready_checkpoint {
-                super::chat::restore_ready_checkpoint(host, &chat.source, ready).map(|_| ())
+            let restore = if checkpoint.phase == Phase::Ready {
+                super::chat::restore_ready_checkpoint(host, &chat.source, &checkpoint).map(|_| ())
             } else {
                 super::chat::restore_upgrade(host, chat)
             };

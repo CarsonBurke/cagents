@@ -1402,9 +1402,9 @@ enum PendingRequest {
 }
 /// Returns the per-user daemon socket, starting the sibling `cagentsd` if necessary.
 ///
-/// Ordinary startup is bounded to five seconds; upgrade restoration receives a
-/// bounded per-session allowance, which also bounds the handshake with a
-/// daemon this call launched. On systemd hosts the daemon runs in its own
+/// Startup has a bounded base allowance, extended per session for upgrade
+/// restoration. The same allowance bounds authentication to a daemon started
+/// by this call or another launcher. On systemd hosts the daemon runs in its own
 /// user scope, keeping UI cgroup shutdown and memory-pressure kills away from
 /// hosted sessions. Other hosts retain the detached process-group fallback.
 pub fn ensure_daemon_ready() -> Result<PathBuf, HostedTerminalStartError> {
@@ -1430,7 +1430,16 @@ fn ensure_daemon_ready_at(
             // A listening socket can belong to an older development build.
             // Verify the wire protocol before opening a window whose actions
             // would otherwise all fail against that daemon.
-            return verify_daemon_protocol(crate::control::ControlClient::from_stream(stream));
+            // A concurrent launcher may still be restoring behind this bound
+            // listener. Authenticate with the same startup allowance as our
+            // own launch. Budget estimation is not readiness authority: a
+            // stale damaged checkpoint must not reject a serving daemon.
+            let timeout = crate::upgrade::handoff::startup_timeout()
+                .unwrap_or(crate::upgrade::handoff::STARTUP_BASE);
+            return verify_daemon_protocol(crate::control::ControlClient::from_stream_until(
+                stream,
+                Instant::now() + timeout,
+            ));
         }
         Err(error)
             if !matches!(
@@ -3259,6 +3268,91 @@ mod tests {
                 );
             }
             server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn existing_listener_handshake_waits_out_restoration_with_and_without_checkpoint() {
+        use std::io::Write;
+        const CHILD: &str = "CAGENTS_TEST_EXISTING_DAEMON_RESTORE";
+        const TEST: &str = "terminal::hosted::tests::existing_listener_handshake_waits_out_restoration_with_and_without_checkpoint";
+        let Ok(checkpoint) = std::env::var(CHILD) else {
+            for checkpoint in ["absent", "damaged"] {
+                let root = tempfile::tempdir().unwrap();
+                std::fs::create_dir(root.path().join("tmp")).unwrap();
+                let mut command = Command::new(std::env::current_exe().unwrap());
+                command
+                    .env_clear()
+                    .env(CHILD, checkpoint)
+                    .env("HOME", root.path().join("home"))
+                    .env("XDG_DATA_HOME", root.path().join("data"))
+                    .env("XDG_CONFIG_HOME", root.path().join("config"))
+                    .env("XDG_RUNTIME_DIR", root.path().join("run"))
+                    .env("TMPDIR", root.path().join("tmp"))
+                    .env("PATH", "/usr/bin:/bin")
+                    .args(["--exact", TEST, "--nocapture"]);
+                if let Some(authority) = std::env::var_os(crate::agent_execution::AUTHORITY_ENV) {
+                    command.env(crate::agent_execution::AUTHORITY_ENV, authority);
+                }
+                assert!(
+                    command.status().unwrap().success(),
+                    "{checkpoint} checkpoint fixture failed"
+                );
+            }
+            return;
+        };
+        let upgrade = crate::instance::project_dirs()
+            .unwrap()
+            .data_local_dir()
+            .join("daemon-upgrade");
+        if checkpoint == "damaged" {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::create_dir_all(&upgrade).unwrap();
+            std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(upgrade.join("daemon-upgrade.json"))
+                .unwrap()
+                .write_all(b"damaged checkpoint")
+                .unwrap();
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(5_600));
+            let mut stream = accept_connection(&listener);
+            let request: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+            let proof = proof("restored-existing");
+            let _ = write_frame(
+                &mut stream,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(request.request_id),
+                    proof: proof.clone(),
+                    message: ServerMessage::Response {
+                        response: ServerResponse::Connected {
+                            proof,
+                            resumed: Vec::new(),
+                        },
+                    },
+                },
+            );
+        });
+        let result = ensure_daemon_ready_at(&socket, crate::notifications::Application::Cagents);
+        server.join().unwrap();
+        result.unwrap();
+        if checkpoint == "absent" {
+            assert!(
+                !upgrade.exists(),
+                "budget estimation must not create upgrade storage"
+            );
+        } else {
+            assert_eq!(
+                std::fs::read(upgrade.join("daemon-upgrade.json")).unwrap(),
+                b"damaged checkpoint"
+            );
         }
     }
 

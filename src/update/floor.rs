@@ -225,6 +225,14 @@ trait FloorSource {
         daemon: &impact::DaemonImpact,
         service: bool,
     ) -> Result<Inventory, UpdateError>;
+    fn capture_before_floor(
+        &mut self,
+        _state: &Path,
+        _job: &UpdateJob,
+        _daemon: &impact::DaemonImpact,
+    ) -> Result<(), UpdateError> {
+        Ok(())
+    }
     fn begin_preparation(
         &mut self,
         _state: &Path,
@@ -312,6 +320,7 @@ struct NativeSource<'a, O> {
     interrupt_reviewed: Option<impact::DaemonImpact>,
     preparing_client: Option<source::Client>,
     preparation: Option<crate::upgrade::recovery::Preparation>,
+    original_census: Option<crate::upgrade::recovery::Census>,
 }
 
 /// Frozen lifecycle sources can prepare and prove Ready without exposing the
@@ -376,14 +385,14 @@ impl<O: FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>> FloorSour
             terminals,
         })
     }
-    fn begin_preparation(
+    fn capture_before_floor(
         &mut self,
         state: &Path,
         job: &UpdateJob,
         daemon: &impact::DaemonImpact,
     ) -> Result<(), UpdateError> {
         let mut client = source_client_for(daemon)?;
-        let census = preparation_census(
+        self.original_census = preparation_census(
             matches!(&client, source::Client::Legacy(_)),
             crate::upgrade::recovery::require_checkpoint_absent,
             || {
@@ -416,6 +425,26 @@ impl<O: FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>> FloorSour
                 })
             },
         )?;
+        if let Some(census) = &self.original_census {
+            crate::upgrade::recovery::capture_before_floor(
+                &self.proof,
+                census,
+                self.guard,
+                state,
+                &job.id,
+            )
+            .map_err(invalid)?;
+        }
+        Ok(())
+    }
+    fn begin_preparation(
+        &mut self,
+        state: &Path,
+        job: &UpdateJob,
+        daemon: &impact::DaemonImpact,
+    ) -> Result<(), UpdateError> {
+        let client = source_client_for(daemon)?;
+        let census = self.original_census.clone();
         self.survivors.prepared_source = Some(match census {
             Some(census) => {
                 self.preparation = Some(
@@ -667,6 +696,7 @@ pub(super) fn quiesce(
         interrupt_reviewed: None,
         preparing_client: None,
         preparation: None,
+        original_census: None,
     };
     quiesce_source(state, job, confirmed, terminal, &mut source)
 }
@@ -802,6 +832,9 @@ fn quiesce_inner(
         .daemon
         .as_ref()
         .ok_or_else(|| invalid("The source disappeared during update review"))?;
+    // Retain the full original census before any floor action can remove a
+    // conversation. A later Ready checkpoint contains only its surviving subset.
+    source.capture_before_floor(state, job, daemon)?;
     let mut service = needs_service_stop(daemon);
     // With no known ends, prepare itself determines whether the service can
     // checkpoint. A refusal has not ended anything and precedes the one stop list.

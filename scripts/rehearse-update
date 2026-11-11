@@ -1,0 +1,652 @@
+#!/bin/bash
+# Rehearse an installed update end to end in a private user: its own HOME, XDG
+# directories, runtime directory, fake providers and headless desktop. Nothing
+# here reaches the real installation, daemon, provider accounts or desktop.
+# Transient scopes deliberately use the real systemd user manager; stop checks them.
+# See "Rehearsing an update" in docs/development.md.
+set -euo pipefail
+{
+
+self=$(readlink -f "$0")
+tool_root=${self%/scripts/*}
+native_lock=${CAGENTS_EVIDENCE_NATIVE_LOCK:-/var/tmp/cagents-fw16-native.lock}
+real_home=$HOME
+
+usage() {
+    cat <<'USAGE'
+Usage: scripts/rehearse-update --root DIR COMMAND [ARGS...]
+
+DIR holds one private user. Its path must be short (sockets live below it).
+
+  init                 Create the private user: directories, a Git project,
+                       fake `claude`, `codex`, `gh` and `curl` first on PATH.
+  install DIR VERSION INSTALLER [INSTALLER-ARGS...]
+                       Run INSTALLER (an install.sh) for the archive and
+                       SHA256SUMS in DIR, as the private user.
+  run --old-dir DIR --old-version V --old-installer FILE
+      --new-dir DIR --new-version V --new-installer FILE [OPTIONS]
+                       Fresh-root scenario; always saves report.txt and stops.
+                       --ceditor BIN_DIR, --answer TEXT (default yes), --yes,
+                       --working TEXT, --stop TEXT,
+                       --upgrade-arg=--interrupt, --untitled 0|1|2, --no-codex,
+                       --no-child, --ignore-term, --no-init, --exit-mid-turn,
+                       --uncarryable, --unreachable. See run --help.
+  compare A B          Compare record names, directories or snapshot JSON.
+  cleanup              Stop everything and remove this marked root.
+  launch [main|NAME]   Open a named installed UI window on the desktop.
+  wm ARGS...           Private compositor IPC (niri msg).
+  ceditor start DIR    Launch DIR/ceditor with its matched companions.
+  seed [OPTIONS]       Open two projects and create channels, agents (chat and
+                       console, named and untitled) and terminals through the
+                       installed CLI.
+  update DIR VERSION INSTALLER [--answer TEXT] [--working TEXT] [--stop TEXT]
+         [UPGRADE-ARGS...]
+                       What scripts/install-local does after its build: stage
+                       the archive with --stage-only, then run the staged
+                       `cagents daemon upgrade` in a terminal (inside the
+                       desktop when it runs). --answer is typed at each
+                       [Y/n] confirmation, --working at the working-agents
+                       choice (empty waits for them) and --stop at the stop
+                       list (empty cancels it).
+  desktop start [--limit SECONDS]
+                       Start a headless desktop (KWin virtual + nested niri)
+                       under the native lock. Windows open there.
+  desktop stop         End the desktop; the daemon and sessions keep running.
+  env CMD...           Run CMD as the private user, without the desktop.
+  app CMD...           Run CMD as the private user inside the desktop.
+  drive ARGS...        niri-harness against the desktop (observe, click, ...).
+  shot NAME            Capture DIR/shots/NAME.webp.
+  record NAME          Write DIR/records/NAME/: daemon status, terminals,
+                       sessions, channels, saved panes and their processes.
+  stop                 End everything the private user runs, the daemon too.
+  status               Report the desktop, daemon and processes.
+USAGE
+}
+
+die() {
+    printf 'rehearse-update: %s\n' "$1" >&2
+    exit "${2:-1}"
+}
+
+# Help is read-only and remains available to hosted agents.
+case ${1:-} in -h | --help) usage; exit 0 ;; esac
+if [ "${1:-}" = --root ]; then
+    case ${3:-} in
+        -h | --help) usage; exit 0 ;;
+        run | scenario)
+            for argument in "${@:4}"; do
+                case $argument in
+                    -h | --help)
+                        /usr/bin/python3 "$tool_root/scripts/rehearse_update_run.py" "$2" "$self" run --help
+                        exit 0 ;;
+                esac
+            done ;;
+    esac
+fi
+
+# A hosted agent's authority must never reach, or be stripped for, this user.
+for name in CAGENTS_AGENT_AUTHORITY CAGENTS_AGENT_TOKEN CAGENTS_SESSION_TOKEN; do
+    if [ "${!name+x}" ]; then
+        die "run this from a genuine user shell, such as plain \`ssh fw16\`; inherited agent authority was not modified" 77
+    fi
+done
+
+[ "${1:-}" = --root ] || { usage >&2; exit 2; }
+[ "$#" -ge 3 ] && [ -n "${2:-}" ] || die '--root needs a directory and command' 2
+root=$(realpath -m -- "$2")
+shift 2
+[[ $root =~ ^/[A-Za-z0-9._/-]+$ ]] || die "root has unsupported characters: $root" 2
+[ "${#root}" -le 40 ] || die "root is over 40 bytes, too long for its sockets: $root" 2
+
+case $root in /var/tmp/* | /tmp/* | /dev/shm/*) ;; *) die 'root must be under /var/tmp, /tmp or /dev/shm' 2 ;; esac
+case $root in /var/tmp/cr) die 'root must be a dedicated child directory' 2 ;; esac
+[ "$root" != "$real_home" ] || die 'root must not be the real HOME' 2
+[ ! -L "$root" ] || die 'root must not be a symlink' 2
+
+user_home=$root/home
+runtime=$root/rt
+bin=$root/bin
+logs=$root/logs
+desktop=$root/desktop
+harness_root=$desktop/niri
+session_name=rehearsal-${root##*/}
+
+# The private user's environment: nothing from this shell beyond locale and
+# terminal, and the toolchain locations a later build may want.
+user_env() {
+    local name passed=()
+    for name in LANG LC_ALL LC_CTYPE TERM; do
+        [ -z "${!name+x}" ] || passed+=("$name=${!name}")
+    done
+    env -i -C "$user_home" "${passed[@]}" \
+        HOME="$user_home" USER="$(id -un)" LOGNAME="$(id -un)" SHELL=/bin/bash \
+        XDG_RUNTIME_DIR="$runtime" \
+        XDG_DATA_HOME="$user_home/.local/share" XDG_CONFIG_HOME="$user_home/.config" \
+        XDG_CACHE_HOME="$user_home/.cache" XDG_STATE_HOME="$user_home/.local/state" \
+        CLAUDE_CONFIG_DIR="$user_home/.claude" CODEX_HOME="$user_home/.codex" \
+        GIT_CONFIG_NOSYSTEM=1 GIT_ALLOW_PROTOCOL=file \
+        CAGENTS_REHEARSAL_ROOT="$root" \
+        PATH="$bin:$user_home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+        "$@"
+}
+
+# Every process the private user runs carries its runtime directory or HOME.
+user_processes() {
+    grep -lFxz -e "XDG_RUNTIME_DIR=$runtime" -e "HOME=$user_home" \
+        -e "XDG_RUNTIME_DIR=$desktop/rt" -e "HOME=$desktop/home" /proc/[0-9]*/environ 2>/dev/null |
+        sed -E 's#^/proc/([0-9]+)/environ$#\1#' | grep -vxF -e "$$" -e "$BASHPID" || true
+}
+
+require_init() {
+    [ -f "$root/.rehearse-update" ] && [ ! -L "$root/.rehearse-update" ] &&
+        [ "$(cat -- "$root/.rehearse-update")" = "$root" ] ||
+        die "not initialized with a matching root marker; run: --root $root init"
+}
+
+cmd_init() {
+    if [ -e "$root" ] && [ ! -e "$root/.rehearse-update" ]; then
+        [ -z "$(ls -A -- "$root")" ] || die "not a rehearsal root, and not empty: $root" 2
+    fi
+    if [ -e "$root/.rehearse-update" ] || [ -L "$root/.rehearse-update" ]; then
+        require_init
+    fi
+    # Recovery storage refuses to live inside a Git checkout.
+    local ancestor=$root
+    while [ "$ancestor" != / ]; do
+        [ ! -e "$ancestor/.git" ] || die "root must be outside Git ancestry; found $ancestor/.git" 2
+        ancestor=$(dirname -- "$ancestor")
+    done
+    mkdir -p -- "$root"
+    chmod 700 "$root"
+    printf '%s\n' "$root" >"$root/.rehearse-update"
+    mkdir -p -- "$bin" "$logs" "$root/records" "$root/shots" "$user_home"/{.claude,.codex,.config,.cache,.local/bin,.local/share,.local/state}
+    mkdir -m 700 -p -- "$runtime"
+    install -m 755 "$tool_root/tests/fixtures/chat-composer-claude.sh" "$bin/claude"
+    install -m 755 "$tool_root/tests/fixtures/fixture-gh.sh" "$bin/gh"
+    printf '#!/bin/sh\necho "curl: (7) the rehearsal has no network access" >&2\nexit 7\n' >"$bin/curl"
+    mkdir -p "$root/libexec/codex"
+    install -m 755 "$tool_root/tests/fixtures/rehearsal-codex.sh" "$bin/codex"
+    install -m 755 "$tool_root/tests/fixtures/rehearsal-codex.py" "$root/libexec/codex/"
+    install -m 755 "$tool_root/tests/fixtures/codex-tool-rows.py" "$root/libexec/codex/"
+    install -m 755 "$tool_root/tests/fixtures/terminal-escape-codex.py" "$root/libexec/codex/"
+    chmod 755 "$bin/curl" "$bin/codex"
+    local project
+    for project in alpha beta; do
+        [ -e "$user_home/src/$project/.git" ] && continue
+        user_env git init --quiet --initial-branch=main "$user_home/src/$project"
+        user_env git -C "$user_home/src/$project" -c user.name=Rehearsal -c user.email=rehearsal@example.invalid \
+            commit --quiet --allow-empty --message "Rehearsal project $project"
+    done
+    printf 'initialized %s\n' "$root"
+}
+
+cmd_install() {
+    require_init
+    local archive_dir=${1:?install needs the archive directory} version=${2:?install needs a version} installer=${3:?install needs an install.sh}
+    shift 3
+    archive_dir=$(realpath -- "$archive_dir")
+    installer=$(realpath -- "$installer")
+    local archive=$archive_dir/cagents-$version-x86_64-unknown-linux-gnu.tar.gz
+    [ -f "$archive" ] || die "no archive $archive"
+    local started=$SECONDS status=0
+    user_env CAGENTS_ARCHIVE="$archive" CAGENTS_CHECKSUMS="$archive_dir/SHA256SUMS" \
+        sh "$installer" --version "$version" "$@" 2>&1 | tee -a "$logs/install.log" || status=${PIPESTATUS[0]}
+    printf 'install %s exited %s after %ss\n' "$version" "$status" "$((SECONDS - started))" | tee -a "$logs/install.log"
+    return "$status"
+}
+
+# The workload an update has to carry, created through the installed build's
+# own CLI so any build can seed it. Windows must already be open on the
+# desktop for panes to be placed; agents spawned here appear as channel cards.
+cmd_seed() {
+    require_init
+    /usr/bin/python3 "$tool_root/scripts/rehearse_update_run.py" "$root" "$self" seed "$@"
+}
+
+# What scripts/install-local does once its archive is built: stage it, then run
+# the staged build's `daemon upgrade` in a terminal, as a person would. ANSWER
+# is typed at each confirmation, WORKING at the working-agents choice and STOP
+# at the destructive stop list; empty WORKING waits and empty STOP cancels.
+cmd_update() {
+    require_init
+    local archive_dir=${1:?update needs the archive directory} version=${2:?update needs a version} installer=${3:?update needs an install.sh}
+    shift 3
+    local answer= working= stop= fail_new_daemon=0 upgrade_args=()
+    while [ "$#" -gt 0 ]; do
+        case $1 in
+            --fail-new-daemon) fail_new_daemon=1; shift ;;
+            --answer) answer=${2?}; shift 2 ;;
+            --working) working=${2?}; shift 2 ;;
+            --stop) stop=${2?}; shift 2 ;;
+            *) upgrade_args+=("$1"); shift ;;
+        esac
+    done
+    local started=$SECONDS status=0 transcript
+    transcript=$logs/update-$(date +%H%M%S).log
+    local prefix=$user_home/.local/share/cagents-install
+    if [ "$fail_new_daemon" -eq 1 ]; then
+        [ ! -e "$prefix/versions/$version" ] || die 'startup failure requires an unstaged private candidate' 2
+        archive_dir=$(user_env /usr/bin/python3 "$tool_root/scripts/rehearse_update_fault.py" \
+            "$root" "$version" --archive-dir "$archive_dir")
+    fi
+    if [[ $prefix/current -ef $prefix/versions/$version ]]; then
+        printf '%s is already current; skipping staging.\n' "$version"
+    elif [ -e "$prefix/versions/$version" ]; then
+        die "$prefix/versions/$version exists but is not current; remove it to reinstall"
+    else
+        local stage_status=0
+        cmd_install "$archive_dir" "$version" "$installer" --stage-only 2>&1 | tee -a "$transcript" || stage_status=${PIPESTATUS[0]}
+        [ "$stage_status" -eq 0 ] || return "$stage_status"
+    fi
+    printf 'staged after %ss\n' "$((SECONDS - started))" | tee -a "$transcript"
+    cmd_app_or_env /usr/bin/python3 "$tool_root/scripts/rehearse_update_pty.py" --answer "$answer" --working "$working" --stop "$stop" -- \
+        "$user_home/.local/share/cagents-install/current/bin/cagents" daemon upgrade "${upgrade_args[@]}" \
+        2>&1 | tee -a "$transcript" || status=${PIPESTATUS[0]}
+    printf 'daemon upgrade exited %s after %ss total\n' "$status" "$((SECONDS - started))" | tee -a "$transcript"
+    return "$status"
+}
+
+# Inside the desktop when one runs, so windows the update reopens have a display.
+cmd_app_or_env() {
+    if desktop_live && [ -e "$desktop/ready" ]; then cmd_app "$@"; else user_env "$@"; fi
+}
+
+desktop_live() {
+    local pid
+    pid=$(cat "$desktop/pid" 2>/dev/null) || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    [ "$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null)" != Z ]
+}
+
+cmd_desktop() {
+    require_init
+    case ${1:-} in
+        start) shift; desktop_start "$@" ;;
+        stop) desktop_stop ;;
+        *) die 'desktop start|stop' 2 ;;
+    esac
+}
+
+desktop_start() {
+    local limit=3600
+    while [ "$#" -gt 0 ]; do
+        case $1 in
+            --limit) limit=${2:?}; shift 2 ;;
+            *) die "unknown desktop option: $1" 2 ;;
+        esac
+    done
+    desktop_live && die 'the desktop is already running'
+    rm -rf -- "$desktop"
+    mkdir -p -- "$desktop"/{home,config,data,cache,state}
+    setsid "$self" --root "$root" __desktop "$limit" </dev/null >"$logs/desktop.log" 2>&1 &
+    printf '%s\n' "$!" >"$desktop/pid"
+    # Waiting in the native lock's queue is not a failure: other agents'
+    # evidence runs may hold it for a long time. Only startup is bounded.
+    local waited=0 started=
+    while :; do
+        [ -e "$desktop/ready" ] && { printf 'desktop ready\n'; return 0; }
+        [ -e "$desktop/failed" ] && die "$(cat "$desktop/failed")"
+        desktop_live || die "the desktop ended before it was ready; see $logs/desktop.log"
+        if [ -e "$desktop/locked" ]; then
+            started=$((${started:-0} + 1))
+            [ "$started" -le 300 ] || break
+        elif [ $((waited % 300)) -eq 0 ]; then
+            printf 'waiting for the native lock (%s min so far)\n' "$((waited / 60))"
+        fi
+        waited=$((waited + 1))
+        sleep 1
+    done
+    touch -- "$desktop/stop"
+    kill -TERM -- "-$(cat "$desktop/pid")" 2>/dev/null || :
+    die 'the desktop was not ready 5 minutes after it took the native lock'
+}
+
+desktop_stop() {
+    desktop_live || { printf 'no desktop is running\n'; return 0; }
+    touch -- "$desktop/stop"
+    local attempt
+    for attempt in $(seq 1 90); do
+        desktop_live || { printf 'desktop stopped\n'; return 0; }
+        sleep 1
+    done
+    kill -TERM -- "-$(cat "$desktop/pid")" 2>/dev/null || :
+    printf 'desktop ended by signal\n'
+}
+
+# Holds the native lock while the desktop exists: other agents' native
+# evidence on this host takes the same lock.
+run_desktop() {
+    local limit=$1
+    exec 9>"$native_lock"
+    printf 'waiting for the native lock %s\n' "$native_lock"
+    while ! flock -w 1 9; do
+        [ ! -e "$desktop/stop" ] || return 0
+    done
+    [ ! -e "$desktop/stop" ] || return 0
+    printf 'holding the native lock\n'
+    : >"$desktop/locked"
+    local runtime_desktop=$desktop/rt
+    mkdir -m 700 -p -- "$runtime_desktop"
+    # Expose only the desktop helpers, even when installed beside provider CLIs.
+    local tool executable
+    mkdir -p -- "$desktop/tools"
+    for tool in niri-harness niri wtype; do
+        executable=$(command -v "$tool") || die "required desktop tool is not installed: $tool"
+        ln -s -- "$(realpath -- "$executable")" "$desktop/tools/$tool"
+    done
+    env -i PATH="$desktop/tools:/usr/local/bin:/usr/bin:/bin" LANG="${LANG:-C.UTF-8}" TERM="${TERM:-dumb}" \
+        HOME="$desktop/home" XDG_RUNTIME_DIR="$runtime_desktop" \
+        XDG_CONFIG_HOME="$desktop/config" XDG_DATA_HOME="$desktop/data" \
+        XDG_CACHE_HOME="$desktop/cache" XDG_STATE_HOME="$desktop/state" \
+        setpriv --pdeathsig TERM dbus-run-session -- setpriv --pdeathsig TERM \
+        kwin_wayland --virtual --no-lockscreen --socket "$session_name" \
+        --width 1596 --height 929 --exit-with-session \
+        "$self --root $root __inner" >"$logs/kwin.log" 2>&1 9>&- &
+    local compositor=$! deadline=$((SECONDS + limit))
+    while kill -0 "$compositor" 2>/dev/null; do
+        if [ -e "$desktop/stop" ] || [ "$SECONDS" -ge "$deadline" ]; then
+            [ -e "$desktop/stop" ] || printf 'desktop reached its %ss limit\n' "$limit"
+            touch -- "$desktop/stop"
+            sleep 5
+            kill -TERM "$compositor" 2>/dev/null || :
+            break
+        fi
+        sleep 1
+    done
+    wait "$compositor" 2>/dev/null || :
+    [ -e "$desktop/ready" ] || [ -e "$desktop/failed" ] ||
+        printf 'the compositor exited before it was ready; see %s\n' "$logs/kwin.log" >"$desktop/failed"
+}
+
+run_inner() {
+    if ! timeout -k 5 240 niri-harness session start "$session_name" --root "$harness_root" --timeout 180 \
+        --no-window-wait --width 1500 --cmd 'exec sleep infinity' >"$logs/harness.log" 2>&1; then
+        printf 'the nested desktop did not start; see %s\n' "$logs/harness.log" >"$desktop/failed"
+        return 1
+    fi
+    {
+        printf 'WAYLAND_DISPLAY=%s\n' "$WAYLAND_DISPLAY"
+        printf 'DBUS_SESSION_BUS_ADDRESS=%s\n' "${DBUS_SESSION_BUS_ADDRESS:-}"
+        printf 'XDG_RUNTIME_DIR=%s\n' "$XDG_RUNTIME_DIR"
+    } >"$desktop/env"
+    touch -- "$desktop/ready"
+    while [ ! -e "$desktop/stop" ] && kill -0 "$PPID" 2>/dev/null; do sleep 0.5; done
+    timeout -k 5 30 niri-harness session stop "$session_name" >>"$logs/harness.log" 2>&1 || :
+}
+
+# Resolve the helper once per invocation, before discarding the caller's PATH.
+resolve_niri_harness() {
+    local harness
+    harness=$(command -v niri-harness) || die 'niri-harness is not installed'
+    realpath -- "$harness"
+}
+
+desktop_env() {
+    local name value variables=()
+    while IFS='=' read -r name value; do
+        case $name in
+            WAYLAND_DISPLAY | DBUS_SESSION_BUS_ADDRESS | XDG_RUNTIME_DIR)
+                variables+=("$name=$value") ;;
+        esac
+    done <"$desktop/env"
+    env -i HOME="$desktop/home" PATH="$desktop/tools:/usr/local/bin:/usr/bin:/bin" \
+        LANG="${LANG:-C.UTF-8}" TERM="${TERM:-dumb}" "${variables[@]}" "$@"
+}
+
+# The nested desktop's display variables, for the app inside it. Its own
+# runtime directory stays the desktop's: the app's is the private user's.
+desktop_variables() {
+    desktop_live && [ -e "$desktop/ready" ] || die 'no desktop is running; run: desktop start'
+    local harness
+    harness=$(resolve_niri_harness)
+    desktop_env timeout -k 5 30 "$harness" --session "$session_name" session env | sed -n 's/^export //p' | grep -E '^(WAYLAND_DISPLAY|NIRI_SOCKET|XDG_CURRENT_DESKTOP|XDG_SESSION_TYPE)='
+}
+
+cmd_app() {
+    require_init
+    local variables=() line display_runtime
+    display_runtime=$(sed -n 's/^XDG_RUNTIME_DIR=//p' "$desktop/env" 2>/dev/null) || :
+    while IFS= read -r line; do
+        line=${line//\'/}
+        line=${line//\"/}
+        # A relative Wayland display resolves against the desktop's runtime.
+        case $line in
+            WAYLAND_DISPLAY=/*) ;;
+            WAYLAND_DISPLAY=*) line=WAYLAND_DISPLAY=$display_runtime/${line#WAYLAND_DISPLAY=} ;;
+            NIRI_SOCKET=*) ;;
+        esac
+        variables+=("$line")
+    done < <(desktop_variables)
+    user_env "${variables[@]}" "$@"
+}
+
+cmd_drive() {
+    desktop_live || die 'no desktop is running'
+    local harness
+    harness=$(resolve_niri_harness)
+    desktop_env timeout -k 5 300 "$harness" --no-heal --session "$session_name" "$@"
+}
+
+cmd_shot() {
+    local name=${1:?shot needs a name}
+    [[ $name =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]] || die 'shot names use letters, digits and hyphens' 2
+    cmd_drive shot "$name" >/dev/null
+    magick "$harness_root/shots/$name.png" -quality 92 "$root/shots/$name.webp"
+    printf '%s\n' "$root/shots/$name.webp"
+}
+
+# What the private user has, in forms a later record can be compared with.
+cmd_record() {
+    require_init
+    local name=${1:?record needs a name} out cli noun status=0
+    [[ $name =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]] || die 'record names use letters, digits and hyphens' 2
+    out=$root/records/$name
+    mkdir -p -- "$out"
+    cli=$user_home/.local/bin/cagents
+    {
+        readlink -- "$user_home/.local/share/cagents-install/current" || :
+        user_env timeout -k 2 10 "$cli" --no-start daemon status 2>&1 || :
+    } >"$out/daemon.txt"
+    local args
+    for noun in terminals sessions channels projects agents; do
+        case $noun in
+            terminals) args=(terminal list --all) ;;
+            sessions) args=(sessions --all) ;;
+            channels) args=(channel list) ;;
+            projects) args=(project list) ;;
+            agents) args=(agent list) ;;
+        esac
+        user_env timeout -k 2 15 "$cli" --no-start --json "${args[@]}" >"$out/$noun.json" 2>"$out/$noun.stderr" || :
+    done
+    # The issued receipt alone is historical evidence. Re-run its read-only
+    # verifier so paused panes are accepted only from the same Ready owner now.
+    local evidence_status=0
+    /usr/bin/python3 "$tool_root/scripts/rehearse_update_records.py" prepare-recovery "$root" "$out" \
+        >"$out/recovery-prepare.stdout" 2>"$out/recovery-prepare.stderr" || evidence_status=$?
+    if [ "$evidence_status" -eq 0 ]; then
+        local verifier
+        IFS= read -r verifier <"$out/recovery-prepare.stdout"
+        user_env timeout -k 2 30 "$verifier" --no-start daemon verify-update-census \
+            --census "$out/recovery-census.json" --outcome "$out/recovery-current.json" \
+            >"$out/recovery-verify.stdout" 2>"$out/recovery-verify.stderr" || {
+                printf '%s\n' 'Current daemon readiness and inventory verification failed; inspect recovery-verify.stderr' >"$out/recovery-error.txt"
+                status=1
+            }
+    elif [ "$evidence_status" -ne 1 ]; then
+        cp -- "$out/recovery-prepare.stderr" "$out/recovery-error.txt"
+        status=1
+    fi
+    if desktop_live; then
+        /usr/bin/python3 "$tool_root/scripts/rehearse_update_run.py" "$root" "$self" observe "$out/windows.json" || status=$?
+    else
+        printf '{}\n' >"$out/windows.json"
+    fi
+    /usr/bin/python3 "$tool_root/scripts/rehearse_update_records.py" record "$root" "$out" --windows "$out/windows.json" || status=$?
+    return "$status"
+}
+
+cmd_compare() {
+    local a=${1:?compare needs two records} b=${2:?compare needs two records}
+    [ -e "$a" ] || a=$root/records/$a
+    [ -e "$b" ] || b=$root/records/$b
+    /usr/bin/python3 "$tool_root/scripts/rehearse_update_records.py" compare "$a" "$b"
+}
+
+cmd_launch() {
+    require_init
+    local slot=${1:-main} args=()
+    [[ $slot =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]] || die 'invalid window name' 2
+    [ "$slot" = main ] || args=(--window "$slot")
+    # The display environment and private environment are retained by the UI.
+    (exec </dev/null; cmd_app "$user_home/.local/bin/cagents" ui "${args[@]}") >"$logs/ui-$slot.log" 2>&1 &
+    printf '%s\n' "$!" >"$root/ui-$slot.pid"
+}
+
+cmd_ceditor() {
+    require_init
+    [ "${1:-}" = start ] || die 'ceditor start BIN_DIR' 2
+    local editor_bin
+    editor_bin=$(realpath -- "${2:?ceditor start needs a binary directory}")
+    local exe
+    for exe in ceditor cagents cagentsd; do
+        [ -x "$editor_bin/$exe" ] || die "missing executable $editor_bin/$exe" 2
+    done
+    # Its companions are selected beside the editor executable. Its private
+    # service shares only this rehearsal's runtime namespace, never real HOME.
+    (exec </dev/null; cmd_app "$editor_bin/ceditor" "$user_home/src/alpha") >"$logs/ceditor.log" 2>&1 &
+    printf '%s\n' "$!" >"$root/ceditor.pid"
+    /usr/bin/python3 "$tool_root/scripts/rehearse_update_run.py" "$root" "$self" wait ceditor
+}
+
+private_process() {
+    grep -qFxz -e "XDG_RUNTIME_DIR=$runtime" -e "HOME=$user_home" \
+        -e "XDG_RUNTIME_DIR=$desktop/rt" -e "HOME=$desktop/home" "/proc/$1/environ" 2>/dev/null
+}
+
+record_private_scopes() {
+    local pid hierarchy controllers group component
+    local -a components
+    for pid in $(user_processes); do
+        private_process "$pid" || continue
+        while IFS=: read -r hierarchy controllers group; do
+            IFS=/ read -ra components <<<"$group"
+            for component in "${components[@]}"; do
+                case $component in *.scope) scopes["$component"]=1 ;; esac
+            done
+        done <"/proc/$pid/cgroup" 2>/dev/null || :
+    done
+}
+
+cmd_stop() {
+    require_init
+    # Let clients disconnect before their display disappears.
+    local pid executable cleanup_status=0
+    local -A scopes=()
+    record_private_scopes
+    for pid in $(user_processes); do
+        executable=$(readlink "/proc/$pid/exe" 2>/dev/null) || continue
+        case $executable in
+            */ceditor | */cagents-ui) kill -TERM "$pid" 2>/dev/null || : ;;
+        esac
+    done
+    sleep 0.3
+    desktop_stop || :
+    # Undo the explicitly seeded preservation fault, including interruption
+    # between its rename and marker write. Never overwrite unexpected content.
+    if [ -d "$runtime/cagents/holders.rehearsal-saved" ]; then
+        if [ ! -e "$runtime/cagents/holders" ] && [ ! -L "$runtime/cagents/holders" ]; then
+            mv -- "$runtime/cagents/holders.rehearsal-saved" "$runtime/cagents/holders"
+        elif [ -f "$runtime/cagents/holders" ] && [ ! -L "$runtime/cagents/holders" ] &&
+            [ "$(cat "$runtime/cagents/holders")" = 'rehearse-update: preservation unavailable' ]; then
+            rm -- "$runtime/cagents/holders"
+            mv -- "$runtime/cagents/holders.rehearsal-saved" "$runtime/cagents/holders"
+        else
+            printf 'rehearse-update: cannot restore holders over unexpected content\n' >&2
+            cleanup_status=1
+        fi
+    fi
+    local cli=$user_home/.local/bin/cagents capability
+    if [ -x "$cli" ] && capability=$(user_env timeout -k 5 20 "$cli" --no-start daemon preflight 2>/dev/null); then
+        user_env timeout -k 5 20 "$cli" --no-start daemon stop --confirm "$capability" >/dev/null 2>&1 || :
+    fi
+    local remaining attempt
+    for attempt in $(seq 1 20); do
+        record_private_scopes
+        remaining=$(user_processes)
+        [ -n "$remaining" ] || break
+        # shellcheck disable=SC2086
+        kill -CONT $remaining 2>/dev/null || :
+        # shellcheck disable=SC2086
+        kill -TERM $remaining 2>/dev/null || :
+        sleep 0.5
+    done
+    remaining=$(user_processes)
+    for pid in $remaining; do
+        # A PID can exit and be reused between enumeration and escalation.
+        private_process "$pid" || continue
+        kill -KILL "$pid" 2>/dev/null || :
+    done
+    local running unit surviving
+    for attempt in $(seq 1 20); do
+        if ! running=$(env -i HOME="$real_home" XDG_RUNTIME_DIR="/run/user/$(id -u)" \
+            PATH=/usr/local/bin:/usr/bin:/bin systemctl --user --plain --no-legend --no-pager \
+            list-units --type=scope --state=running); then
+            printf 'rehearse-update: cannot verify private scopes with the systemd user manager\n' >&2
+            cleanup_status=1
+            break
+        fi
+        surviving=
+        while read -r unit _; do
+            if [ -n "$unit" ] && [ "${scopes[$unit]+attributed}" ]; then
+                surviving+="$unit"$'\n'
+            fi
+        done <<<"$running"
+        [ -n "$surviving" ] || break
+        sleep 0.25
+    done
+    if [ -n "${surviving:-}" ]; then
+        printf 'rehearse-update: attributed scopes still running:\n%s' "$surviving" >&2
+        cleanup_status=1
+    fi
+    if [ -n "$(user_processes)" ]; then
+        printf 'rehearse-update: private processes survived stop\n' >&2
+        cleanup_status=1
+    fi
+    [ "$cleanup_status" -ne 0 ] || printf 'stopped everything %s ran; no attributed scopes remain\n' "$root"
+    return "$cleanup_status"
+}
+
+cmd_status() {
+    if desktop_live; then printf 'desktop: running (pid %s)\n' "$(cat "$desktop/pid")"; else printf 'desktop: stopped\n'; fi
+    printf 'installed: %s\n' "$(readlink -- "$user_home/.local/share/cagents-install/current" 2>/dev/null || echo none)"
+    printf 'processes: %s\n' "$(user_processes | wc -l)"
+}
+
+command=${1:-}
+[ "$#" -eq 0 ] || shift
+case $command in
+    init) cmd_init ;;
+    install) cmd_install "$@" ;;
+    update) cmd_update "$@" ;;
+    seed) cmd_seed "$@" ;;
+    run | scenario) /usr/bin/python3 "$tool_root/scripts/rehearse_update_run.py" "$root" "$self" run "$@" ;;
+    compare) cmd_compare "$@" ;;
+    launch) cmd_launch "$@" ;;
+    ceditor) cmd_ceditor "$@" ;;
+    wm) cmd_app "$(command -v niri)" msg "$@" ;;
+    cleanup) require_init; cmd_stop; rm -rf -- "$root" ;;
+    desktop) cmd_desktop "$@" ;;
+    env) require_init; user_env "$@" ;;
+    app) cmd_app "$@" ;;
+    drive) cmd_drive "$@" ;;
+    shot) cmd_shot "$@" ;;
+    record) cmd_record "$@" ;;
+    stop) cmd_stop ;;
+    status) cmd_status ;;
+    __desktop) run_desktop "$@" ;;
+    __inner) run_inner ;;
+    -h | --help | '') usage ;;
+    *) usage >&2; exit 2 ;;
+esac
+exit
+}

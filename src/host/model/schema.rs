@@ -193,6 +193,83 @@ fn open_existing(path: &Path) -> Result<Connection, String> {
     Ok(db)
 }
 
+/// The oldest schema this version can convert a store back to.
+pub(super) const OLDEST_DOWNGRADE: u32 = 22;
+
+/// The schema of the store at `path`, or `None` when there is no store, which
+/// includes a file whose creation never reached schema 1. Reads only; a store
+/// from a newer release is reported, not refused. The caller must hold the
+/// daemon lease, so that no daemon converts it meanwhile.
+pub(super) fn stored_version(path: &Path) -> Result<Option<u32>, String> {
+    if !path.try_exists().map_err(|e| e.to_string())? {
+        return Ok(None);
+    }
+    let db = connect(path, false)?;
+    let version: u32 = db
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    Ok((version != 0).then_some(version))
+}
+
+/// Converts the store at `path` back to schema `target`, for a daemon that
+/// predates the current schema. One transaction: a failure leaves the store as
+/// it was. Returns the schema it converted from, or `None` when the store is
+/// absent or already at or below `target`. The caller must hold the daemon
+/// lease, so that no daemon has the store open.
+pub(super) fn downgrade(path: &Path, target: u32) -> Result<Option<u32>, String> {
+    if !path.try_exists().map_err(|e| e.to_string())? {
+        return Ok(None);
+    }
+    let mut db = connect(path, false)?;
+    db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")
+        .map_err(|e| e.to_string())?;
+    let tx = db
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
+    let version = inspect(&tx)?.version;
+    if version <= target {
+        return Ok(None);
+    }
+    if target < OLDEST_DOWNGRADE {
+        return Err(format!(
+            "workspace registry schema {version} can be converted back only as far as schema \
+             {OLDEST_DOWNGRADE}, not {target}"
+        ));
+    }
+    require_open_layout(&tx, version)?;
+    for step in (target + 1..=version).rev() {
+        match step {
+            24 => {
+                let retained: bool = tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM console_relaunches)",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| error.to_string())?;
+                if retained {
+                    return Err(
+                        "Console recovery records remain; keep the new installation until its consoles are resolved".into(),
+                    );
+                }
+                tx.execute_batch("DROP TABLE console_relaunches;")
+                    .map_err(|error| error.to_string())?;
+            }
+            23 => super::views::store::downgrade(&tx)?,
+            _ => {
+                return Err(format!(
+                    "no conversion back from workspace registry schema {step}"
+                ));
+            }
+        }
+        tx.pragma_update(None, "user_version", step - 1)
+            .map_err(|e| e.to_string())?;
+    }
+    require_open_layout(&tx, target)?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(Some(version))
+}
+
 fn reject_unjournaled_layout(path: &Path) -> Result<(), String> {
     // Even a read-only WAL connection can create empty journal sidecars before
     // rejecting an unsupported layout. When no journal exists, inspect only
@@ -291,6 +368,7 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
     static TWENTY_ONE: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static TWENTY_TWO: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static TWENTY_THREE: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
+    static TWENTY_FOUR: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     let published = match version {
         12 => &TWELVE,
         13 => &THIRTEEN,
@@ -304,6 +382,7 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
         21 => &TWENTY_ONE,
         22 => &TWENTY_TWO,
         23 => &TWENTY_THREE,
+        24 => &TWENTY_FOUR,
         _ => return Err(format!("unsupported published registry layout {version}")),
     };
     published
@@ -505,6 +584,7 @@ mod tests {
         model::{ChannelId, ChannelTitleSource, ProjectKind},
         workspace_model::ModelEdit,
     };
+    use rusqlite::OptionalExtension;
     use std::{cell::Cell, rc::Rc, time::Duration};
 
     fn fixture_dir() -> tempfile::TempDir {
@@ -795,7 +875,7 @@ mod tests {
             (16, "DROP TABLE automation_lifecycle;"),
             (16, "DROP INDEX automation_lifecycle_scoped;"),
             (22, "DROP TABLE automation_precheck_history_cleanup;"),
-            (23, "DROP TABLE console_relaunches;"),
+            (24, "DROP TABLE console_relaunches;"),
             (22, "DROP TABLE automation_retired_manual_requests;"),
             (22, "DROP INDEX automation_removed_history;"),
             (22, "DROP INDEX automation_firing_successors;"),
@@ -979,6 +1059,144 @@ mod tests {
     }
 
     #[test]
+    fn console_schema24_preserves_published23_and_round_trips_through22() {
+        let directory = fixture_dir();
+        let path = directory.path().join("console-schema24.sqlite3");
+        let (identity, channel) = legacy(&path, 23);
+        let retired = crate::model::CardId::new();
+        let operation = uuid::Uuid::new_v4();
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        require_open_layout(&db, 23).unwrap();
+        assert!(
+            !inspect(&db)
+                .unwrap()
+                .objects
+                .iter()
+                .any(|o| o.1 == "console_relaunches")
+        );
+        assert!(inspect(&db).unwrap().objects.iter().any(|o| o.1 == "panes"));
+        db.execute(
+            "INSERT INTO view_scopes(channel,revision) VALUES(?1,19)",
+            [channel.to_string()],
+        )
+        .unwrap();
+        let scope = db.last_insert_rowid();
+        db.execute("UPDATE view_revision_clock SET last=19 WHERE id=1", [])
+            .unwrap();
+        db.execute(
+            "INSERT INTO retired_panes(scope,pane,ordinal,retired_at_unix_ms) VALUES(?1,?2,0,123)",
+            rusqlite::params![scope, retired.to_string()],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO view_operations(operation,scope,applied_at_unix_ms) VALUES(?1,?2,124)",
+            rusqlite::params![operation.to_string(), scope],
+        )
+        .unwrap();
+        let expected = super::super::views::read(&db, &channel.into()).unwrap();
+        drop(db);
+
+        let registry = Registry::at(&path).unwrap();
+        require_current(&registry.db).unwrap();
+        assert_eq!(inspect(&registry.db).unwrap().version, 24);
+        assert_eq!(registry.model().unwrap().identity.to_string(), identity);
+        assert_eq!(
+            super::super::views::read(&registry.db, &channel.into()).unwrap(),
+            expected
+        );
+        assert_eq!(
+            registry
+                .db
+                .query_row("SELECT count(*) FROM console_relaunches", [], |row| row
+                    .get::<_, u64>(0))
+                .unwrap(),
+            0
+        );
+        drop(registry);
+
+        assert_eq!(downgrade(&path, 23).unwrap(), Some(24));
+        let db = Connection::open(&path).unwrap();
+        require_open_layout(&db, 23).unwrap();
+        assert_eq!(inspect(&db).unwrap().version, 23);
+        assert_eq!(
+            super::super::views::read(&db, &channel.into()).unwrap(),
+            expected
+        );
+        assert!(
+            !inspect(&db)
+                .unwrap()
+                .objects
+                .iter()
+                .any(|o| o.1 == "console_relaunches")
+        );
+        drop(db);
+
+        assert_eq!(downgrade(&path, 22).unwrap(), Some(23));
+        let db = Connection::open(&path).unwrap();
+        require_open_layout(&db, 22).unwrap();
+        assert_eq!(
+            db.query_row(
+                "SELECT operation FROM shared_view_edits WHERE operation=?1",
+                [operation.to_string()],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            operation.to_string()
+        );
+        drop(db);
+        let registry = Registry::at(&path).unwrap();
+        require_current(&registry.db).unwrap();
+        assert_eq!(registry.model().unwrap().identity.to_string(), identity);
+        assert_eq!(
+            super::super::views::read(&registry.db, &channel.into()).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn console_recovery_records_refuse_downgrade_without_changing_evidence() {
+        for target in [22, 23] {
+            let directory = fixture_dir();
+            let path = directory.path().join("retained-console.sqlite3");
+            legacy(&path, 24);
+            let db = Connection::open(&path).unwrap();
+            // Even opaque recovery evidence must be retained, not decoded or
+            // discarded by a schema conversion. Keep its actual FK parents.
+            db.execute_batch("PRAGMA foreign_keys=ON;
+                INSERT INTO native_actor_ownerships(actor,ownership) VALUES('actor','original ownership');
+                INSERT INTO agents(id,origin,record,closed) VALUES('agent','local','{}',0);
+                INSERT INTO console_relaunches(actor,agent,record) VALUES('actor','agent','original console recovery');").unwrap();
+            let before = inspect(&db).unwrap();
+            drop(db);
+            let original = bytes(&path);
+            assert!(
+                downgrade(&path, target)
+                    .unwrap_err()
+                    .contains("Console recovery records remain")
+            );
+            assert_eq!(bytes(&path), original);
+            let db = Connection::open(&path).unwrap();
+            assert_eq!(inspect(&db).unwrap(), before);
+            assert_eq!(
+                db.query_row(
+                    "SELECT record FROM console_relaunches WHERE actor='actor'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+                "original console recovery"
+            );
+            assert_eq!(
+                db.query_row("PRAGMA foreign_key_check", [], |_| Ok(()))
+                    .optional()
+                    .unwrap(),
+                None
+            );
+        }
+    }
+
+    #[test]
     fn published_eighteen_adds_only_empty_attention_outbox_and_preserves_audit() {
         use crate::{
             agent::Provider,
@@ -1037,7 +1255,27 @@ mod tests {
         )
         .unwrap();
         tx.commit().unwrap();
-        let old_layout = inspect(&db).unwrap().objects;
+        // Schema 23 replaces the view tables and repoints the terminal sources
+        // at `panes`; `require_current` already holds those objects to the
+        // published 23 layout. Schema 24 adds the empty console recovery ledger;
+        // this comparison covers every other predecessor object.
+        let replaced_views = [
+            "shared_view_scopes",
+            "shared_views",
+            "shared_view_panes",
+            "shared_view_edits",
+            "shared_view_terminal_sources",
+        ];
+        let normalized_views = [
+            "view_scopes",
+            "view_revision_clock",
+            "panes",
+            "retired_panes",
+            "view_operations",
+            "shared_view_terminal_sources",
+        ];
+        let mut old_layout = inspect(&db).unwrap().objects;
+        old_layout.retain(|object| !replaced_views.contains(&object.2.as_str()));
         let audit_rows = |db: &Connection| {
             db.prepare("SELECT sequence,automation,repository,record FROM automation_lifecycle ORDER BY sequence")
                 .unwrap()
@@ -1059,6 +1297,7 @@ mod tests {
             require_current(&registry.db).unwrap();
             assert_eq!(inspect(&registry.db).unwrap().version, SCHEMA_VERSION);
             let mut inventory = inspect(&registry.db).unwrap().objects;
+            inventory.retain(|object| !normalized_views.contains(&object.2.as_str()));
             let outbox = inventory
                 .iter()
                 .position(|object| object.1 == "automation_notifications")
@@ -1072,7 +1311,8 @@ mod tests {
                     tokens(super::super::automation_notifications::SCHEMA_SQL).unwrap(),
                 )
             );
-            // This current opener also applies retention20, run-attention21 and history22.
+            // This current opener also applies retention20, run-attention21,
+            // history22 and the empty console recovery ledger24.
             // Admit only those known objects here; every predecessor object
             // and the exact lifecycle outbox assertion stay intact.
             let retention_names = [
@@ -1084,6 +1324,7 @@ mod tests {
                 "automation_retired_manual_requests",
                 "automation_removed_history",
                 "automation_firing_successors",
+                "console_relaunches",
             ];
             for name in retention_names {
                 let index = inventory
@@ -1098,6 +1339,7 @@ mod tests {
                 "automation_run_attention",
                 "automation_precheck_history_cleanup",
                 "automation_retired_manual_requests",
+                "console_relaunches",
             ] {
                 assert_eq!(
                     registry
@@ -1124,7 +1366,7 @@ mod tests {
             firing.3.drain(start..start + column.len());
             assert_eq!(
                 inventory, old_layout,
-                "only lifecycle/run outboxes, retention objects and the exact history column may be added"
+                "only lifecycle/run outboxes, retention objects, the console ledger and the exact history column may be added"
             );
             assert!(
                 registry
@@ -1306,39 +1548,38 @@ mod tests {
             "converted legacy rows must roll back with the failed migration"
         );
         let registry = Registry::at(&path).unwrap();
-        let scope = serde_json::json!({"Channel":channel}).to_string();
-        let view: (i64, String, String) = registry
-            .db
-            .query_row(
-                "SELECT revision,panes,retired FROM shared_views WHERE scope=?1",
-                [&scope],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .unwrap();
+        let view = super::super::views::read(
+            &registry.db,
+            &crate::workspace_model::views::Scope::Channel(channel),
+        )
+        .unwrap();
+        assert_eq!(view.revision, 9);
+        assert!(view.panes.is_empty());
         assert_eq!(
-            view,
-            (
-                9,
-                "[]".into(),
-                "[\"00000000-0000-4000-8000-000000000071\"]".into()
-            )
+            view.retired,
+            vec!["00000000-0000-4000-8000-000000000071".parse().unwrap()]
         );
-        for (table, column, value) in [
-            ("shared_view_panes", "id", "pane"),
-            ("shared_view_edits", "operation", "edit"),
-        ] {
-            assert_eq!(
-                registry
-                    .db
-                    .query_row(
-                        &format!("SELECT scope FROM {table} WHERE {column}=?1"),
-                        [value],
-                        |r| r.get::<_, String>(0)
-                    )
-                    .unwrap(),
-                scope
-            );
-        }
+        assert_eq!(
+            registry
+                .db
+                .query_row(
+                    "SELECT s.channel FROM view_operations o JOIN view_scopes s ON s.id = o.scope
+                     WHERE o.operation = 'edit'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            channel.to_string()
+        );
+        // The legacy index named a pane no view held; nothing open is lost
+        // when the converted store forgets it.
+        assert_eq!(
+            registry
+                .db
+                .query_row("SELECT count(*) FROM panes", [], |r| r.get::<_, u32>(0))
+                .unwrap(),
+            0
+        );
         assert!(
             !inspect(&registry.db)
                 .unwrap()
@@ -1452,7 +1693,7 @@ mod tests {
     fn each_actual_migration_failure_rolls_back_all_prior_steps_and_header() {
         let _clear = Clear;
         for step in [
-            1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+            1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
         ] {
             let dir = fixture_dir();
             let path = dir.path().join("rollback.sqlite3");

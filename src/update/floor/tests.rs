@@ -764,6 +764,7 @@ listener.bind(sys.argv[2]);listener.listen()
     let mut file = private_create(&store.path).unwrap();
     file.write_all(&checkpoint).unwrap();
     file.sync_all().unwrap();
+    let original_proof = daemon.capability.proof.clone();
     let mut survivors = Survivors {
         source_prepared: true,
         prepared_source: Some(PreparationEvidence::Full {
@@ -791,19 +792,39 @@ listener.bind(sys.argv[2]);listener.listen()
     .unwrap();
     fs::set_permissions(&cli, fs::Permissions::from_mode(0o700)).unwrap();
     let original = "the original accepted preparation could not produce a recovery receipt";
+    let census: recovery::Census = serde_json::from_value(serde_json::json!({
+        "version": 1, "transaction": job.id, "source": original_proof,
+        "terminals": [], "chats": [], "checkpoint_before": null,
+    }))
+    .unwrap();
+    census
+        .save(&recovery::census_path(&state, &job.id))
+        .unwrap();
+    let recovery = recovery::Context {
+        shutdown_requested: true,
+        census: Some(census),
+    };
     let error = finish_handoff(
         &installation,
         &state,
         &mut job,
         &Err(invalid(original)),
         &mut handoff,
+        &recovery,
         &mut survivors,
         &guard,
     )
-    .unwrap_err()
-    .to_string();
-    assert!(error.starts_with(original), "{error}");
-    assert!(error.contains("still Prepared"), "{error}");
+    .unwrap_err();
+    assert!(
+        matches!(error, UpdateError::TargetRecoveryRequired(_)),
+        "{error}"
+    );
+    let error = error.to_string();
+    assert!(error.contains("Prepared checkpoint"), "{error}");
+    assert!(
+        error.contains("--no-start daemon recover-update --checkpoint"),
+        "{error}"
+    );
     assert!(!error.contains("PID does not own"), "{error}");
     let saved: UpdateJob =
         serde_json::from_slice(&fs::read(state.join("status.json")).unwrap()).unwrap();
@@ -815,6 +836,12 @@ listener.bind(sys.argv[2]);listener.listen()
     );
     assert_eq!(fs::read(&store.path).unwrap(), checkpoint);
     assert!(handoff.is_none());
+    let next = crate::daemon::lease_handoff::LeaseHandoff::try_acquire(&paths).unwrap();
+    assert!(
+        next.is_some(),
+        "the explicit target recovery must be able to acquire daemon custody"
+    );
+    drop(next);
     source.finish(false).unwrap();
 }
 

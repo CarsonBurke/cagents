@@ -45,6 +45,30 @@ class Provider(unittest.TestCase):
         return [block.get("text") for frame in output if frame.get("type") == "assistant"
                 for block in frame["message"]["content"] if block.get("type") == "text"]
 
+    def test_resume_can_branch_from_an_earlier_record_without_removing_turns(self):
+        session = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        interrupt = {"type": "control_request", "request_id": "stop",
+                     "request": {"subtype": "interrupt"}}
+        result, _, _ = self.run_provider("--session-id", session,
+                                        frames=(prompt(1), interrupt, prompt(2)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        history = next((self.config / "projects").glob(f"*/{session}.jsonl"))
+        before = history.read_text().splitlines()
+        (self.config / "fixture-resume-parent").write_text("prompt-1\n")
+        result, _, _ = self.run_provider("--resume", session, frames=(prompt(3),))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        after = history.read_text().splitlines()
+        self.assertEqual(after[:len(before)], before)
+        self.assertEqual(json.loads(after[len(before)])["parentUuid"], "prompt-1")
+        uuids = [json.loads(line)["uuid"] for line in after if "uuid" in json.loads(line)]
+        self.assertEqual(len(uuids), len(set(uuids)))
+
+    def test_resume_parent_refuses_a_missing_record(self):
+        (self.config / "fixture-resume-parent").write_text("missing-record\n")
+        result, _, _ = self.run_provider("--resume", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("Invalid fixture-resume-parent", result.stderr)
+
     def test_a_resumed_transcript_with_damaged_lines_is_read_past_them(self):
         session = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         mangled = "".join(c if c.isalnum() else "-" for c in str(self.project.resolve()))

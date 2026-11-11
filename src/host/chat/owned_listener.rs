@@ -248,7 +248,17 @@ fn touch(path: &Path) -> io::Result<()> {
 /// endpoint that cannot be proven stopped is reported as served and is never
 /// probed, leaving the join to accept or refuse it by its exact identity.
 pub(super) fn served(endpoint: &Path) -> io::Result<bool> {
+    served_before_retire(endpoint, || Ok(()))
+}
+
+/// Check any additional execution evidence before retiring a stopped endpoint.
+/// In particular, a published symlink must remain available to that proof.
+pub(super) fn served_before_retire(
+    endpoint: &Path,
+    before_retire: impl FnOnce() -> io::Result<()>,
+) -> io::Result<bool> {
     let Ok(entry) = std::fs::symlink_metadata(endpoint) else {
+        before_retire()?;
         return Ok(false);
     };
     let account = unsafe { libc::geteuid() };
@@ -273,6 +283,7 @@ pub(super) fn served(endpoint: &Path) -> io::Result<bool> {
     if !stopped {
         return Ok(true);
     }
+    before_retire()?;
     // Another start of this conversation may have retired the entry and
     // launched a server that published its own since the probe.
     let unchanged = std::fs::symlink_metadata(endpoint)

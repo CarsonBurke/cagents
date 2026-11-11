@@ -32,7 +32,9 @@ mod chat;
 mod project_channel_authority_tests;
 pub use chat::ChatCommand;
 mod format;
+mod gh;
 pub use agents::AgentCommand;
+pub use gh::GhCommand;
 mod automations;
 mod completions;
 pub use automations::AutomationCommand;
@@ -94,6 +96,9 @@ const CHAT_CLOSE_TIMEOUT: Duration = crate::chat::INTERRUPT_TIMEOUT
     .saturating_add(crate::chat::TERMINATE_GRACE)
     .saturating_add(Duration::from_secs(8));
 // Retained-owner cleanup can retire both the native holder and its paired PTY.
+/// Ending a lost conversation's processes gives each a grace period to stop,
+/// then waits for them to be collected, for at most ten seconds in all.
+const LOST_PROCESSES_TIMEOUT: Duration = Duration::from_secs(20);
 const RETAINED_CHAT_CLOSE_TIMEOUT: Duration = Duration::from_secs(75);
 const SNAPSHOT_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -140,6 +145,11 @@ pub enum TopCommand {
     Diagnostics,
     /// Read and update Linear tickets, or link a ticket to this Git worktree.
     Linear(LinearCommand),
+    /// Read GitHub status through a shared local cache.
+    Gh {
+        #[command(subcommand)]
+        command: GhCommand,
+    },
     /// Show this session, its parent and agents, and peers in its channel or checkout.
     Whoami,
     /// Inspect account plan allowances and the calling session’s context.
@@ -279,6 +289,59 @@ pub enum DaemonCommand {
     Start,
     /// Report whether the daemon is running.
     Status,
+    /// Validate inherited updater authority without probing daemon liveness.
+    #[command(hide = true)]
+    VerifyUpdateLease,
+    #[command(hide = true)]
+    CaptureUpdateCensus {
+        #[arg(long)]
+        output: PathBuf,
+    },
+    #[command(hide = true)]
+    VerifyUpdateCensus {
+        #[arg(long, conflicts_with = "validate_only")]
+        retire: bool,
+        #[arg(long)]
+        require_absent: bool,
+        #[arg(long)]
+        validate_only: bool,
+        #[arg(long)]
+        require_original: bool,
+        #[arg(long)]
+        allow_absent: bool,
+        #[arg(long)]
+        census: PathBuf,
+        #[arg(long)]
+        outcome: PathBuf,
+    },
+    #[command(hide = true)]
+    InspectUpdateRecovery {
+        #[arg(long)]
+        census: PathBuf,
+        #[arg(long)]
+        outcome: PathBuf,
+        #[arg(long)]
+        candidate_cli: Option<PathBuf>,
+    },
+    #[command(hide = true)]
+    InspectPendingUpdateRecovery {
+        #[arg(long)]
+        candidate_cli: PathBuf,
+        #[arg(long)]
+        census: Option<PathBuf>,
+    },
+    /// Recover retained owners from this candidate's exact Prepared checkpoint.
+    RecoverUpdate {
+        /// SHA256 of the checkpoint named by the failed update.
+        #[arg(long)]
+        checkpoint: String,
+        /// Authorize recovery of this checkpoint without starting providers.
+        #[arg(long)]
+        yes: bool,
+        /// The original private census retained by a standalone installer.
+        #[arg(long)]
+        census: Option<PathBuf>,
+    },
     /// Update to a release or finish a staged installation through the app's reviewed flow.
     Upgrade {
         /// Download and update to this release instead of a staged installation.
@@ -329,6 +392,16 @@ pub enum DaemonCommand {
     },
     /// Print this executable's wire protocol version without contacting a daemon.
     ProtocolVersion,
+    /// Print the schema of the shared-model store on disk, or nothing if there
+    /// is none. Refuses while a daemon runs.
+    StoreSchema,
+    /// Convert the shared-model store back to an older schema, so that an
+    /// older release's daemon can open it. Refuses while a daemon runs.
+    DowngradeStore {
+        /// The schema to convert to, such as one `daemon store-schema` printed
+        /// before an update.
+        schema: u32,
+    },
     /// Stop any development daemon without relying on its wire protocol.
     #[command(hide = true)]
     StopForRebuild {
@@ -1306,6 +1379,26 @@ impl ControlClient {
             ServerResponse::Accepted => Ok(()),
             response => Err(unexpected_response(
                 "retained native owner teardown",
+                &response,
+            )),
+        }
+    }
+
+    /// What still runs for a conversation whose Cagents helper died, after
+    /// ending those of `end` proved to be the conversation's; see
+    /// [`ClientRequest::ChatLostProcesses`].
+    pub fn lost_chat_processes(
+        &mut self,
+        session: crate::chat::Session,
+        end: Vec<crate::terminal::ipc::ProcessStart>,
+    ) -> Result<Vec<crate::terminal::ipc::LostProcess>, ControlError> {
+        match self.request_with_deadline(
+            ClientRequest::ChatLostProcesses { session, end },
+            Instant::now() + LOST_PROCESSES_TIMEOUT,
+        )? {
+            ServerResponse::ChatLostProcesses { processes } => Ok(processes),
+            response => Err(unexpected_response(
+                "a lost conversation's processes",
                 &response,
             )),
         }
@@ -2364,6 +2457,7 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::ChatListed { .. } => "chat_listed",
         ServerResponse::ChatCapacity { .. } => "chat_capacity",
         ServerResponse::ChatReleaseInspected { .. } => "chat_release_inspected",
+        ServerResponse::ChatLostProcesses { .. } => "chat_lost_processes",
         ServerResponse::ChatReleased { .. } => "chat_released",
         ServerResponse::ChatClosed { .. } => "chat_closed",
         ServerResponse::ChatTerminal { .. } => "chat_terminal",
@@ -2645,10 +2739,16 @@ where
                 | DaemonCommand::Start
                 | DaemonCommand::Stop { .. }
                 | DaemonCommand::Preflight
+                | DaemonCommand::CaptureUpdateCensus { .. }
+                | DaemonCommand::VerifyUpdateCensus { .. }
+                | DaemonCommand::InspectUpdateRecovery { .. }
+                | DaemonCommand::InspectPendingUpdateRecovery { .. }
+                | DaemonCommand::RecoverUpdate { .. }
                 | DaemonCommand::PrepareUpgrade { .. }
                 | DaemonCommand::Upgrade { .. }
                 | DaemonCommand::AbandonUpgrade { .. }
-                | DaemonCommand::StopForRebuild { .. },
+                | DaemonCommand::StopForRebuild { .. }
+                | DaemonCommand::DowngradeStore { .. },
         } => Some(crate::daemon::hosting::LIFECYCLE_REFUSAL.into()),
         TopCommand::CoordinateInstall { .. } | TopCommand::RestartWindows { .. } => {
             Some("Installation and window restart commands require your own terminal".into())
@@ -2683,8 +2783,15 @@ where
             TopCommand::Daemon {
                 command: DaemonCommand::Bridge
                     | DaemonCommand::Upgrade { .. }
+                    | DaemonCommand::RecoverUpdate { .. }
+                    | DaemonCommand::InspectPendingUpdateRecovery { .. }
+                    | DaemonCommand::InspectUpdateRecovery { .. }
+                    | DaemonCommand::CaptureUpdateCensus { .. }
+                    | DaemonCommand::VerifyUpdateCensus { .. }
                     | DaemonCommand::AbandonUpgrade { .. }
-                    | DaemonCommand::StopForRebuild { .. },
+                    | DaemonCommand::StopForRebuild { .. }
+                    | DaemonCommand::StoreSchema
+                    | DaemonCommand::DowngradeStore { .. },
             } | TopCommand::CoordinateInstall { .. }
                 | TopCommand::RestartWindows { .. }
         )
@@ -2759,6 +2866,32 @@ where
             Ok(output) => {
                 emit_success(cli.json, output);
                 ExitCode::SUCCESS
+            }
+            Err(error) => {
+                emit_error(cli.json, &error);
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    // This cache belongs to gh's local credential context, not the daemon.
+    // Reading it must not prepare a remote backend or recover a staged owner.
+    if let TopCommand::Gh { command } = cli.command {
+        if cli.device.as_deref().is_some_and(|name| name != "local") || crate::device::is_remote() {
+            emit_error(
+                cli.json,
+                &AppError::new(
+                    "github_status_local_only",
+                    "Run GitHub status on the device containing the gh credentials; --device is not supported",
+                ),
+            );
+            return ExitCode::FAILURE;
+        }
+        return match gh::execute(command) {
+            Ok(output) => {
+                let code = output.exit_code();
+                emit_success(cli.json, output);
+                code
             }
             Err(error) => {
                 emit_error(cli.json, &error);
@@ -2923,12 +3056,14 @@ fn routes_to_staged_owner(command: &TopCommand) -> bool {
         command,
         TopCommand::Completions { .. }
             | TopCommand::Diagnostics
+            | TopCommand::Gh { .. }
             // A paired console already has its exact daemon endpoint and
             // opaque execution authority. It starts during daemon restore,
             // while the updater still holds the installation launch fence.
             | TopCommand::Agent {
                 command: AgentCommand::Console { .. }
             }
+
             | TopCommand::CoordinateInstall { .. }
             | TopCommand::VerifyInstallGuard { .. }
             | TopCommand::RecordDeferredInstall { .. }
@@ -2936,8 +3071,16 @@ fn routes_to_staged_owner(command: &TopCommand) -> bool {
             | TopCommand::RestartWindows { .. }
             | TopCommand::Daemon {
                 command: DaemonCommand::ProtocolVersion
+                    | DaemonCommand::VerifyUpdateLease
+                    | DaemonCommand::CaptureUpdateCensus { .. }
+                    | DaemonCommand::VerifyUpdateCensus { .. }
+                    | DaemonCommand::InspectUpdateRecovery { .. }
+                    | DaemonCommand::InspectPendingUpdateRecovery { .. }
+                    | DaemonCommand::RecoverUpdate { .. }
                     | DaemonCommand::StopForRebuild { .. }
                     | DaemonCommand::Upgrade { .. }
+                    | DaemonCommand::StoreSchema
+                    | DaemonCommand::DowngradeStore { .. }
             }
     )
 }
@@ -2980,6 +3123,7 @@ fn execute_with_model_context(
             })
         }
         TopCommand::Linear(command) => linear::execute(command),
+        TopCommand::Gh { command } => gh::execute(command),
         TopCommand::Automation { command } => match service_context {
             Some(context) => automations::execute_with_context(command, &context),
             None => automations::execute(command),
@@ -3445,7 +3589,12 @@ fn printable(text: &str) -> String {
 }
 
 fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
-    if crate::device::is_remote() && matches!(command, DaemonCommand::Upgrade { .. }) {
+    if crate::device::is_remote()
+        && matches!(
+            command,
+            DaemonCommand::Upgrade { .. } | DaemonCommand::RecoverUpdate { .. }
+        )
+    {
         return Err(AppError::new(
             "device",
             "run installation upgrades in a terminal on the selected device",
@@ -3493,9 +3642,132 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                 human: format!("{} daemon running ({})", instance::NAME, socket.display()),
             })
         }
+        DaemonCommand::CaptureUpdateCensus { output } => {
+            crate::update::recovery::capture_file(&output)
+                .map_err(|e| AppError::new("update_census", e))?;
+            Ok(CommandOutput {
+                command: "daemon.capture_update_census",
+                data: json!({"captured":true}),
+                human: "Pre-update service census saved".into(),
+            })
+        }
+        DaemonCommand::VerifyUpdateCensus {
+            retire,
+            census,
+            outcome,
+            allow_absent,
+            require_original,
+            validate_only,
+            require_absent,
+        } => {
+            if validate_only {
+                crate::update::recovery::validate_file(&census)
+                    .map_err(|e| AppError::new("update_census", e))?;
+                return Ok(CommandOutput {
+                    command: "daemon.verify_update_census",
+                    data: json!({"validated":true,"usable":false}),
+                    human: "Private census validated; daemon readiness has not been verified"
+                        .into(),
+                });
+            }
+            let receipt = if retire {
+                crate::update::recovery::verify_file_retiring(
+                    &census,
+                    &outcome,
+                    allow_absent,
+                    require_original,
+                    require_absent,
+                )
+            } else {
+                crate::update::recovery::verify_file(
+                    &census,
+                    &outcome,
+                    false,
+                    allow_absent,
+                    require_original,
+                    require_absent,
+                )
+            }
+            .map_err(|e| AppError::new("update_recovery", e))?;
+            Ok(CommandOutput {
+                command: "daemon.verify_update_census",
+                data: serde_json::to_value(&receipt)
+                    .map_err(|e| AppError::new("update_recovery", e))?,
+                human: match &receipt.outcome {
+                    crate::update::recovery::Outcome::NoSource => {
+                        "No source daemon was running; staging preserved that state".into()
+                    }
+                    crate::update::recovery::Outcome::Usable {
+                        terminals,
+                        chats,
+                        paused_terminals,
+                        paused_chats,
+                        ..
+                    } if !paused_terminals.is_empty() || !paused_chats.is_empty() => format!(
+                        "Daemon ready; {terminals} terminals and {chats} native chats serving; {} terminals and {} native chats retained as paused panes",
+                        paused_terminals.len(),
+                        paused_chats.len()
+                    ),
+                    _ => "Daemon ready; original terminal inventory verified".into(),
+                },
+            })
+        }
+        DaemonCommand::InspectUpdateRecovery {
+            census,
+            outcome,
+            candidate_cli,
+        } => {
+            let receipt = crate::update::recovery::verify_file_with_candidate(
+                &census,
+                &outcome,
+                candidate_cli.as_deref(),
+            )
+            .map_err(|e| AppError::new("update_recovery", e))?;
+            Ok(CommandOutput {
+                command: "daemon.inspect_update_recovery",
+                data: serde_json::to_value(receipt)
+                    .map_err(|e| AppError::new("update_recovery", e))?,
+                human: "Checkpoint permits one ordinary startup attempt".into(),
+            })
+        }
+        DaemonCommand::InspectPendingUpdateRecovery {
+            candidate_cli,
+            census,
+        } => {
+            crate::update::inspect_pending_recovery(&candidate_cli, census.as_deref())
+                .map_err(|error| AppError::new("update_recovery", error))?;
+            Ok(CommandOutput {
+                command: "daemon.inspect_pending_update_recovery",
+                data: json!({"pending":false}),
+                human: "No pending update recovery".into(),
+            })
+        }
+        DaemonCommand::RecoverUpdate {
+            checkpoint,
+            yes,
+            census,
+        } => {
+            let report = crate::update::recover_pending(&checkpoint, yes, census.as_deref())
+                .map_err(|error| AppError::new("update_recovery", error))?;
+            Ok(CommandOutput {
+                command: "daemon.recover_update",
+                data: json!({"verified":true,"report":report}),
+                human: report,
+            })
+        }
+        DaemonCommand::VerifyUpdateLease => {
+            let inherited = crate::daemon::lease_handoff::has_inherited_lease()
+                .map_err(|error| AppError::new("daemon_lease", error))?;
+            if !inherited {
+                return Err(AppError::new("daemon_lease", "no inherited update lease"));
+            }
+            Ok(CommandOutput {
+                command: "daemon.verify_update_lease",
+                data: json!({ "inherited_lease": true }),
+                human: "Update lease verified".into(),
+            })
+        }
         DaemonCommand::Status => {
-            let paths = crate::daemon::RuntimePaths::discover()
-                .map_err(|error| AppError::new("socket_path", error))?;
             let selected_socket =
                 daemon_socket_path().map_err(|error| AppError::new("socket_path", error))?;
             let socket = &selected_socket;
@@ -3511,16 +3783,23 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                         io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
                     ) =>
                 {
-                    // Ownership proves startup or shutdown is still in progress,
-                    // including a daemon that adopted the updater's descriptor.
-                    crate::daemon::HostLease::is_held(&paths)
-                        .map_err(|error| AppError::new("daemon_status", error))?
+                    // A reservation can belong to the updater or a probe itself.
+                    // Only an authenticated serving handshake establishes running.
+                    false
                 }
                 Err(error) => return Err(AppError::new("protocol", error)),
             };
+            let daemon_present = running
+                || crate::daemon::daemon_process_alive_at(&crate::daemon::RuntimePaths {
+                    directory: socket.parent().unwrap_or(Path::new("/")).to_owned(),
+                    lock: socket.with_file_name("cagentsd.lock"),
+                    socket: socket.clone(),
+                })
+                .map_err(|error| AppError::new("daemon_status", error))?;
             let mut data = json!({
                 "instance": instance::NAME,
                 "running": running,
+                "daemon_present": daemon_present,
                 "socket": socket,
                 "daemon_version": daemon_version,
                 "inherited_lease": crate::daemon::lease_handoff::has_inherited_lease()
@@ -3532,6 +3811,13 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                     "{} daemon {} running ({}); cli {}",
                     instance::NAME,
                     daemon_version.as_deref().unwrap_or("starting"),
+                    socket.display(),
+                    crate::version()
+                )
+            } else if daemon_present {
+                format!(
+                    "{} daemon is starting or stopping ({}); cli {}",
+                    instance::NAME,
                     socket.display(),
                     crate::version()
                 )
@@ -3551,6 +3837,32 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                 command: "daemon.status",
                 data,
                 human,
+            })
+        }
+        DaemonCommand::StoreSchema => {
+            let printed = run_store_maintenance(&["--stored-schema"])?;
+            let schema = if printed.is_empty() {
+                None
+            } else {
+                Some(printed.parse::<u32>().map_err(|_| {
+                    AppError::new(
+                        "store",
+                        format!("the daemon printed an unreadable store schema: {printed}"),
+                    )
+                })?)
+            };
+            Ok(CommandOutput {
+                command: "daemon.store_schema",
+                data: json!({ "schema": schema }),
+                human: schema.map(|schema| schema.to_string()).unwrap_or_default(),
+            })
+        }
+        DaemonCommand::DowngradeStore { schema } => {
+            let printed = run_store_maintenance(&["--downgrade-store", &schema.to_string()])?;
+            Ok(CommandOutput {
+                command: "daemon.downgrade_store",
+                data: json!({ "schema": schema, "converted": !printed.is_empty() }),
+                human: printed,
             })
         }
         DaemonCommand::ProtocolVersion => Ok(CommandOutput {
@@ -3723,6 +4035,45 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
             })
         }
     }
+}
+
+/// Runs the matched daemon's store maintenance flag. The store belongs to
+/// the host build, which this command-line build does not link.
+fn run_store_maintenance(arguments: &[&str]) -> Result<String, AppError> {
+    let daemon = crate::companion::Product::Daemon
+        .beside_current()
+        .map_err(|error| AppError::new("daemon_executable", error.to_string()))?;
+    run_store_maintenance_at(&daemon, arguments)
+}
+
+fn run_store_maintenance_at(daemon: &Path, arguments: &[&str]) -> Result<String, AppError> {
+    let mut command = Command::new(daemon);
+    command.args(arguments).stdin(Stdio::null());
+    crate::install_guard::sanitize_child_environment(&mut command);
+    // SAFETY: the hook only seals descriptors before explicit forwarding.
+    unsafe { command.pre_exec(crate::daemon::seal_inherited_descriptors) };
+    crate::instance::inherit_daemon_fence(&mut command)
+        .and_then(|()| crate::daemon::lease_handoff::inherit_daemon_lease(&mut command))
+        .map_err(|error| AppError::new("daemon_startup", error))?;
+    let output = command.output().map_err(|error| {
+        AppError::new(
+            "daemon_executable",
+            format!("cannot run {}: {error}", daemon.display()),
+        )
+    })?;
+    if !output.status.success() {
+        let message = String::from_utf8_lossy(&output.stderr);
+        let message = message.trim().trim_start_matches("cagentsd: ");
+        return Err(AppError::new(
+            "store",
+            if message.is_empty() {
+                format!("{} failed with {}", daemon.display(), output.status)
+            } else {
+                message.to_owned()
+            },
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
 fn shutdown_output(outcome: ShutdownOutcome) -> Result<CommandOutput, AppError> {
@@ -4794,8 +5145,109 @@ fn emit_error(json_output: bool, error: &AppError) {
 mod tests {
     use super::ControlError;
 
+    #[cfg(feature = "host")]
     #[test]
-    fn inherited_daemon_lease_reports_starting_before_listener_is_bound() {
+    fn inherited_store_maintenance_forwards_reservation_to_matched_daemon() {
+        use std::os::{
+            fd::AsRawFd,
+            unix::{fs::OpenOptionsExt, process::CommandExt},
+        };
+        use std::process::Command;
+
+        const CHILD: &str = "CAGENTS_TEST_INHERITED_STORE_MAINTENANCE";
+        if std::env::var_os(CHILD).is_some() {
+            crate::daemon::lease_handoff::initialize_inherited_lease().unwrap();
+            let daemon = std::env::var_os("CAGENTS_TEST_RETAINED_ACTOR_HELPER").unwrap();
+            let paths = crate::daemon::RuntimePaths::discover().unwrap();
+            let metadata = std::fs::read(&paths.lock).unwrap();
+            for args in [&["--stored-schema"][..], &["--downgrade-store", "22"][..]] {
+                assert_eq!(
+                    super::run_store_maintenance_at(daemon.as_ref(), args).unwrap(),
+                    ""
+                );
+                assert_eq!(std::fs::read(&paths.lock).unwrap(), metadata);
+                assert!(crate::daemon::HostLease::is_held(&paths).unwrap());
+            }
+            let proof = crate::model::HostSessionProof {
+                host_session_id: "maintenance-successor".into(),
+                boot_id: crate::daemon::read_boot_id().unwrap(),
+                host_incarnation: "maintenance-successor".into(),
+            };
+            let _successor = crate::daemon::HostLease::acquire_with_handoff(
+                &paths,
+                &proof,
+                crate::daemon::lease_handoff::clone_inherited_lease().unwrap(),
+            )
+            .unwrap();
+            let error =
+                super::run_store_maintenance_at(daemon.as_ref(), &["--stored-schema"]).unwrap_err();
+            assert!(
+                error.message.contains("a cagents daemon is running"),
+                "{}",
+                error.message
+            );
+            return;
+        }
+        if !crate::daemon::isolated_handoff_coordinator() {
+            return;
+        }
+        // A reaped source supplies genuine exit evidence before any descriptor
+        // is opened; no unrelated fixture can inherit the reservation.
+        let mut source = Command::new("/bin/true").spawn().unwrap();
+        let source_pid = source.id();
+        source.wait().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let runtime = root.path().join("runtime");
+        let directory = runtime.join(crate::instance::runtime_subdirectory());
+        std::fs::create_dir_all(&directory).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(directory.join("cagentsd.lock"))
+            .unwrap();
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+        std::fs::write(
+            directory.join("cagentsd.lock"),
+            format!("{{\"pid\":{source_pid}}}"),
+        )
+        .unwrap();
+        for descriptor in [3, 199] {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", "control::tests::inherited_store_maintenance_forwards_reservation_to_matched_daemon", "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env("XDG_RUNTIME_DIR", &runtime)
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env(crate::daemon::lease_handoff::DAEMON_LEASE_ENV, descriptor.to_string());
+            let source = lock.as_raw_fd();
+            // SAFETY: only descriptor syscalls run in the forked child.
+            unsafe {
+                command.pre_exec(move || {
+                    crate::daemon::seal_inherited_descriptors()?;
+                    if libc::dup2(source, descriptor) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::fcntl(descriptor, libc::F_SETFD, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let output = command.output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            std::fs::write(
+                directory.join("cagentsd.lock"),
+                format!("{{\"pid\":{source_pid}}}"),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn inherited_daemon_lease_is_not_a_serving_daemon() {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
         const CHILD: &str = "CAGENTS_TEST_INHERITED_STATUS";
@@ -4804,11 +5256,12 @@ mod tests {
             let descriptor: i32 = descriptor.parse().unwrap();
             crate::daemon::lease_handoff::initialize_inherited_lease().unwrap();
             let output = super::execute_daemon(super::DaemonCommand::Status).unwrap();
-            assert_eq!(output.data["running"], true);
+            assert_eq!(output.data["running"], false);
             assert_eq!(output.data["inherited_lease"], true);
             assert!(output.data["daemon_version"].is_null());
-            assert!(output.human.contains("starting running"));
-            assert!(!output.human.contains("stopped"));
+            assert!(!output.human.contains("running"));
+            let verified = super::execute_daemon(super::DaemonCommand::VerifyUpdateLease).unwrap();
+            assert_eq!(verified.data["inherited_lease"], true);
             // Startup seals either transport even without a child sealing hook.
             assert_ne!(
                 unsafe { libc::fcntl(descriptor, libc::F_GETFD) } & libc::FD_CLOEXEC,
@@ -4868,17 +5321,17 @@ mod tests {
                     .unwrap();
             let mut command = std::process::Command::new(std::env::current_exe().unwrap());
             command
-            .args([
-                "--exact",
-                "control::tests::inherited_daemon_lease_reports_starting_before_listener_is_bound",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env(CHILD, descriptor.to_string())
-            .env("XDG_RUNTIME_DIR", runtime.path())
-            .env("XDG_CONFIG_HOME", runtime.path().join("config"))
-            .env("XDG_STATE_HOME", runtime.path().join("state"))
-            .env("HOME", runtime.path());
+                .args([
+                    "--exact",
+                    "control::tests::inherited_daemon_lease_is_not_a_serving_daemon",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, descriptor.to_string())
+                .env("XDG_RUNTIME_DIR", runtime.path())
+                .env("XDG_CONFIG_HOME", runtime.path().join("config"))
+                .env("XDG_STATE_HOME", runtime.path().join("state"))
+                .env("HOME", runtime.path());
             if descriptor == 3 {
                 handoff.inherit_for_installer(&mut command).unwrap();
             } else {
@@ -4930,6 +5383,75 @@ mod tests {
         assert!(routed(&["cagents", "daemon", "prepare-upgrade", "--yes"]));
         assert!(routed(&["cagents", "daemon", "abandon-upgrade", "--yes"]));
         assert!(routed(&["cagents", "daemon", "start"]));
+        // The installer asks the replacement it names, never a staged owner.
+        assert!(!routed(&["cagents", "daemon", "store-schema"]));
+        assert!(!routed(&["cagents", "daemon", "downgrade-store", "22"]));
+    }
+
+    #[test]
+    fn final_recovery_retirement_uses_the_explicit_verifier_and_never_validation_only() {
+        use clap::Parser;
+        let argv = [
+            "cagents",
+            "--no-start",
+            "daemon",
+            "verify-update-census",
+            "--census",
+            "/private/original-census.json",
+            "--outcome",
+            "/private/outcome.json",
+            "--retire",
+        ];
+        let parsed = super::Cli::try_parse_from(argv).unwrap();
+        assert!(matches!(
+            &parsed.command,
+            super::TopCommand::Daemon {
+                command: super::DaemonCommand::VerifyUpdateCensus { retire: true, .. }
+            }
+        ));
+        assert!(!super::routes_to_staged_owner(&parsed.command));
+        assert!(!super::staged_command_requires_daemon(&parsed.command));
+        let mut contradictory = argv.to_vec();
+        contradictory.push("--validate-only");
+        assert!(super::Cli::try_parse_from(contradictory).is_err());
+    }
+
+    #[test]
+    fn pending_recovery_uses_the_exact_candidate_without_autostart_or_owner_routing() {
+        use clap::Parser;
+        for argv in [
+            vec![
+                "cagents",
+                "--no-start",
+                "daemon",
+                "recover-update",
+                "--checkpoint",
+                "abcd",
+                "--yes",
+            ],
+            vec![
+                "cagents",
+                "daemon",
+                "inspect-pending-update-recovery",
+                "--candidate-cli",
+                "/private/candidate/bin/cagents",
+            ],
+        ] {
+            let command = super::Cli::try_parse_from(argv).unwrap().command;
+            assert!(!super::routes_to_staged_owner(&command));
+            assert!(!super::staged_command_requires_daemon(&command));
+        }
+        // Confirmation and the exact hash are checked before installation or
+        // daemon state can be opened, even when a person omits --no-start.
+        let error = super::execute_daemon(super::DaemonCommand::RecoverUpdate {
+            checkpoint: "abcd".into(),
+            yes: true,
+            census: None,
+        })
+        .err()
+        .expect("an incomplete hash cannot authorize recovery");
+        assert_eq!(error.kind, "update_recovery");
+        assert!(error.message.contains("--checkpoint SHA256 --yes"));
     }
 
     #[test]
@@ -5227,7 +5749,7 @@ mod tests {
                     .lines()
                     .filter_map(|line| serde_json::from_str::<Value>(line).ok())
                     .collect::<Vec<_>>();
-                assert_eq!(errors.len(), if case == "user" { 6 } else { 26 });
+                assert_eq!(errors.len(), if case == "user" { 6 } else { 28 });
                 assert!(errors.iter().all(|error| {
                     error["ok"] == false
                         && error["error"]["kind"]
@@ -5324,8 +5846,9 @@ mod tests {
         }
 
         if case != "user" {
-            let commands: [&[&str]; 13] = [
+            let commands: [&[&str]; 14] = [
                 &["daemon", "start"],
+                &["daemon", "downgrade-store", "22"],
                 &["daemon", "stop", "--require-empty"],
                 &["daemon", "preflight"],
                 &["daemon", "prepare-upgrade", "--yes", "--no-relaunch-agents"],

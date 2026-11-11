@@ -50,11 +50,13 @@ mod navigation;
 mod schema;
 mod terminal_owners;
 mod terminal_retention;
+#[cfg(test)]
+mod view_cost_bench;
 mod views;
 #[cfg(test)]
 mod workspace_snapshot_tests;
 
-const SCHEMA_VERSION: u32 = 23;
+const SCHEMA_VERSION: u32 = 24;
 
 /// A writer that loses a race waits rather than failing. Only the daemon writes
 /// this store, so contention is between its own client threads and is measured
@@ -129,6 +131,34 @@ impl Registry {
             db,
             path: path.to_owned(),
         })
+    }
+
+    fn installed_path() -> Result<std::path::PathBuf, String> {
+        let dirs = crate::instance::project_dirs()
+            .ok_or_else(|| "the data directory is unavailable".to_owned())?;
+        Ok(dirs.data_dir().join("workspace-model.sqlite3"))
+    }
+
+    /// The schema of this installation's store, or `None` if it has none; see
+    /// [`schema::stored_version`].
+    pub(crate) fn stored_schema() -> Result<Option<u32>, String> {
+        schema::stored_version(&Self::installed_path()?)
+    }
+
+    /// Converts this installation's store back to schema `target`; see
+    /// [`schema::downgrade`].
+    pub(crate) fn downgrade(target: u32) -> Result<Option<u32>, String> {
+        schema::downgrade(&Self::installed_path()?, target)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stored_schema_at(path: &Path) -> Result<Option<u32>, String> {
+        schema::stored_version(path)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn downgrade_at(path: &Path, target: u32) -> Result<Option<u32>, String> {
+        schema::downgrade(path, target)
     }
 
     /// Independent WAL connection for low-rate execution transactions. The
@@ -713,8 +743,12 @@ fn migrate_through(
         schema::migration_checkpoint(22)?;
     }
     if version < 23 && target >= 23 {
-        console_relaunch::migrate(tx)?;
+        views::store::migrate(tx)?;
         schema::migration_checkpoint(23)?;
+    }
+    if version < 24 && target >= 24 {
+        console_relaunch::migrate(tx)?;
+        schema::migration_checkpoint(24)?;
     }
     Ok(())
 }
@@ -1261,6 +1295,12 @@ mod tests {
                  DROP TABLE automation_run_attention;
                  DROP TABLE shared_terminal_retention_pins;
                  DROP TABLE terminal_retention_pins;
+                 DROP TABLE shared_view_terminal_sources;
+                 DROP TABLE view_operations;
+                 DROP TABLE retired_panes;
+                 DROP TABLE panes;
+                 DROP TABLE view_scopes;
+                 DROP TABLE view_revision_clock;
                  DROP TABLE automation_notifications;
                  DROP TABLE channel_work_placement_epochs;
                  DROP TABLE channel_work_placement_clock;

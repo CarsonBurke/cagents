@@ -143,6 +143,11 @@ impl Fixture {
             if time.monotonic()>=deadline: raise RuntimeError('reset gate timed out')
             time.sleep(0.01)
         send({'type':'conversation_reset'})
+        (root/'reset-sent').write_text('sent')
+        deadline=time.monotonic()+30
+        while not (root/'identity-now').exists():
+            if time.monotonic()>=deadline: raise RuntimeError('identity gate timed out')
+            time.sleep(0.01)
         import uuid
         session=str(uuid.uuid4())
         send({'type':'system','subtype':'init','session_id':session})
@@ -973,6 +978,18 @@ fn real_helper_explicit_reset_resolves_known_a_to_b_from_authenticated_lineage()
         Some(a.as_str())
     );
     fs::write(fixture.root.join("reset-now"), b"provider reset").unwrap();
+    wait(
+        || fixture.root.join("reset-sent").exists(),
+        "provider did not emit reset",
+    );
+    wait(
+        || fixture.handle().confirmed_session_id().is_none(),
+        "HOST did not observe reset before the next identity",
+    );
+    // The new identity arrives in a later frame, after the one-shot hidden
+    // output observation has been consumed. No visibility/rearm/refresh may
+    // be needed to learn semantic metadata from this frame.
+    fs::write(fixture.root.join("identity-now"), b"next identity").unwrap();
     wait(
         || fixture.root.join("reset-id").exists(),
         "provider did not emit its explicit reset/new identity",

@@ -6,6 +6,8 @@ pub(crate) mod holder_registry;
 pub(crate) mod hosting;
 pub(crate) mod lease_handoff;
 #[cfg(feature = "host")]
+pub(crate) mod lost_processes;
+#[cfg(feature = "host")]
 pub(crate) mod owned_children;
 #[cfg(feature = "host")]
 pub(crate) mod process_scope;
@@ -341,6 +343,7 @@ pub(crate) struct HostLease {
     socket_path: PathBuf,
     lock: File,
     shared_handoff: bool,
+    _store_maintenance: Option<crate::instance::OwnedLock>,
 }
 
 impl HostLease {
@@ -359,6 +362,9 @@ impl HostLease {
         inherited: Option<File>,
     ) -> Result<Self, PlatformError> {
         prepare_runtime_directory(&paths.directory)?;
+        // Sharing the inventory description must not let startup publish its
+        // PID while the updater is reading or converting the stopped store.
+        let _maintenance = store_maintenance_guard(paths)?;
         let shared_handoff = inherited.is_some();
         let mut lock = if let Some(lock) = inherited {
             lease_handoff::validate_inherited(&lock, paths)?;
@@ -395,6 +401,7 @@ impl HostLease {
             socket_path: paths.socket.clone(),
             lock,
             shared_handoff,
+            _store_maintenance: None,
         })
     }
 
@@ -456,8 +463,113 @@ impl HostLease {
             socket_path: paths.socket.clone(),
             lock,
             shared_handoff: false,
+            _store_maintenance: None,
         })
     }
+}
+
+#[cfg(feature = "host")]
+impl HostLease {
+    /// [`Self::acquire_for_maintenance`] for shared-model store maintenance,
+    /// which may run when no daemon has started since the runtime directory
+    /// was cleared: creates the lock file a daemon would, without metadata, so
+    /// a status check still sees no daemon.
+    pub(crate) fn acquire_for_store_maintenance(
+        paths: &RuntimePaths,
+        inherited: Option<File>,
+    ) -> Result<Self, PlatformError> {
+        prepare_runtime_directory(&paths.directory)?;
+        let maintenance = store_maintenance_guard(paths)?;
+        if let Some(mut lock) = inherited {
+            lease_handoff::validate_inherited(&lock, paths)?;
+            lock.seek(SeekFrom::Start(0))?;
+            let stored: StoredLockMetadata = serde_json::from_reader(&mut lock)?;
+            if !recorded_daemon_exited(stored.pid)? {
+                return Err(PlatformError::AlreadyRunning {
+                    path: paths.socket.clone(),
+                });
+            }
+            recover_stale_socket(&paths.socket)?;
+            return Ok(Self {
+                socket_path: paths.socket.clone(),
+                lock,
+                shared_handoff: true,
+                _store_maintenance: Some(maintenance),
+            });
+        }
+        // flock belongs to an open file description, so closing this one
+        // cannot release a lock another holds.
+        drop(
+            OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .mode(PRIVATE_FILE_MODE)
+                .custom_flags(LOCK_OPEN_FLAGS)
+                .open(&paths.lock)?,
+        );
+        let mut lease = Self::acquire_for_maintenance(paths)?;
+        lease._store_maintenance = Some(maintenance);
+        Ok(lease)
+    }
+}
+
+/// Independent open descriptions serialize store work with inherited lease
+/// adoption. Startup holds this only until its live PID has been published;
+/// maintenance holds it until the store operation has finished.
+#[cfg(feature = "host")]
+fn store_maintenance_guard(
+    paths: &RuntimePaths,
+) -> Result<crate::instance::OwnedLock, PlatformError> {
+    let path = paths.directory.join("cagentsd.store-maintenance.lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .mode(PRIVATE_FILE_MODE)
+        .custom_flags(LOCK_OPEN_FLAGS | libc::O_CLOEXEC)
+        .open(&path)?;
+    validate_lock_file(&path, &lock.metadata()?, current_uid())?;
+    crate::instance::owned_file_lock(lock, libc::LOCK_EX | libc::LOCK_NB).map_err(|error| {
+        if error.kind() == io::ErrorKind::WouldBlock {
+            PlatformError::AlreadyRunning {
+                path: paths.socket.clone(),
+            }
+        } else {
+            error.into()
+        }
+    })
+}
+
+#[cfg(feature = "host")]
+fn recorded_daemon_exited(pid: u32) -> io::Result<bool> {
+    let pid = i32::try_from(pid)
+        .ok()
+        .filter(|pid| *pid > 1)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid daemon PID"))?;
+    // SAFETY: pidfd_open pins the recorded process before checking exit.
+    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if descriptor < 0 {
+        let error = io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(true)
+        } else {
+            Err(error)
+        };
+    }
+    // SAFETY: pidfd_open returned a new descriptor owned exactly once here.
+    let process = unsafe { File::from_raw_fd(descriptor as c_int) };
+    let mut poll = libc::pollfd {
+        fd: process.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: poll points to one initialized pollfd for the live pidfd.
+    if unsafe { libc::poll(&mut poll, 1, 0) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(poll.revents & libc::POLLIN != 0)
 }
 
 impl Drop for HostLease {
@@ -502,6 +614,85 @@ fn write_lock_metadata(lock: &mut File, proof: &HostSessionProof) -> Result<(), 
 #[derive(Deserialize)]
 struct StoredLockMetadata {
     pid: u32,
+}
+
+/// Distinguish a live daemon process from an updater's retained reservation.
+/// A successful handshake establishes serving readiness separately; a live
+/// process still holding the recorded descriptor can be starting or stopping.
+pub(crate) fn daemon_process_alive_at(paths: &RuntimePaths) -> Result<bool, PlatformError> {
+    if !HostLease::is_held(paths)? {
+        return Ok(false);
+    }
+    let lock = match OpenOptions::new()
+        .read(true)
+        .custom_flags(LOCK_OPEN_FLAGS | libc::O_CLOEXEC)
+        .open(&paths.lock)
+    {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    validate_lock_file(&paths.lock, &lock.metadata()?, current_uid())?;
+    let stored: StoredLockMetadata = serde_json::from_reader(&lock)?;
+    let pid = i32::try_from(stored.pid)
+        .ok()
+        .filter(|pid| *pid > 1)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid daemon PID"))?;
+    // Pin and check exit before inspecting descriptors: an exited zombie has
+    // no descriptors even though its /proc directory and pidfd still exist.
+    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if descriptor < 0 {
+        let error = io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(false)
+        } else {
+            Err(error.into())
+        };
+    }
+    // SAFETY: successful pidfd_open returned a fresh descriptor owned here.
+    let process = unsafe { File::from_raw_fd(descriptor as c_int) };
+    let exited = || -> io::Result<bool> {
+        let mut poll = libc::pollfd {
+            fd: process.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one initialized pollfd referring to the pinned process.
+        if unsafe { libc::poll(&mut poll, 1, 0) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(poll.revents != 0)
+    };
+    if exited()? {
+        return Ok(false);
+    }
+    let process_path = Path::new("/proc").join(stored.pid.to_string());
+    let ownership = (|| -> io::Result<bool> {
+        validate_owner(
+            &process_path,
+            &fs::symlink_metadata(&process_path)?,
+            current_uid(),
+        )
+        .map_err(io::Error::other)?;
+        let expected = lock.metadata()?;
+        for entry in fs::read_dir(process_path.join("fd"))? {
+            let entry = entry?;
+            let actual = match fs::metadata(entry.path()) {
+                Ok(actual) => actual,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            if actual.dev() == expected.dev() && actual.ino() == expected.ino() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    })();
+    // A process can finish while its descriptor ownership is being inspected.
+    if exited()? {
+        return Ok(false);
+    }
+    ownership.map_err(Into::into)
 }
 
 /// Locate the executable of this instance's live, kernel-verified lock owner.
@@ -1060,7 +1251,7 @@ pub(crate) fn shut_down_test_listener(listener: std::os::unix::net::UnixListener
 /// can share its description. An unrelated test's concurrent fork can
 /// retain even a CLOEXEC copy until exec; create the tested descriptors
 /// only inside a coordinator with no other tests running beside it.
-#[cfg(all(test, feature = "host"))]
+#[cfg(test)]
 pub(crate) fn isolated_handoff_coordinator() -> bool {
     use std::os::unix::process::CommandExt;
     use std::process::Command;
@@ -1108,6 +1299,44 @@ mod tests {
         let expected = unsafe { libc::geteuid() };
         assert_eq!(peer_uid(&client).unwrap(), expected);
         assert_eq!(peer_uid(&server).unwrap(), expected);
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn lease_handoff_reservation_is_not_a_live_daemon_process() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = RuntimePaths {
+            directory: root.path().to_owned(),
+            socket: root.path().join("cagentsd.sock"),
+            lock: root.path().join("cagentsd.lock"),
+        };
+        let mut child = std::process::Command::new("/bin/true").spawn().unwrap();
+        let pid = child.id();
+        let lock = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(&paths.lock)
+            .unwrap();
+        fs::write(&paths.lock, format!("{{\"pid\":{pid}}}")).unwrap();
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+        // Wait for exit without reaping to exercise the zombie case too.
+        let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        assert!(descriptor >= 0);
+        let process = unsafe { File::from_raw_fd(descriptor as c_int) };
+        let mut poll = libc::pollfd {
+            fd: process.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut poll, 1, 5000) }, 1);
+        assert!(HostLease::is_held(&paths).unwrap());
+        assert!(!daemon_process_alive_at(&paths).unwrap());
+        assert!(child.wait().unwrap().success());
+        assert!(!daemon_process_alive_at(&paths).unwrap());
     }
 
     #[cfg(feature = "host")]
@@ -1928,6 +2157,72 @@ while True: time.sleep(1)
             .is_err()
         );
         assert_eq!(fs::read(&target).unwrap(), b"untouched");
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn store_maintenance_preserves_handoff_and_excludes_adoption() {
+        if !isolated_handoff_coordinator() {
+            return;
+        }
+        let root = tempdir().unwrap();
+        let paths = paths(root.path().join("runtime"));
+        let mut ended = std::process::Command::new("/bin/true").spawn().unwrap();
+        let ended_pid = ended.id();
+        ended.wait().unwrap();
+        let mut original = HostLease::acquire(&paths, &proof()).unwrap();
+        let reservation = original.lock.try_clone().unwrap();
+        original.shared_handoff = true;
+        drop(original);
+        fs::write(&paths.lock, format!("{{\"pid\":{ended_pid}}}")).unwrap();
+        let metadata = fs::read(&paths.lock).unwrap();
+
+        let maintenance = HostLease::acquire_for_store_maintenance(
+            &paths,
+            Some(reservation.try_clone().unwrap()),
+        )
+        .unwrap();
+        assert!(matches!(
+            HostLease::acquire_with_handoff(
+                &paths,
+                &proof(),
+                Some(reservation.try_clone().unwrap())
+            ),
+            Err(PlatformError::AlreadyRunning { .. })
+        ));
+        drop(maintenance);
+        assert!(HostLease::is_held(&paths).unwrap());
+        assert_eq!(fs::read(&paths.lock).unwrap(), metadata);
+
+        // Publication precedes the listener: a live successor must refuse
+        // maintenance even when it shares the worker's inventory description.
+        let successor = HostLease::acquire_with_handoff(
+            &paths,
+            &proof(),
+            Some(reservation.try_clone().unwrap()),
+        )
+        .unwrap();
+        assert!(!paths.socket.exists());
+        assert!(matches!(
+            HostLease::acquire_for_store_maintenance(
+                &paths,
+                Some(reservation.try_clone().unwrap())
+            ),
+            Err(PlatformError::AlreadyRunning { .. })
+        ));
+        drop(successor);
+        assert!(HostLease::is_held(&paths).unwrap());
+        fs::write(&paths.lock, b"unreadable").unwrap();
+        assert!(
+            HostLease::acquire_for_store_maintenance(
+                &paths,
+                Some(reservation.try_clone().unwrap())
+            )
+            .is_err()
+        );
+        assert!(HostLease::is_held(&paths).unwrap());
+        drop(reservation);
+        assert!(!HostLease::is_held(&paths).unwrap());
     }
 
     #[cfg(feature = "host")]

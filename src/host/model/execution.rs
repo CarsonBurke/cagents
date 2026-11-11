@@ -641,7 +641,7 @@ impl Registry {
         let blocked: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM agent_runs WHERE agent=?1 AND state IN ('accepted','running','waiting'))
              OR EXISTS(SELECT 1 FROM agent_launches WHERE agent=?1 OR session_id=?2)
-             OR EXISTS(SELECT 1 FROM shared_view_panes WHERE id=?1)",
+             OR EXISTS(SELECT 1 FROM panes WHERE id=?1)",
             params![agent.id.to_string(), source.id.to_string()], |row| row.get(0),
         ).map_err(|error| error.to_string())?;
         if blocked {
@@ -2239,12 +2239,10 @@ pub(super) fn require_placement(
                     "The worktree view belongs to another project or has an invalid path".into(),
                 );
             }
-            let scope = encode(placement)?;
-            let exists: bool = db.query_row(
-                "SELECT EXISTS(SELECT 1 FROM shared_views JOIN shared_view_scopes USING(scope) WHERE scope=?1 AND repository=?2)",
-                params![scope, repository_key(repository)?], |row| row.get(0),
-            ).map_err(|error|error.to_string())?;
-            if !exists {
+            let path = path
+                .to_str()
+                .ok_or("The worktree view has an invalid path")?;
+            if !super::views::store::worktree_exists(db, repository_key(repository)?, path)? {
                 return Err("The target worktree view is no longer open".into());
             }
             Ok(())
@@ -3629,7 +3627,7 @@ mod tests {
             })
             .unwrap();
         let before = registry.model().unwrap();
-        registry.db.execute_batch("CREATE TRIGGER reject_ended_view BEFORE UPDATE ON shared_views BEGIN SELECT RAISE(FAIL,'fixture ended view failure'); END;").unwrap();
+        registry.db.execute_batch("CREATE TRIGGER reject_ended_view BEFORE UPDATE ON view_scopes BEGIN SELECT RAISE(FAIL,'fixture ended view failure'); END;").unwrap();
         assert!(publish_console(&mut registry, &scope, &pane, &ended_console(&pane)).is_err());
         assert_eq!(registry.model().unwrap(), before);
         let count: u64 = registry
@@ -4498,8 +4496,10 @@ mod tests {
         registry
             .db
             .execute(
-                "DELETE FROM shared_views WHERE scope=?1",
-                [encode(&scope).unwrap()],
+                "DELETE FROM view_scopes WHERE id=?1",
+                [super::super::views::store::scope_id(&registry.db, &scope)
+                    .unwrap()
+                    .unwrap()],
             )
             .unwrap();
         assert!(

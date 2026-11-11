@@ -235,8 +235,14 @@ pub(super) fn prepare_resume(
                 host_incarnation: proof.host_incarnation.clone(),
             },
         };
-        if crate::upgrade::surviving_process(&terminal, std::process::id(), &resume_process_root())?
-            .is_some()
+        if crate::upgrade::surviving_process(
+            &terminal,
+            std::process::id(),
+            &resume_process_root(),
+            &[],
+        )
+        .map_err(|error| error.to_string())?
+        .is_some()
         {
             return Err("This conversation is still running elsewhere; nothing was started".into());
         }
@@ -249,7 +255,9 @@ pub(super) fn prepare_resume(
                     terminal,
                     std::process::id(),
                     &resume_process_root(),
-                )?
+                    &[],
+                )
+                .map_err(|error| error.to_string())?
                 .is_some()
                 {
                     return Err(

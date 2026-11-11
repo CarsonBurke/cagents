@@ -221,6 +221,22 @@ impl Client {
         }
     }
 
+    /// The pidfd-pinned, lease-authenticated peer's executable. Installation
+    /// pointers cannot establish which binary is actually serving this roster.
+    pub(crate) fn serving_executable(&self) -> Result<PathBuf, UpdateError> {
+        match self {
+            Self::Current { client, peer } => {
+                peer.verify(client.proof())?;
+                let executable = peer.executable()?;
+                peer.verify(client.proof())?;
+                Ok(executable)
+            }
+            Self::Legacy(_) => Err(invalid(
+                "The legacy source cannot prove a Ready recovery inventory",
+            )),
+        }
+    }
+
     pub(crate) fn upgrade_impact(
         &mut self,
         policy: impact::Policy,
@@ -322,6 +338,58 @@ impl Client {
             }
             Self::Legacy(_) => Err(invalid(
                 "This source cannot end conversations for the update",
+            )),
+        }
+    }
+
+    /// A daemon-bound monotonic fence for the split terminal/chat inventory
+    /// RPCs. Preflight only issues an ephemeral capability; it never stops,
+    /// adopts or replays a session. No capability is confirmed by this reader.
+    pub(crate) fn inventory_generation(&mut self) -> Result<u64, UpdateError> {
+        match self {
+            Self::Current { client, peer } => {
+                peer.verify(client.proof())?;
+                let preflight = client
+                    .shutdown_preflight()
+                    .map_err(|error| invalid(error.to_string()))?;
+                peer.verify(client.proof())?;
+                if preflight.capability.proof != *client.proof() {
+                    return Err(invalid("The inventory fence belongs to another daemon"));
+                }
+                Ok(preflight.capability.inventory_generation)
+            }
+            Self::Legacy(_) => Err(invalid(
+                "This source cannot fence a read-only terminal census. Keep it running and use a compatible intermediate build before retrying.",
+            )),
+        }
+    }
+
+    /// Every admitted Current source has the exact recorded StartupState
+    /// request, response and nested phase DTO in LIFECYCLE_VARIANTS. Legacy
+    /// families remain refused here instead of guessing their readiness.
+    pub(crate) fn startup_state(
+        &mut self,
+    ) -> Result<crate::terminal_ipc::StartupState, UpdateError> {
+        match self {
+            Self::Current { client, peer } => {
+                peer.verify(client.proof())?;
+                client.startup_state().map_err(|e| invalid(e.to_string()))
+            }
+            Self::Legacy(_) => Err(invalid(
+                "This source cannot prove startup readiness. Keep it running and use a compatible intermediate build before retrying.",
+            )),
+        }
+    }
+    pub(crate) fn list_terminals(
+        &mut self,
+    ) -> Result<Vec<crate::terminal_ipc::TerminalDescriptor>, UpdateError> {
+        match self {
+            Self::Current { client, peer } => {
+                peer.verify(client.proof())?;
+                client.list().map_err(|e| invalid(e.to_string()))
+            }
+            Self::Legacy(_) => Err(invalid(
+                "This source cannot provide a verified terminal census. Keep it running and use a compatible intermediate build before retrying.",
             )),
         }
     }
@@ -430,8 +498,10 @@ impl InstalledIdentity {
 /// no source authority. Remaining reachable payloads, including errors and
 /// historical unsolicited chat traffic, must match in full.
 /// ShutdownV1 includes preflight, stop and confirmed shutdown; List/BuildInfo
-/// include status reads. Current-only ChatLimit cannot arrive from historical
-/// sources; the full current-wire recording test covers that message.
+/// include status reads. StartupState and every nested phase are frozen for
+/// readiness checks on all admitted Current sources. Current-only ChatLimit
+/// cannot arrive from historical sources; the full current-wire recording test
+/// covers that message.
 /// Keep this beside source admission so adding support always runs the proof.
 #[cfg(test)]
 pub(crate) const LIFECYCLE_VARIANTS: &[(&str, &[&str])] = &[
@@ -449,8 +519,6 @@ pub(crate) const LIFECYCLE_VARIANTS: &[(&str, &[&str])] = &[
             "ChatRead",
             "ChatClose",
             "ChatDetach",
-            "ChatVisibility",
-            "ChatRead",
             "ResolveUpgradeChat",
             "Shutdown",
             "ShutdownV1",
@@ -458,6 +526,7 @@ pub(crate) const LIFECYCLE_VARIANTS: &[(&str, &[&str])] = &[
             "UpgradeImpact",
             "PrepareConfirmedUpgrade",
             "BuildInfo",
+            "StartupState",
         ],
     ),
     (
@@ -470,7 +539,6 @@ pub(crate) const LIFECYCLE_VARIANTS: &[(&str, &[&str])] = &[
             "chat_snapshot",
             "chat_update",
             "chat_closed",
-            "chat_snapshot",
             "detached",
             "accepted",
             "upgrade_chat_resolved",
@@ -480,6 +548,7 @@ pub(crate) const LIFECYCLE_VARIANTS: &[(&str, &[&str])] = &[
             "upgrade_impact",
             "upgrade_prepared",
             "build_info",
+            "startup_state",
             "agent",
         ],
     ),

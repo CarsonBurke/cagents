@@ -1013,7 +1013,7 @@ impl State {
             Action::BrowserFocused => {
                 if self.target.is_none()
                     && self.source.as_ref().is_some_and(|source| {
-                        crate::github::polling::ready(&source.repository.host, false)
+                        crate::github::polling::ready(&source.repository.authority(), false)
                     })
                 {
                     let open = if self.list_request.loading {
@@ -1141,9 +1141,6 @@ impl State {
                             });
                         self.force_conversation = false;
                         self.loaded_snapshot = Some(loaded.clone());
-                        if let Some(target) = &self.target {
-                            crate::github::polling::succeeded(&target.repository.host);
-                        }
                         self.adopt(&loaded);
                         if unchanged_conversation {
                             return ActionTask::none();
@@ -1164,7 +1161,7 @@ impl State {
             Action::RefreshIfDue(now) => {
                 if self.target.is_none()
                     && self.source.as_ref().is_some_and(|source| {
-                        crate::github::polling::ready(&source.repository.host, false)
+                        crate::github::polling::ready(&source.repository.authority(), false)
                     })
                 {
                     // Both lists refresh, so a row that closed leaves the
@@ -1184,7 +1181,7 @@ impl State {
                 if !self.refreshing
                     && !self.discussion_is_busy()
                     && self.target.as_ref().is_some_and(|target| {
-                        crate::github::polling::ready(&target.repository.host, false)
+                        crate::github::polling::ready(&target.repository.authority(), false)
                     })
                     && self.last_refresh.is_some_and(|last| {
                         now.saturating_duration_since(last) >= Duration::from_secs(30)
@@ -1510,9 +1507,6 @@ impl State {
                 return ActionTask::none();
             }
         };
-        if let Some(source) = &self.source {
-            crate::github::polling::succeeded(&source.repository.host);
-        }
         self.list_cursor = page.next_cursor;
         let mut rows = if self.list_request.appending {
             match std::mem::replace(&mut self.list, ListState::Idle) {
@@ -1562,9 +1556,6 @@ impl State {
                 return;
             }
         };
-        if let Some(source) = &self.source {
-            crate::github::polling::succeeded(&source.repository.host);
-        }
         let mut rows = match self.search.take() {
             Some(search) if self.search_request.appending && search.query == query => search.rows,
             _ => Vec::new(),
@@ -1713,15 +1704,15 @@ impl State {
         if self.target.is_none() || self.discussion_is_busy() {
             return ActionTask::none();
         }
-        if !self
-            .target
-            .as_ref()
-            .is_some_and(|target| crate::github::polling::ready(&target.repository.host, manual))
-        {
+        if !self.target.as_ref().is_some_and(|target| {
+            crate::github::polling::ready(&target.repository.authority(), manual)
+        }) {
             self.notice = self
                 .target
                 .as_ref()
-                .and_then(|target| crate::github::polling::rate_limit(&target.repository.host))
+                .and_then(|target| {
+                    crate::github::polling::rate_limit(&target.repository.authority())
+                })
                 .map(|limit| limit.to_string());
             return ActionTask::none();
         }
@@ -1759,22 +1750,6 @@ impl State {
                         previous.as_deref(),
                         &cancellation,
                     );
-                    match &result {
-                        Ok(_) => {}
-                        Err(message)
-                            if !cancellation.is_cancelled()
-                                && crate::github::polling::ready(
-                                    &target.repository.host,
-                                    false,
-                                ) =>
-                        {
-                            crate::github::polling::failed(
-                                &target.repository.host,
-                                &crate::github::GitHubError::Inspection(message.clone()),
-                            )
-                        }
-                        Err(_) => {}
-                    }
                     result.map(Arc::new)
                 })
                 .await
@@ -2148,7 +2123,7 @@ impl State {
                                 });
                             }
                         }
-                        if refused.is_none() && !crate::github::polling::ready(&repository.host, false) {
+                        if refused.is_none() && !crate::github::polling::ready(&repository.authority(), false) {
                             refused = Some("GitHub polling is paused after a failure or rate limit. Retry after the reset.".into());
                         }
                         let results: Vec<(RepoPath, bool, ViewedOutcome)> = if let Some(message) = &refused {
@@ -3100,8 +3075,8 @@ impl State {
 
 /// Why the browser may not ask GitHub now, if the host's budget forbids it.
 fn browser_paused(source: &ReviewSource) -> Option<String> {
-    (!crate::github::polling::ready(&source.repository.host, true)).then(|| {
-        crate::github::polling::rate_limit(&source.repository.host)
+    (!crate::github::polling::ready(&source.repository.authority(), true)).then(|| {
+        crate::github::polling::rate_limit(&source.repository.authority())
             .map(|limit| limit.to_string())
             .unwrap_or_else(|| "GitHub refresh is paused. Try again shortly.".into())
     })
@@ -4699,9 +4674,9 @@ pub(crate) mod tests {
             (
                 "review-server-limit.invalid",
                 crate::github::GitHubError::RateLimited {
-                    limit: crate::github::polling::RateLimit {
-                        retry_at: crate::github::polling::now() + 120,
-                    },
+                    limit: crate::github::polling::RateLimit::secondary(
+                        crate::github::polling::now() + 120,
+                    ),
                 },
                 false,
             ),
@@ -4738,10 +4713,11 @@ pub(crate) mod tests {
                 assert!(state.notice.as_deref().unwrap().contains("Retrying at"));
             }
 
-            // A successful in-flight load clears transient failures, while a
-            // server deadline learned by another poller remains authoritative.
+            // A UI completion has no credential authority. Only the service
+            // that completed the request may clear its captured host budget;
+            // a late callback must not alter another account's current budget.
             finish_load(&mut state, loaded(vec![], vec![]));
-            assert_eq!(crate::github::polling::ready(host, false), manual_allowed);
+            assert!(!crate::github::polling::ready(host, false));
             assert!(!state.refreshing);
         }
     }
@@ -4758,11 +4734,11 @@ pub(crate) mod tests {
         state.list = ListState::Ready(vec![Arc::new(pull_request(1))]);
         let before = state.browser_generation;
         crate::github::polling::failed(
-            &repository.host,
+            &repository.authority(),
             &crate::github::GitHubError::RateLimited {
-                limit: crate::github::polling::RateLimit {
-                    retry_at: crate::github::polling::now() + 120,
-                },
+                limit: crate::github::polling::RateLimit::secondary(
+                    crate::github::polling::now() + 120,
+                ),
             },
         );
 

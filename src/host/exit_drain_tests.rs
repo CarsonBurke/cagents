@@ -332,6 +332,7 @@ fn run_host() -> (
     let admission = DaemonAdmission {
         lease: None,
         _guard: crate::instance::DaemonAdmissionGuard::acquire().unwrap(),
+        retirement_owned_by_updater: false,
     };
     let (complete, completion) = mpsc::channel();
     let thread = thread::spawn(move || {

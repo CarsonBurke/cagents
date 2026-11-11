@@ -401,9 +401,9 @@ fn every_current_client_update_source_preserves_the_frozen_lifecycle_and_inspect
 
 #[test]
 fn inspector_proof_detects_each_request_response_and_reachable_history_change() {
-    // Both recorded source lines must prove the inspector as well as lifecycle
-    // control. These mutations also catch accidentally narrowing the subset.
-    for protocol in [128, 156] {
+    // Every admitted Current source must prove the inspector as well as
+    // lifecycle control. These mutations catch narrowing the subset.
+    for protocol in crate::update::source::current_client_protocols() {
         let baseline = recorded(protocol);
         for (container, names) in [
             (
@@ -413,11 +413,17 @@ fn inspector_proof_detects_each_request_response_and_reachable_history_change() 
                     "ResolveUpgradeChat",
                     "ChatVisibility",
                     "ChatRead",
+                    "StartupState",
                 ][..],
             ),
             (
                 "ServerResponse",
-                &["accepted", "chat_snapshot", "upgrade_chat_resolved"][..],
+                &[
+                    "accepted",
+                    "chat_snapshot",
+                    "upgrade_chat_resolved",
+                    "startup_state",
+                ][..],
             ),
         ] {
             let key = baseline
@@ -452,6 +458,53 @@ fn inspector_proof_detects_each_request_response_and_reachable_history_change() 
         };
         fields.push(("future_history_field".into(), Shape::Bool));
         assert!(!lifecycle_differences(&baseline, &changed).is_empty());
+    }
+}
+
+#[test]
+fn readiness_proof_detects_startup_phase_variants_and_nested_payload_changes() {
+    for protocol in crate::update::source::current_client_protocols() {
+        let baseline = recorded(protocol);
+        let key = baseline
+            .containers
+            .keys()
+            .find(|key| short(key) == "StartupState")
+            .unwrap();
+        for mutation in [
+            "variant_position",
+            "new_phase",
+            "restoring_count",
+            "retained_detail",
+        ] {
+            let mut changed = baseline.clone();
+            let Container::Enum(variants) = changed.containers.get_mut(key).unwrap() else {
+                panic!("StartupState must be an enum");
+            };
+            match mutation {
+                "variant_position" => variants.swap(0, 1),
+                "new_phase" => variants.push(("future_phase".into(), Some(Fields::Unit))),
+                "restoring_count" | "retained_detail" => {
+                    let name = if mutation == "restoring_count" {
+                        "restoring"
+                    } else {
+                        "retained"
+                    };
+                    let (_, Some(Fields::Struct(fields))) = variants
+                        .iter_mut()
+                        .find(|(variant, _)| variant == name)
+                        .unwrap()
+                    else {
+                        panic!("{name} must retain its named payload");
+                    };
+                    fields.push(("incompatible_readiness_field".into(), Shape::Bool));
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                !lifecycle_differences(&baseline, &changed).is_empty(),
+                "protocol {protocol}: readiness mutation {mutation} must be rejected"
+            );
+        }
     }
 }
 

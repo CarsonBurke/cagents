@@ -6,6 +6,7 @@ use crate::app::account_ui::ChatAccounts;
 use crate::chat::client::{ClientHandle, Wake};
 use crate::chat::{self, Attachment, Command, ItemContent, PromptMode, Snapshot};
 use crate::file_drop;
+use crate::model::SavedQueue;
 use crate::performance::chat_stage::{self, Stage};
 use base64::Engine as _;
 use cosmic::widget::text_editor;
@@ -69,6 +70,7 @@ mod auth_recovery;
 mod changes;
 mod child_navigation;
 mod clipboard_image;
+mod close_refusal;
 mod closed_draft;
 mod completion;
 mod coordination;
@@ -107,6 +109,7 @@ mod trailing;
 mod turn;
 mod view;
 mod virtualized;
+mod warm;
 
 pub(super) fn invalidate_copy_intent() {
     text_copy::invalidate();
@@ -405,6 +408,9 @@ pub enum Action {
     /// named, or the newest that can be taken back.
     TakeBackQueued(Target, Option<QueueEntry>),
     RemoveQueued(Target, QueueEntry),
+    /// Puts away the notice that messages a provider was holding when it
+    /// stopped are back in the composer.
+    DismissRestoredWaiting(Target),
     ComposerActions(Target, bool),
     /// What the reader has typed into the `+` menu's search.
     ComposerActionsQuery(Target, String),
@@ -491,6 +497,21 @@ pub enum Action {
     HandoffFinished(Target, Result<TerminalSession, String>),
     CloseFinished(Target, Result<(), String>),
     RetainedCloseFinished(Target, chat::Session, Result<(), String>),
+    /// What still runs for a conversation whose Close was refused.
+    CloseHolders(
+        Target,
+        chat::Session,
+        Result<Vec<crate::terminal::ipc::LostProcess>, String>,
+    ),
+    /// Ends what the daemon proves still runs for the conversation, then
+    /// closes it again.
+    EndCloseHolders(Target),
+    CloseHoldersEnded(
+        Target,
+        chat::Session,
+        Result<Vec<crate::terminal::ipc::LostProcess>, String>,
+    ),
+    DismissCloseRefusal(Target),
     /// Where the transcript's viewport has moved to, which is what asks for
     /// another page of history.
     Scrolled(Target, Option<String>, view::Scroll, bool),
@@ -555,6 +576,8 @@ impl Action {
                 | Self::ReturnedLocally(..)
                 | Self::CloseFinished(..)
                 | Self::RetainedCloseFinished(..)
+                | Self::CloseHolders(..)
+                | Self::CloseHoldersEnded(..)
                 | Self::Retired(..)
                 | Self::DispatchQueued(..)
                 | Self::ClearCopied(..)
@@ -801,6 +824,13 @@ pub(super) struct State {
     /// draft. If that window's start fails, the shared pane goes back to the
     /// same conversation as a draft, and so does this card.
     peer_started: HashMap<CardId, TerminalId>,
+    /// The provider queue each card last saved, until a connection to its
+    /// conversation shows whether the provider that held it is still there.
+    waiting: HashMap<CardId, SavedQueue>,
+    /// Drafts another window started, whose cards are attaching to that
+    /// conversation. Their carried-over unsent text may repeat its first
+    /// message, which is checked once the transcript shows it.
+    started_elsewhere: HashSet<CardId>,
     /// Automatically opened placeholders, discarded when their scope is left
     /// until the reader puts work into them or starts their conversation.
     default_chats: HashSet<CardId>,
@@ -838,6 +868,8 @@ impl Default for State {
             drafts: HashMap::new(),
             draft_attachments: HashMap::new(),
             peer_started: HashMap::new(),
+            waiting: HashMap::new(),
+            started_elsewhere: HashSet::new(),
             default_chats: HashSet::new(),
             parked: HashMap::new(),
             fresh_offers: HashSet::new(),
@@ -866,9 +898,21 @@ impl State {
             ..Self::default()
         }
     }
+    pub(super) fn with_waiting_messages(mut self, waiting: HashMap<CardId, SavedQueue>) -> Self {
+        self.waiting = waiting;
+        self
+    }
 }
 
 impl State {
+    /// Give parked chats a changed syntax theme: one can still be warm, and is
+    /// shown again as it is.
+    pub(super) fn set_parked_syntax_theme(&mut self, theme: crate::settings::EditorSyntaxTheme) {
+        for runtime in self.parked.values_mut() {
+            runtime.set_syntax_theme(theme);
+        }
+    }
+
     pub(super) fn transition_pending(&self) -> bool {
         !self.phases.is_empty() || !self.abandoned.is_empty() || !self.retiring.is_empty()
     }
@@ -2342,6 +2386,82 @@ enum QueuedStep {
     Prompt,
 }
 
+/// The messages a conversation's last provider was holding that the provider
+/// it reconnected to does not account for, in their order.
+///
+/// Each message the provider lists accounts for one saved message: first one
+/// with its id and words, then one with its words (some providers' ids only
+/// name a place in the queue, so the same id may now hold another message),
+/// then one with its id alone (a listing may carry only a preview). A saved
+/// message is also accounted for when the provider's history shows a user
+/// message delivered under its id.
+fn unaccounted(
+    snapshot: &chat::Snapshot,
+    saved: Vec<chat::QueuedMessage>,
+) -> Vec<chat::QueuedMessage> {
+    fn same_words(a: &chat::QueuedMessage, b: &chat::QueuedMessage) -> bool {
+        a.text == b.text && a.attachments == b.attachments
+    }
+    type Claim = fn(&chat::QueuedMessage, &chat::QueuedMessage) -> bool;
+    let claims: [Claim; 3] = [
+        |listed, saved| listed.id == saved.id && same_words(listed, saved),
+        |listed, saved| same_words(listed, saved),
+        |listed, saved| listed.id == saved.id,
+    ];
+    let mut listed: Vec<&chat::QueuedMessage> = snapshot.queued_messages.iter().collect();
+    let mut remaining = saved;
+    for claim in claims {
+        remaining.retain(|message| {
+            let Some(index) = listed.iter().position(|queued| claim(queued, message)) else {
+                return true;
+            };
+            listed.swap_remove(index);
+            false
+        });
+    }
+    remaining.retain(|message| {
+        !snapshot.items.iter().any(|item| {
+            item.role == chat::Role::User
+                && item
+                    .id
+                    .strip_prefix(message.id.as_str())
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
+        })
+    });
+    remaining
+}
+
+/// What came back to the composer from a provider queue that did not survive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RestoredWaiting {
+    count: usize,
+    /// Whether every message came back whole; a provider lists only a
+    /// preview of a long message or of input the composer cannot hold, and
+    /// may list an attachment without a file it can name.
+    whole: bool,
+}
+
+impl RestoredWaiting {
+    /// What the notice beside the draft says: what came back, that it was
+    /// not sent again, and that the agent may have it anyway.
+    fn caption(self) -> String {
+        let mut text = if self.count == 1 {
+            "Back in your draft: a message that was still queued when this conversation stopped. It has not been resent; the agent may already have received it.".to_owned()
+        } else {
+            format!(
+                "Back in your draft: {} messages that were still queued when this conversation stopped. They have not been resent; the agent may already have received some of them.",
+                self.count
+            )
+        };
+        if !self.whole {
+            text.push_str(
+                " Only part of what was queued could be restored; check it before sending.",
+            );
+        }
+        text
+    }
+}
+
 const CAPACITY_GUIDANCE: &str = "Inspect usage with cagents chat capacity. Check eligibility with cagents chat release ID --dry-run; release requires verified saved history and no protected work. Then retry. Your conversation and draft are kept.";
 
 pub(super) struct Runtime {
@@ -2379,6 +2499,13 @@ pub(super) struct Runtime {
     /// How the draft was queued before it was taken back, which is how
     /// sending it again queues it unless the reader chooses otherwise.
     resend: Option<PromptMode>,
+    /// The messages a provider that did not come back was still holding when
+    /// this conversation stopped, now returned to the composer unsent. Shown
+    /// beside the draft until it is sent or the notice is dismissed.
+    restored_waiting: Option<RestoredWaiting>,
+    /// The provider queue a parked runtime last saved, by entry, as a parked
+    /// runtime does not refresh the snapshot a live one compares against.
+    parked_queue: Vec<String>,
     composer_actions: bool,
     /// The `+` menu's search, cleared each time the menu opens.
     composer_actions_query: String,
@@ -2454,6 +2581,10 @@ pub(super) struct Runtime {
     image_pastes_saving: usize,
     submit_after_paste: Option<PromptMode>,
     attachment_chooser_pending: Option<uuid::Uuid>,
+    /// The composer revision at which unsent text carried over from a draft
+    /// another window started may still repeat that window's first message.
+    /// Cleared once the transcript settles it, or the reader edits the text.
+    first_message_echo: Option<u64>,
     expanded: HashSet<String>,
     child_expanded: HashMap<String, HashSet<String>>,
     child_unfolded: HashMap<String, HashSet<String>>,
@@ -2467,9 +2598,14 @@ pub(super) struct Runtime {
     /// catalog, which takes each list once rather than on every change.
     listed_models: u64,
     visible: AtomicBool,
+    /// While hidden, the order this chat was hidden in if it keeps its
+    /// presentation and its client's transcript; see [`warm`].
+    warm: Option<u64>,
     error: Option<String>,
     /// A typed admission refusal, independent of provider/account failures.
     capacity_refused: bool,
+    /// A Close the daemon refused, shown on the pane until it closes.
+    close_refusal: Option<close_refusal::CloseRefusal>,
     /// Resuming this card's stopped provider failed, so it offers to try
     /// again; the failure itself stands in `error`.
     resume_failed: bool,
@@ -2826,6 +2962,18 @@ impl Runtime {
             other => self.composer.perform(other),
         }
         self.cancel_invalid_attachment_jobs();
+        self.settle_restored_notice();
+    }
+
+    /// The restored-messages notice describes the draft; once the reader
+    /// has cleared the draft away, there is nothing left for it to describe.
+    fn settle_restored_notice(&mut self) {
+        if self.restored_waiting.is_some()
+            && self.attachments.is_empty()
+            && self.composer.text().trim().is_empty()
+        {
+            self.restored_waiting = None;
+        }
     }
 
     fn cancel_invalid_attachment_jobs(&mut self) {
@@ -2988,7 +3136,10 @@ impl Runtime {
         true
     }
 
+    /// The draft's attachments leave with the draft, when it is sent or held,
+    /// and so does what the restored-messages notice said about it.
     fn take_attachments(&mut self) -> Vec<Attachment> {
+        self.restored_waiting = None;
         self.thumbnails.clear();
         std::mem::take(&mut self.attachments)
     }
@@ -3003,6 +3154,13 @@ impl Runtime {
     /// Puts a message that was waiting back in the composer, ahead of
     /// whatever was typed after it, with the files it was queued with.
     fn take_back(&mut self, text: &str, attachments: Vec<Attachment>, queued: PromptMode) {
+        self.prepend_to_draft(text, attachments);
+        self.resend = Some(queued);
+    }
+
+    /// Puts `text` in the composer ahead of whatever is typed there, with the
+    /// caret at its end, and adds `attachments` before the draft's own.
+    fn prepend_to_draft(&mut self, text: &str, attachments: Vec<Attachment>) {
         let text = text.trim_end();
         let draft = self.unsent_text();
         let combined = match (text.is_empty(), draft.trim().is_empty()) {
@@ -3022,13 +3180,61 @@ impl Runtime {
             selection: None,
         });
         self.replace_draft(composer);
-        self.resend = Some(queued);
         // The draft a walk through sent messages set aside is in `combined`.
         self.history_cursor = None;
         self.history_stash = None;
         self.history_attachment_stash = None;
         let later = self.replace_attachments(attachments);
         self.merge_attachments(later);
+    }
+
+    /// The provider queue as it should be saved: what the provider last said
+    /// it holds, less what has already come back to the composer. A parked
+    /// runtime does not refresh its snapshot, so the connection is asked.
+    fn waiting_messages(&self) -> Vec<chat::QueuedMessage> {
+        let snapshot = self
+            .handle()
+            .map_or_else(|| Arc::clone(&self.snapshot), |handle| handle.snapshot());
+        snapshot
+            .queued_messages
+            .iter()
+            .filter(|message| !self.taken_back.contains(&message.id))
+            .cloned()
+            .collect()
+    }
+
+    /// Returns to the composer the messages a provider that did not come back
+    /// was holding. They are never sent from here: the provider may have
+    /// started on any of them before it went, so the reader decides.
+    fn restore_waiting(&mut self, messages: Vec<chat::QueuedMessage>) {
+        if messages.is_empty() {
+            return;
+        }
+        let mut text = String::new();
+        let mut attachments: Vec<Attachment> = Vec::new();
+        let mut whole = messages.iter().all(|message| message.editable);
+        for message in &messages {
+            let body = message.text.trim_end();
+            if !body.is_empty() {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(body);
+            }
+            // A path the provider could not vouch for names no file here.
+            for attachment in &message.attachments {
+                if attachment.reference.is_none() && attachment.path.as_os_str().is_empty() {
+                    whole = false;
+                } else if !attachments.contains(attachment) {
+                    attachments.push(attachment.clone());
+                }
+            }
+        }
+        self.prepend_to_draft(&text, attachments);
+        self.restored_waiting = Some(RestoredWaiting {
+            count: messages.len(),
+            whole,
+        });
     }
 
     /// Returns every held follow-up to the composer, in the order written.
@@ -3238,21 +3444,78 @@ impl Runtime {
             .unwrap_or(&self.attachments)
     }
 
-    /// A first prompt is still local work until the provider accepts it.
-    /// Keep that source and any later composer edits together as an inert
-    /// recovery draft; restoring it never automatically submits either part.
-    fn persistent_draft(&self) -> (String, Vec<Attachment>) {
-        let mut text = self.unsent_text();
-        let mut attachments = self.unsent_attachments().to_vec();
-        if let Some(queued) = &self.queued {
-            let first = queued.source.text();
-            if text.is_empty() {
-                text = first.to_owned();
-            } else {
-                text = format!("{first}\n{text}");
+    /// Checks carried-over unsent text against the first message of the
+    /// conversation another window started from this draft, once the
+    /// transcript shows it.
+    fn await_first_message_echo(&mut self) {
+        self.first_message_echo = Some(self.revision);
+        self.settle_first_message_echo();
+    }
+
+    /// Drops the composer text if it is exactly the conversation's first
+    /// message, which the window that started it already sent, so it is not
+    /// offered again. Any other text is the reader's own and stays.
+    fn settle_first_message_echo(&mut self) {
+        let Some(revision) = self.first_message_echo else {
+            return;
+        };
+        if revision != self.revision || !self.attachments.is_empty() {
+            // Edited since, or more than the text: no longer a copy.
+            self.first_message_echo = None;
+            return;
+        }
+        if self.snapshot.history_loading || !self.visible.load(Ordering::Relaxed) {
+            return;
+        }
+        let first = self
+            .snapshot
+            .items
+            .iter()
+            .find_map(|item| match &item.content {
+                chat::ItemContent::Text { text, .. } if item.role == chat::Role::User => Some(text),
+                _ => None,
+            });
+        let Some(first) = first else {
+            if self.snapshot.has_earlier {
+                // The first message is not in view, so nothing can be shown
+                // to repeat it.
+                self.first_message_echo = None;
             }
-            let later = std::mem::take(&mut attachments);
-            for attachment in queued.attachments.iter().chain(later.iter()) {
+            return;
+        };
+        self.first_message_echo = None;
+        if !self.snapshot.has_earlier && self.composer.text().trim() == first.trim() {
+            self.replace_draft(text_editor::Content::new());
+        }
+    }
+
+    /// A first prompt is still local work until the provider accepts it, as
+    /// are follow-ups held for a provider with no queue of its own. Keep them
+    /// and any later composer edits together as an inert recovery draft, in
+    /// the order they were written; restoring it never automatically submits
+    /// any part.
+    fn persistent_draft(&self) -> (String, Vec<Attachment>) {
+        let followups = (!self.followups.is_empty()).then(|| self.combined_followups());
+        let held = self
+            .queued
+            .iter()
+            .map(|queued| (queued.source.text(), queued.attachments.as_slice()))
+            .chain(
+                followups
+                    .iter()
+                    .map(|(text, attachments)| (text.as_str(), attachments.as_slice())),
+            );
+        let draft = self.unsent_text();
+        let mut text = String::new();
+        let mut attachments: Vec<Attachment> = Vec::new();
+        for (part, files) in held.chain([(draft.as_str(), self.unsent_attachments())]) {
+            if !part.is_empty() {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(part);
+            }
+            for attachment in files {
                 if !attachments.contains(attachment) {
                     attachments.push(attachment.clone());
                 }
@@ -3366,6 +3629,8 @@ impl Runtime {
             recalling: Vec::new(),
             taken_back: Vec::new(),
             resend: None,
+            restored_waiting: None,
+            parked_queue: Vec::new(),
             composer_actions: false,
             composer_actions_query: String::new(),
             mode_before_plan: None,
@@ -3414,6 +3679,7 @@ impl Runtime {
             image_pastes_saving: 0,
             submit_after_paste: None,
             attachment_chooser_pending: None,
+            first_message_echo: None,
             expanded: HashSet::new(),
             child_expanded: HashMap::new(),
             child_unfolded: HashMap::new(),
@@ -3424,8 +3690,10 @@ impl Runtime {
             disconnected: false,
             listed_models: 0,
             visible: AtomicBool::new(visible),
+            warm: None,
             error: None,
             capacity_refused: false,
+            close_refusal: None,
             resume_failed: false,
             failures: Vec::new(),
             unplaced_failures: Vec::new(),
@@ -4547,7 +4815,7 @@ impl Runtime {
     }
 
     fn markdown_prepared(&mut self, target: Target, id: &str, run: u64, ready: preparation::Ready) {
-        if !self.visible.load(Ordering::Relaxed) {
+        if !self.presents() {
             return;
         }
         // Observe any replacement already published by the client before
@@ -4610,7 +4878,34 @@ impl Runtime {
     fn refresh(&mut self) {
         self.prepare_local_prompt();
         self.refresh_session();
-        if !self.visible.load(Ordering::Relaxed) {
+        self.refresh_snapshot();
+        self.settle_first_message_echo();
+    }
+
+    fn refresh_snapshot(&mut self) {
+        if self.warm.is_some()
+            && self
+                .handle()
+                .is_some_and(|handle| handle.resident_snapshot_with_clock().is_none())
+        {
+            // The client gave up the body it was keeping (a resync, or the
+            // connection ended), so this presentation can no longer follow it.
+            self.cool();
+        }
+        if self.warm.is_some()
+            && !self.visible.load(Ordering::Relaxed)
+            && self.handle().is_some_and(|handle| {
+                handle
+                    .resident_snapshot_with_clock()
+                    .is_some_and(|(snapshot, _)| snapshot.generation != self.snapshot.generation)
+            })
+        {
+            // A warm chat with queued work reads while hidden. Rather than
+            // prepare what it reads where nobody sees it, it goes cold and
+            // follows its hidden metadata as any other hidden chat does.
+            self.cool();
+        }
+        if !self.presents() {
             if let Some((snapshot, clock)) = self
                 .handle()
                 .and_then(|handle| handle.hidden_snapshot_with_clock())
@@ -4645,7 +4940,7 @@ impl Runtime {
         // Hidden publications number new children too, so a child keeps the
         // number it first appeared with for as long as it stays listed.
         self.child_ordinals.observe(&snapshot.subagents);
-        if !self.visible.load(Ordering::Relaxed) {
+        if !self.presents() {
             self.release_transcript_presentation();
             Arc::make_mut(&mut snapshot).evict_transcript();
             self.snapshot = snapshot;
@@ -5166,13 +5461,93 @@ impl Runtime {
             }
         }
         let changed = self.visible.swap(visible, Ordering::Relaxed) != visible;
+        let rewarmed = visible && self.warm.take().is_some();
+        if !visible && changed && self.warm.is_none() && self.keeps_warm() {
+            self.warm = Some(warm::stamp());
+        }
         images::sync(self);
         let result = self.present();
         if visible {
             if changed {
                 self.refresh();
             }
-        } else if result.is_ok()
+            if rewarmed {
+                // Work that waited while hidden: items still loading when the
+                // chat hid, and a syntax theme changed meanwhile. Everything
+                // else is already prepared, so this only revisits the window.
+                let snapshot = self.snapshot.clone();
+                drop(self.prepare_transcript_cache(&snapshot));
+            }
+        } else if result.is_err() {
+            // The client could not be told to keep the body, so this chat is
+            // not warm whatever it was before.
+            self.warm = None;
+            self.release_hidden(changed, false);
+        } else if self.warm.is_none() {
+            self.release_hidden(changed, true);
+        }
+        result
+    }
+
+    /// Whether this chat's presentation stays in place while it is hidden.
+    fn presents(&self) -> bool {
+        self.visible.load(Ordering::Relaxed) || self.warm.is_some()
+    }
+
+    /// Whether hiding this chat now may keep it warm: its client still holds
+    /// the transcript the presentation was built from, and it is small enough
+    /// to keep beside others.
+    fn keeps_warm(&self) -> bool {
+        !self.presentation_evicted
+            && self.handle().is_some_and(|handle| {
+                handle.is_connected() && handle.resident_snapshot_with_clock().is_some()
+            })
+            && self.warm_bytes() <= warm::CHAT_BYTES
+    }
+
+    /// The heap this chat holds while warm: its transcript, and what was
+    /// prepared from it, with parsed documents estimated from their size
+    /// (see [`warm::NODE_BYTES`]). Constant work per item.
+    pub(super) fn warm_bytes(&self) -> usize {
+        let prepared = |cached: &CachedItem| {
+            let [text, nodes, _] = cached
+                .document
+                .as_ref()
+                .map_or([0; 3], prose_document::Document::census);
+            cached.retained_bytes() + text + nodes * warm::NODE_BYTES + warm::ITEM_BYTES
+        };
+        self.snapshot.transcript_bytes()
+            + self
+                .cache
+                .values()
+                .chain(self.child_cache.values())
+                .map(prepared)
+                .sum::<usize>()
+    }
+
+    /// The order this chat was hidden in, while it is warm.
+    pub(super) fn warm_stamp(&self) -> Option<u64> {
+        self.warm
+    }
+
+    /// Release a warm hidden chat's presentation and its client's transcript,
+    /// as hiding did before it was kept. A visible or cold chat is unchanged.
+    pub(super) fn cool(&mut self) {
+        if self.warm.take().is_none() || self.visible.load(Ordering::Relaxed) {
+            return;
+        }
+        let told = self.present();
+        self.release_hidden(true, told.is_ok());
+        if let Err(error) = told {
+            self.error = Some(error);
+        }
+    }
+
+    /// Shed a cold hidden chat's presentation: all of it when the daemon can
+    /// hydrate it again, or only its render caches when it cannot, including
+    /// when the client was not `told` it is hidden.
+    fn release_hidden(&mut self, changed: bool, told: bool) {
+        if told
             && self.handle().is_some_and(|handle| {
                 // Notice suppression is not permission to discard the last
                 // body: a lost client may already have installed metadata.
@@ -5191,8 +5566,7 @@ impl Runtime {
                     .any(|child| !child.items.is_empty()))
         {
             self.release_transcript_presentation();
-        } else if !visible
-            && self.handle().is_some()
+        } else if self.handle().is_some()
             && (!self.cache.is_empty()
                 || !self.child_cache.is_empty()
                 || self.selection_document.borrow().is_some())
@@ -5204,7 +5578,6 @@ impl Runtime {
                 resident_bytes = self.snapshot.transcript_bytes(), cache_entries = 0usize,
                 exposed_presentation_bytes = 0usize);
         }
-        result
     }
     fn release_transcript_caches(&mut self) {
         // Diagnostic metadata retains exact source Arcs. Release these while
@@ -5255,9 +5628,14 @@ impl Runtime {
     /// A connection already lost has nothing to tell: the pane reports the
     /// disconnection itself, and the handle that replaces it is shown with the
     /// visibility recorded here.
+    ///
+    /// A warm hidden chat keeps its body without reading further: what it
+    /// missed arrives as one change, or nothing, when it is shown again.
     fn present(&self) -> Result<(), String> {
-        let retain_body = self.visible.load(Ordering::Relaxed);
-        let interested = retain_body || self.queued.is_some() || !self.followups.is_empty();
+        let retain_body = self.presents();
+        let interested = self.visible.load(Ordering::Relaxed)
+            || self.queued.is_some()
+            || !self.followups.is_empty();
         match self.handle() {
             Some(handle) if handle.is_connected() => {
                 match handle.set_interest(interested, retain_body) {
@@ -5650,9 +6028,10 @@ fn end_conversation(
     let Some(session) = session else {
         return refused.map_or(Ok(()), Err);
     };
+    // The daemon usually refuses both the same way; say it once.
     close(vec![CardKind::Chat(session)]).map_err(|error| match refused {
-        Some(refused) => format!("{refused}; {error}"),
-        None => error,
+        Some(refused) if refused != error => format!("{refused}; {error}"),
+        _ => error,
     })
 }
 
@@ -6994,8 +7373,9 @@ impl Cagents {
         self.load_draft_skills(target)
     }
 
-    /// Takes the draft out of `card` when another window has started the very
-    /// conversation it shows, so the card can attach to it.
+    /// Takes the draft out of `card` when another window has started the
+    /// conversation it shows, under the draft's identity or the new one a
+    /// first send saves, so the card can attach to it.
     ///
     /// The draft runtime cannot attach in place: its start attempt would be
     /// taken for this window's own first send, and a failure would retire the
@@ -7016,7 +7396,6 @@ impl Cagents {
             Some(CardRuntime::Chat(runtime))
                 if runtime.is_draft()
                     && runtime.session.is_unstarted()
-                    && runtime.session.id == session.id
                     && runtime.attachment_chooser_pending.is_none()
                     && runtime.pastes_pending == 0
         );
@@ -7027,7 +7406,7 @@ impl Cagents {
         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) {
             runtime.unqueue();
         }
-        self.stash_unsent_chat(card);
+        self.carry_unsent_chat(card, true);
         self.cards.remove(&card);
         self.lifecycle.remove(card);
         self.shared_views.attached.insert(card);
@@ -7052,7 +7431,7 @@ impl Cagents {
         }
         self.chat_ui.peer_started.remove(&card);
         self.chat_ui.phases.remove(&card);
-        self.stash_unsent_chat(card);
+        self.carry_unsent_chat(card, false);
         self.cards.remove(&card);
         self.lifecycle.remove(card);
         self.resolve_notice(NoticeKey::ChatAttach(card));
@@ -7062,6 +7441,26 @@ impl Cagents {
 
     pub(super) fn forget_peer_started(&mut self, card: CardId) {
         self.chat_ui.peer_started.remove(&card);
+    }
+
+    /// Whether draft `card` is choosing or loading files, whose result its
+    /// draft runtime has to receive before the card can follow a
+    /// conversation another window started from it.
+    pub(super) fn chat_draft_inserting(&self, card: CardId) -> bool {
+        !self.chat_start_pending(card)
+            && matches!(self.cards.get(&card), Some(CardRuntime::Chat(runtime))
+                if runtime.is_draft()
+                    && runtime.session.is_unstarted()
+                    && (runtime.attachment_chooser_pending.is_some() || runtime.pastes_pending != 0))
+    }
+
+    /// The conversation this window's own first send from draft `card` has
+    /// already queued for storage, while that send is still saving.
+    pub(super) fn draft_start_candidate(&self, card: CardId) -> Option<&chat::Session> {
+        self.chat_ui
+            .draft_checkpoints
+            .get(&card)
+            .map(|pending| &pending.candidate)
     }
 
     pub(in crate::app) fn chat_is_draft(&self, card: CardId) -> bool {
@@ -7308,6 +7707,18 @@ impl Cagents {
                 }
             }
         }
+        let chat_waiting_messages = self
+            .durable
+            .cards
+            .iter()
+            .filter(|state| {
+                open_cards.contains(&state.id) && matches!(state.kind, CardKind::Chat(_))
+            })
+            .filter_map(|state| {
+                let waiting = self.chat_waiting_to_save(state.id);
+                (!waiting.messages.is_empty()).then_some((state.id, waiting))
+            })
+            .collect::<HashMap<_, _>>();
         let editors = self
             .durable
             .cards
@@ -7373,6 +7784,7 @@ impl Cagents {
             && admission_sources.is_empty()
             && chat_drafts == self.durable.chat_drafts
             && chat_draft_attachments == self.durable.chat_draft_attachments
+            && chat_waiting_messages == self.durable.chat_waiting_messages
             && repository_navigation == self.durable.repository_navigation
         {
             return Arc::clone(&self.durable);
@@ -7380,6 +7792,7 @@ impl Cagents {
         let mut saved = (*self.durable).clone();
         saved.chat_drafts = chat_drafts;
         saved.chat_draft_attachments = chat_draft_attachments;
+        saved.chat_waiting_messages = chat_waiting_messages;
         saved.repository_navigation = repository_navigation;
         for card in &mut saved.cards {
             if let Some(pending) = draft_starts.get(&card.id) {
@@ -7742,6 +8155,31 @@ impl Cagents {
         self.load_draft_skills(target)
     }
 
+    /// Keep the warm hidden chats within [`warm`]'s budget, releasing the
+    /// least recently hidden. Cheap unless a chat went warm since last time.
+    pub(super) fn trim_warm_chats(&mut self) {
+        if !warm::take_dirty() {
+            return;
+        }
+        let mut runtimes: Vec<&mut Runtime> = self
+            .cards
+            .values_mut()
+            .filter_map(|card| match card {
+                CardRuntime::Chat(runtime) => Some(runtime.as_mut()),
+                _ => None,
+            })
+            .chain(self.chat_ui.parked.values_mut().map(Box::as_mut))
+            .filter(|runtime| runtime.warm_stamp().is_some())
+            .collect();
+        let warm: Vec<_> = runtimes
+            .iter()
+            .map(|runtime| (runtime.warm_stamp().unwrap_or(0), runtime.warm_bytes()))
+            .collect();
+        for index in warm::over_budget(&warm) {
+            runtimes[index].cool();
+        }
+    }
+
     pub(super) fn chat_subscription(&self) -> Subscription<Message> {
         let wakes = Subscription::run_with(Source(self.chat_ui.receiver.clone()), stream)
             .map(|(target, wake)| Message::ChatUi(Action::Wake(target, wake)));
@@ -7835,8 +8273,35 @@ impl Cagents {
         true
     }
 
+    /// What `card`'s provider is holding, to be saved in case it does not
+    /// come back: the queue saved before, until a connection settles it, then
+    /// whatever its chat runtime last heard, each message once, with the
+    /// daemon that hosted the provider listing them.
+    pub(super) fn chat_waiting_to_save(&self, card: CardId) -> SavedQueue {
+        let mut saved = self.chat_ui.waiting.get(&card).cloned().unwrap_or_default();
+        let runtime = match self.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => Some(runtime.as_ref()),
+            _ => self.chat_ui.parked.get(&card).map(Box::as_ref),
+        };
+        if let Some(runtime) = runtime {
+            let listed = runtime.waiting_messages();
+            if saved.messages.is_empty() && !listed.is_empty() {
+                saved.host = runtime.session.proof.clone();
+            }
+            for message in listed {
+                if !saved.messages.iter().any(|kept| kept.id == message.id) {
+                    saved.messages.push(message);
+                }
+            }
+        }
+        saved.messages.truncate(chat::QueuedMessage::LIMIT);
+        saved
+    }
+
     /// Gives a new runtime for `card` the draft saved when its last one
-    /// left: the text and every attachment, files as well as images.
+    /// left: the text and every attachment, files as well as images. Text
+    /// carried from a draft another window started is checked against that
+    /// conversation's first message, once.
     pub(super) fn restore_saved_draft(&mut self, card: CardId, runtime: &mut Runtime) {
         if let Some(draft) = self.chat_ui.drafts.remove(&card)
             && !draft.is_empty()
@@ -7845,6 +8310,9 @@ impl Cagents {
         }
         if let Some(attachments) = self.chat_ui.draft_attachments.remove(&card) {
             runtime.replace_attachments(attachments);
+        }
+        if self.chat_ui.started_elsewhere.remove(&card) {
+            runtime.await_first_message_echo();
         }
     }
 
@@ -7938,6 +8406,19 @@ impl Cagents {
         self.observe_agent_activity_for_card(card, None);
     }
 
+    /// Keeps what the reader is composing in draft `card`, whose conversation
+    /// another window replaced, for the composer that opens in its place, and
+    /// whether its text may only repeat the first message of a conversation
+    /// started from it.
+    pub(super) fn carry_unsent_chat(&mut self, card: CardId, started: bool) {
+        self.stash_unsent_chat(card);
+        if started && self.chat_is_draft(card) {
+            self.chat_ui.started_elsewhere.insert(card);
+        } else {
+            self.chat_ui.started_elsewhere.remove(&card);
+        }
+    }
+
     /// Captures the unsent text and attachments of `card`'s chat runtime, which is
     /// about to be dropped while the card lives on, so whatever runtime the
     /// card builds next opens with them rather than losing them.
@@ -7986,6 +8467,7 @@ impl Cagents {
             return;
         }
         let snapshot = self.persistent_workspace();
+        self.record_shared_chat_identities();
         if let Some(writer) = self.session.as_ref() {
             writer.replace_chat_identity(card, pending.candidate.id, current, snapshot);
         }
@@ -8016,6 +8498,8 @@ impl Cagents {
         self.chat_forget(card);
         self.chat_ui.drafts.remove(&card);
         self.chat_ui.draft_attachments.remove(&card);
+        self.chat_ui.waiting.remove(&card);
+        self.chat_ui.started_elsewhere.remove(&card);
         self.chat_ui.parked.remove(&card);
         self.chat_ui.fresh_offers.remove(&card);
         self.chat_ui.removed_accounts.remove(&card);
@@ -8330,6 +8814,7 @@ impl Cagents {
     /// behind its source terminal closes before that terminal's own close, so
     /// the terminal's close never races the actor that owns it.
     pub(super) fn begin_chat_close(&mut self, card: CardId) -> Task<Message> {
+        self.clear_close_refusal(card);
         if self.chat_awaiting_admission(card) {
             let Some(remove) = self.remove_chat_card(card, None) else {
                 return Task::none();
@@ -9074,6 +9559,7 @@ impl Cagents {
         // The composer and public source are still A. The snapshot projection
         // contains the exact candidate B and the still-editable text/images.
         let snapshot = self.persistent_workspace();
+        self.record_shared_chat_identities();
         let writer = self.session.as_ref().expect("writer was checked above");
         // Exact replacement equality is idempotent when B already landed;
         // otherwise the original A identity must still match. This explicit
@@ -10594,6 +11080,26 @@ impl Cagents {
                         let mut session = handle.session();
                         session.proof = handle.proof();
                         let snapshot = handle.snapshot();
+                        // A saved proof names the daemon that hosted the
+                        // conversation. Another daemon started its provider
+                        // afresh, with none of the queue the last one held.
+                        let other_daemon = attempt.session.proof.is_none()
+                            || attempt.session.proof != session.proof;
+                        let saved = self
+                            .chat_ui
+                            .waiting
+                            .remove(&target.card)
+                            .unwrap_or_default();
+                        // A queue saved under an earlier daemon than the one
+                        // this conversation last connected through is older
+                        // than that connection: a build that keeps no queue
+                        // ran in between, and the queue is no longer news.
+                        let mut waiting =
+                            if saved.host.is_some() && saved.host == attempt.session.proof {
+                                saved.messages
+                            } else {
+                                Vec::new()
+                            };
                         let channel_name = self.observe_channel_name(target, &snapshot);
                         let title = channel_name.as_ref().map(|(title, _)| title.clone());
                         let activity = Activity {
@@ -10605,6 +11111,18 @@ impl Cagents {
                             == Some(VisibilityClass::Visible)
                             && self.workspace_surfaces_visible();
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
+                            // A provider that ended took its queue with it,
+                            // whichever daemon starts the next one.
+                            let ended = runtime.snapshot.exited;
+                            if ended || other_daemon {
+                                for message in runtime.waiting_messages() {
+                                    if !waiting.iter().any(|saved| saved.id == message.id) {
+                                        waiting.push(message);
+                                    }
+                                }
+                            } else {
+                                waiting.clear();
+                            }
                             runtime.preparation.clear();
                             if let Some(queued) = &mut runtime.queued {
                                 queued.presentation = prompt::LocalPresentation::default();
@@ -10651,6 +11169,21 @@ impl Cagents {
                             {
                                 self.retire_switched_terminal(terminal, &session);
                             }
+                            // The same daemon still hosts the provider that
+                            // held the saved queue, and lists what it holds.
+                            if !other_daemon {
+                                waiting.clear();
+                            }
+                        }
+                        // What the new provider lists is still waiting there,
+                        // and what its history shows sent has arrived. The
+                        // rest may never have reached the agent, or may have
+                        // just before the last one went: either way it is the
+                        // reader's to send again, edit or discard.
+                        let waiting = unaccounted(&snapshot, waiting);
+                        let restored_waiting = !waiting.is_empty();
+                        if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
+                            runtime.restore_waiting(waiting);
                         }
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get(&target.card) {
                             session = runtime.session.clone();
@@ -10669,8 +11202,10 @@ impl Cagents {
                         } else {
                             self.commit_chat_session(target.card, session);
                         }
-                        if let Some(title) = title
-                            && self.apply_reported_title(target.card, title)
+                        // The draft that now holds them and the queue saved
+                        // without them are written together.
+                        if title.is_some_and(|title| self.apply_reported_title(target.card, title))
+                            || restored_waiting
                         {
                             self.persist();
                         }
@@ -10988,20 +11523,31 @@ impl Cagents {
                 if let Some(runtime) = self.chat_ui.parked.get_mut(&target.card)
                     && runtime.target == target
                 {
-                    let snapshot = match runtime.handle() {
-                        Some(handle) if needs_name && matches!(wake, Wake::Changed) => {
-                            Some(handle.snapshot())
-                        }
+                    let current = match runtime.handle() {
+                        Some(handle) if matches!(wake, Wake::Changed) => Some(handle.snapshot()),
                         _ => None,
                     };
+                    // A queue that changes off screen is saved as it changes.
+                    let mut queue_changed = false;
+                    if let Some(snapshot) = &current {
+                        let ids = snapshot.queued_messages.iter().map(|message| &message.id);
+                        if !ids.clone().eq(runtime.parked_queue.iter()) {
+                            runtime.parked_queue = ids.cloned().collect();
+                            queue_changed = true;
+                        }
+                    }
                     if let Wake::Disconnected(error) = wake {
                         runtime.disconnected = true;
                         runtime.error = Some(error);
                     }
-                    if let Some((name, source)) =
-                        snapshot.and_then(|snapshot| self.observe_channel_name(target, &snapshot))
+                    if let Some((name, source)) = current
+                        .filter(|_| needs_name)
+                        .and_then(|snapshot| self.observe_channel_name(target, &snapshot))
                     {
                         self.publish_observed_channel_name(target, name, source);
+                    }
+                    if queue_changed {
+                        self.persist();
                     }
                     return Task::none();
                 }
@@ -11015,7 +11561,12 @@ impl Cagents {
                 runtime.refresh_session();
                 match wake {
                     Wake::Changed => {
+                        let before = Arc::clone(&runtime.snapshot);
                         runtime.refresh();
+                        // What the provider holds is saved as it changes, so a
+                        // queue outlives a provider that goes with the computer.
+                        let queue_changed =
+                            before.queued_messages != runtime.snapshot.queued_messages;
                         let fork = if runtime.fork_requested
                             && runtime.snapshot.forked != runtime.fork_seen
                         {
@@ -11053,8 +11604,9 @@ impl Cagents {
                         self.observe_agent_activity_for_card(target.card, Some(activity));
                         self.sidebar_state.set_card_limited(target.card, limited);
                         self.commit_chat_session(target.card, session);
-                        if let Some(title) = title
-                            && self.apply_reported_title(target.card, title)
+                        self.trim_warm_chats();
+                        if title.is_some_and(|title| self.apply_reported_title(target.card, title))
+                            || queue_changed
                         {
                             self.persist();
                         }
@@ -12253,11 +12805,18 @@ impl Cagents {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
+                let mut followups_sent = false;
                 let first_prompt = match result {
                     Ok(()) => {
                         if pending.followup {
+                            followups_sent = !runtime.followups.is_empty();
                             runtime.followups.clear();
                             let _ = runtime.present();
+                        }
+                        // What the notice described left with this message,
+                        // even when the reader has typed on since.
+                        if pending.draft_revision.is_some() {
+                            runtime.restored_waiting = None;
                         }
                         if pending.draft_revision == Some(runtime.revision) {
                             runtime.replace_draft(text_editor::Content::new());
@@ -12286,6 +12845,9 @@ impl Cagents {
                                 runtime.find_navigation.document_epoch(),
                             )
                             .map(cosmic::Action::App);
+                            if followups_sent {
+                                self.persist();
+                            }
                             return Task::batch([
                                 snap,
                                 self.dispatch_queued(target),
@@ -12316,6 +12878,11 @@ impl Cagents {
                         None
                     }
                 };
+                // Sent follow-ups were saved with the draft, so a restart
+                // before the next save would offer them to send again.
+                if followups_sent {
+                    self.persist();
+                }
                 if let Some(prompt) = first_prompt {
                     self.name_channel_from_prompt(target.card, &prompt);
                 }
@@ -12752,6 +13319,11 @@ impl Cagents {
                     );
                 }
             },
+            Action::DismissRestoredWaiting(target) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.restored_waiting = None;
+                }
+            }
             Action::CopyQueued(target, source) => {
                 if self
                     .card_state(target.card)
@@ -13049,6 +13621,7 @@ impl Cagents {
                         runtime.attachments.remove(index);
                         runtime.thumbnails.sync(&runtime.attachments);
                         runtime.revision = runtime.revision.wrapping_add(1);
+                        runtime.settle_restored_notice();
                     }
                 }
             }
@@ -13344,7 +13917,13 @@ impl Cagents {
                     && let Some(CardRuntime::Chat(mut runtime)) = self.cards.remove(&target.card)
                 {
                     runtime.show(false);
+                    runtime.parked_queue = snapshot
+                        .queued_messages
+                        .iter()
+                        .map(|message| message.id.clone())
+                        .collect();
                     self.chat_ui.parked.insert(target.card, runtime);
+                    self.trim_warm_chats();
                 }
                 // Enqueue the returned live proof checkpoint. The host retains
                 // the transition receipt independently of this UI attachment.
@@ -13379,13 +13958,20 @@ impl Cagents {
                     return Task::none();
                 }
                 if let Err(error) = result {
-                    self.status = Some(TransientNotice::error(error));
-                    return Task::none();
+                    return self.refuse_chat_close(target.card, session, error);
                 }
                 return self
                     .remove_chat_card(target.card, None)
                     .unwrap_or_else(Task::none);
             }
+            Action::CloseHolders(target, session, result) => {
+                return self.show_close_holders(target, session, result);
+            }
+            Action::EndCloseHolders(target) => return self.end_close_holders(target),
+            Action::CloseHoldersEnded(target, session, result) => {
+                return self.close_holders_ended(target, session, result);
+            }
+            Action::DismissCloseRefusal(target) => return self.dismiss_close_refusal(target),
             Action::CloseFinished(target, result) => {
                 if let Some(session) = self.chat_ui.abandoned.remove(&target) {
                     // A restart's close whose card has since been closed. It
@@ -18041,6 +18627,7 @@ mod tests {
         let old_answer = Arc::downgrade(&runtime.snapshot.subagents[0].items[0]);
         runtime.set_visible(false).unwrap();
         runtime.set_visible(false).unwrap();
+        runtime.cool();
         preparation::retirement_barrier();
         assert!(runtime.cache.is_empty() && runtime.child_cache.is_empty());
         assert_eq!(runtime.snapshot.transcript_bytes(), 0);
@@ -20051,6 +20638,7 @@ mod tests {
             let history = runtime.history.clone();
             let history_images = runtime.history_images.clone();
             runtime.set_visible(false).unwrap();
+            runtime.cool();
             assert_eq!(runtime.history_cursor, Some(0));
             assert_eq!(runtime.history, history);
             assert_eq!(runtime.history_images, history_images);
@@ -20068,6 +20656,7 @@ mod tests {
             assert!(runtime.history_attachment_stash.is_none());
 
             runtime.set_visible(false).unwrap();
+            runtime.cool();
             assert!(runtime.history.is_empty());
             assert!(runtime.history_images.is_empty());
             assert_eq!(runtime.composer.text(), "Unsent image draft");
@@ -20700,230 +21289,6 @@ mod tests {
         );
     }
 
-    // Tasks are deliberately dropped: these fixtures only cross the actual
-    // app reducers and never connect to a daemon or start a provider.
-    fn open_work_over_chat(app: &mut Cagents) {
-        let channel = crate::model::ChannelId::new();
-        app.workspace_model.identity = uuid::Uuid::new_v4();
-        app.workspace_model
-            .channels
-            .push(crate::workspace_model::ModelChannel {
-                id: channel,
-                repository: FIXTURE_DIRECTORY.into(),
-                title: "Chat input fixture".into(),
-                title_source: Default::default(),
-                ordinal: 1,
-            });
-        drop(app.open_channel_work(channel));
-        assert!(app.channel_work_is_main());
-        assert!(!app.workspace_surfaces_visible());
-    }
-
-    fn return_to_chat(app: &mut Cagents) {
-        let owner = app.channel_work.view.owner().unwrap();
-        drop(app.update_channel_work(crate::channel_work_ui::Action::Close(owner)));
-        assert!(!app.channel_work_is_main());
-        assert!(app.workspace_surfaces_visible());
-    }
-
-    /// Retain a real composer callback before switching away from its pane.
-    fn queued_composer_key(
-        app: &Cagents,
-        card: CardId,
-        event: keyboard::Event,
-        renderer: &cosmic::Renderer,
-    ) -> Vec<Message> {
-        use iced::advanced::{Layout, Shell, clipboard, layout, widget::Tree};
-        let viewport = iced::Rectangle::with_size(iced::Size::new(760.0, 720.0));
-        let mut element = app.chat_view(card);
-        let mut tree = Tree::new(element.as_widget());
-        let node = element.as_widget_mut().layout(
-            &mut tree,
-            renderer,
-            &layout::Limits::new(iced::Size::ZERO, viewport.size()),
-        );
-        element.as_widget_mut().operate(
-            &mut tree,
-            Layout::new(&node),
-            renderer,
-            &mut iced::advanced::widget::operation::focusable::focus::<()>(card_control_id(
-                card,
-                "chat-composer",
-            )),
-        );
-        let mut messages = Vec::new();
-        element.as_widget_mut().update(
-            &mut tree,
-            &iced::Event::Keyboard(event),
-            Layout::new(&node),
-            iced::mouse::Cursor::Unavailable,
-            renderer,
-            &mut clipboard::Null,
-            &mut Shell::new(&mut messages),
-            &viewport,
-        );
-        messages
-    }
-
-    #[test]
-    fn main_work_refuses_queued_native_composer_edits_and_submit_but_conversations_accepts_them() {
-        let renderer = crate::app::tests::headless_renderer();
-        for started in [false, true] {
-            let directory = tempfile::tempdir().unwrap();
-            let mut app = crate::app::tests::context_inspector_test_app(false);
-            let card = if started {
-                live_chat(&mut app, Some(KNOWN_THREAD))
-            } else {
-                draft_chat(&mut app)
-            };
-            if !started {
-                let (writer, _) = crate::session::SessionRuntime::open(
-                    directory.path().join("widget-first-start.sqlite3"),
-                    crate::model::BootId::new("widget-first-start"),
-                )
-                .unwrap();
-                app.session = Some(writer);
-            }
-            write(&mut app, card, "unsent");
-            let character = || keyboard::Event::KeyPressed {
-                key: keyboard::Key::Character("x".into()),
-                modified_key: keyboard::Key::Character("x".into()),
-                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyX),
-                location: keyboard::Location::Standard,
-                modifiers: keyboard::Modifiers::empty(),
-                text: Some("x".into()),
-                repeat: false,
-            };
-            let enter =
-                || permission_key(keyboard::key::Named::Enter, keyboard::Modifiers::empty());
-            let queued_edit = queued_composer_key(&app, card, character(), &renderer);
-            let queued_submit = queued_composer_key(&app, card, enter(), &renderer);
-            assert!(queued_edit.iter().any(|message| matches!(
-                message,
-                Message::ChatUi(Action::Composer(_, action)) if action.is_edit()
-            )));
-            assert!(queued_submit.iter().any(|message| matches!(
-                message,
-                Message::ChatUi(Action::Submit(_, PromptMode::Send))
-            )));
-            let revision = chat_runtime(&app, card).revision;
-
-            open_work_over_chat(&mut app);
-            for message in queued_edit.into_iter().chain(queued_submit) {
-                drop(app.update(message));
-            }
-            let runtime = chat_runtime(&app, card);
-            assert_eq!(runtime.composer.text(), "unsent");
-            assert_eq!(runtime.revision, revision);
-            assert!(runtime.pending.is_none() && runtime.queued.is_none());
-            assert!(!app.chat_start_pending(card));
-
-            return_to_chat(&mut app);
-            for message in queued_composer_key(&app, card, character(), &renderer) {
-                drop(app.update(message));
-            }
-            assert_eq!(chat_runtime(&app, card).composer.text(), "unsentx");
-            for message in queued_composer_key(&app, card, enter(), &renderer) {
-                let task = app.update(message);
-                settle_first_start_checkpoint(&mut app, card, task);
-            }
-            if started {
-                assert!(
-                    chat_runtime(&app, card).pending.is_some(),
-                    "the visible chat can send"
-                );
-            } else {
-                assert!(app.chat_start_pending(card), "the visible draft can start");
-                assert!(chat_runtime(&app, card).queued.is_some());
-            }
-        }
-    }
-
-    #[test]
-    fn main_work_keeps_accepted_paste_bookmarks_and_submission_completions_live() {
-        let _admission = attachment_draft::test_admission();
-        let mut app = crate::app::tests::context_inspector_test_app(false);
-        let card = live_chat(&mut app, Some(KNOWN_THREAD));
-        drop(app.update(Message::Viewport {
-            generation: app.workspace_view_generation,
-            event: WorkspaceViewportEvent::Resized(1_600.0),
-        }));
-        assert_eq!(
-            app.workspace.visibility(card),
-            Some(VisibilityClass::Visible)
-        );
-        let target = chat_runtime(&app, card).target;
-        let handle = chat_runtime(&app, card).handle().unwrap().clone();
-        write(&mut app, card, "accepted ");
-        let bookmark = app
-            .chat_runtime_mut(target)
-            .unwrap()
-            .begin_attachment_insert();
-        submit(&mut app, card);
-        assert_eq!(
-            chat_runtime(&app, card).submit_after_paste,
-            Some(PromptMode::Send)
-        );
-        assert!(chat_runtime(&app, card).pending.is_none());
-
-        open_work_over_chat(&mut app);
-        drop(app.update(Message::ChatUi(Action::PastedText(
-            target,
-            bookmark,
-            Some("paste".into()),
-        ))));
-        let runtime = chat_runtime(&app, card);
-        assert_eq!(runtime.pastes_pending, 0);
-        assert!(runtime.attachment_bookmarks.is_empty());
-        assert_eq!(runtime.submit_after_paste, None);
-        assert_eq!(runtime.composer.text(), "accepted paste");
-        assert!(
-            runtime.pending.is_some(),
-            "the previously accepted send continues"
-        );
-        assert!(!runtime.visible.load(Ordering::Relaxed));
-        assert_eq!(
-            runtime.pending.as_ref().unwrap().sent.as_deref(),
-            Some("accepted paste")
-        );
-
-        settle(&mut app, card, Ok(()));
-        let runtime = chat_runtime(&app, card);
-        assert!(runtime.pending.is_none());
-        assert_eq!(runtime.composer.text(), "");
-        assert!(!runtime.visible.load(Ordering::Relaxed));
-        assert!(app.channel_work_is_main());
-
-        // Hidden transcript-derived history is disposable. The daemon hydrates
-        // it again only after the reader returns to the actual visible pane.
-        return_to_chat(&mut app);
-        assert_eq!(
-            app.workspace.visibility(card),
-            Some(VisibilityClass::Visible)
-        );
-        let runtime = chat_runtime(&app, card);
-        assert!(runtime.visible.load(Ordering::Relaxed));
-        assert_eq!(runtime.target, target);
-        assert!(Arc::ptr_eq(runtime.handle().unwrap(), &handle));
-        let mut hydrated = (*handle.snapshot()).clone();
-        hydrated.generation = hydrated.generation.checked_add(1).unwrap();
-        hydrated.items = vec![Arc::new(chat::Item {
-            id: "accepted-paste".into(),
-            role: chat::Role::User,
-            content: text("accepted paste"),
-            started_at: None,
-            at: None,
-        })];
-        handle.replace_snapshot_for_test(hydrated);
-        drop(app.update(Message::ChatUi(Action::Wake(target, Wake::Changed))));
-        let runtime = app.chat_runtime_mut(target).unwrap();
-        preparation::drain_fixture(runtime);
-        assert_eq!(
-            runtime.history.last().map(String::as_str),
-            Some("accepted paste")
-        );
-    }
-
     /// Rebuilding the strip hides every surface before it lays the new one
     /// out. A conversation on screen both before and after is shown again
     /// rather than left blank.
@@ -20955,141 +21320,6 @@ mod tests {
             Some(VisibilityClass::Visible)
         );
         assert!(handle.is_visible_for_test(), "the chat is shown again");
-    }
-
-    #[test]
-    fn late_ready_attaches_behind_main_work_then_returns_to_visible_conversations() {
-        let mut app = crate::app::tests::context_inspector_test_app(false);
-        let (card, target) = starting_chat(&mut app);
-        let handle = fixture_handle(&app, card, Some(KNOWN_THREAD));
-        drop(app.update(Message::Viewport {
-            generation: app.workspace_view_generation,
-            event: WorkspaceViewportEvent::Resized(1_600.0),
-        }));
-        open_work_over_chat(&mut app);
-        assert_eq!(
-            app.workspace.visibility(card),
-            Some(VisibilityClass::Visible)
-        );
-
-        answer_start(&mut app, target, Ok(handle.clone()));
-        assert!(app.chat_ui.attempt(card).is_none(), "Ready is consumed");
-        let runtime = chat_runtime(&app, card);
-        assert_eq!(runtime.target, target);
-        assert!(Arc::ptr_eq(runtime.handle().unwrap(), &handle));
-        assert!(!runtime.visible.load(Ordering::Relaxed));
-        assert!(
-            runtime.pending.is_some(),
-            "the accepted first prompt continues"
-        );
-        // Accepted work can retain client updates while hidden. Once its
-        // original send settles, presentation must remain hidden too.
-        settle(&mut app, card, Ok(()));
-        assert!(chat_runtime(&app, card).queued.is_none());
-        assert!(!handle.is_visible_for_test());
-
-        return_to_chat(&mut app);
-        assert!(chat_runtime(&app, card).visible.load(Ordering::Relaxed));
-        assert!(handle.is_visible_for_test());
-        assert!(Arc::ptr_eq(
-            chat_runtime(&app, card).handle().unwrap(),
-            &handle
-        ));
-    }
-
-    #[test]
-    fn a_draft_opened_by_late_recovery_stays_hidden_under_main_work() {
-        let mut app = crate::app::tests::context_inspector_test_app(false);
-        let card = live_chat(&mut app, None);
-        let session = chat_runtime(&app, card).session.clone();
-        app.chat_forget(card);
-        app.cards.insert(card, CardRuntime::Loading);
-        drop(app.open_chat(card, session, chat::Intent::Restore));
-        let target = chat_runtime_attempt(&app, card);
-        drop(app.update(Message::Viewport {
-            generation: app.workspace_view_generation,
-            event: WorkspaceViewportEvent::Resized(1_600.0),
-        }));
-        open_work_over_chat(&mut app);
-        assert_eq!(
-            app.workspace.visibility(card),
-            Some(VisibilityClass::Visible)
-        );
-
-        answer_start(
-            &mut app,
-            target,
-            Err(chat::StartFailure::fresh("fixture: no prior conversation")),
-        );
-        let runtime = chat_runtime(&app, card);
-        assert!(runtime.is_draft());
-        assert!(!runtime.visible.load(Ordering::Relaxed));
-        assert!(!app.chat_start_pending(card));
-
-        return_to_chat(&mut app);
-        assert!(chat_runtime(&app, card).visible.load(Ordering::Relaxed));
-    }
-
-    #[test]
-    fn offscreen_late_ready_stays_hidden_when_main_work_returns_to_conversations() {
-        let mut app = crate::app::tests::context_inspector_test_app(false);
-        let (card, target) = starting_chat(&mut app);
-        let handle = fixture_handle(&app, card, Some(KNOWN_THREAD));
-        drop(app.update(Message::Viewport {
-            generation: app.workspace_view_generation,
-            event: WorkspaceViewportEvent::Resized(1_600.0),
-        }));
-        assert_eq!(
-            app.workspace.visibility(card),
-            Some(VisibilityClass::Visible)
-        );
-        for _ in 0..5 {
-            draft_chat(&mut app);
-        }
-        // Advance ordinary frames so native scrolling observes settled pane
-        // geometry, rather than guessing a width or changing exposure flags.
-        let frame = Instant::now();
-        for step in 0..=4 {
-            drop(app.update(Message::Frame(frame + Duration::from_millis(step * 250))));
-        }
-        let width = app.workspace.viewport_width();
-        let offset = app.workspace.geometry().max_offset(width);
-        drop(app.update(Message::Viewport {
-            generation: app.workspace_view_generation,
-            event: WorkspaceViewportEvent::Scrolled(workspace_widget::ViewportSample {
-                offset,
-                width,
-                user_input: true,
-            }),
-        }));
-        assert_eq!(
-            app.workspace.visibility(card),
-            Some(VisibilityClass::Offscreen)
-        );
-        assert_eq!(app.exposure(card), Exposure::Offscreen);
-
-        open_work_over_chat(&mut app);
-        answer_start(&mut app, target, Ok(handle.clone()));
-        assert!(app.chat_ui.attempt(card).is_none(), "Ready is consumed");
-        assert!(Arc::ptr_eq(
-            chat_runtime(&app, card).handle().unwrap(),
-            &handle
-        ));
-        assert!(chat_runtime(&app, card).pending.is_some());
-        assert!(!chat_runtime(&app, card).visible.load(Ordering::Relaxed));
-        settle(&mut app, card, Ok(()));
-
-        return_to_chat(&mut app);
-        assert_eq!(
-            app.workspace.visibility(card),
-            Some(VisibilityClass::Offscreen)
-        );
-        assert!(!chat_runtime(&app, card).visible.load(Ordering::Relaxed));
-        assert!(!handle.is_visible_for_test());
-        assert!(Arc::ptr_eq(
-            chat_runtime(&app, card).handle().unwrap(),
-            &handle
-        ));
     }
 
     /// A new conversation whose start, for its first message, is still in
@@ -22168,6 +22398,7 @@ mod tests {
             "History keeps its daemon IPC connection"
         );
         runtime.set_visible(false).unwrap();
+        runtime.cool();
         preparation::retirement_barrier();
         assert_eq!(runtime.snapshot.transcript_bytes(), 0);
         assert_eq!(handle.snapshot().transcript_bytes(), 0);
@@ -22621,6 +22852,83 @@ mod tests {
             Ok(()),
         )));
         assert!(!app.card_state(card).unwrap().existence.is_open());
+    }
+
+    /// A Close the daemon refuses because a dead helper left processes
+    /// running stays on the pane: it names them, ends the proved ones and
+    /// closes again, and its notice leaves with the pane.
+    #[test]
+    fn a_refused_close_stays_on_its_pane_and_ends_what_holds_it() {
+        use crate::terminal::ipc::{LostProcess, ProcessStart};
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let source = app.chat_return_session(card).unwrap();
+        let _ = app.begin_chat_close(card);
+        let close = app.chat_ui.phases[&card].target();
+        let reason = "Codex is still running for this conversation, but the Cagents helper that controlled it is gone, so the conversation was kept rather than leave Codex running unseen.";
+        let _ = app.update(Message::ChatUi(Action::RetainedCloseFinished(
+            close,
+            source.clone(),
+            Err(reason.into()),
+        )));
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        let runtime = chat_runtime(&app, card);
+        let target = runtime.target;
+        let refusal = runtime.close_refusal.as_ref().expect("shown on the pane");
+        assert_eq!(refusal.reason(), reason);
+        assert!(app.notices.has(NoticeKey::ChatClose(card)));
+
+        let codex = LostProcess {
+            process: ProcessStart {
+                pid: 4045845,
+                start: 9000,
+            },
+            name: "codex".into(),
+            command: "codex app-server --listen unix:///tmp/cagents-codex-x/control.sock".into(),
+            proved: true,
+        };
+        let stranger = LostProcess {
+            process: ProcessStart {
+                pid: 4100000,
+                start: 9100,
+            },
+            name: "sleep".into(),
+            command: "sleep 100".into(),
+            proved: false,
+        };
+        let _ = app.update(Message::ChatUi(Action::CloseHolders(
+            target,
+            source.clone(),
+            Ok(vec![codex.clone(), stranger.clone()]),
+        )));
+        let refusal = chat_runtime(&app, card).close_refusal.as_ref().unwrap();
+        assert_eq!(refusal.processes(), [codex, stranger]);
+        assert_eq!(refusal.end_action(), Some("End 1 process and close".into()));
+
+        let _ = app.update(Message::ChatUi(Action::EndCloseHolders(target)));
+        assert!(
+            chat_runtime(&app, card)
+                .close_refusal
+                .as_ref()
+                .unwrap()
+                .ending()
+        );
+        // Once they are ended, it closes again, and that Close says anew
+        // whatever it finds.
+        let _ = app.update(Message::ChatUi(Action::CloseHoldersEnded(
+            target,
+            source.clone(),
+            Ok(Vec::new()),
+        )));
+        assert!(chat_runtime(&app, card).close_refusal.is_none());
+        let close = app.chat_ui.phases[&card].target();
+        let _ = app.update(Message::ChatUi(Action::RetainedCloseFinished(
+            close,
+            source,
+            Ok(()),
+        )));
+        assert!(!app.card_state(card).unwrap().existence.is_open());
+        assert!(!app.notices.has(NoticeKey::ChatClose(card)));
     }
 
     #[test]
@@ -23091,6 +23399,548 @@ mod tests {
         let attempt = app.chat_ui.attempt(card).expect("Try again resumes");
         assert_eq!(attempt.intent, chat::Intent::Resume);
         assert_eq!(attempt.session, source);
+    }
+
+    fn daemon_proof(daemon: &str) -> crate::model::HostSessionProof {
+        crate::model::HostSessionProof {
+            host_session_id: format!("{daemon}-host").into(),
+            boot_id: format!("{daemon}-boot").into(),
+            host_incarnation: format!("{daemon}-incarnation").into(),
+        }
+    }
+
+    /// A saved chat last connected through `daemon`, whose provider queue was
+    /// saved there, reopened by the fixture daemon with its provider listing
+    /// `listed`.
+    fn reopen_with_saved_queue(
+        daemon: &str,
+        waiting: Vec<chat::QueuedMessage>,
+        listed: Vec<chat::QueuedMessage>,
+    ) -> (Cagents, CardId) {
+        reopen_with(
+            daemon,
+            daemon,
+            waiting,
+            Snapshot {
+                queued_messages: listed,
+                ..Snapshot::default()
+            },
+        )
+    }
+
+    /// As [`reopen_with_saved_queue`], with the queue saved under
+    /// `queue_daemon` and the reopened provider showing `reopened`.
+    fn reopen_with(
+        daemon: &str,
+        queue_daemon: &str,
+        waiting: Vec<chat::QueuedMessage>,
+        reopened: Snapshot,
+    ) -> (Cagents, CardId) {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let mut session = chat::fresh_session(
+            Provider::Claude,
+            TerminalId::new(),
+            PathBuf::from("/project"),
+            &crate::account::Account::system(Provider::Claude),
+        )
+        .unwrap();
+        session.launch.session_id = Some("f0e49307-af96-4edd-b23f-60b185fe4fea".into());
+        session.proof = Some(daemon_proof(daemon));
+        drop(app.insert_chat_card(session.clone(), None, None));
+        let card = app.workspace.focused().unwrap();
+        app.chat_ui.drafts.insert(card, "typed after".into());
+        app.chat_ui.waiting.insert(
+            card,
+            SavedQueue {
+                host: Some(daemon_proof(queue_daemon)),
+                messages: waiting,
+            },
+        );
+        let target = chat_runtime_attempt(&app, card);
+        // The fixture daemon is "fixture"; the saved session names `daemon`.
+        session.proof = Some(daemon_proof("fixture"));
+        answer_start(
+            &mut app,
+            target,
+            Ok(Arc::new(ClientHandle::fixture(
+                session.clone(),
+                Snapshot {
+                    ready: true,
+                    session_id: session.launch.session_id.clone(),
+                    ..reopened
+                },
+            ))),
+        );
+        (app, card)
+    }
+
+    fn saved_queue() -> Vec<chat::QueuedMessage> {
+        let mut first = provider_message("queued-1", "Then run the tests");
+        first.attachments = vec![Attachment::file("/project/notes.txt")];
+        vec![first, provider_message("queued-2", "And summarize")]
+    }
+
+    /// Messages a provider held when its daemon went (#2208) come back to the
+    /// composer ahead of what was typed after them, files included, with a
+    /// notice that nothing was sent again. They are never sent from here.
+    #[test]
+    fn a_queue_the_daemon_lost_comes_back_to_the_draft_unsent() {
+        let (mut app, card) = reopen_with_saved_queue("old", saved_queue(), vec![]);
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(
+            runtime.composer.text().trim(),
+            "Then run the tests\nAnd summarize\ntyped after"
+        );
+        assert_eq!(
+            runtime.attachments,
+            [Attachment::file("/project/notes.txt")]
+        );
+        assert_eq!(
+            runtime.restored_waiting,
+            Some(RestoredWaiting {
+                count: 2,
+                whole: true
+            })
+        );
+        assert!(runtime.pending.is_none());
+        assert!(runtime.queued.is_none());
+        assert!(runtime.followups.is_empty());
+        assert!(!app.chat_ui.waiting.contains_key(&card));
+        // The draft now holds them, so the saved queue no longer does.
+        let saved = app.persistent_workspace();
+        assert!(!saved.chat_waiting_messages.contains_key(&card));
+        assert_eq!(
+            saved.chat_drafts.get(&card).map(|draft| draft.trim()),
+            Some("Then run the tests\nAnd summarize\ntyped after")
+        );
+        assert_eq!(
+            saved.chat_draft_attachments.get(&card).unwrap(),
+            &[Attachment::file("/project/notes.txt")]
+        );
+        // Dismissing the notice puts it away and keeps the draft.
+        let target = chat_runtime(&app, card).target;
+        drop(app.handle_chat_ui(Action::DismissRestoredWaiting(target)));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.restored_waiting, None);
+        assert_eq!(
+            runtime.composer.text().trim(),
+            "Then run the tests\nAnd summarize\ntyped after"
+        );
+    }
+
+    /// The notice describes the draft, so it goes when the draft does: sent,
+    /// even while the reader types on, or cleared away by hand.
+    #[test]
+    fn the_restored_notice_leaves_with_the_draft_it_describes() {
+        let (mut app, card) = reopen_with_saved_queue("old", saved_queue(), vec![]);
+        let target = chat_runtime(&app, card).target;
+        drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Send)));
+        assert!(chat_runtime(&app, card).pending.is_some());
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .composer_action(text_editor::Action::Edit(text_editor::Edit::Insert('!')));
+        assert!(chat_runtime(&app, card).restored_waiting.is_some());
+        settle(&mut app, card, Ok(()));
+        assert_eq!(chat_runtime(&app, card).restored_waiting, None);
+
+        let (mut app, card) = reopen_with_saved_queue("old", saved_queue(), vec![]);
+        let target = chat_runtime(&app, card).target;
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.composer_action(text_editor::Action::SelectAll);
+        runtime.composer_action(text_editor::Action::Edit(text_editor::Edit::Backspace));
+        // The file is still there, and so is what the notice says about it.
+        assert!(runtime.restored_waiting.is_some());
+        drop(app.handle_chat_ui(Action::RemoveAttachment(target, 0)));
+        assert_eq!(chat_runtime(&app, card).restored_waiting, None);
+    }
+
+    /// The notice says what it can promise: nothing was resent, and the agent
+    /// may have the message anyway; and when only part came back, that too.
+    #[test]
+    fn the_restored_notice_says_nothing_was_resent_and_what_is_missing() {
+        assert_eq!(
+            RestoredWaiting {
+                count: 1,
+                whole: true
+            }
+            .caption(),
+            "Back in your draft: a message that was still queued when this conversation stopped. It has not been resent; the agent may already have received it."
+        );
+        assert_eq!(
+            RestoredWaiting {
+                count: 3,
+                whole: false
+            }
+            .caption(),
+            "Back in your draft: 3 messages that were still queued when this conversation stopped. They have not been resent; the agent may already have received some of them. Only part of what was queued could be restored; check it before sending."
+        );
+        // An attachment listed without a file it can name is part missing.
+        let mut message = provider_message("queued-1", "Look at this");
+        message.attachments = vec![Attachment {
+            path: PathBuf::new(),
+            reference: None,
+        }];
+        let (app, card) = reopen_with_saved_queue("old", vec![message], vec![]);
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.attachments.is_empty());
+        assert_eq!(
+            runtime.restored_waiting,
+            Some(RestoredWaiting {
+                count: 1,
+                whole: false
+            })
+        );
+    }
+
+    /// A message the reopened provider still lists is waiting there, and only
+    /// the rest comes back; one listed only in preview says so. A provider
+    /// whose ids only number places in its queue is matched by the message.
+    #[test]
+    fn a_queue_the_new_provider_still_lists_stays_with_the_provider() {
+        for renumbered in [false, true] {
+            let mut queue = saved_queue();
+            queue[1].editable = false;
+            let mut still = queue[0].clone();
+            if renumbered {
+                still.id = "queued-2".into();
+            }
+            let (app, card) = reopen_with_saved_queue("old", queue, vec![still]);
+            let runtime = chat_runtime(&app, card);
+            // Renumbered, the listed message carries the other saved
+            // message's id, yet its words still claim the message it is: either
+            // way only the message the provider no longer holds comes back.
+            assert_eq!(
+                runtime.composer.text().trim(),
+                "And summarize\ntyped after",
+                "renumbered: {renumbered}"
+            );
+            assert!(runtime.attachments.is_empty());
+            assert_eq!(
+                runtime.restored_waiting,
+                Some(RestoredWaiting {
+                    count: 1,
+                    whole: false
+                })
+            );
+        }
+    }
+
+    /// A message the reopened provider's history shows it was given arrived,
+    /// so only what has no trace there comes back.
+    #[test]
+    fn a_message_the_history_shows_delivered_is_not_restored() {
+        let (app, card) = reopen_with(
+            "old",
+            "old",
+            saved_queue(),
+            Snapshot {
+                items: vec![Arc::new(chat::Item {
+                    id: "queued-1:0".into(),
+                    role: chat::Role::User,
+                    at: None,
+                    started_at: None,
+                    content: ItemContent::Text {
+                        text: "Then run the tests".into(),
+                        thinking: false,
+                        phase: chat::Phase::Final,
+                    },
+                })],
+                ..Snapshot::default()
+            },
+        );
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.composer.text().trim(), "And summarize\ntyped after");
+        assert!(runtime.attachments.is_empty());
+        assert_eq!(runtime.restored_waiting.map(|notice| notice.count), Some(1));
+    }
+
+    /// Each message the new provider lists stands for one saved message, so
+    /// a message queued twice comes back once when the provider still holds
+    /// one copy. A listed message's words outrank its id, which a provider
+    /// may have reused for another message, and its id alone still claims a
+    /// message it lists only in preview.
+    #[test]
+    fn each_listed_message_accounts_for_one_saved_message() {
+        let message = |id: &str, text: &str| chat::QueuedMessage {
+            id: id.into(),
+            text: text.into(),
+            editable: true,
+            delivery: chat::QueueDelivery::default(),
+            attachments: Vec::new(),
+        };
+        let left = |listed: Vec<chat::QueuedMessage>, saved: Vec<chat::QueuedMessage>| {
+            let snapshot = Snapshot {
+                queued_messages: listed,
+                ..Snapshot::default()
+            };
+            unaccounted(&snapshot, saved)
+                .into_iter()
+                .map(|message| message.id)
+                .collect::<Vec<_>>()
+        };
+        // "b" claims its own copy; "x" then stands for "a" by its words.
+        assert_eq!(
+            left(
+                vec![message("b", "again"), message("x", "again")],
+                vec![
+                    message("a", "again"),
+                    message("b", "again"),
+                    message("c", "again"),
+                ],
+            ),
+            ["c"]
+        );
+        // A reused id does not hide the message whose words it now holds.
+        assert_eq!(
+            left(
+                vec![message("1", "second")],
+                vec![message("1", "first"), message("2", "second")],
+            ),
+            ["1"]
+        );
+        // A preview listed under the message's id still accounts for it.
+        assert_eq!(
+            left(
+                vec![message("1", "long message, cut")],
+                vec![message("1", "long message, cut short here")],
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    /// A queue saved under an earlier daemon than the one the conversation
+    /// last connected through outlived a build that keeps none, which ran in
+    /// between; what it lists is long settled and does not come back.
+    #[test]
+    fn a_queue_an_earlier_daemon_saved_is_not_restored() {
+        let (mut app, card) = reopen_with("old", "older", saved_queue(), Snapshot::default());
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.composer.text().trim(), "typed after");
+        assert_eq!(runtime.restored_waiting, None);
+        assert!(
+            !app.persistent_workspace()
+                .chat_waiting_messages
+                .contains_key(&card)
+        );
+    }
+
+    /// The daemon that held the queue still hosts the provider, which lists
+    /// what it holds now: what it no longer lists was delivered or removed.
+    #[test]
+    fn a_queue_saved_under_the_same_daemon_is_not_restored() {
+        let (mut app, card) = reopen_with_saved_queue("fixture", saved_queue(), vec![]);
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.composer.text().trim(), "typed after");
+        assert!(runtime.attachments.is_empty());
+        assert_eq!(runtime.restored_waiting, None);
+        assert!(!app.chat_ui.waiting.contains_key(&card));
+        assert!(
+            !app.persistent_workspace()
+                .chat_waiting_messages
+                .contains_key(&card)
+        );
+    }
+
+    /// What the provider holds is saved as it changes, and what has gone from
+    /// its queue is no longer saved.
+    #[test]
+    fn a_provider_queue_is_saved_while_it_holds_messages() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, handle) = provider_queue(&mut app, saved_queue());
+        // Saved with the daemon whose provider holds it.
+        assert_eq!(
+            app.persistent_workspace().chat_waiting_messages.get(&card),
+            Some(&SavedQueue {
+                host: Some(daemon_proof("fixture")),
+                messages: saved_queue(),
+            })
+        );
+        // The provider's next publication is saved when it arrives.
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.queued_messages.remove(0);
+        snapshot.generation += 1;
+        handle.publish_snapshot_for_test(snapshot);
+        let saves = crate::app::terminal_output_tests::persists();
+        drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+        assert_eq!(crate::app::terminal_output_tests::persists(), saves + 1);
+        assert_eq!(
+            app.persistent_workspace().chat_waiting_messages[&card].messages,
+            &saved_queue()[1..]
+        );
+        // A publication that leaves the queue as it was saves nothing more.
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        handle.publish_snapshot_for_test(snapshot);
+        drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+        assert_eq!(crate::app::terminal_output_tests::persists(), saves + 1);
+        provider_drops(&mut app, target, &handle, "queued-2", None);
+        assert!(
+            !app.persistent_workspace()
+                .chat_waiting_messages
+                .contains_key(&card)
+        );
+    }
+
+    /// Held follow-ups are saved with the draft, in the order written, so a
+    /// restart cannot lose them either.
+    #[test]
+    fn held_followups_are_saved_with_the_draft() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+            panic!("expected chat");
+        };
+        runtime
+            .followups
+            .push(followup(0, "first task", &["/project/a.txt"]));
+        runtime.followups.push(followup(1, "second task", &[]));
+        runtime.replace_draft(text_editor::Content::with_text("still typing"));
+        let (draft, attachments) = runtime.persistent_draft();
+        assert_eq!(draft.trim(), "first task\nsecond task\nstill typing");
+        assert_eq!(attachments, [Attachment::file("/project/a.txt")]);
+    }
+
+    /// Once the provider has taken held follow-ups they are saved without
+    /// them at once, so a restart cannot offer them to be sent again.
+    #[test]
+    fn sent_followups_leave_the_saved_draft_when_the_provider_takes_them() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("followup"));
+        let target = chat_runtime(&app, card).target;
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.followups.push(followup(0, "first task", &[]));
+        runtime.replace_draft(text_editor::Content::with_text("still typing"));
+        drop(app.dispatch_queued(target));
+        assert!(chat_runtime(&app, card).pending.as_ref().unwrap().followup);
+        // Until the provider takes it, the follow-up is saved with the draft.
+        assert_eq!(
+            app.persistent_workspace()
+                .chat_drafts
+                .get(&card)
+                .map(|draft| draft.trim()),
+            Some("first task\nstill typing")
+        );
+        let saves = crate::app::terminal_output_tests::persists();
+        settle(&mut app, card, Ok(()));
+        assert!(crate::app::terminal_output_tests::persists() > saves);
+        assert_eq!(
+            app.persistent_workspace()
+                .chat_drafts
+                .get(&card)
+                .map(|draft| draft.trim()),
+            Some("still typing")
+        );
+    }
+
+    /// A conversation parked for a terminal handoff refreshes no snapshot of
+    /// its own, yet what its provider holds is saved as it changes.
+    #[test]
+    fn a_parked_conversation_saves_its_provider_queue_as_it_changes() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, handle) = provider_queue(&mut app, saved_queue());
+        let Some(CardRuntime::Chat(runtime)) = app.cards.remove(&card) else {
+            panic!("chat runtime");
+        };
+        let mut runtime = runtime;
+        runtime.parked_queue = saved_queue()
+            .into_iter()
+            .map(|message| message.id)
+            .collect();
+        app.chat_ui.parked.insert(card, runtime);
+        assert_eq!(
+            app.persistent_workspace().chat_waiting_messages[&card].messages,
+            saved_queue()
+        );
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.queued_messages.remove(0);
+        snapshot.generation += 1;
+        handle.publish_snapshot_for_test(snapshot);
+        let saves = crate::app::terminal_output_tests::persists();
+        drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+        assert_eq!(crate::app::terminal_output_tests::persists(), saves + 1);
+        assert_eq!(
+            app.persistent_workspace().chat_waiting_messages[&card].messages,
+            &saved_queue()[1..]
+        );
+        drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+        assert_eq!(crate::app::terminal_output_tests::persists(), saves + 1);
+    }
+
+    /// An open conversation whose daemon went away, or whose provider ended,
+    /// gets back on reconnecting what that provider was holding; one that
+    /// reconnects to the provider that still holds it gets nothing back.
+    #[test]
+    fn an_open_conversation_reconnecting_gets_back_what_its_lost_provider_held() {
+        for (daemon, ended, restored) in [
+            ("old", false, true),
+            ("fixture", true, true),
+            ("fixture", false, false),
+        ] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let (card, target, handle) = history_fixture_for_provider(&mut app, Provider::Claude);
+            let mut snapshot = (*handle.snapshot()).clone();
+            snapshot.queued_messages = saved_queue();
+            snapshot.generation += 1;
+            handle.publish_snapshot_for_test(snapshot);
+            app.chat_runtime_mut(target)
+                .unwrap()
+                .replace_draft(text_editor::Content::with_text("typed after"));
+            let mut snapshot = (*handle.snapshot()).clone();
+            if ended {
+                snapshot.exited = true;
+            }
+            snapshot.generation += 1;
+            handle.publish_snapshot_for_test(snapshot);
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.refresh();
+            runtime.disconnected = !ended;
+            // The fixture daemon answers the reconnection; this conversation
+            // last connected through `daemon`.
+            runtime.session.proof = Some(daemon_proof(daemon));
+            drop(app.handle_chat_ui(Action::Reconnect(target)));
+            let attempt = chat_runtime_attempt(&app, card);
+            let session = app.chat_ui.attempt(card).unwrap().session.clone();
+            let session_id = session.launch.session_id.clone();
+            answer_start(
+                &mut app,
+                attempt,
+                Ok(Arc::new(ClientHandle::fixture(
+                    session,
+                    Snapshot {
+                        ready: true,
+                        session_id,
+                        ..Snapshot::default()
+                    },
+                ))),
+            );
+            let runtime = chat_runtime(&app, card);
+            assert!(
+                app.chat_ui.attempt(card).is_none()
+                    && runtime.session.proof == Some(daemon_proof("fixture")),
+                "{daemon} ended={ended}: the new connection was not taken (attempt {:?}, proof {:?}, status {:?}, error {:?}, disconnected {}, live {})",
+                app.chat_ui.attempt(card).map(|attempt| attempt.intent),
+                runtime.session.proof,
+                app.status,
+                runtime.error,
+                runtime.disconnected,
+                runtime.handle().is_some(),
+            );
+            if restored {
+                assert_eq!(
+                    runtime.composer.text().trim(),
+                    "Then run the tests\nAnd summarize\ntyped after",
+                    "{daemon} ended={ended}"
+                );
+                assert_eq!(
+                    runtime.attachments,
+                    [Attachment::file("/project/notes.txt")]
+                );
+                assert_eq!(runtime.restored_waiting.map(|notice| notice.count), Some(2));
+            } else {
+                assert_eq!(runtime.composer.text().trim(), "typed after");
+                assert_eq!(runtime.restored_waiting, None);
+            }
+        }
     }
 
     /// Every state a stopped or disconnected card can be in names its action
@@ -24747,7 +25597,7 @@ mod tests {
     }
 
     /// `/resume` sends nothing: it opens the picker on the conversation's
-    /// provider and project, searching for what follows it, and an untouched
+    /// project, searching for what follows it, and an untouched
     /// draft gives its place to the conversation chosen there.
     #[test]
     fn resume_command_opens_the_picker_for_this_conversation() {
@@ -24759,7 +25609,7 @@ mod tests {
         assert!(app.resume_ui.open);
         assert_eq!(app.resume_ui.query, "flaky tests");
         let scope = app.resume_ui.scope.as_ref().expect("a narrowed search");
-        assert_eq!(scope.provider, Provider::Codex);
+        assert_eq!(scope.reach, crate::app::resume_ui::Reach::Project);
         assert!(
             scope
                 .roots
@@ -24770,6 +25620,7 @@ mod tests {
         assert!(runtime.composer.is_empty());
         assert!(runtime.is_draft() && !app.chat_start_pending(card));
         assert_eq!(app.resume_ui.replace, Some(card));
+        assert_eq!(app.resume_ui.asked_from, Some(card), "not offered");
 
         let _ = app.resume_saved_conversation(earlier(&app, card));
         let resumed = app.workspace.focused().unwrap();
@@ -24995,7 +25846,7 @@ mod tests {
                 );
             }
             assert!(!app.channel_ui.was_deleted(channel));
-            assert!(app.channel_work.retire_candidates.contains(&home));
+            assert!(app.channel_ui.retire_candidates.contains(&home));
             let mut before_ack = Vec::new();
             while let Ok(edit) = published.try_recv() {
                 before_ack.push(edit);
@@ -27904,6 +28755,7 @@ mod tests {
         };
         drop(catalog);
         runtime.set_visible(false).unwrap();
+        runtime.cool();
         preparation::retirement_barrier();
         assert!(runtime.cache.is_empty());
         assert!(runtime.child_cache.is_empty());
@@ -28038,6 +28890,7 @@ mod tests {
         runtime.opened.insert("kept turn".into(), true);
         runtime.set_visible(false).unwrap();
         runtime.set_visible(false).unwrap();
+        runtime.cool();
         preparation::retirement_barrier();
         // A live hidden presentation releases the graph and its parser scratch;
         // a draft has no provider transcript to suspend.
@@ -30353,6 +31206,7 @@ mod tests {
         assert!(runtime.logical_prose.request().is_none());
         // Hiding the pane releases the complete text with the presentation.
         app.chat_runtime_mut(target).unwrap().show(false);
+        app.chat_runtime_mut(target).unwrap().cool();
         app.chat_runtime_mut(target).unwrap().refresh();
         assert!(chat_runtime(&app, card).logical_prose.raw().is_none());
     }
@@ -31849,6 +32703,7 @@ mod tests {
                             .unwrap()
                             .set_visible(false)
                             .unwrap();
+                        app.chat_runtime_mut(target).unwrap().cool();
                         preparation::retirement_barrier();
                         assert!(
                             app.chat_runtime_mut(target)
@@ -32047,6 +32902,7 @@ mod tests {
         runtime.unseen_activity = false;
         assert!(!runtime.cache.is_empty());
         runtime.set_visible(false).unwrap();
+        runtime.cool();
         preparation::retirement_barrier();
         // Client publications retire on a separate worker. Waiting for UI
         // presentation disposal alone does not establish body reclamation.

@@ -44,7 +44,7 @@ or underscores, names the task on HOST: ~/.local/state/cev/NAME there.
   where           Print the task and checkouts on HOST.
   clean           Remove the task's session, checkouts, refs and directory
                   from HOST; the shots here are kept.
-  start, stop, status, cli, env, drive, nested, save-seed
+  start, relaunch, stop, status, cli, env, drive, nested, save-seed
                   As in native-evidence, run on HOST. In cli and env
                   arguments, {fixture} stands for the fixture's root there.
 
@@ -379,7 +379,7 @@ cmd_pair() {
             --before) before=${2:-}; shift 2 || die '--before needs a source' 2 ;;
             --after) after=${2:-}; shift 2 || die '--after needs a source' 2 ;;
             --steps) steps=${2:-}; shift 2 || die '--steps needs a file' 2 ;;
-            --width | --portal | --limit | --wait-lock)
+            --width | --height | --portal | --limit | --wait-lock)
                 [ "$#" -ge 2 ] || die "$1 needs a value" 2
                 options+=("$1" "$2")
                 shift 2
@@ -451,7 +451,7 @@ case $command in
             :
         '
         ;;
-    start | stop | status | cli | env | drive | nested | save-seed) forward "$command" "$@" ;;
+    start | relaunch | stop | status | cli | env | drive | nested | save-seed) forward "$command" "$@" ;;
     *) usage >&2; exit 2 ;;
 esac
 exit

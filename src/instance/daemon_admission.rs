@@ -289,7 +289,7 @@ impl std::fmt::Display for DaemonStillStarting {
 pub(crate) fn admission_wait_timeout() -> Duration {
     // A daemon restoring an upgrade checkpoint may take as long as its
     // inventory allows. An unreadable checkpoint fails that daemon anyway.
-    crate::upgrade::handoff::startup_timeout().unwrap_or(Duration::from_secs(5))
+    crate::upgrade::handoff::startup_timeout().unwrap_or(crate::upgrade::handoff::STARTUP_BASE)
         + ADMISSION_WAIT_ALLOWANCE
 }
 

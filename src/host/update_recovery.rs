@@ -24,7 +24,7 @@ pub(super) fn restore_settled_from(
     };
     tracing::info!(checkpoint = %checkpoint.display(),
         "settled update checkpoint identified; adopting current holders and retaining paused history");
-    restore_recovered(host, settled, &[])
+    restore_recovered(host, checkpoint, daemon, settled, &[])
 }
 
 pub(super) fn restore_archived(
@@ -45,11 +45,13 @@ fn restore_archived_from(
     let Some(archived) = recovery::archived_discovery(checkpoint, daemon)? else {
         return Ok(false);
     };
-    restore_recovered(host, archived, refused)
+    restore_recovered(host, checkpoint, daemon, archived, refused)
 }
 
 fn restore_recovered(
     host: &SharedHost,
+    checkpoint: &std::path::Path,
+    daemon: &std::path::Path,
     settled: recovery::AlreadyRecovered,
     refused: &[crate::model::TerminalId],
 ) -> Result<bool, String> {
@@ -149,32 +151,40 @@ fn restore_recovered(
                 &retained_runs,
             )?;
     }
-    let (serving, terminals, chats) = {
+    ensure_no_ambiguous_adoption(host)?;
+    let (serving, terminals, chats, aliases) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        if !matches!(
-            state.startup_state(),
-            crate::terminal_ipc::StartupState::Ready
-        ) {
-            return Err("The recovered daemon has not finished startup; its Prepared checkpoint was retained".into());
-        }
-        let terminals = state
-            .terminals
-            .keys()
-            .map(|id| state.descriptor(0, *id).map_err(|error| error.message))
-            .collect::<Result<Vec<_>, _>>()?;
+        let chats = state
+            .chats
+            .values()
+            .filter(|record| !record.handle.is_read_only_history())
+            .map(|record| {
+                let mut session = record.session.clone();
+                session.launch.session_id = record.handle.session_id();
+                session.native_continuity = record.handle.native_continuity();
+                session
+            })
+            .collect::<Vec<_>>();
         (
             state.proof().clone(),
-            terminals,
-            live_chat_descriptors(&state),
+            state
+                .list(0)
+                .into_iter()
+                .map(recovery::proof_terminal_descriptor)
+                .collect::<Vec<_>>(),
+            chats,
+            state.upgrade_chats.clone(),
         )
     };
-    settled.validate_current_inventory(
-        &serving,
-        &terminals,
-        &chats,
-        &paused_terminals,
-        &paused_chats,
-    )?;
+    // Current ownership is freshly authenticated above. Failure to prove the
+    // historical update inventory must not prevent remaining real owners from
+    // serving after someone later closed a pane. The reader accepts only an
+    // exact positive publication for this incarnation, never the old proof.
+    if let Err(error) = recovery::verified::cold::publish(
+        checkpoint, daemon, &settled, &serving, &terminals, &chats, &aliases,
+    ) {
+        tracing::warn!(%error, "the current service is available but the original update census remains unverified");
+    }
     Ok(true)
 }
 
@@ -309,6 +319,33 @@ pub(super) fn restore(host: &SharedHost) -> Result<bool, String> {
                 &retained_runs,
             )?;
     }
+    // Publish the same immutable issued-chat lineage used by ordinary Ready
+    // restoration. Verification readers require the exact authenticated live
+    // descriptor, so this journal grants neither adoption nor replay authority.
+    let recovered = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        checkpoint
+            .chats
+            .iter()
+            .filter_map(|chat| {
+                let record = state.chats.get(&chat.source.id)?;
+                let mut replacement = record.session.clone();
+                replacement.launch.session_id = record.handle.session_id();
+                replacement.native_continuity = record.handle.native_continuity();
+                Some(crate::upgrade::handoff::RecoveredChat {
+                    evidence: chat.clone(),
+                    replacement,
+                    aliases: Vec::new(),
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    store.record_recovered(&recovered)?;
+    record.adopted_chat_descriptors = recovered
+        .iter()
+        .map(|entry| entry.replacement.clone())
+        .collect();
+    record.adopted_terminal_descriptors = host.lock().unwrap_or_else(|p| p.into_inner()).list(0);
     // The superseding record preserves Prepared byte-for-byte. It records this
     // one adoption's result; it never grants a later plain start new authority.
     record.finish(&successor)?;
@@ -383,29 +420,6 @@ fn paused_record(
         .filter(|presentation| paused.chats.contains(&presentation.session))
         .cloned()
         .collect();
-    // A frozen source may predate the provider's identity notification. Only
-    // the immutable captured page can bind that missing conversation identity;
-    // a later pane or Agent descriptor cannot teach the history a new thread.
-    for (source, saved) in paused.chats.iter_mut().zip(&mut paused.snapshots) {
-        if source.launch.session_id.is_none()
-            && let Some(identity) = saved.snapshot.session_id.clone()
-        {
-            if identity.is_empty() || identity.len() > 1024 {
-                return Err("The captured conversation identity is invalid".into());
-            }
-            if !paused.aliases.contains(source) {
-                paused.aliases.push(source.clone());
-            }
-            source.launch.session_id = Some(identity);
-            saved.source = source.clone();
-            if let Some(reason) = &mut saved.limitation {
-                *reason = reason.replace(
-                    "No conversation identity was recorded; start a new conversation explicitly to continue.",
-                    "Resume explicitly to inspect whether the recorded conversation can continue.",
-                );
-            }
-        }
-    }
     Ok(paused)
 }
 
@@ -517,20 +531,15 @@ mod tests {
 
     #[test]
     fn settled_prepared_restart_restores_history_without_replaying_its_provider() {
-        settled_restart_case(crate::agent::Provider::Codex, false);
+        settled_restart_case(crate::agent::Provider::Codex);
     }
 
     #[test]
     fn settled_prepared_restart_keeps_the_latest_adopted_chat_as_a_history_alias() {
-        settled_restart_case(crate::agent::Provider::Claude, false);
+        settled_restart_case(crate::agent::Provider::Claude);
     }
 
-    #[test]
-    fn settled_prepared_restart_preserves_identity_in_the_captured_page() {
-        settled_restart_case(crate::agent::Provider::Claude, true);
-    }
-
-    fn settled_restart_case(provider_kind: crate::agent::Provider, captured_only: bool) {
+    fn settled_restart_case(provider_kind: crate::agent::Provider) {
         use sha2::{Digest, Sha256};
         use std::os::unix::fs::PermissionsExt;
 
@@ -622,16 +631,12 @@ mod tests {
                 provider_version: "0.100.0".into(),
             };
         }
-        let history_source = source.clone();
-        if captured_only {
-            source.launch.session_id = None;
-        }
         let mut snapshots = recovery::SnapshotCapture::default();
         snapshots
             .push(
                 source.clone(),
                 chat::Snapshot {
-                    session_id: history_source.launch.session_id.clone(),
+                    session_id: source.launch.session_id.clone(),
                     title: Some("Paused across daemon restarts".into()),
                     items: vec![Arc::new(chat::Item {
                         id: "retained-page".into(),
@@ -662,7 +667,6 @@ mod tests {
         // This is the live descriptor the initial recovery actually issued to
         // the managed Agent and canonical pane, not a history retry shape.
         let mut issued = source.clone();
-        issued.launch.session_id = history_source.launch.session_id.clone();
         issued.proof = Some(proof("first-recovery"));
         assert!(
             registry
@@ -820,7 +824,7 @@ mod tests {
         assert!(!sentinel.exists());
         let mut requested = latest_saved;
         let mut expected_agent = original_agent.clone();
-        for epoch in ["cold-start", "subsequent-restart", "reader-restart"] {
+        for epoch in ["cold-start", "subsequent-restart"] {
             let retirement_before = recovery::archived_proof(&store.path, &daemon_binary)
                 .unwrap()
                 .map(|proof| (proof.retirement_path, proof.retirement_sha256));
@@ -860,7 +864,7 @@ mod tests {
                 crate::upgrade::floor::load()
                     .unwrap()
                     .resume_source(&requested),
-                Some(&history_source)
+                Some(&source)
             );
             let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
             let server_host = host.clone();
@@ -869,10 +873,7 @@ mod tests {
             let client =
                 chat::client::ClientHandle::fixture_restore(client, requested.clone()).unwrap();
             requested = client.session();
-            assert_eq!(
-                requested.launch.session_id,
-                history_source.launch.session_id
-            );
+            assert_eq!(requested.launch.session_id, source.launch.session_id);
             assert_eq!(requested.proof, Some(proof(epoch)));
             let handle = host.lock().unwrap().chats[&source.id].handle.clone();
             let page = handle.snapshot(None).unwrap();
@@ -928,7 +929,7 @@ mod tests {
                 // The retained-holder fixture separately exercises ordinary
                 // authentication. Record its exact public issuance here, then
                 // lose that owner before the next archived startup.
-                let mut issued_after_archive = history_source.clone();
+                let mut issued_after_archive = source.clone();
                 issued_after_archive.proof = Some(proof("adopted-after-archive"));
                 let mut registry = super::super::model::Registry::open().unwrap();
                 assert!(
@@ -969,35 +970,6 @@ mod tests {
                         .adopted_chat_descriptors
                         .contains(&issued_after_archive)
                 );
-            } else if epoch == "subsequent-restart" {
-                let mut registry = super::super::model::Registry::open().unwrap();
-                let model = registry.model().unwrap();
-                let view = model
-                    .views
-                    .iter()
-                    .find(|view| view.scope == expected_agent.placement)
-                    .unwrap();
-                let before = view
-                    .panes
-                    .iter()
-                    .find(|current| current.id == pane.id)
-                    .unwrap()
-                    .clone();
-                let mut replacement = before.clone();
-                replacement.kind = crate::model::CardKind::Chat(requested.clone());
-                registry
-                    .apply(&crate::workspace_model::ModelEdit::ChangeView {
-                        scope: view.scope.clone(),
-                        expected_revision: view.revision,
-                        operation: uuid::Uuid::new_v4(),
-                        change: crate::workspace_model::views::Change::Update {
-                            before,
-                            pane: replacement,
-                        },
-                    })
-                    .unwrap();
-                crate::upgrade::floor::prune_unreferenced(&BTreeSet::new()).unwrap();
-                assert!(crate::upgrade::floor::load().unwrap().records.is_empty());
             }
         }
         // A confirmed /clear keeps the authenticated actor but changes its

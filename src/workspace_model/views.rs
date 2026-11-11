@@ -29,6 +29,13 @@ impl From<ChannelId> for Scope {
     }
 }
 
+/// How long the daemon remembers an applied `ChangeView` operation, so a
+/// client that lost the reply can resend it and be told it already happened.
+/// A client must stop resending well before this; the window's publisher stops
+/// after a day.
+pub const OPERATION_RETENTION: std::time::Duration =
+    std::time::Duration::from_secs(7 * 24 * 60 * 60);
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Pane {
     pub id: CardId,

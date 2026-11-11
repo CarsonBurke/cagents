@@ -125,10 +125,13 @@ Rules:
 - `card_scopes` (which worktree a pane is filed under) is shared state today
   stored per window; it becomes the pane's `filing` column.
 
-## Daemon schema (target)
+## Daemon schema
 
 All tables are `STRICT`. Integer surrogate keys replace the serde-JSON scope
-key that is the primary key today.
+key that was schema 22's primary key. Schema 23 (stage 3) ships `view_scopes`,
+`view_revision_clock`, `panes`, `retired_panes` and `view_operations`;
+`closed_panes`, `drafts` and `draft_attachments` arrive with stage 5, which
+moves that history into the daemon.
 
 ```sql
 CREATE TABLE view_scopes(
@@ -136,10 +139,15 @@ CREATE TABLE view_scopes(
   channel TEXT UNIQUE REFERENCES channels(id) ON DELETE CASCADE,
   repository TEXT REFERENCES projects(repository) ON DELETE CASCADE,
   worktree TEXT,
-  revision INTEGER NOT NULL DEFAULT 0,
+  revision INTEGER NOT NULL CHECK(revision >= 0),
   UNIQUE(repository, worktree),
   CHECK((channel IS NULL) = (repository IS NOT NULL)),
   CHECK((repository IS NULL) = (worktree IS NULL))
+) STRICT;
+
+CREATE TABLE view_revision_clock(          -- one row: the last revision issued
+  id INTEGER PRIMARY KEY CHECK(id = 1),
+  last INTEGER NOT NULL CHECK(last >= 0)
 ) STRICT;
 
 CREATE TABLE panes(
@@ -164,6 +172,7 @@ CREATE INDEX panes_by_scope ON panes(scope, position, id);
 CREATE TABLE retired_panes(
   scope INTEGER NOT NULL REFERENCES view_scopes(id) ON DELETE CASCADE,
   pane TEXT NOT NULL,
+  ordinal INTEGER NOT NULL,                  -- retirement order within the scope
   retired_at_unix_ms INTEGER NOT NULL,
   PRIMARY KEY(scope, pane)
 ) STRICT, WITHOUT ROWID;
@@ -172,7 +181,7 @@ CREATE TABLE view_operations(
   operation TEXT PRIMARY KEY,
   scope INTEGER NOT NULL REFERENCES view_scopes(id) ON DELETE CASCADE,
   applied_at_unix_ms INTEGER NOT NULL
-) STRICT;
+) STRICT, WITHOUT ROWID;
 CREATE INDEX view_operations_by_age ON view_operations(applied_at_unix_ms);
 
 CREATE TABLE closed_panes(
@@ -218,7 +227,9 @@ kept in step by hand. The constraint matches `same_resource`, which compares
 resources only within one kind (chat and terminal ids share a type). A draft
 belongs to its pane and goes with it; closing a pane with a draft keeps the
 draft text in its `closed_panes` row's descriptor, as reopening does today. `shared_view_terminal_sources`, `channel_work_placement_epochs`
-and `shared_terminal_retention_pins` keep their columns and point at `panes`.
+and `shared_terminal_retention_pins` keep their columns; the sources and pins
+reference `panes`, and placement epochs stay keyed by pane id without a
+foreign key, deleted when their pane leaves.
 
 ### What is a column and what is a descriptor
 
@@ -249,14 +260,33 @@ Order is `(position, id)`, so a tie is still a total order; there is no unique
 constraint on position, which SQLite would check row by row in the middle of a
 renumbering update.
 
-A scope's revision is taken from the model-wide `metadata.sequence` when the
-scope changes, not counted per scope from 1. A scope that is deleted and later
-recreated therefore never repeats a revision a stale client still holds, so
-its `expected_revision` conflicts and rebases instead of matching by accident.
+A scope's revision is drawn from one model-wide clock, `view_revision_clock`,
+when the scope changes, not counted per scope from 1. A scope that is deleted
+and later recreated therefore never repeats a revision a stale client still
+holds, so its `expected_revision` conflicts and rebases instead of matching by
+accident. The clock is its own row rather than `metadata.sequence` because
+adopting or rebinding a pane changes its view without advancing the model
+sequence. Conversion starts the clock at the largest stored revision. Schema
+22 has no clock, so a store converted back and forward again restarts it at
+the largest revision that survived; a scope deleted under 23 whose revision
+was larger than every surviving one could then be recreated with a revision
+a stale client still holds. That needs a rollback and a re-upgrade between
+the client's last read and its next edit, and is accepted.
+
+Writing a view compares it with the stored rows and changes only those that
+differ: a moved pane updates its `position`, a retitled pane its row, and the
+scope its revision. Panes on the longest run whose stored positions still
+increase keep them; the rest take midpoints between their neighbors.
 
 ## Write paths
 
 ### Daemon edits are row changes
+
+This section is the target once closed history moves into the daemon (stage
+5). Stage 3 already writes only the rows an edit changed, by comparing the
+edited view with the stored rows, but still applies the edit to the view in
+memory, keeps no `closed_panes`, and derives placement and retention from the
+whole view before and after.
 
 `ModelEdit::ChangeView` keeps its wire shape. Applying one is O(change):
 
@@ -318,7 +348,7 @@ check, so a stale window cannot overwrite a newer draft from another window.
 | `closed_panes` chat rows with a provider session | 180 days, at most 5000 rows, and never while its resource is hosted or pinned | deleted oldest first |
 | `closed_panes` other rows | 30 days, and never while its resource is hosted or pinned | deleted |
 | `retired_panes`, empty `view_scopes` | until no window can seed from a local copy (stage 5) | then 30 days |
-| `shared_view_edits` / `view_operations` | kept until rows carry `applied_at` (stage 3); then 7 days, and never while a window still holds the operation pending | deleted. Not pruned earlier: `operation_seen` is the only replay guard, and a replay it misses fails the revision check as a *retryable* conflict, so a rebasing client would apply it twice |
+| `view_operations` | 7 days after `applied_at_unix_ms` (`OPERATION_RETENTION`); conversion from schema 22 starts every existing row's age at the conversion | deleted by the daemon's runtime collector, at most 5000 rows every 10 minutes. `operation_seen` is the only replay guard, and a replay it misses fails the revision check as a *retryable* conflict, so a rebasing client could apply it twice. A window's publisher therefore never resends a pane change more than 24 hours (`REPLAY_LIMIT`) after first sending it, and a test holds the retention at six times that. A pending terminal's insert, whose operation is the pane's id, is sent again by a restarted window regardless of age; that is safe because an insert of a pane the view holds or retired changes nothing |
 | Worktree scopes whose project is closed | cascade, after their panes become `closed_panes` rows | deleted with the project |
 | `.final` receipt snapshot | until the daemon commits the actor's retirement | rewritten without the transcript and marked `compacted`; the proof fields stay so same-boot readers keep validating, and reading it as a transcript is an error |
 | `.final` of an actor that ended without retiring | until reboot | kept whole: a close whose reply was lost publishes its transcript from it |
@@ -417,9 +447,16 @@ stores, so an old copy can never feed a later upgrade or seed.
   backup is not a rollback: it discards every daemon write since, including
   native actor ownerships and retirements that running helpers depend on.
   Each schema stage therefore ships a converter back to the previous layout
-  (`cagentsd --downgrade-store <version>`), run by the installer's rollback
-  path before it starts the previous daemon, and tested in both directions on
-  a realistic store. The backup is kept only for manual recovery.
+  (`cagents daemon downgrade-store <version>`, which runs the matched
+  `cagentsd --downgrade-store`), run by the installer's rollback path before
+  it starts the previous daemon, and tested in both directions on a
+  realistic store. The backup is kept only for manual recovery.
+- A downgrade step must leave a store the older daemon can edit, not only
+  open. Restoring a table the newer schema dropped means restoring its
+  invariants too: the view writers of schemas 22 and 23 refuse any edit to a
+  view holding a pane without a `channel_work_placement_epochs` row, so a step
+  that brings back `channel_work` tables writes one epoch per pane and sets
+  the placement clock, as the channel-work migration does.
 - The wire changes (scope revisions on edits, `ReadWorkspaceView`, draft
   edits) bump `PROTOCOL_VERSION`. Window and daemon versions are a matched set,
   so the in-app update performs a full daemon upgrade, with its existing
@@ -481,10 +518,27 @@ measurement on a realistic-size workspace.
    milliseconds, within noise), and skipping closed cards before serializing
    them, which stage 5 does properly by dropping closed cards from window
    state.
-3. Normalized daemon view schema (`view_scopes`, `panes`, `retired_panes`,
-   `view_operations`, `closed_panes`), row-level edits, its downgrade
-   converter, no wire change. Conversion from `shared_views` is mechanical:
-   one row per pane in list order, one per retired id.
+3. Normalized daemon view schema (`view_scopes`, `view_revision_clock`,
+   `panes`, `retired_panes`, `view_operations`), row-level edits, 7-day
+   operation retention, and `cagents daemon downgrade-store`, with which a failed
+   update converts the store back to the schema it recorded before the
+   replacement daemon started; no wire change.
+   Conversion keeps every pane a view holds open, in list order. A pane
+   listed in two views stays in the one schema 22's index named, and a second
+   pane for one resource gives way to the first, as schema 22 resolved both;
+   the view a pane leaves retires its id and takes a new revision, so neither
+   a stale seed nor a stale edit can bring it back, and a pane that gives way
+   loses its retention pin with its placement. Only an unreadable view
+   refuses, leaving the store at 22. On a copy of the user's store (1858
+   views, 88 panes, 46012 applied operations; `local` profile on fw16,
+   medians of 25, two runs each): an edit to the busiest view costs 7 ms and
+   29 to 49 KB of WAL instead of 9 to 11 ms and 58 to 82 KB; a window
+   re-seeding panes the view already holds costs 6 ms instead of 21 to 24 ms;
+   the model read costs 4 ms instead of 5 to 6 ms; open is unchanged at 3 to
+   4 ms. Converting once takes 0.4 to 0.7 s and converting back 0.3 s. The
+   file's contents shrink from 31.8 MB to 25.0 MB, but the file keeps its
+   high-water mark (37.7 MB) as free pages SQLite reuses until the converted
+   operations age out. Closed panes and drafts move to stage 5.
 4. Deltas to subscribers and per-scope reads (protocol bump).
 5. Daemon-owned closed-pane history and drafts; windows become subscribers
    with per-window stores; migration from all window stores.

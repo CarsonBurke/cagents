@@ -14,7 +14,7 @@ impl Registry {
     }
 
     fn capture_update_floor_snapshot(&self, record: &mut Record) -> Result<(), String> {
-        let views = super::views::all(&self.db)?;
+        let views = super::views::store::published_snapshot(&self.db)?;
         for session in &record.chats {
             let Some(agent) = self.agent_for_session(session.id)? else {
                 continue;
@@ -41,11 +41,13 @@ impl Registry {
             if found.next().is_some() {
                 return Err("A reviewed agent has ambiguous pane ownership".into());
             }
-            if let crate::model::CardKind::Chat(saved) = &pane.kind
-                && crate::upgrade::floor::same_allocation(session, saved)
-                && !record.aliases.contains(saved)
-            {
-                record.aliases.push(saved.clone());
+            if let crate::model::CardKind::Chat(saved) = &pane.kind {
+                if !crate::upgrade::floor::same_allocation(session, saved) {
+                    return Err("A reviewed agent's pane names a different chat allocation".into());
+                }
+                if !record.aliases.contains(saved) {
+                    record.aliases.push(saved.clone());
+                }
             }
             record.presentations.push(Presentation {
                 agent: agent.id,
@@ -67,7 +69,7 @@ impl Registry {
     fn restore_update_floor_inner(&mut self, record: &mut Record) -> Result<(), String> {
         let transaction = self.db.transaction().map_err(|e| e.to_string())?;
         let mut changed = false;
-        for saved in &mut record.presentations {
+        for saved in &record.presentations {
             if saved.restored {
                 continue;
             }
@@ -80,7 +82,6 @@ impl Registry {
                 .optional()
                 .map_err(|e| e.to_string())?;
             let Some(raw) = raw else {
-                saved.restored = true;
                 continue;
             };
             let agent: Agent = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
@@ -89,54 +90,26 @@ impl Registry {
                     owned.same_process(&HostedSession::Chat(saved.session.clone()))
                 })
             {
-                saved.restored = true;
                 continue;
             }
             let id = saved.pane.id;
             let mut view = super::views::read(&transaction, &saved.scope)?;
             if !view.retired.contains(&id) || view.panes.iter().any(|pane| pane.id == id) {
-                saved.restored = true;
                 continue;
             }
-            let owner: bool = transaction
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM shared_view_panes WHERE id=?1)",
-                    [id.to_string()],
-                    |row| row.get(0),
-                )
-                .map_err(|e| e.to_string())?;
-            if owner {
+            if super::views::store::owner(&transaction, id)?.is_some()
+                || super::views::store::resource_holder(&transaction, &saved.pane)?.is_some()
+            {
                 return Err("The stopped agent's pane acquired another owner; retained presentation was not overwritten".into());
             }
             view.retired.retain(|retired| *retired != id);
             view.panes
                 .insert(saved.ordinal.min(view.panes.len()), saved.pane.clone());
-            view.revision = view
-                .revision
-                .checked_add(1)
-                .ok_or("view revision exhausted")?;
-            let scope = serde_json::to_string(&saved.scope).map_err(|e| e.to_string())?;
-            transaction
-                .execute(
-                    "INSERT INTO shared_view_panes(id,scope) VALUES(?1,?2)",
-                    params![id.to_string(), scope],
-                )
-                .map_err(|e| e.to_string())?;
+            view.revision = super::views::store::next_revision(&transaction)?;
+            super::views::store::store(&transaction, &view)?;
             // Update only the exact stopped presentation. Runs, launch authority,
             // actor journals and retirement receipts remain as the old close left them.
             transaction.execute("UPDATE agents SET closed=0,record=json_set(record,'$.closed',json('false'),'$.process_end',?2) WHERE id=?1", params![saved.agent.to_string(), saved.session.id.to_string()]).map_err(|e| e.to_string())?;
-            transaction
-                .execute(
-                    "UPDATE shared_views SET revision=?2,panes=?3,retired=?4 WHERE scope=?1",
-                    params![
-                        scope,
-                        view.revision,
-                        serde_json::to_string(&view.panes).map_err(|e| e.to_string())?,
-                        serde_json::to_string(&view.retired).map_err(|e| e.to_string())?
-                    ],
-                )
-                .map_err(|e| e.to_string())?;
-            saved.restored = true;
             changed = true;
         }
         if changed {
@@ -145,6 +118,11 @@ impl Registry {
                 .map_err(|e| e.to_string())?;
         }
         transaction.commit().map_err(|e| e.to_string())?;
+        // Do not acknowledge any entry before the whole model transaction has
+        // committed. A later conflicting pane must leave earlier entries retryable.
+        for saved in &mut record.presentations {
+            saved.restored = true;
+        }
         // Durable one-shot acknowledgement prevents a later genuine pane close
         // from being undone on the next daemon start. Startup fails if it cannot
         // retain that acknowledgement, before any user can edit the restored pane.
@@ -167,7 +145,6 @@ fn capture_presentations_at(path: &Path, record: &mut Record) -> Result<(), Stri
         .db
         .unchecked_transaction()
         .map_err(|e| e.to_string())?;
-    super::schema::require_published_snapshot(&snapshot)?;
     registry.capture_update_floor_snapshot(record)?;
     snapshot.commit().map_err(|e| e.to_string())
 }
@@ -248,8 +225,13 @@ mod tests {
     };
 
     fn fixture() -> (Registry, Record, Agent) {
-        let db = Connection::open_in_memory().unwrap();
-        db.execute_batch("CREATE TABLE metadata(key INTEGER PRIMARY KEY,sequence INTEGER); INSERT INTO metadata VALUES(0,0); CREATE TABLE agents(id TEXT PRIMARY KEY,origin TEXT,record TEXT,session_id TEXT UNIQUE,closed INTEGER); CREATE TABLE shared_view_scopes(scope TEXT PRIMARY KEY); CREATE TABLE shared_views(scope TEXT PRIMARY KEY,revision INTEGER,panes TEXT,retired TEXT); CREATE TABLE shared_view_panes(id TEXT PRIMARY KEY,scope TEXT); CREATE TABLE agent_runs(id TEXT PRIMARY KEY,state TEXT); INSERT INTO agent_runs VALUES('unfinished','cancelled'); CREATE TABLE agent_authorities(token TEXT PRIMARY KEY); ").unwrap();
+        let mut db = Connection::open_in_memory().unwrap();
+        let tx = db.transaction().unwrap();
+        super::super::migrate_through(&tx, 0, SCHEMA_VERSION).unwrap();
+        tx.pragma_update(None, "user_version", SCHEMA_VERSION)
+            .unwrap();
+        tx.commit().unwrap();
+        db.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         let proof = HostSessionProof {
             host_session_id: HostSessionId::new("host"),
             boot_id: BootId::new("boot"),
@@ -312,26 +294,33 @@ mod tests {
             panes: vec![pane],
             retired: vec![],
         };
-        let scope = serde_json::to_string(&view.scope).unwrap();
-        db.execute("INSERT INTO shared_view_scopes VALUES(?1)", [&scope])
+        let Scope::Channel(channel) = view.scope else {
+            panic!("fixture uses a channel")
+        };
+        db.execute("INSERT INTO projects VALUES('/work','Work',1,'git')", [])
             .unwrap();
         db.execute(
-            "INSERT INTO agents VALUES(?1,'user',?2,?3,0)",
+            "INSERT INTO channels VALUES(?1,'/work','Channel',1,2)",
+            [channel.to_string()],
+        )
+        .unwrap();
+        super::super::views::store::register(&db, &view.scope).unwrap();
+        db.execute("UPDATE view_revision_clock SET last=1", [])
+            .unwrap();
+        db.execute(
+            "INSERT INTO agents VALUES(?1,?4,?2,?3,0)",
             params![
                 agent.id.to_string(),
                 serde_json::to_string(&agent).unwrap(),
-                session.id.to_string()
+                session.id.to_string(),
+                serde_json::to_string(&agent.origin).unwrap()
             ],
         )
         .unwrap();
+        super::super::views::store::store(&db, &view).unwrap();
         db.execute(
-            "INSERT INTO shared_views VALUES(?1,1,?2,'[]')",
-            params![scope, serde_json::to_string(&view.panes).unwrap()],
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO shared_view_panes VALUES(?1,?2)",
-            params![id.to_string(), scope],
+            "INSERT INTO agent_runs VALUES('unfinished',?1,'user','test','{}','cancelled',1,'{}')",
+            [agent.id.to_string()],
         )
         .unwrap();
         (
@@ -343,6 +332,19 @@ mod tests {
             agent,
         )
     }
+    fn close_presentation(registry: &Registry, agent: &Agent) {
+        registry.db.execute(
+            "UPDATE agents SET closed=1,record=json_set(record,'$.closed',json('true')) WHERE id=?1",
+            [agent.id.to_string()],
+        ).unwrap();
+        let mut view = super::super::views::read(&registry.db, &agent.placement).unwrap();
+        let id = CardId::from_uuid(agent.id.as_uuid());
+        view.panes.retain(|pane| pane.id != id);
+        view.retired.push(id);
+        view.revision = super::super::views::store::next_revision(&registry.db).unwrap();
+        super::super::views::store::store(&registry.db, &view).unwrap();
+    }
+
     #[test]
     fn capturing_live_schema_twenty_two_never_admits_a_new_writer_or_migrates_it() {
         let (fixture, mut record, agent) = fixture();
@@ -452,29 +454,167 @@ mod tests {
     }
 
     #[test]
+    fn capture_retains_only_the_exact_saved_chat_alias_and_model_identity() {
+        let (registry, mut record, agent) = fixture();
+        let identity: String = registry
+            .db
+            .query_row("SELECT identity FROM metadata", [], |row| row.get(0))
+            .unwrap();
+        let mut view = super::super::views::read(&registry.db, &agent.placement).unwrap();
+        let CardKind::Chat(alias) = &mut view.panes[0].kind else {
+            unreachable!()
+        };
+        alias.proof = None;
+        alias.launch.session_id = None;
+        let alias = alias.clone();
+        super::super::views::store::store(&registry.db, &view).unwrap();
+        registry.capture_update_floor(&mut record).unwrap();
+        assert_eq!(record.aliases, vec![alias]);
+        assert_eq!(record.presentations[0].pane, view.panes[0]);
+        assert_eq!(record.presentations[0].session, record.chats[0]);
+        assert_eq!(
+            registry
+                .db
+                .query_row("SELECT identity FROM metadata", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            identity
+        );
+        let mut foreign = record.clone();
+        foreign.presentations.clear();
+        foreign.aliases.clear();
+        let CardKind::Chat(alias) = &mut view.panes[0].kind else {
+            unreachable!()
+        };
+        alias.id = TerminalId::new();
+        super::super::views::store::store(&registry.db, &view).unwrap();
+        assert!(
+            registry
+                .capture_update_floor(&mut foreign)
+                .unwrap_err()
+                .contains("different chat allocation")
+        );
+        assert!(foreign.presentations.is_empty());
+        assert!(foreign.aliases.is_empty());
+    }
+
+    #[test]
+    fn paused_restore_preserves_siblings_retirements_identity_and_global_revision() {
+        let (mut registry, mut record, agent) = fixture();
+        let identity: String = registry
+            .db
+            .query_row("SELECT identity FROM metadata", [], |row| row.get(0))
+            .unwrap();
+        let mut view = super::super::views::read(&registry.db, &agent.placement).unwrap();
+        let kept = view.panes[0].clone();
+        let sibling = |title: &str| {
+            let mut pane = kept.clone();
+            pane.id = CardId::new();
+            pane.title = title.into();
+            let CardKind::Chat(session) = &mut pane.kind else {
+                unreachable!()
+            };
+            session.id = TerminalId::new();
+            pane
+        };
+        let left = sibling("left");
+        let right = sibling("right");
+        let retired = CardId::new();
+        view.panes = vec![left.clone(), kept.clone(), right.clone()];
+        view.retired = vec![retired];
+        super::super::views::store::store(&registry.db, &view).unwrap();
+        registry.capture_update_floor(&mut record).unwrap();
+        assert_eq!(record.presentations[0].ordinal, 1);
+        close_presentation(&registry, &agent);
+        registry
+            .db
+            .execute("UPDATE view_revision_clock SET last=100", [])
+            .unwrap();
+        registry.restore_update_floor_inner(&mut record).unwrap();
+        let restored = super::super::views::read(&registry.db, &agent.placement).unwrap();
+        assert_eq!(restored.panes, vec![left, kept, right]);
+        assert_eq!(restored.retired, vec![retired]);
+        assert_eq!(restored.revision, 101);
+        assert!(
+            registry.agent_process_ended(agent.id).unwrap(),
+            "restored chat remains paused"
+        );
+        assert_eq!(
+            registry
+                .db
+                .query_row("SELECT identity FROM metadata", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            identity
+        );
+        assert!(record.presentations.iter().all(|saved| saved.restored));
+    }
+
+    #[test]
+    fn conflicting_resource_rolls_back_all_restores_and_keeps_them_unacknowledged() {
+        let (mut registry, mut record, agent) = fixture();
+        let mut second = agent.clone();
+        second.id = AgentId::new();
+        let Some(HostedSession::Chat(session)) = &mut second.session else {
+            unreachable!()
+        };
+        session.id = TerminalId::new();
+        let session = session.clone();
+        registry
+            .db
+            .execute(
+                "INSERT INTO agents VALUES(?1,?2,?3,?4,0)",
+                params![
+                    second.id.to_string(),
+                    serde_json::to_string(&second.origin).unwrap(),
+                    serde_json::to_string(&second).unwrap(),
+                    session.id.to_string()
+                ],
+            )
+            .unwrap();
+        let mut view = super::super::views::read(&registry.db, &agent.placement).unwrap();
+        let mut pane = view.panes[0].clone();
+        pane.id = CardId::from_uuid(second.id.as_uuid());
+        pane.kind = CardKind::Chat(session.clone());
+        view.panes.push(pane);
+        super::super::views::store::store(&registry.db, &view).unwrap();
+        record.chats.push(session);
+        registry.capture_update_floor(&mut record).unwrap();
+        assert_eq!(record.presentations.len(), 2);
+        close_presentation(&registry, &agent);
+        close_presentation(&registry, &second);
+        let mut view = super::super::views::read(&registry.db, &agent.placement).unwrap();
+        let mut foreign = record.presentations[1].pane.clone();
+        foreign.id = CardId::new();
+        view.panes.push(foreign);
+        super::super::views::store::store(&registry.db, &view).unwrap();
+        assert!(
+            registry
+                .restore_update_floor_inner(&mut record)
+                .unwrap_err()
+                .contains("another owner")
+        );
+        assert!(record.presentations.iter().all(|saved| !saved.restored));
+        assert_eq!(
+            super::super::views::read(&registry.db, &agent.placement).unwrap(),
+            view
+        );
+        let closed: u32 = registry
+            .db
+            .query_row("SELECT count(*) FROM agents WHERE closed=1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(closed, 2, "the earlier restore must roll back too");
+    }
+
+    #[test]
     fn restoring_an_old_close_keeps_only_the_reviewed_pane_and_never_replays_work() {
         let (mut registry, mut record, agent) = fixture();
         registry.capture_update_floor(&mut record).unwrap();
         assert_eq!(record.presentations.len(), 1);
         let id = record.presentations[0].pane.id;
-        registry
-            .db
-            .execute(
-                "UPDATE agents SET closed=1,record=json_set(record,'$.closed',json('true'))",
-                [],
-            )
-            .unwrap();
-        registry
-            .db
-            .execute(
-                "UPDATE shared_views SET panes='[]',retired=?1",
-                [serde_json::to_string(&vec![id]).unwrap()],
-            )
-            .unwrap();
-        registry
-            .db
-            .execute("DELETE FROM shared_view_panes", [])
-            .unwrap();
+        close_presentation(&registry, &agent);
         registry.restore_update_floor_inner(&mut record).unwrap();
         let view = super::super::views::read(&registry.db, &agent.placement).unwrap();
         assert_eq!(view.panes.len(), 1);

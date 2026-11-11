@@ -203,6 +203,10 @@ class Plan:
         return (self.executables or self.caller_wants_json or self.flag("--open")
                 or self.flag("--unit-graph") or self.flag("--build-plan"))
 
+    @property
+    def runs_tests(self):
+        return self.subcommand in ("test", "bench") and not self.no_run
+
     def arguments(self, translate, extra):
         """The command line for the build host: paths translated, the
         message format this side reads, and `extra` options."""
@@ -2317,6 +2321,22 @@ elif command == "run":
             directories = {}
         sys.stdout.write(DIRECTORIES_MARKER + json.dumps(directories) + "\n")
         sys.stdout.flush()
+    if request.get("host_test_helper") is not None:
+        # The helper build and test run share this lease, source copy and Cargo
+        # environment. Keep it beneath the supervised child, so cancellation
+        # and the phase-based memory pricing cover the preparation too.
+        helper = os.path.join(base, "cargo-host-test-helper.py")
+        with open(helper, "w") as file:
+            file.write(request["host_test_helper"])
+        arguments = [sys.executable, "-I", helper, "--run", *arguments]
+    if request.get("memory_cap") is not None:
+        # The gate's helper travels with this invocation, including installed
+        # gates and arbitrary Cargo workspaces that have no repository scripts.
+        # Write outside src: a checkout copy/prune must not replace its wrapper.
+        cap = os.path.join(base, "memory-capped")
+        with open(cap, "w") as file:
+            file.write(request["memory_cap"])
+        arguments = [sys.executable, "-I", cap, *arguments]
     child = subprocess.Popen(arguments, env=environment, stdin=subprocess.DEVNULL,
                              start_new_session=True)
     ended = threading.Event()
@@ -2433,6 +2453,12 @@ class Offload:
     def __init__(self, host, plan, environment, loopback=False):
         self.host = host
         self.loopback = loopback
+        self.memory_cap = None
+        if plan is not None and plan.runs_tests:
+            try:
+                self.memory_cap = Path(__file__).with_name("memory-capped").read_text()
+            except OSError as error:
+                raise Refusal(f"offloaded tests require memory-capped beside cargo-offload: {error}") from error
         self.plan = plan
         self.environment = environment
         self.slots = positive(environment, "CAGENTS_BUILD_REMOTE_SLOTS", 8)
@@ -2931,6 +2957,12 @@ class Offload:
         try:
             request = {"environment": environment,
                        "core_dumps": self.environment.get("CAGENTS_BUILD_REMOTE_CORE_DUMPS") == "1"}
+            if plan.runs_tests:
+                request["memory_cap"] = self.memory_cap
+            if plan.subcommand == "test":
+                helper = Path(__file__).resolve().with_name("cargo-host-test-helper.py")
+                if helper.is_file():
+                    request["host_test_helper"] = helper.read_text()
             if plan.captures:
                 request["directories"] = [arg for value in configs for arg in ("--config", value)]
             command.stdin.write((json.dumps(request) + "\n").encode())
@@ -3400,7 +3432,11 @@ def main(arguments):
     if plan is None:
         cargo = real_cargo(environment)
         os.execvp(cargo, [cargo, *arguments])
-    return Offload(host, plan, environment, loopback).run()
+    try:
+        return Offload(host, plan, environment, loopback).run()
+    except Refusal as refusal:
+        say(str(refusal))
+        return REFUSED
 
 
 if __name__ == "__main__":

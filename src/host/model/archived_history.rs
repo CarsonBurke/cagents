@@ -163,7 +163,7 @@ impl Registry {
                 "SELECT (SELECT count(*) FROM agents WHERE session_id=?1 AND closed=1) != 1
              OR EXISTS(SELECT 1 FROM agent_authorities WHERE session_id=?1)
              OR EXISTS(SELECT 1 FROM agent_launches WHERE session_id=?1 OR agent=?2)
-             OR EXISTS(SELECT 1 FROM shared_view_panes WHERE id=?2)
+             OR EXISTS(SELECT 1 FROM panes WHERE id=?2)
              OR EXISTS(SELECT 1 FROM agents WHERE session_id=?1 AND closed=0)",
                 params![source.id.to_string(), agent.id.to_string()],
                 |row| row.get(0),
