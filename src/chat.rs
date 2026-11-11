@@ -685,7 +685,7 @@ pub fn is_account_recovery(source: &Session, replacement: &Session) -> bool {
 /// This predicate is not provenance: callers must also have resolved the exact
 /// source through ResolveUpgradeChat and attached its confirmed replacement.
 pub fn is_upgrade_recovery(source: &Session, replacement: &Session) -> bool {
-    if crate::upgrade::floor::cached()
+    if crate::upgrade::floor::load()
         .is_ok_and(|ledger| ledger.history_replacement(source, replacement))
     {
         return true;
@@ -742,7 +742,7 @@ pub fn is_upgrade_recovery(source: &Session, replacement: &Session) -> bool {
 /// no authority by itself; only an authenticated `ChatPrepareResume` answer on
 /// the same daemon stream may produce one.
 pub fn is_retained_resume_successor(source: &Session, successor: &Session) -> bool {
-    if crate::upgrade::floor::cached().is_ok_and(|ledger| ledger.resume_source(source).is_some())
+    if crate::upgrade::floor::load().is_ok_and(|ledger| ledger.resume_source(source).is_some())
         && source.launch.session_id.is_some()
     {
         let mut expected = source.clone();
@@ -955,7 +955,7 @@ impl Session {
     /// This shape is never authority to launch, close or resume a provider.
     pub(crate) fn is_saved_claude_history(&self) -> bool {
         (self.launch.provider == Provider::Claude
-            || crate::upgrade::floor::cached().is_ok_and(|ledger| ledger.source(self.id).is_some()))
+            || crate::upgrade::floor::load().is_ok_and(|ledger| ledger.source(self.id).is_some()))
             && matches!(self.native_continuity, NativeContinuity::ReconnectOnly)
             && self.terminal.is_none()
             && self.owned_codex_listener.is_none()
@@ -968,7 +968,7 @@ impl Session {
                 .session_id
                 .as_ref()
                 .is_some_and(|id| id.len() == 36 && uuid::Uuid::parse_str(id).is_ok())
-                || crate::upgrade::floor::cached().is_ok_and(|ledger| {
+                || crate::upgrade::floor::load().is_ok_and(|ledger| {
                     ledger
                         .resume_source(self)
                         .is_some_and(|source| source.launch.session_id == self.launch.session_id)

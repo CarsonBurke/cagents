@@ -53,7 +53,7 @@ impl Adapter for StoppedAdapter {
 }
 
 pub(super) fn recover(host: &SharedHost, requested: &Session) -> Result<(), String> {
-    let ledger = crate::upgrade::floor::cached()?;
+    let ledger = crate::upgrade::floor::load()?;
     let original = ledger
         .resume_source(requested)
         .ok_or("The stopped update source changed its saved conversation")?;
@@ -176,7 +176,7 @@ pub(super) fn prepare_resume(
     host: &SharedHost,
     requested: &Session,
 ) -> Result<Option<Session>, String> {
-    let ledger = crate::upgrade::floor::cached()?;
+    let ledger = crate::upgrade::floor::load()?;
     let Some(source) = ledger.resume_source(requested) else {
         return Ok(None);
     };
@@ -484,17 +484,16 @@ mod flow_tests {
         record.aliases.push(stale.clone());
         // Retained adoption can consult this index before Prepared recovery
         // publishes its paused record in the same daemon process.
-        let before_publication = crate::upgrade::floor::cached().unwrap();
+        let before_publication = crate::upgrade::floor::display_snapshot();
         assert!(before_publication.resume_source(&stale).is_none());
         record.save().unwrap();
         assert!(before_publication.resume_source(&stale).is_none());
         assert!(
-            crate::upgrade::floor::cached()
-                .unwrap()
+            crate::upgrade::floor::display_snapshot()
                 .resume_source(&stale)
                 .is_some()
         );
-        let published = crate::upgrade::floor::cached().unwrap();
+        let published = crate::upgrade::floor::display_snapshot();
         let invalid = crate::instance::project_dirs()
             .unwrap()
             .data_local_dir()
@@ -503,9 +502,36 @@ mod flow_tests {
         assert!(record.save().is_err());
         assert!(Arc::ptr_eq(
             &published,
-            &crate::upgrade::floor::cached().unwrap()
+            &crate::upgrade::floor::display_snapshot()
         ));
-        std::fs::remove_file(invalid).unwrap();
+        std::fs::remove_file(&invalid).unwrap();
+        let path = std::fs::read_dir(invalid.parent().unwrap())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let held = path.with_extension("held");
+        std::fs::rename(&path, &held).unwrap();
+        assert!(
+            crate::upgrade::floor::load()
+                .unwrap()
+                .resume_source(&stale)
+                .is_none()
+        );
+        assert!(
+            crate::upgrade::floor::display_snapshot()
+                .resume_source(&stale)
+                .is_none()
+        );
+        assert!(published.resume_source(&stale).is_some());
+        std::fs::rename(held, path).unwrap();
+        assert!(
+            crate::upgrade::floor::load()
+                .unwrap()
+                .resume_source(&stale)
+                .is_some()
+        );
         let mut state = HostState::new(new.clone());
         state.install_model(
             crate::host::model::Registry::at(&root.join("registry.sqlite3")).unwrap(),

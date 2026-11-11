@@ -438,8 +438,7 @@ pub(crate) fn managed_pane_matches(agent: &crate::agent_execution::Agent, pane: 
     // the agent's execution descriptor and accepted run remain unchanged.
     match (&agent.session, &current) {
         (Some(HostedSession::Chat(original)), HostedSession::Chat(current)) => {
-            crate::upgrade::floor::cached()
-                .is_ok_and(|ledger| ledger.history_replacement(original, current))
+            crate::upgrade::floor::display_snapshot().history_replacement(original, current)
         }
         _ => false,
     }

@@ -51,7 +51,7 @@ pub(crate) struct Presentation {
     pub restored: bool,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct Ledger {
     pub records: Vec<Record>,
 }
@@ -154,7 +154,7 @@ impl Record {
             return Err("Stopped update panes have no exact source proof".into());
         }
         record.write_to(&root)?;
-        refresh_cached()
+        load().map(|_| ())
     }
 
     fn file_name(&self) -> Result<String, String> {
@@ -351,8 +351,47 @@ fn directory() -> Result<PathBuf, String> {
         .ok_or_else(|| "Cannot discover stopped update panes".into())
 }
 
+/// Read the current durable index for a recovery or lineage decision. Both the
+/// daemon and guarded update helpers can change these records while an existing
+/// daemon or window survives, so a process startup snapshot is not authoritative.
+/// Transcript payloads are skipped; rendering uses its attached snapshot instead.
 pub(crate) fn load() -> Result<Ledger, String> {
-    load_at(&directory()?)
+    // Serialize reads and publication without holding the display lock over
+    // filesystem work. An earlier read cannot overwrite a later local save.
+    static LOADER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _loader = LOADER.lock().unwrap_or_else(|poison| poison.into_inner());
+    #[cfg(test)]
+    INDEX_READS.with(|reads| reads.set(reads.get() + 1));
+    let ledger = load_at(&directory()?)?;
+    *display_index()
+        .write()
+        .unwrap_or_else(|poison| poison.into_inner()) = std::sync::Arc::new(ledger.clone());
+    Ok(ledger)
+}
+
+fn display_index() -> &'static std::sync::RwLock<std::sync::Arc<Ledger>> {
+    static INDEX: std::sync::OnceLock<std::sync::RwLock<std::sync::Arc<Ledger>>> =
+        std::sync::OnceLock::new();
+    INDEX.get_or_init(|| std::sync::RwLock::new(std::sync::Arc::new(Ledger::default())))
+}
+
+/// Presentation reads the last published index without filesystem work.
+/// Recovery and lineage decisions call load() for current durable evidence.
+pub(crate) fn display_snapshot() -> std::sync::Arc<Ledger> {
+    display_index()
+        .read()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone()
+}
+
+#[cfg(test)]
+thread_local! {
+    static INDEX_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn index_reads_for_test() -> usize {
+    INDEX_READS.with(std::cell::Cell::get)
 }
 
 fn open_directory(directory: &Path) -> Result<Option<crate::fs_safety::Root>, String> {
@@ -718,32 +757,6 @@ mod tests {
         std::os::unix::fs::symlink(directory.path(), directory.path().join("link")).unwrap();
         assert!(load_at(&directory.path().join("link")).is_err());
     }
-}
-
-type CachedLedger = std::sync::RwLock<Result<std::sync::Arc<Ledger>, String>>;
-
-fn ledger_cache() -> &'static CachedLedger {
-    static LEDGER: std::sync::OnceLock<CachedLedger> = std::sync::OnceLock::new();
-    LEDGER.get_or_init(|| std::sync::RwLock::new(load().map(std::sync::Arc::new)))
-}
-
-/// Processes retain their startup inventory across external writes. Prepared
-/// recovery can publish another record during startup, so successful local
-/// saves refresh the index before serving the new stopped readers.
-pub(crate) fn cached() -> Result<std::sync::Arc<Ledger>, String> {
-    ledger_cache()
-        .read()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .clone()
-}
-
-fn refresh_cached() -> Result<(), String> {
-    let mut ledger = ledger_cache()
-        .write()
-        .unwrap_or_else(|poison| poison.into_inner());
-    let updated = load()?;
-    *ledger = Ok(std::sync::Arc::new(updated));
-    Ok(())
 }
 
 pub(crate) fn same_allocation(source: &Session, saved: &Session) -> bool {

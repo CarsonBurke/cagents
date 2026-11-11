@@ -144,8 +144,7 @@ pub(in crate::host) fn resolve(
         super::retained_actor::recover_cleanup_attachment(host, source).map_err(unavailable)?;
     }
     if missing
-        && crate::upgrade::floor::cached()
-            .is_ok_and(|ledger| ledger.resume_source(source).is_some())
+        && crate::upgrade::floor::load().is_ok_and(|ledger| ledger.resume_source(source).is_some())
     {
         super::floor_history::recover(host, source).map_err(unavailable)?;
     } else if missing {

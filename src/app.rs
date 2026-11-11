@@ -5473,6 +5473,10 @@ impl Cagents {
     }
 
     fn bootstrap(strict: bool) -> Result<Bootstrap, String> {
+        // Publish the stopped-pane display index before shared views arrive.
+        if let Err(error) = crate::upgrade::floor::load() {
+            tracing::warn!(%error, "Stopped update panes could not be indexed at startup");
+        }
         let mut settings_warnings = Vec::new();
         let (settings, settings_path, settings_write_blocked, status) =
             match settings::default_path() {
