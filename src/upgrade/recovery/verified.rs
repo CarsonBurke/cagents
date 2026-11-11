@@ -356,7 +356,16 @@ pub(super) mod tests {
         };
         if provider == Provider::Codex {
             source.launch.recipe.arguments = vec!["--remote".into(), "unix://".into()];
+            // Allocate the source's listener before it has a provider thread,
+            // then record the identity learned at its initial start. A begun
+            // bare remote names the shared service and cannot be claimed by
+            // this ordinary allocator without the host's writer checks.
+            let thread = source.launch.session_id.take().unwrap();
+            let requested = source.clone();
             assert!(source.claim_owned_codex_listener(root, &proof("source")));
+            source.launch.session_id = Some(thread);
+            assert!(source.owns_codex_listener());
+            assert!(requested.resolved_to_owned_codex_listener(&source));
             source.native_continuity = crate::chat::NativeContinuity::Durable {
                 provider_version: "1.0".into(),
             };
