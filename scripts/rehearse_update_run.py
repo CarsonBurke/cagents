@@ -726,6 +726,8 @@ class Rehearsal:
         with records.WindowCloseMonitor(self.root) as monitor:
             result=self.call('update',*args,timeout=300,check=False)
             monitor.command_exit=result[0]
+            if '--require-working' in args and (result[0]==2 or 'rehearse-update: case-invalid:' in result[1]):
+                raise RuntimeError('case-invalid: required working review failed; this is not an expected refusal')
             return result
 
     def require_active_working(self):

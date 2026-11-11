@@ -11,7 +11,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 SCRIPTS=Path(__file__).resolve().parents[1]/'scripts'
 sys.path.insert(0,str(SCRIPTS))
@@ -141,6 +141,24 @@ class WorkingIntent(unittest.TestCase):
                 if mutation=='new-turn': events.append({**events[0],'turn_id':'replacement-turn'})
                 with self.assertRaisesRegex(RuntimeError,'case-invalid'):
                     self.check(before,agents,proof,events,panes)
+
+
+class UpdateIntentClassification(unittest.TestCase):
+    def test_invalid_prompt_cannot_be_classified_as_an_expected_cancel(self):
+        rehearsal=scenario.Rehearsal('/var/tmp/unused-rehearsal','/unused-shell')
+        monitor=Mock()
+        monitor.__enter__=Mock(return_value=monitor)
+        monitor.__exit__=Mock(return_value=False)
+        module=Mock()
+        module.WindowCloseMonitor.return_value=monitor
+        spec=Mock()
+        with patch.object(scenario.importlib.util,'spec_from_file_location',return_value=spec), \
+             patch.object(scenario.importlib.util,'module_from_spec',return_value=module), \
+             patch.object(rehearsal,'call',return_value=(2,'rehearse-update: case-invalid: declining')):
+            with self.assertRaisesRegex(RuntimeError,'not an expected refusal'):
+                rehearsal.observed_update('/archive','new','/installer','--require-working')
+        self.assertEqual(monitor.command_exit,2)
+        monitor.__exit__.assert_called_once()
 
 
 class StagedShellOrchestration(unittest.TestCase):
