@@ -816,6 +816,35 @@ class NativeTerminalAfterRestore(unittest.TestCase):
             with self.subTest(mutation=mutation),self.assertRaises(RuntimeError):
                 scenario.terminal_restart_failure_contract(changed,version)
 
+    def test_pending_before_failure_requires_exact_bounded_native_and_typed_absence_evidence(self):
+        scenario=self.module()
+        version,evidence=self.evidence()
+        evidence['after_status']['data'].update(running=False,daemon_present=False)
+        evidence['after_processes']['processes']=evidence['before_processes']['processes'][:2]
+        evidence['selected_card']['continuity']={'relaunch_available':{'recipe':{'program':'/bin/bash'},'last_exit':None}}
+        evidence['failure_kind']='pending_without_daemon'
+        observation={'window':{'id':10},'runs':[{'text':'Starting terminal…'},{'text':'The daemon is unreachable'}]}
+        evidence['failure_observation']=observation
+        sample={'monotonic':100,'card':copy.deepcopy(evidence['selected_card']),'snapshot_terminal_id':'new-terminal',
+                'snapshot_exit':1,'snapshot_refusal':{'ok':False,'error':{'kind':'daemon_not_running'}},
+                'status':copy.deepcopy(evidence['after_status']),'observation':observation,
+                'processes':copy.deepcopy(evidence['after_processes']),'windows':dict(evidence['after_windows'])}
+        evidence['pending_observations']=[copy.deepcopy(sample),{**copy.deepcopy(sample),'monotonic':104}]
+        self.assertEqual(scenario.terminal_restart_failure_contract(evidence,version)['observed_state'],'pending_without_daemon')
+        cases=[]
+        changed=copy.deepcopy(evidence);changed['pending_observations']=[];cases.append(changed)
+        changed=copy.deepcopy(evidence);changed['pending_observations'][1]['monotonic']=101;cases.append(changed)
+        changed=copy.deepcopy(evidence);changed['pending_observations'][1]['observation']['runs']=[{'text':'Unknown state'}];cases.append(changed)
+        changed=copy.deepcopy(evidence);changed['pending_observations'][1]['snapshot_refusal']['error']['kind']='protocol';cases.append(changed)
+        changed=copy.deepcopy(evidence);changed['pending_observations'][1]['snapshot_terminal_id']='foreign';cases.append(changed)
+        changed=copy.deepcopy(evidence);changed['pending_observations'][1]['status']['data']['running']=True;cases.append(changed)
+        changed=copy.deepcopy(evidence);changed['pending_observations'][1]['processes']['processes'].append(
+            {'pid':500,'start_ticks':1500,'terminal_id':'new-terminal','executable':'/usr/bin/bash','argv':['bash']});cases.append(changed)
+        changed=copy.deepcopy(evidence);changed['pending_observations'][1]['windows']['main']=99;cases.append(changed)
+        for changed in cases:
+            with self.subTest(evidence=changed),self.assertRaises(RuntimeError):
+                scenario.terminal_restart_failure_contract(changed,version)
+
     def test_shortcut_is_read_from_the_actual_private_settings_without_a_default(self):
         scenario=self.module()
         with tempfile.TemporaryDirectory(prefix='ru-action-key-') as temporary:

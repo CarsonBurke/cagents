@@ -289,8 +289,6 @@ def terminal_restart_failure_contract(evidence, version_root):
     original=ui(evidence['before_processes'])
     status=evidence['after_status'].get('data',{})
     card=evidence['selected_card']
-    diagnostic=evidence['failure_diagnostic']
-    fields=dict(line.split(': ',1) for line in diagnostic.splitlines() if ': ' in line)
     daemons=[row for row in evidence['after_processes']['processes']
              if Path(row.get('executable','')).name=='cagentsd' and row.get('argv')==[row['executable']]]
     if (evidence['before_processes']['errors'] or evidence['after_processes']['errors']
@@ -299,15 +297,49 @@ def terminal_restart_failure_contract(evidence, version_root):
             or evidence['after_status'].get('ok') is not True or status.get('running') is not False
             or status.get('daemon_present') is not False or status.get('instance')!='production'
             or status.get('socket')!=str(Path(evidence['after_processes']['root'])/'rt/cagents/cagentsd.sock')
-            or daemons or not card['focused'] or card['card'] in evidence['cards_before_input']
-            or len(diagnostic)>16384 or not fields.get('Code') or not fields.get('Message')
-            or fields.get('Terminal')!=card['terminal_id']
+            or daemons or any(row.get('terminal_id')==card['terminal_id'] for row in evidence['after_processes']['processes'])
+            or not card['focused'] or card['card'] in evidence['cards_before_input']
             or evidence['failure_observation'].get('window',{}).get('id')!=evidence['before_windows']['main']):
         raise RuntimeError('the before example did not prove a failed new terminal in the same native window')
+    if evidence.get('failure_kind')=='pending_without_daemon':
+        samples=evidence.get('pending_observations',[])
+        if (len(samples)<2 or samples[-1]['monotonic']-samples[0]['monotonic']<3
+                or not all(pending_terminal_failure(sample,card,evidence['before_windows'],original,version_root) for sample in samples)):
+            raise RuntimeError('the pending terminal example lacks bounded native and typed absence observations')
+    else:
+        diagnostic=evidence.get('failure_diagnostic','')
+        fields=dict(line.split(': ',1) for line in diagnostic.splitlines() if ': ' in line)
+        if (len(diagnostic)>16384 or not fields.get('Code') or not fields.get('Message')
+                or fields.get('Terminal')!=card['terminal_id']):
+            raise RuntimeError('the before example has no exact terminal error diagnostic')
     for field in ('claude_user_prompts','codex_thread_starts','codex_turn_starts'):
         if evidence['activity_before'][field]!=evidence['activity_after'][field]:
             raise RuntimeError('the before example replayed a provider conversation or prompt')
-    return {'outcome':'expected_terminal_restart_failure','failed_card':card,'status':evidence['after_status']}
+    return {'outcome':'expected_terminal_restart_failure','observed_state':evidence.get('failure_kind','runtime_error'),
+            'observed_card':card,'status':evidence['after_status']}
+
+
+def pending_terminal_failure(sample, card, windows, ui_identities, version_root):
+    """Recognize the observed old-policy spinner, never an arbitrary timeout."""
+    observed=sample['observation']
+    text=[' '.join(run.get('text','').casefold().split()) for run in observed.get('runs',[])]
+    status=sample['status'].get('data',{})
+    snapshot=sample['snapshot_refusal']
+    processes=sample['processes']
+    uis={(row['pid'],row['start_ticks']) for row in processes['processes']
+         if row.get('executable')==str(Path(version_root)/'bin/cagents-ui')}
+    daemons=[row for row in processes['processes'] if Path(row.get('executable','')).name=='cagentsd'
+             and row.get('argv')==[row['executable']]]
+    return (sample['card']==card and sample['windows']==windows and uis==ui_identities and not processes['errors']
+            and observed.get('window',{}).get('id')==windows['main']
+            and any('starting terminal' in line for line in text)
+            and any('unreachable' in line for line in text) and any('daemon' in line for line in text)
+            and sample['snapshot_terminal_id']==card['terminal_id'] and sample['snapshot_exit']!=0
+            and snapshot.get('ok') is False and snapshot.get('error',{}).get('kind')=='daemon_not_running'
+            and sample['status'].get('ok') is True and status.get('running') is False
+            and status.get('daemon_present') is False and status.get('instance')=='production'
+            and status.get('socket')==str(Path(processes['root'])/'rt/cagents/cagentsd.sock')
+            and not daemons and not any(row.get('terminal_id')==card['terminal_id'] for row in processes['processes']))
 
 
 def existing_only_contract(before, after, activity_before, activity_after, version_root):
@@ -692,15 +724,42 @@ class Rehearsal:
         save()
         self.call('drive','key',shortcut['chord'],timeout=30)
         evidence['events'].append({'event':'native_new_terminal_shortcut_sent','monotonic':time.monotonic()})
+        save()
         deadline=time.monotonic()+45
         selected=None
+        original_uis={(row['pid'],row['start_ticks']) for row in before['processes']
+                      if row.get('executable')==str(version_root/'bin/cagents-ui')}
         while time.monotonic()<deadline:
             try:
                 candidates=[card for card in terminal_cards(self.root) if card['focused']
                             and card['card'] not in evidence['cards_before_input']]
                 if len(candidates)==1:
                     selected=candidates[0]
+                    evidence['selected_card']=selected
+                    save()
                     if expect_failure:
+                        snapshot_code,snapshot=self.cli('--no-start','terminal','snapshot',selected['terminal_id'],check=False)
+                        if not snapshot_code:
+                            raise RuntimeError('the expected before failure instead produced a terminal snapshot')
+                        _, observation=self.call('drive','--json','observe',timeout=30)
+                        _, current_status=self.cli('--no-start','daemon','status')
+                        if current_status.get('data',{}).get('running') is True:
+                            raise RuntimeError('the expected before failure instead has a serving daemon')
+                        sample={'monotonic':time.monotonic(),'card':selected,'snapshot_terminal_id':selected['terminal_id'],
+                                'snapshot_exit':snapshot_code,'snapshot_refusal':snapshot,'status':current_status,
+                                'observation':json.loads(observation),'processes':self.private_processes(after_intentional_stop=True),
+                                'windows':{slot:window['id'] for slot,window in self.mapped().items() if slot in ('main','second')}}
+                        if pending_terminal_failure(sample,selected,before_windows,original_uis,version_root):
+                            samples=evidence.setdefault('pending_observations',[])
+                            samples.append(sample)
+                            if sample['monotonic']-samples[0]['monotonic']>=3:
+                                evidence['failure_kind']='pending_without_daemon'
+                                save()
+                                break
+                            save()
+                            time.sleep(.2)
+                            continue
+                        evidence['pending_observations']=[]
                         code, copied=self.call('drive','click','Copy details',timeout=30,check=False)
                         if not code:
                             code, diagnostic=self.call('app','wl-paste','--no-newline',timeout=10,check=False)
@@ -709,6 +768,7 @@ class Rehearsal:
                                 if fields.get('Terminal')==selected['terminal_id'] and fields.get('Code'):
                                     evidence['failure_diagnostic']=diagnostic
                                     break
+                        save()
                     code, shown=self.cli('--no-start','terminal','show',selected['terminal_id'],check=False)
                     actual=shown.get('data',{}).get('terminal',{}).get('session',{})
                     if (not code and actual.get('continuity')=={'live':shown.get('data',{}).get('proof')}
@@ -720,7 +780,9 @@ class Rehearsal:
                 pass
             time.sleep(.2)
         else:
-            raise RuntimeError('the native New terminal action did not create a focused live terminal')
+            self.call('shot','new-terminal-unverified',timeout=45,check=False)
+            raise RuntimeError('the native New terminal action did not reach the required observed failure'
+                               if expect_failure else 'the native New terminal action did not create a focused live terminal')
         evidence['selected_card']=selected
         if expect_failure:
             _, observed=self.call('drive','--json','observe',timeout=30)
