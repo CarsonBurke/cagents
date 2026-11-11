@@ -391,7 +391,12 @@ fn coordinated_release_mode(
     let bundle_forwarded = handoff && publish_failure.is_none() && !orphan_bundle;
     let downgrade_refusal = matches!(
         restart,
-        Some("empty-downgrade-refusal" | "empty-downgrade-refusal-fails")
+        Some(
+            "empty-downgrade-refusal"
+                | "empty-downgrade-refusal-fails"
+                | "empty-downgrade-unverified"
+                | "empty-downgrade-unverified-nonzero"
+        )
     );
     let maintenance = restart == Some("handoff-maintenance-failure") || downgrade_refusal;
     let bootstrap = restart == Some("handoff-bootstrap");
@@ -637,7 +642,7 @@ case "$*" in
   'daemon downgrade-store 22')
     [ "$CLI" = new ] && [ "$FIXTURE_MAINTENANCE" = true ] || exit 98
     printf 'new:downgrade:22\n' >> "$FIXTURE_ACTIONS"
-    case "$FIXTURE_RESTART" in empty-downgrade-refusal*) exit 7 ;; esac
+    case "$FIXTURE_RESTART" in empty-downgrade-*) exit 7 ;; esac
     ;;
   'daemon --help')
     [ "$#" -eq 2 ] || exit 98
@@ -688,7 +693,7 @@ case "$*" in
     printf '%s:start\n' "$CLI" >> "$FIXTURE_ACTIONS"
     case "$CLI:$FIXTURE_RESTART" in
       new:empty-downgrade-refusal-fails) exit 4 ;;
-      new:empty-downgrade-refusal)
+      new:empty-downgrade-refusal|new:empty-downgrade-unverified|new:empty-downgrade-unverified-nonzero)
         if [ ! -e "$FIXTURE_START_FAILED_ONCE" ]; then touch "$FIXTURE_START_FAILED_ONCE"; exit 4; fi
         ;;
       new:prepared-status-unknown) exit 4 ;;
@@ -709,6 +714,14 @@ case "$*" in
     fi
     if [ "$CLI:$FIXTURE_RESTART" = new:census-unready ] || [ "$CLI:$FIXTURE_RESTART" = old:empty-recovery-unready ]; then exit 0; fi
     if [ ! -e "$FIXTURE_RUNNING" ]; then printf '%s\n' "$CLI" > "$FIXTURE_RUNNING"; fi
+    case "$CLI:$FIXTURE_RESTART" in
+      new:empty-downgrade-unverified|new:empty-downgrade-unverified-nonzero)
+        # A terminal arriving after startup makes the captured census differ.
+        # The serving target and that new terminal must survive verification.
+        printf 'terminal-new-arrival\n' > "$FIXTURE_TERMINAL_INVENTORY"
+        [ "$FIXTURE_RESTART" != empty-downgrade-unverified-nonzero ] || exit 4
+        ;;
+    esac
     if [ "$CLI:$FIXTURE_RESTART" = new:census-missing ]; then
       printf 'terminal-0\n' > "$FIXTURE_TERMINAL_INVENTORY"
     fi
@@ -1052,6 +1065,8 @@ exec sh "$@""#,
                 | "empty-recovery-unready"
                 | "empty-downgrade-refusal"
                 | "empty-downgrade-refusal-fails"
+                | "empty-downgrade-unverified"
+                | "empty-downgrade-unverified-nonzero"
         )
     ) {
         command.arg("--require-empty-daemon");
@@ -1629,6 +1644,32 @@ with open(os.environ['FIXTURE_LEASE_PATH'], 'r+') as contender:
         if restart == Some("empty-downgrade-refusal") {
             assert_eq!(fs::read_to_string(&running).unwrap(), "new\n");
             assert_eq!(receipt["outcome"]["state"], "usable");
+        } else if matches!(
+            restart,
+            Some("empty-downgrade-unverified" | "empty-downgrade-unverified-nonzero")
+        ) {
+            assert_eq!(fs::read_to_string(&running).unwrap(), "new\n");
+            assert_eq!(
+                fs::read_to_string(&terminal_inventory).unwrap(),
+                "terminal-new-arrival\n"
+            );
+            assert_eq!(fs::read_to_string(&census).unwrap(), "");
+            assert_eq!(receipt["outcome"]["state"], "unverified");
+            let diagnostic = String::from_utf8_lossy(&output.stderr);
+            if restart == Some("empty-downgrade-unverified") {
+                assert!(diagnostic.contains("daemon start command completed, but readiness and the original inventory remain unverified"));
+            } else {
+                assert!(
+                    diagnostic.contains(
+                        "daemon start command failed, but a stopped service was not proven"
+                    )
+                );
+            }
+            let cli = prefix.join("versions/9.9.9/bin/cagents");
+            assert!(diagnostic.contains(&format!("'{}' --no-start daemon status", cli.display())));
+            assert!(diagnostic.contains(&format!("'{}' --no-start terminal list", cli.display())));
+            assert!(!diagnostic.contains(&format!("'{}' daemon start", cli.display())));
+            assert!(!diagnostic.contains("Start it with"));
         } else {
             assert!(!running.exists());
             assert_ne!(receipt["outcome"]["state"], "usable");
@@ -2436,6 +2477,16 @@ fn explicit_restart_without_a_source_keeps_files_when_first_start_fails() {
 #[test]
 fn standalone_downgrade_refusal_restarts_the_selected_candidate_or_prints_exact_start_command() {
     for mode in ["empty-downgrade-refusal", "empty-downgrade-refusal-fails"] {
+        upgrade_fixture(true, 0, None, Some(mode));
+    }
+}
+
+#[test]
+fn standalone_downgrade_refusal_preserves_a_serving_target_with_unverified_continuity() {
+    for mode in [
+        "empty-downgrade-unverified",
+        "empty-downgrade-unverified-nonzero",
+    ] {
         upgrade_fixture(true, 0, None, Some(mode));
     }
 }
