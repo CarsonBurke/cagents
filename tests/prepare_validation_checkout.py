@@ -610,22 +610,25 @@ class ScriptContractsApplicability(unittest.TestCase):
             return "".join(body)
 
         cls.run_block = block("Check validation checkout and process custody contracts")
-        if not cls.run_block.startswith("python3 -I -B - <<'PY'\n"):
-            raise AssertionError("applicability step must run its inline isolated Python")
-        # Every other pair the step checks, in its order, which these private
-        # fixtures leave absent: a pair added to the workflow needs no edit here.
-        listed = [ast.literal_eval(line.strip().rstrip(","))[0]
-                  for line in cls.run_block.splitlines()
-                  if re.fullmatch(r'\s*\("[^"]+", "[^"]+", "[^"]+"\),', line)]
-        names = [name for name, _, _ in cls.pairs]
-        if listed[:len(names)] != names:
-            raise AssertionError(f"the step must check {names} first, not {listed}")
+        cls.native_block = block("Check native evidence contracts")
+        for command in (cls.run_block, cls.native_block):
+            if not command.startswith("python3 -I -B - <<'PY'\n"):
+                raise AssertionError("applicability steps must run their inline isolated Python")
+
+        def listed_pairs(command):
+            return [ast.literal_eval(line.strip().rstrip(","))
+                    for line in command.splitlines()
+                    if re.fullmatch(r'\s*\("[^"]+", "[^"]+", "[^"]+"\),', line)]
+
+        listed = listed_pairs(cls.run_block)
+        if listed[:2] != list(cls.pairs[:2]) or cls.pairs[2] in listed:
+            raise AssertionError(f"serial contracts must own checkout and custody, not native evidence: {listed}")
+        if listed_pairs(cls.native_block) != [cls.pairs[2]]:
+            raise AssertionError("native evidence must have its own applicability block")
+        # Other serial pairs remain absent in these private fixture heads.
         cls.absent = [f"Not applicable: {name} (source and fixture both absent at this head)"
-                      for name in listed[len(names):]]
+                      for name, _, _ in listed[2:]]
         cls.syntax_block = block("Check shell syntax")
-        # Exercise the historical unconditional fixture command, when present,
-        # as well as the applicability and syntax steps that can reach it.
-        cls.legacy_native_block = block("Check native evidence contracts", optional=True)
 
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="script-contract-applicability-", dir="/var/tmp")
@@ -659,7 +662,7 @@ class ScriptContractsApplicability(unittest.TestCase):
         # fixtures are those this test placed beneath the private cwd. No env
         # override, helper import, real Git repository or build is involved.
         stdout, stderr = "", ""
-        for command in filter(None, blocks if blocks is not None else [self.run_block]):
+        for command in filter(None, blocks if blocks is not None else [self.run_block, self.native_block]):
             result = subprocess.run(
                 ["/bin/sh", "-e", "-c", command], cwd=root,
                 capture_output=True, text=True, timeout=15,
@@ -686,8 +689,10 @@ class ScriptContractsApplicability(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(), [
             f"Not applicable: {name} (source and fixture both absent at this head)"
-            for name, _, _ in self.pairs
-        ] + self.absent)
+            for name, _, _ in self.pairs[:2]
+        ] + self.absent + [
+            f"Not applicable: {self.pairs[2][0]} (source and fixture both absent at this head)"
+        ])
         self.assertEqual(self.calls(root), [])
         self.assertEqual(list(root.iterdir()), [])
 
@@ -697,8 +702,8 @@ class ScriptContractsApplicability(unittest.TestCase):
             self.pair(root, index)
         result = self.invoke_block(root)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines(), [f"Checking: {name}" for name, _, _ in self.pairs]
-                         + self.absent)
+        self.assertEqual(result.stdout.splitlines(), [f"Checking: {name}" for name, _, _ in self.pairs[:2]]
+                         + self.absent + [f"Checking: {self.pairs[2][0]}"])
         self.assertEqual(self.calls(root), self.expected_calls(*range(len(self.pairs))))
 
     def test_each_partial_pair_fails_instead_of_being_skipped(self):
@@ -726,15 +731,30 @@ class ScriptContractsApplicability(unittest.TestCase):
                     if other != index:
                         self.assertIn(f"Not applicable: {self.pairs[other][0]} ", result.stdout)
 
-    def test_original_failure_status_stops_later_pairs(self):
+    def test_jobs_run_only_their_assigned_fixtures(self):
+        for job, blocks, expected in (
+            ("serial", [self.run_block], (0, 1)),
+            ("native", [self.native_block], (2,)),
+        ):
+            with self.subTest(job=job):
+                root = self.case(f"assigned-{job}")
+                for index in range(len(self.pairs)):
+                    self.pair(root, index)
+                result = self.invoke_block(root, blocks=blocks)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.calls(root), self.expected_calls(*expected))
+
+    def test_original_failure_status_stops_later_pairs_in_its_job(self):
         for index, exit_code in enumerate((7, 9, 11)):
             with self.subTest(failing_pair=index):
                 root = self.case(f"failure-{index}")
                 for other in range(len(self.pairs)):
                     self.pair(root, other, exit_code=exit_code if index == other else 0)
-                result = self.invoke_block(root)
+                blocks = [self.run_block] if index < 2 else [self.native_block]
+                expected = range(index + 1) if index < 2 else (2,)
+                result = self.invoke_block(root, blocks=blocks)
                 self.assertEqual(result.returncode, exit_code, result.stderr)
-                self.assertEqual(self.calls(root), self.expected_calls(*range(index + 1)))
+                self.assertEqual(self.calls(root), self.expected_calls(*expected))
                 self.assertNotIn("Not applicable: build directory seeding", result.stdout)
                 if index == 0:
                     self.assertNotIn("Checking: process custody", result.stdout)
@@ -745,7 +765,7 @@ class ScriptContractsApplicability(unittest.TestCase):
         for name in ("run-development", "check-format"):
             (root / "scripts" / name).write_text("#!/bin/sh\nexit 0\n")
         result = self.invoke_block(root, blocks=[
-            self.run_block, self.legacy_native_block, self.syntax_block,
+            self.run_block, self.native_block, self.syntax_block,
         ])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Not applicable: native evidence (source and fixture both absent at this head)\n",
