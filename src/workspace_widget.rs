@@ -22,6 +22,35 @@ use crate::{
     },
 };
 
+// Measurement-only callback trace; it neither requests frames nor changes UI state.
+#[cfg(feature = "development")]
+fn trace_surface_redraw(at: Instant) {
+    std::thread_local! {
+        static LAST: Cell<Option<Instant>> = const { Cell::new(None) };
+    }
+    if !tracing::enabled!(target: "cagents::workspace_frame", tracing::Level::DEBUG) {
+        return;
+    }
+    LAST.with(|last| {
+        if last.replace(Some(at)) == Some(at) {
+            return;
+        }
+        let mut clock = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut clock) } == 0 {
+            tracing::debug!(
+                target: "cagents::workspace_frame",
+                stage = "surface_redraw",
+                monotonic_ns = clock.tv_sec as u64 * 1_000_000_000 + clock.tv_nsec as u64,
+                callback_age_ns = at.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                "Delivered a native workspace redraw"
+            );
+        }
+    });
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ViewportSample {
     pub offset: f32,
@@ -2177,6 +2206,10 @@ impl<Message> Widget<Message, Theme, Renderer> for WorkspaceSurface<'_, Message>
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        #[cfg(feature = "development")]
+        if let Event::Window(window::Event::RedrawRequested(at)) = event {
+            trace_surface_redraw(*at);
+        }
         let content_layout = Self::child_layout(layout);
 
         match event {
