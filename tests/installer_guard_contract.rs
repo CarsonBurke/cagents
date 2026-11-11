@@ -1114,18 +1114,21 @@ fn staging_never_contacts_or_reopens_live_windows_even_on_failure_or_cancel() {
         );
         std::os::unix::fs::symlink("versions/old", prefix.join("current")).unwrap();
         let script = root.path().join("installer");
-        fs::write(&script, r#"#!/bin/sh
+        fs::write(
+            &script,
+            r#"#!/bin/sh
 set -eu
 "$TEST_CLI" verify-install-guard --stage-only
 if "$TEST_CLI" verify-install-guard; then exit 91; fi
-"$TEST_CLI" record-deferred-install --stage-only --prefix "$TEST_PREFIX" --version-root "$TEST_PREFIX/versions/new"
 printf ready > "$TEST_READY"
 case "$TEST_STATUS" in
-  0) ln -s versions/new "$TEST_PREFIX/next"; mv -Tf "$TEST_PREFIX/next" "$TEST_PREFIX/current" ;;
+  0) : ;;
   7) exit 7 ;;
   cancel) sleep 30 ;;
 esac
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         let ready = root.path().join("ready");
         let actions = root.path().join("actions");
         let mut command = Command::new(env!("CARGO_BIN_EXE_cagents"));
@@ -1180,11 +1183,7 @@ esac
         );
         assert_eq!(
             fs::read_link(prefix.join("current")).unwrap(),
-            Path::new(if status == "0" {
-                "versions/new"
-            } else {
-                "versions/old"
-            })
+            Path::new("versions/old")
         );
         root.close_after_parent(|| {
             window.stop_checked()?;

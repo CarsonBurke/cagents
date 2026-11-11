@@ -460,16 +460,22 @@ fn apply_installed_from(executable: &Path, terminal: bool) -> Result<UpdateJob, 
     inspect_pending_recovery(&candidate_cli, None)?;
     let mut installation = running_installation()?;
     let layout = locate(&std::env::current_exe()?)?;
-    let served = served_version_root(&layout)?;
-    if executable.canonicalize()? != served.join("bin/cagents-ui").canonicalize()? {
+    let candidate = locate(executable)?;
+    if candidate.prefix != layout.prefix
+        || executable.canonicalize()?
+            != candidate
+                .version_root
+                .join("bin/cagents-ui")
+                .canonicalize()?
+    {
         return Err(invalid(
             "the installed candidate changed; inspect the installation again",
         ));
     }
-    // The served build owns every update, including an older daemon's
-    // replacement and a remaining window-only replacement.
-    installation.version = installed_entry_worker(&layout, &served)?;
-    let version = served
+    // The selected build owns the review and worker before it becomes current.
+    let candidate_root = candidate.version_root;
+    installation.version = installed_entry_worker(&layout, &candidate_root)?;
+    let version = candidate_root
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(unsupported_install)?
@@ -478,14 +484,18 @@ fn apply_installed_from(executable: &Path, terminal: bool) -> Result<UpdateJob, 
         &installation,
         &version,
         &if terminal {
-            UpdateRequest::InstalledFromTerminal { root: served }
+            UpdateRequest::InstalledFromTerminal {
+                root: candidate_root,
+            }
         } else {
-            UpdateRequest::Installed { root: served }
+            UpdateRequest::Installed {
+                root: candidate_root,
+            }
         },
     )
 }
 
-fn installed_entry_worker(window: &InstallLayout, served: &Path) -> Result<String, UpdateError> {
+fn installed_entry_worker(window: &InstallLayout, candidate: &Path) -> Result<String, UpdateError> {
     let source = source::inspect_installed_identity()?;
     let owner = installed_daemon_owner(window)?;
     // A header cannot choose a coordinator. Keep the original socket peer's
@@ -496,18 +506,18 @@ fn installed_entry_worker(window: &InstallLayout, served: &Path) -> Result<Strin
     source.verify_owner(executable.as_deref())?;
     installed_candidate_version(
         window,
-        served,
+        candidate,
         owner.as_ref(),
         source.protocol,
         source.proof.as_ref(),
     )
 }
 
-/// Return the served candidate's version after source admission and the no-op
+/// Return the selected candidate's version after source admission and the no-op
 /// check. The candidate updater rechecks the source and its installed owner.
 fn installed_candidate_version(
     window: &InstallLayout,
-    served: &Path,
+    candidate: &Path,
     daemon: Option<&InstallLayout>,
     source_protocol: u16,
     source_proof: Option<&crate::model::HostSessionProof>,
@@ -517,11 +527,11 @@ fn installed_candidate_version(
     }
     let replaces_daemon = source_proof.is_some()
         && (source_protocol != crate::terminal_ipc::PROTOCOL_VERSION
-            || daemon.is_some_and(|owner| owner.version_root != served));
-    if served == window.version_root && !replaces_daemon {
+            || daemon.is_some_and(|owner| owner.version_root != candidate));
+    if candidate == window.version_root && served_version_root(window)? == candidate && !replaces_daemon {
         return Err(invalid("the installed application is already running"));
     }
-    served
+    candidate
         .file_name()
         .and_then(|name| name.to_str())
         .map(str::to_owned)
@@ -545,14 +555,15 @@ fn installed_daemon_owner(layout: &InstallLayout) -> Result<Option<InstallLayout
 }
 
 /// CLI entry point for the same leased worker, exact preview and window fence
-/// used by the application. The served candidate always supplies the worker.
+/// used by the application. The explicitly invoked build supplies the worker.
 pub fn upgrade_installed(yes: bool, interrupt: bool) -> Result<UpdateJob, UpdateError> {
     let _interrupt = cancellation::Interrupt::install()?;
     // An interrupted preparation has its own immutable source census. Do not
     // route this retry through old `current` or construct a fresh empty source.
     inspect_pending_recovery(&std::env::current_exe()?, None)?;
     let layout = locate(&std::env::current_exe()?)?;
-    let candidate = served_version_root(&layout)?.join("bin/cagents-ui");
+    // An explicit versions/V CLI applies V without publishing it first.
+    let candidate = layout.version_root.join("bin/cagents-ui");
     if cancellation::requested() {
         return Err(UpdateError::Cancelled);
     }
@@ -4202,10 +4213,17 @@ finally:
 
     #[test]
     fn staged_update_always_uses_the_candidate_worker() {
-        let layout = |version: &str| InstallLayout {
-            prefix: "/owned/install".into(),
-            version_root: PathBuf::from("/owned/install/versions").join(version),
-            version: version.into(),
+        let directory = tempfile::tempdir().unwrap();
+        install_tree(directory.path(), &["old", "new", "third"], "new");
+        let layout = |version: &str| {
+            locate(
+                &directory
+                    .path()
+                    .join("versions")
+                    .join(version)
+                    .join("bin/cagents"),
+            )
+            .unwrap()
         };
         let old = layout("old");
         let new = layout("new");
@@ -4268,6 +4286,21 @@ finally:
                 .is_err()
             );
         }
+        // Even with no running daemon, invoking a staged build selects it;
+        // the current link remains the old build until the worker succeeds.
+        install_tree(directory.path(), &[], "old");
+        assert_eq!(
+            installed_candidate_version(
+                &new,
+                &new.version_root,
+                None,
+                crate::terminal_ipc::PROTOCOL_VERSION,
+                None
+            )
+            .unwrap(),
+            "new"
+        );
+        assert_eq!(served_version_root(&new).unwrap(), old.version_root);
         let error =
             installed_candidate_version(&new, &new.version_root, Some(&old), 127, Some(&proof))
                 .unwrap_err()
@@ -4437,7 +4470,7 @@ finally:
 
     /// Builds `<root>/{.cagents-install-root,versions/<v>/bin/{cagents,cagents-ui,cagentsd}}`
     /// and points `current` at `served`.
-    fn install_tree(root: &Path, versions: &[&str], served: &str) {
+    pub(super) fn install_tree(root: &Path, versions: &[&str], served: &str) {
         fs::write(root.join(".cagents-install-root"), b"cagents install root").unwrap();
         for version in versions {
             let bin = root.join("versions").join(version).join("bin");

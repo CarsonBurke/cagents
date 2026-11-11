@@ -42,6 +42,12 @@ def immutable_evidence(root):
     return result
 
 
+def provider_identities(snapshot,root):
+    return {(row['pid'],row['start_ticks']) for row in snapshot['processes']
+            if row.get('state') not in ('Z','X') and (row.get('role')=='long-lived-child'
+                or str(root/'bin/claude') in row.get('argv',[]))}
+
+
 def restart(rehearsal, version):
     started = time.monotonic()
     root = rehearsal.root
@@ -81,12 +87,16 @@ def restart(rehearsal, version):
             or after['serving']['boot_id']!=before['serving']['boot_id']):
         raise RuntimeError('ordinary restart did not establish a fresh same-boot owner')
     successor = owned_daemon(root,executable,after['serving'],no_recovery_environment=True)
+    successor_proof = after['serving']
     rehearsal.capture_chats('after')
     rehearsal.capture_console('after')
     rehearsal.call('record','after',timeout=150)
     after = records.read_json(root/'records/after/snapshot.json')
     if records.verified_recovery(baseline,after) is None or after['errors']:
         raise RuntimeError('post-restart native presentation lost verified readiness')
+    if (after['serving'] != successor_proof
+            or owned_daemon(root,executable,after['serving'],no_recovery_environment=True) != successor):
+        raise RuntimeError('daemon ownership changed during post-restart native presentation')
     if (root/'records/after/recovery-census.json').read_bytes()!=original_census:
         raise RuntimeError('ordinary restart replaced the original raw census')
     if immutable_evidence(root)!=immutable:
@@ -99,10 +109,7 @@ def restart(rehearsal, version):
     for key, row in before['agents'].items():
         if row.get('run')!=after['agents'][key].get('run'):
             raise RuntimeError('ordinary restart replaced an accepted run')
-    def providers(snapshot):
-        return {(row['pid'],row['start_ticks']) for row in snapshot['processes']
-                if row.get('role')=='long-lived-child' or str(root/'bin/claude') in row.get('argv',[])}
-    if providers(before)!=providers(after):
+    if provider_identities(before,root)!=provider_identities(after,root):
         raise RuntimeError('ordinary restart replaced a retained provider or long-lived child')
     replay = [row for row in after.get('fixture_events',[]) if row.get('time',0)>=restart_at and (
         row.get('event')=='request' and row.get('method') in ('thread/start','thread/resume','turn/start')

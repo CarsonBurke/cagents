@@ -90,7 +90,7 @@ replacement to the application unless --restart-daemon is explicit.
 Options:
   --version VERSION  Install a release version (default: latest v* release)
   --prefix PATH      Installation root (default: $XDG_DATA_HOME/cagents-install)
-  --stage-only       Publish a verified update without changing running windows or daemon
+  --stage-only       Stage a verified version without changing current, windows or daemon
   --restart-daemon   Checkpoint supported sessions and replace the running daemon
   --require-empty-daemon  With --restart-daemon, refuse to interrupt live sessions
   --relaunch-agents  With --restart-daemon, relaunch non-resumable agents into their resume picker
@@ -965,7 +965,7 @@ supports_install_guard() {
 }
 supports_stage_guard() {
     supports_install_guard "$1" || return 1
-    for stage_command in coordinate-install verify-install-guard record-deferred-install; do
+    for stage_command in coordinate-install verify-install-guard; do
         stage_help=$(installer_tool "$1" "$stage_command" --help 2>/dev/null) || return 1
         printf '%s\n' "$stage_help" | awk '$1 == "--stage-only" { found = 1 } END { exit !found }' || return 1
     done
@@ -1139,6 +1139,11 @@ if [ -z "$PREPARE_CANDIDATE" ]; then
     fi
 fi
 
+if [ "$STAGE_ONLY" -eq 1 ]; then
+    [ "$HAD_CURRENT" -eq 1 ] && [ -d "$PREVIOUS_VERSION_DIR" ] \
+        || fail '--stage-only requires an existing installation; run install.sh without --stage-only for the first install'
+fi
+
 # Succeeds when COPY is a regular file with the same bytes as MEMBER in any of
 # the given version roots. Desktop tools can replace a link with a copy of its
 # target; such a copy carries no change of its own.
@@ -1309,6 +1314,13 @@ if [ -n "$PREPARE_CANDIDATE" ]; then
         "$VERSION" "$NEW_VERSION_DIR"
     exit 0
 fi
+if [ "$STAGE_ONLY" -eq 1 ]; then
+    # Publish the authenticated private tree; current and all public links
+    # continue to select the serving build until the worker proves success.
+    TRANSACTION_COMMITTED=1
+    printf 'Staged cagents %s; current, running windows and daemon were preserved. Run "%s/bin/cagents" daemon upgrade to apply it when ready.\n' "$VERSION" "$NEW_VERSION_DIR"
+    exit 0
+fi
 
 # A copy at a link path is compared with the finished candidate files, so the
 # rewritten desktop and autostart entries count, and with the current version.
@@ -1432,13 +1444,7 @@ if [ "$RESTART_DAEMON" -eq 0 ] && [ "$STAGE_ONLY" -eq 0 ]; then
     fi
 fi
 OWNER_CLI=${CAGENTS_INSTALL_OWNER_CLI:-$PREFIX/current/bin/cagents}
-if [ "$STAGE_ONLY" -eq 1 ]; then
-    # Private routing is recorded in the complete candidate tree BEFORE it can
-    # become current. The coordinator authenticates the unchanged live owner.
-    installer_tool "$COORDINATOR" record-deferred-install --stage-only --prefix "$PREFIX" --version-root "$NEW_VERSION_DIR" >/dev/null \
-        || fail 'cannot preserve the running owner for this staged update; installation was not changed'
-    DAEMON_DEFERRED=1
-elif [ "$HAD_CURRENT" -eq 1 ]; then
+if [ "$HAD_CURRENT" -eq 1 ]; then
     if [ "$RESTART_DAEMON" -eq 1 ]; then
         if [ -n "${CAGENTS_DAEMON_LEASE_FD:-}" ]; then
             # The reviewed worker already checkpointed the source and holds
@@ -1583,9 +1589,7 @@ if command -v update-desktop-database >/dev/null 2>&1; then
 fi
 
 
-if [ "$STAGE_ONLY" -eq 1 ]; then
-    printf 'Staged cagents %s; existing windows and the previous service state were preserved. Run cagents daemon upgrade to apply it when ready.\n' "$VERSION"
-elif [ "$DAEMON_DEFERRED" -eq 1 ]; then
+if [ "$DAEMON_DEFERRED" -eq 1 ]; then
     printf 'Installed cagents %s; running sessions were preserved. Run cagents daemon upgrade to finish updating the daemon.\n' "$VERSION"
 elif [ "$DAEMON_STARTED" -eq 1 ]; then
     printf 'Installed cagents %s; the production daemon and your sessions are ready. The daemon will start at login.\n' "$VERSION"

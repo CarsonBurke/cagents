@@ -240,7 +240,7 @@ cmd_update() {
     fi
     printf 'staged after %ss\n' "$((SECONDS - started))" | tee -a "$transcript"
     cmd_app_or_env /usr/bin/python3 "$tool_root/scripts/rehearse_update_pty.py" --answer "$answer" --working "$working" --stop "$stop" -- \
-        "$user_home/.local/share/cagents-install/current/bin/cagents" daemon upgrade "${upgrade_args[@]}" \
+        "$prefix/versions/$version/bin/cagents" daemon upgrade "${upgrade_args[@]}" \
         2>&1 | tee -a "$transcript" || status=${PIPESTATUS[0]}
     printf 'daemon upgrade exited %s after %ss total\n' "$status" "$((SECONDS - started))" | tee -a "$transcript"
     return "$status"

@@ -79,7 +79,9 @@ pub(super) fn perform(
     let (source_protocol, _) = source::inspect_identity(None)?;
     // Retain the exact installation boundary even for an older source.
     let source_owner = installed_daemon_owner(&layout)?;
-    if served_version_root(&layout)? != root {
+    let selected_current = served_version_root(&layout)?;
+    let candidate = locate(&root.join("bin/cagents"))?;
+    if candidate.prefix != layout.prefix || candidate.version_root != root {
         return Err(invalid(
             "the installed candidate changed; inspect the installation again",
         ));
@@ -110,7 +112,7 @@ pub(super) fn perform(
         candidate::Staged::from_file(executable, job.version.clone(), identity, &cancellation)?;
     let mut turns = source::TurnReview::default();
     let mut observe = |policy| {
-        if served_version_root(&layout)? != root || stamp(root)? != before {
+        if served_version_root(&layout)? != selected_current || stamp(root)? != before {
             return Err(invalid(
                 "the installed application changed; review the new build before updating",
             ));
@@ -170,6 +172,7 @@ pub(super) fn perform(
     let output = StartupOutput::create(state)?;
     let mut startup_attempted = false;
     let mut startup_owned = false;
+    let mut current_published = false;
     let mut previous = None;
     let mut original_schema = None;
     let mut result = (|| {
@@ -236,21 +239,28 @@ pub(super) fn perform(
         startup_owned = started.as_ref().err().is_none_or(|failure| failure.spawned);
         // The worker's stderr is this job's log.
         let reason = output.record(&mut io::stderr().lock());
-        // A post-spawn failure is never converted to success by readiness.
-        // Its exact original command has settled, but its result remains error.
-        if let Err(failure) = started {
-            let successor_runs = crate::daemon::running_executable()
-                .is_ok_and(|executable| executable == Some(root.join("bin/cagentsd")));
-            return Err(startup_failure(
-                &failure.error,
-                reason.as_deref(),
-                successor_runs,
-            ));
-        }
-        // Wait through bounded restoration until the exact successor is
-        // Ready, then prove this job's recovery inventory against it.
-        confirm_daemon_ready(&root.join("bin/cagentsd"), timeout)?;
-        survivors.verify_successor(&root.join("bin/cagentsd"))
+        // Keep the supplied Ready-then-inventory boundary. Only that proof
+        // permits publishing the target as current, including an overdue start
+        // whose original wrapper error must still be reported.
+        let serving = confirm_daemon_ready(&root.join("bin/cagentsd"), timeout)
+            .and_then(|()| survivors.verify_successor(&root.join("bin/cagentsd")))
+            .and_then(|()| candidate_serving(root))
+            .and_then(|()| {
+                let census = recovery.census.as_ref().ok_or_else(|| {
+                    invalid("No pre-update census exists; current was not changed")
+                })?;
+                let receipt = census.verify_with_target(root, state, &job.id)?;
+                if receipt.usable() {
+                    Ok(())
+                } else {
+                    Err(receipt.failure())
+                }
+            });
+        settle_startup(started, reason.as_deref(), serving, || {
+            publish_current(&layout, &selected_current, root)?;
+            current_published = true;
+            Ok(())
+        })
     })();
     let mut restored_previous = false;
     if result.is_err()
@@ -261,6 +271,11 @@ pub(super) fn perform(
             &installation.prefix,
             root,
             previous,
+            if current_published {
+                root
+            } else {
+                &selected_current
+            },
             original_schema,
             startup_owned,
             &guard,
@@ -288,7 +303,7 @@ pub(super) fn perform(
     } else if result.is_ok() || successor_owns_runtime || startup_owned {
         root.to_owned()
     } else {
-        previous.unwrap_or_else(|| root.to_owned())
+        selected_current.clone()
     };
     let recovery_result = finish_handoff(
         installation,
@@ -315,6 +330,73 @@ pub(super) fn perform(
         );
     }
     result
+}
+
+fn candidate_serving(root: &Path) -> Result<(), UpdateError> {
+    let identity = source::inspect_installed_identity()?;
+    if identity.protocol != crate::terminal_ipc::PROTOCOL_VERSION || identity.proof.is_none() {
+        return Err(invalid(
+            "The candidate terminal service has not started serving",
+        ));
+    }
+    identity.verify_owner(Some(&root.join("bin/cagentsd")))?;
+    let socket = crate::terminal_ipc::daemon_socket_path()?;
+    let mut client =
+        source::Client::connect(&socket).map_err(|error| invalid(error.to_string()))?;
+    if Some(client.proof()) != identity.proof.as_ref() {
+        return Err(invalid("The terminal service changed during startup"));
+    }
+    client.list_chats()?;
+    // Restoration may make a read take longer than the initial observation's
+    // short admission TTL. Authenticate a fresh observation without extending
+    // the original peer's authority across a replacement.
+    let after = source::inspect_installed_identity()?;
+    after.verify_owner(Some(&root.join("bin/cagentsd")))?;
+    identity.verify_same_owner(&after)
+}
+
+fn settle_startup(
+    started: Result<(), crate::install_guard::DaemonStartError>,
+    reason: Option<&str>,
+    serving: Result<(), UpdateError>,
+    publish: impl FnOnce() -> Result<(), UpdateError>,
+) -> Result<(), UpdateError> {
+    let ready = serving.is_ok();
+    if ready {
+        publish()?;
+    }
+    if let Err(failure) = started {
+        return Err(startup_failure(&failure.error, reason, ready));
+    }
+    serving
+}
+
+/// The serving-success point is the only publisher. No fallible bookkeeping
+/// follows this rename; later window errors retain the serving matched set.
+fn publish_current(
+    layout: &InstallLayout,
+    previous: &Path,
+    root: &Path,
+) -> Result<(), UpdateError> {
+    if served_version_root(layout)? != previous {
+        return Err(invalid("current installation changed during the update"));
+    }
+    if previous == root {
+        return Ok(());
+    }
+    let current = layout.prefix.join("current");
+    let temporary = layout
+        .prefix
+        .join(format!(".current.{}", uuid::Uuid::new_v4()));
+    let target = root
+        .strip_prefix(&layout.prefix)
+        .map_err(|_| unsupported_install())?;
+    std::os::unix::fs::symlink(target, &temporary)?;
+    if let Err(error) = fs::rename(&temporary, &current) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    Ok(())
 }
 
 /// Store maintenance receives the reservation intentionally; status probes
@@ -363,12 +445,13 @@ fn rollback_stopped_candidate(
     prefix: &Path,
     candidate: &Path,
     previous: &Path,
+    selected_current: &Path,
     schema: Option<u32>,
     startup_spawned: bool,
     guard: &crate::instance::UiUpdateGuard,
     handoff: &mut Option<crate::daemon::lease_handoff::LeaseHandoff>,
 ) -> Result<bool, UpdateError> {
-    selected_candidate(prefix, candidate)?;
+    selected_candidate(prefix, selected_current)?;
     let paths =
         crate::daemon::RuntimePaths::discover().map_err(|error| invalid(error.to_string()))?;
     if crate::daemon::daemon_process_alive_at(&paths).map_err(|error| invalid(error.to_string()))? {
@@ -400,7 +483,13 @@ fn rollback_stopped_candidate(
             lease,
         )?;
     }
-    restore_current(prefix, candidate, previous)?;
+    if selected_current == candidate {
+        restore_current(prefix, candidate, previous)?;
+    } else if selected_current != previous {
+        return Err(invalid(
+            "The previous service and selected installation differ; automatic rollback was not authorized",
+        ));
+    }
     Ok(true)
 }
 
@@ -811,6 +900,7 @@ else: raise AssertionError(sys.argv)
                 &root,
                 &candidate,
                 &old,
+                &candidate,
                 Some(schema),
                 true,
                 &guard,
@@ -822,8 +912,10 @@ else: raise AssertionError(sys.argv)
         // A command that never spawned cannot have converted the store; old
         // recovery must not depend on invoking that unavailable candidate.
         assert!(
-            rollback_stopped_candidate(&root, &candidate, &old, None, false, &guard, &mut lease,)
-                .unwrap()
+            rollback_stopped_candidate(
+                &root, &candidate, &old, &candidate, None, false, &guard, &mut lease,
+            )
+            .unwrap()
         );
         assert_eq!(root.join("current").canonicalize().unwrap(), old);
         assert!(!root.join("converted").exists());
@@ -839,6 +931,7 @@ else: raise AssertionError(sys.argv)
                 &root,
                 &candidate,
                 &old,
+                &candidate,
                 Some(schema),
                 true,
                 &guard,
@@ -857,6 +950,7 @@ else: raise AssertionError(sys.argv)
                 &root,
                 &candidate,
                 &old,
+                &candidate,
                 Some(schema),
                 true,
                 &guard,
@@ -867,12 +961,35 @@ else: raise AssertionError(sys.argv)
         assert_eq!(root.join("current").canonicalize().unwrap(), old);
         assert_eq!(fs::read_to_string(root.join("converted")).unwrap(), "23");
         fs::remove_file(root.join("converted")).unwrap();
+        // Staging now leaves current on old. Recovery still proves the dead
+        // candidate and lease, without replacing an already correct pointer.
+        let selected = fs::symlink_metadata(root.join("current")).unwrap().ino();
+        assert!(
+            rollback_stopped_candidate(
+                &root,
+                &candidate,
+                &old,
+                &old,
+                Some(schema),
+                true,
+                &guard,
+                &mut lease
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            fs::symlink_metadata(root.join("current")).unwrap().ino(),
+            selected
+        );
+        assert_eq!(fs::read_to_string(root.join("converted")).unwrap(), "23");
+        fs::remove_file(root.join("converted")).unwrap();
         // An independently changed current is rejected before store conversion.
         assert!(
             rollback_stopped_candidate(
                 &root,
                 &candidate,
                 &old,
+                &candidate,
                 Some(schema),
                 true,
                 &guard,
@@ -1067,6 +1184,107 @@ else: raise AssertionError(sys.argv)
             "{error}"
         );
         assert!(requests > 0);
+    }
+
+    #[test]
+    fn staged_current_is_published_once_only_on_success() {
+        let directory = tempfile::tempdir().unwrap();
+        let prefix = directory.path();
+        super::super::tests::install_tree(prefix, &["old", "new"], "old");
+        let layout = locate(&prefix.join("versions/new/bin/cagents")).unwrap();
+        let previous = served_version_root(&layout).unwrap();
+        let root = layout.version_root.clone();
+        let original = fs::symlink_metadata(prefix.join("current")).unwrap().ino();
+        // Dropping a staged candidate or refusing/cancelling its review performs
+        // no publication. Only the serving-success branch calls this helper.
+        assert_eq!(served_version_root(&layout).unwrap(), previous);
+        assert_eq!(
+            fs::symlink_metadata(prefix.join("current")).unwrap().ino(),
+            original
+        );
+        publish_current(&layout, &previous, &root).unwrap();
+        assert_eq!(
+            fs::read_link(prefix.join("current")).unwrap(),
+            Path::new("versions/new")
+        );
+        let published = fs::symlink_metadata(prefix.join("current")).unwrap().ino();
+        assert_ne!(published, original);
+        publish_current(&layout, &root, &root).unwrap();
+        assert_eq!(
+            fs::symlink_metadata(prefix.join("current")).unwrap().ino(),
+            published
+        );
+    }
+
+    #[test]
+    fn settled_startup_publishes_only_a_serving_successor_even_after_a_wrapper_error() {
+        for command in ["exit 0", "exit 4"] {
+            for serving in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let prefix = directory.path();
+                super::super::tests::install_tree(prefix, &["old", "new"], "old");
+                let layout = locate(&prefix.join("versions/new/bin/cagents")).unwrap();
+                let previous = served_version_root(&layout).unwrap();
+                let (started, _, reason) = run_captured(command);
+                let result = settle_startup(
+                    started,
+                    reason.as_deref(),
+                    if serving {
+                        Ok(())
+                    } else {
+                        Err(invalid("fake successor not serving"))
+                    },
+                    || publish_current(&layout, &previous, &layout.version_root),
+                );
+                assert_eq!(result.is_ok(), serving && command == "exit 0");
+                assert_eq!(
+                    served_version_root(&layout).unwrap(),
+                    if serving {
+                        layout.version_root
+                    } else {
+                        previous
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn overdue_successful_start_publishes_serving_candidate_and_retains_timeout() {
+        let directory = tempfile::tempdir().unwrap();
+        let prefix = directory.path();
+        super::super::tests::install_tree(prefix, &["old", "new"], "old");
+        let layout = locate(&prefix.join("versions/new/bin/cagents")).unwrap();
+        let previous = served_version_root(&layout).unwrap();
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 0.05; exit 0"]);
+        let started =
+            crate::install_guard::wait_daemon_start(&mut command, Duration::from_millis(5));
+        assert_eq!(
+            started.as_ref().unwrap_err().error.kind(),
+            io::ErrorKind::TimedOut
+        );
+        let result = settle_startup(started, None, Ok(()), || {
+            publish_current(&layout, &previous, &layout.version_root)
+        });
+        assert!(result.unwrap_err().to_string().contains("startup budget"));
+        assert_eq!(served_version_root(&layout).unwrap(), layout.version_root);
+    }
+
+    #[test]
+    fn publication_preserves_an_independent_current_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let prefix = directory.path();
+        super::super::tests::install_tree(prefix, &["old", "new", "other"], "old");
+        let layout = locate(&prefix.join("versions/new/bin/cagents")).unwrap();
+        let previous = served_version_root(&layout).unwrap();
+        super::super::tests::install_tree(prefix, &[], "other");
+        assert!(publish_current(&layout, &previous, &layout.version_root).is_err());
+        assert!(
+            served_version_root(&layout)
+                .unwrap()
+                .ends_with("versions/other")
+        );
     }
 
     fn run_captured(

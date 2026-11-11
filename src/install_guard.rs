@@ -282,15 +282,7 @@ pub(crate) fn run(
         // No window has been prepared: releasing this guard only releases the
         // launch fence, on success, failure and cancellation alike.
         drop(guard);
-        return installed.and_then(|()| {
-            if deferred {
-                Ok(())
-            } else {
-                Err(io::Error::other(
-                    "staging installer did not record deferred ownership",
-                ))
-            }
-        });
+        return installed;
     }
     let reopen = if deferred && !slots.is_empty() {
         previous_executable.as_ref().ok_or_else(|| {
