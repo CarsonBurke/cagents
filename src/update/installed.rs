@@ -139,7 +139,6 @@ pub(super) fn perform(
         "Saving and closing application windows",
     )?;
     let mut guard = crate::instance::UiUpdateGuard::acquire()?;
-    crate::install_guard::preflight_editor_companions(Some(staged.identity.protocol))?;
     confirmation::check_cancelled(state, job)?;
     let windows = guard.prepare_windows(Duration::from_secs(45))?;
     {

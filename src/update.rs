@@ -1539,7 +1539,6 @@ fn perform_update(
         "Saving and closing all application windows",
     )?;
     let mut guard = crate::instance::UiUpdateGuard::acquire()?;
-    crate::install_guard::preflight_editor_companions(Some(staged.identity.protocol))?;
     confirmation::check_cancelled(state, job)?;
     let windows = guard.prepare_windows(Duration::from_secs(45))?;
     {
