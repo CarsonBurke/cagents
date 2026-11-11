@@ -8,7 +8,7 @@ use std::{
     collections::BTreeSet,
     fs,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 const MODE: &str = "CAGENTS_SETTLED_NATIVE_RETRY_TEST";
@@ -70,6 +70,10 @@ fn isolated(matched_executable: bool) -> Option<PathBuf> {
     } else {
         std::env::current_exe().unwrap()
     };
+    // run_isolated's separate subreaper owns this complete process family.
+    // If the bounded child is killed below, unwinding the worker makes that
+    // supervisor kill and reap the cold host and setsid provider descendants.
+    assert!(crate::retained_fixture::owner_env().is_some());
     let mut child = std::process::Command::new(executable)
         .args(["--exact", &exact, "--nocapture", "--test-threads=1"])
         .env_clear()
@@ -99,10 +103,11 @@ fn isolated(matched_executable: bool) -> Option<PathBuf> {
         .stderr(fs::File::create(&stderr).unwrap())
         .spawn()
         .unwrap();
-    // The joint case executes three fresh host processes and repeatedly hashes
-    // the full debug test ELF. Keep each complete sequence bounded without
-    // reusing the smaller single-hop provider fixture's 90-second budget.
-    let deadline = Instant::now() + Duration::from_secs(if matched_executable { 300 } else { 90 });
+    // Three fresh hosts repeatedly run production SHA checks over the large
+    // test ELF, including independent original/current census and actual
+    // archive verification. Stripping DWARF still leaves substantial code;
+    // bound that complete sequence separately from the smaller 90-second case.
+    let deadline = Instant::now() + Duration::from_secs(if matched_executable { 600 } else { 90 });
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
             break Some(status);
@@ -145,7 +150,20 @@ struct Fixture {
 
 impl Fixture {
     fn new(root: PathBuf) -> Self {
-        super::super::retained_actor_tests::install_provider(&root.join("bin/claude"));
+        let provider = root.join("bin/claude");
+        super::super::retained_actor_tests::install_provider(&provider);
+        // This private provider receives only this fixture's explicit seed
+        // commands. Record metadata, not message bodies, to distinguish those
+        // original turns from any replay during later host adoption.
+        let script = fs::read_to_string(&provider).unwrap();
+        let marker = "        with (root/'prompts').open('a') as log: log.write('prompt\\n')";
+        assert_eq!(script.matches(marker).count(), 1);
+        let receipt = r#"        with (root/'prompt-receipts').open('a') as log: log.write(json.dumps({'pid':os.getpid(),'session':session,'uuid':frame['uuid'],'type':frame.get('type'),'seed':frame.get('message')=={'role':'user','content':[{'type':'text','text':"Confirm this private recovery fixture's conversation"}]}})+'\n')"#;
+        fs::write(
+            &provider,
+            script.replace(marker, &format!("{marker}\n{receipt}")),
+        )
+        .unwrap();
         let proof = HostSessionProof {
             host_session_id: HostSessionId::new("settled-native-retry"),
             boot_id: crate::daemon::read_boot_id().unwrap(),
@@ -583,7 +601,7 @@ fn start_ordinary_terminal(
         arguments: vec![
             "-c".into(),
             format!(
-                "printf '%s\\n' \"$$\" > '{}'; exec /bin/sleep 600",
+                "printf '%s\\n' \"$$\" > '{}'; exec /bin/sleep 900",
                 pid_file.display()
             ),
         ],
@@ -756,7 +774,35 @@ fn settled_cold_host_keeps_real_actors_and_terminal_then_verifies_original_censu
     fixture.owners.retain(|owner| owner != &paused_actor);
     let launches = fs::read(fixture.root.join("launches")).unwrap();
     assert_eq!(String::from_utf8_lossy(&launches).lines().count(), 2);
-    assert!(!fixture.root.join("prompts").exists());
+    let prompts = fs::read(fixture.root.join("prompts")).unwrap();
+    assert_eq!(prompts, b"prompt\nprompt\n");
+    let prompt_receipts = fs::read(fixture.root.join("prompt-receipts")).unwrap();
+    let receipts = String::from_utf8(prompt_receipts.clone())
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(receipts.len(), 2);
+    for (receipt, (session, owner)) in receipts.iter().zip([
+        (&accepted, &fixture.owners[0]),
+        (&originally_paused, &paused_actor),
+    ]) {
+        assert_eq!(
+            receipt["pid"].as_i64(),
+            Some(i64::from(owner.record.root.pid))
+        );
+        assert_eq!(
+            receipt["session"].as_str(),
+            session.launch.session_id.as_deref()
+        );
+        assert_eq!(receipt["type"], "user");
+        assert_eq!(receipt["seed"], true);
+        uuid::Uuid::parse_str(receipt["uuid"].as_str().unwrap()).unwrap();
+    }
+    eprintln!(
+        "source A: exactly two explicit fixture seed user frames completed, from provider PIDs {} and {}; retaining immutable no-replay baseline before B",
+        receipts[0]["pid"], receipts[1]["pid"]
+    );
 
     fixture.rotate("settled-B");
     crate::host::state::restore_orphaned_holders(fixture.host()).unwrap();
@@ -798,6 +844,8 @@ fn settled_cold_host_keeps_real_actors_and_terminal_then_verifies_original_censu
         checkpoint_bytes,
         outcome_bytes,
         launches,
+        prompts,
+        prompt_receipts,
     };
     let mut metadata = std::fs::OpenOptions::new()
         .write(true)
@@ -821,6 +869,7 @@ fn settled_cold_host_keeps_real_actors_and_terminal_then_verifies_original_censu
         let output = std::process::Command::new(&target)
             .args(["--exact", &selector, "--nocapture", "--test-threads=1"])
             .env("CAGENTS_SETTLED_COLD_HOP", incarnation)
+            .stderr(std::process::Stdio::inherit())
             .output()
             .unwrap();
         assert!(
@@ -835,13 +884,20 @@ fn settled_cold_host_keeps_real_actors_and_terminal_then_verifies_original_censu
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
-        assert_eq!(fs::read(&data.checkpoint).unwrap(), data.checkpoint_bytes);
+        assert_retired_fixture_evidence(&data, &target);
         assert_eq!(fs::read(&data.outcome).unwrap(), data.outcome_bytes);
         assert_eq!(
             fs::read(fixture.root.join("launches")).unwrap(),
             data.launches
         );
-        assert!(!fixture.root.join("prompts").exists());
+        assert_eq!(
+            fs::read(fixture.root.join("prompts")).unwrap(),
+            data.prompts
+        );
+        assert_eq!(
+            fs::read(fixture.root.join("prompt-receipts")).unwrap(),
+            data.prompt_receipts
+        );
     }
     fixture.owners.retain(|owner| owner != &data.actor);
 }
@@ -860,6 +916,24 @@ struct ColdFixtureData {
     checkpoint_bytes: Vec<u8>,
     outcome_bytes: Vec<u8>,
     launches: Vec<u8>,
+    prompts: Vec<u8>,
+    prompt_receipts: Vec<u8>,
+}
+
+fn assert_retired_fixture_evidence(data: &ColdFixtureData, target: &Path) {
+    assert!(
+        !data.checkpoint.exists(),
+        "completed recovery must release the canonical checkpoint for the next update"
+    );
+    let archive = crate::upgrade::recovery::archived_proof(&data.checkpoint, target)
+        .unwrap()
+        .expect("the actual archived checkpoint must remain verifiable");
+    assert_eq!(
+        fs::read(&archive.archive_path).unwrap(),
+        data.checkpoint_bytes
+    );
+    assert_eq!(fs::read(&archive.outcome_path).unwrap(), data.outcome_bytes);
+    assert_eq!(archive.outcome_path, data.outcome);
 }
 
 fn cold_host_hop(root: PathBuf, incarnation: &str) {
@@ -887,14 +961,24 @@ fn cold_host_hop(root: PathBuf, incarnation: &str) {
         data.actor.record.holder
     );
     let target = std::env::current_exe().unwrap();
-    assert!(
-        crate::host::update_recovery::restore_settled_from(
-            fixture.host(),
-            &data.checkpoint,
-            &target
-        )
-        .unwrap()
-    );
+    let canonical = crate::host::update_recovery::restore_settled_from(
+        fixture.host(),
+        &data.checkpoint,
+        &target,
+    )
+    .unwrap();
+    if incarnation == "cold-C" {
+        assert!(
+            canonical,
+            "the first cold recovery still owns the canonical Prepared checkpoint"
+        );
+    } else {
+        assert!(
+            !canonical,
+            "completed recovery must use ordinary archived holder discovery"
+        );
+        assert!(crate::host::update_recovery::restore_archived(fixture.host(), &[]).unwrap());
+    }
     {
         let state = fixture.host().lock().unwrap();
         assert_eq!(
@@ -950,6 +1034,42 @@ fn cold_host_hop(root: PathBuf, incarnation: &str) {
             receipt.outcome
         );
     }
+    if incarnation != "cold-after-explicit-close" {
+        eprintln!(
+            "{incarnation}: original census is Usable; starting production retirement/refresh verification"
+        );
+        let retired = with_private_socket(&fixture, || {
+            if incarnation == "cold-C" {
+                crate::update::recovery::retire_current_service()
+            } else {
+                crate::update::recovery::refresh_completed_service()
+            }
+        })
+        .unwrap();
+        assert!(matches!(
+            retired,
+            crate::update::recovery::RetirementStatus::Completed
+        ));
+        assert_retired_fixture_evidence(&data, &target);
+        let after = verify_over_private_socket(&fixture, &original);
+        assert!(
+            after.usable(),
+            "archiving must retain exact current lineage: {:?}",
+            after.outcome
+        );
+        let issued = crate::upgrade::recovery::archived_discovery(&data.checkpoint, &target)
+            .unwrap()
+            .unwrap();
+        assert!(
+            issued.adopted_chat_descriptors.iter().any(|chat| {
+                chat.id == data.accepted.id && chat.proof.as_ref() == Some(&fixture.proof)
+            }),
+            "retirement must record only this authenticated current chat issuance"
+        );
+        eprintln!(
+            "{incarnation}: production RootCensus completed retirement; canonical checkpoint absent, exact archive/outcome unchanged, original census still Usable"
+        );
+    }
     let candidate_cli = target.with_file_name("cagents");
     if incarnation != "cold-after-explicit-close" {
         let (admitted, captured) = with_private_socket(&fixture, || {
@@ -986,37 +1106,54 @@ fn cold_host_hop(root: PathBuf, incarnation: &str) {
         eprintln!(
             "{incarnation}: production pending admission accepted exact current owner; fresh census contains 1 current chat and 1 current terminal"
         );
-    } else if data.checkpoint.exists() {
-        let (admitted, captured) = with_private_socket(&fixture, || {
+    } else {
+        assert_retired_fixture_evidence(&data, &target);
+        let (retired, admitted, captured) = with_private_socket(&fixture, || {
             (
+                crate::update::recovery::retire_current_service(),
                 crate::update::inspect_pending_recovery(&candidate_cli, None),
                 crate::update::recovery::Census::capture(uuid::Uuid::new_v4().to_string()),
             )
         });
-        let error = admitted.unwrap_err();
-        assert!(
-            !matches!(error, crate::update::UpdateError::TargetRecoveryRequired(_)),
-            "{error}"
+        assert!(matches!(
+            retired.unwrap(),
+            crate::update::recovery::RetirementStatus::AlreadyCompleted
+        ));
+        admitted.unwrap();
+        let captured = captured.unwrap();
+        assert_eq!(captured.source.as_ref(), Some(&fixture.proof));
+        let captured = serde_json::to_value(&captured).unwrap();
+        let terminals: Vec<TerminalSession> =
+            serde_json::from_value(captured["terminals"].clone()).unwrap();
+        let chats: Vec<Session> = serde_json::from_value(captured["chats"].clone()).unwrap();
+        assert_eq!(terminals.len(), 1);
+        assert_eq!(terminals[0].id, data.terminal.id);
+        assert_eq!(
+            terminals[0].continuity.live_proof().as_ref(),
+            Some(&fixture.proof)
         );
         assert!(
-            !error.to_string().contains("recover-update"),
-            "a changed retained inventory must not offer a doomed recovery command: {error}"
-        );
-        assert!(
-            captured.is_err(),
-            "an unverified retained source must not be replaced with an empty or different census"
+            chats.is_empty(),
+            "explicitly closed and originally paused chats must stay absent"
         );
         eprintln!(
-            "{incarnation}: production pending admission refused changed retained scope and fresh recapture, without a manual-command loop"
+            "{incarnation}: completed history did not gate a new job; fresh census contains the exact Ready current owner, 1 surviving terminal and no live chats"
         );
     }
-    assert_eq!(fs::read(&data.checkpoint).unwrap(), data.checkpoint_bytes);
+    assert_retired_fixture_evidence(&data, &target);
     assert_eq!(fs::read(&data.outcome).unwrap(), data.outcome_bytes);
     assert_eq!(
         fs::read(fixture.root.join("launches")).unwrap(),
         data.launches
     );
-    assert!(!fixture.root.join("prompts").exists());
+    assert_eq!(
+        fs::read(fixture.root.join("prompts")).unwrap(),
+        data.prompts
+    );
+    assert_eq!(
+        fs::read(fixture.root.join("prompt-receipts")).unwrap(),
+        data.prompt_receipts
+    );
     assert!(
         !data.paused_actor.record.root.is_current()
             && !data.paused_actor.record.holder.is_current()

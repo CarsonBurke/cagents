@@ -343,12 +343,12 @@ pub(crate) fn publish(
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{proof, source, write_private};
+    use super::super::tests::{private_root, proof, source, write_private};
     use super::*;
 
     #[test]
     fn ready_paused_publication_requires_serving_owner_exact_capture_and_fresh_retention() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_root();
         let checkpoint = directory.path().join("daemon-upgrade.json");
         let target = directory.path().join("cagentsd");
         write_private(&target, b"fixture; never executed");

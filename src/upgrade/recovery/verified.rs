@@ -275,6 +275,14 @@ pub(super) mod tests {
         source
     }
 
+    pub(super) fn private_root() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("cagents-recovery-proof-")
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir_in("/var/tmp")
+            .unwrap()
+    }
+
     pub(super) fn write_private(path: &Path, bytes: &[u8]) {
         let mut file = OpenOptions::new()
             .write(true)
@@ -306,7 +314,7 @@ pub(super) mod tests {
 
     impl Fixture {
         pub(super) fn new(provider: Provider, adopted: bool) -> Self {
-            let root = tempfile::tempdir().unwrap();
+            let root = private_root();
             let source = source(provider, root.path());
             let paused_peer = self::source(Provider::Claude, root.path());
             let mut original_terminal = TerminalDescriptor::relaunchable(
@@ -351,8 +359,7 @@ pub(super) mod tests {
             }
             let target = fs::canonicalize(bin.join("cagentsd")).unwrap();
             let state = prefix.join(".update");
-            fs::create_dir(&state).unwrap();
-            fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+            crate::secure_file::prepare_private_directory(&state).unwrap();
             let job = uuid::Uuid::new_v4().to_string();
             let request = b"exact private original fixture request";
             write_private(&state.join(format!("{job}.request")), request);
