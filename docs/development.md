@@ -1778,7 +1778,16 @@ harness, it provides:
 - **Codex chats.** `start SIDE --codex tool-rows` (or `child-errors`,
   `terminal-escape`) installs that offline Codex app-server peer as the
   fixture's `codex`; see [An offline Codex](fixtures.md#an-offline-codex).
-  Without it, the app lists Codex as not installed.
+  For real app-server lifecycle or saved-history tests, use
+  `--codex-executable /absolute/path/to/codex` instead. The path is on the
+  execution host (`fw16` with `--remote fw16`); the runner validates and
+  snapshots the ELF before waiting for the native lock, then installs an
+  isolated mode-0755 copy. Validation never runs the executable. The receipt
+  in `TASK/session/codex-executable-installed.json` records source, snapshot
+  and installed identities and SHA256 hashes. The options are mutually
+  exclusive. With neither option, the app lists Codex as not installed.
+  See [A real Codex in the fixture](fixtures.md#a-real-codex-in-the-fixture)
+  for private offline config and saved-history setup.
 - **Who holds the lock.** `scripts/lock-holders /var/tmp/cagents-fw16-native.lock` shows
   the holder and whether it is doing anything, when `start` seems stuck.
 - **Cleanup.** `stop` stops the fixture daemon, then ends any process that

@@ -28770,7 +28770,7 @@ mod tests {
         };
         app.durable = Arc::new(WorkspaceState {
             focused: Some(id),
-            cards: vec![card],
+            cards: vec![card].into(),
             ..WorkspaceState::default()
         });
         app.workspace = Cagents::rebuild_workspace(&app.durable);

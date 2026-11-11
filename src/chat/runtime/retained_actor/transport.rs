@@ -7285,6 +7285,8 @@ done"#;
         // Preserve itself fences new helper input, so manufacturing a command
         // after preserve would test a forbidden ordering rather than a lost ACK.
         actor.0.stop.store(true, Ordering::Release);
+        // An idle pump waits for readiness without a timer. Wake this exact
+        // observer before joining it, as production preservation does.
         actor.0.wake.notify();
         let pump = actor.0.worker.lock().unwrap().take();
         pump.expect("metadata pump").join().unwrap();

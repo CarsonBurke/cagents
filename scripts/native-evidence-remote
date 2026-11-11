@@ -34,7 +34,8 @@ or underscores, names the task on HOST: ~/.local/state/cev/NAME there.
                   as in `evidence drive click 'Open repository'`, `evidence
                   shot channel-prs`. A session that FILE leaves running is
                   stopped. START OPTIONS, such as --width PX, --portal gtk or
-                  --codex tool-rows, go to each side's start.
+                  --codex tool-rows or --codex-executable /host/path/codex,
+                  go to each side's start. Executable paths name files on HOST.
   build SIDE SOURCE
                   Copy SOURCE to HOST and build it there. SOURCE is a checkout
                   directory, whose uncommitted and untracked files are
@@ -385,6 +386,11 @@ cmd_pair() {
                 shift 2
                 ;;
             --keep-state) options+=("$1"); shift ;;
+            --codex-executable)
+                [ "$#" -ge 2 ] || die "$1 needs a value" 2
+                options+=("$1" "$2")
+                shift 2
+                ;;
             *) die "unknown pair option: $1" 2 ;;
         esac
     done

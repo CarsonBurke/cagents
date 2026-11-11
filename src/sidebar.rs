@@ -12981,7 +12981,7 @@ pub(crate) mod tests {
             focused: None,
         };
         let mut durable = Arc::new(crate::model::WorkspaceState {
-            cards: vec![first.clone(), alias.clone(), closed.clone()],
+            cards: vec![first.clone(), alias.clone(), closed.clone()].into(),
             channels: vec![channel],
             ..Default::default()
         });
@@ -13027,7 +13027,7 @@ pub(crate) mod tests {
         let card = compact_attention_terminal(CardId::new());
         let durable = Arc::new(crate::model::WorkspaceState {
             card_scopes: std::collections::HashMap::from([(card.id, original.path.clone())]),
-            cards: vec![card.clone()],
+            cards: vec![card.clone()].into(),
             ..Default::default()
         });
         let mut state = SidebarState::default();
@@ -13093,7 +13093,7 @@ pub(crate) mod tests {
         let card = compact_attention_terminal(CardId::new());
         let durable = Arc::new(crate::model::WorkspaceState {
             card_scopes: std::collections::HashMap::from([(card.id, root.clone())]),
-            cards: vec![card.clone()],
+            cards: vec![card.clone()].into(),
             ..Default::default()
         });
         let mut projects = vec![folder];
@@ -13146,7 +13146,7 @@ pub(crate) mod tests {
                 .enumerate()
                 .map(|(index, card)| (card.id, project.worktrees[index + 1].path.clone()))
                 .collect(),
-            cards,
+            cards: cards.into(),
             ..Default::default()
         });
         (
@@ -18809,7 +18809,7 @@ pub(crate) mod tests {
             .channels
             .push(channel_row(ActivityState::Waiting, true));
         let durable = Arc::new(crate::model::WorkspaceState {
-            cards: vec![root.clone(), child.clone()],
+            cards: vec![root.clone(), child.clone()].into(),
             channels: vec![channel.clone()],
             card_scopes: std::collections::HashMap::from([(root.id, folder.repository.clone())]),
             ..Default::default()
@@ -18939,7 +18939,7 @@ pub(crate) mod tests {
         let key = folder.folder_key().unwrap();
         let card = compact_attention_terminal(CardId::new());
         let durable = Arc::new(crate::model::WorkspaceState {
-            cards: vec![card.clone()],
+            cards: vec![card.clone()].into(),
             card_scopes: std::collections::HashMap::from([(card.id, folder.repository.clone())]),
             ..Default::default()
         });
@@ -19138,7 +19138,7 @@ pub(crate) mod tests {
         let terminal = compact_attention_terminal(CardId::new());
         let card = terminal.id;
         let durable = Arc::new(crate::model::WorkspaceState {
-            cards: vec![terminal],
+            cards: vec![terminal].into(),
             ..Default::default()
         });
         let mut state = SidebarState::default();
@@ -19432,7 +19432,7 @@ pub(crate) mod tests {
             )),
         );
         let durable = Arc::new(crate::model::WorkspaceState {
-            cards: vec![root.clone(), child.clone()],
+            cards: vec![root.clone(), child.clone()].into(),
             channels: vec![channel],
             card_scopes: std::collections::HashMap::from([(root.id, folder.repository.clone())]),
             ..Default::default()

@@ -3109,9 +3109,13 @@ impl Cagents {
                     // A reported title waiting for its save is newer than the
                     // shared one, which it replaces when that save publishes it.
                     let reported = self.reported_title_save.cards.contains(&pane.id);
-                    let changed = (!reported && card.title != pane.title)
-                        || card.width_fraction != pane.width_fraction
-                        || (!resuming && card.kind != kind);
+                    // Writing a card copies it while a save still holds it,
+                    // so only a card the view changes is written.
+                    let changed = self.card_state(pane.id).is_some_and(|current| {
+                        (!reported && current.title != pane.title)
+                            || current.width_fraction != pane.width_fraction
+                            || (!resuming && current.kind != kind)
+                    });
                     if changed && let Some(current) = self.card_state_mut(pane.id) {
                         if !reported {
                             current.title = pane.title.clone();
@@ -3161,7 +3165,7 @@ impl Cagents {
                     let durable = Arc::make_mut(&mut self.durable);
                     if let Some(existing) = durable.cards.iter_mut().find(|card| card.id == pane.id)
                     {
-                        *existing = card;
+                        *existing = card.into();
                     } else {
                         durable.cards.push(card);
                     }
@@ -3240,22 +3244,9 @@ impl Cagents {
         {
             self.shared_views.order_rewrites += 1;
         }
-        let members = visible.iter().copied().collect::<HashSet<_>>();
-        let states = self
-            .durable
+        Arc::make_mut(&mut self.durable)
             .cards
-            .iter()
-            .filter(|card| members.contains(&card.id))
-            .map(|card| (card.id, card.clone()))
-            .collect::<HashMap<_, _>>();
-        let mut ordered = visible.iter().filter_map(|id| states.get(id).cloned());
-        for card in &mut Arc::make_mut(&mut self.durable).cards {
-            if members.contains(&card.id)
-                && let Some(next) = ordered.next()
-            {
-                *card = next;
-            }
-        }
+            .arrange_within(visible);
     }
 
     pub(super) fn presentation_chrome_cards(&self, scope: &Scope) -> Vec<CardId> {
@@ -5870,7 +5861,7 @@ mod tests {
         };
         let durable = Arc::make_mut(&mut app.durable);
         if let Some(existing) = durable.cards.iter_mut().find(|row| row.id == card) {
-            *existing = state;
+            *existing = state.into();
         } else {
             durable.cards.push(state);
         }
@@ -6088,7 +6079,13 @@ mod tests {
         let exposure = app.exposure(pane.id);
         app.shared_views.pane_attachment_count = 0;
         let listed_passive = app.durable.cards[1].id;
-        let history = app.durable.cards[1..].to_vec();
+        let history = app
+            .durable
+            .cards
+            .iter()
+            .skip(1)
+            .cloned()
+            .collect::<Vec<_>>();
         let views = app.workspace_model.views[2..].to_vec();
         let update = presentation_edge(&app, Scope::Channel(source), 21, "Remote label", 0.72);
         app.shared_views.scope_discovery_count.set(0);
@@ -6131,7 +6128,7 @@ mod tests {
             rx.try_recv().is_err(),
             "a remote presentation is not republished"
         );
-        assert_eq!(&app.durable.cards[1..], history.as_slice());
+        assert!(app.durable.cards.iter().skip(1).eq(history.iter()));
         assert_eq!(&app.workspace_model.views[2..], views.as_slice());
         assert!(
             matches!(app.cards.get(&pane.id), Some(CardRuntime::Failed(error)) if format!("{error:?}") == failure)
@@ -6252,7 +6249,8 @@ mod tests {
         history.id = CardId::new();
         history.existence = super::super::project_ui::removed_existence("history");
         let first = app.card_state(pane.id).unwrap().clone();
-        Arc::make_mut(&mut app.durable).cards = vec![first.clone(), history.clone(), other.clone()];
+        Arc::make_mut(&mut app.durable).cards =
+            vec![first.clone(), history.clone(), other.clone()].into();
         app.index_cards();
         // COW leaves the old index cached; each lookup must validate its ID
         // before using that index as durable ordering evidence.
@@ -6260,8 +6258,13 @@ mod tests {
         // Channel order is already right; the durable selected subsequence is
         // deliberately reversed around an unrelated closed historical card.
         Arc::make_mut(&mut app.durable).channels[0].cards = vec![first.id, other.id];
+        let before = app.durable.cards.clone();
         app.normalize_projected_card_order(&[first.id, other.id]);
-        assert_eq!(app.durable.cards, vec![first, history, other]);
+        assert!(
+            app.durable.cards.copied_from(&before).is_empty(),
+            "reordering shares the original cards rather than copying their descriptors"
+        );
+        assert_eq!(app.durable.cards, vec![first, history, other].into());
         assert_eq!(app.shared_views.order_rewrites, 1);
         let held = app.durable.clone();
         app.normalize_projected_card_order(&[pane.id, held.cards[2].id]);
@@ -6547,7 +6550,7 @@ mod tests {
         let _directory = replica_capture::writer_fixture(&mut app);
         let captures = app.replica_capture.captures;
         let mut strip = (*app.durable).clone();
-        strip.cards = vec![second.clone(), first.clone()];
+        strip.cards = vec![second.clone(), first.clone()].into();
         app.workspace = Cagents::rebuild_workspace(&strip);
         drop(app.sync_chrome());
         assert_eq!(app.card_chrome[&first.id].title, "Manual conversation name");
@@ -6979,7 +6982,8 @@ mod tests {
             app.presentation_projection_ready(&before, &after, None),
             Err("a local resource alias needs reconciliation")
         );
-        Arc::make_mut(&mut app.durable).cards.pop();
+        let last = app.durable.cards.len() - 1;
+        Arc::make_mut(&mut app.durable).cards.remove(last);
         let retained_failure = app.cards.remove(&pane.id).unwrap();
         app.cards.insert(pane.id, CardRuntime::Loading);
         assert_eq!(

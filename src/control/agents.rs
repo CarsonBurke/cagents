@@ -2097,29 +2097,17 @@ mod tests {
     #[test]
     fn console_reads_and_controls_keep_ordinary_reply_budget() {
         use crate::agent_execution::ConsoleCommand;
-        use std::{net::Shutdown, sync::mpsc};
 
-        struct ShutdownOnDrop(UnixStream);
-
-        impl Drop for ShutdownOnDrop {
-            fn drop(&mut self) {
-                let _ = self.0.shutdown(Shutdown::Both);
-            }
-        }
-
-        struct Peer {
+        struct ReleasePeer {
             stream: UnixStream,
-            release: mpsc::Sender<()>,
-            task: Option<thread::JoinHandle<()>>,
+            release: crossbeam_channel::Sender<()>,
         }
-
-        impl Drop for Peer {
+        impl Drop for ReleasePeer {
             fn drop(&mut self) {
-                let _ = self.release.send(());
-                let _ = self.stream.shutdown(Shutdown::Both);
-                if let Some(task) = self.task.take() {
-                    let _ = task.join();
-                }
+                // Also unblock both threads if setup, observation or an
+                // assertion unwinds. Cleanup cannot supply a successful reply.
+                let _ = self.stream.shutdown(std::net::Shutdown::Both);
+                let _ = self.release.try_send(());
             }
         }
 
@@ -2134,41 +2122,78 @@ mod tests {
             ConsoleCommand::Control(crate::chat::Command::Refresh),
         ] {
             let expected = command.clone();
+            let sent = command.clone();
             let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
-            let (release, wait) = mpsc::channel();
-            let mut server = Peer {
-                stream: server_stream.try_clone().unwrap(),
-                release,
-                task: None,
-            };
-            let shutdown = ShutdownOnDrop(server_stream.try_clone().unwrap());
-            server.task = Some(thread::spawn(move || {
-                let _shutdown = shutdown;
-                answer(&mut server_stream, |_| true, connected());
-                let request: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
-                assert!(matches!(request.request, ClientRequest::Agent {
-                operation: Operation::Console { command, .. }, ..
-            } if command == expected));
-                // Keep the peer silent until the client finishes. A fixed sleep
-                // can expire before a descheduled client starts its socket read.
-                // The independent 60s cleanup backstop (twice the submission
-                // budget) does not change the client's ordinary reply timeout.
-                wait.recv_timeout(AGENT_SUBMIT_TIMEOUT * 2).unwrap();
-            }));
-            let mut client = ControlClient::from_stream(client_stream).unwrap();
-            let read = client.agent(
-                Authority::default(),
-                Operation::Console {
-                    agent: crate::model::AgentId::new(),
-                    command,
-                },
-            );
-            drop(client);
-            server.release.send(()).unwrap();
-            server.task.take().unwrap().join().unwrap();
+            let (seen, observed, server, caller) = thread::scope(|scope| {
+                let (release, released) = crossbeam_channel::bounded(1);
+                let cleanup = ReleasePeer {
+                    stream: server_stream.try_clone().unwrap(),
+                    release,
+                };
+                let (received, request_seen) = crossbeam_channel::bounded(1);
+                let (finished, result) = crossbeam_channel::bounded(1);
+                let server = scope.spawn(move || {
+                    answer(&mut server_stream, |_| true, connected());
+                    let request: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                    assert!(matches!(request.request, ClientRequest::Agent {
+                        operation: Operation::Console { command, .. }, ..
+                    } if command == expected));
+                    let _ = received.send(());
+                    // A finite sleep after receipt cannot establish when the
+                    // caller entered its socket read. Keep the response held
+                    // until its result has actually been observed instead.
+                    let _ = released.recv();
+                    let _ = write_frame(
+                        &mut server_stream,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id: Some(request.request_id),
+                            proof: proof(),
+                            message: ServerMessage::Response {
+                                response: ServerResponse::Agent(Reply::Console(None)),
+                            },
+                        },
+                    );
+                });
+                let caller = scope.spawn(move || {
+                    let mut client = ControlClient::from_stream(client_stream).unwrap();
+                    let before = client.stream.read_timeout().unwrap();
+                    let read = client.agent(
+                        Authority::default(),
+                        Operation::Console {
+                            agent: crate::model::AgentId::new(),
+                            command: sent,
+                        },
+                    );
+                    let after = client.stream.read_timeout().unwrap();
+                    let _ = finished.send((read, before, after));
+                });
+                // This is a fixture guard, not the client's reply budget.
+                // An accidentally extended budget must fail observation,
+                // rather than wait forever or accept a cleanup-induced EOF.
+                let guard = IO_TIMEOUT + Duration::from_secs(5);
+                let seen = request_seen.recv_timeout(guard);
+                let observed = seen.is_ok().then(|| result.recv_timeout(guard));
+                drop(cleanup);
+                (seen, observed, server.join(), caller.join())
+            });
+            assert!(server.is_ok(), "console peer failed for {command:?}");
+            assert!(caller.is_ok(), "console caller failed for {command:?}");
             assert!(
-                matches!(read, Err(ControlError::ReplyTimeout { timeout, .. }) if timeout == IO_TIMEOUT),
-                "a stalled console poll must keep the ordinary timeout: {read:?}"
+                seen.is_ok(),
+                "console request was not received: {command:?}"
+            );
+            let observed = observed.unwrap();
+            assert!(
+                observed.is_ok(),
+                "console reply exceeded the fixture guard for {command:?}: {observed:?}"
+            );
+            let (read, before, after) = observed.unwrap();
+            assert_eq!(before, Some(IO_TIMEOUT), "before {command:?}");
+            assert_eq!(after, Some(IO_TIMEOUT), "after {command:?}");
+            assert!(
+                matches!(&read, Err(ControlError::ReplyTimeout { timeout, .. }) if *timeout == IO_TIMEOUT),
+                "a stalled console command must keep the ordinary timeout: {command:?}: {read:?}"
             );
         }
     }

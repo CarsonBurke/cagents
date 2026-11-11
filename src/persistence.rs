@@ -18,11 +18,11 @@ use thiserror::Error;
 
 use crate::{
     model::{
-        BootId, BrowserRestoreFidelity, BrowserSession, CardId, CardKind, CardState, ChannelId,
-        Existence, HostSessionProof, OperationId, ProjectChannel, ProjectId, ProjectState,
-        TerminalContinuity, TerminalId, TerminalSession, Tombstone, TranscriptMetadata,
-        WorkspaceDestination, WorkspaceId, WorkspaceState, WorktreeId, WorktreeState,
-        normalize_project_channels,
+        BootId, BrowserRestoreFidelity, BrowserSession, CardId, CardKind, CardState, Cards,
+        ChannelId, Existence, HostSessionProof, OperationId, ProjectChannel, ProjectId,
+        ProjectState, TerminalContinuity, TerminalId, TerminalSession, Tombstone,
+        TranscriptMetadata, WorkspaceDestination, WorkspaceId, WorkspaceState, WorktreeId,
+        WorktreeState, normalize_project_channels,
     },
     secure_file::{
         migrate_existing_private_file, prepare_private_directory, validate_and_privatize_open_file,
@@ -2159,7 +2159,7 @@ impl StateStore {
             id: manifest.id,
             generation: manifest.generation,
             existence: manifest.existence,
-            cards,
+            cards: cards.into(),
             focused: manifest.focused,
             active_worktree: manifest.active_worktree,
             worktree_focus: manifest.worktree_focus,
@@ -4452,7 +4452,7 @@ fn savepoint(transaction: &Transaction<'_>, statement: &str) -> Result<()> {
 }
 
 /// The conversation each open chat card holds, by card.
-fn open_chat_sessions(cards: &[CardState]) -> HashMap<CardId, &crate::chat::Session> {
+fn open_chat_sessions(cards: &Cards) -> HashMap<CardId, &crate::chat::Session> {
     cards
         .iter()
         .filter(|card| card.existence.is_open())
@@ -6625,7 +6625,8 @@ mod tests {
                         host_incarnation: HostIncarnation::new("incarnation-a"),
                     },
                 }),
-            }],
+            }]
+            .into(),
             focused: Some(card_id),
             active_worktree: None,
             worktree_focus: HashMap::new(),
@@ -9263,7 +9264,8 @@ mod tests {
             existence: Existence::Open,
             kind: CardKind::Chat(draft),
             ..workspace.cards[0].clone()
-        }];
+        }]
+        .into();
         let base = store.stored_generations(workspace.id).unwrap();
         store
             .save_workspace(
@@ -10803,6 +10805,68 @@ mod tests {
         let mut next_host = own.clone();
         next_host.proof.as_mut().unwrap().host_incarnation = "next-host".into();
         save(&next_host).unwrap();
+    }
+
+    /// Resume conversation reopens a saved Codex thread with a bare `unix://`
+    /// remote, and the daemon gives it a listener of its own when no shared
+    /// daemon serves it. The started thread saves over the reopened card; any
+    /// other change to its launch is still refused.
+    #[test]
+    fn a_reopened_codex_thread_saves_as_the_daemon_started_it() {
+        let directory = tempdir().unwrap();
+        let store =
+            StateStore::open(directory.path().join("chat.sqlite3"), boot("chat-boot")).unwrap();
+        let (mut workspace, begun) = agent_workspace(crate::agent::Provider::Codex);
+        let proof = begun.terminal.as_ref().unwrap().continuity.live_proof();
+        let mut reopened = begun.clone();
+        reopened
+            .launch
+            .recipe
+            .arguments
+            .extend(["--remote".into(), "unix://".into()]);
+        reopened.proof = None;
+        reopened.terminal = None;
+        reopened.id = TerminalId::new();
+        workspace.cards[0].kind = CardKind::Chat(reopened.clone());
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        let mut save = |session: &crate::chat::Session| {
+            let mut workspace = workspace.clone();
+            workspace.cards[0].kind = CardKind::Chat(session.clone());
+            lane.save(&store, &workspace)
+        };
+
+        let daemon_root = directory.path().join("daemon-tmp");
+        let mut own = reopened.clone();
+        assert!(
+            own.claim_owned_codex_listener_for_unserved_thread(
+                &daemon_root,
+                proof.as_ref().unwrap()
+            )
+        );
+        own.proof = proof.clone();
+        let mut other_thread = own.clone();
+        other_thread.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        assert!(matches!(
+            card_refusal(save(&other_thread), workspace.cards[0].id),
+            StoreError::InvalidState(_)
+        ));
+        let mut other_option = own.clone();
+        other_option.launch.recipe.arguments.push("--search".into());
+        assert!(matches!(
+            card_refusal(save(&other_option), workspace.cards[0].id),
+            StoreError::InvalidState(violation) if violation.message().contains("launch recipe")
+        ));
+        save(&own).unwrap();
+        let stored =
+            StateStore::open(directory.path().join("chat.sqlite3"), boot("chat-boot")).unwrap();
+        match stored.load_card(workspace.cards[0].id, None).unwrap() {
+            Some(CardState {
+                kind: CardKind::Chat(stored),
+                ..
+            }) => assert_eq!(stored, own),
+            other => panic!("the card is stored as the started thread: {other:?}"),
+        }
     }
 
     #[test]
@@ -12749,8 +12813,10 @@ mod tests {
         let boot_id = boot("boot-a");
         let store = StateStore::open(&path, boot_id.clone()).unwrap();
         let (workspace, mut lane) = settled_closed_history(&store, &boot_id);
-        let rows = workspace.cards[1..]
+        let rows = workspace
+            .cards
             .iter()
+            .skip(1)
             .map(|card| stored_card_row(&store, card.id))
             .collect::<Vec<_>>();
 
@@ -12766,7 +12832,7 @@ mod tests {
             3,
             "each flush writes its workspace row and nothing else"
         );
-        for (card, row) in workspace.cards[1..].iter().zip(&rows) {
+        for (card, row) in workspace.cards.iter().skip(1).zip(&rows) {
             assert_eq!(&stored_card_row(&store, card.id), row);
             assert_eq!(lane.cards[&card.id], row.0.cast_unsigned());
         }
@@ -12787,7 +12853,7 @@ mod tests {
             }),
             1
         );
-        for (card, row) in workspace.cards[1..].iter().zip(&rows) {
+        for (card, row) in workspace.cards.iter().skip(1).zip(&rows) {
             assert_eq!(&stored_card_row(&store, card.id), row);
         }
     }

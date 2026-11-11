@@ -131,13 +131,17 @@ fn presentation_replica_capture_updates_immediately_and_reopens_the_latest_sqlit
     drop(app.sync_chrome());
     let directory = writer_fixture(&mut app);
     let initial = app.durable.clone();
-    let initial_cards = initial.cards.as_ptr();
+    let initial_card = initial
+        .cards
+        .iter()
+        .find(|card| card.id == pane.id)
+        .unwrap() as *const CardState;
     let captures = app.replica_capture.captures;
     let offers = app.replica_capture.offers;
     let (tx, rx) = async_channel::unbounded();
     app.workspace_model_tx = tx;
     let runtime = app.cards.get(&pane.id).unwrap() as *const CardRuntime;
-    let mut separated_cards = None;
+    let mut separated_card = None;
     for revision in 21..25 {
         let title = format!("Replica {revision}");
         let update = presentation_edge(&app, Scope::Channel(source), revision, &title, 0.73);
@@ -152,15 +156,20 @@ fn presentation_replica_capture_updates_immediately_and_reopens_the_latest_sqlit
         assert_eq!(app.replica_capture.offers, offers);
         assert!(app.replica_capture.pending.is_some());
         assert!(app.replica_capture.timer_armed);
-        let cards = app.durable.cards.as_ptr();
+        let card = app.card_state(pane.id).unwrap() as *const CardState;
         assert_ne!(
-            cards, initial_cards,
-            "first edit separates the deliberately held prior revision"
+            card, initial_card,
+            "first edit separates the deliberately held prior card revision"
         );
         assert_eq!(
-            *separated_cards.get_or_insert(cards),
-            cards,
-            "later replica edits do not deep-copy the saved card history"
+            *separated_card.get_or_insert(card),
+            card,
+            "later replica edits do not copy the already-separated card before capture"
+        );
+        assert_eq!(
+            app.durable.cards.copied_from(&initial.cards),
+            [pane.id],
+            "the held prior snapshot shares every unrelated saved card"
         );
         assert_eq!(
             app.cards.get(&pane.id).unwrap() as *const CardRuntime,

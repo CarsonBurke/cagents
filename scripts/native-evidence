@@ -30,7 +30,7 @@ usage() {
 Usage: scripts/native-evidence --task DIR COMMAND
 
 Sides are "before" and "after". Each has its own checkout and target directory;
-both use the same fixture data and synthetic provider.
+both use the same fixture data and selected providers.
 
   build SIDE CHECKOUT
                   Build the runner's three browserless executables in one of
@@ -47,7 +47,9 @@ both use the same fixture data and synthetic provider.
                   --portal runs xdg-desktop-portal with that backend inside the
                   session, so the app's file chooser opens there for drive to
                   operate. --codex installs that offline Codex app-server peer
-                  as the fixture's codex; without it, Codex is not installed.
+                  as the fixture's codex. --codex-executable ABSOLUTE_PATH copies a
+                  real ELF into the isolated fixture, without its config or
+                  credentials. With neither option, Codex is not installed.
   cli ARGS...     Run this side's cagents CLI in the fixture environment.
   env CMD...      Run a command in the fixture environment, which keeps nothing
                   from this shell beyond locale and terminal settings and
@@ -415,7 +417,7 @@ prepare_fixture() {
     # Avatars come only from the seeds the forge copies into the app's cache.
     printf '#!/bin/sh\necho "curl: (7) the fixture has no network access" >&2\nexit 7\n' >"$fixture/bin/curl"
     chmod 755 "$fixture/bin/curl"
-    install_codex_peer
+    install_codex
     if [ ! -e "$fixture/project/.git" ]; then
         (
             export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
@@ -426,12 +428,113 @@ prepare_fixture() {
     fi
 }
 
-# Codex is installed only for a session started with --codex, as that peer:
-# a codex on PATH is what makes the app list Codex as installed.
-install_codex_peer() {
+# Snapshot the explicitly selected ELF before queuing for the native lock.
+# Validation never executes it. A queued session uses these exact bytes even
+# if the original executable is replaced while it waits.
+copy_codex_executable() {
+    /usr/bin/python3 - "$@" <<'PY'
+from pathlib import Path
+import hashlib
+import json
+import os
+import stat
+import sys
+import tempfile
+
+source, destination, receipt = map(Path, sys.argv[1:4])
+expected_receipt = Path(sys.argv[4]) if len(sys.argv) == 5 else None
+temporary = None
+descriptor = None
+
+def identity(info):
+    return {"device": info.st_dev, "inode": info.st_ino, "size": info.st_size,
+            "mode": stat.S_IMODE(info.st_mode), "mtime_ns": info.st_mtime_ns,
+            "ctime_ns": info.st_ctime_ns}
+
+try:
+    if not source.is_absolute():
+        raise ValueError("--codex-executable needs an absolute path")
+    # O_NONBLOCK lets a non-regular input be refused without waiting on a FIFO.
+    descriptor = os.open(source, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    before = os.fstat(descriptor)
+    if not stat.S_ISREG(before.st_mode):
+        raise ValueError("--codex-executable must name a regular file")
+    with os.fdopen(descriptor, "rb") as original:
+        descriptor = None
+        if not before.st_mode & 0o111 or not os.access(f"/proc/self/fd/{original.fileno()}", os.X_OK):
+            raise ValueError("--codex-executable must name an executable file")
+        header = original.read(64)
+        if (len(header) < 52 or header[:4] != b"\x7fELF" or header[4] not in (1, 2)
+                or header[5] not in (1, 2) or header[6] != 1
+                or (header[4] == 2 and len(header) < 64)):
+            raise ValueError("--codex-executable must name an ELF executable")
+        byte_order = "little" if header[5] == 1 else "big"
+        if int.from_bytes(header[16:18], byte_order) not in (2, 3):
+            raise ValueError("--codex-executable must name an executable or PIE ELF")
+        expected = None
+        if expected_receipt is not None:
+            expected = json.loads(expected_receipt.read_text())
+            if (not isinstance(expected, dict)
+                    or not isinstance(expected.get("snapshot_identity"), dict)
+                    or not isinstance(expected.get("sha256"), str)
+                    or len(expected["sha256"]) != 64
+                    or any(character not in "0123456789abcdef" for character in expected["sha256"])):
+                raise ValueError("the selected Codex snapshot receipt is invalid")
+        if expected is not None and identity(before) != expected["snapshot_identity"]:
+            raise ValueError("the selected Codex snapshot changed before installation")
+        original.seek(0)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=destination.parent, delete=False) as copied:
+            temporary = Path(copied.name)
+            digest = hashlib.sha256()
+            size = 0
+            while block := original.read(1024 * 1024):
+                copied.write(block)
+                digest.update(block)
+                size += len(block)
+            if identity(before) != identity(os.fstat(original.fileno())) or size != before.st_size:
+                raise ValueError("the selected Codex executable changed while copying")
+            sha256 = digest.hexdigest()
+            if expected is not None and sha256 != expected["sha256"]:
+                raise ValueError("the selected Codex snapshot's contents changed")
+            # A new inode with explicit permissions imports no set-id bits,
+            # extended attributes or capabilities from the original binary.
+            os.fchmod(copied.fileno(), 0o755)
+        temporary.replace(destination)
+        temporary = None
+        if expected is not None:
+            record = {**expected, "installed_path": str(destination),
+                      "installed_identity": identity(destination.stat()),
+                      "installed_sha256": sha256}
+        else:
+            record = {"source_path": str(source), "source_identity": identity(before),
+                      "sha256": sha256, "snapshot_path": str(destination),
+                      "snapshot_identity": identity(destination.stat())}
+        receipt.write_text(json.dumps(record, indent=2) + "\n")
+except (OSError, ValueError, KeyError) as error:
+    print(f"native-evidence: {error}", file=sys.stderr)
+    sys.exit(2)
+finally:
+    if descriptor is not None:
+        os.close(descriptor)
+    if temporary is not None:
+        temporary.unlink(missing_ok=True)
+PY
+}
+
+# A codex on PATH makes the app list Codex as installed. Install only the
+# explicitly requested peer or isolated real executable; plain starts reset it.
+install_codex() {
     local peer peers=$fixture/libexec/codex
     peer=$(cat -- "$state/codex" 2>/dev/null) || peer=
     rm -rf -- "$peers" "$fixture/bin/codex"
+    if [ -f "$state/codex-executable" ]; then
+        copy_codex_executable "$state/codex-executable" "$peers/codex" \
+            "$state/codex-executable-installed.json" "$state/codex-executable.json"
+        mkdir -p -- "$fixture/bin" "$fixture/home/.codex"
+        ln -s -- ../libexec/codex/codex "$fixture/bin/codex"
+        return
+    fi
     [ -n "$peer" ] || return 0
     mkdir -p -- "$peers" "$fixture/home/.codex"
     # The peers load their transport from beside them.
@@ -509,33 +612,49 @@ path_without_shims() {
 # gone: nobody would drive or stop a session that began after that.
 wait_for_native_lock() {
     local wait_lock=$1 starter=$2 waited=0
-    # Stay in the kernel's queue the whole time: retrying with a short timeout
-    # loses to every blocked waiter, and could wait out the limit behind them.
-    # The child shares this descriptor, so the lock outlives it.
-    flock 9 &
-    lock_waiter=$!
-    local waiter=$lock_waiter
-    while kill -0 "$waiter" 2>/dev/null; do
-        if [ -e "$state/stop" ] || ! kill -0 "$starter" 2>/dev/null; then
-            kill -KILL "$waiter" 2>/dev/null || true
-            wait "$waiter" 2>/dev/null || true
-            printf 'stopped while waiting for the native lock\n' >"$state/failed"
+    if [ "$wait_lock" -eq 0 ]; then
+        # A zero budget still tries the idle lock. Starting a queued helper
+        # and immediately cancelling it races the helper's first scheduling.
+        if flock -n 9; then
+            :
+        else
+            local status=$?
+            if [ "$status" -eq 1 ]; then
+                printf 'the native lock stayed busy for 0 seconds (see scripts/lock-holders %s)\n' "$native_lock" >"$state/failed"
+            else
+                printf 'could not take the native lock\n' >"$state/failed"
+            fi
             return 1
         fi
-        if [ "$waited" -ge "$wait_lock" ]; then
-            kill -KILL "$waiter" 2>/dev/null || true
-            wait "$waiter" 2>/dev/null || true
-            printf 'the native lock stayed busy for %s seconds (see scripts/lock-holders %s)\n' "$wait_lock" "$native_lock" >"$state/failed"
+    else
+        # Stay in the kernel's queue the whole time: retrying with a short timeout
+        # loses to every blocked waiter, and could wait out the limit behind them.
+        # The child shares this descriptor, so the lock outlives it.
+        flock 9 &
+        lock_waiter=$!
+        local waiter=$lock_waiter
+        while kill -0 "$waiter" 2>/dev/null; do
+            if [ -e "$state/stop" ] || ! kill -0 "$starter" 2>/dev/null; then
+                kill -KILL "$waiter" 2>/dev/null || true
+                wait "$waiter" 2>/dev/null || true
+                printf 'stopped while waiting for the native lock\n' >"$state/failed"
+                return 1
+            fi
+            if [ "$waited" -ge "$wait_lock" ]; then
+                kill -KILL "$waiter" 2>/dev/null || true
+                wait "$waiter" 2>/dev/null || true
+                printf 'the native lock stayed busy for %s seconds (see scripts/lock-holders %s)\n' "$wait_lock" "$native_lock" >"$state/failed"
+                return 1
+            fi
+            sleep 1
+            waited=$((waited + 1))
+        done
+        wait "$waiter" || {
+            printf 'could not take the native lock\n' >"$state/failed"
             return 1
-        fi
-        sleep 1
-        waited=$((waited + 1))
-    done
-    wait "$waiter" || {
-        printf 'could not take the native lock\n' >"$state/failed"
-        return 1
-    }
-    lock_waiter=
+        }
+        lock_waiter=
+    fi
     if [ -e "$state/stop" ] || ! kill -0 "$starter" 2>/dev/null; then
         printf 'stopped while waiting for the native lock\n' >"$state/failed"
         return 1
@@ -848,7 +967,7 @@ cmd_relaunch() {
 }
 
 cmd_start() {
-    local side=${1:-} width=1500 height=900 keep_state=false wait_lock=1800 limit=2700 portal= codex=
+    local side=${1:-} width=1500 height=900 keep_state=false wait_lock=1800 limit=2700 portal= codex= codex_executable=
     require_side "$side"
     shift
     while [ "$#" -gt 0 ]; do
@@ -861,6 +980,7 @@ cmd_start() {
             --limit) limit=${2:?--limit needs seconds}; shift 2 ;;
             --portal) portal=${2:?--portal needs a backend: gtk, kde, gnome or cosmic}; shift 2 ;;
             --codex) codex=${2:?--codex needs a peer: tool-rows, child-errors or terminal-escape}; shift 2 ;;
+            --codex-executable) codex_executable=${2:?--codex-executable needs an absolute ELF path}; shift 2 ;;
             *) die "unknown start option: $1" 2 ;;
         esac
     done
@@ -870,6 +990,8 @@ cmd_start() {
         die "unknown portal backend: $portal; use gtk, kde, gnome or cosmic" 2
     [[ -z $codex || $codex =~ ^(tool-rows|child-errors|terminal-escape)$ ]] ||
         die "unknown Codex peer: $codex; use tool-rows, child-errors or terminal-escape" 2
+    [[ -z $codex || -z $codex_executable ]] ||
+        die '--codex and --codex-executable are mutually exclusive' 2
     [[ $self =~ ^/[A-Za-z0-9._/-]+$ ]] || die "the tool's path has unsupported characters: $self" 2
     [[ -z $instance_name || $instance_name =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,23}$ ]] ||
         die 'instance names must be 1-24 ASCII letters, digits or hyphens, starting with a letter or digit' 2
@@ -884,6 +1006,12 @@ cmd_start() {
     mark_used
     load_side "$side"
     source_is_current || die "$checkout changed since its build; run: build $side $checkout"
+    if [ -n "$codex_executable" ]; then
+        copy_codex_executable "$codex_executable" "$state/codex-executable" "$state/codex-executable.json"
+    else
+        rm -f -- "$state/codex-executable" "$state/codex-executable.json"
+    fi
+    rm -f -- "$state/codex-executable-installed.json"
     rm -f -- "$state/ready" "$state/failed" "$state/stop" "$state/env" "$state/over-limit" "$state/notice"
     # Fix what this session runs: everything it reports reads this copy.
     cp -- "$(target_of "$side")/evidence-source" "$state/source" 2>/dev/null ||

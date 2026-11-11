@@ -22783,7 +22783,7 @@ mod tests {
         let (first, second) = (panes[0].id, panes[1].id);
         let mut state = WorkspaceState {
             focused: Some(second),
-            cards: panes,
+            cards: panes.into(),
             ..WorkspaceState::default()
         };
         retire_duplicate_utility_cards(&mut state);
@@ -22801,7 +22801,7 @@ mod tests {
         let id = pane.id;
         app.durable = Arc::new(WorkspaceState {
             focused: Some(id),
-            cards: vec![pane],
+            cards: vec![pane].into(),
             ..WorkspaceState::default()
         });
         app.workspace = Cagents::rebuild_workspace(&app.durable);
@@ -25219,7 +25219,7 @@ mod tests {
         let active = cards[0].id;
         app.durable = Arc::new(WorkspaceState {
             focused: Some(active),
-            cards,
+            cards: cards.into(),
             ..WorkspaceState::default()
         });
         app.workspace = Cagents::rebuild_workspace(&app.durable);
@@ -25248,7 +25248,7 @@ mod tests {
         let moved = cards[12].id;
         app.durable = Arc::new(WorkspaceState {
             focused: Some(active),
-            cards,
+            cards: cards.into(),
             ..WorkspaceState::default()
         });
         app.workspace = Cagents::rebuild_workspace(&app.durable);
@@ -25274,7 +25274,7 @@ mod tests {
         let retarget = cards[5].id;
         app.durable = Arc::new(WorkspaceState {
             focused: Some(origin),
-            cards,
+            cards: cards.into(),
             ..WorkspaceState::default()
         });
         app.workspace = Cagents::rebuild_workspace(&app.durable);
@@ -25317,7 +25317,7 @@ mod tests {
         let target = cards[2].id;
         app.durable = Arc::new(WorkspaceState {
             focused: Some(cards[0].id),
-            cards,
+            cards: cards.into(),
             ..WorkspaceState::default()
         });
         app.workspace = Cagents::rebuild_workspace(&app.durable);
@@ -25367,7 +25367,7 @@ mod tests {
             let source = terminal.clone();
             app.durable = Arc::new(WorkspaceState {
                 focused: Some(first),
-                cards,
+                cards: cards.into(),
                 ..WorkspaceState::default()
             });
             app.workspace = Cagents::rebuild_workspace(&app.durable);
@@ -25436,7 +25436,7 @@ mod tests {
         let terminal_id = terminal.id;
         app.durable = Arc::new(WorkspaceState {
             focused: Some(id),
-            cards: vec![card],
+            cards: vec![card].into(),
             ..WorkspaceState::default()
         });
         app.workspace = Cagents::rebuild_workspace(&app.durable);
@@ -26492,7 +26492,7 @@ mod tests {
         ];
         app.durable = Arc::new(WorkspaceState {
             focused: Some(visible.id),
-            cards: cards.to_vec(),
+            cards: cards.to_vec().into(),
             ..WorkspaceState::default()
         });
         app.set_exposure(visible.id, Exposure::Visible);
@@ -26532,7 +26532,7 @@ mod tests {
         let terminals = ["/bin/sh", "/usr/bin/omp", "/fixture/custom-wrapper"]
             .map(|program| restored_live_terminal(program));
         app.durable = Arc::new(WorkspaceState {
-            cards: terminals.to_vec(),
+            cards: terminals.to_vec().into(),
             ..WorkspaceState::default()
         });
         app.workspace = Cagents::rebuild_workspace(&app.durable);
@@ -26559,7 +26559,7 @@ mod tests {
         let mut app = context_inspector_test_app(false);
         let agent = restored_live_terminal("/usr/bin/claude");
         app.durable = Arc::new(WorkspaceState {
-            cards: vec![agent.clone()],
+            cards: vec![agent.clone()].into(),
             ..WorkspaceState::default()
         });
         app.workspace = Cagents::rebuild_workspace(&app.durable);
@@ -26590,7 +26590,7 @@ mod tests {
         }
         let session = session.clone();
         app.durable = Arc::new(WorkspaceState {
-            cards: vec![agent.clone()],
+            cards: vec![agent.clone()].into(),
             ..WorkspaceState::default()
         });
         app.workspace = Cagents::rebuild_workspace(&app.durable);
@@ -26910,7 +26910,7 @@ mod tests {
             .collect();
         let channel_card = cards[2].id;
         let durable = Arc::make_mut(&mut app.durable);
-        durable.cards = cards;
+        durable.cards = cards.into();
         durable.channels.push(ProjectChannel {
             title_source: Default::default(),
             id: channel,
@@ -32140,7 +32140,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let card_ids = cards.iter().map(|card| card.id).collect::<Vec<_>>();
-        Arc::make_mut(&mut app.durable).cards = cards;
+        Arc::make_mut(&mut app.durable).cards = cards.into();
         let first_id = first.project.id;
         for loaded in [&first, &aliased, &linked_load] {
             app.repository_generations.insert(loaded.project.id, 1);
@@ -32194,7 +32194,7 @@ mod tests {
         card.width_fraction = 0.125;
         let card_id = card.id;
         let durable = WorkspaceState {
-            cards: vec![card],
+            cards: vec![card].into(),
             focused: Some(card_id),
             ..WorkspaceState::default()
         };
@@ -32901,7 +32901,7 @@ mod tests {
         let ids: Vec<_> = cards.iter().map(|card| card.id).collect();
         app.durable = Arc::new(WorkspaceState {
             focused: Some(ids[0]),
-            cards,
+            cards: cards.into(),
             ..WorkspaceState::default()
         });
         app.workspace = Cagents::rebuild_workspace(&app.durable);
@@ -33271,7 +33271,8 @@ mod tests {
                 repository(&"A".repeat(20_000_000)),
                 repository("safe\u{202e}gnitiops"),
                 repository("\u{202e}\u{7}"),
-            ],
+            ]
+            .into(),
             ..WorkspaceState::default()
         };
 
@@ -33856,7 +33857,7 @@ mod tests {
         };
         let feature = terminal("/repo/feature");
         let other = terminal("/repo/other");
-        Arc::make_mut(&mut app.durable).cards = vec![feature.clone(), other.clone()];
+        Arc::make_mut(&mut app.durable).cards = vec![feature.clone(), other.clone()].into();
         let rows = &mut app.sidebar_model.projects[0].worktrees;
         rows.extend(["/repo/feature", "/repo/other"].map(|path| {
             SidebarWorktree::from_durable(WorktreeId::new(), path.into(), Some("feature".into()))

@@ -189,7 +189,7 @@ fn reopened_window_saving(with_projected: bool, saved: TerminalSession) -> Windo
         .find(|channel| channel.id == hidden)
         .unwrap()
         .cards = vec![cached.id];
-    durable.cards = vec![cached.clone()];
+    durable.cards = vec![cached.clone()].into();
     app.workspace = Cagents::rebuild_workspace(&app.durable);
     app.shared_views = State::for_workspace(&app.durable);
     app.workspace_model = crate::workspace_model::WorkspaceModel::default();
@@ -758,7 +758,7 @@ fn reopened_observed_window(with_projected: bool) -> Window {
         .find(|channel| channel.id == hidden)
         .unwrap()
         .cards = vec![cached.id];
-    durable.cards = vec![active_pane.clone(), cached.clone()];
+    durable.cards = vec![active_pane.clone(), cached.clone()].into();
     // The visible strip belongs to the active channel; the cached terminal
     // remains durable offscreen content, not the focus/order baseline.
     let mut visible = (*app.durable).clone();
