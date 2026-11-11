@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ast
 import fcntl
 import hashlib
 import json
@@ -17,6 +18,8 @@ import textwrap
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 REPOSITORY = Path(__file__).resolve().parent.parent
 SCRIPT = REPOSITORY / "scripts" / "native-evidence"
@@ -1029,6 +1032,41 @@ class Evidence(unittest.TestCase):
         self.assertTrue((self.task / "session" / "stop").exists())
         self.assertFalse((self.task / "session" / "replaying").exists())
         self.wait_for_native_release()
+
+    def test_window_query_distinguishes_observation_timeout_from_readiness_deadline(self) -> None:
+        controller = SCRIPT.read_text().split("<<'WINDOW'\n", 1)[1].split("\nWINDOW\n", 1)[0]
+        function = next(node for node in ast.parse(controller).body
+                        if isinstance(node, ast.FunctionDef) and node.name == "app_windows")
+        code = compile(ast.Module(body=[function], type_ignores=[]), "native-evidence app_windows", "exec")
+        for start, finish, times_out, query_timeout, expected in [
+            (5.0, 15.0, True, 10.0, "could not observe whether"),
+            (29.5, 29.9, True, 0.5, "could not observe whether"),
+            (29.5, 30.0, True, 0.5, "within 30 seconds"),
+            (29.5, 30.1, True, 0.5, "within 30 seconds"),
+            (29.5, 30.1, False, 0.5, "within 30 seconds"),
+            (29.5, 29.9, False, 0.5, None),
+        ]:
+            with self.subTest(start=start, finish=finish, times_out=times_out):
+                clock = SimpleNamespace(now=start)
+
+                def query(*args, **kwargs):
+                    self.assertEqual(args[0], ["niri", "msg", "--json", "windows"])
+                    self.assertEqual(kwargs["timeout"], query_timeout)
+                    clock.now = finish
+                    if times_out:
+                        raise subprocess.TimeoutExpired(args[0], kwargs["timeout"])
+                    return subprocess.CompletedProcess(args[0], 0, stdout="[]")
+
+                namespace = {"json": json, "subprocess": subprocess,
+                             "time": SimpleNamespace(monotonic=lambda: clock.now)}
+                exec(code, namespace)
+                with mock.patch.object(subprocess, "run", side_effect=query) as run:
+                    if expected:
+                        with self.assertRaisesRegex(RuntimeError, expected):
+                            namespace["app_windows"](30.0)
+                    else:
+                        self.assertEqual(namespace["app_windows"](30.0), {})
+                    self.assertEqual(run.call_count, 1)
 
     def test_unmapped_relaunch_cannot_fail_a_replacement_session(self) -> None:
         self.multiple_window_fixture()

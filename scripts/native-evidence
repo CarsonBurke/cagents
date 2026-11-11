@@ -992,9 +992,11 @@ def interrupted(signum, _frame):
 
 
 def app_windows(deadline):
+    deadline_error = "the new app window did not appear within 30 seconds"
+    observation_error = "could not observe whether the app window is closed or a new window appeared"
     remaining = deadline - time.monotonic()
     if remaining <= 0:
-        raise RuntimeError("the new app window did not appear within 30 seconds")
+        raise RuntimeError(deadline_error)
     try:
         observed = subprocess.run(
             ["niri", "msg", "--json", "windows"], check=True,
@@ -1016,9 +1018,14 @@ def app_windows(deadline):
                 if type(identity) is not int or identity < 0 or identity in ids:
                     raise ValueError("invalid app window identity")
                 ids[identity] = window.get("pid")
+        if time.monotonic() >= deadline:
+            raise RuntimeError(deadline_error)
         return ids
+    except subprocess.TimeoutExpired as error:
+        message = deadline_error if time.monotonic() >= deadline else observation_error
+        raise RuntimeError(message) from error
     except (subprocess.SubprocessError, ValueError) as error:
-        raise RuntimeError("could not observe whether the app window is closed or a new window appeared") from error
+        raise RuntimeError(observation_error) from error
 
 
 def exited():
