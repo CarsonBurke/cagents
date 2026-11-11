@@ -6994,6 +6994,9 @@ mod tests {
 
         #[test]
         fn bash_cli_forwards_recovery_only_to_the_verified_daemon() {
+            if crate::retained_fixture::run_isolated() {
+                return;
+            }
             if let Some(mode) = std::env::var_os(MODE) {
                 let root = PathBuf::from(std::env::var_os(ROOT).unwrap());
                 crate::daemon::lease_handoff::initialize_inherited_lease().unwrap();
