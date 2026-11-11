@@ -10,11 +10,13 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
 import sys
 from typing import Any
 
 
 COLLECTIONS = ("terminals", "sessions", "channels", "projects", "agents")
+EVIDENCE_LIMIT = 8 * 1024 * 1024
 
 
 def read_json(path: Path) -> Any:
@@ -23,6 +25,19 @@ def read_json(path: Path) -> Any:
 
 def dump(value: Any) -> str:
     return json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+
+
+def private_evidence(path: Path) -> bytes:
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(descriptor, "rb") as stream:
+        metadata = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid()
+                or metadata.st_mode & 0o077 or metadata.st_size > EVIDENCE_LIMIT):
+            raise ValueError(f"unsafe or oversized recovery evidence: {path.name}")
+        raw = stream.read(EVIDENCE_LIMIT + 1)
+        if len(raw) > EVIDENCE_LIMIT:
+            raise ValueError(f"recovery evidence exceeds size limit: {path.name}")
+        return raw
 
 
 def cli_rows(out: Path, name: str, errors: list[str]) -> list[dict]:
@@ -183,7 +198,12 @@ def prepare_recovery(root: Path, out: Path) -> bool:
         raise ValueError("invalid update target version")
     for suffix, name in (("census", "recovery-census"), ("recovery", "recovery-issued")):
         source = state / f"{job}.{suffix}.json"
-        (out / f"{name}.json").write_bytes(source.read_bytes())
+        raw = private_evidence(source)
+        destination = out / f"{name}.json"
+        descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            stream.write(raw)
     # A restored old current may predate the verifier. The staged target owns
     # the protocol bridge and receipt schema for this exact update job.
     print(root / "home/.local/share/cagents-install/versions" / version / "bin/cagents")
@@ -199,10 +219,10 @@ def recovery_evidence(out: Path, errors: list[str]) -> dict | None:
     if not census_file.exists():
         return None
     try:
-        raw = census_file.read_bytes()
+        raw = private_evidence(census_file)
         evidence = {"census": json.loads(raw), "digest": hashlib.sha256(raw).hexdigest(),
-                    "issued": read_json(out / "recovery-issued.json"),
-                    "current": read_json(out / "recovery-current.json")}
+                    "issued": json.loads(private_evidence(out / "recovery-issued.json")),
+                    "current": json.loads(private_evidence(out / "recovery-current.json"))}
         return evidence
     except (OSError, ValueError) as error:
         errors.append(f"recovery evidence: {error}")

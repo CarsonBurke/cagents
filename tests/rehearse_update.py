@@ -160,12 +160,17 @@ class Comparison(unittest.TestCase):
             raw = records.dump(evidence["census"]).encode()
             (state / f"{job}.census.json").write_bytes(raw)
             (state / f"{job}.recovery.json").write_text(records.dump(evidence["issued"]))
+            (state / f"{job}.census.json").chmod(0o600)
+            (state / f"{job}.recovery.json").chmod(0o600)
             self.assertTrue(records.prepare_recovery(root, out))
             self.assertEqual((out / "recovery-census.json").read_bytes(), raw)
+            self.assertEqual((out / "recovery-census.json").stat().st_mode & 0o777, 0o600)
+            self.assertEqual((out / "recovery-issued.json").stat().st_mode & 0o777, 0o600)
             errors = []
             self.assertIsNone(records.recovery_evidence(out, errors))
             self.assertTrue(errors)
             (out / "recovery-current.json").write_text(records.dump(evidence["current"]))
+            (out / "recovery-current.json").chmod(0o600)
             errors = []
             captured = records.recovery_evidence(out, errors)
             self.assertEqual(errors, [])
@@ -179,6 +184,23 @@ class Comparison(unittest.TestCase):
             (state / "status.json").write_text(records.dump({"id": job, "phase": "Complete", "version": "candidate"}))
             with self.assertRaises(ValueError):
                 records.prepare_recovery(root, out)
+
+    def test_recovery_evidence_rejects_public_oversized_and_linked_inputs(self):
+        with tempfile.TemporaryDirectory(prefix="rehearse-private-") as temporary:
+            path = Path(temporary) / "receipt.json"
+            path.write_text("{}")
+            path.chmod(0o644)
+            with self.assertRaises(ValueError):
+                records.private_evidence(path)
+            path.chmod(0o600)
+            with path.open("r+b") as stream:
+                stream.truncate(records.EVIDENCE_LIMIT + 1)
+            with self.assertRaises(ValueError):
+                records.private_evidence(path)
+            alias = Path(temporary) / "alias.json"
+            alias.symlink_to(path)
+            with self.assertRaises(OSError):
+                records.private_evidence(alias)
 
     def test_titles_that_follow_content_are_changes_and_blank_titles_are_losses(self):
         before, after = snapshot(), snapshot()
