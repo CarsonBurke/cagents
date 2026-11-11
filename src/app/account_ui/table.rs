@@ -477,11 +477,9 @@ fn toolbar<'a>(state: &'a State, layout: &Layout, browser_busy: bool) -> Element
     );
     let description = widget::column::with_children(vec![
         design::heading("Accounts").into(),
-        design::caption(
-            "Usage limits as each provider's own CLI reports them. Every login stays with its CLI; cagents never reads credentials.",
-        )
-        .wrapping(cosmic::iced::widget::text::Wrapping::Word)
-        .into(),
+        design::caption("Compare usage limits and available resets across your accounts.")
+            .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+            .into(),
     ])
     .spacing(space::XS)
     .width(Length::Fill);
