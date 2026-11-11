@@ -20,6 +20,7 @@ pub(super) struct State {
     restarting: bool,
     pub(super) confirmation: Option<crate::update::UpdateConfirmation>,
     submitted_confirmation: Option<String>,
+    copied_command: Option<(String, Instant)>,
     /// The job whose review was set aside to go and deal with a session that
     /// blocks it. Its dialog stays away until nothing blocks any more, or
     /// until the update control asks for it again.
@@ -126,6 +127,8 @@ pub enum Action {
     /// Leave the review to look at a session it names, keeping the update.
     ShowSession(crate::model::TerminalId),
     CopyDetails,
+    CopyCommand,
+    ClearCopiedCommand(Instant),
     CancelApply,
     StartApply,
     Applied(Result<UpdateJob, String>),
@@ -175,6 +178,57 @@ fn confirmation_details(
     } else {
         preview_details(&confirmation.preview)
     }
+}
+
+/// The worker appends this exact instruction for installed and release jobs.
+/// Only display/copy its supported command; never infer a different target.
+fn terminal_command<'a>(job: &'a UpdateJob, nonce: &str) -> Option<&'a str> {
+    let confirmation = job.active_confirmation()?;
+    if confirmation.stop.is_none()
+        || confirmation.nonce != nonce
+        || confirmation.preview.candidate.version != job.version
+    {
+        return None;
+    }
+    let (_, instruction) = job.message.rsplit_once("Run `")?;
+    let command = instruction.strip_suffix("` from a system terminal outside cagents.")?;
+    if command == "cagents daemon upgrade" {
+        return Some(command);
+    }
+    let version = command.strip_prefix("cagents daemon upgrade --version ")?;
+    let parsed = semver::Version::parse(version).ok()?;
+    (version == job.version
+        && parsed.to_string() == version
+        && parsed.pre.is_empty()
+        && parsed.build.is_empty())
+    .then_some(command)
+}
+
+fn stop_activity(kind: crate::update::impact::SessionKind, running: &str) -> String {
+    if kind != crate::update::impact::SessionKind::NativeChat {
+        return running.to_owned();
+    }
+    let (activity, cannot_resume) = running
+        .strip_suffix(" (can't be resumed)")
+        .or_else(|| running.strip_suffix(" (cannot be resumed)"))
+        .map_or((running, false), |activity| (activity, true));
+    let activity = activity.replacen(", ", " · ", 1);
+    if cannot_resume {
+        format!("{activity} · can't be resumed")
+    } else {
+        activity
+    }
+}
+
+fn stop_recovery(recovery: &str) -> String {
+    let mut text = recovery.trim().trim_end_matches('.').chars();
+    let recovery: String = text
+        .next()
+        .into_iter()
+        .flat_map(char::to_lowercase)
+        .chain(text)
+        .collect();
+    format!("After the update: {recovery}.")
 }
 
 /// Why the update cannot be confirmed yet, counted so the reader knows how
@@ -326,6 +380,11 @@ impl Cagents {
             None => title,
         };
         let terminal_confirmation = confirmation.stop.is_some();
+        let command = self
+            .update_ui
+            .job
+            .as_ref()
+            .and_then(|job| terminal_command(job, &confirmation.nonce));
         let mut body = vec![
             heading,
             notice_body(if terminal_confirmation {
@@ -335,13 +394,68 @@ impl Cagents {
             }),
         ];
         let mut rows = Vec::new();
-        if terminal_confirmation {
-            // The worker's list and command replace the old refusal details in
-            // the existing bounded area, keeping Cancel and Copy details visible.
-            rows.push(notice_body(confirmation_message(
-                confirmation,
-                self.update_ui.job.as_ref(),
-            )));
+        if let Some(stopped) = &confirmation.stop {
+            if !stopped.items.is_empty() || stopped.background_tasks > 0 {
+                rows.push(notice_body(format!(
+                    "The running terminal service ({}) cannot hand these over. Updating stops them:",
+                    stopped.from_version
+                )));
+            }
+            if stopped.background_tasks > 0 {
+                rows.push(notice_body(format!(
+                    "{} running background {} also stop; they do not resume automatically.",
+                    stopped.background_tasks,
+                    if stopped.background_tasks == 1 {
+                        "task"
+                    } else {
+                        "tasks"
+                    }
+                )));
+            }
+            rows.extend(stopped.items.iter().map(|item| {
+                widget::column::with_children(vec![
+                    widget::selectable_text(item.label.as_str())
+                        .size(design::TEXT_HEADING)
+                        .font(design::heading_font())
+                        .width(Length::Fill)
+                        .into(),
+                    notice_detail(stop_activity(item.kind, &item.running)),
+                    notice_detail(stop_recovery(&item.recovery)),
+                ])
+                .spacing(space::XXS)
+                .into()
+            }));
+            if let Some(command) = command {
+                rows.push(
+                    widget::container(
+                        widget::scrollable::horizontal(
+                            widget::selectable_text(command)
+                                .size(design::TEXT_BODY)
+                                .font(iced::Font::MONOSPACE)
+                                .wrapping(iced::widget::text::Wrapping::None),
+                        )
+                        .direction(iced::widget::scrollable::Direction::Horizontal(
+                            design::scrollbar(),
+                        ))
+                        .width(Length::Fill)
+                        .height(Length::Shrink),
+                    )
+                    .padding(space::S)
+                    .class(design::surface(
+                        Some(design::sunken),
+                        [design::RADIUS_S; 4],
+                        true,
+                    ))
+                    .into(),
+                );
+                rows.push(notice_detail(
+                    "Run this command from a system terminal outside cagents.",
+                ));
+            } else {
+                rows.push(notice_body(
+                    "Copy details for the complete system-terminal instructions.",
+                ));
+            }
         } else if let Some(daemon) = &preview.daemon {
             if let Some(attention) = attention_summary(daemon) {
                 body.push(
@@ -387,38 +501,65 @@ impl Cagents {
                     .into(),
             );
         }
-        body.push(
-            widget::row::with_children(vec![
+        let mut actions = Vec::new();
+        if !terminal_confirmation || command.is_some() {
+            actions.push(
                 crate::ui_controls::button::quiet("Copy details")
                     .id(widget::Id::new("update.copy"))
                     .on_press(Message::UpdateUi(Action::CopyDetails))
                     .into(),
-                iced::widget::Space::new().width(Length::Fill).into(),
-                crate::ui_controls::button::secondary("Cancel")
-                    .id(widget::Id::new("update.cancel"))
-                    .on_press(Message::UpdateUi(Action::CancelApply))
-                    .into(),
-                crate::ui_controls::button::primary(if terminal_confirmation {
-                    "Continue in terminal"
-                } else if preview.daemon.as_ref().is_some_and(|daemon| {
-                    daemon
-                        .sessions
-                        .iter()
-                        .any(|session| session.disposition == Disposition::WaitsForIdle)
-                }) {
-                    "Update when idle"
-                } else {
-                    "Update and reopen"
-                })
+            );
+        }
+        actions.extend([
+            iced::widget::Space::new().width(Length::Fill).into(),
+            crate::ui_controls::button::secondary("Cancel")
+                .id(widget::Id::new("update.cancel"))
+                .on_press(Message::UpdateUi(Action::CancelApply))
+                .into(),
+        ]);
+        if terminal_confirmation {
+            actions.push(if command.is_some() {
+                let copied = self
+                    .update_ui
+                    .copied_command
+                    .as_ref()
+                    .is_some_and(|(nonce, _)| nonce == &confirmation.nonce);
+                crate::ui_controls::button::primary(if copied { "Copied" } else { "Copy command" })
+                    .id(widget::Id::new("update.copy-command"))
+                    .on_press(Message::UpdateUi(Action::CopyCommand))
+                    .into()
+            } else {
+                crate::ui_controls::button::primary("Copy details")
+                    .id(widget::Id::new("update.copy"))
+                    .on_press(Message::UpdateUi(Action::CopyDetails))
+                    .into()
+            });
+        } else {
+            actions.push(
+                crate::ui_controls::button::primary(
+                    if preview.daemon.as_ref().is_some_and(|daemon| {
+                        daemon
+                            .sessions
+                            .iter()
+                            .any(|session| session.disposition == Disposition::WaitsForIdle)
+                    }) {
+                        "Update when idle"
+                    } else {
+                        "Update and reopen"
+                    },
+                )
                 .id(widget::Id::new("update.confirm"))
-                .on_press_maybe((!terminal_confirmation).then_some(Message::UpdateUi(
-                    Action::ConfirmApply(confirmation.nonce.clone()),
+                .on_press(Message::UpdateUi(Action::ConfirmApply(
+                    confirmation.nonce.clone(),
                 )))
                 .into(),
-            ])
-            .align_y(Alignment::Center)
-            .spacing(space::S)
-            .into(),
+            );
+        }
+        body.push(
+            widget::row::with_children(actions)
+                .align_y(Alignment::Center)
+                .spacing(space::S)
+                .into(),
         );
         Some(dialog_ui::overlay(
             dialog_ui::surface(widget::column::with_children(body).spacing(space::L), 600.0),
@@ -849,6 +990,46 @@ impl Cagents {
                             self.update_ui.job.as_ref(),
                         ))
                     })
+            }
+            Action::CopyCommand => {
+                let Some(confirmation) = self
+                    .update_ui
+                    .confirmation
+                    .as_ref()
+                    .filter(|confirmation| confirmation.stop.is_some())
+                else {
+                    return Task::none();
+                };
+                let Some(command) = self
+                    .update_ui
+                    .job
+                    .as_ref()
+                    .and_then(|job| terminal_command(job, &confirmation.nonce))
+                else {
+                    return Task::none();
+                };
+                let command = command.to_owned();
+                let at = Instant::now();
+                self.update_ui.copied_command = Some((confirmation.nonce.clone(), at));
+                chat_ui::invalidate_copy_intent();
+                Task::batch([
+                    iced::clipboard::write(command),
+                    cosmic::task::future(async move {
+                        tokio::time::sleep(Duration::from_millis(1500)).await;
+                        Message::UpdateUi(Action::ClearCopiedCommand(at))
+                    }),
+                ])
+            }
+            Action::ClearCopiedCommand(at) => {
+                if self
+                    .update_ui
+                    .copied_command
+                    .as_ref()
+                    .is_some_and(|(_, copied_at)| *copied_at == at)
+                {
+                    self.update_ui.copied_command = None;
+                }
+                Task::none()
             }
             Action::ReviewJob => {
                 self.update_ui.set_aside = None;
@@ -1477,18 +1658,7 @@ mod tests {
     #[test]
     fn a_stop_preview_keeps_its_terminal_instructions_and_cannot_submit_confirm() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
-        let mut confirmation = daemon_preview(Vec::new());
-        confirmation.stop = Some(
-            serde_json::from_value(serde_json::json!({
-                "from_version": "old",
-                "items": [],
-            }))
-            .unwrap(),
-        );
-        let mut job = awaiting(&confirmation);
-        job.message =
-            "To update to 9.8.7, run `cagents daemon upgrade --version 9.8.7` in a terminal."
-                .into();
+        let (confirmation, job) = stop_review();
         assert_eq!(confirmation_message(&confirmation, Some(&job)), job.message);
         assert_eq!(confirmation_details(&confirmation, Some(&job)), job.message);
         assert_eq!(
@@ -1498,11 +1668,120 @@ mod tests {
         app.update_ui.job = Some(job.clone());
         app.update_ui.confirmation = Some(confirmation.clone());
         let ids = custom_widget_ids(&mut app.update_dialog().expect("instructions are shown"));
-        assert!(ids.iter().any(|id| id == "update.cancel"));
+        for id in ["update.copy", "update.copy-command", "update.cancel"] {
+            assert!(ids.iter().any(|actual| actual == id));
+        }
+        assert!(!ids.iter().any(|id| id == "update.confirm"));
         drop(app.update_update_ui(Action::ConfirmApply(confirmation.nonce)));
         assert!(app.update_ui.confirmation.is_some());
         assert!(app.update_ui.submitted_confirmation.is_none());
         assert_eq!(app.update_ui.job.as_ref().unwrap().message, job.message);
+    }
+
+    fn stop_review() -> (crate::update::UpdateConfirmation, UpdateJob) {
+        let mut confirmation = daemon_preview(Vec::new());
+        confirmation.stop = Some(
+            serde_json::from_value(serde_json::json!({
+                "from_version": "old",
+                "items": [],
+            }))
+            .unwrap(),
+        );
+        let mut job = awaiting(&confirmation);
+        job.message = "Stopping live work needs confirmation in a terminal. Run `cagents daemon upgrade --version 9.8.7` from a system terminal outside cagents.".into();
+        (confirmation, job)
+    }
+
+    #[test]
+    fn stop_commands_are_exact_and_bound_to_the_displayed_review() {
+        let (confirmation, mut job) = stop_review();
+        assert_eq!(
+            terminal_command(&job, &confirmation.nonce),
+            Some("cagents daemon upgrade --version 9.8.7")
+        );
+        assert_eq!(terminal_command(&job, "another review"), None);
+        for instruction in [
+            "Run `cagents daemon upgrade --version 1.2.3` from a system terminal outside cagents.",
+            "Run `cagents daemon upgrade --version 9.8.7; echo wrong` from a system terminal outside cagents.",
+            "Run `other-command` from a system terminal outside cagents.",
+            "No supported command was recorded",
+        ] {
+            job.message = instruction.into();
+            assert_eq!(terminal_command(&job, &confirmation.nonce), None);
+        }
+        job.message = "Run `cagents daemon upgrade` from a system terminal outside cagents.".into();
+        assert_eq!(
+            terminal_command(&job, &confirmation.nonce),
+            Some("cagents daemon upgrade")
+        );
+        job.phase = UpdatePhase::Complete;
+        assert_eq!(terminal_command(&job, &confirmation.nonce), None);
+    }
+
+    #[test]
+    fn copying_the_command_keeps_stop_consent_pending_and_feedback_tracks_the_latest_copy() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (confirmation, job) = stop_review();
+        let original = serde_json::to_value(&job).unwrap();
+        app.update_ui.job = Some(job);
+        app.update_ui.confirmation = Some(confirmation.clone());
+        drop(app.update_update_ui(Action::CopyCommand));
+        let (nonce, first) = app.update_ui.copied_command.clone().unwrap();
+        assert_eq!(nonce, confirmation.nonce);
+        assert_eq!(app.update_ui.confirmation.as_ref(), Some(&confirmation));
+        assert!(app.update_ui.submitted_confirmation.is_none());
+        assert_eq!(serde_json::to_value(&app.update_ui.job).unwrap(), original);
+        let latest = first + Duration::from_millis(1);
+        app.update_ui.copied_command = Some((nonce, latest));
+        drop(app.update_update_ui(Action::ClearCopiedCommand(first)));
+        assert!(app.update_ui.copied_command.is_some());
+        drop(app.update_update_ui(Action::ClearCopiedCommand(latest)));
+        assert!(app.update_ui.copied_command.is_none());
+    }
+
+    #[test]
+    fn a_stop_review_without_a_supported_command_keeps_a_working_details_action() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (confirmation, mut job) = stop_review();
+        job.message = "Complete terminal instructions from an older helper".into();
+        app.update_ui.job = Some(job);
+        app.update_ui.confirmation = Some(confirmation);
+        let ids = custom_widget_ids(&mut app.update_dialog().expect("instructions are shown"));
+        assert!(ids.iter().any(|id| id == "update.copy"));
+        assert!(ids.iter().any(|id| id == "update.cancel"));
+        assert!(
+            !ids.iter()
+                .any(|id| id == "update.copy-command" || id == "update.confirm")
+        );
+        drop(app.update_update_ui(Action::CopyCommand));
+        assert!(app.update_ui.copied_command.is_none());
+        assert!(app.update_ui.submitted_confirmation.is_none());
+    }
+
+    #[test]
+    fn stop_entries_keep_provider_and_terminal_information_in_readable_sentences() {
+        use crate::update::impact::SessionKind;
+        assert_eq!(
+            stop_activity(
+                SessionKind::NativeChat,
+                "Claude chat, working (can't be resumed)"
+            ),
+            "Claude chat · working · can't be resumed"
+        );
+        assert_eq!(
+            stop_activity(SessionKind::NativeChat, "Codex chat, idle"),
+            "Codex chat · idle"
+        );
+        let terminal = "shell running `printf 'a, b'`";
+        assert_eq!(stop_activity(SessionKind::Terminal, terminal), terminal);
+        assert_eq!(
+            stop_recovery("The transcript stays visible; start a new conversation"),
+            "After the update: the transcript stays visible; start a new conversation."
+        );
+        assert_eq!(
+            stop_recovery("press Resume in the pane."),
+            "After the update: press Resume in the pane."
+        );
     }
 
     fn daemon_preview(
