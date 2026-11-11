@@ -21,6 +21,11 @@ credits, source, observation time, age, and stale/reset indicators.
 Reset inventory includes each grant's scope, count, expiry where reported,
 and whether it can be used now.
 
+Claude plan names come from its reported profile or usage metadata. Max tiers
+such as 5x and 20x remain distinct, and a reported Ultra or future plan keeps
+its own name. Allowances use the reported usage windows; cagents does not
+convert a plan name or multiplier into hours of model work.
+
 `--refresh` requires one explicit `--account` ID and reuses that provider CLI's
 isolated usage probe. It requests usage, without submitting a paid model turn.
 A busy or failed probe retains the previous observation and reports the reason.
@@ -78,8 +83,9 @@ recovery command rather than creating a new operation.
 
 Codex uses its supported app-server reset-credit methods. Claude Code does not
 expose a reset operation through its control protocol, so Claude reset inventory
-and consumption use the private endpoint its own client uses. This narrowly
-scoped adapter reads the selected Claude home's OAuth login without copying or
+and consumption use the private endpoint its own client uses. The same probe
+reads its identity-verified profile for dynamic plan names and tiers. This
+adapter reads the selected Claude home's OAuth login without copying or
 refreshing credentials. Normal sign-in remains the provider CLI's responsibility.
 
 ## Choosing defaults from the CLI

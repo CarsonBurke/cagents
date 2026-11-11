@@ -21,6 +21,31 @@ FAKE_TOKEN = "cagents-fixture-only"
 ORGANIZATION = "00000000-0000-4000-8000-000000000001"
 EXPIRY = "2030-01-01T00:00:00Z"
 RESET_AT = "2027-01-01T12:00:00Z"
+# Max tier IDs mirror cached Claude Code metadata. Ultra mirrors a read-only
+# profile response; only Horizon's tier/type IDs are deliberately invented.
+PLAN_VARIANTS = {
+    "pro": ("pro", "Pro", None, "claude_pro"),
+    "max5x": ("max", "Max", "default_claude_max_5x", "claude_max"),
+    "max20x": ("max", "Max", "default_claude_max_20x", "claude_max"),
+    "ultra": ("max", "Ultra", "default_claude_max_20x", "claude_max"),
+    "unknown": ("max", "Fixture Horizon", "fixture_horizon_unknown_tier", "fixture_horizon_type"),
+}
+
+
+def profile_seed():
+    return {"account": {"email": "fixture@example.test"},
+            "organization": {"uuid": ORGANIZATION, "plan_display_name": "Max"}}
+
+
+def plan_marker(state, marker):
+    marker = dict(marker)
+    marker["subscription_type"] = state["usage"]["subscription_type"]
+    tier = state.get("profile", profile_seed())["organization"].get("rate_limit_tier")
+    if tier is None:
+        marker.pop("rate_limit_tier", None)
+    else:
+        marker["rate_limit_tier"] = tier
+    return marker
 
 
 def private_directory(path):
@@ -32,34 +57,38 @@ def private_directory(path):
     return path.resolve(strict=True)
 
 
-def write_json(path, value):
+def write_text(path, value):
     temporary = path.with_name(f".{path.name}-{uuid.uuid4()}.tmp")
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(descriptor, "w") as stream:
-            json.dump(value, stream, indent=2)
-            stream.write("\n")
+            stream.write(value)
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)
 
 
+def write_json(path, value):
+    write_text(path, json.dumps(value, indent=2) + "\n")
+
+
 @contextlib.contextmanager
-def state_file(home):
+def state_file(home, *, readonly=False):
     home = private_directory(home)
     lock = os.open(home / "fixture-reset.lock", os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        fcntl.flock(lock, fcntl.LOCK_SH if readonly else fcntl.LOCK_EX)
         descriptor = os.open(home / "fixture-reset-state.json", os.O_RDONLY | os.O_NOFOLLOW)
         with os.fdopen(descriptor) as stream:
             state = json.load(stream)
         if state.get("fixture") != FAKE_TOKEN:
             raise ValueError("refusing non-fixture reset state")
         yield state
-        write_json(home / "fixture-reset-state.json", state)
-        if "usage" in state:
-            write_json(home / "fixture-usage.json", state["usage"])
-            write_claude_frames(home, state)
+        if not readonly:
+            write_json(home / "fixture-reset-state.json", state)
+            if "usage" in state:
+                write_json(home / "fixture-usage.json", state["usage"])
+                write_claude_frames(home, state)
     finally:
         os.close(lock)
 
@@ -73,6 +102,7 @@ def grant(identifier, windows, count=2):
 
 def claude_seed():
     return {"fixture": FAKE_TOKEN, "claims": {}, "consume_count": 0, "mode": "success",
+            "profile": profile_seed(),
             "usage": {"subscription_type": "max", "rate_limits_available": True,
                       "rate_limits": {
                           "five_hour": {"utilization": 82, "resets_at": RESET_AT},
@@ -165,7 +195,7 @@ def write_claude_frames(home, state):
                        "message": {"id": "fixture-reset-answer-@TURN@", "role": "assistant",
                                    "content": [{"type": "text", "text": "The fixture task can continue."}]}})
     frames.extend([result, {"_end": True}])
-    (home / "fixture-frames.jsonl").write_text("".join(json.dumps(frame) + "\n" for frame in frames))
+    write_text(home / "fixture-frames.jsonl", "".join(json.dumps(frame) + "\n" for frame in frames))
 
 
 def consume_claude(home, body):
@@ -293,14 +323,16 @@ def server(root):
             if not self.authorized():
                 return
             if self.path == "/api/oauth/profile":
-                self.response(200, {"account": {"email": "fixture@example.test"},
-                                    "organization": {"uuid": ORGANIZATION}})
+                with state_file(home, readonly=True) as state:
+                    profile = copy.deepcopy(state.get("profile", profile_seed()))
+                self.response(200, profile)
                 return
             if self.path.split("?", 1)[0] != "/api/oauth/usage":
                 self.response(404, {})
                 return
-            with state_file(home) as state:
-                self.response(200, copy.deepcopy(state["usage"]["rate_limits"]))
+            with state_file(home, readonly=True) as state:
+                limits = copy.deepcopy(state["usage"]["rate_limits"])
+            self.response(200, limits)
 
         def do_POST(self):
             if not self.authorized():
@@ -325,7 +357,9 @@ def server(root):
             self.response(code, result)
 
     http = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    write_json(home / "fixture-reset-api.json", {"base_url": f"http://127.0.0.1:{http.server_port}", "fixture": True})
+    with state_file(home, readonly=True) as state:
+        marker = plan_marker(state, {"base_url": f"http://127.0.0.1:{http.server_port}", "fixture": True})
+    write_json(home / "fixture-reset-api.json", marker)
     return http
 
 
@@ -370,9 +404,44 @@ def configure(root, provider, mode):
                 credit["status"] = "redeemed"
 
 
+def configure_plan(root, name):
+    if name not in PLAN_VARIANTS:
+        raise ValueError("unknown fixture plan: use pro, max5x, max20x, ultra or unknown")
+    root = private_directory(root)
+    root_marker = root / ".cagents-reset-fixture"
+    if not root_marker.is_file() or root_marker.is_symlink():
+        raise ValueError("plan switch requires the private fixture marker")
+    home = private_directory(root / "home/.claude")
+    marker_path = home / "fixture-reset-api.json"
+    marker = None
+    if marker_path.exists() or marker_path.is_symlink():
+        descriptor = os.open(marker_path, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(descriptor) as stream:
+            marker = json.load(stream)
+        if not isinstance(marker, dict) or marker.get("fixture") is not True:
+            raise ValueError("plan switch refuses an invalid fake service marker")
+    subscription, label, tier, organization_type = PLAN_VARIANTS[name]
+    with state_file(home) as state:
+        profile = state.setdefault("profile", profile_seed())
+        organization = profile["organization"]
+        organization["plan_display_name"] = label
+        organization["organization_type"] = organization_type
+        if name == "ultra":
+            organization["seat_tier"] = None
+        else:
+            organization.pop("seat_tier", None)
+        if tier is None:
+            organization.pop("rate_limit_tier", None)
+        else:
+            organization["rate_limit_tier"] = tier
+        state["usage"]["subscription_type"] = subscription
+        if marker is not None:
+            write_json(marker_path, plan_marker(state, marker))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("seed", "serve", "mode"))
+    parser.add_argument("command", choices=("seed", "serve", "mode", "plan"))
     parser.add_argument("root", type=Path)
     parser.add_argument("provider", nargs="?")
     parser.add_argument("mode", nargs="?")
@@ -381,6 +450,8 @@ def main():
         seed(args.root)
     elif args.command == "mode":
         configure(args.root, args.provider, args.mode)
+    elif args.command == "plan":
+        configure_plan(args.root, args.provider)
     else:
         http = server(args.root)
         print(json.dumps({"url": f"http://127.0.0.1:{http.server_port}",

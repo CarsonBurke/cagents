@@ -2,8 +2,9 @@
 //!
 //! Ordinary usage goes through the provider's official client and its
 //! protocol: Claude Code's stream-json control
-//! requests and `claude auth status`, Codex's app server. Reset inventory and
-//! consumption are the narrow exception: Claude exposes no control route,
+//! requests and `claude auth status`, Codex's app server. Reset inventory,
+//! consumption and dynamic plan metadata are the narrow exception: Claude
+//! exposes no control route for resets or the profile's display name,
 //! so `reset_transport` reads its subscription bearer in memory for its fixed
 //! private endpoint. The provider CLI still owns login and credential refresh.
 //!
@@ -347,6 +348,8 @@ fn answered(identity: Option<Identity>, snapshot: UsageSnapshot) -> Outcome {
 struct Probed {
     identity: Option<Identity>,
     snapshot: UsageSnapshot,
+    /// Raw plan observations used only to merge verified profile metadata.
+    plan_metadata: super::claude::PlanMetadata,
     /// A model response has its own observation, independent of quota.
     catalog: Option<Catalog>,
 }
@@ -361,6 +364,7 @@ impl Probed {
         Self {
             identity: None,
             snapshot: UsageSnapshot::state(status, detail, observed_at),
+            plan_metadata: Default::default(),
             catalog,
         }
     }
@@ -984,13 +988,34 @@ async fn probe_claude_with_path(
     let mut probed = join_claude(run_json(status), claude_usage(usage)).await?;
     if confirms_login(probed.identity.as_ref(), probed.snapshot.status) {
         match reset_transport::Client::load(account, program, search_path).await {
-            Ok(client) => match client.inventory().await {
-                Ok(resets) => probed.snapshot.resets = resets,
-                Err(_) => {
-                    probed.snapshot.detail =
-                        Some("Reset availability could not be refreshed".into())
+            Ok(client) => {
+                // Both reads use the frozen login. Reading plan metadata must
+                // not consume inventory's existing probe timeout budget.
+                let plan = async {
+                    match probed.identity.as_ref() {
+                        Some(identity) => client
+                            .plan(identity, &probed.plan_metadata)
+                            .await
+                            .ok()
+                            .flatten(),
+                        None => None,
+                    }
+                };
+                let (plan, inventory) = tokio::join!(plan, client.inventory());
+                if let Some(plan) = plan {
+                    if let Some(identity) = &mut probed.identity {
+                        identity.plan = Some(plan.clone());
+                    }
+                    probed.snapshot.plan = Some(plan);
                 }
-            },
+                match inventory {
+                    Ok(resets) => probed.snapshot.resets = resets,
+                    Err(_) => {
+                        probed.snapshot.detail =
+                            Some("Reset availability could not be refreshed".into())
+                    }
+                }
+            }
             Err(_) => {
                 probed.snapshot.detail = Some("Reset availability could not be refreshed".into())
             }
@@ -1076,7 +1101,12 @@ fn finish_claude_probe(
         Ok(ClaudeSession { catalog, usage }) => (catalog, Ok(usage)),
         Err(message) => (None, Err(message)),
     };
-    let identity = match status {
+    let auth_metadata = status
+        .as_ref()
+        .ok()
+        .map(|status| super::claude::plan_metadata(&status.value))
+        .unwrap_or_default();
+    let mut identity = match status {
         Ok(status) => match super::claude::parse_auth_status(&status.value) {
             Err(state) => {
                 return Ok(Probed::state(
@@ -1093,8 +1123,15 @@ fn finish_claude_probe(
     // An auth failure still takes precedence above. Otherwise a missing usage
     // answer remains the original failure, even when identity was available.
     let usage = usage?;
+    let plan_metadata = usage
+        .value
+        .as_ref()
+        .ok()
+        .map(super::claude::plan_metadata)
+        .unwrap_or_default()
+        .or(auth_metadata);
     let observed_at = usage.observed_at;
-    let snapshot = match usage.value {
+    let mut snapshot = match usage.value {
         Ok(response) => super::claude::probe_usage(&response, observed_at)?,
         Err(message) => match super::claude::error_status(&message) {
             Some(UsageStatus::NeedsLogin) => UsageSnapshot::state(
@@ -1112,9 +1149,21 @@ fn finish_claude_probe(
             None => return Err("Claude Code could not read usage just now".into()),
         },
     };
+    // The merged CLI observation is already useful when the optional profile
+    // lookup cannot run. Keep identity and usage on the same reported plan;
+    // a rejected login retains its existing signed-out behavior.
+    if confirms_login(identity.as_ref(), snapshot.status)
+        && let Some(plan) = plan_metadata.name()
+    {
+        if let Some(identity) = &mut identity {
+            identity.plan = Some(plan.clone());
+        }
+        snapshot.plan = Some(plan);
+    }
     Ok(Probed {
         identity,
         snapshot,
+        plan_metadata,
         catalog,
     })
 }
@@ -1298,6 +1347,7 @@ fn finish_codex_probe(result: Result<CodexSession, String>) -> Result<Probed, St
     Ok(Probed {
         identity,
         snapshot,
+        plan_metadata: Default::default(),
         catalog,
     })
 }
@@ -1663,6 +1713,88 @@ mod tests {
             rpc_result(json!({"id": 3, "error": null, "result": 5})),
             Ok(json!(5))
         );
+    }
+
+    #[test]
+    fn claude_probe_keeps_usage_plan_metadata_over_auth_without_persisting_it() {
+        let auth = json!({"loggedIn":true,"email":"fixture@example.test",
+            "subscriptionType":"max","planDisplayName":"Ultra","rateLimitTier":"default_claude_max_20x"});
+        for display in [Some("Future Plan"), None] {
+            let mut response = json!({"subscription_type":"future-subscription",
+                "rate_limit_tier":"default_claude_future_subscription_17x",
+                "rate_limits":{"limits":[{"kind":"session","group":"session","percent":25,"resets_at":null}]}});
+            if let Some(display) = display {
+                response["plan_display_name"] = json!(display);
+            }
+            let probed = finish_claude_probe(
+                Ok(Observed {
+                    value: auth.clone(),
+                    observed_at: 1,
+                }),
+                Ok(ClaudeSession {
+                    catalog: None,
+                    usage: Observed {
+                        value: Ok(response),
+                        observed_at: 2,
+                    },
+                }),
+            )
+            .unwrap();
+            assert_eq!(
+                probed.plan_metadata.subscription_type.as_deref(),
+                Some("future-subscription")
+            );
+            assert_eq!(
+                probed.plan_metadata.display_name.as_deref(),
+                Some(display.unwrap_or("Ultra"))
+            );
+            assert_eq!(
+                probed.plan_metadata.rate_limit_tier.as_deref(),
+                Some("default_claude_future_subscription_17x")
+            );
+            let encoded = serde_json::to_value(probed.into_outcome()).unwrap();
+            assert!(!encoded.to_string().contains("plan_metadata"));
+        }
+    }
+
+    #[test]
+    fn merged_cli_plan_survives_without_an_optional_profile_lookup() {
+        for (auth, mut response, expected) in [
+            (
+                json!({"loggedIn":true,"email":"fixture@example.test","subscriptionType":"max","planDisplayName":"Ultra"}),
+                json!({"subscription_type":"max"}),
+                "Ultra",
+            ),
+            (
+                json!({"loggedIn":true,"email":"fixture@example.test","subscriptionType":"max"}),
+                json!({"subscription_type":"max","plan_display_name":"Future Plan"}),
+                "Future Plan",
+            ),
+        ] {
+            response["rate_limits"] = json!({"limits":[{"kind":"session","group":"session","percent":25,"resets_at":null}]});
+            let probed = finish_claude_probe(
+                Ok(Observed {
+                    value: auth,
+                    observed_at: 1,
+                }),
+                Ok(ClaudeSession {
+                    catalog: None,
+                    usage: Observed {
+                        value: Ok(response),
+                        observed_at: 2,
+                    },
+                }),
+            )
+            .unwrap();
+            assert_eq!(probed.snapshot.plan.as_deref(), Some(expected));
+            assert_eq!(
+                probed.identity.as_ref().unwrap().plan.as_deref(),
+                Some(expected)
+            );
+            assert_eq!(probed.snapshot.status, UsageStatus::Ok);
+            let encoded = serde_json::to_value(probed.into_outcome()).unwrap();
+            assert!(!encoded.to_string().contains("plan_metadata"));
+        }
     }
 
     fn claude_reply(request: &str, response: Value) -> Value {
@@ -2199,6 +2331,7 @@ sleep 30
             identity,
             snapshot,
             catalog,
+            ..
         } = probe_claude(&account, &script).await.unwrap();
         let models = catalog.unwrap().models;
         assert_eq!(identity.unwrap().email.as_deref(), Some("user@example.com"));
@@ -2261,6 +2394,7 @@ cat >/dev/null
             identity,
             snapshot,
             catalog,
+            ..
         } = probe_codex(&Account::system(Provider::Codex), &script)
             .await
             .unwrap();

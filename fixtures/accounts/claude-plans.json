@@ -1,0 +1,148 @@
+[
+  {
+    "case": "pro",
+    "fixture_note": "Invented non-secret account response. Max tier IDs follow the installed client; the future plan/tier are synthetic.",
+    "auth_status": {
+      "loggedIn": true,
+      "subscriptionType": "pro"
+    },
+    "usage_response": {
+      "subscription_type": "pro",
+      "rate_limits_available": true,
+      "rate_limits": {
+        "five_hour": {
+          "utilization": 25,
+          "resets_at": "2030-01-01T00:00:00Z"
+        },
+        "seven_day": {
+          "utilization": 60,
+          "resets_at": "2030-01-07T00:00:00Z"
+        }
+      }
+    },
+    "profile": {
+      "organization": {
+        "plan_display_name": "Pro",
+        "rate_limit_tier": null
+      }
+    },
+    "expected_label": "Pro"
+  },
+  {
+    "case": "max-5x",
+    "fixture_note": "Invented non-secret account response. Max tier IDs follow the installed client; the future plan/tier are synthetic.",
+    "auth_status": {
+      "loggedIn": true,
+      "subscriptionType": "max"
+    },
+    "usage_response": {
+      "subscription_type": "max",
+      "rate_limits_available": true,
+      "rate_limits": {
+        "five_hour": {
+          "utilization": 25,
+          "resets_at": "2030-01-01T00:00:00Z"
+        },
+        "seven_day": {
+          "utilization": 60,
+          "resets_at": "2030-01-07T00:00:00Z"
+        }
+      }
+    },
+    "profile": {
+      "organization": {
+        "plan_display_name": "Max",
+        "rate_limit_tier": "default_claude_max_5x"
+      }
+    },
+    "expected_label": "Max 5x"
+  },
+  {
+    "case": "max-20x",
+    "fixture_note": "Invented non-secret account response. Max tier IDs follow the installed client; the future plan/tier are synthetic.",
+    "auth_status": {
+      "loggedIn": true,
+      "subscriptionType": "max"
+    },
+    "usage_response": {
+      "subscription_type": "max",
+      "rate_limits_available": true,
+      "rate_limits": {
+        "five_hour": {
+          "utilization": 25,
+          "resets_at": "2030-01-01T00:00:00Z"
+        },
+        "seven_day": {
+          "utilization": 60,
+          "resets_at": "2030-01-07T00:00:00Z"
+        }
+      }
+    },
+    "profile": {
+      "organization": {
+        "plan_display_name": "Max",
+        "rate_limit_tier": "default_claude_max_20x"
+      }
+    },
+    "expected_label": "Max 20x"
+  },
+  {
+    "case": "ultra",
+    "fixture_note": "Non-secret plan fields match a read-only real profile: Ultra display name with legacy Max organization and 20x tier. No account identity is retained.",
+    "auth_status": {
+      "loggedIn": true,
+      "subscriptionType": "max"
+    },
+    "usage_response": {
+      "subscription_type": "max",
+      "rate_limits_available": true,
+      "rate_limits": {
+        "five_hour": {
+          "utilization": 25,
+          "resets_at": "2030-01-01T00:00:00Z"
+        },
+        "seven_day": {
+          "utilization": 60,
+          "resets_at": "2030-01-07T00:00:00Z"
+        }
+      }
+    },
+    "profile": {
+      "organization": {
+        "plan_display_name": "Ultra",
+        "rate_limit_tier": "default_claude_max_20x",
+        "organization_type": "claude_max"
+      }
+    },
+    "expected_label": "Ultra"
+  },
+  {
+    "case": "unknown",
+    "fixture_note": "Invented non-secret account response. Max tier IDs follow the installed client; the future plan/tier are synthetic.",
+    "auth_status": {
+      "loggedIn": true,
+      "subscriptionType": "fixture_horizon"
+    },
+    "usage_response": {
+      "subscription_type": "fixture_horizon",
+      "rate_limits_available": true,
+      "rate_limits": {
+        "five_hour": {
+          "utilization": 25,
+          "resets_at": "2030-01-01T00:00:00Z"
+        },
+        "seven_day": {
+          "utilization": 60,
+          "resets_at": "2030-01-07T00:00:00Z"
+        }
+      }
+    },
+    "profile": {
+      "organization": {
+        "plan_display_name": "Fixture-Horizon",
+        "rate_limit_tier": "default_claude_fixture_horizon_37x"
+      }
+    },
+    "expected_label": "Fixture-Horizon 37x"
+  }
+]

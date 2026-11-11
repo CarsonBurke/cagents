@@ -41,9 +41,116 @@ pub fn parse_auth_status(status: &Value) -> Result<Identity, UsageStatus> {
     Ok(Identity {
         email: text("email"),
         organization: text("orgName"),
-        plan: text("subscriptionType"),
+        plan: plan_metadata(status).name(),
         disputed_by: None,
     })
+}
+
+/// A reported name and tier, without assuming a fixed set of subscriptions.
+/// Claude's profile name takes precedence over its older subscription enum.
+/// A multiplier belongs only to the family named by the tier: a legacy Max
+/// tier must never turn a reported Ultra (or future plan) back into Max.
+pub(super) fn plan_name(
+    subscription_type: Option<&str>,
+    display_name: Option<&str>,
+    rate_limit_tier: Option<&str>,
+) -> Option<String> {
+    let name = display_name.and_then(valid_plan_display_name).or_else(|| {
+        subscription_type
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+    })?;
+    let multiplier = rate_limit_tier
+        .map(str::trim)
+        .and_then(|tier| tier.strip_prefix("default_claude_"))
+        .and_then(|tier| tier.rsplit_once('_'))
+        .filter(|(family, _)| {
+            let words = |value: &str| {
+                value
+                    .split(['_', '-', ' '])
+                    .filter(|word| !word.is_empty())
+                    .map(str::to_lowercase)
+                    .collect::<Vec<_>>()
+            };
+            words(family) == words(name)
+        })
+        .and_then(|(_, multiplier)| {
+            multiplier
+                .strip_suffix('x')
+                .filter(|digits| digits.bytes().all(|byte| byte.is_ascii_digit()))
+                .and_then(|digits| digits.parse::<u64>().ok())
+                .filter(|number| *number > 0)
+                .map(|_| multiplier)
+        });
+    Some(match multiplier {
+        Some(multiplier) => format!("{name} {multiplier}"),
+        None => name.to_owned(),
+    })
+}
+
+fn valid_plan_display_name(name: &str) -> Option<&str> {
+    let name = name.trim();
+    let count = name.chars().count();
+    ((1..=40).contains(&count)
+        && name
+            .chars()
+            .all(|c| c.is_alphanumeric() || " .+-".contains(c))
+        && name.chars().next().is_some_and(char::is_alphanumeric)
+        && name
+            .chars()
+            .last()
+            .is_some_and(|c| c.is_alphanumeric() || c == '+'))
+    .then_some(name)
+}
+
+/// Temporary probe metadata keeps explicit names distinct from legacy enums
+/// while the verified profile and the control response are reconciled.
+#[derive(Debug, Default, Clone)]
+pub(super) struct PlanMetadata {
+    pub subscription_type: Option<String>,
+    pub display_name: Option<String>,
+    pub rate_limit_tier: Option<String>,
+}
+
+impl PlanMetadata {
+    pub(super) fn name(&self) -> Option<String> {
+        plan_name(
+            self.subscription_type.as_deref(),
+            self.display_name.as_deref(),
+            self.rate_limit_tier.as_deref(),
+        )
+    }
+
+    pub(super) fn or(self, fallback: Self) -> Self {
+        Self {
+            subscription_type: self.subscription_type.or(fallback.subscription_type),
+            display_name: self.display_name.or(fallback.display_name),
+            rate_limit_tier: self.rate_limit_tier.or(fallback.rate_limit_tier),
+        }
+    }
+}
+
+/// Newer usage/login responses may carry profile metadata directly. Prefer
+/// that report's explicit name, including unknown future names, to its enum.
+pub(super) fn plan_metadata(report: &Value) -> PlanMetadata {
+    let limits = &report["rate_limits"];
+    let text = |names: &[&str]| {
+        [report, limits].into_iter().find_map(|value| {
+            names.iter().find_map(|name| {
+                value[*name]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+            })
+        })
+    };
+    PlanMetadata {
+        subscription_type: text(&["subscription_type", "subscriptionType"]).map(str::to_owned),
+        display_name: text(&["plan_display_name", "planDisplayName"])
+            .and_then(valid_plan_display_name)
+            .map(str::to_owned),
+        rate_limit_tier: text(&["rate_limit_tier", "rateLimitTier"]).map(str::to_owned),
+    }
 }
 
 /// What a Claude Code configuration records of who its login is, as
@@ -162,10 +269,7 @@ pub fn settle_dispute(
 /// when that list is absent, and every other key in `rate_limits` - of which
 /// the CLI carries a growing set of internal codenames - is ignored.
 pub fn parse_usage(response: &Value, observed_at: u64) -> UsageSnapshot {
-    let plan = response["subscription_type"]
-        .as_str()
-        .filter(|plan| !plan.is_empty())
-        .map(str::to_owned);
+    let plan = plan_metadata(response).name();
     let limits = &response["rate_limits"];
     if response["rate_limits_available"].as_bool() == Some(false) || !limits.is_object() {
         let mut snapshot = UsageSnapshot::state(
@@ -887,6 +991,82 @@ mod tests {
             .join("fixtures/accounts")
             .join(name);
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn plan_fixtures_preserve_dynamic_names_tiers_and_reported_allowance() {
+        for case in fixture("claude-plans.json").as_array().unwrap() {
+            let subscription = case["auth_status"]["subscriptionType"].as_str();
+            let organization = &case["profile"]["organization"];
+            let label = organization["plan_display_name"].as_str().unwrap();
+            let tier = organization["rate_limit_tier"].as_str();
+            let expected = case["expected_label"].as_str().unwrap();
+            let plan = plan_name(subscription, Some(label), tier).unwrap();
+            assert_eq!(
+                super::super::plan_label(&plan),
+                expected,
+                "{}",
+                case["case"]
+            );
+
+            // Additive metadata from a newer login/control response follows
+            // the same rules even though 2.1.296 omits these projections.
+            let mut auth = case["auth_status"].clone();
+            auth["planDisplayName"] = label.into();
+            auth["rateLimitTier"] = organization["rate_limit_tier"].clone();
+            let identity = parse_auth_status(&auth).unwrap();
+            assert_eq!(identity.plan.as_deref(), Some(plan.as_str()));
+            let mut usage = case["usage_response"].clone();
+            usage["rate_limits"]["plan_display_name"] = label.into();
+            usage["rate_limits"]["rate_limit_tier"] = organization["rate_limit_tier"].clone();
+            let snapshot = parse_usage(&usage, 10);
+            assert_eq!(snapshot.plan.as_deref(), Some(plan.as_str()));
+            assert_eq!(snapshot.windows.len(), 2);
+            assert_eq!(snapshot.windows[0].used, 0.25);
+            assert_eq!(snapshot.windows[1].used, 0.6);
+            // These are reset-window durations, not inferred working hours.
+            assert_eq!(snapshot.windows[0].span_secs, Some(FIVE_HOURS));
+            assert_eq!(snapshot.windows[1].span_secs, Some(SEVEN_DAYS));
+            assert_eq!(snapshot.status, UsageStatus::Ok);
+        }
+    }
+
+    #[test]
+    fn plan_names_never_fall_back_to_max_or_borrow_another_plans_multiplier() {
+        assert_eq!(plan_name(None, None, None), None);
+        for (subscription, label, tier, expected) in [
+            ("max", "Ultra", "default_claude_max_20x", "Ultra"),
+            ("max", "Max 20x", "default_claude_max_5x", "Max 20x"),
+            (
+                "future",
+                "Future Horizon",
+                "default_claude_future_horizon_37x",
+                "Future Horizon 37x",
+            ),
+            ("pro", "Pro", "default_claude_pro_0x", "Pro"),
+            ("pro", "Pro", "default_claude_pro_-5x", "Pro"),
+            ("future", "未来プラン", "unrecognized_tier", "未来プラン"),
+        ] {
+            assert_eq!(
+                plan_name(Some(subscription), Some(label), Some(tier)).as_deref(),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            plan_name(Some("future_plan"), None, None).as_deref(),
+            Some("future_plan")
+        );
+        assert_eq!(
+            plan_name(Some("pro"), Some("Max\n20x"), None).as_deref(),
+            Some("pro")
+        );
+        let unknown = parse_usage(&serde_json::json!({"subscription_type":"future_plan"}), 1);
+        assert_eq!(unknown.plan.as_deref(), Some("future_plan"));
+        assert_eq!(unknown.status, UsageStatus::Unavailable);
+        assert!(
+            unknown.windows.is_empty(),
+            "a plan label never invents allowance"
+        );
     }
 
     /// The recorded response carries a dozen codename keys beside the

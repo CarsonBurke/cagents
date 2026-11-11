@@ -1,5 +1,6 @@
 //! The replaceable Claude reset transport. Claude Code 2.1.296 exposes no
-//! reset control request, so this adapter uses its private OAuth endpoints.
+//! reset control request or dynamic plan name, so this adapter uses its
+//! private OAuth usage/reset and identity-verified profile endpoints.
 //! Credentials are read only into this adapter and sent over curl's stdin,
 //! never its arguments, logs, cache, or a response to the caller. We never
 //! refresh or write credentials. The existing CLI probe owns token refresh.
@@ -13,6 +14,10 @@ pub(super) struct Client {
     bearer: String,
     organization: String,
     version: String,
+    subscription_type: Option<String>,
+    rate_limit_tier: Option<String>,
+    plan_display_name: Option<String>,
+    plan_email: Option<String>,
     fixture: bool,
 }
 
@@ -109,6 +114,14 @@ impl Client {
             bearer,
             organization,
             version,
+            subscription_type: oauth["subscriptionType"].as_str().map(str::to_owned),
+            rate_limit_tier: oauth["rateLimitTier"].as_str().map(str::to_owned),
+            plan_display_name: config["oauthAccount"]["planDisplayName"]
+                .as_str()
+                .map(str::to_owned),
+            plan_email: config["oauthAccount"]["emailAddress"]
+                .as_str()
+                .map(str::to_owned),
             fixture: false,
         })
     }
@@ -154,7 +167,60 @@ impl Client {
 
     /// Verify the frozen bearer rather than trusting separate CLI metadata.
     pub(super) async fn verify_identity(&self, expected: &Identity) -> Result<(), String> {
+        self.verified_profile(expected).await.map(|_| ())
+    }
+
+    /// Display metadata belongs to the same verified login as the usage probe.
+    /// Missing profile fields retain the subscription type the CLI knows.
+    pub(super) async fn plan(
+        &self,
+        expected: &Identity,
+        reported: &super::super::claude::PlanMetadata,
+    ) -> Result<Option<String>, String> {
+        let profile = self.verified_profile(expected).await?;
+        let organization = &profile["organization"];
+        // Only these profile fields can become plan metadata. Identity and
+        // unrelated profile content stay inside this credential adapter.
+        let mut profile = super::super::claude::plan_metadata(&json!({
+            "subscription_type": organization["organization_type"].as_str()
+                .and_then(|kind| kind.strip_prefix("claude_")),
+            "plan_display_name": organization["plan_display_name"],
+            "rate_limit_tier": organization["rate_limit_tier"],
+        }));
+        // A CLI-reported subscription outranks the profile's legacy org type;
+        // the profile's explicit display name and current tier remain primary.
+        profile.subscription_type = reported
+            .subscription_type
+            .clone()
+            .or(profile.subscription_type);
+        // The config cache is independent of the frozen bearer. Its display
+        // name is only a fallback after profile verification, for this email.
+        let same_owner = self
+            .plan_email
+            .as_deref()
+            .zip(expected.email.as_deref())
+            .is_some_and(|(cached, expected)| {
+                !cached.trim().is_empty() && cached.trim().eq_ignore_ascii_case(expected.trim())
+            });
+        let cached = super::super::claude::plan_metadata(&json!({
+            "subscription_type": self.subscription_type,
+            "plan_display_name": same_owner.then_some(self.plan_display_name.as_deref()).flatten(),
+            "rate_limit_tier": self.rate_limit_tier,
+        }));
+        let fallback = super::super::claude::PlanMetadata {
+            subscription_type: expected.plan.clone(),
+            ..Default::default()
+        };
+        Ok(profile.or(reported.clone()).or(cached).or(fallback).name())
+    }
+
+    async fn verified_profile(&self, expected: &Identity) -> Result<Value, String> {
         let profile = self.request("GET", "/api/oauth/profile", None).await?;
+        self.verify_profile(&profile, expected)?;
+        Ok(profile)
+    }
+
+    fn verify_profile(&self, profile: &Value, expected: &Identity) -> Result<(), String> {
         let email = profile["account"]["email"]
             .as_str()
             .or_else(|| profile["account"]["email_address"].as_str());
@@ -339,6 +405,10 @@ async fn fixture_client(home: &Path, marker: &Path) -> Result<Client, String> {
         bearer: "cagents-fixture-only".into(),
         organization: "00000000-0000-4000-8000-000000000001".into(),
         version: "0.0.0-fixture".into(),
+        subscription_type: value["subscription_type"].as_str().map(str::to_owned),
+        rate_limit_tier: value["rate_limit_tier"].as_str().map(str::to_owned),
+        plan_display_name: value["plan_display_name"].as_str().map(str::to_owned),
+        plan_email: value["plan_email"].as_str().map(str::to_owned),
         fixture: true,
     })
 }
@@ -405,6 +475,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(client.bearer, "cagents-fixture-only");
+        assert_eq!(client.subscription_type, None);
+        assert_eq!(client.rate_limit_tier, None);
+        assert_eq!(client.plan_display_name, None);
+        assert_eq!(client.plan_email, None);
+        std::fs::write(
+            &marker,
+            json!({"base_url":"http://127.0.0.1:1234","fixture":true,
+            "subscription_type":"max","rate_limit_tier":"default_claude_max_5x",
+            "plan_display_name":"Ultra","plan_email":"fixture@example.test"})
+            .to_string(),
+        )
+        .unwrap();
+        let client = Client::load(&account, Path::new("/missing/claude"), None)
+            .await
+            .unwrap();
+        assert_eq!(client.subscription_type.as_deref(), Some("max"));
+        assert_eq!(
+            client.rate_limit_tier.as_deref(),
+            Some("default_claude_max_5x")
+        );
+        assert_eq!(client.plan_display_name.as_deref(), Some("Ultra"));
+        assert_eq!(client.plan_email.as_deref(), Some("fixture@example.test"));
         std::fs::remove_file(&marker).unwrap();
         assert!(
             Client::load(&account, Path::new("/missing/claude"), None)
@@ -421,11 +513,27 @@ mod offer_context_tests {
     use std::io::{Read, Write};
 
     fn server(responses: Vec<Value>) -> (Client, std::thread::JoinHandle<()>) {
+        let requests = responses
+            .into_iter()
+            .enumerate()
+            .map(|(index, body)| {
+                let path = if index == 0 {
+                    "/api/oauth/usage?cedar_ember=1&skip_spend=1"
+                } else {
+                    "/api/oauth/usage?at_wall=1&skip_spend=1"
+                };
+                (path, body)
+            })
+            .collect();
+        read_server(requests)
+    }
+
+    fn read_server(responses: Vec<(&'static str, Value)>) -> (Client, std::thread::JoinHandle<()>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
         let worker = std::thread::spawn(move || {
-            for (index, response) in responses.into_iter().enumerate() {
+            for (path, response) in responses {
                 let deadline = std::time::Instant::now() + Duration::from_secs(5);
                 let mut stream = loop {
                     match listener.accept() {
@@ -450,11 +558,8 @@ mod offer_context_tests {
                     request.extend_from_slice(&chunk[..count]);
                 }
                 let request = String::from_utf8(request).unwrap();
-                assert!(request.starts_with(if index == 0 {
-                    "GET /api/oauth/usage?cedar_ember=1&skip_spend=1 "
-                } else {
-                    "GET /api/oauth/usage?at_wall=1&skip_spend=1 "
-                }));
+                assert!(request.starts_with(&format!("GET {path} ")));
+                assert!(request.contains("Authorization: Bearer cagents-fixture-only\r\n"));
                 let body = response.to_string();
                 write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
             }
@@ -465,6 +570,10 @@ mod offer_context_tests {
                 bearer: "cagents-fixture-only".into(),
                 organization: "00000000-0000-4000-8000-000000000001".into(),
                 version: "0.0.0-fixture".into(),
+                subscription_type: None,
+                rate_limit_tier: None,
+                plan_display_name: None,
+                plan_email: None,
                 fixture: true,
             },
             worker,
@@ -505,5 +614,232 @@ mod offer_context_tests {
             [super::super::super::ResetScope::AccountWeekly]
         );
         assert!(resets[0].is_available((now_ms() / 1000) as i64));
+    }
+    fn profile() -> Value {
+        json!({"account":{"email":"fixture@example.test"},
+            "organization":{"uuid":"00000000-0000-4000-8000-000000000001","name":"Fixture workspace"}})
+    }
+
+    fn identity() -> Identity {
+        Identity {
+            email: Some("fixture@example.test".into()),
+            organization: Some("Fixture workspace".into()),
+            plan: Some("legacy-subscription".into()),
+            disputed_by: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_metadata_requires_the_same_email_organization_and_name_as_consume() {
+        for field in ["email", "organization", "name"] {
+            let mut profile = profile();
+            match field {
+                "email" => profile["account"]["email"] = json!("other@example.test"),
+                "organization" => {
+                    profile["organization"]["uuid"] = json!("00000000-0000-4000-8000-000000000002")
+                }
+                _ => profile["organization"]["name"] = json!("Other workspace"),
+            }
+            profile["organization"]["plan_display_name"] = json!("Unrelated plan");
+            let (client, server) = read_server(vec![
+                ("/api/oauth/profile", profile.clone()),
+                ("/api/oauth/profile", profile),
+            ]);
+            assert!(
+                client.plan(&identity(), &Default::default()).await.is_err(),
+                "{field}"
+            );
+            assert!(
+                client.verify_identity(&identity()).await.is_err(),
+                "{field}"
+            );
+            server.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn optional_plan_metadata_falls_back_to_cached_and_cli_subscription() {
+        let (mut client, server) = read_server(vec![
+            ("/api/oauth/profile", profile()),
+            ("/api/oauth/profile", profile()),
+        ]);
+        assert_eq!(
+            client
+                .plan(&identity(), &Default::default())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("legacy-subscription")
+        );
+        client.subscription_type = Some("future-subscription".into());
+        assert_eq!(
+            client
+                .plan(&identity(), &Default::default())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("future-subscription")
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn profile_display_name_and_tier_override_cached_legacy_metadata() {
+        let mut explicit = profile();
+        explicit["organization"]["organization_type"] = json!("claude_max");
+        explicit["organization"]["plan_display_name"] = json!("Ultra");
+        // Synthetic matching-family tier exercises generic suffix handling;
+        // it does not claim this is a real provider tier identifier.
+        explicit["organization"]["rate_limit_tier"] = json!("default_claude_ultra_20x");
+        // Confirmed read-only provider shape: Ultra can retain the legacy Max
+        // organization type and tier. That tier must not rename the plan.
+        let mut legacy_alias = profile();
+        legacy_alias["organization"]["plan_display_name"] = json!("Ultra");
+        legacy_alias["organization"]["organization_type"] = json!("claude_max");
+        legacy_alias["organization"]["rate_limit_tier"] = json!("default_claude_max_20x");
+        legacy_alias["organization"]["seat_tier"] = Value::Null;
+        let mut generic = profile();
+        generic["organization"]["organization_type"] = json!("claude_future-subscription");
+        let (mut client, server) = read_server(vec![
+            ("/api/oauth/profile", explicit),
+            ("/api/oauth/profile", legacy_alias),
+            ("/api/oauth/profile", generic),
+        ]);
+        client.subscription_type = Some("max".into());
+        client.rate_limit_tier = Some("default_claude_max_5x".into());
+        assert_eq!(
+            client
+                .plan(&identity(), &Default::default())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("Ultra 20x")
+        );
+        let reported =
+            super::super::super::claude::plan_metadata(&json!({"subscription_type":"max"}));
+        assert_eq!(
+            client
+                .plan(&identity(), &reported)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("Ultra")
+        );
+        assert_eq!(
+            client
+                .plan(&identity(), &Default::default())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("future-subscription")
+        );
+        server.join().unwrap();
+    }
+    #[tokio::test]
+    async fn legacy_profile_types_do_not_downgrade_explicit_reported_plans() {
+        let mut legacy = profile();
+        legacy["organization"]["organization_type"] = json!("claude_max");
+        let mut malformed = legacy.clone();
+        malformed["organization"]["plan_display_name"] = json!("untrusted\nlabel");
+        let cases = [
+            (
+                json!({"subscription_type":"max","plan_display_name":"Ultra","rate_limit_tier":"default_claude_max_20x"}),
+                legacy.clone(),
+                "Ultra",
+            ),
+            (
+                json!({"subscription_type":"future-subscription","rate_limit_tier":"default_claude_future_subscription_17x"}),
+                legacy,
+                "future-subscription 17x",
+            ),
+            (
+                json!({"subscription_type":"max","plan_display_name":"Future Plan"}),
+                malformed,
+                "Future Plan",
+            ),
+        ];
+        let (mut client, server) = read_server(
+            cases
+                .iter()
+                .map(|(_, profile, _)| ("/api/oauth/profile", profile.clone()))
+                .collect(),
+        );
+        client.subscription_type = Some("max".into());
+        client.rate_limit_tier = Some("default_claude_max_5x".into());
+        for (reported, _, expected) in cases {
+            let reported = super::super::super::claude::plan_metadata(&reported);
+            assert_eq!(
+                client
+                    .plan(&identity(), &reported)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(expected)
+            );
+        }
+        server.join().unwrap();
+    }
+    #[tokio::test]
+    async fn cached_display_requires_verified_profile_and_matching_owner() {
+        let mut legacy = profile();
+        legacy["organization"]["organization_type"] = json!("claude_max");
+        let mut explicit = legacy.clone();
+        explicit["organization"]["plan_display_name"] = json!("Profile Plan");
+        let mut mismatch = legacy.clone();
+        mismatch["account"]["email"] = json!("other@example.test");
+        let cases = [
+            (
+                " FIXTURE@EXAMPLE.TEST ",
+                json!({"subscription_type":"max"}),
+                legacy.clone(),
+                Some("Ultra"),
+            ),
+            (
+                "other@example.test",
+                json!({"subscription_type":"max"}),
+                legacy.clone(),
+                Some("max 5x"),
+            ),
+            (
+                "fixture@example.test",
+                json!({"subscription_type":"max"}),
+                explicit,
+                Some("Profile Plan"),
+            ),
+            (
+                "fixture@example.test",
+                json!({"subscription_type":"max","plan_display_name":"Reported Plan"}),
+                legacy,
+                Some("Reported Plan"),
+            ),
+            (
+                "fixture@example.test",
+                json!({"subscription_type":"max"}),
+                mismatch,
+                None,
+            ),
+        ];
+        let (mut client, server) = read_server(
+            cases
+                .iter()
+                .map(|(_, _, profile, _)| ("/api/oauth/profile", profile.clone()))
+                .collect(),
+        );
+        client.subscription_type = Some("max".into());
+        client.rate_limit_tier = Some("default_claude_max_5x".into());
+        client.plan_display_name = Some("Ultra".into());
+        for (owner, reported, _, expected) in cases {
+            client.plan_email = Some(owner.into());
+            let reported = super::super::super::claude::plan_metadata(&reported);
+            let result = client.plan(&identity(), &reported).await;
+            match expected {
+                Some(expected) => assert_eq!(result.unwrap().as_deref(), Some(expected)),
+                None => assert!(
+                    result.is_err(),
+                    "cached display must not survive profile mismatch"
+                ),
+            }
+        }
+        server.join().unwrap();
     }
 }

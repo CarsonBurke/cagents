@@ -34,7 +34,7 @@ class Scenario(peer.Scenario):
             return []
         home = Path(codex_home)
         if method == "account/rateLimits/read":
-            with reset.state_file(home) as state:
+            with reset.state_file(home, readonly=True) as state:
                 result = json.loads(json.dumps(state["limits"]))
             if frame.get("params", {}).get("excludeResetCreditDetails"):
                 result["rateLimitResetCredits"]["credits"] = None
@@ -50,7 +50,7 @@ class Scenario(peer.Scenario):
         elif method == "turn/start":
             if frame.get("params", {}).get("threadId") != self.thread:
                 return [{"id": identifier, "error": {"code": -32602, "message": "Prompt the fixture thread"}}]
-            with reset.state_file(home) as state:
+            with reset.state_file(home, readonly=True) as state:
                 allowed = state["limits"].get("ordinaryUsageAllowed") is True
             turn = str(uuid.uuid4())
             started = {"id": turn, "status": "inProgress", "items": []}

@@ -33,6 +33,47 @@ class UsageResetFixture(unittest.TestCase):
         return FIXTURE.consume_claude(self.claude, {
             "program": "cedar_ember", "grant_id": grant, "request_id": key})
 
+    def test_http_reads_and_service_start_preserve_custom_frames_and_published_files(self):
+        frames = self.claude / "fixture-frames.jsonl"
+        frames.write_text('{"_sleep":60}\n{"_end":true}\n')
+        paths = [self.claude / name for name in (
+            "fixture-reset-state.json", "fixture-usage.json", "fixture-frames.jsonl")]
+
+        def published_files():
+            return [(path.read_bytes(), path.stat().st_ino, path.stat().st_mtime_ns) for path in paths]
+
+        before = published_files()
+        server = FIXTURE.server(self.root)
+        self.assertEqual(published_files(), before, "service metadata read republished fixture data")
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        self.addCleanup(connection.close)
+        for path in ("/api/oauth/profile", "/api/oauth/usage?cedar_ember=1&skip_spend=1",
+                     "/api/oauth/usage?at_wall=1&skip_spend=1"):
+            with self.subTest(path=path):
+                connection.request("GET", path, headers={"Authorization": f"Bearer {FIXTURE.FAKE_TOKEN}"})
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                self.assertTrue(json.loads(response.read()))
+                self.assertEqual(published_files(), before, "read-only request republished fixture data")
+
+    def test_frame_publication_preserves_an_open_turn_reader(self):
+        path = self.claude / "fixture-frames.jsonl"
+        old = path.read_bytes()
+        with path.open("rb", buffering=0) as reader:
+            prefix = reader.read(23)
+            old_inode = os.fstat(reader.fileno()).st_ino
+            self.assertEqual(self.claim()[1]["result"], "reset")
+            self.assertEqual(prefix + reader.read(), old)
+            self.assertNotEqual(path.stat().st_ino, old_inode)
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        frames = [json.loads(line) for line in path.read_text().splitlines()]
+        self.assertEqual(frames[0]["rate_limit_info"]["status"], "allowed")
+        self.assertEqual(frames[-2]["subtype"], "success")
+        self.assertEqual(frames[-1], {"_end": True})
+
     def test_fable_claim_is_idempotent_and_preserves_account_windows(self):
         before = self.read(self.claude)["usage"]["rate_limits"]
         code, response, disconnect = self.claim()
@@ -281,10 +322,16 @@ class UsageResetFixture(unittest.TestCase):
                     return frames
 
         try:
+            state_path = self.codex / "fixture-reset-state.json"
+            before_read = (state_path.read_bytes(), state_path.stat().st_ino, state_path.stat().st_mtime_ns)
             send(1, "initialize")
             thread = send(2, "thread/start")[0]["result"]["thread"]["id"]
+            inventory = send(20, "account/rateLimits/read")[0]["result"]
+            self.assertEqual(inventory["rateLimitResetCredits"]["availableCount"], 2)
             first = send(3, "turn/start", {"threadId": thread}, turn=True)
             self.assertEqual(first[-1]["params"]["turn"]["status"], "failed")
+            self.assertEqual((state_path.read_bytes(), state_path.stat().st_ino, state_path.stat().st_mtime_ns),
+                             before_read, "Codex inventory/turn reads republished fixture state")
             self.assertEqual(send(4, "account/rateLimitResetCredit/consume", {"idempotencyKey": "recover-first"})[0]["result"], {"outcome": "reset"})
             recovered = send(5, "turn/start", {"threadId": thread}, turn=True)
             self.assertEqual(recovered[-1]["params"]["turn"]["status"], "completed")
@@ -321,6 +368,96 @@ class UsageResetFixture(unittest.TestCase):
         (self.root / ".cagents-reset-fixture").unlink()
         with self.assertRaisesRegex(ValueError, "fixture marker"):
             FIXTURE.configure(self.root, "claude", "depleted")
+        self.assertEqual(self.read(self.claude), before)
+
+    def test_default_plan_stays_max_without_a_tier_and_cli_omits_new_metadata(self):
+        server = FIXTURE.server(self.root)
+        self.addCleanup(server.server_close)
+        state = self.read(self.claude)
+        self.assertEqual(state["profile"]["organization"]["plan_display_name"], "Max")
+        self.assertNotIn("rate_limit_tier", state["profile"]["organization"])
+        marker = json.loads((self.claude / "fixture-reset-api.json").read_text())
+        self.assertEqual(marker["subscription_type"], "max")
+        self.assertNotIn("rate_limit_tier", marker)
+        usage = json.loads((self.claude / "fixture-usage.json").read_text())
+        self.assertEqual(usage["subscription_type"], "max")
+        self.assertNotIn("plan_display_name", usage)
+        self.assertNotIn("rate_limit_tier", usage)
+        script = SOURCE.with_name("chat-composer-claude.sh")
+        process = subprocess.run(["/bin/sh", str(script), "auth", "status", "--json"],
+                                 env={"HOME": str(self.root / "home"), "CLAUDE_CONFIG_DIR": str(self.claude),
+                                      "PATH": "/usr/bin:/bin"}, capture_output=True, text=True, timeout=5)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        auth = json.loads(process.stdout)
+        self.assertEqual(auth["email"], state["profile"]["account"]["email"])
+        self.assertNotIn("planDisplayName", auth)
+        self.assertNotIn("rateLimitTier", auth)
+        self.assertFalse((self.claude / ".credentials.json").exists())
+
+    def test_all_five_plans_publish_dynamic_profile_and_cached_metadata_without_consuming(self):
+        server = FIXTURE.server(self.root)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        before = self.read(self.claude)
+        connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        self.addCleanup(connection.close)
+        headers = {"Authorization": f"Bearer {FIXTURE.FAKE_TOKEN}"}
+        expected = [
+            ("pro", "pro", "Pro", None),
+            ("max5x", "max", "Max", "default_claude_max_5x"),
+            ("max20x", "max", "Max", "default_claude_max_20x"),
+            ("ultra", "max", "Ultra", "default_claude_max_20x"),
+            ("unknown", "max", "Fixture Horizon", "fixture_horizon_unknown_tier")]
+        for name, subscription, label, tier in expected:
+            with self.subTest(plan=name):
+                FIXTURE.configure_plan(self.root, name)
+                connection.request("GET", "/api/oauth/profile", headers=headers)
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                profile = json.loads(response.read())
+                self.assertEqual(profile["account"], before["profile"]["account"])
+                self.assertEqual(profile["organization"]["uuid"], before["profile"]["organization"]["uuid"])
+                self.assertEqual(profile["organization"]["plan_display_name"], label)
+                self.assertEqual(profile["organization"].get("rate_limit_tier"), tier)
+                if name == "ultra":
+                    self.assertEqual(profile["organization"]["organization_type"], "claude_max")
+                    self.assertIn("seat_tier", profile["organization"])
+                    self.assertIsNone(profile["organization"]["seat_tier"])
+                else:
+                    self.assertNotIn("seat_tier", profile["organization"])
+                marker = json.loads((self.claude / "fixture-reset-api.json").read_text())
+                self.assertEqual(marker["base_url"], f"http://127.0.0.1:{server.server_port}")
+                self.assertTrue(marker["fixture"])
+                self.assertEqual(marker["subscription_type"], subscription)
+                self.assertEqual(marker.get("rate_limit_tier"), tier)
+                state = self.read(self.claude)
+                self.assertEqual(state["usage"]["subscription_type"], subscription)
+                self.assertEqual(state["usage"]["rate_limits"], before["usage"]["rate_limits"])
+                for key in ("consume_count", "claims", "mode"):
+                    self.assertEqual(state[key], before[key])
+                usage = json.loads((self.claude / "fixture-usage.json").read_text())
+                self.assertNotIn("plan_display_name", usage)
+                self.assertNotIn("rate_limit_tier", usage)
+        self.assertEqual(self.read(self.claude)["consume_count"], 0)
+
+    def test_plan_selected_before_serving_survives_service_start(self):
+        FIXTURE.configure_plan(self.root, "max20x")
+        self.assertFalse((self.claude / "fixture-reset-api.json").exists())
+        server = FIXTURE.server(self.root)
+        self.addCleanup(server.server_close)
+        marker = json.loads((self.claude / "fixture-reset-api.json").read_text())
+        self.assertEqual(marker["subscription_type"], "max")
+        self.assertEqual(marker["rate_limit_tier"], "default_claude_max_20x")
+
+    def test_plan_switch_requires_marked_fixture_and_refuses_invalid_names(self):
+        before = self.read(self.claude)
+        with self.assertRaisesRegex(ValueError, "unknown fixture plan"):
+            FIXTURE.configure_plan(self.root, "invent-another-plan")
+        self.assertEqual(self.read(self.claude), before)
+        (self.root / ".cagents-reset-fixture").unlink()
+        with self.assertRaisesRegex(ValueError, "private fixture marker"):
+            FIXTURE.configure_plan(self.root, "ultra")
         self.assertEqual(self.read(self.claude), before)
 
     def test_seed_never_overwrites_a_previous_inventory(self):

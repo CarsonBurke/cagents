@@ -739,8 +739,8 @@ impl Account {
 pub struct Identity {
     pub email: Option<String>,
     pub organization: Option<String>,
-    /// The provider's plan identifier (`max`, `prolite`), not a display name;
-    /// see [`plan_label`].
+    /// The reported plan name, including a reported tier where available.
+    /// Older providers may supply only an identifier; see [`plan_label`].
     pub plan: Option<String>,
     /// The login another record of the same credentials names, when the
     /// records disagree.
@@ -1229,16 +1229,20 @@ pub fn plan_label(plan: &str) -> String {
         "prolite" => "Pro Lite".into(),
         "edu_plus" => "Edu Plus".into(),
         "edu_pro" => "Edu Pro".into(),
-        other => humanize(other),
+        // Underscores identify older machine names. Otherwise preserve the
+        // provider's punctuation and capitalization within its display name.
+        other => humanize_words(other, &['_', ' ']),
     }
 }
 
 /// `weekly_scoped` as `Weekly scoped`: a provider's identifier made legible
 /// for the one place it has to be shown verbatim.
 pub fn humanize(identifier: &str) -> String {
-    let mut words = identifier
-        .split(['_', '-', ' '])
-        .filter(|word| !word.is_empty());
+    humanize_words(identifier, &['_', '-', ' '])
+}
+
+fn humanize_words(identifier: &str, separators: &[char]) -> String {
+    let mut words = identifier.split(separators).filter(|word| !word.is_empty());
     let mut label = String::with_capacity(identifier.len());
     if let Some(first) = words.next() {
         let mut characters = first.chars();
@@ -2111,6 +2115,9 @@ mod tests {
         assert_eq!(humanize(""), "");
         assert_eq!(plan_label("prolite"), "Pro Lite");
         assert_eq!(plan_label("team"), "Team");
+        assert_eq!(plan_label("Max 20x"), "Max 20x");
+        assert_eq!(plan_label("Ultra"), "Ultra");
+        assert_eq!(plan_label("Fixture-Horizon 37x"), "Fixture-Horizon 37x");
         assert_eq!(span_label(300 * 60), "5h");
         assert_eq!(span_label(10_080 * 60), "Weekly");
         assert_eq!(span_label(30 * 86_400), "30d");

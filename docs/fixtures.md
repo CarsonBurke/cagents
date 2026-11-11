@@ -252,6 +252,28 @@ Codex then fails a turn only while ordinary usage is blocked; after a fake
 reset it emits an ordinary completed assistant reply, so the native flow can
 verify that work continues. Mode changes share the service's state lock.
 
+For Claude plan-label evidence, `usage-reset-scene.sh plan NAME` accepts
+`pro`, `max5x`, `max20x`, `ultra` or `unknown`. It changes the fake profile's
+`organization.plan_display_name`, its tier/type metadata, the debug marker's
+optional `subscription_type` and `rate_limit_tier`, and the usage report's
+legacy subscription type. Email, organization UUID, usage windows, reset
+counts and prior claims stay unchanged; the switch never submits a consume.
+Refresh account usage after switching plans. The fake auth status and
+`get_usage` responses continue to omit display labels and tier metadata,
+matching the installed client; the extra information comes from the fake
+profile and cached-metadata marker.
+
+Pro reports `Pro`. Max cases report the label `Max` with the known cached tier
+IDs `default_claude_max_5x` and `default_claude_max_20x`. Ultra reports `Ultra`
+while its legacy subscription remains `max`; its profile uses the confirmed
+`default_claude_max_20x` tier, `claude_max` organization type and null
+`seat_tier`. The unknown case reports `Fixture Horizon`
+with the invented `fixture_horizon_unknown_tier`, also retaining legacy
+`max`, so a reader can verify that unfamiliar labels are not collapsed into
+an older plan. The unchanged default scene reports `Max` without a tier.
+Plan switches work before or after starting the fake service and retain its
+current loopback address.
+
 The service and Codex peer share `fixture-reset-state.json` files guarded by
 file locks. Their offline contracts run with
 `/usr/bin/python3 -I -B tests/usage_reset_fixture.py -v`. These verify fake
