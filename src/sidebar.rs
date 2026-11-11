@@ -7976,26 +7976,30 @@ fn context_controls_with_display<'a>(
                         ContextCommand::ShowWorktrees(project_id, global),
                     ));
                 }
-                let mut choices = vec![Item::CheckBox(
-                    format!("Use default ({})", global.label()),
-                    None,
-                    override_mode.is_none(),
-                    ContextCommand::Display(project_id, None),
-                )];
-                choices.extend(
-                    crate::settings::SidebarWorktrees::ALL
-                        .into_iter()
-                        .map(|mode| {
-                            Item::CheckBox(
-                                mode.label().into(),
-                                None,
-                                override_mode == Some(mode),
-                                ContextCommand::Display(project_id, Some(mode)),
-                            )
-                        }),
-                );
-                entries.push(Item::Folder("Worktrees in sidebar".into(), choices));
             }
+        }
+        if let Some((global, override_mode)) = display.filter(|_| selection_count == Some(1) && git)
+        {
+            let mut choices = vec![Item::CheckBox(
+                format!("Use default ({})", global.label()),
+                None,
+                override_mode.is_none(),
+                ContextCommand::Display(project_id, None),
+            )];
+            choices.extend(
+                crate::settings::SidebarWorktrees::ALL
+                    .into_iter()
+                    .map(|mode| {
+                        Item::CheckBox(
+                            mode.label().into(),
+                            None,
+                            override_mode == Some(mode),
+                            ContextCommand::Display(project_id, Some(mode)),
+                        )
+                    }),
+            );
+            entries.push(Item::Divider);
+            entries.push(Item::Folder("Worktrees in sidebar".into(), choices));
         }
         items(&std::collections::HashMap::new(), entries)
     })
@@ -16704,6 +16708,239 @@ pub(crate) mod tests {
             );
         }
         assert_eq!(messages, vec![SidebarAction::OpenRepositoryPicker]);
+    }
+
+    #[test]
+    fn cached_sidebar_project_submenu_opens_over_expanded_rows_at_label_and_arrow() {
+        use cosmic::iced::{
+            Event, Point,
+            advanced::{clipboard, mouse, renderer::Style, widget::Operation},
+            runtime::{UserInterface, user_interface::Cache},
+        };
+
+        #[derive(Default)]
+        struct Probe {
+            texts: Vec<(String, Rectangle)>,
+            controls: Vec<(Option<Id>, Rectangle)>,
+        }
+        impl Operation for Probe {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&Id>, bounds: Rectangle, text: &str) {
+                self.texts.push((text.to_owned(), bounds));
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&Id>,
+                bounds: Rectangle,
+                _: &mut dyn cosmic::iced::advanced::widget::operation::Focusable,
+            ) {
+                self.controls.push((id.cloned(), bounds));
+            }
+        }
+        fn frame(
+            model: &SidebarModel,
+            state: &SidebarState,
+            navigation: &NavigationCache,
+            cache: &mut Cache,
+            renderer: &mut cosmic::Renderer,
+            events: &[Event],
+            cursor: Point,
+        ) -> (Vec<SidebarAction>, Probe) {
+            let shortcuts = crate::settings::KeyboardShortcuts::default();
+            let sidebar = view_cached(
+                model,
+                state,
+                SidebarMode::Expanded,
+                260.0,
+                false,
+                navigation,
+                &shortcuts,
+                false,
+            );
+            let mut ui = UserInterface::build(
+                widget::row::with_children(vec![
+                    sidebar,
+                    cosmic::iced::widget::Space::new()
+                        .width(Length::Fill)
+                        .into(),
+                ]),
+                Size::new(1400.0, 900.0),
+                std::mem::take(cache),
+                renderer,
+            );
+            let mut messages = Vec::new();
+            let cursor = mouse::Cursor::Available(cursor);
+            ui.update(
+                events,
+                cursor,
+                renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            ui.draw(renderer, &cosmic::Theme::dark(), &Style::default(), cursor);
+            let mut probe = Probe::default();
+            ui.operate(renderer, &mut probe);
+            *cache = ui.into_cache();
+            (messages, probe)
+        }
+
+        let mut project = display_project();
+        project.worktrees.extend([
+            worktree(30, "feature-search", false),
+            worktree(31, "docs-refresh", false),
+        ]);
+        project.channels.push(SidebarChannel::new(
+            ChannelId::new(),
+            "Project roadmap".into(),
+            false,
+            None,
+            false,
+            0,
+            true,
+            3,
+        ));
+        let project_id = project.id;
+        let model = SidebarModel::ready(SidebarMode::Expanded, vec![project]);
+        let mut renderer = headless_renderer();
+        for mode in [
+            crate::settings::SidebarWorktrees::Grouped,
+            crate::settings::SidebarWorktrees::Hidden,
+        ] {
+            for over_arrow in [false, true] {
+                let case = format!("{mode:?}, arrow {over_arrow}");
+                let mut state = SidebarState::default();
+                state.set_sidebar_worktrees(mode);
+                state.apply(&SidebarAction::ToggleWorktrees(project_id));
+                state.set_channel_selected(true);
+                let navigation = NavigationCache::default();
+                let mut cache = Cache::new();
+                let (_, probe) = frame(
+                    &model,
+                    &state,
+                    &navigation,
+                    &mut cache,
+                    &mut renderer,
+                    &[],
+                    Point::ORIGIN,
+                );
+                let header = probe
+                    .controls
+                    .iter()
+                    .find(|(id, _)| {
+                        id.as_ref()
+                            == Some(&selection_row_focus_id(SelectionRow::Project(project_id)))
+                    })
+                    .expect("project header is mounted")
+                    .1;
+                let anchor = Point::new(70.0, header.center_y());
+                let (mut messages, _) = frame(
+                    &model,
+                    &state,
+                    &navigation,
+                    &mut cache,
+                    &mut renderer,
+                    &[
+                        Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)),
+                        Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)),
+                    ],
+                    anchor,
+                );
+                let (next, probe) = frame(
+                    &model,
+                    &state,
+                    &navigation,
+                    &mut cache,
+                    &mut renderer,
+                    &[Event::Window(cosmic::iced::window::Event::RedrawRequested(
+                        std::time::Instant::now(),
+                    ))],
+                    anchor,
+                );
+                messages.extend(next);
+                let label = probe
+                    .texts
+                    .iter()
+                    .find(|(text, _)| text == "Worktrees in sidebar")
+                    .unwrap_or_else(|| panic!("{case}: project menu missing: {:?}", probe.texts))
+                    .1;
+                let folder = probe
+                    .controls
+                    .iter()
+                    .filter(|(_, bounds)| bounds.contains(label.center()))
+                    .max_by(|(_, left), (_, right)| left.x.total_cmp(&right.x))
+                    .expect("native folder button bounds")
+                    .1;
+                let pointer = if over_arrow {
+                    Point::new(folder.x + folder.width - 24.0, folder.center_y())
+                } else {
+                    label.center()
+                };
+                let (next, _) = frame(
+                    &model,
+                    &state,
+                    &navigation,
+                    &mut cache,
+                    &mut renderer,
+                    &[Event::Mouse(mouse::Event::CursorMoved {
+                        position: pointer,
+                    })],
+                    pointer,
+                );
+                messages.extend(next);
+                let (next, probe) = frame(
+                    &model,
+                    &state,
+                    &navigation,
+                    &mut cache,
+                    &mut renderer,
+                    &[Event::Window(cosmic::iced::window::Event::RedrawRequested(
+                        std::time::Instant::now(),
+                    ))],
+                    pointer,
+                );
+                messages.extend(next);
+                let hidden = probe
+                    .texts
+                    .iter()
+                    .find(|(text, _)| text == "Hidden")
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{case}: pointer {pointer:?} did not open submenu: {:?}",
+                            probe.texts
+                        )
+                    })
+                    .1
+                    .center();
+                assert!(
+                    messages.is_empty(),
+                    "{case}: hover must not activate rows: {messages:?}"
+                );
+                let (next, _) = frame(
+                    &model,
+                    &state,
+                    &navigation,
+                    &mut cache,
+                    &mut renderer,
+                    &[
+                        Event::Mouse(mouse::Event::CursorMoved { position: hidden }),
+                        Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                        Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                    ],
+                    hidden,
+                );
+                messages.extend(next);
+                assert_eq!(
+                    messages,
+                    [SidebarAction::SetWorktreeDisplay {
+                        project_id,
+                        mode: Some(crate::settings::SidebarWorktrees::Hidden),
+                    }],
+                    "{case}: native child click"
+                );
+            }
+        }
     }
 
     /// One frame's worth of the real sidebar, laid out the way the runtime
