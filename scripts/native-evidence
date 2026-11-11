@@ -39,11 +39,14 @@ both use the same fixture data and selected providers.
                   once no build or session has used them for 12 hours, or 1
                   hour while the disk is low.
   start SIDE [--width PX] [--height PX] [--keep-state] [--wait-lock SECONDS] [--limit SECONDS]
+        [--startup-timeout SECONDS]
         [--portal gtk|kde|gnome|cosmic] [--codex tool-rows|child-errors|terminal-escape]
         [--instance NAME]
                   Take the native lock and start a headless session at the
                   requested logical width and height (default 1500x900). The lock is
                   released by stop, or after --limit seconds (default 2700).
+                  --startup-timeout bounds the wait for the app window (default
+                  180, range 1-3600 seconds); it does not extend --limit.
                   --portal runs xdg-desktop-portal with that backend inside the
                   session, so the app's file chooser opens there for drive to
                   operate. --codex installs that offline Codex app-server peer
@@ -671,8 +674,14 @@ report_over_limit() {
     [ -e "$state/ready" ] || printf '%s\n' "$notice" >"$state/failed"
 }
 
+require_startup_timeout() {
+    [[ $1 =~ ^[1-9][0-9]{0,3}$ ]] && [ "$1" -le 3600 ] ||
+        die 'startup timeout must be a whole number from 1 to 3600 seconds' 2
+}
+
 run_session() {
-    local side=$1 width=$2 keep_state=$3 wait_lock=$4 limit=$5 starter=$6 height=${7:-900}
+    local side=$1 width=$2 keep_state=$3 wait_lock=$4 limit=$5 starter=$6 height=${7:-900} startup_timeout=${8-180}
+    require_startup_timeout "$startup_timeout"
     load_side "$side" "$state/source"
     # Open for the whole session, even while it waits for the native lock, so
     # the pruner leaves the target.
@@ -745,7 +754,7 @@ RULES
         setpriv --pdeathsig TERM dbus-run-session -- setpriv --pdeathsig TERM \
         kwin_wayland --virtual --no-lockscreen --socket "$session_name" \
         --width "$width" --height "$height" --exit-with-session \
-        "$self --task $task __inner $side $width" \
+        "$self --task $task __inner $side $width $startup_timeout" \
         >"$logs/kwin-$side.log" 2>&1 8<&- 9>&- &
     compositor=$!
     local deadline=$((SECONDS + limit)) stop_deadline=
@@ -777,11 +786,13 @@ RULES
 }
 
 run_inner() {
-    local side=$1 width=$2 failure=
+    local side=$1 width=$2 startup_timeout=${3-180} failure=
+    require_startup_timeout "$startup_timeout"
+    local startup_outer_timeout=$((startup_timeout + 60))
     load_side "$side" "$state/source"
     local portal
     portal=$(cat "$state/portal" 2>/dev/null) || portal=
-    if ! timeout -k 5 240 niri-harness session start "$session_name" --root "$harness_root" --timeout 180 \
+    if ! timeout -k 5 "$startup_outer_timeout" niri-harness session start "$session_name" --root "$harness_root" --timeout "$startup_timeout" \
         --width "$width" ${portal:+--portal "$portal"} --cmd "exec $self --task $task __app $side" \
         >"$logs/harness-$side.log" 2>&1; then
         failure="the app window did not appear; see $logs/harness-$side.log, $harness_root/session.log and $logs/ui-$side.log"
@@ -967,7 +978,7 @@ cmd_relaunch() {
 }
 
 cmd_start() {
-    local side=${1:-} width=1500 height=900 keep_state=false wait_lock=1800 limit=2700 portal= codex= codex_executable=
+    local side=${1:-} width=1500 height=900 keep_state=false wait_lock=1800 limit=2700 startup_timeout=180 portal= codex= codex_executable=
     require_side "$side"
     shift
     while [ "$#" -gt 0 ]; do
@@ -978,6 +989,9 @@ cmd_start() {
             --instance) instance_name=${2:?--instance needs a name}; shift 2 ;;
             --wait-lock) wait_lock=${2:?--wait-lock needs seconds}; shift 2 ;;
             --limit) limit=${2:?--limit needs seconds}; shift 2 ;;
+            --startup-timeout)
+                [ "$#" -ge 2 ] || die '--startup-timeout needs seconds' 2
+                startup_timeout=$2; shift 2 ;;
             --portal) portal=${2:?--portal needs a backend: gtk, kde, gnome or cosmic}; shift 2 ;;
             --codex) codex=${2:?--codex needs a peer: tool-rows, child-errors or terminal-escape}; shift 2 ;;
             --codex-executable) codex_executable=${2:?--codex-executable needs an absolute ELF path}; shift 2 ;;
@@ -986,6 +1000,7 @@ cmd_start() {
     done
     [[ $width =~ ^[1-9][0-9]*$ && $height =~ ^[1-9][0-9]*$ && $wait_lock =~ ^[0-9]+$ && $limit =~ ^[1-9][0-9]*$ ]] ||
         die 'width and height must be positive pixels; lock wait and session limit must be whole numbers' 2
+    require_startup_timeout "$startup_timeout"
     [[ -z $portal || $portal =~ ^(gtk|kde|gnome|cosmic)$ ]] ||
         die "unknown portal backend: $portal; use gtk, kde, gnome or cosmic" 2
     [[ -z $codex || $codex =~ ^(tool-rows|child-errors|terminal-escape)$ ]] ||
@@ -1020,11 +1035,12 @@ cmd_start() {
     printf '%s\n' "$side" >"$state/side"
     printf '%s\n' "$width" >"$state/width"
     printf '%s\n' "$height" >"$state/height"
+    printf '%s\n' "$startup_timeout" >"$state/startup-timeout"
     printf '%s\n' "$portal" >"$state/portal"
     printf '%s\n' "$codex" >"$state/codex"
     printf 'waiting for the native session (lock wait up to %ss)\n' "$wait_lock"
     # The session outlives this command, so it starts in its own process session.
-    setsid nohup "$self" --task "$task" __session "$side" "$width" "$keep_state" "$wait_lock" "$limit" "$$" "$height" \
+    setsid nohup "$self" --task "$task" __session "$side" "$width" "$keep_state" "$wait_lock" "$limit" "$$" "$height" "$startup_timeout" \
         >>"$logs/session-$side.log" 2>&1 </dev/null &
     local pid=$!
     printf '%s\n' "$pid" >"$state/pid"

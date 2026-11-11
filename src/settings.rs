@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt::Write as _,
     fs::{self, DirBuilder, File, OpenOptions},
     io::{self, Read, Write},
@@ -901,6 +901,40 @@ pub enum WorktreeSort {
     Alphabetical,
 }
 
+/// How additional worktrees appear beside a project's channels.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SidebarWorktrees {
+    #[default]
+    Grouped,
+    Expanded,
+    Hidden,
+}
+
+impl SidebarWorktrees {
+    pub const ALL: [Self; 3] = [Self::Grouped, Self::Expanded, Self::Hidden];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Grouped => "Grouped",
+            Self::Expanded => "Expanded",
+            Self::Hidden => "Hidden",
+        }
+    }
+
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Grouped => "grouped",
+            Self::Expanded => "expanded",
+            Self::Hidden => "hidden",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.key() == key)
+    }
+}
+
 /// Syntax colors for native editors and diffs. `Auto` follows the app theme.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1048,6 +1082,10 @@ pub struct AppSettings {
     #[serde(default)]
     pub worktree_sort: WorktreeSort,
     #[serde(default)]
+    pub sidebar_worktrees: SidebarWorktrees,
+    #[serde(default)]
+    pub sidebar_worktree_overrides: BTreeMap<crate::model::ProjectId, SidebarWorktrees>,
+    #[serde(default)]
     pub default_worktree_pane: DefaultPane,
     #[serde(default)]
     pub default_channel_pane: DefaultPane,
@@ -1186,6 +1224,8 @@ impl Default for AppSettings {
             managed_worktree_directory: default_managed_worktree_directory(),
             auto_delete_merged_worktrees: false,
             worktree_sort: WorktreeSort::default(),
+            sidebar_worktrees: SidebarWorktrees::default(),
+            sidebar_worktree_overrides: BTreeMap::new(),
             default_worktree_pane: DefaultPane::default(),
             default_channel_pane: DefaultPane::default(),
             editor_auto_save: default_editor_auto_save(),
@@ -3570,6 +3610,55 @@ mod tests {
         let restored = load(&path).unwrap();
         assert_eq!(restored.terminal_font_size, 19.0);
         assert_eq!(restored.app_theme, AppTheme::Light);
+    }
+
+    #[test]
+    fn sidebar_worktree_preferences_round_trip_default_and_merge_per_project() {
+        use SidebarWorktrees::*;
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let first = crate::model::ProjectId::new();
+        let second = crate::model::ProjectId::new();
+        let base = AppSettings::default();
+        let mut legacy = toml::Value::try_from(&base).unwrap();
+        legacy.as_table_mut().unwrap().remove("sidebar_worktrees");
+        legacy
+            .as_table_mut()
+            .unwrap()
+            .remove("sidebar_worktree_overrides");
+        let legacy: AppSettings = legacy.try_into().unwrap();
+        assert_eq!(legacy.sidebar_worktrees, Grouped);
+        assert!(legacy.sidebar_worktree_overrides.is_empty());
+        save(&path, &base).unwrap();
+        let mut one = base.clone();
+        one.sidebar_worktrees = Hidden;
+        one.sidebar_worktree_overrides.insert(first, Expanded);
+        save_merged(&path, &base, &one).unwrap();
+        let mut two = base.clone();
+        two.sidebar_worktree_overrides.insert(second, Grouped);
+        save_merged(&path, &base, &two).unwrap();
+        let saved = load(&path).unwrap();
+        assert_eq!(saved.sidebar_worktrees, Hidden);
+        assert_eq!(
+            saved.sidebar_worktree_overrides.get(&first),
+            Some(&Expanded)
+        );
+        assert_eq!(
+            saved.sidebar_worktree_overrides.get(&second),
+            Some(&Grouped)
+        );
+        one.sidebar_worktree_overrides.remove(&first);
+        let mut one_base = base.clone();
+        one_base.sidebar_worktrees = Hidden;
+        one_base.sidebar_worktree_overrides.insert(first, Expanded);
+        save_merged(&path, &one_base, &one).unwrap();
+        let saved = load(&path).unwrap();
+        assert!(!saved.sidebar_worktree_overrides.contains_key(&first));
+        assert_eq!(
+            saved.sidebar_worktree_overrides.get(&second),
+            Some(&Grouped)
+        );
+        assert_eq!(saved.sidebar_worktrees, Hidden);
     }
 
     #[test]

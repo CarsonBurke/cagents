@@ -694,6 +694,53 @@ class Evidence(unittest.TestCase):
         self.assertNotIn("--no-window-wait", start)
         self.run_tool("stop")
 
+    def test_startup_timeout_is_recorded_and_reaches_both_wait_bounds(self) -> None:
+        self.built()
+        real_timeout = shutil.which("timeout")
+        self.assertIsNotNone(real_timeout)
+        write_executable(
+            self.bin / "timeout",
+            """
+            #!/bin/sh
+            printf '%s\\n' "$*" >> "$STUB_LOG/timeouts"
+            exec REAL_TIMEOUT "$@"
+            """.replace("REAL_TIMEOUT", shlex.quote(real_timeout)),
+            self.logs,
+        )
+        for options, seconds in (([], 180), (["--startup-timeout", "600"], 600),
+                                 (["--startup-timeout", "3600"], 3600)):
+            with self.subTest(seconds=seconds):
+                (self.logs / "ui-ran").unlink(missing_ok=True)
+                self.run_tool("start", "after", "--limit", "1234", *options)
+                self.assertEqual((self.task / "session/startup-timeout").read_text(), f"{seconds}\n")
+                harness = next(line for line in reversed((self.logs / "harness").read_text().splitlines())
+                               if "--cmd" in line)
+                args = shlex.split(harness)
+                self.assertEqual(args[args.index("--timeout") + 1], str(seconds))
+                self.assertNotIn("--no-window-wait", args)
+                outer = next(line for line in reversed((self.logs / "timeouts").read_text().splitlines())
+                             if "niri-harness session start" in line)
+                self.assertEqual(shlex.split(outer)[:4], ["-k", "5", str(seconds + 60), "niri-harness"])
+                self.assertTrue((self.logs / "ui-ran").is_file())
+                self.run_tool("stop")
+
+    def test_startup_timeout_rejects_invalid_or_missing_seconds_before_launch(self) -> None:
+        for value in ("0", "-1", "+1", "01", "1.5", "3601", "10000", "99999999999999999999", "", "1+2", "1\n2"):
+            with self.subTest(value=value):
+                result = self.run_tool("start", "after", "--startup-timeout", value, check=False)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("startup timeout must be a whole number from 1 to 3600", result.stderr)
+        missing = self.run_tool("start", "after", "--startup-timeout", check=False)
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("--startup-timeout needs seconds", missing.stderr)
+        # The lower bound passes validation, then refuses the absent build.
+        accepted = self.run_tool("start", "after", "--startup-timeout", "1", check=False)
+        self.assertNotEqual(accepted.returncode, 2)
+        self.assertNotIn("startup timeout", accepted.stderr)
+        self.assertFalse((self.task / "session/startup-timeout").exists())
+        self.assertFalse((self.logs / "kwin").exists())
+        self.assertFalse((self.logs / "harness").exists())
+
     def test_shot_does_not_mistake_long_observe_output_for_no_window(self) -> None:
         self.built()
         (self.logs / "observe-large").touch()
@@ -1698,7 +1745,7 @@ exec(compile(code, "native-evidence copy helper", "exec"))
 
     def test_a_forgotten_session_releases_the_lock_at_its_limit(self) -> None:
         self.built()
-        self.run_tool("start", "after", "--limit", "1")
+        self.run_tool("start", "after", "--limit", "1", "--startup-timeout", "600")
         for _ in range(100):
             if self.lock_is_free(self.native_lock):
                 break
@@ -1920,13 +1967,21 @@ class RemoteEvidence(unittest.TestCase):
         steps.write_text('evidence drive click "Open repository"\nevidence shot "home-$SIDE"\n')
         self.run_tool("pair", "--before", str(before), "--after", str(after),
                       "--steps", str(steps), "--width", "1200", "--height", "800", "--portal", "gtk",
-                      "--codex", "tool-rows")
+                      "--codex", "tool-rows", "--startup-timeout", "900")
         self.assertTrue((self.task / "shots" / "before-home-before.webp").exists())
         self.assertTrue((self.task / "shots" / "after-home-after.webp").exists())
         calls = self.tool_calls()
-        self.assertIn("start before --width 1200 --height 800 --portal gtk --codex tool-rows", calls)
+        for side in ("before", "after"):
+            self.assertIn(f"start {side} --width 1200 --height 800 --portal gtk --codex tool-rows --startup-timeout 900", calls)
         self.assertIn("drive click Open repository", calls)
         self.assertEqual(calls.count("stop"), 2)
+
+    def test_pair_refuses_a_missing_startup_timeout_before_remote_work(self) -> None:
+        result = self.run_tool("pair", "--startup-timeout", check=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--startup-timeout needs a value", result.stderr)
+        self.assertFalse((self.logs / "ssh").exists())
+        self.assertFalse((self.logs / "remote-tool").exists())
 
     def test_pair_forwards_a_real_codex_host_path_without_shell_evaluation(self) -> None:
         before = self.repository("before", {"src.rs": "old\n"})
