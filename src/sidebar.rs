@@ -7735,6 +7735,7 @@ pub enum ProjectCommand {
 enum ContextCommand<'a> {
     Project(ProjectId, Option<WorktreeId>, &'a ProjectCommand, bool),
     Display(ProjectId, Option<crate::settings::SidebarWorktrees>),
+    ShowWorktrees(ProjectId, crate::settings::SidebarWorktrees),
 }
 
 impl widget::menu::Action for ContextCommand<'_> {
@@ -7751,6 +7752,11 @@ impl widget::menu::Action for ContextCommand<'_> {
             Self::Display(project, mode) => SidebarAction::SetWorktreeDisplay {
                 project_id: *project,
                 mode: *mode,
+            },
+            Self::ShowWorktrees(project, global) => SidebarAction::SetWorktreeDisplay {
+                project_id: *project,
+                mode: (*global == crate::settings::SidebarWorktrees::Hidden)
+                    .then_some(crate::settings::SidebarWorktrees::Grouped),
             },
         }
     }
@@ -7960,39 +7966,36 @@ fn context_controls_with_display<'a>(
                         && matches!(command, ProjectCommand::Delete | ProjectCommand::Remove),
                 ),
             ));
-        }
-        if let Some((global, override_mode)) = display.filter(|_| selection_count == Some(1) && git)
-        {
-            entries.push(Item::Divider);
-            if override_mode.unwrap_or(global) == crate::settings::SidebarWorktrees::Hidden {
-                entries.push(Item::Button(
-                    "Show worktrees".into(),
+            if let Some((global, override_mode)) = display.filter(|_| {
+                selection_count == Some(1) && git && *command == ProjectCommand::NewWorktree
+            }) {
+                if override_mode.unwrap_or(global) == crate::settings::SidebarWorktrees::Hidden {
+                    entries.push(Item::Button(
+                        "Show worktrees".into(),
+                        Some(Icon::Branch.handle()),
+                        ContextCommand::ShowWorktrees(project_id, global),
+                    ));
+                }
+                let mut choices = vec![Item::CheckBox(
+                    format!("Use default ({})", global.label()),
                     None,
-                    ContextCommand::Display(
-                        project_id,
-                        Some(crate::settings::SidebarWorktrees::Grouped),
-                    ),
-                ));
+                    override_mode.is_none(),
+                    ContextCommand::Display(project_id, None),
+                )];
+                choices.extend(
+                    crate::settings::SidebarWorktrees::ALL
+                        .into_iter()
+                        .map(|mode| {
+                            Item::CheckBox(
+                                mode.label().into(),
+                                None,
+                                override_mode == Some(mode),
+                                ContextCommand::Display(project_id, Some(mode)),
+                            )
+                        }),
+                );
+                entries.push(Item::Folder("Worktrees in sidebar".into(), choices));
             }
-            let mut choices = vec![Item::CheckBox(
-                format!("Use default ({})", global.label()),
-                None,
-                override_mode.is_none(),
-                ContextCommand::Display(project_id, None),
-            )];
-            choices.extend(
-                crate::settings::SidebarWorktrees::ALL
-                    .into_iter()
-                    .map(|mode| {
-                        Item::CheckBox(
-                            mode.label().into(),
-                            None,
-                            override_mode == Some(mode),
-                            ContextCommand::Display(project_id, Some(mode)),
-                        )
-                    }),
-            );
-            entries.push(Item::Folder("Worktrees in sidebar".into(), choices));
         }
         items(&std::collections::HashMap::new(), entries)
     })
@@ -14321,6 +14324,35 @@ pub(crate) mod tests {
         });
         assert_eq!(state.worktree_display(project), Grouped);
         assert!(state.worktree_display_overrides.is_empty());
+    }
+
+    #[test]
+    fn show_worktrees_follows_visible_global_defaults_and_pins_only_when_hidden() {
+        use crate::settings::SidebarWorktrees::*;
+        use widget::menu::Action as _;
+        let project = project_id(1);
+        for global in [Grouped, Expanded, Hidden] {
+            let mut state = SidebarState::default();
+            state.set_sidebar_worktrees(global);
+            state.apply(&SidebarAction::SetWorktreeDisplay {
+                project_id: project,
+                mode: Some(Hidden),
+            });
+            state.apply(&ContextCommand::ShowWorktrees(project, global).message());
+            assert_eq!(
+                state.worktree_display(project),
+                if global == Hidden { Grouped } else { global }
+            );
+            assert_eq!(
+                state.worktree_display_overrides.contains_key(&project),
+                global == Hidden
+            );
+            state.set_sidebar_worktrees(Expanded);
+            assert_eq!(
+                state.worktree_display(project),
+                if global == Hidden { Grouped } else { Expanded }
+            );
+        }
     }
 
     #[test]
