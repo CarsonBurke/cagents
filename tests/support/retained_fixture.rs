@@ -42,6 +42,12 @@ pub fn owner_env() -> Option<(&'static str, std::ffi::OsString)> {
 /// Call first in the test. Returns true in the harness and the supervisor;
 /// only the worker returns false and continues into the test body.
 pub fn run_isolated() -> bool {
+    run_isolated_with_timeout(Duration::from_secs(900))
+}
+
+/// Give a measured multi-hop fixture its complete bounded execution budget,
+/// while retaining the same private subreaper and mandatory descendant cleanup.
+pub fn run_isolated_with_timeout(timeout: Duration) -> bool {
     let thread = std::thread::current();
     let test = thread.name().expect("named libtest fixture");
     let worker = format!("worker:{test}");
@@ -63,7 +69,7 @@ pub fn run_isolated() -> bool {
             let mut command = test_command(test);
             command.env(OWNER_ENV, worker);
             let (status, killed) = Family::spawn(command)
-                .and_then(|mut family| family.finish(Duration::from_secs(900)))
+                .and_then(|mut family| family.finish(timeout))
                 .expect("fixture family must exit and be completely reaped");
             assert!(status.success(), "isolated fixture failed: {status}");
             if killed > 0 {

@@ -103,11 +103,11 @@ fn isolated(matched_executable: bool) -> Option<PathBuf> {
         .stderr(fs::File::create(&stderr).unwrap())
         .spawn()
         .unwrap();
-    // Three fresh hosts repeatedly run production SHA checks over the large
-    // test ELF, including independent original/current census and actual
-    // archive verification. Stripping DWARF still leaves substantial code;
-    // bound that complete sequence separately from the smaller 90-second case.
-    let deadline = Instant::now() + Duration::from_secs(if matched_executable { 600 } else { 90 });
+    // The measured first archive-qualified hop spends about 195 seconds on
+    // production SHA/census checks over the stripped 245 MB test ELF in this
+    // unoptimized test lane. Bound all three physical hops, setup and teardown
+    // together; the separate subreaper has another 120 seconds of margin.
+    let deadline = Instant::now() + Duration::from_secs(if matched_executable { 900 } else { 90 });
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
             break Some(status);
@@ -601,7 +601,7 @@ fn start_ordinary_terminal(
         arguments: vec![
             "-c".into(),
             format!(
-                "printf '%s\\n' \"$$\" > '{}'; exec /bin/sleep 900",
+                "printf '%s\\n' \"$$\" > '{}'; exec /bin/sleep 1200",
                 pid_file.display()
             ),
         ],
@@ -700,7 +700,7 @@ fn verify_over_private_socket(
 
 #[test]
 fn settled_cold_host_keeps_real_actors_and_terminal_then_verifies_original_census() {
-    if crate::retained_fixture::run_isolated() {
+    if crate::retained_fixture::run_isolated_with_timeout(Duration::from_secs(1020)) {
         return;
     }
     let Some(root) = isolated(true) else { return };
