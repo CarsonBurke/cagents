@@ -4,6 +4,7 @@ mod account_isolation_tests;
 #[cfg(test)]
 mod account_recovery_target_tests;
 pub(super) mod capacity;
+mod codex_owners;
 #[cfg(test)]
 mod lost_agent_close_tests;
 #[cfg(test)]
@@ -41,6 +42,8 @@ mod retained_resume;
 mod start_retryability_tests;
 #[cfg(test)]
 mod startup_tests;
+#[cfg(test)]
+mod unserved_resume_tests;
 pub(super) mod upgrade_resolution;
 use crate::{
     agent::Provider,
@@ -1546,12 +1549,163 @@ fn codex_terminal_owner(state: &HostState, session: &Session) -> Option<Terminal
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SharedCodexService {
+    Missing,
+    Stopped,
+    Listening,
+    Unknown,
+}
+
+fn shared_codex_failure(failure: chat::protocol::SetupError) -> ProtocolError {
+    match failure {
+        chat::protocol::SetupError::Invalid(message) => error(message),
+        chat::protocol::SetupError::Unavailable(message) => {
+            ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true)
+        }
+    }
+}
+
+/// Probe the exact shared transport both preparation and fallback would use.
+/// The adapter owns any verified short alias until the probe has completed.
+/// Only an absent entry or ConnectionRefused proves this endpoint unserved;
+/// unreadable/replaced evidence and every other connection failure stay unknown.
+fn shared_codex_service(
+    launch: &chat::Launch,
+    before_probe: impl FnOnce() -> Result<(), ProtocolError>,
+) -> Result<SharedCodexService, ProtocolError> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let Some(shared) = chat::protocol::codex::shared_daemon_socket(launch) else {
+        return Ok(SharedCodexService::Unknown);
+    };
+    let endpoint = match std::fs::metadata(&shared) {
+        Ok(endpoint) if endpoint.file_type().is_socket() => endpoint,
+        Err(failure) if failure.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SharedCodexService::Missing);
+        }
+        _ => return Ok(SharedCodexService::Unknown),
+    };
+    before_probe()?;
+    let (spec, _adapter) = match chat::protocol::codex::create_for_start(launch) {
+        Ok(created) => created,
+        Err(failure) => {
+            if !std::fs::metadata(&shared).is_ok_and(|now| {
+                now.file_type().is_socket()
+                    && now.dev() == endpoint.dev()
+                    && now.ino() == endpoint.ino()
+            }) {
+                return Ok(SharedCodexService::Unknown);
+            }
+            return Err(shared_codex_failure(failure));
+        }
+    };
+    let service = match &spec.transport {
+        chat::protocol::TransportSpec::UnixWebSocket {
+            socket,
+            device,
+            inode,
+        } if *device == endpoint.dev() && *inode == endpoint.ino() => {
+            match crate::agent::observe::socket::connect(socket, *device, *inode) {
+                Ok(_) => SharedCodexService::Listening,
+                Err(failure) if failure.not_listening => SharedCodexService::Stopped,
+                Err(_) => SharedCodexService::Unknown,
+            }
+        }
+        _ => SharedCodexService::Unknown,
+    };
+    // Refusal is not a post-connect identity proof. In particular, replacing
+    // the published endpoint before or during the probe must not turn another
+    // socket's ConnectionRefused into authority to start a private server.
+    Ok(
+        if std::fs::metadata(&shared).is_ok_and(|now| {
+            now.file_type().is_socket()
+                && now.dev() == endpoint.dev()
+                && now.ino() == endpoint.ino()
+        }) {
+            service
+        } else {
+            SharedCodexService::Unknown
+        },
+    )
+}
+
+/// A proofless history selection can join the account's live shared daemon
+/// without retiring an old pane. This grants no replacement-writer authority:
+/// Start receives the unchanged bare descriptor and rechecks the endpoint.
+fn prepare_shared_codex_join(host: &SharedHost, source: &Session) -> Result<bool, ProtocolError> {
+    if source.launch.provider != Provider::Codex
+        || source.proof.is_some()
+        || source.terminal.is_some()
+        || source.owned_codex_listener.is_some()
+        || source.native_continuity != chat::NativeContinuity::ReconnectOnly
+        || source.launch.session_id.is_none()
+    {
+        return Ok(false);
+    }
+    let process_launch = prepare_native_process_launch(
+        &source.launch,
+        Some(crate::model::agent_recovery::fresh_native_environment(
+            Provider::Codex,
+            false,
+        )),
+        &BTreeMap::new(),
+        None,
+    )?;
+    Ok(shared_codex_service(&process_launch, || {
+        // Preserve Start's recorded-selector, effective account and directory
+        // checks before constructing/probing a potential shared transport.
+        super::account_lifecycle::ensure_launch(
+            host,
+            &source.launch.recipe.working_directory,
+            &source.launch.recipe.environment,
+            &Default::default(),
+            true,
+        )?;
+        super::account_lifecycle::ensure_launch_at_directory(
+            host,
+            &process_launch.recipe.working_directory,
+            &process_launch.recipe.environment,
+            &process_launch.recipe.unset_environment,
+            false,
+            None,
+        )?;
+        super::account_lifecycle::ensure_launch(
+            host,
+            &process_launch.recipe.working_directory,
+            &process_launch.recipe.environment,
+            &process_launch.recipe.unset_environment,
+            false,
+        )
+    })? == SharedCodexService::Listening)
+}
+
 /// Read the same execution evidence for restart and picker preparation, so
 /// unreadable evidence retains its concrete diagnostic in both paths.
 fn require_ended_codex_execution(
     host: &SharedHost,
     session: &Session,
     boot: &crate::model::BootId,
+) -> std::io::Result<()> {
+    let launch = prepare_native_process_launch(
+        &session.launch,
+        Some(crate::model::agent_recovery::fresh_native_environment(
+            Provider::Codex,
+            false,
+        )),
+        &BTreeMap::new(),
+        None,
+    )
+    .map_err(|failure| std::io::Error::other(failure.message))?;
+    require_ended_codex_execution_for_launch(host, session, boot, &launch)
+}
+
+/// The process launch may add the effective account home without changing the
+/// saved descriptor whose old execution must be proved ended.
+fn require_ended_codex_execution_for_launch(
+    host: &SharedHost,
+    session: &Session,
+    boot: &crate::model::BootId,
+    launch: &chat::Launch,
 ) -> std::io::Result<()> {
     use super::upgrade_inspect::{CodexExecution, codex_execution};
     {
@@ -1577,11 +1731,30 @@ fn require_ended_codex_execution(
             ));
         }
     }
-    let message = match codex_execution(session, boot) {
+    let execution = match codex_execution(session, boot) {
+        CodexExecution::Ended => match launch.session_id.as_deref() {
+            Some(thread) => match codex_owners::writer(
+                chat::protocol::codex::thread_writer_lock(launch, thread).as_deref(),
+                thread,
+            ) {
+                Ok(Some(writer)) => {
+                    return Err(std::io::Error::other(running_codex_process(writer.pid)));
+                }
+                Ok(None) => CodexExecution::Ended,
+                Err(reason) => {
+                    return Err(std::io::Error::new(
+                        reason.kind(),
+                        unproved_codex_execution(&reason.to_string()),
+                    ));
+                }
+            },
+            None => CodexExecution::Ended,
+        },
+        execution => execution,
+    };
+    let message = match execution {
         CodexExecution::Ended => return Ok(()),
-        CodexExecution::Running { pid: Some(pid), .. } => format!(
-            "Codex is still running this conversation (process {pid}). Stop process {pid}, then try again."
-        ),
+        CodexExecution::Running { pid: Some(pid), .. } => running_codex_process(pid),
         CodexExecution::Running { pid: None, socket } => format!(
             "Codex is still serving this conversation at {}. Stop that server, then try again.",
             socket.display()
@@ -1593,11 +1766,21 @@ fn require_ended_codex_execution(
         {
             "A process was still starting; try again in a moment.".into()
         }
-        CodexExecution::Unproved { reason } => format!(
-            "The old Codex execution could not be checked: {reason}. This conversation was not restarted. Restore access to this evidence and try again."
-        ),
+        CodexExecution::Unproved { reason } => unproved_codex_execution(&reason),
     };
     Err(std::io::Error::other(message))
+}
+
+fn unproved_codex_execution(reason: &str) -> String {
+    format!(
+        "The old Codex execution could not be checked: {reason}. This conversation was not restarted. Restore access to this evidence and try again."
+    )
+}
+
+fn running_codex_process(pid: impl std::fmt::Display) -> String {
+    format!(
+        "Codex is still running this conversation (process {pid}). Stop process {pid}, then try again."
+    )
 }
 
 /// Admit a replacement writer using the original descriptor, then retire only
@@ -1606,13 +1789,14 @@ fn prepare_codex_restart(
     host: &SharedHost,
     session: &Session,
     boot: &crate::model::BootId,
+    launch: &chat::Launch,
 ) -> std::io::Result<()> {
     use crate::daemon::holder_registry::{self as registry, Kind};
     use std::os::unix::fs::MetadataExt;
     if session.launch.session_id.is_none() {
         return Ok(());
     }
-    require_ended_codex_execution(host, session, boot)?;
+    require_ended_codex_execution_for_launch(host, session, boot, launch)?;
     let directory = registry::directory(Kind::Native).map_err(std::io::Error::other)?;
     let control = registry::socket(&directory, session.id);
     let record = registry::execution_record(&control)?;
@@ -1989,23 +2173,6 @@ fn start_with_execution(
             .socket
             .clone()
     });
-    // Join a served listener. Before replacing a saved conversation's server,
-    // prove its old execution ended, even if its endpoint vanished. Inspect
-    // the original descriptor: claiming a legacy listener above grants no
-    // evidence about the execution that used to serve it.
-    let owned_socket = match owned_socket {
-        Some(socket)
-            if !owned_listener::served_before_retire(&socket, || {
-                prepare_codex_restart(host, &requested_source, &allocator.boot_id)
-            })
-            .map_err(|failure| {
-                retryable_unavailable(format!("Cannot restart Codex: {failure}"))
-            })? =>
-        {
-            Some(socket)
-        }
-        _ => None,
-    };
     // An authenticated checkpoint may need different resume argv from the
     // immutable recipe issued to windows. Keep that execution detail out of
     // the descriptor, authority registry and runtime's installed identity.
@@ -2037,7 +2204,7 @@ fn start_with_execution(
     // Saved read-only history receives recorded removals, never fresh defaults
     // or transient execution credentials.
     let empty_execution_environment = BTreeMap::new();
-    let process_launch = prepare_native_process_launch(
+    let mut process_launch = prepare_native_process_launch(
         recorded_process_launch,
         (!saved_history_only && source.is_none()).then(|| {
             crate::model::agent_recovery::fresh_native_environment(session.launch.provider, false)
@@ -2053,6 +2220,54 @@ fn start_with_execution(
             source_execution.as_ref()
         },
     )?;
+    // A begun thread's bare remote joins the account's shared daemon, which
+    // owns the thread while it runs. With nothing serving that daemon, the
+    // thread is reopened from its history on a listener of its own instead of
+    // failing to join a daemon that is absent.
+    let owned_socket = match owned_socket {
+        None if !owned
+            && source.is_none()
+            && restart_launch.is_none()
+            && !saved_history_only
+            && process_launch.provider == Provider::Codex
+            && matches!(
+                shared_codex_service(&process_launch, || Ok(()))?,
+                SharedCodexService::Missing | SharedCodexService::Stopped
+            )
+            && listeners.claim_for_unserved_thread(&mut session, &allocator) =>
+        {
+            process_launch.recipe.arguments = session.launch.recipe.arguments.clone();
+            let socket = session
+                .owned_codex_listener
+                .as_ref()
+                .unwrap()
+                .socket
+                .clone();
+            Some(socket)
+        }
+        owned_socket => owned_socket,
+    };
+    // Join a served listener. Before replacing a saved conversation's server,
+    // prove its old execution ended and no outside process writes the thread.
+    // Inspect the original descriptor before retiring any endpoint: assigning
+    // a listener above grants no evidence about the execution that served it.
+    let owned_socket = match owned_socket {
+        Some(socket)
+            if !owned_listener::served_before_retire(&socket, || {
+                prepare_codex_restart(host, &requested_source, &allocator.boot_id, &process_launch)
+            })
+            .map_err(|failure| {
+                ProtocolError::new(
+                    ProtocolErrorCode::TerminalUnavailable,
+                    format!("Cannot restart Codex: {failure}"),
+                    true,
+                )
+            })? =>
+        {
+            Some(socket)
+        }
+        _ => None,
+    };
     if process_launch.provider != Provider::Codex && !saved_history_only {
         check_launch_account(&process_launch)?;
     }
@@ -3505,6 +3720,9 @@ fn process_inner(
             if !retirement.is_classified() && has_native_owner(&ended)? {
                 return Ok(ServerResponse::ChatResumePrepared { session: ended });
             }
+            if prepare_shared_codex_join(host, &source)? {
+                return Ok(ServerResponse::ChatResumePrepared { session: source });
+            }
             // A kernel boot change proves every process from the saved boot
             // is gone. Unlike missing runtime files within the same boot, it
             // authorizes an exact disk resume without its ephemeral receipt.
@@ -3544,8 +3762,15 @@ fn process_inner(
                     .is_some_and(|(_, paired_closed)| paired_closed)
                     || match reserve_unhosted_allocation(host, &source, None) {
                         Ok(_fence) => {
-                            require_ended_codex_execution(host, &source, &proof.boot_id)
-                                .map_err(|error| retryable_unavailable(error.to_string()))?;
+                            require_ended_codex_execution(host, &source, &proof.boot_id).map_err(
+                                |failure| {
+                                    ProtocolError::new(
+                                        ProtocolErrorCode::TerminalUnavailable,
+                                        failure.to_string(),
+                                        source.launch.provider == Provider::Codex,
+                                    )
+                                },
+                            )?;
                             true
                         }
                         Err(()) => false,

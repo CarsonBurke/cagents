@@ -173,6 +173,77 @@ pub fn align_resume_identity(arguments: &mut Vec<String>, id: &str) -> Result<()
     Ok(())
 }
 
+/// Where an account's shared Codex daemon listens, relative to its home.
+const SHARED_CONTROL_SOCKET: &str = "app-server-control/app-server-control.sock";
+
+/// The account home a Codex process launched from `spec` keeps its state in.
+fn account_home(spec: &ProcessSpec) -> Result<PathBuf, &'static str> {
+    let home = spec
+        .environment
+        .get("CODEX_HOME")
+        .cloned()
+        .map(PathBuf::from)
+        .or_else(|| {
+            spec.environment
+                .get("HOME")
+                .cloned()
+                .map(|home| PathBuf::from(home).join(".codex"))
+        })
+        .ok_or("Cannot locate the existing Codex daemon: CODEX_HOME/HOME are unavailable")?;
+    Ok(if home.is_absolute() {
+        home
+    } else {
+        spec.working_directory.join(home)
+    })
+}
+
+/// The account's shared daemon endpoint, when `launch` would join it.
+///
+/// A bare `unix://` remote, without a socket named after it, selects the
+/// shared daemon of the account home the launch runs under. Any named
+/// endpoint is a request for that exact server, so none is reported.
+pub(crate) fn shared_daemon_socket(launch: &Launch) -> Option<PathBuf> {
+    let mut shared = false;
+    let mut named = false;
+    let mut args = launch.recipe.arguments.iter();
+    while let Some(arg) = args.next() {
+        let remote = match arg.as_str() {
+            "--sock" => {
+                args.next();
+                named = true;
+                continue;
+            }
+            "--remote" => args.next()?,
+            _ if arg.starts_with("--remote=") => &arg["--remote=".len()..],
+            _ if arg == "resume"
+                || crate::agent::Provider::Codex.is_value_option(arg)
+                || crate::agent::Provider::Codex.is_cwd_option(arg) =>
+            {
+                args.next();
+                continue;
+            }
+            _ => continue,
+        };
+        shared = true;
+        named = remote != "unix://";
+    }
+    let spec = ProcessSpec::from(&launch.recipe);
+    (shared && !named)
+        .then(|| account_home(&spec).ok())
+        .flatten()
+        .map(|home| home.join(SHARED_CONTROL_SOCKET))
+}
+
+/// The lock file whose holder Codex makes the one writer of `thread` in the
+/// account home `launch` runs under. Codex holds it while the thread is loaded.
+pub(crate) fn thread_writer_lock(launch: &Launch, thread: &str) -> Option<PathBuf> {
+    let home = account_home(&ProcessSpec::from(&launch.recipe)).ok()?;
+    Some(
+        home.join("thread-writer-locks")
+            .join(format!("{thread}.lock")),
+    )
+}
+
 pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
     create_for_start(launch).map_err(|error| error.to_string())
 }
@@ -332,23 +403,7 @@ fn create_inner(
             }
         }
     }
-    let home = spec
-        .environment
-        .get("CODEX_HOME")
-        .cloned()
-        .map(PathBuf::from)
-        .or_else(|| {
-            spec.environment
-                .get("HOME")
-                .cloned()
-                .map(|home| PathBuf::from(home).join(".codex"))
-        })
-        .ok_or("Cannot locate the existing Codex daemon: CODEX_HOME/HOME are unavailable")?;
-    let home = if home.is_absolute() {
-        home
-    } else {
-        spec.working_directory.join(home)
-    };
+    let home = account_home(&spec)?;
     let expected_home = if let Some(identity) = &retained_identity {
         identity.canonical_home.clone()
     } else {
@@ -376,8 +431,7 @@ fn create_inner(
         ];
         spec.transport = TransportSpec::OwnedUnixWebSocket { socket };
     } else if shared || launch.session_id.is_some() || explicit_socket.is_some() {
-        let socket = explicit_socket
-            .unwrap_or_else(|| home.join("app-server-control/app-server-control.sock"));
+        let socket = explicit_socket.unwrap_or_else(|| home.join(SHARED_CONTROL_SOCKET));
         let socket = if socket.is_absolute() {
             socket
         } else {

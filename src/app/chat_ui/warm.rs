@@ -24,11 +24,10 @@
 //! unreloadable source windows, each still bounded by its publication limits.
 use std::cell::Cell;
 
-/// What a parsed document holds beyond its text, per node: the parse and
-/// its document share each node's spans, but each keeps its own item, text
-/// cells, metadata and outline. Measured by
-/// `frame_cost::what_a_warm_hidden_chat_holds`, which counts the heap
-/// cooling frees: about 1.8 KiB a paragraph.
+/// Conservative per-node allowance beyond the document's text. The parse
+/// and its document share raw runs but keep their own items, text cells,
+/// metadata and outline. Keep headroom for complex nodes; the cooling census
+/// in `frame_cost::what_a_warm_hidden_chat_holds` measures the retained graph.
 pub(super) const NODE_BYTES: usize = 2 << 10;
 /// What a prepared item holds whatever its content: its cached state, flow
 /// cache and reader memory. Measured the same way, about 10 KiB an item in a

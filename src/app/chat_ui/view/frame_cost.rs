@@ -1623,6 +1623,7 @@ fn what_a_warm_hidden_chat_holds() {
             pane.frame();
         }
         pane.cache = Cache::new();
+        preparation::retirement_barrier();
         // What the budget would charge; a chat over a chat's share goes cold
         // as it hides, so what it frees is measured either way.
         let counted = pane.runtime.warm_bytes();

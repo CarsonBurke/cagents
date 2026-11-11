@@ -1152,7 +1152,8 @@ impl Session {
     }
 
     /// Point this Codex thread's first `--remote` at its own listener.
-    /// A bare `unix://` requests a new allocation, including for disk resume.
+    /// A new thread's bare `unix://` requests an allocation. Begun threads
+    /// require the daemon's separate shared-service and writer checks.
     ///
     /// Only the daemon chooses `root`. Existing evidence must have come from
     /// trusted retained/checkpointed state before invoking this method. Legacy
@@ -1161,6 +1162,33 @@ impl Session {
         &mut self,
         root: &std::path::Path,
         allocator: &crate::model::HostSessionProof,
+    ) -> bool {
+        let new_thread = self.launch.session_id.is_none();
+        self.claim_codex_listener(root, allocator, new_thread)
+    }
+
+    /// Point this existing Codex thread's bare `unix://` at its own listener.
+    ///
+    /// A begun thread's bare remote names the account's shared daemon, which
+    /// owns the thread whenever it is running. Only the daemon calls this,
+    /// after finding the shared endpoint unserved and checking for another
+    /// process writing the thread. This method only assigns the listener;
+    /// the caller remains responsible for those launch checks.
+    pub fn claim_owned_codex_listener_for_unserved_thread(
+        &mut self,
+        root: &std::path::Path,
+        allocator: &crate::model::HostSessionProof,
+    ) -> bool {
+        self.launch.session_id.is_some()
+            && self.terminal.is_none()
+            && self.claim_codex_listener(root, allocator, true)
+    }
+
+    fn claim_codex_listener(
+        &mut self,
+        root: &std::path::Path,
+        allocator: &crate::model::HostSessionProof,
+        allocate: bool,
     ) -> bool {
         if self.launch.provider != Provider::Codex {
             return false;
@@ -1179,7 +1207,7 @@ impl Session {
         let Some((index, remote)) = codex_remote_argument(arguments) else {
             return false;
         };
-        if remote != owned && remote != "unix://" {
+        if remote != owned && !(allocate && remote == "unix://") {
             return false;
         }
         set_codex_remote(arguments, index, owned);
@@ -3539,6 +3567,12 @@ mod tests {
         asked.proof = Some(allocator.clone());
         assert!(asked.owns_codex_listener());
         assert!(unstarted.resolved_to_owned_codex_listener(&asked));
+        let mut learned = asked.clone();
+        learned.launch.session_id = Some("learned".into());
+        assert!(
+            unstarted.resolved_to_owned_codex_listener(&learned),
+            "a new thread learns its identity as it starts"
+        );
         let claimed = asked.clone();
         assert!(
             asked.claim_owned_codex_listener(
@@ -3567,7 +3601,12 @@ mod tests {
 
         let mut resumed = session(&["--remote", "unix://"], Some("begun"));
         let requested = resumed.clone();
-        assert!(resumed.claim_owned_codex_listener(root, &allocator));
+        assert!(!resumed.claim_owned_codex_listener(root, &allocator));
+        assert_eq!(
+            resumed, requested,
+            "a begun bare remote needs launch checks"
+        );
+        assert!(resumed.claim_owned_codex_listener_for_unserved_thread(root, &allocator));
         resumed.proof = Some(allocator.clone());
         assert!(resumed.owns_codex_listener());
         assert!(requested.resolved_to_owned_codex_listener(&resumed));
@@ -3576,10 +3615,41 @@ mod tests {
         assert!(!requested.resolved_to_owned_codex_listener(&changed));
         let mut resumed = session(&["--remote=unix://"], Some("begun"));
         let requested = resumed.clone();
-        assert!(resumed.claim_owned_codex_listener(root, &allocator));
+        assert!(!resumed.claim_owned_codex_listener(root, &allocator));
+        assert_eq!(
+            resumed, requested,
+            "a begun bare remote needs launch checks"
+        );
+        assert!(resumed.claim_owned_codex_listener_for_unserved_thread(root, &allocator));
         resumed.proof = Some(allocator.clone());
         assert!(resumed.owns_codex_listener());
         assert!(requested.resolved_to_owned_codex_listener(&resumed));
+
+        // Reopened from history, a thread nothing serves takes a listener of
+        // its own only when the daemon asks on its behalf, and only in place
+        // of the shared daemon its bare remote names.
+        let mut reopened = session(&["resume", "begun", "--remote", "unix://"], Some("begun"));
+        let saved = reopened.clone();
+        assert!(reopened.claim_owned_codex_listener_for_unserved_thread(root, &allocator));
+        reopened.proof = Some(allocator.clone());
+        assert!(reopened.owns_codex_listener());
+        assert!(saved.resolved_to_owned_codex_listener(&reopened));
+        let mut renamed = reopened.clone();
+        renamed.launch.session_id = Some("other".into());
+        assert!(!saved.resolved_to_owned_codex_listener(&renamed));
+        for (arguments, session_id) in [
+            (&["--remote", "unix://"][..], None),
+            (&["--remote", "unix:///shared/elsewhere"][..], Some("begun")),
+            (&["--search"][..], Some("begun")),
+        ] {
+            let mut other = session(arguments, session_id);
+            let before = other.clone();
+            assert!(
+                !other.claim_owned_codex_listener_for_unserved_thread(root, &allocator),
+                "{arguments:?}"
+            );
+            assert_eq!(other, before);
+        }
 
         // Proof rotation does not rewrite the allocator or the saved endpoint.
         let mut restored: Session =

@@ -18,11 +18,11 @@ use thiserror::Error;
 
 use crate::{
     model::{
-        BootId, BrowserRestoreFidelity, BrowserSession, CardId, CardKind, CardState, ChannelId,
-        Existence, HostSessionProof, OperationId, ProjectChannel, ProjectId, ProjectState,
-        TerminalContinuity, TerminalId, TerminalSession, Tombstone, TranscriptMetadata,
-        WorkspaceDestination, WorkspaceId, WorkspaceState, WorktreeId, WorktreeState,
-        normalize_project_channels,
+        BootId, BrowserRestoreFidelity, BrowserSession, CardId, CardKind, CardState, Cards,
+        ChannelId, Existence, HostSessionProof, OperationId, ProjectChannel, ProjectId,
+        ProjectState, TerminalContinuity, TerminalId, TerminalSession, Tombstone,
+        TranscriptMetadata, WorkspaceDestination, WorkspaceId, WorkspaceState, WorktreeId,
+        WorktreeState, normalize_project_channels,
     },
     secure_file::{
         migrate_existing_private_file, prepare_private_directory, validate_and_privatize_open_file,
@@ -2159,7 +2159,7 @@ impl StateStore {
             id: manifest.id,
             generation: manifest.generation,
             existence: manifest.existence,
-            cards,
+            cards: cards.into(),
             focused: manifest.focused,
             active_worktree: manifest.active_worktree,
             worktree_focus: manifest.worktree_focus,
@@ -2764,6 +2764,17 @@ impl MigrationInspectionBudget {
         Ok(())
     }
 
+    fn reserve_bytes(&mut self, bytes: u64) -> Result<()> {
+        self.check_deadline()?;
+        if bytes > self.remaining_bytes {
+            return Err(invalid_state!(
+                "Saved pane inventory exceeds the migration inspection limit"
+            ));
+        }
+        self.remaining_bytes -= bytes;
+        Ok(())
+    }
+
     fn reserve(&mut self, bytes: u64) -> Result<()> {
         self.check_deadline()?;
         if self.remaining_rows == 0 || bytes > self.remaining_bytes {
@@ -2787,11 +2798,90 @@ fn read_open_migration_sessions(path: &Path) -> Result<Vec<(CardId, CardKind)>> 
 
 /// Read exact open descriptors without migrating or writing a source database.
 /// Refuse unreadable or over-budget rows instead of omitting recovery work.
-#[cfg(any(feature = "host", test))]
+#[cfg(test)]
 pub(crate) fn read_open_migration_sessions_with_budget(
     path: &Path,
     budget: &mut MigrationInspectionBudget,
 ) -> Result<Vec<(CardId, CardKind)>> {
+    Ok(read_labeled_migration_sessions_with_budget(path, budget)?
+        .into_iter()
+        .filter(|pane| !pane.inert)
+        .map(|pane| (pane.card, pane.kind))
+        .collect())
+}
+
+/// The saved presentation and exact descriptor share one read-only snapshot.
+#[cfg(any(feature = "host", test))]
+pub(crate) struct MigrationPane {
+    pub(crate) card: CardId,
+    pub(crate) kind: CardKind,
+    pub(crate) label: crate::update::source_inspection::PaneLabel,
+    pub(crate) inert: bool,
+}
+
+/// Persisted sidebar roots, bounded independently of the saved pane inventory.
+/// Ancestor lookup matches components, so `repo-other` is not inside `repo`.
+#[cfg(any(feature = "host", test))]
+fn migration_project_roots(
+    transaction: &Transaction<'_>,
+    budget: &mut MigrationInspectionBudget,
+) -> Result<BTreeMap<PathBuf, String>> {
+    let mut statement = transaction.prepare(
+        "SELECT CASE WHEN length(CAST(p.name AS BLOB)) <= 65536 THEN p.name ELSE NULL END,
+                CASE WHEN length(CAST(p.repository_json AS BLOB)) <= 65536 THEN p.repository_json ELSE NULL END,
+                CASE WHEN length(CAST(p.existence_json AS BLOB)) <= 4096 THEN p.existence_json ELSE NULL END,
+                CASE WHEN length(CAST(p.existence_json AS BLOB)) <= 4096 THEN p.existence_json ELSE NULL END,
+                1
+         FROM projects p
+         UNION ALL
+         SELECT CASE WHEN length(CAST(p.name AS BLOB)) <= 65536 THEN p.name ELSE NULL END,
+                CASE WHEN length(CAST(w.path_json AS BLOB)) <= 65536 THEN w.path_json ELSE NULL END,
+                CASE WHEN length(CAST(p.existence_json AS BLOB)) <= 4096 THEN p.existence_json ELSE NULL END,
+                CASE WHEN length(CAST(w.existence_json AS BLOB)) <= 4096 THEN w.existence_json ELSE NULL END,
+                0
+         FROM worktrees w JOIN projects p ON p.project_id = w.project_id",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut roots = BTreeMap::new();
+    let mut count = 0;
+    while let Some(row) = rows.next()? {
+        budget.check_deadline()?;
+        count += 1;
+        if count > 16 * 1024 {
+            return Err(invalid_state!(
+                "Saved project roots exceed the migration inspection limit"
+            ));
+        }
+        let name: String = row.get(0)?;
+        let path: String = row.get(1)?;
+        let project_existence: String = row.get(2)?;
+        let root_existence: String = row.get(3)?;
+        budget.reserve_bytes(
+            (name.len() + path.len() + project_existence.len() + root_existence.len()) as u64,
+        )?;
+        if !from_json::<Existence>("project existence", &project_existence)?.is_open()
+            || !from_json::<Existence>("worktree existence", &root_existence)?.is_open()
+        {
+            continue;
+        }
+        let path: PathBuf = from_json("project root", &path)?;
+        let repository: bool = row.get(4)?;
+        if repository
+            && path.file_name().is_some_and(|name| name == ".git")
+            && let Some(parent) = path.parent()
+        {
+            roots.insert(parent.to_owned(), name.clone());
+        }
+        roots.insert(path, name);
+    }
+    Ok(roots)
+}
+
+#[cfg(any(feature = "host", test))]
+pub(crate) fn read_labeled_migration_sessions_with_budget(
+    path: &Path,
+    budget: &mut MigrationInspectionBudget,
+) -> Result<Vec<MigrationPane>> {
     // Local presentation markers are not daemon authority. Read them under
     // the same snapshot and budget as their exact saved source descriptors.
     fn retained_metadata<T: serde::de::DeserializeOwned + Default>(
@@ -2857,7 +2947,8 @@ pub(crate) fn read_open_migration_sessions_with_budget(
                     + coalesce(length(CAST({predecessor} AS BLOB)),0) + coalesce(length(CAST(t.path_json AS BLOB)),0)
                FROM terminal_recipes r LEFT JOIN transcript_metadata t ON t.terminal_id=r.terminal_id WHERE r.card_id=c.card_id)
          END,
-         CASE WHEN length(CAST(w.workspace_id AS BLOB)) <= 128 THEN w.workspace_id ELSE NULL END
+         CASE WHEN length(CAST(w.workspace_id AS BLOB)) <= 128 THEN w.workspace_id ELSE NULL END,
+         CASE WHEN length(CAST(c.title AS BLOB)) <= 65536 THEN c.title ELSE NULL END
          FROM cards c JOIN workspaces w ON w.workspace_id = c.workspace_id
          WHERE c.kind_tag IN ('chat', 'terminal') ORDER BY c.card_id"
     ))?;
@@ -2865,6 +2956,10 @@ pub(crate) fn read_open_migration_sessions_with_budget(
     let mut sessions = Vec::new();
     let mut retained =
         HashMap::<WorkspaceId, (HashSet<CardId>, HashMap<CardId, crate::chat::Session>)>::new();
+    let mut channel_names = HashMap::<WorkspaceId, Vec<ProjectChannel>>::new();
+    let mut project_names = HashMap::<ProjectId, (String, String)>::new();
+    let mut card_scopes = HashMap::<WorkspaceId, HashMap<CardId, PathBuf>>::new();
+    let mut project_roots = None;
     while let Some(row) = rows.next()? {
         budget.check_deadline()?;
         let existence: String = row.get(3)?;
@@ -2882,6 +2977,7 @@ pub(crate) fn read_open_migration_sessions_with_budget(
         let content: Option<String> = row.get(2)?;
         let card = parse_id("migration card", &card)?;
         let session = read_migration_session_at(&transaction, card, &kind, content.as_deref())?;
+        let mut inert = false;
         if let CardKind::Chat(source) = &session {
             let workspace: String = row.get(6)?;
             let workspace = parse_id("migration workspace", &workspace)?;
@@ -2910,10 +3006,148 @@ pub(crate) fn read_open_migration_sessions_with_budget(
                         "Retained saved pane has invalid native continuity"
                     ));
                 }
-                continue;
+                inert = true;
             }
         }
-        sessions.push((card, session));
+        let workspace: String = row.get(6)?;
+        let workspace = parse_id("migration workspace", &workspace)?;
+        let title: String = row.get(7)?;
+        budget.reserve_bytes(title.len() as u64)?;
+        if let std::collections::hash_map::Entry::Vacant(entry) = channel_names.entry(workspace) {
+            entry.insert(retained_metadata(
+                &transaction,
+                workspace,
+                CHANNELS_FIELD,
+                budget,
+            )?);
+        }
+        let channel = channel_names.get(&workspace).and_then(|channels| {
+            channels
+                .iter()
+                .find(|channel| channel.cards.contains(&card))
+        });
+        let project = if let Some(channel) = channel {
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                project_names.entry(channel.project_id)
+            {
+                let project: Option<(String, String)> = transaction.query_row(
+                    "SELECT CASE WHEN length(CAST(name AS BLOB)) <= 65536 THEN name ELSE NULL END,
+                     CASE WHEN length(CAST(repository_json AS BLOB)) <= 65536 THEN repository_json ELSE NULL END
+                     FROM projects WHERE project_id = ?1",
+                    [channel.project_id.to_string()], |row| Ok((row.get(0)?, row.get(1)?)),
+                ).optional()?;
+                let (name, default_channel) = if let Some((name, repository_json)) = project {
+                    budget.reserve_bytes((name.len() + repository_json.len()) as u64)?;
+                    let repository: PathBuf = from_json("project repository", &repository_json)?;
+                    let primary = if repository.file_name().is_some_and(|name| name == ".git") {
+                        repository.parent().unwrap_or(&repository)
+                    } else {
+                        &repository
+                    };
+                    let branch: Option<String> = transaction.query_row(
+                        "SELECT CASE WHEN length(CAST(branch AS BLOB)) <= 65536 THEN branch ELSE NULL END FROM worktrees
+                         WHERE project_id = ?1 AND path_json IN (?2, ?3) LIMIT 1",
+                        params![channel.project_id.to_string(), repository_json, to_json(&primary)?],
+                        |row| row.get(0),
+                    ).optional()?.flatten();
+                    if let Some(branch) = &branch {
+                        budget.reserve_bytes(branch.len() as u64)?;
+                    }
+                    let default_channel = branch
+                        .map(|branch| {
+                            format!(
+                                "New channel · {}",
+                                branch.strip_prefix("refs/heads/").unwrap_or(&branch)
+                            )
+                        })
+                        .unwrap_or_else(|| "New channel".into());
+                    (name, default_channel)
+                } else {
+                    ("Unknown project".into(), "New channel".into())
+                };
+                entry.insert((name, default_channel));
+            }
+            project_names
+                .get(&channel.project_id)
+                .map(|(name, _)| name.as_str())
+                .unwrap_or("Unknown project")
+        } else {
+            if let std::collections::hash_map::Entry::Vacant(entry) = card_scopes.entry(workspace) {
+                entry.insert(retained_metadata(
+                    &transaction,
+                    workspace,
+                    "card_scopes",
+                    budget,
+                )?);
+            }
+            if project_roots.is_none() {
+                project_roots = Some(migration_project_roots(&transaction, budget)?);
+            }
+            let roots = project_roots
+                .as_ref()
+                .expect("project roots were just loaded");
+            // An explicit saved scope names the pane's strip even if it was
+            // moved there from another cwd. Never use the window's active strip.
+            let scope = card_scopes
+                .get(&workspace)
+                .and_then(|scopes| scopes.get(&card));
+            let directory = scope.unwrap_or_else(|| match &session {
+                CardKind::Chat(source) => &source.launch.recipe.working_directory,
+                CardKind::Terminal(source) => &source.launch.working_directory,
+                _ => unreachable!(),
+            });
+            let project = if scope.is_some() {
+                roots.get(directory)
+            } else {
+                directory
+                    .ancestors()
+                    .find_map(|ancestor| roots.get(ancestor))
+            };
+            project.map(String::as_str).unwrap_or_else(|| {
+                directory
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("Unknown project")
+            })
+        };
+        #[cfg(feature = "host")]
+        let started = match &session {
+            CardKind::Chat(source)
+                if crate::update::source_inspection::is_untitled(&title, true) =>
+            {
+                crate::update::source_inspection::conversation_started(source)
+            }
+            CardKind::Terminal(source)
+                if crate::update::source_inspection::is_untitled(&title, false) =>
+            {
+                crate::update::source_inspection::terminal_started(source)
+            }
+            _ => None,
+        };
+        #[cfg(not(feature = "host"))]
+        let started = None;
+        let label = crate::update::source_inspection::pane_label(
+            &title,
+            channel.map(|channel| {
+                if channel.title.is_empty() {
+                    project_names
+                        .get(&channel.project_id)
+                        .map(|(_, title)| title.as_str())
+                        .unwrap_or("New channel")
+                } else {
+                    &channel.title
+                }
+            }),
+            project,
+            matches!(session, CardKind::Chat(_)),
+            started,
+        );
+        sessions.push(MigrationPane {
+            card,
+            kind: session,
+            label,
+            inert,
+        });
     }
     budget.check_deadline()?;
     Ok(sessions)
@@ -4218,7 +4452,7 @@ fn savepoint(transaction: &Transaction<'_>, statement: &str) -> Result<()> {
 }
 
 /// The conversation each open chat card holds, by card.
-fn open_chat_sessions(cards: &[CardState]) -> HashMap<CardId, &crate::chat::Session> {
+fn open_chat_sessions(cards: &Cards) -> HashMap<CardId, &crate::chat::Session> {
     cards
         .iter()
         .filter(|card| card.existence.is_open())
@@ -6391,7 +6625,8 @@ mod tests {
                         host_incarnation: HostIncarnation::new("incarnation-a"),
                     },
                 }),
-            }],
+            }]
+            .into(),
             focused: Some(card_id),
             active_worktree: None,
             worktree_focus: HashMap::new(),
@@ -7913,6 +8148,78 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "host")]
+    #[test]
+    fn migration_labels_distinguish_untitled_console_terminals_by_recorded_start() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let path = root.path().join("window.sqlite");
+        let store = StateStore::open(&path, boot("chat-boot")).unwrap();
+        let config = root.path().join("claude-fixture");
+        let transcripts = config.join("projects/-alpha");
+        std::fs::create_dir_all(&transcripts).unwrap();
+        let (mut workspace, _) = agent_workspace(crate::agent::Provider::Claude);
+        let template = workspace.cards[0].clone();
+        workspace.cards.clear();
+        for (id, timestamp) in [
+            (
+                "77777777-1111-4111-8111-111111111111",
+                "2026-11-09T14:02:00Z",
+            ),
+            (
+                "77777777-2222-4222-8222-222222222222",
+                "2026-11-09T14:17:00Z",
+            ),
+        ] {
+            let mut card = template.clone();
+            card.id = CardId::new();
+            card.title = "Claude Code".into();
+            let CardKind::Terminal(terminal) = &mut card.kind else {
+                unreachable!()
+            };
+            terminal.id = TerminalId::new();
+            terminal.launch.working_directory = "/alpha".into();
+            terminal.launch.arguments = vec!["--resume".into(), id.into()];
+            terminal
+                .launch
+                .environment
+                .insert("HOME".into(), root.path().display().to_string());
+            terminal
+                .launch
+                .environment
+                .insert("CLAUDE_CONFIG_DIR".into(), config.display().to_string());
+            terminal.resume_hint = crate::model::agent_recovery::hint_from_launch(&terminal.launch);
+            // Accepted consoles launch the companion; their exact provider
+            // identity remains in the saved resume hint.
+            terminal.launch.program = "/fixture/bin/cagents".into();
+            terminal.launch.arguments = vec![
+                "agent".into(),
+                "console".into(),
+                crate::model::AgentId::new().to_string(),
+            ];
+            std::fs::write(
+                transcripts.join(format!("{id}.jsonl")),
+                format!("{{\"timestamp\":\"{timestamp}\"}}\n"),
+            )
+            .unwrap();
+            workspace.cards.push(card);
+        }
+        workspace.focused = Some(workspace.cards[0].id);
+        SaveLane::default().save(&store, &workspace).unwrap();
+        let mut budget = MigrationInspectionBudget::new(Instant::now() + Duration::from_secs(30));
+        let panes = read_labeled_migration_sessions_with_budget(&path, &mut budget).unwrap();
+        assert_eq!(panes.len(), 2);
+        assert_ne!(panes[0].label, panes[1].label);
+        for pane in panes {
+            assert!(
+                pane.label
+                    .starts_with("Untitled conversation in alpha, started "),
+                "{}",
+                pane.label
+            );
+            assert!(!pane.label.contains("unavailable"));
+        }
+    }
+
     /// What a provider held is kept with the open chat that showed it, and
     /// a store written before the key existed reads as holding nothing (#2208).
     #[test]
@@ -8271,6 +8578,122 @@ mod tests {
     }
 
     #[test]
+    fn migration_inspection_names_saved_panes_without_splitting_details() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("labels.sqlite3");
+        let store = StateStore::open(&path, boot("chat-boot")).unwrap();
+        let project = ProjectState {
+            id: ProjectId::new(),
+            generation: 0,
+            name: "alpha".into(),
+            repository: "/alpha".into(),
+            kind: Default::default(),
+            existence: Existence::Open,
+        };
+        store.save_project(&project).unwrap();
+        let (mut workspace, source) = agent_workspace(crate::agent::Provider::Claude);
+        let card = workspace.cards[0].id;
+        workspace.cards[0].title = "Pane Details: keep verbatim".into();
+        workspace.cards[0].kind = CardKind::Chat(source.clone());
+        workspace.channels.push(ProjectChannel {
+            id: ChannelId::new(),
+            project_id: project.id,
+            title: "Release Details: rollout".into(),
+            title_source: Default::default(),
+            ordinal: 1,
+            shared: false,
+            cards: vec![card],
+            focused: Some(card),
+        });
+        SaveLane::default().save(&store, &workspace).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let mut budget = MigrationInspectionBudget::new(Instant::now() + Duration::from_secs(30));
+        budget.remaining_rows = 1;
+        let panes = read_labeled_migration_sessions_with_budget(&path, &mut budget).unwrap();
+        assert_eq!(panes.len(), 1);
+        assert_eq!(
+            panes[0].label,
+            "Pane Details: keep verbatim · Release Details: rollout · alpha"
+        );
+        assert!(!panes[0].inert);
+        assert_eq!(
+            budget.remaining_rows, 0,
+            "labels consume bytes, not another pane row"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn migration_inspection_names_unchanneled_panes_by_their_saved_sidebar_project() {
+        for mode in ["subdirectory", "explicit-scope", "component-prefix"] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("scoped-labels.sqlite3");
+            let store = StateStore::open(&path, boot("chat-boot")).unwrap();
+            let project = ProjectState {
+                id: ProjectId::new(),
+                generation: 0,
+                name: "Custom cagents name".into(),
+                repository: "/projects/cagents".into(),
+                kind: Default::default(),
+                existence: Existence::Open,
+            };
+            store.save_project(&project).unwrap();
+            store
+                .save_project(&ProjectState {
+                    id: ProjectId::new(),
+                    generation: 0,
+                    name: "Parent workspace".into(),
+                    repository: "/projects".into(),
+                    kind: Default::default(),
+                    existence: Existence::Open,
+                })
+                .unwrap();
+            let root = PathBuf::from("/projects/cagents/.worktrees/update-outcomes");
+            store
+                .save_worktree(&WorktreeState {
+                    id: WorktreeId::new(),
+                    project_id: project.id,
+                    generation: 0,
+                    path: root.clone(),
+                    branch: Some("feat/update-outcomes".into()),
+                    existence: Existence::Open,
+                })
+                .unwrap();
+            let (mut workspace, mut source) = agent_workspace(crate::agent::Provider::Claude);
+            source.terminal = None;
+            source.launch.recipe.working_directory = match mode {
+                "explicit-scope" => "/tmp/unrelated-launch".into(),
+                "component-prefix" => "/projects/cagents-other/src".into(),
+                _ => root.join("src"),
+            };
+            let card = workspace.cards[0].id;
+            workspace.cards[0].title = "Inspect Details: scope".into();
+            workspace.cards[0].kind = CardKind::Chat(source);
+            if mode == "explicit-scope" {
+                workspace.card_scopes.insert(card, root);
+            }
+            SaveLane::default().save(&store, &workspace).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            let mut budget =
+                MigrationInspectionBudget::new(Instant::now() + Duration::from_secs(30));
+            budget.remaining_rows = 1;
+            let panes = read_labeled_migration_sessions_with_budget(&path, &mut budget).unwrap();
+            assert_eq!(panes.len(), 1);
+            assert_eq!(
+                panes[0].label,
+                if mode == "component-prefix" {
+                    "Inspect Details: scope · Parent workspace"
+                } else {
+                    "Inspect Details: scope · Custom cagents name"
+                },
+                "{mode}"
+            );
+            assert_eq!(budget.remaining_rows, 0);
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+    }
+
+    #[test]
     fn migration_inspection_omits_only_exact_retained_local_chat_sources() {
         for mode in [
             "retained",
@@ -8402,10 +8825,12 @@ mod tests {
             Connection::open_with_flags(&paths[0], OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
         let inspection_bytes: u64 = connection
             .query_row(
-                "SELECT length(CAST(content_json AS BLOB)) +
+                "SELECT length(CAST(content_json AS BLOB)) + length(CAST(title AS BLOB)) +
                  (SELECT coalesce(sum(length(CAST(value AS BLOB))), 0) FROM metadata
                   WHERE key LIKE '%:navigation:local_only_cards'
-                     OR key LIKE '%:navigation:pending_chat_admissions')
+                     OR key LIKE '%:navigation:pending_chat_admissions'
+                     OR key LIKE '%:navigation:threads'
+                     OR key LIKE '%:navigation:card_scopes')
                  FROM cards WHERE kind_tag='chat'",
                 [],
                 |row| row.get(0),
@@ -8839,7 +9264,8 @@ mod tests {
             existence: Existence::Open,
             kind: CardKind::Chat(draft),
             ..workspace.cards[0].clone()
-        }];
+        }]
+        .into();
         let base = store.stored_generations(workspace.id).unwrap();
         store
             .save_workspace(
@@ -10379,6 +10805,68 @@ mod tests {
         let mut next_host = own.clone();
         next_host.proof.as_mut().unwrap().host_incarnation = "next-host".into();
         save(&next_host).unwrap();
+    }
+
+    /// Resume conversation reopens a saved Codex thread with a bare `unix://`
+    /// remote, and the daemon gives it a listener of its own when no shared
+    /// daemon serves it. The started thread saves over the reopened card; any
+    /// other change to its launch is still refused.
+    #[test]
+    fn a_reopened_codex_thread_saves_as_the_daemon_started_it() {
+        let directory = tempdir().unwrap();
+        let store =
+            StateStore::open(directory.path().join("chat.sqlite3"), boot("chat-boot")).unwrap();
+        let (mut workspace, begun) = agent_workspace(crate::agent::Provider::Codex);
+        let proof = begun.terminal.as_ref().unwrap().continuity.live_proof();
+        let mut reopened = begun.clone();
+        reopened
+            .launch
+            .recipe
+            .arguments
+            .extend(["--remote".into(), "unix://".into()]);
+        reopened.proof = None;
+        reopened.terminal = None;
+        reopened.id = TerminalId::new();
+        workspace.cards[0].kind = CardKind::Chat(reopened.clone());
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        let mut save = |session: &crate::chat::Session| {
+            let mut workspace = workspace.clone();
+            workspace.cards[0].kind = CardKind::Chat(session.clone());
+            lane.save(&store, &workspace)
+        };
+
+        let daemon_root = directory.path().join("daemon-tmp");
+        let mut own = reopened.clone();
+        assert!(
+            own.claim_owned_codex_listener_for_unserved_thread(
+                &daemon_root,
+                proof.as_ref().unwrap()
+            )
+        );
+        own.proof = proof.clone();
+        let mut other_thread = own.clone();
+        other_thread.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        assert!(matches!(
+            card_refusal(save(&other_thread), workspace.cards[0].id),
+            StoreError::InvalidState(_)
+        ));
+        let mut other_option = own.clone();
+        other_option.launch.recipe.arguments.push("--search".into());
+        assert!(matches!(
+            card_refusal(save(&other_option), workspace.cards[0].id),
+            StoreError::InvalidState(violation) if violation.message().contains("launch recipe")
+        ));
+        save(&own).unwrap();
+        let stored =
+            StateStore::open(directory.path().join("chat.sqlite3"), boot("chat-boot")).unwrap();
+        match stored.load_card(workspace.cards[0].id, None).unwrap() {
+            Some(CardState {
+                kind: CardKind::Chat(stored),
+                ..
+            }) => assert_eq!(stored, own),
+            other => panic!("the card is stored as the started thread: {other:?}"),
+        }
     }
 
     #[test]
@@ -12325,8 +12813,10 @@ mod tests {
         let boot_id = boot("boot-a");
         let store = StateStore::open(&path, boot_id.clone()).unwrap();
         let (workspace, mut lane) = settled_closed_history(&store, &boot_id);
-        let rows = workspace.cards[1..]
+        let rows = workspace
+            .cards
             .iter()
+            .skip(1)
             .map(|card| stored_card_row(&store, card.id))
             .collect::<Vec<_>>();
 
@@ -12342,7 +12832,7 @@ mod tests {
             3,
             "each flush writes its workspace row and nothing else"
         );
-        for (card, row) in workspace.cards[1..].iter().zip(&rows) {
+        for (card, row) in workspace.cards.iter().skip(1).zip(&rows) {
             assert_eq!(&stored_card_row(&store, card.id), row);
             assert_eq!(lane.cards[&card.id], row.0.cast_unsigned());
         }
@@ -12363,7 +12853,7 @@ mod tests {
             }),
             1
         );
-        for (card, row) in workspace.cards[1..].iter().zip(&rows) {
+        for (card, row) in workspace.cards.iter().skip(1).zip(&rows) {
             assert_eq!(&stored_card_row(&store, card.id), row);
         }
     }

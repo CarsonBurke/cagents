@@ -2740,6 +2740,14 @@ fn updated_codex_agent_answers_through_its_relaunched_server() {
     // The previous daemon prepares its checkpoint and stops; its successor
     // restores the checkpoint from the same registry.
     let update = |host: SharedHost, incarnation: &str, previous_launch: usize| {
+        let providers = host
+            .lock()
+            .unwrap()
+            .chats
+            .values()
+            .map(|record| record.handle.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(providers.len(), 1, "the fixture owns exactly one provider");
         // A local holder-backed runtime does not populate provider_process().
         // The controlled stub records its own kernel identity before exec,
         // which retains PID/start, so this also detects death or PID reuse
@@ -2763,14 +2771,6 @@ fn updated_codex_agent_answers_through_its_relaunched_server() {
         );
         let entry = processes.join(provider.pid.to_string());
         std::os::unix::fs::symlink(format!("/proc/{}", provider.pid), &entry).unwrap();
-        let providers = host
-            .lock()
-            .unwrap()
-            .chats
-            .values()
-            .map(|record| record.handle.clone())
-            .collect::<Vec<_>>();
-        assert_eq!(providers.len(), 1);
         let control_gate = host.lock().unwrap().control_gate.clone();
         let control = control_gate.write().unwrap();
         let capability = host
