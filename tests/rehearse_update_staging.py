@@ -209,6 +209,13 @@ cmd_update /archive new /installer --use-staged --require-working --working i --
             self.assertIn('--require-working',invocation)
             self.assertNotIn('--use-staged',invocation)
             self.assertIn('verified against the early stage receipt',result.stdout)
+            for override in ('--yes','--version other','--version=other'):
+                (root/'invocation').unlink(missing_ok=True)
+                declined=subprocess.run(['bash','-c',program.replace('--interrupt\n','--interrupt '+override+'\n'),
+                    'fixture',str(root)],capture_output=True,text=True,timeout=10)
+                self.assertEqual(declined.returncode,2,declined.stdout+declined.stderr)
+                self.assertFalse((root/'invocation').exists())
+
 
 
 class WorkingPromptGuard(unittest.TestCase):

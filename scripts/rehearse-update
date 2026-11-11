@@ -280,6 +280,10 @@ cmd_update() {
     local staged_cli=$prefix/versions/$version/bin/cagents
     if [ "$use_staged" -eq 1 ]; then
         [ "$fail_new_daemon" -eq 0 ] || die '--use-staged cannot combine with --fail-new-daemon' 2
+        local arg
+        for arg in "${upgrade_args[@]}"; do
+            case $arg in --version | --version=*) die '--use-staged forbids a different release target' 2 ;; esac
+        done
         archive_dir=$(realpath -- "$archive_dir")
         installer=$(realpath -- "$installer")
         staged_cli=$(user_env /usr/bin/python3 "$tool_root/scripts/rehearse_update_run.py" "$root" "$self" staged-candidate \
