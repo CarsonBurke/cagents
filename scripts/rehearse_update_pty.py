@@ -2,13 +2,16 @@
 """Run an update on a controlling PTY, answering each observed confirmation."""
 import argparse
 import errno
+import json
 import os
+from pathlib import Path
 import pty
 import re
 import select
 import signal
 import sys
 import time
+import stat
 
 # The updater's prompts: an ordinary confirmation, the choice offered while
 # agents are mid-turn, and the typed destructive confirmation. Each ends where
@@ -17,6 +20,27 @@ PROMPTS = re.compile(
     rb'(?P<confirm>[^\r\n]*(?:\[y/N\]|\[Y/n\])[ \t]*)'
     rb'|(?P<working>[^\r\n]*i: interrupt them now[^\r\n]*n: cancel[ \t]*\r?\n)'
     rb'|(?P<stop>[^\r\n]*Anything else cancels\.[ \t]*\r?\n)')
+
+
+def capture_review(root, output, index):
+    """Retain the real private confirmation before answering its prompt."""
+    root = Path(root).resolve()
+    marker = root / '.rehearse-update'
+    destination = Path(output).resolve()
+    if (marker.is_symlink() or marker.read_text().strip() != str(root)
+            or not destination.is_relative_to(root / 'retry') or destination.is_symlink()):
+        raise ValueError('review capture requires a marked root and its private retry directory')
+    destination.mkdir(mode=0o700, exist_ok=True)
+    descriptor = os.open(root / 'home/.local/share/cagents-install/.update/status.json', os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(descriptor, 'rb') as stream:
+        metadata = os.fstat(stream.fileno())
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or metadata.st_mode & 0o077:
+            raise ValueError('review status must be an owned private regular file')
+        raw = stream.read(8 * 1024 * 1024 + 1)
+    if len(raw) > 8 * 1024 * 1024 or not json.loads(raw).get('confirmation'):
+        raise ValueError('prompt has no bounded actual confirmation')
+    with (destination / f'prompt-{index}.status.json').open('xb') as stream:
+        stream.write(raw)
 
 
 def main():
@@ -28,23 +52,31 @@ def main():
     parser.add_argument('--stop', default='',
                         help='typed at the destructive stop list; empty cancels')
     parser.add_argument('--timeout', type=float, default=240)
+    parser.add_argument('--review-root', type=Path)
+    parser.add_argument('--review-output', type=Path)
     parser.add_argument('command', nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ['--'] else args.command
     if not command or args.timeout <= 0:
         parser.error('a command and positive timeout are required')
+    if bool(args.review_root) != bool(args.review_output):
+        parser.error('--review-root and --review-output must be supplied together')
     pid, fd = pty.fork()
     if pid == 0:
         os.execvp(command[0], command)
     deadline = time.monotonic()+args.timeout
     pending = b''
     timed_out = False
+    prompt_count = 0
     try:
         while True:
             if time.monotonic() >= deadline:
                 timed_out = True
                 print('\nrehearse-update: update exceeded PTY timeout', flush=True)
-                os.killpg(pid, signal.SIGTERM)
+                try:
+                    os.killpg(pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
                 break
             if not select.select([fd], [], [], .2)[0]:
                 continue
@@ -62,25 +94,42 @@ def main():
             # These are the updater's confirmation markers, including prompts
             # arriving across separate PTY reads. Do not queue answers early.
             while match := PROMPTS.search(pending):
+                prompt_count += 1
+                if args.review_root:
+                    capture_review(args.review_root, args.review_output, prompt_count)
                 answer = (args.answer if match.group('confirm') else
                           args.working if match.group('working') else args.stop)
                 print(f'\n[rehearsal prompt={match.group().decode(errors="replace").strip()!r} answer={answer!r}]', flush=True)
                 os.write(fd, answer.encode()+b'\n')
                 pending = pending[match.end():]
             pending = pending[-8192:]
+    except BaseException:
+        timed_out = True
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        raise
     finally:
-        if timed_out:
-            for _ in range(30):
-                child, status = os.waitpid(pid, os.WNOHANG)
-                if child:
-                    break
-                time.sleep(.1)
+        blocked = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM})
+        try:
+            if timed_out:
+                for _ in range(30):
+                    child, status = os.waitpid(pid, os.WNOHANG)
+                    if child:
+                        break
+                    time.sleep(.1)
+                else:
+                    try:
+                        os.killpg(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    _, status = os.waitpid(pid, 0)
             else:
-                os.killpg(pid, signal.SIGKILL)
                 _, status = os.waitpid(pid, 0)
-        else:
-            _, status = os.waitpid(pid, 0)
-        os.close(fd)
+        finally:
+            os.close(fd)
+            signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
     return 124 if timed_out else os.waitstatus_to_exitcode(status)
 
 

@@ -657,7 +657,7 @@ class Rehearsal:
         Path(output).write_text(json.dumps(observed, indent=2, sort_keys=True)+'\n')
         return observed
 
-    def capture_chats(self, side):
+    def capture_chats(self, side, *, baseline='before'):
         """Exercise the seeded chats themselves, preserving UUID-bound evidence."""
         seeds = json.loads((self.root/'seeds.json').read_text())['items']
         targets = [item for item in seeds if item['state'] in ('named-chat','codex-chat')]
@@ -667,10 +667,10 @@ class Rehearsal:
         agents = {row['agent']['id']:row['agent'] for row in response['data']['agents']}
         _, response = self.cli('--no-start','channel','list')
         channels = response['data']['channels']
-        originals = (json.loads((self.root/'ui-chats-before.json').read_text())
+        originals = (json.loads((self.root/f'ui-chats-{baseline}.json').read_text())
                      if side != 'before' else [])
         snapshots = ([json.loads((self.root/'records'/name/'snapshot.json').read_text())
-                      for name in ('before','after')] if side != 'before' else None)
+                      for name in (baseline,'after')] if side != 'before' else None)
         evidence = []
         for item in targets:
             original = item['response']['data']['agent']

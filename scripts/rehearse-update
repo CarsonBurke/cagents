@@ -123,6 +123,17 @@ user_env() {
     for name in LANG LC_ALL LC_CTYPE TERM; do
         [ -z "${!name+x}" ] || passed+=("$name=${!name}")
     done
+    # Optional private retry fixture. Never inherit the caller's loader state or
+    # apply this outside its marked root; all installed executables stay intact.
+    if [ -e "$root/.fixture/startup-bind.so" ] || [ -L "$root/.fixture/startup-bind.so" ]; then
+        require_init
+        [ -d "$root/.fixture" ] && [ ! -L "$root/.fixture" ] &&
+            [ -f "$root/.fixture/startup-bind.so" ] && [ ! -L "$root/.fixture/startup-bind.so" ] &&
+            [ "$(stat -c %u "$root/.fixture/startup-bind.so")" = "$(id -u)" ] &&
+            [ "$(stat -c %a "$root/.fixture/startup-bind.so")" = 700 ] ||
+            die 'startup bind fixture must be an owned private regular library'
+        passed+=("LD_PRELOAD=$root/.fixture/startup-bind.so")
+    fi
     env -i -C "$user_home" "${passed[@]}" \
         HOME="$user_home" USER="$(id -un)" LOGNAME="$(id -un)" SHELL=/bin/bash \
         XDG_RUNTIME_DIR="$runtime" \
