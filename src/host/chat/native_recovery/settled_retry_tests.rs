@@ -758,11 +758,18 @@ fn settled_cold_host_keeps_real_actors_and_terminal_then_verifies_original_censu
     // A genuinely retained paused pane keeps its actual saved page referenced.
     // Cold startup must not manufacture this reference from archive metadata.
     let mut registry = crate::host::model::Registry::open().unwrap();
+    registry
+        .apply(&crate::workspace_model::ModelEdit::OpenProject {
+            repository: fixture.root.join("project"),
+            name: "Private recovery fixture".into(),
+            kind: crate::model::ProjectKind::Folder,
+        })
+        .unwrap();
     let scope = crate::workspace_model::views::Scope::Worktree {
         repository: fixture.root.join("project"),
         path: fixture.root.join("project"),
     };
-    registry
+    let seeded = registry
         .apply(&crate::workspace_model::ModelEdit::SeedView {
             scope,
             panes: vec![crate::workspace_model::views::Pane {
@@ -777,6 +784,10 @@ fn settled_cold_host_keeps_real_actors_and_terminal_then_verifies_original_censu
             closed: vec![],
         })
         .unwrap();
+    assert!(
+        seeded.changed,
+        "the paused-pane reference must be published in an open project"
+    );
     drop(registry);
 
     // This owner really ended during the incomplete preparation. A live
@@ -850,6 +861,27 @@ fn settled_cold_host_keeps_real_actors_and_terminal_then_verifies_original_censu
         .cloned()
         .collect();
     paused.save().unwrap();
+    let retained = crate::upgrade::floor::record_for_source(&source)
+        .unwrap()
+        .unwrap();
+    assert!(retained.chats.contains(&originally_paused));
+    assert!(
+        retained
+            .snapshots
+            .iter()
+            .any(|snapshot| snapshot.source == originally_paused)
+    );
+    let model = crate::host::model::Registry::open().unwrap().model().unwrap();
+    let reference_retained = model.views.iter().any(|view| {
+        view.panes.iter().any(|pane| {
+            matches!(&pane.kind, crate::model::CardKind::Chat(session)
+                if session.id == originally_paused.id)
+        })
+    });
+    assert!(
+        reference_retained,
+        "B first recovery must retain a real saved paused-pane reference before settling"
+    );
     let target = std::env::current_exe().unwrap();
     let outcome = crate::upgrade::recovery::fixture_settled_outcome(
         &store.path,
@@ -1054,6 +1086,16 @@ fn cold_host_hop(root: PathBuf, incarnation: &str) {
         }
     }
     eprintln!("{incarnation}: cold host restoration settled; verifying original census");
+    let outcome: serde_json::Value = serde_json::from_slice(&data.outcome_bytes).unwrap();
+    let cold = data.checkpoint.with_file_name(format!(
+        "daemon-upgrade.cold-outcome.{}.json",
+        outcome["checkpoint_hash"].as_str().unwrap()
+    ));
+    let cold: serde_json::Value = serde_json::from_slice(&fs::read(cold).unwrap()).unwrap();
+    eprintln!(
+        "{incarnation}: exact cold-proof completeness: {}",
+        cold["completeness"]
+    );
     assert!(
         data.original_child.is_current(),
         "the exact original terminal child must survive every host process"
