@@ -338,7 +338,8 @@ class ChatViews(unittest.TestCase):
             root = Path(temporary)
             path = root/'home/.local/share/cagents/sessions.sqlite3'
             path.parent.mkdir(parents=True)
-            descriptor = {'id':'session','launch':{'provider':'Claude','session_id':'issued-thread'}}
+            descriptor = {'id':'session','proof':{'host_session_id':'source','boot_id':'boot','host_incarnation':'first'},
+                          'launch':{'provider':'Claude','session_id':'issued-thread'}}
             with closing(sqlite3.connect(path)) as db, db:
                 db.executescript('CREATE TABLE workspaces(workspace_id TEXT,focused_card_id TEXT);'
                                  'CREATE TABLE cards(card_id TEXT,workspace_id TEXT,kind_tag TEXT,content_json TEXT,existence_json TEXT);'
@@ -354,9 +355,18 @@ class ChatViews(unittest.TestCase):
                 self.assertEqual(selected['session'], descriptor)
                 self.assertEqual(path.read_bytes(), original)
                 for expected in ({**descriptor,'id':'foreign'},
-                                 {'id':'session','launch':{'provider':'Codex','session_id':'issued-thread'}},
-                                 {'id':'session','launch':{'provider':'Claude','session_id':'foreign-thread'}}):
+                                 {**descriptor,'launch':{'provider':'Codex','session_id':'issued-thread'}},
+                                 {**descriptor,'launch':{'provider':'Claude','session_id':'foreign-thread'}},
+                                 {**descriptor,'launch':{**descriptor['launch'],'recipe':{'program':'foreign'}}},
+                                 {**descriptor,'proof':{**descriptor['proof'],'host_incarnation':'foreign'}}):
                     self.assertIsNone(scenario.selected_chat(root,'main','exact-card','exact-channel',expected))
+                # Frozen owners can publish a null provider thread after their
+                # exact issued UI projection learns it. Bind that first view,
+                # then require its actual provider thread on the second view.
+                unpromoted = {**descriptor,'launch':{'provider':'Claude','session_id':None}}
+                self.assertIsNotNone(scenario.selected_chat(root,'main','exact-card','exact-channel',unpromoted))
+                self.assertIsNotNone(scenario.selected_chat(root,'main','exact-card','exact-channel',unpromoted,'issued-thread'))
+                self.assertIsNone(scenario.selected_chat(root,'main','exact-card','exact-channel',unpromoted,'foreign-thread'))
                 self.assertIsNone(scenario.selected_chat(root,'main','foreign-card','exact-channel',descriptor))
                 self.assertIsNone(scenario.selected_chat(root,'main','exact-card','foreign-channel',descriptor))
                 db.execute('UPDATE workspaces SET focused_card_id=?',['foreign-card'])
@@ -369,7 +379,8 @@ class ChatViews(unittest.TestCase):
             root = Path(temporary)
             seed = {'id':'seed-agent','name':'old-name','placement':{'Channel':'seed-channel'},
                     'spec':{'provider':'Claude','target':{'repository':'/private/alpha/.git'}}}
-            chat = {'id':'seed-session','launch':{'provider':'Claude','session_id':'issued-thread'}}
+            chat = {'id':'seed-session','proof':{'host_session_id':'source','boot_id':'boot','host_incarnation':'first'},
+                    'launch':{'provider':'Claude','session_id':'issued-thread'}}
             current = {**seed,'name':'changed-name','session':{'Chat':chat}}
             (root/'seeds.json').write_text(json.dumps({'items':[
                 {'state':'named-chat','response':{'data':{'agent':seed}}}]}))
@@ -395,10 +406,19 @@ class ChatViews(unittest.TestCase):
                 evidence = rehearsal.capture_chats('before')
             self.assertEqual(len(evidence),2)
             self.assertTrue(all(item['agent']=='seed-agent' for item in evidence))
-            for call in selected.call_args_list:
-                self.assertEqual(call.args[2:4],('seed-agent','seed-channel'))
+            for selection_call in selected.call_args_list:
+                self.assertEqual(selection_call.args[2:4],('seed-agent','seed-channel'))
             self.assertIn(('drive','click','Visible canonical channel'),calls)
             self.assertFalse(any('spawn' in call for call in calls))
+            chat['launch']['session_id'] = None
+            def conflicting_view(root,slot,*args):
+                return {'session':{**chat,'launch':{**chat['launch'],'session_id':f'thread-{slot}'}}}
+            with patch.object(rehearsal,'cli',side_effect=cli), \
+                    patch.object(rehearsal,'call',side_effect=call), \
+                    patch.object(rehearsal,'mapped',return_value={'main':window,'second':window}), \
+                    patch.object(scenario,'selected_chat',side_effect=conflicting_view):
+                with self.assertRaisesRegex(RuntimeError,'two windows disagree'):
+                    rehearsal.capture_chats('before')
 
 
 class Pty(unittest.TestCase):

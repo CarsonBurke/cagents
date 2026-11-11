@@ -12,7 +12,7 @@ import sys
 import time
 
 
-def selected_chat(root, slot, card_id, channel_id, expected):
+def selected_chat(root, slot, card_id, channel_id, expected, required_thread=None):
     """Read the exact saved selection; visible labels grant no identity."""
     data = Path(root)/'home/.local/share/cagents'
     database = data/'sessions.sqlite3' if slot == 'main' else data/'windows'/slot/'sessions.sqlite3'
@@ -29,9 +29,18 @@ def selected_chat(root, slot, card_id, channel_id, expected):
         active = connection.execute('SELECT value FROM metadata WHERE key=?',
             [f'workspace:{row[0]}:navigation:active_thread']).fetchone()
         launch = descriptor.get('launch', {})
+        proof = expected.get('proof')
+        thread = launch.get('session_id')
         if (descriptor.get('id') != expected['id']
                 or launch.get('provider') != expected['launch']['provider']
-                or launch.get('session_id') != expected['launch'].get('session_id')
+                or launch.get('recipe') != expected['launch'].get('recipe')
+                or not isinstance(proof,dict) or descriptor.get('proof') != proof
+                or any(not isinstance(proof.get(field),str) or not proof[field]
+                       for field in ('host_session_id','boot_id','host_incarnation'))
+                or not isinstance(thread,str) or not thread
+                or (expected['launch'].get('session_id') is not None
+                    and thread != expected['launch']['session_id'])
+                or (required_thread is not None and thread != required_thread)
                 or not active or json.loads(active[0]) != channel_id):
             return None
         return {'database':str(database), 'workspace':row[0], 'card':card_id,
@@ -156,6 +165,8 @@ class Rehearsal:
         agents = {row['agent']['id']:row['agent'] for row in response['data']['agents']}
         _, response = self.cli('--no-start','channel','list')
         channels = response['data']['channels']
+        originals = (json.loads((self.root/'ui-chats-before.json').read_text())
+                     if side == 'after' else [])
         evidence = []
         for item in targets:
             original = item['response']['data']['agent']
@@ -180,22 +191,37 @@ class Rehearsal:
                     continue
                 self.call('wm','action','focus-window','--id',window['id'])
                 self.call('drive','click',title,timeout=30)
+                required_thread = None
+                if side == 'after':
+                    previous = next(view for view in originals
+                                    if view['agent']==original['id'] and view['slot']==slot)
+                    required_thread = previous['selection']['session']['launch']['session_id']
+                _, status = self.cli('--no-start','agent','status',original['id'])
+                actual = status['data']['agent']['session']['Chat']
+                if actual['id'] != chat['id'] or actual['launch']['provider'] != chat['launch']['provider']:
+                    raise RuntimeError('opening a seeded chat allocated a different session')
                 deadline = time.monotonic()+15
                 selected = None
                 while time.monotonic()<deadline:
-                    _, status = self.cli('--no-start','agent','status',original['id'])
-                    actual = status['data']['agent']['session']['Chat']
-                    if actual['id'] != chat['id'] or actual['launch']['provider'] != chat['launch']['provider']:
-                        raise RuntimeError('opening a seeded chat allocated a different session')
                     try:
-                        selected = selected_chat(self.root,slot,original['id'],channel_id,actual)
+                        selected = selected_chat(self.root,slot,original['id'],channel_id,actual,required_thread)
                     except (sqlite3.Error, OSError):
                         selected = None
                     if selected:
                         break
                     time.sleep(.1)
                 if not selected:
+                    self.call('shot',f'{side}-{provider}-{slot}-selection-failed',timeout=45,check=False)
                     raise RuntimeError(f'{slot} did not focus exact seeded {provider} card {original["id"]}')
+                if any(view['agent']==original['id']
+                       and view['selection']['session']['launch']['session_id'] != selected['session']['launch']['session_id']
+                       for view in evidence):
+                    raise RuntimeError('two windows disagree on the exact seeded provider thread')
+                _, status = self.cli('--no-start','agent','status',original['id'])
+                settled = status['data']['agent']['session']['Chat']
+                if (settled['id'] != actual['id'] or settled.get('proof') != actual.get('proof')
+                        or selected_chat(self.root,slot,original['id'],channel_id,settled,required_thread) is None):
+                    raise RuntimeError('seeded chat ownership or thread changed during native capture')
                 _, observed = self.call('drive','--json','observe',timeout=30)
                 observation = json.loads(observed)
                 if observation['window']['id'] != window['id']:
