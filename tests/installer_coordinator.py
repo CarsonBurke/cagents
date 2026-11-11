@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import platform
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
@@ -23,6 +24,9 @@ VERSION = "9.9.9"
 JOB = "00000000-0000-4000-8000-000000000001"
 TOP = f"cagents-{VERSION}"
 ARCHIVE_NAME = f"{TOP}-x86_64-unknown-linux-gnu.tar.gz"
+# Preparation deliberately runs syncfs. Parallel gate compilation can leave
+# substantial shared-filesystem writeback ahead of this private fixture tree.
+INSTALL_TIMEOUT_SECONDS = 60
 
 COORDINATOR = r'''
 import json, os, pathlib, subprocess, sys
@@ -256,11 +260,24 @@ class InstallerCoordinator(unittest.TestCase):
         self.executable(path, f"#!{sys.executable}\n" + body)
 
     def install(self, *options):
-        return subprocess.run(
-            ["/bin/sh", str(ROOT / "install.sh"), "--version", VERSION, "--prefix", str(self.prefix),
-             *options],
-            env=self.environment, cwd=self.directory, capture_output=True, text=True, timeout=10,
-        )
+        command = ["/bin/sh", str(ROOT / "install.sh"), "--version", VERSION, "--prefix", str(self.prefix),
+                   *options]
+        with subprocess.Popen(command, env=self.environment, cwd=self.directory,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True, start_new_session=True) as process:
+            try:
+                stdout, stderr = process.communicate(timeout=INSTALL_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired:
+                # The fixture coordinator and inner installer are in this
+                # private process group. A deadline must not orphan them.
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                stdout, stderr = process.communicate()
+                self.fail(f"installer fixture exceeded {INSTALL_TIMEOUT_SECONDS}s: {command!r}\n"
+                          f"stdout: {stdout}\nstderr: {stderr}")
+            return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
     def events(self):
         return [json.loads(line) for line in self.calls.read_text().splitlines()]

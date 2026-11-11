@@ -419,6 +419,10 @@ fn coordinated_release_mode(
             | "first-start-checkpoint"
             | "absent-start-checkpoint"
     );
+    // A handoff's source was serving when the worker captured its census,
+    // including an empty daemon stopped without Prepared recovery. Empty
+    // terminal text alone cannot turn that pinned source into NoSource.
+    let captured_source_present = handoff || (!absent_source && coordinator != "stage-no-source");
     let home = tempfile::tempdir().unwrap();
     let coordinator_bin = home.path().join("coordinator-bin");
     fs::create_dir(&coordinator_bin).unwrap();
@@ -528,7 +532,7 @@ case "$*" in
       exit 1
     fi
     if [ "$#" -eq 7 ] && [ "$7" = --require-absent ]; then
-      if [ ! -e "$FIXTURE_RUNNING" ] && [ ! -s "$4" ] && [ ! -e "$FIXTURE_CHECKPOINT" ]; then
+      if [ "$FIXTURE_CAPTURED_SOURCE_PRESENT" = false ] && [ ! -e "$FIXTURE_RUNNING" ] && [ ! -s "$4" ] && [ ! -e "$FIXTURE_CHECKPOINT" ]; then
         fixture_recovery_receipt "$6" "no_source" ""
         exit 0
       fi
@@ -1198,6 +1202,10 @@ with open(os.environ['FIXTURE_LEASE_PATH'], 'r+') as contender:
         .env("XDG_RUNTIME_DIR", &runtime)
         .env("FIXTURE_HANDOFF", handoff.to_string())
         .env(
+            "FIXTURE_CAPTURED_SOURCE_PRESENT",
+            captured_source_present.to_string(),
+        )
+        .env(
             "FIXTURE_ORDINARY_START_FAILURE",
             ordinary_start_failure.to_string(),
         )
@@ -1412,6 +1420,14 @@ with open(os.environ['FIXTURE_LEASE_PATH'], 'r+') as contender:
                     .contains("original terminal service could not be verified"),
                 "{output:?}"
             );
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains(&format!(
+                    "'{}' --no-start daemon recover-update --checkpoint fixture-digest --yes --census '{}'",
+                    prefix.join("versions/9.9.9/bin/cagents").display(),
+                    census.display()
+                )),
+                "a non-ready target must retain the exact Prepared recovery step: {output:?}"
+            );
         } else {
             assert!(!running.exists());
             assert!(prefix.join("versions/9.9.9").exists());
@@ -1433,8 +1449,6 @@ with open(os.environ['FIXTURE_LEASE_PATH'], 'r+') as contender:
                 "restart_permitted"
             } else if success {
                 "usable"
-            } else if starting {
-                "unverified"
             } else {
                 "needs_target_recovery"
             }
