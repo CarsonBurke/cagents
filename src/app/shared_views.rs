@@ -50,6 +50,14 @@ impl CardWorktrees {
     }
 }
 
+/// Root resolution and repository authority stay fixed during one synchronous
+/// reconciliation; card membership and descriptors are projected afresh.
+struct ViewScopeTopology<'a> {
+    roots: worktree_ui::WorktreeRoots<'a>,
+    repositories: HashMap<PathBuf, PathBuf>,
+    project_repositories: HashSet<PathBuf>,
+}
+
 struct ScopeDiscovery<'a> {
     scopes: Vec<Scope>,
     worktree_cards: Vec<(&'a CardState, &'a Path)>,
@@ -139,6 +147,8 @@ pub(super) struct State {
     pub(super) snapshot_sequence: u64,
     #[cfg(test)]
     local_projection_count: std::cell::Cell<usize>,
+    #[cfg(test)]
+    topology_build_count: std::cell::Cell<usize>,
     #[cfg(test)]
     view_projection_count: std::cell::Cell<usize>,
     /// The daemon answered this window without a shared model to give.
@@ -746,14 +756,14 @@ impl Cagents {
     /// channel resolves to. A large workspace holds thousands of cards and
     /// historical worktrees, so each card and path is resolved by lookup
     /// rather than by comparing it with every root or project worktree.
-    fn discover_view_scopes(&self) -> ScopeDiscovery<'_> {
-        let roots = self.indexed_worktree_roots();
-        let channel_cards = self
-            .durable
-            .channels
-            .iter()
-            .flat_map(|channel| channel.cards.iter().copied())
-            .collect::<HashSet<_>>();
+    fn view_scope_topology<'a>(
+        &self,
+        roots: worktree_ui::WorktreeRoots<'a>,
+    ) -> ViewScopeTopology<'a> {
+        #[cfg(test)]
+        self.shared_views
+            .topology_build_count
+            .set(self.shared_views.topology_build_count.get() + 1);
         // Preserve the first matching project's authority, just as
         // worktree_view_scope does, without searching every worktree per path.
         let mut repositories = HashMap::new();
@@ -772,16 +782,45 @@ impl Cagents {
                         .flatten(),
                 )
             {
-                repositories.entry(path).or_insert(&project.repository);
+                repositories
+                    .entry(path.to_owned())
+                    .or_insert_with(|| project.repository.clone());
             }
         }
+        ViewScopeTopology {
+            roots,
+            repositories,
+            project_repositories: self
+                .sidebar_model
+                .projects
+                .iter()
+                .map(|project| project.repository.clone())
+                .collect(),
+        }
+    }
+
+    fn discover_view_scopes(&self) -> ScopeDiscovery<'_> {
+        let topology = self.view_scope_topology(self.indexed_worktree_roots());
+        self.discover_view_scopes_with(&topology)
+    }
+
+    fn discover_view_scopes_with<'a>(
+        &'a self,
+        topology: &ViewScopeTopology<'a>,
+    ) -> ScopeDiscovery<'a> {
+        let channel_cards = self
+            .durable
+            .channels
+            .iter()
+            .flat_map(|channel| channel.cards.iter().copied())
+            .collect::<HashSet<_>>();
         let worktree_cards = self
             .durable
             .cards
             .iter()
             .filter(|card| !channel_cards.contains(&card.id))
             .filter_map(|card| {
-                self.unchanneled_card_worktree_indexed(card, &roots)
+                self.unchanneled_card_worktree_indexed(card, &topology.roots)
                     .map(|path| (card, path))
             })
             .collect::<Vec<_>>();
@@ -791,19 +830,13 @@ impl Cagents {
             .iter()
             .map(|channel| Scope::Channel(channel.id))
             .collect::<Vec<_>>();
-        let project_repositories = self
-            .sidebar_model
-            .projects
-            .iter()
-            .map(|project| &project.repository)
-            .collect::<HashSet<_>>();
         scopes.extend(
             self.workspace_model
                 .views
                 .iter()
                 .filter_map(|view| match &view.scope {
                     Scope::Worktree { repository, .. }
-                        if project_repositories.contains(repository) =>
+                        if topology.project_repositories.contains(repository) =>
                     {
                         Some(view.scope.clone())
                     }
@@ -817,9 +850,9 @@ impl Cagents {
             .chain(self.active_workspace.as_deref())
             .chain(worktree_cards.iter().map(|(_, path)| *path))
         {
-            if let Some(repository) = repositories.get(path) {
+            if let Some(repository) = topology.repositories.get(path) {
                 scopes.push(Scope::Worktree {
-                    repository: (*repository).clone(),
+                    repository: repository.clone(),
                     path: path.to_owned(),
                 });
             }
@@ -4854,6 +4887,7 @@ mod tests {
             });
         }
         app.shared_views.view_projection_count.set(0);
+        app.shared_views.topology_build_count.set(0);
         for loaded in loaded {
             drop(app.update(Message::RepositoryLoaded {
                 open_cards: false,
@@ -4862,6 +4896,11 @@ mod tests {
                 result: Ok(Box::new(loaded)),
             }));
         }
+        assert_eq!(
+            app.shared_views.topology_build_count.get(),
+            6,
+            "each repository pass builds its immutable root and authority indexes once"
+        );
         assert_eq!(
             app.shared_views.view_projection_count.get(),
             6 * 8,
