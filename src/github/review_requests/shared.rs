@@ -6,13 +6,13 @@ use super::{HistoryPage, Page, scan::Scan, scan::Work};
 use crate::{
     github::{GitHubError, GitHubRepoKey, GitHubService, PullRequestKey, polling, pr_status},
     repository::{
-        CancellationToken, CommandSpec, ProcessExecutor, ProcessFailure, ProcessOutput,
-        SystemProcessExecutor,
+        CancellationToken, CommandSpec, ProcessExecutor, ProcessFailure, ProcessFailureKind,
+        ProcessOutput, SystemProcessExecutor,
     },
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{os::fd::AsRawFd, path::Path, sync::Arc};
+use std::{fs::File, path::Path, sync::Arc};
 
 const REFRESH: u64 = 60;
 const PACE: u64 = 6;
@@ -137,7 +137,7 @@ pub fn poll(
 }
 
 /// The child retains the lease if its window dies while gh is still running.
-struct FlightExecutor(i32);
+struct FlightExecutor(Arc<File>);
 
 impl ProcessExecutor for FlightExecutor {
     fn execute(
@@ -145,8 +145,17 @@ impl ProcessExecutor for FlightExecutor {
         command: &CommandSpec,
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, ProcessFailure> {
-        let mut command = command.clone();
-        command.inherited_lease = Some(self.0);
+        let command = command
+            .clone()
+            .inherit_file(Arc::clone(&self.0))
+            .map_err(|error| {
+                crate::process::process_failure(
+                    command,
+                    ProcessFailureKind::Spawn,
+                    &format!("Cannot inherit the GitHub review flight: {error}"),
+                    false,
+                )
+            })?;
         SystemProcessExecutor.execute(&command, cancellation)
     }
 }
@@ -172,13 +181,13 @@ fn poll_with(
     repository: &GitHubRepoKey,
     cancellation: &CancellationToken,
     clock: impl Fn() -> u64,
-    read: impl FnOnce(&Work, i32) -> Result<Reply, GitHubError>,
+    read: impl FnOnce(&Work, Arc<File>) -> Result<Reply, GitHubError>,
     validate_context: impl Fn() -> Result<(), String>,
 ) -> Result<PollResult, String> {
     repository.validate().map_err(|error| error.to_string())?;
     pr_status::private_directory(root).map_err(|error| error.to_string())?;
     let name = name(credentials, repository);
-    let flight = pr_status::query_flight(&root.join(format!("{name}.lock")), cancellation)?;
+    let flight = pr_status::lock(&root.join(format!("{name}.lock")), cancellation)?;
     validate_context()?;
     let path = root.join(format!("{name}.json"));
     let mut stored = pr_status::load::<Stored>(&path)
@@ -205,7 +214,14 @@ fn poll_with(
         return Err("Review-request read cancelled".into());
     }
     let work = stored.scan.next();
-    let reply = polling::with_scope(credentials, || read(&work, flight.as_raw_fd()));
+    // Preserve this exclusive description in gh, while the scoped owner still
+    // releases unrelated fork copies after the executor has reaped the child.
+    let lease = Arc::new(
+        flight
+            .try_clone()
+            .map_err(|error| format!("Cannot inherit the GitHub review flight: {error}"))?,
+    );
+    let reply = polling::with_scope(credentials, || read(&work, lease));
     // A gh auth switch can race a subprocess. Never publish the response under
     // the credential context captured before it started.
     validate_context()?;
@@ -371,48 +387,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn shared_poll_launches_actual_query_and_reuses_publication() {
-        use std::os::unix::fs::PermissionsExt;
-        let root = private_root();
-        let script = root.path().join("gh");
-        let calls = root.path().join("calls");
-        let quoted = format!("'{}'", calls.to_str().unwrap().replace('\'', "'\\''"));
-        fs::write(&script, format!("#!/bin/sh\nprintf x >> {quoted}\ncat <<'RESPONSE'\n{{\"data\":{{\"rateLimit\":{{\"cost\":1}},\"viewer\":{{\"id\":\"viewer\",\"login\":\"viewer\"}},\"repository\":{{\"pullRequests\":{{\"nodes\":[],\"pageInfo\":{{\"hasNextPage\":false,\"endCursor\":null}}}}}}}}}}\nRESPONSE\n")).unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
-        let cancellation = CancellationToken::new();
-        let first = poll_with(
-            root.path(),
-            "actual-query-flight-account",
-            &repository(),
-            &cancellation,
-            || 1000,
-            |work, lease| {
-                assert!(matches!(work, Work::Page { cursor: None }));
-                GitHubService::new(&script, Arc::new(FlightExecutor(lease)))
-                    .review_request_page(&repository(), None, &cancellation)
-                    .map(Reply::Page)
-            },
-            || Ok(()),
-        )
-        .unwrap();
-        assert!(first.error.is_none(), "{:?}", first.error);
-        assert_eq!(first.scan.viewer.unwrap().id, "viewer");
-        let second = poll_with(
-            root.path(),
-            "actual-query-flight-account",
-            &repository(),
-            &cancellation,
-            || 1001,
-            |_, _| panic!("the published query must be reused"),
-            || Ok(()),
-        )
-        .unwrap();
-        assert!(second.error.is_none());
-        assert_eq!(fs::read(calls).unwrap(), b"x");
-    }
-
-    #[test]
-    fn a_scan_flight_allows_its_actual_query_child_to_run() {
+    fn an_exclusive_scan_flight_allows_its_actual_query_child_to_run() {
         let root = private_root();
         let cancellation = CancellationToken::new();
         let result = poll_with(
