@@ -362,6 +362,38 @@ mod tests {
                 closed: Vec::new(),
             })
             .unwrap();
+        registry
+            .register_agent_authority(agent.session.as_ref().unwrap())
+            .unwrap();
+        let stored_ownership = || {
+            let db = rusqlite::Connection::open_with_flags(
+                &registry_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let durable_agent: (String, String, bool) = db
+                .query_row(
+                    "SELECT record,session_id,closed FROM agents WHERE id=?1",
+                    [agent.id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            let authorities = db
+                .prepare("SELECT token,session_id,source FROM agent_authorities ORDER BY token")
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            (durable_agent, authorities)
+        };
+        let original_ownership = stored_ownership();
         let mut presentation =
             crate::upgrade::floor::Record::new(proof("old"), vec![source.clone()], Vec::new());
         registry.capture_update_floor(&mut presentation).unwrap();
@@ -436,6 +468,10 @@ mod tests {
         assert_eq!(crate::upgrade::floor::index_reads_for_test(), reads);
         for changed in [
             Session {
+                id: TerminalId::new(),
+                ..resolved.clone()
+            },
+            Session {
                 proof: None,
                 ..resolved.clone()
             },
@@ -507,6 +543,7 @@ mod tests {
         assert!(snapshot.items.iter().any(|item| matches!(&item.content, chat::ItemContent::Text { text, .. } if text == "The original turn remains visible")));
         assert!(handle.is_read_only_history());
         assert!(!handle.owns_work());
+        assert_eq!(stored_ownership(), original_ownership);
         assert_eq!(snapshot.session_id, source.launch.session_id);
         assert!(!fs::exists("/must-not-execute-a-recovery-provider").unwrap());
         handle.close().unwrap();
