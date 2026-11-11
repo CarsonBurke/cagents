@@ -2402,20 +2402,22 @@ impl Cagents {
     /// a default account for a rejection.
     pub(super) fn refresh_chat_limit_accounts(&mut self) -> Task<Message> {
         let requests = self
-            .cards
-            .iter()
-            .filter_map(|(card, state)| {
-                let CardRuntime::Chat(runtime) = state else {
+            .workspace
+            .mounted_visibility()
+            .filter(|(_, visibility)| *visibility == VisibilityClass::Visible)
+            .filter_map(|(card, _)| {
+                let CardRuntime::Chat(runtime) = self.cards.get(&card)? else {
                     return None;
                 };
                 (runtime.limit_refresh_pending
+                    && runtime.is_visible()
                     && self
                         .chat_account(
                             runtime.session.launch.provider,
                             &runtime.session.launch.recipe,
                         )
                         .is_some())
-                .then(|| (*card, runtime.session.launch.clone()))
+                .then(|| (card, runtime.session.launch.clone()))
             })
             .collect::<Vec<_>>();
         let mut tasks = Vec::new();

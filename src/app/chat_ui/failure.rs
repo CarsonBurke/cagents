@@ -236,12 +236,21 @@ struct Metadata {
     kind: Option<FailureKind>,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct LimitMarker {
+    carrier: Option<String>,
+    active: bool,
+}
+
+pub(super) type LimitEpisode = Vec<(String, Option<String>)>;
+
 #[derive(Default)]
 pub(super) struct State {
     pub incidents: Vec<Incident>,
     pub expanded: HashSet<String>,
     pub revision: u64,
     pub(super) limit_occurrence: u64,
+    limit_markers: std::collections::BTreeMap<String, LimitMarker>,
     pub local_error: Option<Arc<str>>,
     pub find_expanded: HashSet<String>,
     previews: HashMap<String, Preview>,
@@ -568,6 +577,28 @@ impl State {
             }
             self.push_metadata(meta.clone(), source.clone());
         }
+    }
+
+    pub(super) fn release_presentation(&mut self) {
+        let markers = std::mem::take(&mut self.limit_markers);
+        let occurrence = self.limit_occurrence;
+        let expanded = std::mem::take(&mut self.expanded);
+        let find_expanded = std::mem::take(&mut self.find_expanded);
+        *self = Self::default();
+        self.limit_markers = markers;
+        self.limit_occurrence = occurrence;
+        self.expanded = expanded;
+        self.find_expanded = find_expanded;
+    }
+
+    fn active_limit_episode(&self) -> Option<LimitEpisode> {
+        let episode = self
+            .limit_markers
+            .iter()
+            .filter(|(_, marker)| marker.active)
+            .map(|(key, marker)| (key.clone(), marker.carrier.clone()))
+            .collect::<Vec<_>>();
+        (!episode.is_empty()).then_some(episode)
     }
 
     pub(super) fn active_account_limit(&self) -> bool {
@@ -900,54 +931,44 @@ impl State {
                         .unwrap_or_else(|| runtime.turns.last().map(|turn| turn.key.clone()))
                 });
         }
+        state.limit_markers = state
+            .incidents
+            .iter()
+            .filter(|incident| incident.kind == Some(FailureKind::AccountLimit))
+            .map(|incident| {
+                (
+                    incident.key.clone(),
+                    LimitMarker {
+                        carrier: incident
+                            .sources
+                            .iter()
+                            .rev()
+                            .find_map(|source| state.limit_carrier(provider, source)),
+                        active: incident
+                            .sources
+                            .iter()
+                            .any(|source| matches!(source, Source::Snapshot | Source::Local(_))),
+                    },
+                )
+            })
+            .collect();
         state.limit_occurrence = runtime
             .failure_ui
             .limit_occurrence
-            .saturating_add(u64::from(state.incidents.iter().any(|incident| {
-                if incident.kind != Some(FailureKind::AccountLimit) {
-                    return false;
-                }
-                let Some(previous) = runtime
-                    .failure_ui
-                    .incidents
-                    .iter()
-                    .find(|old| old.key == incident.key)
-                else {
-                    return true;
-                };
-                // New marked request carriers can recur within one prompt's
-                // incident. Claude's streamed blocks share one carrier, so
-                // extending that same response is never another refresh.
-                let carriers = incident
-                    .sources
-                    .iter()
-                    .filter_map(|source| state.limit_carrier(provider, source))
-                    .collect::<HashSet<_>>();
-                let old_carriers = previous
-                    .sources
-                    .iter()
-                    .filter_map(|source| runtime.failure_ui.limit_carrier(provider, source))
-                    .collect::<HashSet<_>>();
-                if carriers
-                    .iter()
-                    .any(|carrier| !old_carriers.contains(carrier))
-                {
-                    return true;
-                }
-                // For providers exposing only a live error, a fresh rejection
-                // after that live error cleared is a new occurrence. Retained
-                // notes alone are historical and do not trigger reads.
-                carriers.is_empty()
-                    && old_carriers.is_empty()
-                    && incident
-                        .sources
-                        .iter()
-                        .any(|source| matches!(source, Source::Snapshot | Source::Local(_)))
-                    && !previous
-                        .sources
-                        .iter()
-                        .any(|source| matches!(source, Source::Snapshot | Source::Local(_)))
-            })));
+            .saturating_add(u64::from(state.limit_markers.iter().any(
+                |(key, marker)| {
+                    let Some(previous) = runtime.failure_ui.limit_markers.get(key) else {
+                        return true;
+                    };
+                    // Streamed Claude blocks share a carrier; a new rejected
+                    // request in the same prompt has a different carrier.
+                    (marker.carrier.is_some() && marker.carrier != previous.carrier)
+                        || (marker.carrier.is_none()
+                            && previous.carrier.is_none()
+                            && marker.active
+                            && !previous.active)
+                },
+            )));
         state.expanded = runtime
             .failure_ui
             .expanded
@@ -1180,7 +1201,24 @@ impl Runtime {
 
     pub(super) fn refresh_failure_ui(&mut self) {
         self.failure_ui = State::collect(self);
+        self.observe_visible_limit();
         self.refresh_failure_previews();
+    }
+
+    pub(super) fn observe_visible_limit(&mut self) {
+        if !self.visible.load(Ordering::Relaxed)
+            || !matches!(
+                self.session.launch.provider,
+                Provider::Claude | Provider::Codex
+            )
+        {
+            return;
+        }
+        let episode = self.failure_ui.active_limit_episode();
+        if episode.is_some() && episode != self.visible_limit_episode {
+            self.limit_refresh_pending = true;
+        }
+        self.visible_limit_episode = episode;
     }
 
     pub(super) fn refresh_failure_previews(&mut self) {

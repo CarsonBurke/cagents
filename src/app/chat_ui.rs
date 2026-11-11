@@ -2510,6 +2510,7 @@ pub(super) struct Runtime {
     /// The usage limit stopping the conversation, as the daemon judges it.
     usage_limit: Option<crate::agent_execution::directory::UsageLimit>,
     pub(super) limit_refresh_pending: bool,
+    visible_limit_episode: Option<failure::LimitEpisode>,
     /// The first message of a draft, while its conversation starts.
     queued: Option<Queued>,
     /// Messages held here for the next turn, oldest first.
@@ -3649,6 +3650,7 @@ impl Runtime {
             closed_elsewhere: false,
             usage_limit: None,
             limit_refresh_pending: false,
+            visible_limit_episode: None,
             queued: None,
             followups: Vec::new(),
             next_followup: 0,
@@ -3783,6 +3785,8 @@ impl Runtime {
         self.failures.clear();
         self.unplaced_failures.clear();
         self.failure_ui = failure::State::default();
+        self.visible_limit_episode = None;
+        self.limit_refresh_pending = false;
         self.child_picker = None;
         self.child_tab_focus.borrow_mut().take();
         self.listed_models = 0;
@@ -5494,6 +5498,10 @@ impl Runtime {
         self.refresh_failure_previews();
         self.refresh_find_work();
     }
+    pub(super) fn is_visible(&self) -> bool {
+        self.visible.load(Ordering::Relaxed)
+    }
+
     pub(super) fn set_visible(&mut self, visible: bool) -> Result<(), String> {
         if !visible {
             self.find_navigation.cancel_all();
@@ -5512,6 +5520,14 @@ impl Runtime {
         if visible {
             if changed {
                 self.refresh();
+                if self.presentation_evicted
+                    && (self.snapshot.error.is_some() || self.error.is_some())
+                {
+                    // A disconnected cold chat may retain only current error
+                    // metadata and will never send a hydration wake.
+                    self.refresh_failure_ui();
+                }
+                self.observe_visible_limit();
             }
             if rewarmed {
                 // Work that waited while hidden: items still loading when the
@@ -5625,11 +5641,7 @@ impl Runtime {
         // Diagnostic metadata retains exact source Arcs. Release these while
         // the snapshot still owns its items, keeping only small disclosure
         // choices for the authoritative rehydration.
-        let expanded = std::mem::take(&mut self.failure_ui.expanded);
-        let find_expanded = std::mem::take(&mut self.failure_ui.find_expanded);
-        self.failure_ui = failure::State::default();
-        self.failure_ui.expanded = expanded;
-        self.failure_ui.find_expanded = find_expanded;
+        self.failure_ui.release_presentation();
         self.provider_queue.borrow_mut().clear();
         if let Some(queued) = &mut self.queued {
             queued.presentation = prompt::LocalPresentation::default();
@@ -11623,9 +11635,15 @@ impl Cagents {
                     Wake::Changed => {
                         let before = Arc::clone(&runtime.snapshot);
                         let previous_limit = runtime.failure_ui.limit_occurrence;
+                        let rehydrating = runtime.presentation_evicted;
                         runtime.refresh();
-                        let new_limit = runtime.failure_ui.limit_occurrence != previous_limit;
+                        // First hydration can load historical provider errors
+                        // never classified in this window. Current Snapshot/
+                        // Local rejection handoff is recorded by refresh itself.
+                        let new_limit =
+                            !rehydrating && runtime.failure_ui.limit_occurrence != previous_limit;
                         runtime.limit_refresh_pending |= new_limit
+                            && runtime.visible.load(Ordering::Relaxed)
                             && matches!(
                                 runtime.session.launch.provider,
                                 Provider::Claude | Provider::Codex
@@ -24599,6 +24617,10 @@ mod tests {
         app.account_ui
             .set_registry(crate::account::registry::Registry::default());
         app.refresh_ui.focused = true;
+        drop(app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::Resized(1_600.0),
+        }));
         let card = live_chat(&mut app, Some(KNOWN_THREAD));
         let key = uuid::Uuid::from_u128(818191);
         let home =
@@ -24630,6 +24652,156 @@ mod tests {
                 .pending_probe_for_test(&crate::account::Account::system(Provider::Codex).id())
                 .is_none()
         );
+    }
+
+    #[test]
+    fn revealing_a_cold_disconnected_current_limit_refreshes_once_without_another_client_wake() {
+        for active in [true, false] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let mut registry = crate::account::registry::Registry::default();
+            for provider in crate::account::Account::PROVIDERS {
+                registry.set_default(&crate::account::Account::system(provider));
+            }
+            app.account_ui.set_registry(registry);
+            app.refresh_ui.focused = true;
+            app.settings.show_status_bar = false;
+            drop(app.update(Message::Viewport {
+                generation: app.workspace_view_generation,
+                event: WorkspaceViewportEvent::Resized(1_600.0),
+            }));
+            let card = live_chat(&mut app, Some(KNOWN_THREAD));
+            let target = chat_runtime(&app, card).target;
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            let handle = runtime.handle().unwrap().clone();
+            let raw = "Usage limit reached for this plan";
+            if !active {
+                runtime.note(raw.into());
+                assert!(
+                    !runtime.failure_ui.active_account_limit(),
+                    "a retained note is historical"
+                );
+            }
+            runtime.set_visible(false).unwrap();
+            runtime.cool();
+            assert!(!runtime.presents());
+            let mut snapshot = (*handle.snapshot()).clone();
+            snapshot.generation += 1;
+            snapshot.error = active.then(|| raw.into());
+            handle.publish_snapshot_for_test(snapshot);
+            drop(app.update(Message::ChatUi(Action::Wake(target, Wake::Changed))));
+            let id = crate::account::Account::system(Provider::Codex).id();
+            assert!(
+                app.account_ui.pending_probe_for_test(&id).is_none(),
+                "hidden metadata never starts a usage read"
+            );
+            handle.disconnect_for_test();
+            app.set_workspace_surfaces_visible(true);
+            assert!(chat_runtime(&app, card).is_visible());
+            // This is a normal shell update after visibility changed. There
+            // is no Changed/hydration client wake after the reveal.
+            drop(app.update(Message::AccountUi(
+                crate::app::account_ui::Action::ManualReady,
+            )));
+            assert_eq!(app.account_ui.pending_probe_is_forced_for_test(&id), active);
+            assert_eq!(
+                chat_runtime(&app, card).failure_ui.active_account_limit(),
+                active
+            );
+            if active {
+                let owner = app.account_ui.probe_owner(&id).unwrap();
+                let ticket = app.account_ui.pending_probe_for_test(&id).unwrap();
+                drop(
+                    app.update(Message::AccountUi(crate::app::account_ui::Action::Probed {
+                        id: id.clone(),
+                        owner,
+                        ticket,
+                        outcome: crate::account::probe::Outcome::Answered {
+                            identity: None,
+                            catalog: None,
+                            snapshot: crate::account::UsageSnapshot::state(
+                                crate::account::UsageStatus::Limited,
+                                "fresh",
+                                crate::chat::now_ms().unwrap(),
+                            ),
+                        },
+                    })),
+                );
+            }
+            let observed = chat_runtime(&app, card).failure_ui.limit_occurrence;
+            app.set_workspace_surfaces_visible(false);
+            app.chat_runtime_mut(target).unwrap().cool();
+            app.set_workspace_surfaces_visible(true);
+            drop(app.update(Message::AccountUi(
+                crate::app::account_ui::Action::ManualReady,
+            )));
+            assert!(
+                app.account_ui.pending_probe_for_test(&id).is_none(),
+                "showing the same episode again does not spend another read"
+            );
+            assert!(!chat_runtime(&app, card).limit_refresh_pending);
+            assert_eq!(
+                chat_runtime(&app, card).failure_ui.limit_occurrence,
+                observed
+            );
+        }
+    }
+
+    #[test]
+    fn first_cold_limit_hydration_reads_current_rejections_but_not_unseen_historical_items() {
+        for active in [true, false] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let mut registry = crate::account::registry::Registry::default();
+            for provider in crate::account::Account::PROVIDERS {
+                registry.set_default(&crate::account::Account::system(provider));
+            }
+            app.account_ui.set_registry(registry);
+            app.refresh_ui.focused = true;
+            app.settings.show_status_bar = false;
+            // No viewport yet: this is a newly attached, initially cold chat
+            // whose historical provider errors have never been classified.
+            let card = live_chat(&mut app, Some(KNOWN_THREAD));
+            let runtime = chat_runtime(&app, card);
+            let target = runtime.target;
+            let handle = runtime.handle().unwrap().clone();
+            assert!(!runtime.is_visible());
+            assert!(runtime.presentation_evicted);
+            assert!(runtime.failure_ui.incidents.is_empty());
+            drop(app.update(Message::Viewport {
+                generation: app.workspace_view_generation,
+                event: WorkspaceViewportEvent::Resized(1_600.0),
+            }));
+            assert!(chat_runtime(&app, card).is_visible());
+            assert!(
+                chat_runtime(&app, card).presentation_evicted,
+                "fixture waits for the first resident hydration"
+            );
+            let raw = "Usage limit reached for this plan";
+            let mut old_failure = chat::Item {
+                id: "old-historical-provider-error".into(),
+                role: chat::Role::System,
+                at: None,
+                started_at: None,
+                content: text(raw),
+            };
+            assert!(chat::failure::mark_provider_error(
+                Provider::Codex,
+                &mut old_failure
+            ));
+            let mut snapshot = (*handle.snapshot()).clone();
+            snapshot.generation += 1;
+            snapshot.items.push(Arc::new(old_failure));
+            snapshot.error = active.then(|| raw.into());
+            handle.deliver_snapshot_for_test(snapshot);
+            drop(app.update(Message::ChatUi(Action::Wake(target, Wake::Changed))));
+            assert!(chat_runtime(&app, card).failure_ui.incidents.iter().any(|incident| incident.kind == Some(chat::failure::FailureKind::AccountLimit)));
+            let id = crate::account::Account::system(Provider::Codex).id();
+            assert_eq!(
+                app.account_ui.pending_probe_is_forced_for_test(&id),
+                active,
+                "only the current live rejection warrants a reading on first hydration"
+            );
+            assert!(!chat_runtime(&app, card).limit_refresh_pending);
+        }
     }
 
     /// A disconnected conversation's close request failed before it was sent,
