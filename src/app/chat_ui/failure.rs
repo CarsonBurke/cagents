@@ -1477,9 +1477,12 @@ impl Runtime {
         ];
         if !cleared {
             rows.push(
-                design::caption(incident.guidance)
-                    .width(Length::Fill)
-                    .into(),
+                design::caption(reset_controls.as_ref().map_or_else(
+                    || incident.guidance.to_owned(),
+                    |controls| controls.limit_guidance(&incident.summary, incident.guidance),
+                ))
+                .width(Length::Fill)
+                .into(),
             );
         }
         if incident.kind == Some(FailureKind::AccountLimit)

@@ -54,7 +54,7 @@ pub(super) fn execute(
     let selection =
         prepare_selection(resets, scope.as_deref(), reset_id.as_deref(), recovery, now)?;
     let name = account_name(info);
-    let prompt = confirmation(&account, &name, &selection.scope, selection.count, recovery);
+    let prompt = confirmation(&account, &name, &selection, recovery);
     if !yes {
         let mut stderr = std::io::stderr().lock();
         write!(stderr, "{prompt} [y/N] ")
@@ -143,29 +143,27 @@ fn account_name(info: &AccountInfo) -> String {
     info.label.clone().unwrap_or_else(|| info.id.to_string())
 }
 
-fn confirmation(
-    account: &AccountId,
-    name: &str,
-    scope: &str,
-    count: Option<u64>,
-    recovery: bool,
-) -> String {
+fn confirmation(account: &AccountId, name: &str, selection: &Selection, recovery: bool) -> String {
     let account_name = if name == account.as_str() {
         name.to_owned()
     } else {
         format!("{name} ({account})")
     };
-    let left = count.map_or_else(
-        || "Current count unknown".into(),
-        |count| format!("{count} left"),
-    );
-    if recovery {
-        format!(
-            "Retry the same {scope} reset for {account_name} with its original key? {left}. This will not select another reset."
-        )
-    } else {
-        format!("Use one {scope} reset for {account_name}? {left}. This cannot be undone.")
+    if !recovery && let Some(reset) = &selection.reset {
+        return format!(
+            "{} {}",
+            reset.confirmation_question(&account_name),
+            reset.confirmation_effect(selection.count.unwrap_or(reset.available_count)),
+        );
     }
+    let available = selection.count.map_or_else(
+        || "Current available count unknown".into(),
+        |count| format!("{count} available"),
+    );
+    format!(
+        "Retry the same {} reset for {account_name} with its original key? {available}. This will not select another reset.",
+        selection.scope,
+    )
 }
 
 /// Confirmation metadata is separate from the provider inventory: a spent
@@ -175,6 +173,9 @@ struct Selection {
     id: String,
     scope: String,
     count: Option<u64>,
+    /// The original inventory entry freezes the shared confirmation wording.
+    /// A disappeared-credit recovery has only the original scope label.
+    reset: Option<UsageReset>,
 }
 
 fn prepare_selection(
@@ -194,6 +195,7 @@ fn prepare_selection(
             id: id.into(),
             scope: original_scope.into(),
             count: None,
+            reset: None,
         });
     }
     let reset = select_reset(resets, scope, reset_id, recovery, now)?;
@@ -207,6 +209,7 @@ fn prepare_selection(
         id: reset.id.clone(),
         scope: reset.label(),
         count: Some(count),
+        reset: Some(reset.clone()),
     })
 }
 
@@ -392,16 +395,14 @@ mod tests {
         );
         assert!(select_reset(&resets, Some("session"), None, false, 100).is_err());
         assert!(select_reset(&resets, Some("fable"), None, false, 200).is_err());
-        let text = confirmation(
-            &"claude/system".parse().unwrap(),
-            "Work",
-            &fable.label(),
-            Some(2),
-            false,
-        );
+        let selection = prepare_selection(&resets, Some("fable"), None, false, 100).unwrap();
+        let text = confirmation(&"claude/system".parse().unwrap(), "Work", &selection, false);
         assert!(text.contains("Work (claude/system)"));
         assert!(text.contains("Fable"));
-        assert!(text.contains("2 left"));
+        assert_eq!(
+            text,
+            "Use a Fable reset for Work (claude/system)? This clears the Fable weekly limit now. 2 available; this can’t be undone."
+        );
     }
 
     #[test]
@@ -568,10 +569,10 @@ mod tests {
         assert_eq!(selected.scope, "Account limits");
         assert_eq!(selected.count, None);
         let account: AccountId = "codex/system".parse().unwrap();
-        let prompt = confirmation(&account, "Work", &selected.scope, selected.count, true);
+        let prompt = confirmation(&account, "Work", &selected, true);
         assert!(prompt.contains("Retry the same Account limits reset"));
         assert!(prompt.contains("Work (codex/system)"));
-        assert!(prompt.contains("Current count unknown"));
+        assert!(prompt.contains("Current available count unknown"));
         let request = ConsumeRequest {
             account,
             reset_id: selected.id,
@@ -643,5 +644,43 @@ mod tests {
         assert!(
             retry_command(&request, "Weekly", "local").starts_with("cagents --device 'local' ")
         );
+    }
+    #[test]
+    fn combined_confirmation_names_both_cleared_windows_and_current_count() {
+        let resets = vec![grant(
+            "combined",
+            vec![ResetScope::AccountSession, ResetScope::AccountWeekly],
+            2,
+        )];
+        let selection = prepare_selection(&resets, None, None, false, 100).unwrap();
+        let account = "claude/system".parse().unwrap();
+        let prompt = confirmation(&account, "Work", &selection, false);
+        assert_eq!(
+            prompt,
+            "Use a Session + Weekly reset for Work (claude/system)? This clears the Session and Weekly limits now. 2 available; this can’t be undone."
+        );
+        assert_eq!(
+            selection.scope, "Session + Weekly",
+            "recovery scope stays stable"
+        );
+    }
+
+    #[test]
+    fn account_confirmation_uses_shared_effect_and_sums_same_scope_credit_count() {
+        let mut paused = grant("paused", vec![ResetScope::Account], 9);
+        paused.usable = false;
+        let resets = vec![
+            grant("first", vec![ResetScope::Account], 1),
+            grant("second", vec![ResetScope::Account], 1),
+            paused,
+        ];
+        let selection = prepare_selection(&resets, None, None, false, 100).unwrap();
+        let account = "codex/system".parse().unwrap();
+        let prompt = confirmation(&account, "codex/system", &selection, false);
+        assert_eq!(
+            prompt,
+            "Use an account reset for codex/system? This clears the account usage limits now. 2 available; this can’t be undone."
+        );
+        assert!(!prompt.contains("codex/system (codex/system)"));
     }
 }

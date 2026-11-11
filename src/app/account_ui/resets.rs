@@ -209,6 +209,7 @@ struct InventoryGroup {
     scopes: Vec<account::resets::ResetScope>,
     label: String,
     count: u64,
+    usable_now: bool,
     next_expiry: Option<i64>,
     unknown_expiry: bool,
 }
@@ -224,7 +225,11 @@ fn grouped_inventory(snapshot: &UsageSnapshot, now: Millis) -> Vec<InventoryGrou
     let mut groups: Vec<InventoryGroup> = Vec::new();
     for reset in snapshot.resets.iter().filter(|reset| inventory(reset, now)) {
         let scopes = normalized_scopes(reset);
-        if let Some(group) = groups.iter_mut().find(|group| group.scopes == scopes) {
+        let usable_now = reset.is_available(unix_seconds(now));
+        if let Some(group) = groups
+            .iter_mut()
+            .find(|group| group.scopes == scopes && group.usable_now == usable_now)
+        {
             group.count = group.count.saturating_add(reset.available_count);
             group.next_expiry = group.next_expiry.into_iter().chain(reset.expires_at).min();
             group.unknown_expiry |= reset.expires_at.is_none();
@@ -241,12 +246,17 @@ fn grouped_inventory(snapshot: &UsageSnapshot, now: Millis) -> Vec<InventoryGrou
                 },
                 scopes,
                 count: reset.available_count,
+                usable_now,
                 next_expiry: reset.expires_at,
                 unknown_expiry: reset.expires_at.is_none(),
             });
         }
     }
-    groups.sort_by(|left, right| left.label.cmp(&right.label));
+    groups.sort_by(|left, right| {
+        left.label
+            .cmp(&right.label)
+            .then_with(|| right.usable_now.cmp(&left.usable_now))
+    });
     groups
 }
 
@@ -254,7 +264,7 @@ fn scope_count(snapshot: &UsageSnapshot, reset: &UsageReset, now: Millis) -> u64
     let scopes = normalized_scopes(reset);
     grouped_inventory(snapshot, now)
         .into_iter()
-        .find(|group| group.scopes == scopes)
+        .find(|group| group.scopes == scopes && group.usable_now)
         .map_or(0, |group| group.count)
 }
 
@@ -288,7 +298,7 @@ struct ScopeChoice {
 
 impl ScopeChoice {
     fn label(&self) -> String {
-        format!("{} · {} left", self.reset.label(), self.count)
+        format!("{} · {} available", self.reset.label(), self.count)
     }
 }
 
@@ -430,6 +440,47 @@ impl Controls {
         controls
     }
 
+    pub(in crate::app) fn limit_guidance(&self, summary: &str, fallback: &str) -> String {
+        let covered = self.enabled
+            && self.snapshot.resets.iter().any(|reset| {
+                can_offer(&self.snapshot, &self.state, reset, self.now)
+                    && self.snapshot.windows.iter().any(|window| {
+                        limit_matches(summary, window)
+                            && reset.clears(window)
+                            && (window.used >= account::WARNING_FRACTION || window.binding)
+                            && window
+                                .resets_at
+                                .is_none_or(|at| at > unix_seconds(self.now))
+                    })
+            });
+        if !covered {
+            return fallback.into();
+        }
+        let wait = summary.split_once(" · resets ").map_or_else(
+            || "for the limit to reset".into(),
+            |(_, at)| format!("until {at}"),
+        );
+        let account_blocked = self.snapshot.ordinary_usage_allowed == Some(false)
+            || self.snapshot.windows.iter().any(|window| {
+                matches!(
+                    window.kind,
+                    account::WindowKind::Session | account::WindowKind::Weekly
+                ) && (window.used >= 1.0 || window.binding)
+                    && window
+                        .resets_at
+                        .is_none_or(|at| at > unix_seconds(self.now))
+            });
+        let alternative = if !account_blocked
+            && self.snapshot.windows.iter().any(|window| {
+                window.kind == account::WindowKind::Scoped && limit_matches(summary, window)
+            }) {
+            "another model or account"
+        } else {
+            "another account"
+        };
+        format!("Use a reset now, choose {alternative}, or wait {wait}.")
+    }
+
     pub(in crate::app) fn for_limit(&self, summary: &str) -> Option<Self> {
         let cleared = self.limit_cleared(summary);
         let mut controls = self.clone();
@@ -503,9 +554,11 @@ impl Controls {
                     format!(
                         " · {} {}",
                         if group.unknown_expiry {
-                            "next known expiry"
+                            "first known expiry"
+                        } else if group.count == 1 {
+                            "expires"
                         } else {
-                            "next expires"
+                            "first expires"
                         },
                         account::format_local_moment(at, unix_seconds(self.now))
                     )
@@ -513,10 +566,12 @@ impl Controls {
                 .unwrap_or_default();
             rows.push(
                 design::caption(format!(
-                    "{}: {} reset{} left{expiry}",
-                    group.label,
-                    group.count,
-                    if group.count == 1 { "" } else { "s" },
+                    "{}{expiry}",
+                    account::resets::inventory_caption(
+                        &group.scopes,
+                        group.count,
+                        group.usable_now
+                    )
                 ))
                 .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
                 .into(),
@@ -526,7 +581,7 @@ impl Controls {
             rows.push(design::caption("Checking usage…").into());
         }
         if let Some(pending) = &self.state.pending {
-            rows.push(design::caption(format!("Using a {} reset…", pending.reset.label())).into());
+            rows.push(design::caption(format!("Using {}…", pending.reset.reset_phrase())).into());
         } else if let Some(confirmation) = &self.state.confirmation {
             let choices = scope_choices(&self.snapshot, &self.state, self.now);
             if choices.len() > 1 {
@@ -541,16 +596,16 @@ impl Controls {
                 ));
             }
             rows.push(
-                design::body(format!("Use a reset for {}?", self.name))
+                design::body(confirmation.reset.confirmation_question(&self.name))
                     .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
                     .into(),
             );
             rows.push(
-                design::caption(format!(
-                    "{} · {} left. This cannot be undone.",
-                    confirmation.reset.label(),
-                    confirmation.total_count,
-                ))
+                design::caption(
+                    confirmation
+                        .reset
+                        .confirmation_effect(confirmation.total_count),
+                )
                 .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
                 .into(),
             );
@@ -575,12 +630,12 @@ impl Controls {
             let label = if self.state.uncertain.is_empty() {
                 "Use a reset".into()
             } else {
-                format!("Use a {} reset", reset.label())
+                format!("Use {}", reset.reset_phrase())
             };
             rows.push(
                 crate::ui_controls::button::secondary(label)
                     .id(reset_control_id(&self.id, &self.surface, "start"))
-                    .name(format!("Use a {} reset for {}", reset.label(), self.name))
+                    .name(reset.confirmation_question(&self.name))
                     .on_press_maybe(self.enabled.then(|| {
                         Message::AccountUi(Action::ResetStart(
                             self.id.clone(),
@@ -597,8 +652,8 @@ impl Controls {
                 let recurring = attempt.reset.kind == account::resets::ResetKind::WeeklySession;
                 rows.push(
                     design::caption(format!(
-                        "{} for {} · {} left when confirmed.",
-                        attempt.reset.label(),
+                        "Requested {} for {} · {} available when confirmed.",
+                        attempt.reset.reset_phrase(),
                         self.name,
                         attempt.total_count,
                     ))
@@ -1260,10 +1315,10 @@ mod tests {
         let inventory: Vec<_> = texts
             .0
             .iter()
-            .filter(|text| text.starts_with("Account limits:"))
+            .filter(|text| text.starts_with("3 account resets available"))
             .collect();
         assert_eq!(inventory.len(), 1);
-        assert!(inventory[0].contains("3 resets left · next expires"));
+        assert!(inventory[0].contains("3 account resets available · first expires"));
     }
 
     #[test]
@@ -1455,11 +1510,13 @@ mod tests {
         let mut state = State::default();
         let choices = scope_choices(&snapshot, &state, now);
         assert_eq!(choices.len(), 2);
-        assert!(choices.iter().any(|choice| choice.reset.id == session.id && choice.label() == "Session · 1 left"));
+        assert!(choices.iter().any(
+            |choice| choice.reset.id == session.id && choice.label() == "Session · 1 available"
+        ));
         assert!(
-            choices
-                .iter()
-                .any(|choice| choice.reset.id == fable.id && choice.label() == "Fable · 2 left")
+            choices.iter().any(
+                |choice| choice.reset.id == fable.id && choice.label() == "Fable · 2 available"
+            )
         );
         state.prepare(session, 1, None);
         let selected = choices
@@ -2704,5 +2761,203 @@ mod tests {
         assert_eq!(entries[0].1.snapshot.windows, partial.windows);
         assert_eq!(entries[0].1.snapshot.observed_at, now + 2);
         assert_eq!(entries[0].1.snapshot.resets[0].available_count, 1);
+    }
+    #[test]
+    fn reset_copy_counts_only_usable_grants_and_explains_the_effect_on_every_surface() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree},
+        };
+        #[derive(Default)]
+        struct Texts(Vec<String>);
+        impl Operation for Texts {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, text: &str) {
+                self.0.push(text.into());
+            }
+        }
+        let now = now_ms();
+        let grant = reset(ResetScope::Model("Fable".into()));
+        let mut paused = grant.clone();
+        paused.id = "not-next".into();
+        paused.usable = false;
+        paused.available_count = 9;
+        let mut combined = reset(ResetScope::AccountSession);
+        combined.id = "combined".into();
+        combined.scopes.push(ResetScope::AccountWeekly);
+        combined.available_count = 1;
+        let mut snapshot = UsageSnapshot::state(UsageStatus::Limited, "", now);
+        snapshot.windows = vec![
+            window(account::WindowKind::Scoped, "weekly_scoped:Fable", 1.0),
+            window(account::WindowKind::Weekly, "weekly_all", 1.0),
+        ];
+        snapshot.resets = vec![grant.clone(), paused, combined];
+        assert_eq!(scope_count(&snapshot, &grant, now), 2);
+        let groups = grouped_inventory(&snapshot, now);
+        assert!(
+            groups
+                .iter()
+                .any(|group| group.usable_now && group.count == 2)
+        );
+        assert!(
+            groups
+                .iter()
+                .any(|group| !group.usable_now && group.count == 9)
+        );
+        let mut state = State::default();
+        state.prepare(grant, 2, None);
+        let controls = Controls {
+            id: Account::system(Provider::Claude).id(),
+            name: "fixture@example.test".into(),
+            snapshot,
+            state,
+            now,
+            enabled: true,
+            recovery_enabled: true,
+            checking: false,
+            surface: "accounts".into(),
+            identity: None,
+        };
+        let renderer = crate::app::tests::headless_renderer();
+        for surface in ["accounts", "popover", "chat/fixture/card"] {
+            let mut element = controls.clone().on_surface(surface).view();
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(420.0, 900.0)),
+            );
+            let mut texts = Texts::default();
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut texts);
+            for expected in [
+                "2 Fable resets available",
+                "9 Fable resets not usable now",
+                "1 reset available for Session + Weekly",
+                "Use a Fable reset for fixture@example.test?",
+                "This clears the Fable weekly limit now. 2 available; this can’t be undone.",
+            ] {
+                assert!(
+                    texts.0.iter().any(|text| text == expected),
+                    "{surface}: missing {expected:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn actionable_limit_guidance_offers_only_a_reset_covering_the_current_limit() {
+        let now = now_ms();
+        let fable = reset(ResetScope::Model("Fable".into()));
+        let mut weekly = reset(ResetScope::AccountWeekly);
+        weekly.id = "weekly".into();
+        let mut snapshot = UsageSnapshot::state(UsageStatus::Limited, "", now);
+        snapshot.windows = vec![
+            window(account::WindowKind::Scoped, "weekly_scoped:Fable", 1.0),
+            window(account::WindowKind::Weekly, "weekly_all", 0.96),
+        ];
+        snapshot.resets = vec![fable, weekly];
+        let mut controls = Controls {
+            id: Account::system(Provider::Claude).id(),
+            name: "Fixture".into(),
+            snapshot,
+            state: State::default(),
+            now,
+            enabled: true,
+            recovery_enabled: true,
+            checking: false,
+            surface: "accounts".into(),
+            identity: None,
+        };
+        let summary = "Claude Fable limit reached · resets Jan 1, 12pm (UTC)";
+        let fallback = "Choose another model or account, or wait for the reported reset.";
+        assert_eq!(
+            controls.limit_guidance(summary, fallback),
+            "Use a reset now, choose another model or account, or wait until Jan 1, 12pm (UTC)."
+        );
+        controls.snapshot.windows[1].used = 1.0;
+        assert_eq!(
+            controls.limit_guidance(summary, fallback),
+            "Use a reset now, choose another account, or wait until Jan 1, 12pm (UTC).",
+            "resetting Fable does not make another model bypass exhausted account quota"
+        );
+        controls.snapshot.windows[1].used = 0.96;
+        for (provider, scope, kind, key, account_summary) in [
+            (
+                Provider::Claude,
+                ResetScope::AccountWeekly,
+                account::WindowKind::Weekly,
+                "weekly_all",
+                "Claude weekly limit reached · resets Jan 1, 12pm (UTC)",
+            ),
+            (
+                Provider::Claude,
+                ResetScope::AccountSession,
+                account::WindowKind::Session,
+                "session",
+                "Claude session limit reached · resets Jan 1, 12pm (UTC)",
+            ),
+            (
+                Provider::Codex,
+                ResetScope::Account,
+                account::WindowKind::Session,
+                "codex:primary",
+                "Codex usage limit reached · resets Jan 1, 12pm (UTC)",
+            ),
+        ] {
+            let mut account_controls = controls.clone();
+            account_controls.id = Account::system(provider).id();
+            account_controls.snapshot.windows = vec![window(kind, key, 1.0)];
+            account_controls.snapshot.resets = vec![reset(scope)];
+            assert_eq!(
+                account_controls.limit_guidance(
+                    account_summary,
+                    "Wait for the reported reset or choose another account."
+                ),
+                "Use a reset now, choose another account, or wait until Jan 1, 12pm (UTC).",
+                "a model switch does not bypass {account_summary}"
+            );
+        }
+        controls.snapshot.resets[0].usable = false;
+        assert_eq!(
+            controls.limit_guidance(summary, fallback),
+            fallback,
+            "an account grant cannot clear a model limit"
+        );
+        assert!(
+            controls
+                .limit_guidance("Claude weekly limit reached", fallback)
+                .starts_with("Use a reset now,")
+        );
+        controls.snapshot.resets[1].usable = false;
+        controls.snapshot.resets[0].usable = true;
+        assert_eq!(
+            controls.limit_guidance("Claude weekly limit reached", fallback),
+            fallback,
+            "a model grant cannot clear the account window"
+        );
+        let original = controls.snapshot.resets[0].clone();
+        controls.state.prepare(original.clone(), 2, None);
+        let attempt = controls.state.submit(&original, 2, None).unwrap();
+        controls.state.finish(
+            &attempt.key,
+            ConsumeStatus::Unconfirmed,
+            "Result unknown".into(),
+        );
+        assert_eq!(
+            controls.limit_guidance(summary, fallback),
+            fallback,
+            "an uncertain original request offers recovery, not a new reset"
+        );
+        controls.state = State::default();
+        controls.enabled = false;
+        assert_eq!(
+            controls.limit_guidance(summary, fallback),
+            fallback,
+            "pending or stale state keeps existing guidance"
+        );
     }
 }

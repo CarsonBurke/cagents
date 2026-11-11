@@ -77,6 +77,42 @@ impl UsageReset {
             .join(" + ")
     }
 
+    /// The reset grant being spent, distinct from its affected limit windows.
+    pub fn reset_phrase(&self) -> String {
+        match ordered_scopes(&self.scopes).as_slice() {
+            [ResetScope::Account] => "an account reset".into(),
+            [] => "a reset".into(),
+            _ => format!("a {} reset", scope_label(&self.scopes)),
+        }
+    }
+
+    pub fn confirmation_question(&self, account_name: &str) -> String {
+        format!("Use {} for {account_name}?", self.reset_phrase())
+    }
+
+    pub fn confirmation_effect(&self, available_count: u64) -> String {
+        let scopes = ordered_scopes(&self.scopes);
+        let effect: String = if scopes == [ResetScope::AccountSession, ResetScope::AccountWeekly] {
+            "This clears the Session and Weekly limits now.".into()
+        } else {
+            let windows = scopes
+                .iter()
+                .map(|scope| match scope {
+                    ResetScope::AccountSession => "the Session limit".into(),
+                    ResetScope::AccountWeekly => "the Weekly limit".into(),
+                    ResetScope::Model(model) => format!("the {model} weekly limit"),
+                    ResetScope::Account => "the account usage limits".into(),
+                })
+                .collect::<Vec<String>>();
+            if windows.is_empty() {
+                "This uses the selected reset now.".into()
+            } else {
+                format!("This clears {} now.", windows.join(" and "))
+            }
+        };
+        format!("{effect} {available_count} available; this can’t be undone.")
+    }
+
     pub fn clears(&self, window: &UsageWindow) -> bool {
         self.scopes.iter().any(|scope| scope.clears(window))
     }
@@ -86,6 +122,41 @@ impl UsageReset {
             && self.usable
             && !self.scopes.is_empty()
             && self.expires_at.is_none_or(|expires| expires > now_secs)
+    }
+}
+
+fn ordered_scopes(scopes: &[ResetScope]) -> Vec<ResetScope> {
+    let mut scopes = scopes.to_vec();
+    scopes.sort_by_key(ResetScope::label);
+    scopes.dedup();
+    scopes
+}
+
+fn scope_label(scopes: &[ResetScope]) -> String {
+    ordered_scopes(scopes)
+        .iter()
+        .map(ResetScope::label)
+        .collect::<Vec<_>>()
+        .join(" + ")
+}
+
+/// Inventory copy names grants, never a countdown until a limit resets.
+/// Paused/non-next grants must remain distinct from grants usable now.
+pub fn inventory_caption(scopes: &[ResetScope], count: u64, usable_now: bool) -> String {
+    let plural = if count == 1 { "" } else { "s" };
+    let availability = if usable_now {
+        "available"
+    } else {
+        "not usable now"
+    };
+    match ordered_scopes(scopes).as_slice() {
+        [ResetScope::Account] => format!("{count} account reset{plural} {availability}"),
+        [scope] => format!("{count} {} reset{plural} {availability}", scope.label()),
+        [] => format!("{count} reset{plural} with an unknown scope · not usable now"),
+        _ => format!(
+            "{count} reset{plural} {availability} for {}",
+            scope_label(scopes)
+        ),
     }
 }
 
@@ -191,5 +262,68 @@ mod tests {
         assert!(snapshot.actionable_reset(&weekly, 100).is_some());
         weekly.used = 0.1;
         assert!(snapshot.actionable_reset(&weekly, 100).is_none());
+    }
+    #[test]
+    fn confirmation_names_the_grant_and_only_the_windows_it_clears() {
+        for (scopes, question, effect) in [
+            (
+                vec![ResetScope::Model("Fable".into())],
+                "Use a Fable reset for fixture@example.test?",
+                "This clears the Fable weekly limit now. 2 available; this can’t be undone.",
+            ),
+            (
+                vec![ResetScope::AccountWeekly, ResetScope::AccountSession],
+                "Use a Session + Weekly reset for fixture@example.test?",
+                "This clears the Session and Weekly limits now. 2 available; this can’t be undone.",
+            ),
+            (
+                vec![ResetScope::AccountSession],
+                "Use a Session reset for fixture@example.test?",
+                "This clears the Session limit now. 2 available; this can’t be undone.",
+            ),
+            (
+                vec![ResetScope::Account],
+                "Use an account reset for fixture@example.test?",
+                "This clears the account usage limits now. 2 available; this can’t be undone.",
+            ),
+        ] {
+            let reset = UsageReset {
+                id: "fixture".into(),
+                kind: ResetKind::WeeklySession,
+                scopes,
+                available_count: 2,
+                expires_at: None,
+                usable: true,
+            };
+            assert_eq!(
+                reset.confirmation_question("fixture@example.test"),
+                question
+            );
+            assert_eq!(reset.confirmation_effect(2), effect);
+        }
+    }
+
+    #[test]
+    fn inventory_copy_distinguishes_reset_grants_from_limit_windows_and_unusable_grants() {
+        assert_eq!(
+            inventory_caption(&[ResetScope::Model("Fable".into())], 2, true),
+            "2 Fable resets available"
+        );
+        assert_eq!(
+            inventory_caption(
+                &[ResetScope::AccountSession, ResetScope::AccountWeekly],
+                1,
+                true
+            ),
+            "1 reset available for Session + Weekly"
+        );
+        assert_eq!(
+            inventory_caption(&[ResetScope::Model("Fable".into())], 9, false),
+            "9 Fable resets not usable now"
+        );
+        assert_eq!(
+            inventory_caption(&[], 1, true),
+            "1 reset with an unknown scope · not usable now"
+        );
     }
 }
