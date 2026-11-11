@@ -329,13 +329,54 @@ def server(root):
     return http
 
 
+def configure(root, provider, mode):
+    if provider not in ("claude", "codex") or mode not in ("success", "error", "disconnect", "unconfirmed", "depleted"):
+        raise ValueError("unknown reset fixture provider or mode")
+    if mode == "unconfirmed" and provider != "claude":
+        raise ValueError("unconfirmed is a Claude-only mode")
+    root = private_directory(root)
+    marker = root / ".cagents-reset-fixture"
+    if not marker.is_file() or marker.is_symlink():
+        raise ValueError("reset mode requires the private fixture marker")
+    with state_file(root / "home" / ("." + provider)) as state:
+        state["mode"] = "success" if mode == "depleted" else mode
+        if mode != "depleted":
+            return
+        if provider == "claude":
+            limits = state["usage"]["rate_limits"]
+            for model in limits["model_scoped"]:
+                if model["display_name"] == "Fable":
+                    model["utilization"] = 100
+            program = limits["cedar_ember"]
+            for item in program["grants"]:
+                item["resets_left"] = 0
+                item["usable_now"] = False
+            program["next_grant_id"] = None
+            program["at_limit"] = True
+            program["exhausted"] = ["seven_day_overage_included"]
+            limits["juniper_tide"]["available"] = False
+            limits["juniper_tide"]["next_available_at"] = RESET_AT
+        else:
+            limits = state["limits"]
+            limits["ordinaryUsageAllowed"] = False
+            for window in ("primary", "secondary"):
+                limits["rateLimits"][window]["usedPercent"] = 100
+            limits["rateLimitResetCredits"]["availableCount"] = 0
+            for credit in limits["rateLimitResetCredits"]["credits"]:
+                credit["status"] = "redeemed"
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("seed", "serve"))
+    parser.add_argument("command", choices=("seed", "serve", "mode"))
     parser.add_argument("root", type=Path)
+    parser.add_argument("provider", nargs="?")
+    parser.add_argument("mode", nargs="?")
     args = parser.parse_args()
     if args.command == "seed":
         seed(args.root)
+    elif args.command == "mode":
+        configure(args.root, args.provider, args.mode)
     else:
         http = server(args.root)
         print(json.dumps({"url": f"http://127.0.0.1:{http.server_port}",

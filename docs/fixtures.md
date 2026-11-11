@@ -241,7 +241,11 @@ and replaying the original idempotency key spends nothing further. Use
 modes. `mode claude unconfirmed` spends once but answers HTTP 200 with
 `result: unavailable` and `reason: reset_unconfirmed`; the same key then
 answers `already_used` without another spend. Restore the seed before each independent comparison so both sides
-start with the same counts. Do not edit the state while a request is pending.
+start with the same counts. For a limited account without a reset action, use
+`mode claude depleted` or `mode codex depleted`: these set the relevant window
+to 100% and all reset counts to zero, without submitting a consume. Claude
+turn frames are refreshed too, so the Fable card stays limited without an
+available reset. Mode changes share the service's state lock.
 
 The service and Codex peer share `fixture-reset-state.json` files guarded by
 file locks. Their offline contracts run with

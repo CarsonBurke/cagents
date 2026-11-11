@@ -34,19 +34,9 @@ case $command in
         ;;
     mode)
         provider=${2:?name claude or codex}
-        mode=${3:?name success, error, disconnect or unconfirmed}
-        [[ $provider =~ ^(claude|codex)$ && $mode =~ ^(success|error|disconnect|unconfirmed)$ ]] || exit 2
-        [[ $provider == claude || $mode != unconfirmed ]] || { echo "unconfirmed is a Claude-only mode" >&2; exit 2; }
-        evidence env /usr/bin/python3 -c '
-import json, os, pathlib, sys
-root, provider, mode = pathlib.Path(os.environ["CAGENTS_EVIDENCE_FIXTURE"]), sys.argv[1], sys.argv[2]
-assert (root / ".cagents-reset-fixture").is_file()
-path = root / "home" / ("." + provider) / "fixture-reset-state.json"
-state = json.loads(path.read_text())
-assert state["fixture"] == "cagents-fixture-only"
-state["mode"] = mode
-path.write_text(json.dumps(state))
-' "$provider" "$mode"
+        mode=${3:?name success, error, disconnect, unconfirmed or depleted}
+        evidence env sh -c 'exec /usr/bin/python3 "$1" mode "$CAGENTS_EVIDENCE_FIXTURE" "$2" "$3"' sh \
+            "$here/tests/fixtures/usage-reset-fixture.py" "$provider" "$mode"
         ;;
     *) echo "unknown reset scene command: $command" >&2; exit 2 ;;
 esac

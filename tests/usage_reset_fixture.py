@@ -213,6 +213,34 @@ class UsageResetFixture(unittest.TestCase):
         self.assertEqual(state["consume_count"], 1)
         self.assertEqual(state["session_post_count"], 2)
 
+    def test_depleted_mode_reports_limits_without_any_available_reset(self):
+        for provider in ("claude", "codex"):
+            FIXTURE.configure(self.root, provider, "depleted")
+        claude = self.read(self.claude)
+        limits = claude["usage"]["rate_limits"]
+        self.assertEqual(limits["model_scoped"][0]["utilization"], 100)
+        self.assertEqual([item["resets_left"] for item in limits["cedar_ember"]["grants"]], [0, 0])
+        self.assertIsNone(limits["cedar_ember"]["next_grant_id"])
+        self.assertFalse(limits["juniper_tide"]["available"])
+        frames = [json.loads(line) for line in (self.claude / "fixture-frames.jsonl").read_text().splitlines()]
+        self.assertEqual(frames[0]["rate_limit_info"]["status"], "rejected")
+        self.assertEqual(frames[-2]["subtype"], "error_during_execution")
+        self.assertEqual(self.claim()[1]["result"], "already_used")
+        codex = self.read(self.codex)
+        self.assertEqual(codex["limits"]["rateLimitResetCredits"]["availableCount"], 0)
+        self.assertFalse(codex["limits"]["ordinaryUsageAllowed"])
+        self.assertEqual([codex["limits"]["rateLimits"][window]["usedPercent"] for window in ("primary", "secondary")], [100, 100])
+        self.assertEqual(FIXTURE.consume_codex(self.codex, {"idempotencyKey": "depleted"})[0], {"outcome": "noCredit"})
+        self.assertEqual(self.read(self.claude)["consume_count"], 0)
+        self.assertEqual(self.read(self.codex)["consume_count"], 0)
+
+    def test_modes_require_the_marked_fixture_before_writing(self):
+        before = self.read(self.claude)
+        (self.root / ".cagents-reset-fixture").unlink()
+        with self.assertRaisesRegex(ValueError, "fixture marker"):
+            FIXTURE.configure(self.root, "claude", "depleted")
+        self.assertEqual(self.read(self.claude), before)
+
     def test_seed_never_overwrites_a_previous_inventory(self):
         before = self.read(self.claude)
         with self.assertRaisesRegex(ValueError, "already exists"):
