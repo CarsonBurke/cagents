@@ -1,10 +1,11 @@
 //! Asking a provider's own CLI how an account stands.
 //!
-//! Every question goes through the provider's official client, as that
-//! client's own documented protocol: Claude Code's stream-json control
-//! requests and `claude auth status`, Codex's app server. cagents never reads
-//! a credential file and never calls a provider's service itself, so a login
-//! stays the property of the client it belongs to.
+//! Ordinary usage goes through the provider's official client and its
+//! protocol: Claude Code's stream-json control
+//! requests and `claude auth status`, Codex's app server. Reset inventory and
+//! consumption are the narrow exception: Claude exposes no control route,
+//! so `reset_transport` reads its subscription bearer in memory for its fixed
+//! private endpoint. The provider CLI still owns login and credential refresh.
 //!
 //! A probe runs on the async runtime, never the interface thread. It is
 //! bounded in time ([`TIMEOUT`]) and in how much output it will read
@@ -34,6 +35,12 @@ use super::{
     schedule::STALE_AFTER,
 };
 use crate::{agent::Provider, chat::Model};
+
+mod reset_consume;
+#[cfg(test)]
+mod reset_contract_tests;
+mod reset_transport;
+pub use reset_consume::consume;
 
 /// How long a probe may take in total.
 pub const TIMEOUT: Duration = Duration::from_secs(30);
@@ -182,6 +189,25 @@ async fn run_reading(
                 .await
                 .ok()
                 .flatten();
+    }
+    // Failed inventory is unknown, not zero. Retain disabled prior rows.
+    if let Outcome::Answered {
+        identity, snapshot, ..
+    } = &mut outcome
+        && snapshot.detail.as_deref() == Some("Reset availability could not be refreshed")
+        && let Some(previous) = cache.as_ref().and_then(|cache| {
+            key.as_ref()
+                .and_then(|key| cache.load(now_ms()).remove(key))
+        })
+        && identity
+            .as_ref()
+            .zip(previous.identity.as_ref())
+            .is_some_and(|(current, previous)| reset_consume::same_identity(current, previous))
+    {
+        snapshot.resets = previous.snapshot.resets;
+        for reset in &mut snapshot.resets {
+            reset.usable = false;
+        }
     }
     if let (
         Outcome::Answered {
@@ -921,7 +947,22 @@ async fn probe_claude_with_path(
         "",
         "--disable-slash-commands",
     ]);
-    join_claude(run_json(status), claude_usage(usage)).await
+    let mut probed = join_claude(run_json(status), claude_usage(usage)).await?;
+    if confirms_login(probed.identity.as_ref(), probed.snapshot.status) {
+        match reset_transport::Client::load(account, program, search_path).await {
+            Ok(client) => match client.inventory().await {
+                Ok(resets) => probed.snapshot.resets = resets,
+                Err(_) => {
+                    probed.snapshot.detail =
+                        Some("Reset availability could not be refreshed".into())
+                }
+            },
+            Err(_) => {
+                probed.snapshot.detail = Some("Reset availability could not be refreshed".into())
+            }
+        }
+    }
+    Ok(probed)
 }
 
 /// The home whose record of `account`'s login may disagree with the one its

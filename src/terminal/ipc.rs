@@ -221,7 +221,9 @@ use crate::{
 /// are reserved for parallel branches and are not adopted here.
 /// Version 166 adds a tool status for an agent waiting on its own background
 /// work, which an older client is sent as running.
-pub const PROTOCOL_VERSION: u16 = 166;
+/// Version 167 adds reset inventories to account readings and an explicit
+/// account-reset device operation, with JSON-framed refreshed snapshots.
+pub const PROTOCOL_VERSION: u16 = 167;
 /// The install candidate line's protocol. Every message an update exchanges
 /// with its daemon (Connect, the upgrade preview and preparation, and the
 /// inspector's frozen and saved-history requests) has this release's

@@ -15,6 +15,7 @@ pub struct Query {
 /// fields, which cannot be omitted from postcard's positional representation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UsageReading {
+    pub resets: Vec<super::UsageReset>,
     pub windows: Vec<UsageWindow>,
     pub credits: Option<Credits>,
     pub status: super::UsageStatus,
@@ -28,6 +29,7 @@ pub struct UsageReading {
 impl From<UsageSnapshot> for UsageReading {
     fn from(snapshot: UsageSnapshot) -> Self {
         Self {
+            resets: snapshot.resets,
             windows: snapshot.windows,
             credits: snapshot.credits,
             status: snapshot.status,

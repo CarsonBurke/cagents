@@ -9,6 +9,7 @@
 #                    collaboration and event items, started then completed.
 #   child-errors     codex-child-errors.py: subagent diagnostics and failed turns.
 #   terminal-escape  terminal-escape-codex.py: streamed terminal escapes.
+#   usage-resets     codex-usage-resets.py: invented reset inventory/consumes.
 #
 # Each peer wants a private root (mode 0700, the fixture), CODEX_HOME beneath
 # it and a private XDG_RUNTIME_DIR; this supplies the root and CODEX_HOME.
@@ -23,8 +24,9 @@ case $peer in
     tool-rows) script=codex-tool-rows.py root=CAGENTS_TOOL_ROWS_FIXTURE_ROOT ;;
     child-errors) script=codex-child-errors.py root=CAGENTS_CHILD_ERROR_FIXTURE_ROOT ;;
     terminal-escape) script=terminal-escape-codex.py root=CAGENTS_ESCAPE_FIXTURE_ROOT ;;
+    usage-resets) script=codex-usage-resets.py root=CAGENTS_USAGE_RESETS_FIXTURE_ROOT ;;
     *)
-        echo "codex: the fixture has no Codex peer; start the session with --codex tool-rows, child-errors or terminal-escape" >&2
+        echo "codex: the fixture has no Codex peer; start the session with --codex tool-rows, child-errors, terminal-escape or usage-resets" >&2
         exit 127
         ;;
 esac

@@ -94,6 +94,7 @@ pub fn parse_rate_limits(result: &Value, observed_at: u64) -> UsageSnapshot {
     let detail = (status == UsageStatus::Unavailable)
         .then(|| "Codex did not report usable usage limits".into());
     UsageSnapshot {
+        resets: parse_resets(result),
         windows,
         credits,
         status,
@@ -103,6 +104,66 @@ pub fn parse_rate_limits(result: &Value, observed_at: u64) -> UsageSnapshot {
         plan,
         detail,
     }
+}
+
+/// Credit details can be absent or capped; the available count remains the
+/// authority for how many credits exist, independently of detail rows.
+pub fn parse_resets(result: &Value) -> Vec<super::UsageReset> {
+    use super::{ResetKind, ResetScope, UsageReset};
+    let summary = &result["rateLimitResetCredits"];
+    let Some(count) = summary["availableCount"].as_u64() else {
+        return Vec::new();
+    };
+    let mut resets = Vec::new();
+    let mut available_details = 0;
+    for credit in summary["credits"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(256)
+    {
+        let Some(id) = credit["id"].as_str().filter(|id| {
+            !id.is_empty() && id.len() <= 256 && id.bytes().all(|b| b.is_ascii_graphic())
+        }) else {
+            continue;
+        };
+        if resets.iter().any(|reset: &UsageReset| reset.id == id) {
+            continue;
+        }
+        let available = credit["status"].as_str() == Some("available") && available_details < count;
+        if available {
+            available_details += 1;
+        }
+        let known = credit["resetType"].as_str() == Some("codexRateLimits");
+        resets.push(UsageReset {
+            id: id.into(),
+            kind: ResetKind::Granted,
+            scopes: if known {
+                vec![ResetScope::Account]
+            } else {
+                Vec::new()
+            },
+            available_count: u64::from(available),
+            expires_at: credit["expiresAt"].as_i64(),
+            usable: available
+                && known
+                && count > 0
+                && credit
+                    .get("expiresAt")
+                    .is_none_or(|value| value.is_null() || value.as_i64().is_some()),
+        });
+    }
+    if count > available_details {
+        resets.push(UsageReset {
+            id: "codex/next".into(),
+            kind: ResetKind::Granted,
+            scopes: vec![ResetScope::Account],
+            available_count: count - available_details,
+            expires_at: None,
+            usable: true,
+        });
+    }
+    resets
 }
 
 /// A successful RPC frame without quota or explicit backend permission is
@@ -795,6 +856,78 @@ mod tests {
                 super::super::routing::available(&reported, 1_001),
                 available
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod reset_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn reset_inventory_reads_details_and_retains_capped_count() {
+        let resets = parse_resets(
+            &json!({"rateLimitResetCredits":{"availableCount":3,"credits":[
+                {"id":"one","status":"available","resetType":"codexRateLimits","expiresAt":200},
+                {"id":"two","status":"available","resetType":"unknown","title":"Weekly reset"}
+            ]}}),
+        );
+        assert_eq!(
+            resets
+                .iter()
+                .map(|reset| reset.available_count)
+                .sum::<u64>(),
+            3
+        );
+        assert!(resets[0].is_available(100));
+        assert!(
+            !resets[1].is_available(100),
+            "unknown type cannot borrow scope from its title"
+        );
+        assert_eq!(resets[2].id, "codex/next");
+        assert_eq!(resets[2].available_count, 1);
+        assert_eq!(
+            parse_resets(&json!({"rateLimitResetCredits":{"availableCount":4,"credits":null}}))[0]
+                .available_count,
+            4
+        );
+    }
+    #[test]
+    fn inconsistent_detail_rows_never_invent_available_credits() {
+        for count in [0, 1] {
+            let resets = parse_resets(
+                &json!({"rateLimitResetCredits":{"availableCount":count,"credits":[
+                    {"id":"one","status":"available","resetType":"codexRateLimits"},
+                    {"id":"two","status":"available","resetType":"codexRateLimits"}
+                ]}}),
+            );
+            assert_eq!(
+                resets
+                    .iter()
+                    .map(|reset| reset.available_count)
+                    .sum::<u64>(),
+                count
+            );
+        }
+        assert!(parse_resets(&json!({"rateLimitResetCredits":{"availableCount":-1}})).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod reset_timestamp_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn malformed_credit_expiry_is_unknown_not_unlimited() {
+        for expires in [json!("tomorrow"), json!(u64::MAX), json!({})] {
+            let resets = parse_resets(
+                &json!({"rateLimitResetCredits":{"availableCount":1,"credits":[{
+                "id":"one","status":"available","resetType":"codexRateLimits","expiresAt":expires}]}}),
+            );
+            assert_eq!(resets.len(), 1);
+            assert_eq!(resets[0].available_count, 1);
+            assert!(!resets[0].is_available(100));
         }
     }
 }

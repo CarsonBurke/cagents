@@ -1276,7 +1276,16 @@ impl Runtime {
         Some(details.join("\n\n---\n\n"))
     }
 
+    #[cfg(test)]
     pub(super) fn failure_view(&self, incident: &Incident) -> Element<'static, Message> {
+        self.failure_view_with_reset(incident, None)
+    }
+
+    pub(super) fn failure_view_with_reset(
+        &self,
+        incident: &Incident,
+        reset_controls: Option<&crate::app::account_ui::resets::Controls>,
+    ) -> Element<'static, Message> {
         let mut rows = vec![
             widget::row::with_children(vec![
                 crate::ui_controls::passive_icon(Icon::Warning, design::COMPACT_ICON_SIZE),
@@ -1291,6 +1300,12 @@ impl Runtime {
                 .width(Length::Fill)
                 .into(),
         ];
+        if incident.kind == Some(FailureKind::AccountLimit)
+            && let Some(controls) =
+                reset_controls.and_then(|controls| controls.for_limit(&incident.summary))
+        {
+            rows.push(controls.view());
+        }
         rows.push(self.failure_diagnostics(incident));
         widget::container(
             widget::column::with_children(rows)

@@ -1232,7 +1232,7 @@ impl Cagents {
                 } else {
                     Vec::new()
                 };
-                let view = runtime.view(
+                let view = runtime.view_with_resets(
                     self.chat_auth_recovery(runtime),
                     self.chat_ui.phases.get(&card),
                     self.settings.chat_enter_sends,
@@ -1246,6 +1246,10 @@ impl Cagents {
                     !self.workspace_inputs_blocked(),
                     accounts,
                     offers,
+                    self.chat_reset_controls(
+                        runtime.session.launch.provider,
+                        &runtime.session.launch.recipe,
+                    ),
                 );
                 if !runtime.closed_elsewhere
                     && let Some(recovery) = self.account_recovery_controls(card)
@@ -2064,6 +2068,7 @@ impl Runtime {
         })
     }
 
+    #[cfg(test)]
     fn view<'a>(
         &'a self,
         recovery: Option<auth_recovery::Recovery>,
@@ -2075,6 +2080,33 @@ impl Runtime {
         accepting_drops: bool,
         accounts: Option<ChatAccounts>,
         offers: Vec<Offer<'a>>,
+    ) -> Element<'a, Message> {
+        self.view_with_resets(
+            recovery,
+            transition,
+            enter_sends,
+            shortcuts,
+            content_width,
+            place,
+            accepting_drops,
+            accounts,
+            offers,
+            None,
+        )
+    }
+
+    fn view_with_resets<'a>(
+        &'a self,
+        recovery: Option<auth_recovery::Recovery>,
+        transition: impl Into<ViewTransition>,
+        enter_sends: bool,
+        shortcuts: &crate::settings::KeyboardShortcuts,
+        content_width: f32,
+        place: Place,
+        accepting_drops: bool,
+        accounts: Option<ChatAccounts>,
+        offers: Vec<Offer<'a>>,
+        reset_controls: Option<crate::app::account_ui::resets::Controls>,
     ) -> Element<'a, Message> {
         let transition = transition.into();
         let transitioning = !matches!(transition, ViewTransition::Idle);
@@ -2199,16 +2231,19 @@ impl Runtime {
                         .is_some_and(|(found, _)| found.key == incident.key)
                 });
                 if !has_item {
-                    transcript.push(self.failure_view(incident));
+                    transcript
+                        .push(self.failure_view_with_reset(incident, reset_controls.as_ref()));
                 }
             }
             for item in &agent.items {
                 if let Some((incident, first)) = self.failure_ui.child_item(&agent.id, &item.id) {
                     if first {
                         transcript.push(
-                            widget::container(self.failure_view(incident))
-                                .id(self.find_anchor(&item.id))
-                                .into(),
+                            widget::container(
+                                self.failure_view_with_reset(incident, reset_controls.as_ref()),
+                            )
+                            .id(self.find_anchor(&item.id))
+                            .into(),
                         );
                     }
                     continue;
@@ -2335,9 +2370,11 @@ impl Runtime {
                     && incident.anchor.is_none()
             }) {
                 transcript.push(
-                    widget::container(self.failure_view(incident))
-                        .id(self.find_anchor(&format!("failure:{}", incident.key)))
-                        .into(),
+                    widget::container(
+                        self.failure_view_with_reset(incident, reset_controls.as_ref()),
+                    )
+                    .id(self.find_anchor(&format!("failure:{}", incident.key)))
+                    .into(),
                 );
             }
             for turn in &self.turns {
@@ -2391,9 +2428,11 @@ impl Runtime {
                         && incident.anchor.as_ref() == Some(&turn.key)
                 }) {
                     transcript.push(
-                        widget::container(self.failure_view(incident))
-                            .id(self.find_anchor(&format!("failure:{}", incident.key)))
-                            .into(),
+                        widget::container(
+                            self.failure_view_with_reset(incident, reset_controls.as_ref()),
+                        )
+                        .id(self.find_anchor(&format!("failure:{}", incident.key)))
+                        .into(),
                     );
                 }
             }

@@ -79,6 +79,10 @@ pub enum Operation {
     ReadImageAsset {
         reference: crate::chat::ImageReference,
     },
+    /// Spend one explicitly confirmed reset on a daemon-resolved account.
+    AccountReset {
+        request: crate::account::resets::ConsumeRequest,
+    },
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum GitOperation {
@@ -132,6 +136,7 @@ pub enum Reply {
         error: String,
     },
     Image(Vec<u8>),
+    AccountReset(#[serde(with = "wire_json")] serde_json::Value),
 }
 
 /// Daemon-resolved directories used for workspace navigation. No displaying
@@ -189,6 +194,7 @@ pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
     use crate::fs_safety;
     use std::fs;
     match operation {
+        Operation::AccountReset { .. } => Err("Account resets require daemon admission".into()),
         Operation::RemoveMergedWorktree { .. } => {
             Err("Automatic cleanup requires the daemon lifecycle fence".into())
         }

@@ -795,6 +795,14 @@ fn row<'a>(
     // background check fails. The explanation can wrap below the fixed-height
     // row, including when the Status column has been dropped for space.
     let mut lines = vec![content];
+    if let Some(resets) = app.usage_reset_controls(account) {
+        lines.push(
+            widget::container(resets.view())
+                .padding([space::XS, space::M])
+                .width(Length::Fill)
+                .into(),
+        );
+    }
     // The group explains a missing CLI once, with the way to install it.
     if let Some(reason) = failure_caption(account, now)
         .filter(|_| state.installed.get(&account.account.provider) != Some(&false))

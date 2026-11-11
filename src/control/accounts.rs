@@ -5,9 +5,27 @@ mod link;
 mod list;
 mod preferences;
 mod removal;
+mod reset;
 
 #[derive(Debug, clap::Subcommand)]
 pub enum AccountCommand {
+    /// Spend an available reset after confirming the account and scope.
+    Reset {
+        /// Stable provider/account ID from account list.
+        account: crate::account::AccountId,
+        /// Window to refill, or the original scope label when retrying a reset.
+        #[arg(long)]
+        scope: Option<String>,
+        /// Select an exact reset; retries must also use the original idempotency key.
+        #[arg(long)]
+        reset_id: Option<String>,
+        /// Confirm spending one reset without an interactive prompt.
+        #[arg(long)]
+        yes: bool,
+        /// Reuse this key only to resolve the same previously submitted reset.
+        #[arg(long, requires = "reset_id")]
+        idempotency_key: Option<String>,
+    },
     /// Register an existing provider home on this device, or on --device.
     /// Does not transfer credentials or verify coding access.
     Link {
@@ -56,6 +74,15 @@ pub enum AccountCommand {
 
 pub(super) fn execute(command: AccountCommand) -> Result<CommandOutput, AppError> {
     let (query, listing) = match command {
+        AccountCommand::Reset {
+            account,
+            scope,
+            reset_id,
+            yes,
+            idempotency_key,
+        } => {
+            return reset::execute(account, scope, reset_id, yes, idempotency_key);
+        }
         AccountCommand::Link { provider, home } => return link::execute(provider, home),
         AccountCommand::Default {
             provider,
@@ -203,6 +230,22 @@ fn human(report: &Report) -> String {
                     } else {
                         ""
                     }
+                ));
+            }
+            for reset in &usage.resets {
+                lines.push(format!(
+                    "  Resets: {} · {} left{}{}",
+                    reset.label(),
+                    reset.available_count,
+                    reset
+                        .expires_at
+                        .map(|at| format!(" · expires {at}"))
+                        .unwrap_or_default(),
+                    if reset.usable {
+                        ""
+                    } else {
+                        " · unavailable now"
+                    },
                 ));
             }
             if let Some(credits) = &account.credits {

@@ -1238,6 +1238,10 @@ class Evidence(unittest.TestCase):
         self.run_tool("start", "after", "--codex", "terminal-escape")
         self.assertIn("terminal", self.fixture_shell("codex --version").stdout)
         self.run_tool("stop")
+        self.run_tool("start", "after", "--codex", "usage-resets")
+        self.assertIn("usage-resets", self.fixture_shell("codex --version").stdout)
+        self.assertTrue((fixture / "libexec/codex/usage-reset-fixture.py").is_file())
+        self.run_tool("stop")
         self.run_tool("start", "after")
         self.assertFalse((fixture / "bin" / "codex").exists())
         self.assertFalse((fixture / "libexec" / "codex").exists())
@@ -1256,7 +1260,7 @@ class Evidence(unittest.TestCase):
         self.built()
         result = self.run_tool("start", "after", "--codex", "codex", check=False)
         self.assertEqual(result.returncode, 2)
-        self.assertIn("unknown Codex peer: codex; use tool-rows, child-errors or terminal-escape", result.stderr)
+        self.assertIn("unknown Codex peer: codex; use tool-rows, child-errors, terminal-escape or usage-resets", result.stderr)
         self.assertTrue(self.lock_is_free(self.native_lock))
 
     def codex_elf(self, name: str = "real codex") -> Path:

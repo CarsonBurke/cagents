@@ -46,6 +46,7 @@ use crate::account::{
 };
 use crate::agent::Provider;
 
+pub(super) mod resets;
 mod table;
 
 fn remote_lifecycle<T: serde::de::DeserializeOwned>(
@@ -913,6 +914,7 @@ struct AccountState {
     /// disagreement between two records of its login (see
     /// [`Identity::disputed_by`]).
     settle_records: bool,
+    reset: resets::State,
 }
 
 impl AccountState {
@@ -920,6 +922,7 @@ impl AccountState {
         // A result from before this login cannot confirm the new login intent.
         // Abandon that scheduling slot so a fresh verification can start.
         self.owner = NEXT_ACCOUNT_OWNER.fetch_add(1, Ordering::Relaxed);
+        self.reset = resets::State::default();
         self.pending_probe = None;
         self.schedule.abandon();
         self.schedule.await_login(now);
@@ -942,6 +945,7 @@ impl AccountState {
             signing_in_from: None,
             sign_in_terminal: None,
             settle_records: false,
+            reset: resets::State::default(),
         }
     }
 
@@ -1104,6 +1108,16 @@ pub enum Action {
     /// Omp's usage record was read.
     OmpRead(History),
     Refresh(AccountId),
+    ResetStart(AccountId, String),
+    ResetConfirm(AccountId),
+    ResetRecover(AccountId, String),
+    ResetCancel(AccountId),
+    ResetFinished {
+        id: AccountId,
+        owner: u64,
+        key: String,
+        result: Result<account::resets::ConsumeOutcome, String>,
+    },
     /// The debounce on a manual refresh lifted, so its control can offer
     /// another.
     ManualReady,
@@ -1215,7 +1229,10 @@ impl Action {
     pub(super) fn blocked_while_modal(&self) -> bool {
         matches!(
             self,
-            Self::Refresh(_)
+            Self::ResetStart(_, _)
+                | Self::ResetConfirm(_)
+                | Self::ResetRecover(_, _)
+                | Self::Refresh(_)
                 | Self::Install(_)
                 | Self::Popover(Some(_))
                 | Self::ShowAccount(_)
@@ -2195,6 +2212,24 @@ impl Cagents {
     /// a dialog opening closes them, and Escape closes them before anything
     /// behind.
     pub(super) fn account_key_event(&mut self, event: &keyboard::Event) -> Option<Task<Message>> {
+        if self.modal_is_open() {
+            for state in &mut self.account_ui.accounts {
+                state.reset.confirmation = None;
+            }
+        }
+        if !self.modal_is_open()
+            && is_escape_press(event)
+            && self
+                .account_ui
+                .accounts
+                .iter()
+                .any(|state| state.reset.confirmation.is_some())
+        {
+            for state in &mut self.account_ui.accounts {
+                state.reset.confirmation = None;
+            }
+            return Some(Task::none());
+        }
         if self.account_ui.popover.is_none() && !self.account_ui.table.has_popup() {
             return None;
         }
@@ -2250,6 +2285,9 @@ impl Cagents {
         // queued probe. All automatic paths wait for policy, except an
         // already explicit account-specific sign-in that needs verification.
         if !self.account_ui.probe_policy_ready(id, trigger, now) {
+            return None;
+        }
+        if self.account_ui.account(id)?.reset.in_flight() {
             return None;
         }
         self.refresh_login_watch(id, now);
@@ -2567,6 +2605,21 @@ impl Cagents {
 
     pub(super) fn update_account_ui(&mut self, action: Action) -> Task<Message> {
         match action {
+            Action::ResetStart(id, reset) => self.start_usage_reset(id, reset),
+            Action::ResetConfirm(id) => self.confirm_usage_reset(id),
+            Action::ResetRecover(id, reset) => self.recover_usage_reset(id, reset),
+            Action::ResetCancel(id) => {
+                if let Some(state) = self.account_ui.account_mut(&id) {
+                    state.reset.confirmation = None;
+                }
+                Task::none()
+            }
+            Action::ResetFinished {
+                id,
+                owner,
+                key,
+                result,
+            } => self.finish_usage_reset(id, owner, key, result),
             Action::RemoteHomeReady(provider, result) => match result {
                 Ok(created) => {
                     let task = self.begin_account_login(
@@ -5349,6 +5402,9 @@ impl Cagents {
                     }
                 }
             },
+        }
+        if let Some(resets) = self.usage_reset_controls(account) {
+            rows.push(resets.view());
         }
         let mut footer: Vec<Element<'a, Message>> = Vec::new();
         if let Some(snapshot) = &account.snapshot {
@@ -9946,6 +10002,7 @@ mod app_tests {
         let cached = |used| Entry {
             identity: None,
             snapshot: UsageSnapshot {
+                resets: Vec::new(),
                 windows: vec![UsageWindow {
                     key: "five_hour".into(),
                     kind: WindowKind::Session,
