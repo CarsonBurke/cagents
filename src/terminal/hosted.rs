@@ -149,6 +149,8 @@ pub enum HostedTerminalStartError {
     HostReadyTimeout { path: PathBuf, timeout: Duration },
     #[error("could not complete cagents daemon startup: {0}")]
     HostStartup(String),
+    #[error("cagents is updating; try again shortly")]
+    UpdateInProgress(#[source] crate::instance::UpdateInProgress),
     #[error("could not verify the running cagents daemon: {0}")]
     HostProtocol(#[source] crate::control::ControlError),
     #[error(
@@ -1465,10 +1467,7 @@ fn ensure_daemon_ready_at(
             // stale damaged checkpoint must not reject a serving daemon.
             let timeout = crate::upgrade::handoff::startup_timeout()
                 .unwrap_or(crate::upgrade::handoff::STARTUP_BASE);
-            return verify_daemon_protocol(crate::control::ControlClient::from_stream_until(
-                stream,
-                Instant::now() + timeout,
-            ));
+            return verify_startup_stream(socket, stream, Instant::now() + timeout);
         }
         Err(error)
             if !matches!(
@@ -1483,6 +1482,8 @@ fn ensure_daemon_ready_at(
         }
         Err(_) => {}
     }
+
+    refuse_update_launch(socket)?;
 
     let timeout = crate::upgrade::handoff::startup_timeout()
         .map_err(HostedTerminalStartError::HostStartup)?;
@@ -1528,9 +1529,37 @@ fn start_and_verify_daemon_at(
             path: socket.to_owned(),
             source,
         })?;
-    verify_daemon_protocol(crate::control::ControlClient::from_stream_until(
-        stream, deadline,
-    ))
+    verify_startup_stream(socket, stream, deadline)
+}
+
+fn launch_is_updating(socket: &Path) -> Result<bool, HostedTerminalStartError> {
+    crate::instance::daemon_launch_is_updating(socket)
+        .map_err(|error| HostedTerminalStartError::HostStartup(error.to_string()))
+}
+
+fn refuse_update_launch(socket: &Path) -> Result<(), HostedTerminalStartError> {
+    if launch_is_updating(socket)? {
+        return Err(HostedTerminalStartError::UpdateInProgress(
+            crate::instance::UpdateInProgress,
+        ));
+    }
+    Ok(())
+}
+
+fn verify_startup_stream(
+    socket: &Path,
+    stream: UnixStream,
+    deadline: Instant,
+) -> Result<(), HostedTerminalStartError> {
+    // A serving daemon remains usable during review. An ordinary reader of
+    // an update's bound-but-unready listener gets the normal handshake budget;
+    // only an admitted/inherited launch may need checkpoint restoration time.
+    let client = if launch_is_updating(socket)? {
+        crate::control::ControlClient::from_stream(stream)
+    } else {
+        crate::control::ControlClient::from_stream_until(stream, deadline)
+    };
+    verify_daemon_protocol(client)
 }
 
 fn verify_daemon_protocol(
@@ -1683,6 +1712,7 @@ fn daemon_startup_ready(
             });
         }
     }
+    refuse_update_launch(socket)?;
     if let Some(status) = child_status {
         // A concurrent launch can win the lease while our child exits. Its
         // listener may not be bound yet; the lease proves its ownership.
@@ -3184,6 +3214,118 @@ mod tests {
         // Match the daemon's explicit unlock: a concurrent fork can still own
         // a copy of the descriptor after this thread drops its copy.
         crate::daemon::HostLease::acquire_for_maintenance(&paths).unwrap()
+    }
+
+    #[test]
+    fn update_fence_interrupts_ordinary_readiness_but_preserves_admission_and_serving_daemon() {
+        const CHILD: &str = "CAGENTS_TEST_UPDATE_READINESS";
+        if std::env::var_os(CHILD).is_some() {
+            use std::os::unix::process::ExitStatusExt;
+
+            let runtime = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap());
+            let socket = runtime
+                .join(crate::instance::runtime_subdirectory())
+                .join(crate::terminal_ipc::SOCKET_FILE_NAME);
+            std::fs::create_dir(socket.parent().unwrap()).unwrap();
+            let update = crate::instance::UiUpdateGuard::acquire().unwrap();
+            let _worker_lease = hold_startup_lease(&socket);
+            let started = Instant::now();
+            let error = ensure_daemon_ready_at(&socket, crate::notifications::Application::Cagents)
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                HostedTerminalStartError::UpdateInProgress(_)
+            ));
+            assert!(crate::instance::is_update_in_progress(&error));
+            // This is an already-dispatched launch: a failed child plus the
+            // update worker's lease must not look like a restoring daemon.
+            let result = start_daemon_at(
+                &socket,
+                Duration::from_secs(125),
+                Path::new("fixture-daemon"),
+                false,
+                |_| Command::new("/bin/false").spawn(),
+            );
+            assert!(matches!(
+                result,
+                Err(HostedTerminalStartError::UpdateInProgress(_))
+            ));
+            assert!(started.elapsed() < Duration::from_secs(2));
+
+            for compatible in [true, false] {
+                let listener = UnixListener::bind(&socket).unwrap();
+                let server = thread::spawn(move || {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let request: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+                    assert!(matches!(request.request, ClientRequest::Connect { .. }));
+                    let proof = proof("serving-during-review");
+                    write_frame(
+                        &mut stream,
+                        &ServerEnvelope {
+                            version: if compatible {
+                                PROTOCOL_VERSION
+                            } else {
+                                PROTOCOL_VERSION + 1
+                            },
+                            request_id: Some(request.request_id),
+                            proof: proof.clone(),
+                            message: ServerMessage::Response {
+                                response: ServerResponse::Connected {
+                                    proof,
+                                    resumed: vec![],
+                                },
+                            },
+                        },
+                    )
+                    .unwrap();
+                });
+                let result =
+                    ensure_daemon_ready_at(&socket, crate::notifications::Application::Cagents);
+                if compatible {
+                    result.unwrap();
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(HostedTerminalStartError::HostIncompatible { .. })
+                    ));
+                }
+                server.join().unwrap();
+                std::fs::remove_file(&socket).unwrap();
+            }
+            drop(update);
+            let _admission = crate::instance::AdmissionFence::acquire().unwrap();
+            assert!(
+                !daemon_startup_ready(
+                    &socket,
+                    Duration::from_secs(125),
+                    Duration::from_secs(60),
+                    Some(ExitStatus::from_raw(1 << 8)),
+                )
+                .unwrap(),
+                "a declared concurrent admission still owns its restoration allowance"
+            );
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let name = std::thread::current().name().unwrap().to_owned();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", &name, "--nocapture"])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", root.path())
+            .env("XDG_RUNTIME_DIR", root.path())
+            .env(CHILD, "1");
+        if let Some(authority) = std::env::var_os(crate::agent_execution::AUTHORITY_ENV) {
+            command.env(crate::agent_execution::AUTHORITY_ENV, authority);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

@@ -31,7 +31,8 @@ mod daemon_admission;
 pub mod ui_options;
 pub use daemon_admission::DaemonStillStarting;
 pub(crate) use daemon_admission::{
-    AdmissionFence, DAEMON_FENCE_ENV, DaemonAdmissionGuard, LaunchFence, inherit_daemon_fence,
+    AdmissionFence, DAEMON_FENCE_ENV, DaemonAdmissionGuard, LaunchFence, daemon_launch_is_updating,
+    inherit_daemon_fence,
 };
 
 use directories::ProjectDirs;
