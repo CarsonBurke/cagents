@@ -59,7 +59,24 @@ pub(super) fn plan_name(
         subscription_type
             .map(str::trim)
             .filter(|name| !name.is_empty())
-    })?;
+    });
+    let Some(name) = name else {
+        // A tier-only response still names what the account reports. This is
+        // a display fallback, never an enum or an estimate of allowance hours.
+        return rate_limit_tier
+            .map(str::trim)
+            .filter(|tier| !tier.is_empty())
+            .map(|tier| {
+                tier.strip_prefix("default_claude_")
+                    .unwrap_or(tier)
+                    .split(['_', '-', ' '])
+                    .filter(|word| !word.is_empty())
+                    .map(humanize)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .filter(|label| !label.is_empty());
+    };
     let multiplier = rate_limit_tier
         .map(str::trim)
         .and_then(|tier| tier.strip_prefix("default_claude_"))
@@ -1066,6 +1083,32 @@ mod tests {
         assert!(
             unknown.windows.is_empty(),
             "a plan label never invents allowance"
+        );
+    }
+
+    #[test]
+    fn tier_only_reports_keep_known_multipliers_and_title_case_unknown_names() {
+        for (tier, expected) in [
+            ("default_claude_max_5x", "Max 5x"),
+            ("default_claude_max_20x", "Max 20x"),
+            ("default_claude_zero", "Zero"),
+            ("future_research_plan", "Future Research Plan"),
+            ("default_claude_horizon_37x", "Horizon 37x"),
+        ] {
+            assert_eq!(plan_name(None, None, Some(tier)).as_deref(), Some(expected));
+            let usage = parse_usage(&json!({"rate_limit_tier":tier}), 1);
+            assert_eq!(usage.plan.as_deref(), Some(expected));
+            assert!(
+                usage.windows.is_empty(),
+                "a tier name never supplies usage hours"
+            );
+            assert_eq!(usage.status, UsageStatus::Unavailable);
+        }
+        assert_eq!(plan_name(None, None, Some("  ")), None);
+        assert_eq!(plan_name(None, None, Some("___")), None);
+        assert_eq!(
+            plan_name(Some("max"), Some("Ultra"), Some("default_claude_max_20x")).as_deref(),
+            Some("Ultra")
         );
     }
 
