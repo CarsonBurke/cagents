@@ -1939,8 +1939,9 @@ Optional problem states each have their own switch:
   cleanup. If preparation unexpectedly succeeds, it can stop the private
   daemon; the report identifies that outcome.
 - `--unreachable`: SIGSTOP the selected terminal's private holder.
-- `--fail-new-daemon`: after staging, replace only the private candidate's daemon
-  entrypoint with a script that exits 1 on normal startup. Informational,
+- `--fail-new-daemon`: create a checksum-verified fault archive in the marked
+  private root before staging, with a daemon entrypoint that exits 1 on normal
+  startup. The input archive stays unchanged. Informational,
   source-inspection and store-maintenance commands still use the candidate's
   real binary. The scenario requires the worker to report this failure, restore
   OLD as `current`, serve daemon requests again, reopen OLD's windows and retain
@@ -1950,6 +1951,18 @@ Optional problem states each have their own switch:
   to test rollback with ordinary terminals. With a managed console, add
   `--expect-console-refusal` instead: the scenario requires a refusal before
   startup, no execution receipt, the original daemon serving and all work intact.
+
+A failed Prepared update retains its original census and selected target.
+Use the exact `daemon recover-update --checkpoint ... --yes` command printed by
+that target; an old `current` executable cannot recover Prepared. A retry must
+resolve the retained job before capturing a fresh source inventory.
+
+A partial recovery claim with no settled outcome is intentionally not retryable.
+The claim may have transferred owner custody before the process exited; it is
+neither proof of success nor permission to start or replay a provider. Keep the
+checkpoint, original census, claim and private update log for investigation.
+Check daemon status and terminal inventory without autostart. Do not delete the
+claim, relabel it as settled, or restart an older daemon to bypass this refusal.
 
 A seeded state does not guarantee a particular refusal on every revision.
 `seeds.json` preserves spawn results, OLD's actual inventories, verification

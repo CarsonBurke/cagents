@@ -457,6 +457,100 @@ class ChatViews(unittest.TestCase):
                     rehearsal.capture_chats('before')
 
 
+class ExistingOnlyReopen(unittest.TestCase):
+    def module(self):
+        spec=importlib.util.spec_from_file_location('existing_only_rehearsal',REPOSITORY/'scripts/rehearse_update_run.py')
+        scenario=importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(scenario)
+        return scenario
+
+    def samples(self):
+        root=Path('/var/tmp/private-reopen')
+        version=root/'home/.local/share/cagents-install/versions/new'
+        def process(pid,image,argv,**fields):
+            return {'pid':pid,'start_ticks':pid+1000,'executable':image,'argv':argv,**fields}
+        before={'root':str(root),'errors':[],'serving':{'host_session_id':'serving','boot_id':'boot','host_incarnation':'one'},
+            'processes':[
+                process(1,str(version/'bin/cagentsd'),[str(version/'bin/cagentsd')]),
+                process(2,str(version/'bin/cagents-ui'),[str(version/'bin/cagents-ui')]),
+                process(3,str(version/'bin/cagents-ui'),[str(version/'bin/cagents-ui'),'--window','second']),
+                process(4,'/usr/bin/sh',['sh',str(root/'bin/claude')]),
+                process(5,'/usr/bin/python3',['python3',str(root/'libexec/codex/rehearsal-codex.py'),'app-server','--listen','unix:///private/control.sock']),
+                process(6,'/usr/bin/sleep',['sleep','86400'],role='long-lived-child'),
+            ]}
+        after=copy.deepcopy(before)
+        for row in after['processes'][1:3]:
+            row['pid']+=10;row['start_ticks']+=10;row['argv'].append('--restore-existing-only')
+        activity={'claude_chat_launches':1,'codex_chat_launches':1,'codex_thread_starts':1,'codex_turn_starts':1}
+        return before,after,activity,version
+
+    def test_actual_new_ui_policy_preserves_serving_owners(self):
+        scenario=self.module()
+        before,after,activity,version=self.samples()
+        result=scenario.existing_only_contract(before,after,activity,activity,version)
+        self.assertEqual(result['ui_after'],[(12,1012),(13,1013)])
+        self.assertEqual(result['daemon_processes'],[(1,1001)])
+        self.assertEqual(result['provider_processes'],{'claude':[(4,1004)],'codex':[(5,1005)]})
+        self.assertEqual(result['terminal_children'],[(6,1006)])
+
+    def test_reopen_rejects_hidden_turn_replay_provider_restart_or_ordinary_ui(self):
+        scenario=self.module()
+        mutations={
+            'same-process-turn-replay':lambda a,c:c.update(codex_turn_starts=2),
+            'extra-provider-start':lambda a,c:c.update(claude_chat_launches=2),
+            'daemon-owner-changed':lambda a,c:a['serving'].update(host_incarnation='foreign'),
+            'daemon-process-replaced':lambda a,c:a['processes'][0].update(pid=101),
+            'provider-process-replaced':lambda a,c:a['processes'][3].update(pid=104),
+            'child-pid-reused':lambda a,c:a['processes'][5].update(start_ticks=2000),
+            'ordinary-ui-focused':lambda a,c:a['processes'][1]['argv'].remove('--restore-existing-only'),
+            'old-ui-not-replaced':lambda a,c:a['processes'][1].update(pid=2,start_ticks=1002),
+            'wrong-kernel-ui-image':lambda a,c:a['processes'][1].update(executable='/unrelated/cagents-ui'),
+        }
+        for name,change in mutations.items():
+            with self.subTest(name=name):
+                before,after,activity,version=self.samples()
+                current=copy.deepcopy(activity);change(after,current)
+                with self.assertRaises(RuntimeError):
+                    scenario.existing_only_contract(before,after,activity,current,version)
+
+    def test_launch_counters_distinguish_probes_from_conversation_resume(self):
+        scenario=self.module()
+        with tempfile.TemporaryDirectory(prefix='ru-provider-counts-') as temporary:
+            root=Path(temporary)
+            (root/'home/.claude').mkdir(parents=True);(root/'logs').mkdir()
+            (root/'home/.claude/fixture-launches').write_text('new\nresumed-thread\n')
+            events=[
+                {'event':'launch','pid':1,'argv':['app-server','--listen','unix:///conversation/control.sock']},
+                {'event':'request','pid':1,'method':'thread/start'},
+                {'event':'request','pid':1,'method':'turn/start'},
+                {'event':'launch','pid':2,'argv':['app-server']},
+                {'event':'probe-request','pid':2,'method':'account/read'},
+                {'event':'launch','pid':3,'argv':['app-server']},
+                {'event':'probe-request','pid':3,'method':'thread/resume'},
+            ]
+            path=root/'logs/codex-provider.jsonl'
+            path.write_text(''.join(json.dumps(event)+'\n' for event in events))
+            expected={'claude_chat_launches':2,'codex_chat_launches':2,'codex_thread_starts':1,'codex_turn_starts':1}
+            self.assertEqual(scenario.provider_activity(root),expected)
+            with path.open('a') as stream:
+                stream.write(json.dumps({'event':'launch','pid':4,'argv':['app-server']})+'\n')
+                stream.write(json.dumps({'event':'probe-request','pid':4,'method':'model/list'})+'\n')
+            self.assertEqual(scenario.provider_activity(root),expected)
+
+    def test_option_refuses_failure_or_missing_codex_before_actions(self):
+        with tempfile.TemporaryDirectory(prefix='ru-policy-args-') as temporary:
+            root=Path(temporary)/'absent'
+            command=[sys.executable,str(REPOSITORY/'scripts/rehearse_update_run.py'),str(root),str(SCRIPT),'run',
+                     '--old-dir','/unused','--old-version','old','--old-installer','/unused/install.sh',
+                     '--new-dir','/unused','--new-version','new','--new-installer','/unused/install.sh',
+                     '--reopen-existing-only']
+            for option in (['--fail-new-daemon'],['--no-codex'],['--ceditor','/unused']):
+                result=subprocess.run([*command,*option],capture_output=True,text=True)
+                self.assertEqual(result.returncode,2,result.stdout+result.stderr)
+                self.assertIn('requires a healthy update',result.stderr)
+                self.assertFalse(root.exists())
+
+
 class Pty(unittest.TestCase):
     def run_peer(self, body, *options):
         command = [sys.executable, str(REPOSITORY / "scripts/rehearse_update_pty.py"),
@@ -631,6 +725,40 @@ class PrivateRoot(unittest.TestCase):
         result = self.call("update", "/missing", "new", "/missing/install.sh")
         self.assertIn("already current; skipping staging", result.stdout)
         self.assertNotIn("exists but is not current", result.stderr)
+
+    def test_existing_only_launch_executes_the_ui_directly_with_private_environment(self):
+        self.assertEqual(self.call('init').returncode,0)
+        desktop=self.root/'desktop'
+        (desktop/'home').mkdir(parents=True)
+        (desktop/'pid').write_text(str(os.getpid()))
+        (desktop/'ready').touch()
+        (desktop/'env').write_text('WAYLAND_DISPLAY=fixture-wayland\n'
+                                  'DBUS_SESSION_BUS_ADDRESS=unix:path=/fixture\n'
+                                  f'XDG_RUNTIME_DIR={desktop}/rt\n')
+        tools=self.root/'caller-tools';tools.mkdir()
+        harness=tools/'niri-harness'
+        harness.write_text('#!/bin/sh\nprintf "%s\\n" "export WAYLAND_DISPLAY=fixture-wayland"\n')
+        harness.chmod(0o755)
+        prefix=self.root/'home/.local/share/cagents-install'
+        binary=prefix/'versions/new/bin/cagents-ui'
+        binary.parent.mkdir(parents=True)
+        output=self.root/'ui-launch.json'
+        binary.write_text('#!/usr/bin/python3\nimport json,os,pathlib,sys\n'
+            f'pathlib.Path({str(output)!r}).write_text(json.dumps({{"argv":sys.argv[1:],"home":os.environ["HOME"],"secret":os.environ.get("PRIVATE_SECRET")}}))\n')
+        binary.chmod(0o755)
+        (prefix/'current').symlink_to('versions/new')
+        cli=self.root/'home/.local/bin/cagents'
+        cli.write_text('#!/bin/sh\nexit 91\n');cli.chmod(0o755)
+        result=self.call('launch','--restore-existing-only','second',
+            env={**os.environ,'PATH':str(tools)+':'+os.environ['PATH'],'PRIVATE_SECRET':'must-not-pass'})
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        deadline=time.monotonic()+5
+        while not output.exists():
+            self.assertLess(time.monotonic(),deadline)
+            time.sleep(.01)
+        value=json.loads(output.read_text())
+        self.assertEqual(value,{'argv':['--restore-existing-only','--window','second'],
+                                'home':str(self.root/'home'),'secret':None})
 
     def test_desktop_waiting_for_lock_exits_on_stop_without_starting_compositor(self):
         self.assertEqual(self.call("init").returncode, 0)

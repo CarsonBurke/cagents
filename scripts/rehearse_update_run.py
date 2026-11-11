@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 """Scenario orchestration for rehearse-update; all application commands use its private env."""
 import argparse
+from collections import Counter
 from contextlib import closing
 import json
 import os
@@ -11,6 +12,62 @@ import sqlite3
 import subprocess
 import sys
 import time
+
+
+def provider_activity(root):
+    root=Path(root)
+    claude=(root/'home/.claude/fixture-launches').read_text().splitlines()
+    events=[json.loads(line) for line in (root/'logs/codex-provider.jsonl').read_text().splitlines()]
+    methods=Counter(event.get('method') for event in events)
+    listeners=[event for event in events if event.get('event')=='launch'
+               and any(arg=='--listen' or arg.startswith('--listen=') for arg in event.get('argv',[]))]
+    conversations={event['pid'] for event in listeners}
+    conversations.update(event['pid'] for event in events if event.get('method') in
+        ('thread/start','thread/resume','turn/start','turn/interrupt'))
+    launches=sum(event.get('event')=='launch' and event['pid'] in conversations for event in events)
+    return {'claude_chat_launches':len(claude),'codex_chat_launches':launches,
+            'codex_thread_starts':methods['thread/start'],'codex_turn_starts':methods['turn/start']}
+
+
+def existing_only_contract(before, after, activity_before, activity_after, version_root):
+    """A UI process replacement must leave serving owners and work untouched."""
+    version_root=Path(version_root)
+    if before['errors'] or after['errors'] or before.get('serving') != after.get('serving'):
+        raise RuntimeError('existing-only reopen changed daemon ownership or has incomplete evidence')
+    if activity_before != activity_after:
+        raise RuntimeError('existing-only reopen started a provider, conversation or turn')
+    def identities(snapshot, predicate):
+        return {(row['pid'],row['start_ticks']) for row in snapshot['processes'] if predicate(row)}
+    def image(product):
+        return lambda row: row.get('executable')==str(version_root/'bin'/product)
+    daemon=identities(before,image('cagentsd'))
+    if not daemon or daemon != identities(after,image('cagentsd')):
+        raise RuntimeError('existing-only reopen replaced a matched daemon process')
+    root=Path(before['root'])
+    providers={
+        'claude':lambda row: str(root/'bin/claude') in row.get('argv',[]),
+        'codex':lambda row: str(root/'libexec/codex/rehearsal-codex.py') in row.get('argv',[])
+            and any(arg=='--listen' or arg.startswith('--listen=') for arg in row['argv']),
+    }
+    stable={}
+    for provider,predicate in providers.items():
+        original=identities(before,predicate)
+        if not original or original != identities(after,predicate):
+            raise RuntimeError(f'existing-only reopen replaced the {provider} provider process')
+        stable[provider]=sorted(original)
+    child=identities(before,lambda row: row.get('role')=='long-lived-child')
+    if child != identities(after,lambda row: row.get('role')=='long-lived-child'):
+        raise RuntimeError('existing-only reopen lost the original terminal child')
+    is_ui=image('cagents-ui')
+    old_ui=identities(before,is_ui); new_ui=identities(after,is_ui)
+    ui_rows=[row for row in after['processes'] if is_ui(row)]
+    if (len(old_ui)!=2 or len(new_ui)!=2 or not old_ui.isdisjoint(new_ui)
+            or any('--restore-existing-only' not in row['argv'] for row in ui_rows)):
+        raise RuntimeError('the two replacement UI processes did not run with --restore-existing-only')
+    return {'serving':after['serving'],'daemon_processes':sorted(daemon),'provider_processes':stable,
+            'terminal_children':sorted(child),'ui_before':sorted(old_ui),'ui_after':sorted(new_ui),
+            'ui_processes':[{key:row[key] for key in ('pid','start_ticks','executable','argv')} for row in ui_rows],
+            'activity_before':activity_before,'activity_after':activity_after}
 
 
 def sidebar_channel_ref(observation, title):
@@ -177,7 +234,7 @@ class Rehearsal:
         _, response = self.cli('--no-start','channel','list')
         channels = response['data']['channels']
         originals = (json.loads((self.root/'ui-chats-before.json').read_text())
-                     if side == 'after' else [])
+                     if side != 'before' else [])
         evidence = []
         for item in targets:
             original = item['response']['data']['agent']
@@ -210,7 +267,7 @@ class Rehearsal:
                 # Keep hover labels away from subsequent navigation and shots.
                 self.call('drive','move','850,750',timeout=30)
                 required_thread = None
-                if side == 'after':
+                if side != 'before':
                     previous = next(view for view in originals
                                     if view['agent']==original['id'] and view['slot']==slot)
                     required_thread = previous['selection']['session']['launch']['session_id']
@@ -251,6 +308,44 @@ class Rehearsal:
                                  'observation':observation,'shot':f'shots/{shot}.webp'})
         (self.root/f'ui-chats-{side}.json').write_text(json.dumps(evidence,indent=2,sort_keys=True)+'\n')
         return evidence
+
+    def reopen_existing_only(self, version):
+        self.call('record','existing-only-before',timeout=150)
+        before=json.loads((self.root/'records/existing-only-before/snapshot.json').read_text())
+        activity_before=provider_activity(self.root)
+        windows=self.mapped()
+        for slot in ('main','second'):
+            self.call('wm','action','close-window','--id',windows[slot]['id'])
+        old={row['pid']:row['start_ticks'] for row in before['processes']
+             if row.get('executable')==str(self.root/f'home/.local/share/cagents-install/versions/{version}/bin/cagents-ui')}
+        deadline=time.monotonic()+30
+        while time.monotonic()<deadline:
+            alive=False
+            for pid,start in old.items():
+                try:
+                    stat=Path(f'/proc/{pid}/stat').read_text().rsplit(')',1)[1].split()
+                    alive |= int(stat[19])==start and stat[0] not in ('Z','X')
+                except (OSError,ValueError,IndexError):
+                    pass
+            if not alive and not {'main','second'} & self.mapped().keys():
+                break
+            time.sleep(.1)
+        else:
+            raise RuntimeError('ordinary UI processes did not close before existing-only relaunch')
+        for slot in ('main','second'):
+            self.call('launch','--restore-existing-only',slot)
+        self.wait_windows(['main','second'],version=version)
+        self.capture_chats('existing-only')
+        self.call('record','existing-only-after',timeout=150)
+        after=json.loads((self.root/'records/existing-only-after/snapshot.json').read_text())
+        activity_after=provider_activity(self.root)
+        result=existing_only_contract(before,after,activity_before,activity_after,
+            self.root/f'home/.local/share/cagents-install/versions/{version}')
+        self.call('compare','existing-only-before','existing-only-after',timeout=30)
+        result['records']={'before':'records/existing-only-before/snapshot.json',
+                           'after':'records/existing-only-after/snapshot.json'}
+        result['views']={'before':'ui-chats-after.json','after':'ui-chats-existing-only.json'}
+        (self.root/'existing-only.json').write_text(json.dumps(result,indent=2,sort_keys=True)+'\n')
 
     def seed(self, args):
         evidence = []
@@ -502,6 +597,8 @@ class Rehearsal:
             code, _ = self.call('compare','before','after',timeout=30,check=False)
             if code:
                 self.errors.append('comparison found regressions or missing evidence; see comparison step')
+            if args.reopen_existing_only and not self.errors:
+                self.reopen_existing_only(args.new_version)
         except Exception as exc:
             failure = str(exc)
             self.errors.append(failure)
@@ -531,7 +628,10 @@ class Rehearsal:
             receipt = self.root/'records/after/recovery-current.json'
             if receipt.exists():
                 report += ['', f'Fresh readiness and inventory verification: {receipt}', receipt.read_text()]
-            for side in ('before','after'):
+            policy=self.root/'existing-only.json'
+            if policy.exists():
+                report += ['',f'Existing-only UI process replacement: {policy}',policy.read_text()]
+            for side in ('before','after','existing-only'):
                 views = self.root/f'ui-chats-{side}.json'
                 if views.exists():
                     report += ['', f'Native chat selection evidence: {views}']
@@ -598,6 +698,7 @@ def main():
     run.add_argument('--upgrade-arg',action='append',default=[],help='use --upgrade-arg=--interrupt, for example')
     run.add_argument('--expect-console-refusal', action='store_true', help='with --fail-new-daemon, require console refusal before startup and preserve all work')
     run.add_argument('--fail-new-daemon', action='store_true', help='fail private candidate startup; require old current, serving daemon and preserved work')
+    run.add_argument('--reopen-existing-only',action='store_true',help='after a healthy update reopen both UI windows with --restore-existing-only; require unchanged daemon, providers and work')
     run.add_argument('--reopen-timeout',type=float,default=45)
     seed_options(run)
     seed_options(commands.add_parser('seed'))
@@ -608,6 +709,8 @@ def main():
     args=parser.parse_args()
     if args.command == 'run' and args.expect_console_refusal and (not args.fail_new_daemon or args.no_console):
         parser.error('--expect-console-refusal requires --fail-new-daemon and a seeded console')
+    if args.command == 'run' and args.reopen_existing_only and (args.fail_new_daemon or args.no_codex or args.ceditor):
+        parser.error('--reopen-existing-only requires a healthy update with Claude and Codex and no ceditor')
     rehearsal=Rehearsal(args.root,args.shell)
     try:
         if args.command=='wait':
