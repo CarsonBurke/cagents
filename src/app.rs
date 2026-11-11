@@ -33730,7 +33730,7 @@ mod tests {
         app.github_availability.insert(
             project,
             GitHubAvailability::Ready {
-                repository_key: GitHubRepoKey::new("github.com", None, "o", "r").unwrap(),
+                repository_key: crate::pull_request_review::tests::target(1).repository,
                 pull_requests: numbers
                     .iter()
                     .map(|number| {
@@ -33771,7 +33771,7 @@ mod tests {
         Message::Sidebar(SidebarAction::OpenPullRequest {
             project_id,
             number,
-            url: Url::parse(&format!("https://github.com/o/r/pull/{number}")).unwrap(),
+            url: crate::pull_request_review::tests::pull_request(number).url,
         })
     }
 
