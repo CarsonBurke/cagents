@@ -383,6 +383,29 @@ fn paused_record(
         .filter(|presentation| paused.chats.contains(&presentation.session))
         .cloned()
         .collect();
+    // A frozen source may predate the provider's identity notification. Only
+    // the immutable captured page can bind that missing conversation identity;
+    // a later pane or Agent descriptor cannot teach the history a new thread.
+    for (source, saved) in paused.chats.iter_mut().zip(&mut paused.snapshots) {
+        if source.launch.session_id.is_none()
+            && let Some(identity) = saved.snapshot.session_id.clone()
+        {
+            if identity.is_empty() || identity.len() > 1024 {
+                return Err("The captured conversation identity is invalid".into());
+            }
+            if !paused.aliases.contains(source) {
+                paused.aliases.push(source.clone());
+            }
+            source.launch.session_id = Some(identity);
+            saved.source = source.clone();
+            if let Some(reason) = &mut saved.limitation {
+                *reason = reason.replace(
+                    "No conversation identity was recorded; start a new conversation explicitly to continue.",
+                    "Resume explicitly to inspect whether the recorded conversation can continue.",
+                );
+            }
+        }
+    }
     Ok(paused)
 }
 
@@ -494,15 +517,20 @@ mod tests {
 
     #[test]
     fn settled_prepared_restart_restores_history_without_replaying_its_provider() {
-        settled_restart_case(crate::agent::Provider::Codex);
+        settled_restart_case(crate::agent::Provider::Codex, false);
     }
 
     #[test]
     fn settled_prepared_restart_keeps_the_latest_adopted_chat_as_a_history_alias() {
-        settled_restart_case(crate::agent::Provider::Claude);
+        settled_restart_case(crate::agent::Provider::Claude, false);
     }
 
-    fn settled_restart_case(provider_kind: crate::agent::Provider) {
+    #[test]
+    fn settled_prepared_restart_preserves_identity_in_the_captured_page() {
+        settled_restart_case(crate::agent::Provider::Claude, true);
+    }
+
+    fn settled_restart_case(provider_kind: crate::agent::Provider, captured_only: bool) {
         use sha2::{Digest, Sha256};
         use std::os::unix::fs::PermissionsExt;
 
@@ -594,12 +622,16 @@ mod tests {
                 provider_version: "0.100.0".into(),
             };
         }
+        let history_source = source.clone();
+        if captured_only {
+            source.launch.session_id = None;
+        }
         let mut snapshots = recovery::SnapshotCapture::default();
         snapshots
             .push(
                 source.clone(),
                 chat::Snapshot {
-                    session_id: source.launch.session_id.clone(),
+                    session_id: history_source.launch.session_id.clone(),
                     title: Some("Paused across daemon restarts".into()),
                     items: vec![Arc::new(chat::Item {
                         id: "retained-page".into(),
@@ -630,6 +662,7 @@ mod tests {
         // This is the live descriptor the initial recovery actually issued to
         // the managed Agent and canonical pane, not a history retry shape.
         let mut issued = source.clone();
+        issued.launch.session_id = history_source.launch.session_id.clone();
         issued.proof = Some(proof("first-recovery"));
         assert!(
             registry
@@ -827,7 +860,7 @@ mod tests {
                 crate::upgrade::floor::load()
                     .unwrap()
                     .resume_source(&requested),
-                Some(&source)
+                Some(&history_source)
             );
             let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
             let server_host = host.clone();
@@ -836,7 +869,10 @@ mod tests {
             let client =
                 chat::client::ClientHandle::fixture_restore(client, requested.clone()).unwrap();
             requested = client.session();
-            assert_eq!(requested.launch.session_id, source.launch.session_id);
+            assert_eq!(
+                requested.launch.session_id,
+                history_source.launch.session_id
+            );
             assert_eq!(requested.proof, Some(proof(epoch)));
             let handle = host.lock().unwrap().chats[&source.id].handle.clone();
             let page = handle.snapshot(None).unwrap();
@@ -892,7 +928,7 @@ mod tests {
                 // The retained-holder fixture separately exercises ordinary
                 // authentication. Record its exact public issuance here, then
                 // lose that owner before the next archived startup.
-                let mut issued_after_archive = source.clone();
+                let mut issued_after_archive = history_source.clone();
                 issued_after_archive.proof = Some(proof("adopted-after-archive"));
                 let mut registry = super::super::model::Registry::open().unwrap();
                 assert!(
