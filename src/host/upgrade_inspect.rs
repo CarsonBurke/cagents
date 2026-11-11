@@ -1999,7 +1999,7 @@ mod tests {
         assert!(current::supports_protocol(156));
         assert_eq!(
             source::protocols().collect::<Vec<_>>(),
-            [68, 77, 128, 156, crate::terminal_ipc::PROTOCOL_VERSION]
+            [156, crate::terminal_ipc::PROTOCOL_VERSION]
         );
     }
 
