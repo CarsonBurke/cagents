@@ -3411,6 +3411,52 @@ mod tests {
     }
 
     #[test]
+    fn immutable_authority_lookup_borrows_the_first_project_repository() {
+        let (mut app, _, _, _) = fixture();
+        let shared = PathBuf::from("/shared-worktree");
+        for repository in ["/first/.git", "/second/.git"] {
+            app.sidebar_model.projects.push(SidebarProject::new(
+                ProjectId::new(),
+                RepositoryId::new(),
+                "repo".into(),
+                repository.into(),
+                vec![crate::sidebar::SidebarWorktree::from_durable(
+                    crate::model::WorktreeId::new(),
+                    shared.clone(),
+                    None,
+                )],
+                vec![],
+            ));
+        }
+        let borrowed = app.borrowed_view_scope_topology();
+        let root_paths = app.worktree_root_paths();
+        let owned = app.view_scope_topology(worktree_ui::WorktreeRoots::new(
+            root_paths.iter().map(PathBuf::as_path),
+        ));
+        let first = app.sidebar_model.projects[0].repository.as_path();
+        assert!(
+            std::ptr::eq(borrowed.authorities.repository_for(&shared).unwrap(), first,),
+            "a readiness lookup must not allocate another repository path value"
+        );
+        for path in [
+            &shared,
+            Path::new("/first"),
+            Path::new("/first/.git"),
+            Path::new("/second"),
+        ] {
+            assert_eq!(
+                borrowed.authorities.repository_for(path),
+                owned.authorities.repository_for(path)
+            );
+        }
+        assert_eq!(owned.authorities.repository_for(&shared), Some(first));
+        for repository in [Path::new("/first/.git"), Path::new("/second/.git")] {
+            assert!(borrowed.authorities.contains_repository(repository));
+            assert!(owned.authorities.contains_repository(repository));
+        }
+    }
+
+    #[test]
     fn alias_index_preserves_order_and_resource_kind_while_excluding_owned_and_closed_cards() {
         let (_, _, _, browser) = fixture();
         let (_, _, _, chat) = retained_chat_move_fixture();
