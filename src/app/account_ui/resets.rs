@@ -8,6 +8,34 @@ pub(super) struct State {
     pending: Option<Attempt>,
     uncertain: BTreeMap<String, Attempt>,
     feedback: Option<String>,
+    feedback_reset: Option<UsageReset>,
+    feedback_status: Option<ConsumeStatus>,
+    confirmed: BTreeMap<String, ConfirmedReset>,
+}
+
+#[derive(Debug, Clone)]
+struct ConfirmedReset {
+    reset: UsageReset,
+    identity: Option<Identity>,
+    observed_at: Millis,
+    incidents: LimitIncidents,
+}
+
+/// Evidence existing before an explicit consume, scoped to one chat lifetime.
+#[derive(Debug, Clone, Default)]
+pub(in crate::app) struct LimitIncidents(pub BTreeMap<String, std::collections::BTreeSet<u64>>);
+
+impl LimitIncidents {
+    pub(in crate::app) fn contains(&self, current: &Self) -> bool {
+        !current.0.is_empty()
+            && current.0.iter().all(|(key, sources)| {
+                !sources.is_empty()
+                    && self
+                        .0
+                        .get(key)
+                        .is_some_and(|known| sources.is_subset(known))
+            })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -20,6 +48,7 @@ pub(super) struct Confirmation {
 
 #[derive(Debug, Clone)]
 struct Attempt {
+    incidents: LimitIncidents,
     reset: UsageReset,
     key: String,
     total_count: u64,
@@ -55,21 +84,15 @@ impl State {
         });
         if before != self.uncertain.len() && self.uncertain.is_empty() {
             self.feedback = None;
+            self.feedback_reset = None;
         }
     }
 
     fn prepare(&mut self, reset: UsageReset, total_count: u64, identity: Option<Identity>) {
-        if self.pending.is_some()
-            || (reset.kind == account::resets::ResetKind::WeeklySession
-                && self.uncertain.contains_key(&reset.id))
-        {
+        if self.pending.is_some() || self.uncertain.contains_key(&reset.id) {
             return;
         }
-        let key = self
-            .uncertain
-            .get(&reset.id)
-            .map(|attempt| attempt.key.clone())
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let key = uuid::Uuid::new_v4().to_string();
         self.confirmation = Some(Confirmation {
             reset,
             key,
@@ -92,10 +115,13 @@ impl State {
             || confirmation.total_count != total_count
             || confirmation.identity.as_ref() != identity
         {
+            self.feedback_status = None;
             self.feedback = Some("Resets changed. Review the current count and try again.".into());
+            self.feedback_reset = Some(current.clone());
             return None;
         }
         let attempt = Attempt {
+            incidents: LimitIncidents::default(),
             reset: confirmation.reset,
             key: confirmation.key,
             total_count: confirmation.total_count,
@@ -103,6 +129,7 @@ impl State {
         };
         self.pending = Some(attempt.clone());
         self.feedback = None;
+        self.feedback_reset = None;
         Some(attempt)
     }
 
@@ -131,6 +158,8 @@ impl State {
             return false;
         }
         let attempt = self.pending.take().expect("pending key checked");
+        self.feedback_reset = Some(attempt.reset.clone());
+        self.feedback_status = Some(status);
         match status {
             ConsumeStatus::Unconfirmed => {
                 self.uncertain.insert(attempt.reset.id.clone(), attempt);
@@ -158,6 +187,8 @@ pub(in crate::app) struct Controls {
     now: Millis,
     enabled: bool,
     recovery_enabled: bool,
+    surface: String,
+    identity: Option<Identity>,
 }
 
 fn actionable(snapshot: &UsageSnapshot, reset: &UsageReset, now: Millis) -> bool {
@@ -234,9 +265,7 @@ fn reset_order(left: &UsageReset, right: &UsageReset) -> std::cmp::Ordering {
 }
 
 fn can_offer(snapshot: &UsageSnapshot, state: &State, reset: &UsageReset, now: Millis) -> bool {
-    actionable(snapshot, reset, now)
-        && !(reset.kind == account::resets::ResetKind::WeeklySession
-            && state.uncertain.contains_key(&reset.id))
+    actionable(snapshot, reset, now) && !state.uncertain.contains_key(&reset.id)
 }
 
 fn next_reset<'a>(
@@ -290,8 +319,118 @@ fn scope_choices(snapshot: &UsageSnapshot, state: &State, now: Millis) -> Vec<Sc
     choices
 }
 
+fn reset_control_id(account: &AccountId, surface: &str, control: &str) -> widget::Id {
+    widget::Id::new(format!("usage-reset/{surface}/{account}/{control}"))
+}
+
+fn scope_choice_id(account: &AccountId, surface: &str, reset_id: &str) -> widget::Id {
+    widget::Id::new(format!("usage-reset-scope/{surface}/{account}/{reset_id}"))
+}
+
+fn scope_selector(
+    account: &AccountId,
+    name: &str,
+    surface: &str,
+    choices: Vec<ScopeChoice>,
+    selected: &str,
+    enabled: bool,
+) -> Element<'static, Message> {
+    let rows = choices
+        .into_iter()
+        .map(|choice| {
+            let chosen = choice.reset.id == selected;
+            crate::interaction::keyboard_list_row(
+                widget::button::custom(design::caption(choice.label()))
+                    .id(scope_choice_id(account, surface, &choice.reset.id))
+                    .name(format!("Choose {} reset for {name}", choice.reset.label()))
+                    .selected(chosen)
+                    .class(crate::ui_controls::control_style(chosen, None))
+                    .padding([space::XS, space::S])
+                    .width(Length::Fill)
+                    .on_press_maybe(enabled.then(|| {
+                        Message::AccountUi(Action::ResetStart(
+                            account.clone(),
+                            choice.reset.id,
+                            surface.to_owned(),
+                            true,
+                        ))
+                    })),
+            )
+        })
+        .collect::<Vec<_>>();
+    crate::interaction::keyboard_list(
+        widget::column::with_children(rows)
+            .spacing(space::XXS)
+            .width(Length::Fill),
+        enabled,
+    )
+}
+
 impl Controls {
+    pub(in crate::app) fn on_surface(mut self, surface: impl Into<String>) -> Self {
+        self.surface = surface.into();
+        self
+    }
+
+    /// A confirmed reset and a fresh matching window establish that this
+    /// historical limit is clear. Unknown, unrelated, and newly exhausted
+    /// limits retain their ordinary presentation.
+    pub(in crate::app) fn limit_cleared(&self, summary: &str) -> bool {
+        if !self.enabled
+            || is_stale(&self.snapshot, self.now)
+            || self.now.saturating_sub(self.snapshot.observed_at) > schedule::STALE_AFTER
+            || self.snapshot.observed_at > self.now.saturating_add(schedule::CLOCK_SLACK)
+            || self.snapshot.ordinary_usage_allowed == Some(false)
+            || !matches!(
+                self.snapshot.status,
+                UsageStatus::Ok | UsageStatus::Warning | UsageStatus::Limited
+            )
+        {
+            return false;
+        }
+        let windows = self
+            .snapshot
+            .windows
+            .iter()
+            .filter(|window| limit_matches(summary, window))
+            .collect::<Vec<_>>();
+        if windows.is_empty()
+            || windows
+                .iter()
+                .any(|window| !window.used.is_finite() || window.used >= 1.0 || window.binding)
+        {
+            return false;
+        }
+        self.state.confirmed.values().any(|confirmed| {
+            confirmed.identity == self.identity
+                && confirmed.observed_at <= self.snapshot.observed_at
+                && windows.iter().all(|window| confirmed.reset.clears(window))
+        })
+    }
+
+    /// A later rejection must not inherit an earlier reset's cleared label or
+    /// success message, even before the next provider usage update arrives.
+    pub(in crate::app) fn for_incident(&self, incident: &LimitIncidents) -> Self {
+        let mut controls = self.clone();
+        controls
+            .state
+            .confirmed
+            .retain(|_, proof| proof.incidents.contains(incident));
+        if controls.state.feedback_status == Some(ConsumeStatus::Reset)
+            && !controls
+                .state
+                .feedback_reset
+                .as_ref()
+                .is_some_and(|reset| controls.state.confirmed.contains_key(&reset.id))
+        {
+            controls.state.feedback = None;
+            controls.state.feedback_reset = None;
+        }
+        controls
+    }
+
     pub(in crate::app) fn for_limit(&self, summary: &str) -> Option<Self> {
+        let cleared = self.limit_cleared(summary);
         let mut controls = self.clone();
         controls
             .snapshot
@@ -326,7 +465,30 @@ impl Controls {
                 .iter()
                 .any(|window| attempt.reset.clears(window))
         });
-        (!controls.snapshot.resets.is_empty() || !controls.state.uncertain.is_empty())
+        if controls.state.pending.as_ref().is_some_and(|attempt| {
+            !controls
+                .snapshot
+                .windows
+                .iter()
+                .any(|window| attempt.reset.clears(window))
+        }) {
+            controls.state.pending = None;
+        }
+        if !controls.state.feedback_reset.as_ref().is_some_and(|reset| {
+            controls
+                .snapshot
+                .windows
+                .iter()
+                .any(|window| reset.clears(window))
+        }) {
+            controls.state.feedback = None;
+            controls.state.feedback_reset = None;
+        }
+        (!controls.snapshot.resets.is_empty()
+            || !controls.state.uncertain.is_empty()
+            || controls.state.pending.is_some()
+            || controls.state.feedback.is_some()
+            || cleared)
             .then_some(controls)
     }
 
@@ -362,23 +524,16 @@ impl Controls {
             rows.push(design::caption(format!("Using a {} reset…", pending.reset.label())).into());
         } else if let Some(confirmation) = &self.state.confirmation {
             let choices = scope_choices(&self.snapshot, &self.state, self.now);
-            if self.enabled && choices.len() > 1 {
-                let selected = choices
-                    .iter()
-                    .position(|choice| choice.reset.id == confirmation.reset.id);
-                let labels = choices.iter().map(ScopeChoice::label).collect::<Vec<_>>();
-                let id = self.id.clone();
+            if choices.len() > 1 {
                 rows.push(design::caption("Reset scope").into());
-                rows.push(
-                    crate::ui_controls::field::select(labels, selected, move |index| {
-                        Message::AccountUi(choices.get(index).map_or_else(
-                            || Action::ResetCancel(id.clone()),
-                            |choice| Action::ResetStart(id.clone(), choice.reset.id.clone()),
-                        ))
-                    })
-                    .width(Length::Fill)
-                    .into(),
-                );
+                rows.push(scope_selector(
+                    &self.id,
+                    &self.name,
+                    &self.surface,
+                    choices,
+                    &confirmation.reset.id,
+                    self.enabled,
+                ));
             }
             rows.push(
                 design::body(format!("Use a reset for {}?", self.name))
@@ -397,12 +552,14 @@ impl Controls {
             rows.push(
                 widget::row::with_children(vec![
                     crate::ui_controls::button::primary("Use reset")
+                        .id(reset_control_id(&self.id, &self.surface, "confirm"))
                         .on_press_maybe(
                             self.enabled
                                 .then(|| Message::AccountUi(Action::ResetConfirm(self.id.clone()))),
                         )
                         .into(),
                     crate::ui_controls::button::secondary("Cancel")
+                        .id(reset_control_id(&self.id, &self.surface, "cancel"))
                         .on_press(Message::AccountUi(Action::ResetCancel(self.id.clone())))
                         .into(),
                 ])
@@ -417,9 +574,15 @@ impl Controls {
             };
             rows.push(
                 crate::ui_controls::button::secondary(label)
+                    .id(reset_control_id(&self.id, &self.surface, "start"))
                     .name(format!("Use a {} reset for {}", reset.label(), self.name))
                     .on_press_maybe(self.enabled.then(|| {
-                        Message::AccountUi(Action::ResetStart(self.id.clone(), reset.id.clone()))
+                        Message::AccountUi(Action::ResetStart(
+                            self.id.clone(),
+                            reset.id.clone(),
+                            self.surface.clone(),
+                            scope_choices(&self.snapshot, &self.state, self.now).len() > 1,
+                        ))
                     }))
                     .into(),
             );
@@ -534,6 +697,7 @@ impl Cagents {
             && reset_state.confirmation.is_none()
             && reset_state.feedback.is_none()
             && reset_state.uncertain.is_empty()
+            && reset_state.confirmed.is_empty()
         {
             return None;
         }
@@ -542,11 +706,15 @@ impl Cagents {
             name: self.account_ui.display_name(state),
             snapshot: snapshot.clone(),
             state: reset_state,
+            identity: state.identity.clone(),
+            surface: "accounts".into(),
             now: self.account_ui.now_ms,
             recovery_enabled: state.present
+                && !state.reset.in_flight()
                 && self.account_ui.login_conflict(state).is_none()
                 && !self.account_sign_in_running(&state.account),
             enabled: state.present
+                && !state.reset.in_flight()
                 && state.failure.is_none()
                 && !is_stale(snapshot, self.account_ui.now_ms)
                 && self.account_ui.login_conflict(state).is_none()
@@ -566,7 +734,13 @@ impl Cagents {
         )?)
     }
 
-    pub(super) fn start_usage_reset(&mut self, id: AccountId, reset_id: String) -> Task<Message> {
+    pub(super) fn start_usage_reset(
+        &mut self,
+        id: AccountId,
+        reset_id: String,
+        surface: String,
+        choose_scope: bool,
+    ) -> Task<Message> {
         let now = now_ms();
         self.account_ui.now_ms = now;
         if let Some(state) = self.account_ui.account_mut(&id)
@@ -582,7 +756,7 @@ impl Cagents {
                 .resets
                 .iter()
                 .find(|reset| reset.id == reset_id)?;
-            actionable(&controls.snapshot, reset, now_ms()).then(|| {
+            can_offer(&controls.snapshot, &state.reset, reset, now_ms()).then(|| {
                 (
                     reset.clone(),
                     scope_count(&controls.snapshot, reset, controls.now),
@@ -593,7 +767,22 @@ impl Cagents {
         if let Some((reset, count, identity)) = reset
             && let Some(state) = self.account_ui.account_mut(&id)
         {
+            let reset_id = reset.id.clone();
             state.reset.prepare(reset, count, identity);
+            if state.reset.confirmation.is_some() {
+                // Native buttons participate in Tab traversal; arrow movement
+                // stays within the scope list and Enter only selects a scope.
+                let several = choose_scope
+                    && state.snapshot.as_ref().is_some_and(|snapshot| {
+                        scope_choices(snapshot, &state.reset, now).len() > 1
+                    });
+                let focus = if several {
+                    scope_choice_id(&id, &surface, &reset_id)
+                } else {
+                    reset_control_id(&id, &surface, "cancel")
+                };
+                return iced::widget::operation::focus(focus).map(cosmic::Action::App);
+            }
         }
         Task::none()
     }
@@ -619,16 +808,37 @@ impl Cagents {
         });
         let Some((reset, count)) = reset else {
             if let Some(state) = self.account_ui.account_mut(&id) {
-                state.reset.confirmation = None;
+                state.reset.feedback_reset = state
+                    .reset
+                    .confirmation
+                    .take()
+                    .map(|confirmation| confirmation.reset);
+                state.reset.feedback_status = None;
                 state.reset.feedback =
                     Some("Reset availability changed. Check usage and try again.".into());
             }
             return Task::none();
         };
+        let mut incidents = LimitIncidents::default();
+        for card in self.cards.values() {
+            if let CardRuntime::Chat(runtime) = card
+                && self
+                    .chat_account(
+                        runtime.session.launch.provider,
+                        &runtime.session.launch.recipe,
+                    )
+                    .as_ref()
+                    == Some(&id)
+            {
+                incidents.0.extend(runtime.reset_limit_incidents().0);
+            }
+        }
         let state = self.account_ui.account_mut(&id).expect("account checked");
-        let Some(attempt) = state.reset.submit(&reset, count, state.identity.as_ref()) else {
+        let Some(mut attempt) = state.reset.submit(&reset, count, state.identity.as_ref()) else {
             return Task::none();
         };
+        attempt.incidents = incidents;
+        state.reset.pending = Some(attempt.clone());
         let owner = state.owner;
         // A pre-consume probe must not overwrite the refreshed result.
         state.pending_probe = None;
@@ -668,30 +878,24 @@ impl Cagents {
         else {
             return Task::none();
         };
+        let submitted = state.reset.pending.clone();
+        let recurring =
+            state.reset.pending.as_ref().is_some_and(|attempt| {
+                attempt.reset.kind == account::resets::ResetKind::WeeklySession
+            });
         let (status, message, snapshot) = match result {
-            Ok(outcome) => (
-                outcome.status,
-                outcome.message.unwrap_or_else(|| {
-                    match outcome.status {
-                        ConsumeStatus::Reset => "Reset used. Usage refreshed.",
-                        ConsumeStatus::NoCredit => {
-                            "This reset is no longer available. Usage refreshed."
-                        }
-                        ConsumeStatus::NotLimited => "No reset was needed. Usage refreshed.",
-                        ConsumeStatus::Unconfirmed => {
-                            "Reset could not be confirmed. Check usage before trying again."
-                        }
-                        ConsumeStatus::Unavailable => {
-                            "Reset unavailable. Check usage and try again."
-                        }
-                    }
-                    .into()
-                }),
-                outcome.snapshot,
-            ),
+            Ok(outcome) => {
+                let message = reset_feedback(
+                    outcome.status,
+                    outcome.message.as_deref(),
+                    outcome.snapshot.is_some(),
+                    recurring,
+                );
+                (outcome.status, message, outcome.snapshot)
+            }
             Err(_) => (
                 ConsumeStatus::Unconfirmed,
-                "Reset could not be confirmed. Checking usage before another attempt.".into(),
+                reset_feedback(ConsumeStatus::Unconfirmed, None, false, recurring),
                 None,
             ),
         };
@@ -699,6 +903,19 @@ impl Cagents {
             return Task::none();
         }
         if let Some(snapshot) = snapshot {
+            if status == ConsumeStatus::Reset
+                && let Some(attempt) = submitted
+            {
+                state.reset.confirmed.insert(
+                    attempt.reset.id.clone(),
+                    ConfirmedReset {
+                        reset: attempt.reset,
+                        identity: attempt.identity,
+                        observed_at: snapshot.observed_at,
+                        incidents: attempt.incidents,
+                    },
+                );
+            }
             state.schedule.observe(snapshot.observed_at);
             if state
                 .snapshot
@@ -715,6 +932,49 @@ impl Cagents {
             self.update_account_ui(Action::Refresh(id))
         }
     }
+}
+
+fn reset_feedback(
+    status: ConsumeStatus,
+    detail: Option<&str>,
+    refreshed: bool,
+    recurring: bool,
+) -> String {
+    if status == ConsumeStatus::Unconfirmed {
+        let recovery = if recurring {
+            "Check usage before doing more."
+        } else {
+            "Review usage, then use Retry same reset if needed."
+        };
+        return format!(
+            "The reset could not be confirmed. {recovery}{}",
+            if refreshed {
+                ""
+            } else {
+                " Current usage could not be refreshed."
+            }
+        );
+    }
+    if let Some(detail) = detail.filter(|detail| {
+        !detail.trim().is_empty() && !detail.to_ascii_lowercase().contains("idempotency")
+    }) {
+        return detail.to_owned();
+    }
+    let message = match status {
+        ConsumeStatus::Reset => "Reset used.",
+        ConsumeStatus::NoCredit => "This reset is no longer available.",
+        ConsumeStatus::NotLimited => "These limits no longer need a reset.",
+        ConsumeStatus::Unavailable => "Reset unavailable. Check usage and try again.",
+        ConsumeStatus::Unconfirmed => unreachable!(),
+    };
+    format!(
+        "{message}{}",
+        if refreshed {
+            " Usage refreshed."
+        } else {
+            " Current usage could not be refreshed."
+        }
+    )
 }
 
 fn submit_attempt(id: AccountId, owner: u64, attempt: Attempt) -> Task<Message> {
@@ -843,15 +1103,15 @@ mod tests {
     }
 
     #[test]
-    fn uncertainty_reuses_the_original_idempotency_key_after_another_confirmation() {
+    fn uncertainty_recovery_reuses_the_original_idempotency_key() {
         let mut state = State::default();
         let grant = reset(ResetScope::AccountWeekly);
         state.prepare(grant.clone(), 2, None);
         let first = state.submit(&grant, 2, None).unwrap();
         assert!(state.finish(&first.key, ConsumeStatus::Unconfirmed, "Check usage".into()));
         state.prepare(grant.clone(), 2, None);
-        assert_eq!(state.confirmation.as_ref().unwrap().key, first.key);
-        let second = state.submit(&grant, 2, None).unwrap();
+        assert!(state.confirmation.is_none());
+        let second = state.recover(&grant.id, None).unwrap();
         assert_eq!(second.key, first.key);
         assert!(state.finish(&second.key, ConsumeStatus::Reset, "Used".into()));
         state.prepare(grant, 2, None);
@@ -949,6 +1209,8 @@ mod tests {
             now,
             enabled: true,
             recovery_enabled: true,
+            surface: "accounts".into(),
+            identity: None,
         };
         let renderer = crate::app::tests::headless_renderer();
         let mut element = controls.view();
@@ -1139,7 +1401,7 @@ mod tests {
         ));
         assert_eq!(state.uncertain.get(&grant.id).unwrap().key, original.key);
         state.prepare(grant.clone(), 2, None);
-        assert_eq!(state.confirmation.as_ref().unwrap().key, original.key);
+        assert!(state.confirmation.is_none());
         let next_retry = state.recover(&grant.id, None).unwrap();
         assert_eq!(next_retry.key, original.key);
     }
@@ -1194,10 +1456,891 @@ mod tests {
             now,
             enabled: true,
             recovery_enabled: true,
+            surface: "accounts".into(),
+            identity: None,
         };
         let card = controls.for_limit("Claude Fable limit reached").unwrap();
         let card_choices = scope_choices(&card.snapshot, &card.state, now);
         assert_eq!(card_choices.len(), 1);
         assert_eq!(card_choices[0].reset.id, fable.id);
+    }
+    #[test]
+    fn an_uncertain_grant_has_only_its_recovery_action_and_other_scopes_stay_available() {
+        let now = now_ms();
+        let mut snapshot = UsageSnapshot::state(UsageStatus::Limited, "", now);
+        snapshot.windows = vec![
+            window(account::WindowKind::Session, "session", 0.82),
+            window(account::WindowKind::Scoped, "weekly_scoped:Fable", 1.0),
+        ];
+        let mut fable = reset(ResetScope::Model("Fable".into()));
+        fable.id = "fable-fixture".into();
+        let mut session = reset(ResetScope::AccountSession);
+        session.id = "session-fixture".into();
+        snapshot.resets = vec![fable.clone(), session.clone()];
+        let mut state = State::default();
+        state.prepare(fable.clone(), 2, None);
+        let attempt = state.submit(&fable, 2, None).unwrap();
+        state.finish(
+            &attempt.key,
+            ConsumeStatus::Unconfirmed,
+            "Unconfirmed".into(),
+        );
+        assert!(!can_offer(&snapshot, &state, &fable, now));
+        assert!(can_offer(&snapshot, &state, &session, now));
+        let choices = scope_choices(&snapshot, &state, now);
+        assert_eq!(choices.len(), 1);
+        assert_eq!(choices[0].reset.id, session.id);
+        assert_eq!(state.recover(&fable.id, None).unwrap().key, attempt.key);
+    }
+
+    #[test]
+    fn reset_feedback_is_plain_and_preserves_actionable_failures_and_refresh_uncertainty() {
+        let unconfirmed = reset_feedback(
+            ConsumeStatus::Unconfirmed,
+            Some("Retry with the same idempotency key"),
+            false,
+            false,
+        );
+        assert!(!unconfirmed.contains("idempotency"));
+        assert!(unconfirmed.contains("Retry same reset"));
+        assert!(unconfirmed.contains("Current usage could not be refreshed"));
+        let recurring = reset_feedback(
+            ConsumeStatus::Unconfirmed,
+            Some("Retry with the same idempotency key"),
+            true,
+            true,
+        );
+        assert!(recurring.contains("Check usage"));
+        assert!(!recurring.contains("Retry same reset"));
+        let login = "The account login changed. Refresh usage and confirm again.";
+        assert_eq!(
+            reset_feedback(ConsumeStatus::Unavailable, Some(login), true, false),
+            login
+        );
+        let used = reset_feedback(ConsumeStatus::Reset, None, false, false);
+        assert!(used.starts_with("Reset used."));
+        assert!(!used.contains("Usage refreshed"));
+    }
+
+    #[test]
+    fn actual_account_scope_controls_support_tab_arrows_enter_and_cancel_without_spending() {
+        use iced::advanced::{
+            Layout, Shell, clipboard, layout,
+            widget::{Operation, Tree, operation},
+        };
+        use iced::{Event, Rectangle, Size, mouse};
+        fn perform<T: Send + 'static>(
+            element: &mut Element<'_, Message>,
+            tree: &mut Tree,
+            node: &layout::Node,
+            renderer: &cosmic::Renderer,
+            mut operation: Box<dyn Operation<T>>,
+        ) -> Option<T> {
+            loop {
+                element.as_widget_mut().operate(
+                    tree,
+                    Layout::new(node),
+                    renderer,
+                    &mut operation::black_box(operation.as_mut()),
+                );
+                match operation.finish() {
+                    operation::Outcome::Chain(next) => operation = next,
+                    operation::Outcome::Some(value) => return Some(value),
+                    operation::Outcome::None => return None,
+                }
+            }
+        }
+        let press = |key| keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(key),
+            modified_key: keyboard::Key::Named(key),
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        };
+        let now = now_ms();
+        let mut snapshot = UsageSnapshot::state(UsageStatus::Limited, "", now);
+        snapshot.windows = vec![
+            window(account::WindowKind::Session, "session", 0.82),
+            window(account::WindowKind::Scoped, "weekly_scoped:Fable", 1.0),
+        ];
+        let mut session = reset(ResetScope::AccountSession);
+        session.id = "session-fixture".into();
+        session.available_count = 1;
+        let mut fable = reset(ResetScope::Model("Fable".into()));
+        fable.id = "fable-fixture".into();
+        snapshot.resets = vec![session.clone(), fable.clone()];
+        let mut app = context_inspector_test_app(false);
+        let id = Account::system(Provider::Claude).id();
+        let state = app.account_ui.account_mut(&id).unwrap();
+        state.present = true;
+        state.snapshot = Some(snapshot);
+        app.account_ui.installed.insert(Provider::Claude, true);
+        drop(app.update(Message::AccountUi(Action::ResetStart(
+            id.clone(),
+            session.id.clone(),
+            "accounts".into(),
+            true,
+        ))));
+        assert!(
+            app.account_ui
+                .account(&id)
+                .unwrap()
+                .reset
+                .confirmation
+                .is_some()
+        );
+        assert!(
+            app.core.keyboard_nav(),
+            "the actual account confirmation keeps COSMIC Tab routing enabled"
+        );
+        assert!(
+            app.account_key_event(&press(keyboard::key::Named::Tab))
+                .is_none(),
+            "account popup handling leaves Tab to COSMIC FocusNext"
+        );
+        let renderer = crate::app::tests::headless_renderer();
+        let mut element = app.accounts_pane();
+        let mut tree = Tree::new(element.as_widget());
+        let bounds = Rectangle::with_size(Size::new(1200.0, 1800.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, bounds.size()),
+        );
+        let fable_id = scope_choice_id(&id, "accounts", &fable.id);
+        let session_id = scope_choice_id(&id, "accounts", &session.id);
+        let mut reached = false;
+        for _ in 0..100 {
+            perform(
+                &mut element,
+                &mut tree,
+                &node,
+                &renderer,
+                Box::new(operation::focusable::focus_next::<()>()),
+            );
+            if perform(
+                &mut element,
+                &mut tree,
+                &node,
+                &renderer,
+                Box::new(operation::focusable::find_focused()),
+            ) == Some(fable_id.clone())
+            {
+                reached = true;
+                break;
+            }
+        }
+        assert!(
+            reached,
+            "Tab traversal reaches the first scope in the actual Accounts pane"
+        );
+        let mut messages = Vec::new();
+        for (key, expected) in [
+            (keyboard::key::Named::ArrowDown, session_id),
+            (keyboard::key::Named::ArrowUp, fable_id),
+        ] {
+            element.as_widget_mut().update(
+                &mut tree,
+                &Event::Keyboard(press(key)),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &bounds,
+            );
+            assert_eq!(
+                perform(
+                    &mut element,
+                    &mut tree,
+                    &node,
+                    &renderer,
+                    Box::new(operation::focusable::find_focused())
+                ),
+                Some(expected)
+            );
+            assert!(messages.is_empty(), "arrow focus never submits an action");
+        }
+        element.as_widget_mut().update(
+            &mut tree,
+            &Event::Keyboard(press(keyboard::key::Named::Enter)),
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &bounds,
+        );
+        assert!(
+            matches!(messages.as_slice(), [Message::AccountUi(Action::ResetStart(account, reset, surface, choose_scope))] if account == &id && reset == &fable.id && surface == "accounts" && *choose_scope)
+        );
+        for _ in 0..3 {
+            perform(
+                &mut element,
+                &mut tree,
+                &node,
+                &renderer,
+                Box::new(operation::focusable::focus_next::<()>()),
+            );
+        }
+        element.as_widget_mut().update(
+            &mut tree,
+            &Event::Keyboard(press(keyboard::key::Named::Enter)),
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &bounds,
+        );
+        assert!(
+            matches!(messages.last(), Some(Message::AccountUi(Action::ResetCancel(account))) if account == &id),
+            "Tab also reaches Cancel"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|message| matches!(message, Message::AccountUi(Action::ResetConfirm(_))))
+        );
+        drop(element);
+        let chosen = messages.remove(0);
+        drop(app.update(chosen));
+        let reset = &app.account_ui.account(&id).unwrap().reset;
+        assert_eq!(reset.confirmation.as_ref().unwrap().reset.id, fable.id);
+        assert!(
+            reset.pending.is_none(),
+            "Enter selected Fable without spending"
+        );
+        drop(app.update(messages.pop().unwrap()));
+        assert!(
+            app.account_ui
+                .account(&id)
+                .unwrap()
+                .reset
+                .confirmation
+                .is_none()
+        );
+    }
+    #[test]
+    fn simultaneous_account_and_popover_controls_have_distinct_ids_and_keyboard_origins() {
+        use iced::advanced::{
+            Layout, Shell, clipboard, layout,
+            widget::{Operation, Tree, operation::Focusable},
+        };
+        use iced::{Event, Rectangle, Size, mouse};
+        #[derive(Default)]
+        struct Focuses(Vec<(widget::Id, bool)>);
+        impl Operation for Focuses {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                _: Rectangle,
+                state: &mut dyn Focusable,
+            ) {
+                if let Some(id) = id {
+                    self.0.push((id.clone(), state.is_focused()));
+                }
+            }
+        }
+        let now = now_ms();
+        let id = Account::system(Provider::Claude).id();
+        let mut snapshot = UsageSnapshot::state(UsageStatus::Limited, "", now);
+        snapshot.windows = vec![
+            window(account::WindowKind::Session, "session", 1.0),
+            window(account::WindowKind::Scoped, "weekly_scoped:Fable", 1.0),
+        ];
+        let mut fable = reset(ResetScope::Model("Fable".into()));
+        fable.id = "fable-fixture".into();
+        let mut session = reset(ResetScope::AccountSession);
+        session.id = "session-fixture".into();
+        snapshot.resets = vec![fable.clone(), session.clone()];
+        let mut state = State::default();
+        state.prepare(fable.clone(), 2, None);
+        let controls = Controls {
+            id: id.clone(),
+            name: "Fixture".into(),
+            snapshot,
+            state,
+            now,
+            enabled: true,
+            recovery_enabled: true,
+            surface: "accounts".into(),
+            identity: None,
+        };
+        let mut element: Element<'_, Message> = widget::row::with_children(vec![
+            controls.clone().on_surface("accounts").view(),
+            controls.on_surface("popover").view(),
+        ])
+        .spacing(space::M)
+        .into();
+        let renderer = crate::app::tests::headless_renderer();
+        let mut tree = Tree::new(element.as_widget());
+        let bounds = Rectangle::with_size(Size::new(800.0, 900.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, bounds.size()),
+        );
+        let mut focuses = Focuses::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut focuses);
+        let mut unique = std::collections::HashSet::new();
+        for (id, _) in &focuses.0 {
+            assert!(
+                unique.insert(id.clone()),
+                "each mounted control has one stable ID"
+            );
+        }
+        assert_eq!(
+            unique.len(),
+            8,
+            "two scope options plus confirm/cancel on each surface"
+        );
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut iced::advanced::widget::operation::focusable::focus::<()>(scope_choice_id(
+                &id, "popover", &fable.id,
+            )),
+        );
+        let mut messages = Vec::new();
+        for key in [keyboard::key::Named::ArrowDown, keyboard::key::Named::Enter] {
+            let event = Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(key),
+                modified_key: keyboard::Key::Named(key),
+                physical_key: keyboard::key::Physical::Unidentified(
+                    keyboard::key::NativeCode::Unidentified,
+                ),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            });
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &bounds,
+            );
+        }
+        assert!(
+            matches!(messages.as_slice(), [Message::AccountUi(Action::ResetStart(account, reset, surface, choose_scope))] if account == &id && reset == &session.id && surface == "popover" && *choose_scope)
+        );
+        let mut focused = Focuses::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut focused);
+        assert_eq!(
+            focused
+                .0
+                .into_iter()
+                .filter(|(_, focused)| *focused)
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            [scope_choice_id(&id, "popover", &session.id)]
+        );
+    }
+
+    #[test]
+    fn limit_card_pending_and_feedback_only_describe_the_reset_that_covers_it() {
+        let now = now_ms();
+        let mut snapshot = UsageSnapshot::state(UsageStatus::Limited, "", now);
+        snapshot.windows = vec![
+            window(account::WindowKind::Session, "session", 1.0),
+            window(account::WindowKind::Scoped, "weekly_scoped:Fable", 1.0),
+        ];
+        let mut session = reset(ResetScope::AccountSession);
+        session.id = "session-fixture".into();
+        let mut fable = reset(ResetScope::Model("Fable".into()));
+        fable.id = "fable-fixture".into();
+        snapshot.resets = vec![session.clone(), fable.clone()];
+        for (grant, related, unrelated) in [
+            (
+                session.clone(),
+                "Claude session limit reached",
+                "Claude Fable limit reached",
+            ),
+            (
+                fable.clone(),
+                "Claude Fable limit reached",
+                "Claude session limit reached",
+            ),
+        ] {
+            let mut state = State::default();
+            state.prepare(grant.clone(), 2, None);
+            let attempt = state.submit(&grant, 2, None).unwrap();
+            let mut controls = Controls {
+                id: Account::system(Provider::Claude).id(),
+                name: "Fixture".into(),
+                snapshot: snapshot.clone(),
+                state,
+                now,
+                enabled: false,
+                recovery_enabled: false,
+                surface: "accounts".into(),
+                identity: None,
+            };
+            assert!(controls.for_limit(related).unwrap().state.pending.is_some());
+            let other = controls.for_limit(unrelated).unwrap();
+            assert!(other.state.pending.is_none());
+            assert!(
+                !other.enabled,
+                "hiding an unrelated pending label does not release the account-wide submit guard"
+            );
+            controls.state.finish(
+                &attempt.key,
+                ConsumeStatus::Reset,
+                "Reset used. Usage refreshed.".into(),
+            );
+            controls.enabled = true;
+            assert!(
+                controls
+                    .for_limit(related)
+                    .unwrap()
+                    .state
+                    .feedback
+                    .is_some()
+            );
+            let other = controls.for_limit(unrelated).unwrap();
+            assert!(
+                other.state.feedback.is_none(),
+                "the other limit must not appear to have been reset"
+            );
+            assert_eq!(other.snapshot.windows[0].used, 1.0);
+            assert_eq!(other.snapshot.resets[0].available_count, 2);
+        }
+    }
+    #[test]
+    fn enter_starting_a_narrowed_limit_card_focuses_its_rendered_cancel_control() {
+        use iced::advanced::{
+            Layout, Shell, clipboard, layout,
+            widget::{Operation, Tree, operation, operation::Focusable},
+        };
+        use iced::{Event, Rectangle, Size, futures::StreamExt, mouse};
+        #[derive(Default)]
+        struct Focused(Option<widget::Id>);
+        impl Operation for Focused {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                _: Rectangle,
+                state: &mut dyn Focusable,
+            ) {
+                if state.is_focused() {
+                    self.0 = id.cloned();
+                }
+            }
+        }
+        let now = now_ms();
+        let id = Account::system(Provider::Claude).id();
+        let surface = "chat/fixture-card/fixture-incident";
+        let mut snapshot = UsageSnapshot::state(UsageStatus::Limited, "", now);
+        snapshot.windows = vec![
+            window(account::WindowKind::Session, "session", 0.82),
+            window(account::WindowKind::Scoped, "weekly_scoped:Fable", 1.0),
+        ];
+        let mut session = reset(ResetScope::AccountSession);
+        session.id = "session-fixture".into();
+        let mut fable = reset(ResetScope::Model("Fable".into()));
+        fable.id = "fable-fixture".into();
+        snapshot.resets = vec![session, fable.clone()];
+        let mut app = context_inspector_test_app(false);
+        let account = app.account_ui.account_mut(&id).unwrap();
+        account.present = true;
+        account.snapshot = Some(snapshot);
+        let controls = app
+            .usage_reset_controls(app.account_ui.account(&id).unwrap())
+            .unwrap();
+        assert_eq!(
+            scope_choices(&controls.snapshot, &controls.state, now).len(),
+            2
+        );
+        let card = controls
+            .for_limit("Claude Fable limit reached")
+            .unwrap()
+            .on_surface(surface);
+        assert_eq!(scope_choices(&card.snapshot, &card.state, now).len(), 1);
+        let renderer = crate::app::tests::headless_renderer();
+        let bounds = Rectangle::with_size(Size::new(400.0, 900.0));
+        let mut element = card.view();
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, bounds.size()),
+        );
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::focusable::focus::<()>(reset_control_id(&id, surface, "start")),
+        );
+        let enter = Event::Keyboard(keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Enter),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        });
+        let mut messages = Vec::new();
+        element.as_widget_mut().update(
+            &mut tree,
+            &enter,
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &bounds,
+        );
+        assert!(
+            matches!(messages.as_slice(), [Message::AccountUi(Action::ResetStart(account, reset, origin, choose_scope))] if account == &id && reset == &fable.id && origin == surface && !*choose_scope)
+        );
+        let task = app.update(messages.pop().unwrap());
+        assert!(app.account_ui.account(&id).unwrap().reset.pending.is_none());
+        let card = app
+            .usage_reset_controls(app.account_ui.account(&id).unwrap())
+            .unwrap()
+            .for_limit("Claude Fable limit reached")
+            .unwrap()
+            .on_surface(surface);
+        let mut confirmation = card.view();
+        let mut tree = Tree::new(confirmation.as_widget());
+        let node = confirmation.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, bounds.size()),
+        );
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        executor.block_on(async {
+            let mut stream = iced::runtime::task::into_stream(task)
+                .expect("opening confirmation focuses its own control");
+            while let Ok(Some(action)) =
+                tokio::time::timeout(Duration::from_millis(250), stream.next()).await
+            {
+                if let iced::runtime::Action::Widget(mut operation) = action {
+                    loop {
+                        confirmation.as_widget_mut().operate(
+                            &mut tree,
+                            Layout::new(&node),
+                            &renderer,
+                            operation.as_mut(),
+                        );
+                        match operation.finish() {
+                            operation::Outcome::Chain(next) => operation = next,
+                            _ => break,
+                        }
+                    }
+                }
+            }
+        });
+        let mut focused = Focused::default();
+        confirmation.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut focused,
+        );
+        assert_eq!(
+            focused.0,
+            Some(reset_control_id(&id, surface, "cancel")),
+            "a single-scope card cannot focus the account's unmounted scope selector"
+        );
+        confirmation.as_widget_mut().update(
+            &mut tree,
+            &enter,
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &bounds,
+        );
+        assert!(
+            matches!(messages.as_slice(), [Message::AccountUi(Action::ResetCancel(account))] if account == &id)
+        );
+        assert!(
+            app.account_ui.account(&id).unwrap().reset.pending.is_none(),
+            "neither Enter started a consume"
+        );
+    }
+    #[test]
+    fn confirmed_refreshed_limits_clear_only_the_named_scope_and_new_limits_restore_normal_state() {
+        let now = now_ms();
+        for (scope, summary, unrelated) in [
+            (
+                ResetScope::Model("Fable".into()),
+                "Claude Fable limit reached",
+                "Claude weekly limit reached",
+            ),
+            (
+                ResetScope::AccountWeekly,
+                "Claude weekly limit reached",
+                "Claude Fable limit reached",
+            ),
+        ] {
+            let mut app = context_inspector_test_app(false);
+            let id = Account::system(Provider::Claude).id();
+            let grant = reset(scope);
+            let mut snapshot = UsageSnapshot::state(UsageStatus::Limited, "", now);
+            snapshot.windows = vec![
+                window(account::WindowKind::Session, "session", 1.0),
+                window(account::WindowKind::Weekly, "weekly_all", 1.0),
+                window(account::WindowKind::Scoped, "weekly_scoped:Fable", 1.0),
+            ];
+            snapshot.resets = vec![grant.clone()];
+            let state = app.account_ui.account_mut(&id).unwrap();
+            state.present = true;
+            state.snapshot = Some(snapshot.clone());
+            state.reset.prepare(grant.clone(), 2, None);
+            let attempt = state.reset.submit(&grant, 2, None).unwrap();
+            let owner = state.owner;
+            for window in &mut snapshot.windows {
+                if grant.clears(window) {
+                    window.used = 0.0;
+                    window.binding = false;
+                }
+            }
+            snapshot.resets[0].available_count = 0;
+            drop(app.finish_usage_reset(
+                id.clone(),
+                owner,
+                attempt.key,
+                Ok(ConsumeOutcome {
+                    status: ConsumeStatus::Reset,
+                    message: None,
+                    snapshot: Some(snapshot),
+                }),
+            ));
+            let controls = app
+                .usage_reset_controls(app.account_ui.account(&id).unwrap())
+                .unwrap();
+            assert!(controls.limit_cleared(summary));
+            assert!(!controls.limit_cleared(unrelated));
+            let mut blocked = controls.clone();
+            blocked.snapshot.ordinary_usage_allowed = Some(false);
+            assert!(
+                !blocked.limit_cleared(summary),
+                "explicit provider denial overrides low windows"
+            );
+            blocked.snapshot.ordinary_usage_allowed = Some(true);
+            assert!(blocked.limit_cleared(summary));
+            assert!(
+                !controls.limit_cleared("Claude usage limit reached"),
+                "an unrelated exhausted account window still binds"
+            );
+            let resolved = controls.for_limit(summary).unwrap();
+            assert!(
+                resolved.snapshot.resets.is_empty(),
+                "last reset count0 does not discard the matching result"
+            );
+            assert!(
+                resolved
+                    .state
+                    .feedback
+                    .as_ref()
+                    .unwrap()
+                    .contains("Reset used")
+            );
+            let mut stale = controls.clone();
+            stale.now += schedule::STALE_AFTER + 1;
+            assert!(!stale.limit_cleared(summary));
+            let mut unavailable = controls.clone();
+            unavailable.snapshot.status = UsageStatus::Unavailable;
+            assert!(!unavailable.limit_cleared(summary));
+            let mut changed_login = controls.clone();
+            changed_login.identity = Some(Identity {
+                organization: Some("another-fixture-login".into()),
+                ..Identity::default()
+            });
+            assert!(!changed_login.limit_cleared(summary));
+            let mut missing = controls.clone();
+            missing.snapshot.windows.clear();
+            assert!(!missing.limit_cleared(summary));
+            let mut later = controls;
+            for window in &mut later.snapshot.windows {
+                if grant.clears(window) {
+                    window.used = 1.0;
+                }
+            }
+            assert!(
+                !later.limit_cleared(summary),
+                "later exhaustion restores the current limit card"
+            );
+        }
+    }
+
+    #[test]
+    fn no_credit_unconfirmed_and_unrefreshed_results_cannot_mark_a_limit_cleared() {
+        let now = now_ms();
+        for (status, refreshed) in [
+            (ConsumeStatus::NoCredit, true),
+            (ConsumeStatus::Unconfirmed, true),
+            (ConsumeStatus::Unavailable, true),
+            (ConsumeStatus::Reset, false),
+        ] {
+            let mut app = context_inspector_test_app(false);
+            let id = Account::system(Provider::Claude).id();
+            let grant = reset(ResetScope::Model("Fable".into()));
+            let mut snapshot = UsageSnapshot::state(UsageStatus::Ok, "", now);
+            snapshot.windows = vec![
+                window(account::WindowKind::Scoped, "weekly_scoped:Fable", 0.0),
+                window(account::WindowKind::Weekly, "weekly_all", 0.0),
+            ];
+            snapshot.resets = vec![grant.clone()];
+            let state = app.account_ui.account_mut(&id).unwrap();
+            state.present = true;
+            state.snapshot = Some(snapshot.clone());
+            state.reset.prepare(grant.clone(), 2, None);
+            let attempt = state.reset.submit(&grant, 2, None).unwrap();
+            let owner = state.owner;
+            drop(app.finish_usage_reset(
+                id.clone(),
+                owner,
+                attempt.key,
+                Ok(ConsumeOutcome {
+                    status,
+                    message: None,
+                    snapshot: refreshed.then_some(snapshot),
+                }),
+            ));
+            let controls = app
+                .usage_reset_controls(app.account_ui.account(&id).unwrap())
+                .unwrap();
+            assert!(
+                !controls.limit_cleared("Claude Fable limit reached"),
+                "{status:?}, refreshed={refreshed}"
+            );
+            assert!(!controls.limit_cleared("Claude weekly limit reached"));
+        }
+    }
+    #[test]
+    fn a_new_same_scope_incident_inherits_neither_cleared_proof_nor_success_feedback() {
+        let now = now_ms();
+        let grant = reset(ResetScope::Model("Fable".into()));
+        let id = Account::system(Provider::Claude).id();
+        let old = LimitIncidents(BTreeMap::from([(
+            "card/1/old".into(),
+            BTreeSet::from([1, 2]),
+        )]));
+        let mut snapshot = UsageSnapshot::state(UsageStatus::Ok, "", now);
+        snapshot.windows = vec![window(
+            account::WindowKind::Scoped,
+            "weekly_scoped:Fable",
+            0.0,
+        )];
+        let mut state = State::default();
+        state.feedback = Some("Reset used. Usage refreshed.".into());
+        state.feedback_reset = Some(grant.clone());
+        state.feedback_status = Some(ConsumeStatus::Reset);
+        state.confirmed.insert(
+            grant.id.clone(),
+            ConfirmedReset {
+                reset: grant,
+                identity: None,
+                observed_at: now,
+                incidents: old.clone(),
+            },
+        );
+        let controls = Controls {
+            id,
+            name: "Fixture".into(),
+            snapshot,
+            state,
+            now,
+            enabled: true,
+            recovery_enabled: true,
+            surface: "accounts".into(),
+            identity: None,
+        };
+        let previous = controls.for_incident(&old);
+        assert!(previous.limit_cleared("Claude Fable limit reached"));
+        assert!(previous.state.feedback.is_some());
+        let remaining_old_source =
+            LimitIncidents(BTreeMap::from([("card/1/old".into(), BTreeSet::from([1]))]));
+        assert!(
+            controls
+                .for_incident(&remaining_old_source)
+                .limit_cleared("Claude Fable limit reached")
+        );
+        for current in [
+            LimitIncidents(BTreeMap::from([("card/1/new".into(), BTreeSet::from([1]))])),
+            LimitIncidents(BTreeMap::from([(
+                "card/1/old".into(),
+                BTreeSet::from([1, 3]),
+            )])),
+            LimitIncidents(BTreeMap::from([("card/2/old".into(), BTreeSet::from([1]))])),
+        ] {
+            let later = controls.for_incident(&current);
+            assert!(!later.limit_cleared("Claude Fable limit reached"));
+            assert!(
+                later.state.feedback.is_none(),
+                "new rejection must not show an older reset success"
+            );
+        }
+        assert!(
+            controls.state.feedback.is_some(),
+            "general account view keeps its recent result"
+        );
+    }
+    #[test]
+    fn authoritative_codex_denial_prevents_a_cleared_card_despite_low_windows() {
+        let now = now_ms();
+        let grant = reset(ResetScope::Account);
+        let mut snapshot = UsageSnapshot::state(UsageStatus::Limited, "", now);
+        snapshot.windows = vec![
+            window(account::WindowKind::Session, "codex:primary", 0.1),
+            window(account::WindowKind::Weekly, "codex:secondary", 0.1),
+        ];
+        let mut state = State::default();
+        state.confirmed.insert(
+            grant.id.clone(),
+            ConfirmedReset {
+                reset: grant,
+                identity: None,
+                observed_at: now,
+                incidents: LimitIncidents::default(),
+            },
+        );
+        let mut controls = Controls {
+            id: Account::system(Provider::Codex).id(),
+            name: "Fixture".into(),
+            snapshot,
+            state,
+            now,
+            enabled: true,
+            recovery_enabled: true,
+            surface: "accounts".into(),
+            identity: None,
+        };
+        for allowed in [None, Some(true)] {
+            controls.snapshot.ordinary_usage_allowed = allowed;
+            assert!(controls.limit_cleared("Codex usage limit reached"));
+        }
+        controls.snapshot.ordinary_usage_allowed = Some(false);
+        assert!(!controls.limit_cleared("Codex usage limit reached"));
     }
 }

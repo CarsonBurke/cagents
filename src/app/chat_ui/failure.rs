@@ -220,6 +220,7 @@ pub(super) struct Incident {
     pub guidance: &'static str,
     pub kind: Option<FailureKind>,
     sources: Vec<Source>,
+    reset_sources: std::collections::BTreeSet<u64>,
     /// The chronological first transcript source owns the visible notice.
     pub first_item: Option<String>,
     pub anchor: Option<String>,
@@ -487,6 +488,7 @@ impl State {
                 guidance: meta.guidance,
                 kind: meta.kind,
                 sources: vec![source],
+                reset_sources: Default::default(),
                 first_item,
                 anchor: None,
                 child_scope: None,
@@ -890,12 +892,41 @@ impl State {
             .intersection(&state.expanded)
             .cloned()
             .collect();
+        // Compute reset evidence once alongside classification. Rendering a
+        // collapsed limit must never rehash a potentially large diagnostic.
+        for incident in &mut state.incidents {
+            if incident.kind == Some(FailureKind::AccountLimit) {
+                incident.reset_sources = incident
+                    .sources
+                    .iter()
+                    .map(|source| {
+                        let mut hash = std::collections::hash_map::DefaultHasher::new();
+                        source.hash(&mut hash);
+                        if let Some((item, _, _)) = state.item_metadata.get(source) {
+                            Arc::as_ptr(item).hash(&mut hash);
+                        } else {
+                            runtime.failure_source(source).hash(&mut hash);
+                            // Live diagnostics can recur under the same textual
+                            // identity; require the exact published occurrence.
+                            if matches!(
+                                source,
+                                Source::Snapshot | Source::ChildDetail(_) | Source::Local(_)
+                            ) {
+                                runtime.snapshot.generation.hash(&mut hash);
+                            }
+                        }
+                        hash.finish()
+                    })
+                    .collect();
+            }
+        }
         let mut hash = std::hash::DefaultHasher::new();
         for incident in &state.incidents {
             (
                 &incident.key,
                 &incident.summary,
                 &incident.sources,
+                &incident.reset_sources,
                 &incident.first_item,
                 &incident.anchor,
                 &incident.active_recovery,
@@ -1281,30 +1312,79 @@ impl Runtime {
         self.failure_view_with_reset(incident, None)
     }
 
+    /// A source may disappear after a successful continuation; a new source or
+    /// chat lifetime is never evidence for an earlier reset.
+    fn reset_incident_evidence(
+        &self,
+        incident: &Incident,
+    ) -> crate::app::account_ui::resets::LimitIncidents {
+        crate::app::account_ui::resets::LimitIncidents(std::collections::BTreeMap::from([(
+            format!(
+                "{}/{}/{}",
+                self.target.card, self.target.generation, incident.key
+            ),
+            incident.reset_sources.clone(),
+        )]))
+    }
+
+    pub(in crate::app) fn reset_limit_incidents(
+        &self,
+    ) -> crate::app::account_ui::resets::LimitIncidents {
+        let mut evidence = crate::app::account_ui::resets::LimitIncidents::default();
+        for incident in &self.failure_ui.incidents {
+            if incident.kind == Some(FailureKind::AccountLimit) {
+                evidence.0.extend(self.reset_incident_evidence(incident).0);
+            }
+        }
+        evidence
+    }
+
     pub(super) fn failure_view_with_reset(
         &self,
         incident: &Incident,
         reset_controls: Option<&crate::app::account_ui::resets::Controls>,
     ) -> Element<'static, Message> {
+        let reset_controls = reset_controls
+            .map(|controls| controls.for_incident(&self.reset_incident_evidence(incident)));
+        let cleared = incident.kind == Some(FailureKind::AccountLimit)
+            && reset_controls
+                .as_ref()
+                .is_some_and(|controls| controls.limit_cleared(&incident.summary));
+        let summary = if cleared {
+            let label = incident
+                .summary
+                .split_once(" limit reached")
+                .map_or("usage", |(label, _)| label);
+            format!("Earlier {label} limit · cleared")
+        } else {
+            incident.summary.clone()
+        };
         let mut rows = vec![
             widget::row::with_children(vec![
                 crate::ui_controls::passive_icon(Icon::Warning, design::COMPACT_ICON_SIZE),
-                design::body(incident.summary.clone())
-                    .width(Length::Fill)
-                    .into(),
+                design::body(summary).width(Length::Fill).into(),
             ])
             .spacing(space::S)
             .align_y(Alignment::Start)
             .into(),
-            design::caption(incident.guidance)
-                .width(Length::Fill)
-                .into(),
         ];
+        if !cleared {
+            rows.push(
+                design::caption(incident.guidance)
+                    .width(Length::Fill)
+                    .into(),
+            );
+        }
         if incident.kind == Some(FailureKind::AccountLimit)
-            && let Some(controls) =
-                reset_controls.and_then(|controls| controls.for_limit(&incident.summary))
+            && let Some(controls) = reset_controls
+                .as_ref()
+                .and_then(|controls| controls.for_limit(&incident.summary))
         {
-            rows.push(controls.view());
+            rows.push(
+                controls
+                    .on_surface(format!("chat/{}/{}", self.target.card, incident.key))
+                    .view(),
+            );
         }
         rows.push(self.failure_diagnostics(incident));
         widget::container(
@@ -1531,6 +1611,37 @@ mod tests {
             .0
             .text(diagnostic_preview_identity(key))
             .is_some()
+    }
+
+    #[test]
+    fn reset_evidence_rejects_a_new_rejection_without_any_usage_update() {
+        let raw = "You've hit your limit · resets 9pm (UTC)";
+        let (mut runtime, handle) = live_fixture(
+            Provider::Claude,
+            vec![
+                text("prompt-1", chat::Role::User, "Fixture question"),
+                text("failure-1", chat::Role::System, raw),
+            ],
+        );
+        runtime.refresh_failure_ui();
+        let original = runtime.reset_limit_incidents();
+        assert!(
+            !original.0.is_empty(),
+            "fixture must classify a real limit incident"
+        );
+        assert!(original.contains(&runtime.reset_limit_incidents()));
+        publish(&mut runtime, &handle, |next| {
+            next.items
+                .push(Arc::new(text("prompt-2", chat::Role::User, "Continue")));
+            next.items
+                .push(Arc::new(text("failure-2", chat::Role::System, raw)));
+        });
+        let current = runtime.reset_limit_incidents();
+        assert!(current.0.keys().any(|key| !original.0.contains_key(key)));
+        assert!(
+            !original.contains(&current),
+            "same summary in a later turn is a new occurrence"
+        );
     }
 
     #[test]

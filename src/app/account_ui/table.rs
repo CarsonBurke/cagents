@@ -795,7 +795,7 @@ fn row<'a>(
     let mut lines = vec![content];
     if let Some(resets) = app.usage_reset_controls(account) {
         lines.push(
-            widget::container(resets.view())
+            widget::container(resets.on_surface("accounts").view())
                 .padding([space::XS, space::M])
                 .width(Length::Fill)
                 .into(),

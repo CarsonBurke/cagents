@@ -1108,7 +1108,7 @@ pub enum Action {
     /// Omp's usage record was read.
     OmpRead(History),
     Refresh(AccountId),
-    ResetStart(AccountId, String),
+    ResetStart(AccountId, String, String, bool),
     ResetConfirm(AccountId),
     ResetRecover(AccountId, String),
     ResetCancel(AccountId),
@@ -1229,7 +1229,7 @@ impl Action {
     pub(super) fn blocked_while_modal(&self) -> bool {
         matches!(
             self,
-            Self::ResetStart(_, _)
+            Self::ResetStart(_, _, _, _)
                 | Self::ResetConfirm(_)
                 | Self::ResetRecover(_, _)
                 | Self::Refresh(_)
@@ -2605,7 +2605,9 @@ impl Cagents {
 
     pub(super) fn update_account_ui(&mut self, action: Action) -> Task<Message> {
         match action {
-            Action::ResetStart(id, reset) => self.start_usage_reset(id, reset),
+            Action::ResetStart(id, reset, surface, choose_scope) => {
+                self.start_usage_reset(id, reset, surface, choose_scope)
+            }
             Action::ResetConfirm(id) => self.confirm_usage_reset(id),
             Action::ResetRecover(id, reset) => self.recover_usage_reset(id, reset),
             Action::ResetCancel(id) => {
@@ -5404,7 +5406,7 @@ impl Cagents {
             },
         }
         if let Some(resets) = self.usage_reset_controls(account) {
-            rows.push(resets.view());
+            rows.push(resets.on_surface("popover").view());
         }
         let mut footer: Vec<Element<'a, Message>> = Vec::new();
         if let Some(snapshot) = &account.snapshot {
