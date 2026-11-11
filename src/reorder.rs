@@ -755,7 +755,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Reorder<'_, Message> {
                     border: cosmic::iced::Border {
                         color: design::accent_color(theme),
                         width: 1.0,
-                        radius: 4.0.into(),
+                        radius: theme.cosmic().corner_radii.radius_s.into(),
                     },
                     ..Default::default()
                 },

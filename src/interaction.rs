@@ -307,9 +307,23 @@ pub fn reserve_tab_history<'a, Message: 'a>(
 /// Soft full-bounds hover feedback, including when a child captures the event.
 /// The native animation clock requests frames only until its target is reached.
 pub fn hover<'a, Message: 'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    hover_with_radius(content, false)
+}
+
+/// Hover feedback matching the theme radius used by sidebar row controls.
+pub fn hover_with_theme_radius<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    hover_with_radius(content, true)
+}
+
+fn hover_with_radius<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    themed_radius: bool,
+) -> Element<'a, Message> {
     Effect {
         content: content.into(),
-        kind: Kind::Hover,
+        kind: Kind::Hover { themed_radius },
         tip: None,
         on_focused_key: None,
     }
@@ -1292,7 +1306,9 @@ enum Kind {
     ListRow,
     ListEntry,
     TabHistory(bool),
-    Hover,
+    Hover {
+        themed_radius: bool,
+    },
     ContextMenu,
     Fade(f32),
     Tooltip,
@@ -1440,7 +1456,7 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
             Kind::UnclaimedKey => tree::Tag::of::<UnclaimedKeyTag>(),
             Kind::ListRow | Kind::ListEntry => tree::Tag::of::<ListRowTag>(),
             Kind::TabHistory(_) => tree::Tag::of::<TabHistoryTag>(),
-            Kind::Hover => tree::Tag::of::<HoverTag>(),
+            Kind::Hover { .. } => tree::Tag::of::<HoverTag>(),
             Kind::Fade(_) => tree::Tag::of::<FadeTag>(),
             Kind::Tooltip => tree::Tag::of::<TooltipTag>(),
             Kind::DriveAnimation(_) => tree::Tag::of::<AnimationDriverTag>(),
@@ -1790,7 +1806,7 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
             shell.request_redraw();
         }
         match self.kind {
-            Kind::Hover if state.hover.is_animating(now) => shell.request_redraw(),
+            Kind::Hover { .. } if state.hover.is_animating(now) => shell.request_redraw(),
             Kind::Tooltip => {
                 let mut visible = false;
                 if let Some(entered) = state
@@ -1915,7 +1931,7 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
             cursor,
             viewport,
         );
-        if matches!(self.kind, Kind::Hover) {
+        if let Kind::Hover { themed_radius } = self.kind {
             // Keep low-emphasis rows legible against neutral surfaces without
             // turning hover feedback into a selected-state fill.
             let alpha = state.hover.interpolate(0.0, 0.10, state.now);
@@ -1930,7 +1946,11 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
                             renderer::Quad {
                                 bounds: layout.bounds(),
                                 border: cosmic::iced::Border {
-                                    radius: crate::design::RADIUS_S.into(),
+                                    radius: if themed_radius {
+                                        theme.cosmic().corner_radii.radius_s.into()
+                                    } else {
+                                        crate::design::RADIUS_S.into()
+                                    },
                                     ..Default::default()
                                 },
                                 ..Default::default()

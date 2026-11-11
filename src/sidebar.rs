@@ -5777,8 +5777,8 @@ impl RowGrid {
         }
         button::custom(content)
             .class(match self.kind {
-                RowKind::Project => row_button_style::<true, false>(selected),
-                RowKind::Child => row_button_style::<true, true>(selected),
+                RowKind::Project => row_button_style::<false>(selected),
+                RowKind::Child => row_button_style::<true>(selected),
             })
             .selected(selected)
             .padding([0.0, self.gutter()])
@@ -7623,7 +7623,7 @@ fn worktree_view<'a>(
     let action: Element<'static, SidebarAction> = if compact {
         action.into()
     } else {
-        crate::interaction::hover(action)
+        crate::interaction::hover_with_theme_radius(action)
     };
     let action =
         crate::interaction::tooltip(action, rail_tooltip(&chrome.tooltip, deletion, compact));
@@ -9023,7 +9023,10 @@ fn panel_section<'a>(
     .height(Length::Fixed(PANEL_ROW_HEIGHT))
     .width(Length::Fill)
     .on_press_maybe(parts.toggle);
-    let header = crate::interaction::tooltip(crate::interaction::hover(row), parts.action_name);
+    let header = crate::interaction::tooltip(
+        crate::interaction::hover_with_theme_radius(row),
+        parts.action_name,
+    );
     let header: Element<'a, SidebarAction> = if let Some(actions) = actions {
         RowInteraction::actions(header.into(), actions, 0.0).into()
     } else {
@@ -10775,7 +10778,7 @@ fn panel_row<'a>(
     modal_open: bool,
 ) -> Element<'a, SidebarAction> {
     let indent = u16::try_from(depth).unwrap_or(u16::MAX).saturating_mul(12);
-    crate::interaction::keyboard_list_row(crate::interaction::hover(
+    crate::interaction::keyboard_list_row(crate::interaction::hover_with_theme_radius(
         button::custom(
             widget::row::with_children(vec![
                 cosmic::iced::widget::Space::new()
@@ -10888,12 +10891,12 @@ fn gated(action: SidebarAction, modal_open: bool) -> Option<SidebarAction> {
 
 /// Neutral text, transparent rows, and restrained pointer/keyboard feedback.
 pub fn sidebar_button_style(selected: bool) -> theme::Button {
-    row_button_style::<false, true>(selected)
+    row_button_style::<true>(selected)
 }
 
-/// Navigation fills span their complete row; project labels remain plain on hover.
-fn row_button_style<const FLAT: bool, const HOVER: bool>(selected: bool) -> theme::Button {
-    fn appearance<const FLAT: bool>(
+/// Inset navigation fills use the theme radius; project labels remain plain on hover.
+fn row_button_style<const HOVER: bool>(selected: bool) -> theme::Button {
+    fn appearance(
         theme: &cosmic::Theme,
         focused: bool,
         selected: bool,
@@ -10912,11 +10915,7 @@ fn row_button_style<const FLAT: bool, const HOVER: bool>(selected: bool) -> them
         } else {
             design::muted_icon_color(theme)
         });
-        style.border_radius = if FLAT {
-            [0.0; 4].into()
-        } else {
-            theme.cosmic().corner_radii.radius_s.into()
-        };
+        style.border_radius = theme.cosmic().corner_radii.radius_s.into();
         if selected || focused || alpha > 0.0 {
             let mut surface = foreground;
             surface.a = if disabled {
@@ -10930,14 +10929,12 @@ fn row_button_style<const FLAT: bool, const HOVER: bool>(selected: bool) -> them
     }
     // Noncapturing closures keep the boxed callbacks allocation-free for the
     // hundreds of file rows rebuilt on terminal wakes.
-    fn class<const SELECTED: bool, const FLAT: bool, const HOVER: bool>() -> theme::Button {
+    fn class<const SELECTED: bool, const HOVER: bool>() -> theme::Button {
         theme::Button::Custom {
-            active: Box::new(|focused, theme| {
-                appearance::<FLAT>(theme, focused, SELECTED, 0.0, false)
-            }),
-            disabled: Box::new(|theme| appearance::<FLAT>(theme, false, SELECTED, 0.0, true)),
+            active: Box::new(|focused, theme| appearance(theme, focused, SELECTED, 0.0, false)),
+            disabled: Box::new(|theme| appearance(theme, false, SELECTED, 0.0, true)),
             hovered: Box::new(|focused, theme| {
-                appearance::<FLAT>(
+                appearance(
                     theme,
                     focused,
                     SELECTED,
@@ -10946,7 +10943,7 @@ fn row_button_style<const FLAT: bool, const HOVER: bool>(selected: bool) -> them
                 )
             }),
             pressed: Box::new(|focused, theme| {
-                appearance::<FLAT>(
+                appearance(
                     theme,
                     focused,
                     SELECTED,
@@ -10957,9 +10954,9 @@ fn row_button_style<const FLAT: bool, const HOVER: bool>(selected: bool) -> them
         }
     }
     if selected {
-        class::<true, FLAT, HOVER>()
+        class::<true, HOVER>()
     } else {
-        class::<false, FLAT, HOVER>()
+        class::<false, HOVER>()
     }
 }
 
@@ -12939,7 +12936,7 @@ mod row_interaction {
                             renderer::Quad {
                                 bounds,
                                 border: cosmic::iced::Border {
-                                    radius: 0.0.into(),
+                                    radius: theme.cosmic().corner_radii.radius_s.into(),
                                     ..Default::default()
                                 },
                                 ..Default::default()
@@ -15848,30 +15845,53 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn project_drag_label_has_no_hover_fill_and_navigation_selection_spans_a_flat_row() {
+    fn project_drag_label_stays_plain_and_inset_navigation_states_are_rounded() {
         let theme = cosmic::Theme::dark();
         let theme::Button::Custom {
             active,
             hovered,
             pressed,
             ..
-        } = row_button_style::<true, false>(false)
+        } = row_button_style::<false>(false)
         else {
             unreachable!();
         };
         assert!(active(false, &theme).background.is_none());
         assert!(hovered(false, &theme).background.is_none());
         assert!(pressed(false, &theme).background.is_none());
+        let focused = hovered(true, &theme);
         assert!(
-            hovered(true, &theme).background.is_some(),
+            focused.background.is_some(),
             "keyboard focus remains visible"
         );
-        let theme::Button::Custom { active, .. } = row_button_style::<true, true>(true) else {
+        assert_eq!(
+            focused.border_radius,
+            theme.cosmic().corner_radii.radius_s.into()
+        );
+        let theme::Button::Custom {
+            active,
+            hovered,
+            pressed,
+            disabled,
+        } = row_button_style::<true>(true)
+        else {
             unreachable!();
         };
-        let selected = active(false, &theme);
-        assert!(selected.background.is_some());
-        assert_eq!(selected.border_radius, [0.0; 4].into());
+        for state in [
+            active(false, &theme),
+            active(true, &theme),
+            hovered(false, &theme),
+            hovered(true, &theme),
+            pressed(false, &theme),
+            pressed(true, &theme),
+            disabled(&theme),
+        ] {
+            assert!(state.background.is_some());
+            assert_eq!(
+                state.border_radius,
+                theme.cosmic().corner_radii.radius_s.into()
+            );
+        }
     }
 
     /// The whole point of drawing the header's commands over the row is that
