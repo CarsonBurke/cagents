@@ -1193,7 +1193,9 @@ fn cold_host_hop(root: PathBuf, incarnation: &str) {
                     crate::update::recovery::retire_current_service().unwrap(),
                     crate::update::recovery::RetirementStatus::AlreadyCompleted
                 ));
-                Ok(crate::update::recovery::RetirementStatus::Completed)
+                Ok::<_, crate::update::UpdateError>(
+                    crate::update::recovery::RetirementStatus::Completed,
+                )
             })
             .unwrap();
             assert!(matches!(
