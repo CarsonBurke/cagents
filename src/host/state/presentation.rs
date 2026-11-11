@@ -362,6 +362,12 @@ mod tests {
     #[test]
     fn scrolling_one_client_does_not_move_another_or_the_parser_viewport() {
         let (host, handle, id, _dir) = fixture();
+        // Drain the queued startup reveal and its forced capture before taking
+        // baselines. An explicit offset requires a worker round trip instead
+        // of the published bottom-view fast path; it does not scroll the parser.
+        handle
+            .viewport_snapshot(Some(handle.snapshot().scroll.max_offset()), None, true)
+            .unwrap();
         let parser = handle.snapshot();
         let bottom = snapshot(&host, 2, id, 0).unwrap().unwrap();
         host.lock()

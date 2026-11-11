@@ -1,7 +1,7 @@
 //! Daemon-owned, non-PTY provider actor. Detaching never stops its transport.
 use super::{
     Command, Event, Item, ItemContent, Phase, Snapshot, Subagent, ToolStatus,
-    protocol::{Adapter, ProcessSpec, Step, TransportSpec},
+    protocol::{Adapter, ProcessSpec, SetupError, Step, TransportSpec},
 };
 use crate::account::LiveReport;
 use crate::agent::ActivityState;
@@ -1597,6 +1597,13 @@ impl LocalHandle {
 
 /// Validate local launch and adapter initialization before stopping an existing CLI.
 pub(crate) fn preflight(spec: &ProcessSpec, initial: &mut Step) -> Result<Store, String> {
+    preflight_for_start(spec, initial).map_err(|error| error.to_string())
+}
+
+pub(crate) fn preflight_for_start(
+    spec: &ProcessSpec,
+    initial: &mut Step,
+) -> Result<Store, SetupError> {
     preflight_inner(spec, initial, false)
 }
 
@@ -1604,6 +1611,13 @@ pub(crate) fn preflight(spec: &ProcessSpec, initial: &mut Step) -> Result<Store,
 /// after the original directory was removed. Authorizing commands still check
 /// the retained execution policy in the actor before any provider write.
 pub(crate) fn preflight_retained(spec: &ProcessSpec, initial: &mut Step) -> Result<Store, String> {
+    preflight_retained_for_start(spec, initial).map_err(|error| error.to_string())
+}
+
+pub(crate) fn preflight_retained_for_start(
+    spec: &ProcessSpec,
+    initial: &mut Step,
+) -> Result<Store, SetupError> {
     if !matches!(spec.transport, TransportSpec::UnixWebSocket { .. }) {
         return Err("Retained preflight cannot launch a provider".into());
     }
@@ -1614,13 +1628,15 @@ fn preflight_inner(
     spec: &ProcessSpec,
     initial: &mut Step,
     retained: bool,
-) -> Result<Store, String> {
+) -> Result<Store, SetupError> {
     use std::os::unix::ffi::OsStrExt;
     if !retained
         && !matches!(spec.transport, TransportSpec::History)
         && !spec.working_directory.is_dir()
     {
-        return Err("Provider working directory does not exist".into());
+        return Err(SetupError::Unavailable(
+            "Provider working directory does not exist".into(),
+        ));
     }
     if spec.program.is_empty()
         || spec.program.contains('\0')
@@ -1655,16 +1671,17 @@ fn preflight_inner(
                 && std::ffi::CString::new(path.as_os_str().as_bytes())
                     .is_ok_and(|path| unsafe { libc::access(path.as_ptr(), libc::X_OK) } == 0)
         }) {
-            return Err(format!(
+            return Err(SetupError::Unavailable(format!(
                 "Provider executable {} is not executable in the preserved launch environment",
                 spec.program
-            ));
+            )));
         }
     }
     let mut queued = 0usize;
     for frame in &initial.writes {
         let mut count = ByteCounter(0);
-        serde_json::to_writer(&mut count, frame).map_err(|error| error.to_string())?;
+        serde_json::to_writer(&mut count, frame)
+            .map_err(|error| SetupError::Invalid(error.to_string()))?;
         if count.0 > FRAME_LIMIT {
             return Err("Provider initialization frame exceeds 32 MiB".into());
         }
@@ -1673,7 +1690,7 @@ fn preflight_inner(
     if queued > QUEUE_LIMIT {
         return Err("Provider initialization exceeds stdin queue capacity".into());
     }
-    let mut store = Store::new()?;
+    let mut store = Store::new().map_err(SetupError::Unavailable)?;
     store.file_cwd = Some(spec.working_directory.clone());
     store.recognize_messages(spec.messages.clone());
     let mut metadata = Vec::new();
@@ -1683,12 +1700,13 @@ fn preflight_inner(
             fatal: true,
         } = &event
         {
-            return Err(message.clone());
+            return Err(SetupError::Invalid(message.clone()));
         }
-        metadata.extend(store.apply(event)?);
+        metadata.extend(store.apply_for_start(event)?);
     }
     let mut count = ByteCounter(0);
-    serde_json::to_writer(&mut count, &metadata).map_err(|error| error.to_string())?;
+    serde_json::to_writer(&mut count, &metadata)
+        .map_err(|error| SetupError::Invalid(error.to_string()))?;
     // Child transcripts are bounded presentation items, not long-lived
     // request/model metadata. The actor checks that metadata alone stays
     // under STATE_LIMIT after applying this initial batch.

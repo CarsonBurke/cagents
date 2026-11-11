@@ -2,6 +2,7 @@
 //! never authorizes launching a replacement for a lost durable server.
 use super::*;
 use crate::daemon::holder_registry::{self as registry, Kind};
+use chat::protocol::SetupError;
 
 #[cfg(test)]
 mod paired_projection_tests;
@@ -36,6 +37,7 @@ fn before_publication_for_test(
     BeforePublicationHook(std::marker::PhantomData)
 }
 
+#[cfg(test)]
 fn project_paired_terminal(
     state: &HostState,
     terminal: &crate::model::TerminalSession,
@@ -48,21 +50,49 @@ fn project_paired_terminal(
     ),
     String,
 > {
+    project_paired_terminal_for_start(state, terminal, paired_holder, proof)
+        .map_err(|error| error.to_string())
+}
+
+fn project_paired_terminal_for_start(
+    state: &HostState,
+    terminal: &crate::model::TerminalSession,
+    paired_holder: Option<&crate::terminal::holder::Record>,
+    proof: &HostSessionProof,
+) -> Result<
+    (
+        crate::model::TerminalSession,
+        crate::terminal::TerminalHandle,
+    ),
+    SetupError,
+> {
     // Raw terminal records retain their original custody descriptor. Current
     // ownership comes from the same authenticated worker, not that old proof.
-    let current = state
-        .terminals
-        .get(&terminal.id)
-        .filter(|current| {
-            current.handle.holder_identity().is_some()
-                && current.handle.holder_identity() == paired_holder
-                && current.session.launch == terminal.launch
-                && current.session.owned_codex_listener == terminal.owned_codex_listener
-        })
-        .ok_or("The paired terminal could not be recovered; native ownership was preserved")?;
-    let projected = state.native_terminal_projection(terminal.id)?;
+    let current = state.terminals.get(&terminal.id).ok_or_else(|| {
+        SetupError::Unavailable(
+            "The paired terminal could not be recovered; native ownership was preserved".into(),
+        )
+    })?;
+    if current.handle.holder_identity().is_none() {
+        return Err(SetupError::Unavailable(
+            "The paired terminal could not be recovered; native ownership was preserved".into(),
+        ));
+    }
+    if current.handle.holder_identity() != paired_holder
+        || current.session.launch != terminal.launch
+        || current.session.owned_codex_listener != terminal.owned_codex_listener
+    {
+        return Err(
+            "The paired terminal could not be recovered; native ownership was preserved".into(),
+        );
+    }
+    let projected = state
+        .native_terminal_projection(terminal.id)
+        .map_err(SetupError::Unavailable)?;
     if projected.continuity.live_proof().as_ref() != Some(proof) {
-        return Err("The paired terminal belongs to a different daemon owner".into());
+        return Err(SetupError::Unavailable(
+            "The paired terminal belongs to a different daemon owner".into(),
+        ));
     }
     Ok((projected, current.handle.clone()))
 }
@@ -180,31 +210,50 @@ pub(super) fn restore(
     restore_with_admission(host, client, source, None)
 }
 
+pub(super) fn restore_for_start(
+    host: &SharedHost,
+    client: ClientId,
+    source: &Session,
+) -> Result<ServerResponse, ProtocolError> {
+    restore_with_admission_for_start(host, client, source, None)
+}
+
 pub(super) fn restore_with_admission(
     host: &SharedHost,
     client: ClientId,
     source: &Session,
-    mut admission: Option<capacity::Reservation>,
+    admission: Option<capacity::Reservation>,
 ) -> Result<ServerResponse, String> {
+    restore_with_admission_for_start(host, client, source, admission).map_err(|error| error.message)
+}
+
+pub(super) fn restore_with_admission_for_start(
+    host: &SharedHost,
+    client: ClientId,
+    source: &Session,
+    mut admission: Option<capacity::Reservation>,
+) -> Result<ServerResponse, ProtocolError> {
     // Main's durable holder format has no immutable account-home proof.
-    super::super::account_lifecycle::ensure_idle(host).map_err(|error| error.message)?;
+    super::super::account_lifecycle::ensure_idle(host)?;
     let proof = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-        require_unreserved_terminals(&state, source).map_err(|error| error.message)?;
+        require_unreserved_terminals(&state, source)?;
         if state.shutting_down
             || (state.chat_spawning.contains_key(&source.id) && admission.is_none())
             || state.native_closing.contains_key(&source.id)
         {
-            return Err(
-                "Native holder adoption is unavailable while another transition is pending".into(),
-            );
+            return Err(retryable_unavailable(
+                "Native holder adoption is unavailable while another transition is pending",
+            ));
         }
         if state
             .chats
             .get(&source.id)
             .is_some_and(|record| record.handle.owns_work())
         {
-            return Err("The native conversation already has a live actor; attach to it".into());
+            return Err(retryable_unavailable(
+                "The native conversation already has a live actor; attach to it",
+            ));
         }
         if state.chat_handoffs.contains_key(&source.id)
             || state.chats.values().any(|record| {
@@ -215,7 +264,9 @@ pub(super) fn restore_with_admission(
                 *id != source.id && same_conversation(&pending.launch, &source.launch)
             })
         {
-            return Err("Native conversation ownership or capacity prevents adoption".into());
+            return Err(retryable_unavailable(
+                "Native conversation ownership or capacity prevents adoption",
+            ));
         }
         // A prepublication failure still owns a slot. Only its complete issued
         // source may reuse that slot, even when the daemon has spare capacity.
@@ -223,21 +274,22 @@ pub(super) fn restore_with_admission(
         // the retained holder before it can publish an actor.
         let retained_startup = if let Some(pending) = state.native_actor_startups.get(&source.id) {
             if &pending.source != source {
-                return Err("The retained startup belongs to another exact descriptor".into());
+                return Err(error(
+                    "The retained startup belongs to another exact descriptor",
+                ));
             }
             true
         } else {
             false
         };
         if !state.chats.contains_key(&source.id) && admission.is_none() && !retained_startup {
-            capacity::require_available(&state).map_err(|error| error.message)?;
+            capacity::require_available(&state)?;
         }
-        capacity::Reservation::install(&mut admission, host, &mut state, source)
-            .map_err(|error| error.message)?;
+        capacity::Reservation::install(&mut admission, host, &mut state, source)?;
         state.inventory_generation += 1;
         state.proof().clone()
     };
-    let result = restore_reserved(host, client, source, &proof);
+    let result = restore_reserved(host, client, source, &proof).map_err(setup_error);
     drop(admission);
     result
 }
@@ -247,22 +299,26 @@ fn restore_reserved(
     client: ClientId,
     source: &Session,
     proof: &HostSessionProof,
-) -> Result<ServerResponse, String> {
-    let directory = registry::directory(Kind::Native)?;
+) -> Result<ServerResponse, SetupError> {
+    let directory = registry::directory(Kind::Native).map_err(SetupError::Unavailable)?;
     let record = registry::recovery_candidate(
         &registry::socket(&directory, source.id),
         Kind::Native,
-    )?
-    .ok_or(
-        "The durable native holder is unavailable; this conversation was not restarted or resent",
-    )?;
+    ).map_err(SetupError::Unavailable)?
+    .ok_or_else(|| SetupError::Unavailable(
+        "The durable native holder is unavailable; this conversation was not restarted or resent".into(),
+    ))?;
     if Handle::is_remote_record(&record) {
-        return super::retained_actor::restore(host, client, source, proof, record);
+        return super::retained_actor::restore_for_start(host, client, source, proof, record);
     }
     if source.launch.provider == Provider::Claude {
         return Err("The retained Claude owner uses an unsupported private protocol; its owner and evidence were preserved".into());
     }
-    let (recovery, exited) = chat::native_holder::inspect(&record, proof)?;
+    // This private RPC still exposes operational failures as strings. Keep
+    // Retry conservatively; the explicit descriptor/holder checks below are
+    // permanent refusals and no failure authorizes a replacement provider.
+    let (recovery, exited) =
+        chat::native_holder::inspect(&record, proof).map_err(SetupError::Unavailable)?;
     if exited {
         return Err("The retained native server exited; explicitly resume the conversation to start another server".into());
     }
@@ -281,9 +337,11 @@ fn restore_reserved(
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     match &result {
         Ok(_) => state.native_adoption_failures.clear(source.id),
-        Err(reason) => state
-            .native_adoption_failures
-            .remember(source.id, sources, reason),
+        Err(reason) => {
+            state
+                .native_adoption_failures
+                .remember(source.id, sources, &reason.to_string())
+        }
     }
     drop(state);
     if result.is_ok() {
@@ -299,7 +357,7 @@ fn restore_authenticated(
     proof: &HostSessionProof,
     record: registry::Record,
     recovery: chat::native_holder::Recovery,
-) -> Result<ServerResponse, String> {
+) -> Result<ServerResponse, SetupError> {
     let mut retained: Vec<_> = recovery
         .previous_sources
         .iter()
@@ -307,12 +365,14 @@ fn restore_authenticated(
         .chain(std::iter::once(recovery.source.clone()))
         .map(crate::agent_execution::HostedSession::Chat)
         .collect();
-    let execution_registry = super::super::agent_execution::registry(host)?;
+    let execution_registry =
+        super::super::agent_execution::registry(host).map_err(SetupError::Unavailable)?;
     let directory = execution_registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .retained_agent_directory(&retained)?;
-    let (mut spec, mut adapter) = chat::protocol::codex::create_restored(&recovery)?;
+        .retained_agent_directory(&retained)
+        .map_err(SetupError::Unavailable)?;
+    let (mut spec, mut adapter) = chat::protocol::codex::create_restored_for_start(&recovery)?;
     spec.environment = recovery.execution_environment.0.clone();
     spec.execution =
         directory.map(|identity| Arc::new(chat::protocol::ExecutionContext::restored(identity)));
@@ -323,9 +383,10 @@ fn restore_authenticated(
         .as_ref()
         .map(|seal| Arc::new(seal.recognizer()));
     let execution_context = spec.execution.clone();
-    let mut initial = adapter.initialize()?;
-    let store = chat::runtime::preflight_retained(&spec, &mut initial)?;
-    let (holder, recovery) = chat::native_holder::adopt(&record, source, proof)?;
+    let mut initial = adapter.initialize_for_start()?;
+    let store = chat::runtime::preflight_retained_for_start(&spec, &mut initial)?;
+    let (holder, recovery) =
+        chat::native_holder::adopt(&record, source, proof).map_err(SetupError::Unavailable)?;
     let mut session = recovery.source.clone();
     let execution_console = recovery.execution_console.clone();
     let paired_holder = recovery.paired_holder.clone();
@@ -343,7 +404,8 @@ fn restore_authenticated(
         recovery,
         holder,
         move |update| changed_owned(&weak, id, execution_instance, update),
-    )?;
+    )
+    .map_err(SetupError::Unavailable)?;
     // Installation is still reversible: close drops only this new connection
     // until the exact server confirms the retained thread and the host owns it.
     let confirmed = (|| {
@@ -352,22 +414,27 @@ fn restore_authenticated(
             if crate::daemon::termination_requested()
                 || host.lock().unwrap_or_else(|p| p.into_inner()).shutting_down
             {
-                return Err("Daemon shutdown interrupted native adoption".into());
+                return Err(SetupError::Unavailable(
+                    "Daemon shutdown interrupted native adoption".into(),
+                ));
             }
             if let Some(error) = handle.failure() {
-                return Err(error);
+                return Err(SetupError::Unavailable(error));
             }
             if handle.is_completed() {
-                return Err("Retained server disconnected during adoption".into());
+                return Err(SetupError::Unavailable(
+                    "Retained server disconnected during adoption".into(),
+                ));
             }
-            if restored_thread_ready(&handle, expected_thread.as_deref())? {
+            if restored_thread_ready(&handle, expected_thread.as_deref())
+                .map_err(SetupError::Invalid)?
+            {
                 return Ok(());
             }
             if Instant::now() >= deadline {
-                return Err(
-                    "Retained server did not confirm durable continuity for its thread within 30 seconds"
-                        .into(),
-                );
+                return Err(SetupError::Unavailable(
+                    "Retained server did not confirm durable continuity for its thread within 30 seconds".into(),
+                ));
             }
             thread::sleep(Duration::from_millis(20));
         }
@@ -377,19 +444,25 @@ fn restore_authenticated(
         // In particular, Codex can retain metadata while removed account
         // storage makes its rollout unavailable. Preserve its owner without
         // claiming a live attachment or recreating the missing account.
-        return match handle.close() {
-            Ok(()) => Err(format!(
+        let message = match handle.close() {
+            Ok(()) => format!(
                 "Cannot reattach the retained native conversation: {error}. Provider ownership was preserved; no replacement was started or prompt resent"
-            )),
-            Err(cleanup) => Err(format!(
+            ),
+            Err(cleanup) => format!(
                 "Cannot reattach the retained native conversation: {error}. Local attachment cleanup is unconfirmed: {cleanup}; no replacement was started or prompt resent"
-            )),
+            ),
         };
+        return Err(match error {
+            SetupError::Invalid(_) => SetupError::Invalid(message),
+            SetupError::Unavailable(_) => SetupError::Unavailable(message),
+        });
     }
     let paired = (|| {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         if state.shutting_down {
-            return Err("Daemon shutdown interrupted native adoption".to_string());
+            return Err(SetupError::Unavailable(
+                "Daemon shutdown interrupted native adoption".into(),
+            ));
         }
         let Some(terminal) = &mut session.terminal else {
             return Ok(None);
@@ -398,7 +471,7 @@ fn restore_authenticated(
         // Keep that exact worker through the native holder's acknowledgment;
         // an equal recipe alone cannot authorize a concurrent replacement.
         let (projected, worker) =
-            project_paired_terminal(&state, terminal, paired_holder.as_ref(), proof)?;
+            project_paired_terminal_for_start(&state, terminal, paired_holder.as_ref(), proof)?;
         *terminal = projected;
         Ok(Some(worker))
     })();
@@ -417,7 +490,7 @@ fn restore_authenticated(
             .and_then(|handle| handle.holder_identity().cloned()),
     ) {
         let _ = handle.close();
-        return Err(error);
+        return Err(SetupError::Unavailable(error));
     }
     retained.extend(
         sources
@@ -434,7 +507,7 @@ fn restore_authenticated(
         )
     {
         let _ = handle.close();
-        return Err(error);
+        return Err(SetupError::Unavailable(error));
     }
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
     let pair_unchanged =
@@ -445,9 +518,17 @@ fn restore_authenticated(
     {
         drop(state);
         let _ = handle.close();
-        return Err(
-            "Native adoption was interrupted before its paired ownership could be installed".into(),
-        );
+        return Err(if !pair_unchanged {
+            SetupError::Invalid(
+                "Native adoption was interrupted before its paired ownership could be installed"
+                    .into(),
+            )
+        } else {
+            SetupError::Unavailable(
+                "Native adoption was interrupted before its paired ownership could be installed"
+                    .into(),
+            )
+        });
     }
     let observation = Observation {
         after_generation: handle.observe_next_update(),
@@ -475,7 +556,8 @@ fn restore_authenticated(
         returning_terminal: false,
     };
     drop(state);
-    let response = session_snapshot(&record.session, &record.handle)?;
+    let response =
+        session_snapshot(&record.session, &record.handle).map_err(SetupError::Unavailable)?;
     #[cfg(test)]
     BEFORE_PUBLICATION.with(|slot| {
         if let Some(action) = slot.borrow_mut().take() {
@@ -483,6 +565,11 @@ fn restore_authenticated(
         }
     });
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    let pair_current = pair_projection_is_current(
+        &state,
+        record.session.terminal.as_ref(),
+        record.paired_terminal.as_ref(),
+    );
     if state.shutting_down
         || require_unreserved_terminals(&state, &record.session).is_err()
         || state.proof() != proof
@@ -490,20 +577,23 @@ fn restore_authenticated(
             .chats
             .get(&id)
             .is_some_and(|current| current.handle.owns_work())
-        || !pair_projection_is_current(
-            &state,
-            record.session.terminal.as_ref(),
-            record.paired_terminal.as_ref(),
-        )
+        || !pair_current
     {
         drop(state);
         let _ = record.handle.close();
-        return Err("Native adoption changed before attachment publication".into());
+        return Err(if pair_current {
+            SetupError::Unavailable("Native adoption changed before attachment publication".into())
+        } else {
+            SetupError::Invalid("Native adoption changed before attachment publication".into())
+        });
     }
     // This path constructs a Local adopted handle: committing is an atomic
     // flag, not a holder RPC. Keep it uncommitted through every refusal above
     // so dropping the failed attachment preserves the original provider.
-    record.handle.commit_native_installation()?;
+    record
+        .handle
+        .commit_native_installation()
+        .map_err(SetupError::Unavailable)?;
     let retired = state.chats.insert(id, record);
     if let Some(context) = execution_context {
         context.installed();

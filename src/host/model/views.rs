@@ -2,7 +2,7 @@ use super::*;
 use crate::workspace_model::views::{Change, Scope, View};
 
 pub(in crate::host::model) mod store;
-pub(super) use store::{all, occupied, operation_seen, read};
+pub(super) use store::{all, occupied, occupied_for_start, operation_seen, read};
 
 pub(super) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
     let current: u32 = tx

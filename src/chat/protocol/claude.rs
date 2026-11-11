@@ -42,10 +42,18 @@ const MODES: &[&str] = &[
 ];
 
 pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
+    create_for_start(launch).map_err(|error| error.to_string())
+}
+
+pub(crate) fn create_for_start(
+    launch: &Launch,
+) -> Result<(ProcessSpec, Box<dyn Adapter>), super::SetupError> {
     create_inner(launch, None, false)
 }
 
-pub(super) fn create_history(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
+pub(super) fn create_history_for_start(
+    launch: &Launch,
+) -> Result<(ProcessSpec, Box<dyn Adapter>), super::SetupError> {
     create_inner(launch, None, true)
 }
 
@@ -173,14 +181,14 @@ pub(crate) fn create_prepared(
     identity: PreparedIdentity,
 ) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
     identity.validate(launch)?;
-    create_inner(launch, Some(identity), false)
+    create_inner(launch, Some(identity), false).map_err(|error| error.to_string())
 }
 
 fn create_inner(
     launch: &Launch,
     prepared: Option<PreparedIdentity>,
     forced_history: bool,
-) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
+) -> Result<(ProcessSpec, Box<dyn Adapter>), super::SetupError> {
     if forced_history
         && (launch
             .session_id
@@ -201,7 +209,7 @@ fn create_inner(
     }
     let mut spec = ProcessSpec::from(&launch.recipe);
     spec.stdout_noise = Some(embedded_protocol_frame);
-    spec.arguments = arguments(launch)?;
+    spec.arguments = arguments(launch).map_err(super::SetupError::Invalid)?;
     let history_only = forced_history || launch.needs_read_only_history();
     // A conversation whose saved history cannot be shown still resumes: the
     // provider keeps its own copy. Only a reader with no provider needs it.
@@ -219,7 +227,7 @@ fn create_inner(
         Ok(history) => (history, None),
         Err(HistoryUnavailable::Unreadable(error)) if !history_only => {
             tracing::warn!(%error, "Resuming a Claude conversation without its saved history");
-            (None, Some(error))
+            (None, Some(error.to_string()))
         }
         Err(HistoryUnavailable::Missing(error) | HistoryUnavailable::Unreadable(error)) => {
             return Err(error);
@@ -360,20 +368,9 @@ fn arguments(launch: &Launch) -> Result<Vec<String>, String> {
         ) && inline.is_none()
         {
             // Replaced below; never replay the positional prompt from the TUI recipe.
-        } else if matches!(
-            flag,
-            "--model"
-                | "--agent"
-                | "--permission-mode"
-                | "--settings"
-                | "--setting-sources"
-                | "--effort"
-                | "--system-prompt"
-                | "--append-system-prompt"
-                | "--max-turns"
-                | "--max-budget-usd"
-                | "--fallback-model"
-        ) {
+        } else if crate::chat::fresh::claude_arity(flag)
+            == Some(crate::chat::fresh::ArgumentArity::Value)
+        {
             let value = inline
                 .or_else(|| args.next().map(String::as_str))
                 .ok_or_else(|| format!("Missing value for Claude {flag}"))?;
@@ -387,17 +384,9 @@ fn arguments(launch: &Launch) -> Result<Vec<String>, String> {
                 return Err(format!("Unknown Claude launch permission mode {value}"));
             }
             result.extend([flag.into(), value.into()]);
-        } else if matches!(
-            flag,
-            "--add-dir"
-                | "--mcp-config"
-                | "--plugin-dir"
-                | "--allowedTools"
-                | "--allowed-tools"
-                | "--disallowedTools"
-                | "--disallowed-tools"
-                | "--tools"
-        ) {
+        } else if crate::chat::fresh::claude_arity(flag)
+            == Some(crate::chat::fresh::ArgumentArity::Values)
+        {
             result.push(flag.into());
             if let Some(value) = inline {
                 result.push(value.into());
@@ -410,17 +399,9 @@ fn arguments(launch: &Launch) -> Result<Vec<String>, String> {
                     return Err(format!("Missing value for Claude {flag}"));
                 }
             }
-        } else if matches!(
-            flag,
-            "--bare"
-                | "--safe-mode"
-                | "--no-chrome"
-                | "--chrome"
-                | "--strict-mcp-config"
-                | "--disable-slash-commands"
-                | "--dangerously-skip-permissions"
-                | "--allow-dangerously-skip-permissions"
-        ) && inline.is_none()
+        } else if crate::chat::fresh::claude_arity(flag)
+            == Some(crate::chat::fresh::ArgumentArity::Switch)
+            && inline.is_none()
         {
             result.push(arg.clone());
         } else if !flag.starts_with('-') {
@@ -2773,12 +2754,16 @@ impl Adapter for Claude {
         !self.deferred_attention.is_empty()
     }
     fn initialize(&mut self) -> Result<Step, String> {
+        self.initialize_for_start()
+            .map_err(|error| error.to_string())
+    }
+    fn initialize_for_start(&mut self) -> Result<Step, super::SetupError> {
         let mut step = if self.history_only {
             Step::default()
         } else {
             self.control(
                 json!({"subtype":"initialize", "forwardSubagentText":true, "supportedDialogKinds":[], "promptSuggestions":true}),
-            )?
+            ).map_err(super::SetupError::Invalid)?
         };
         if let Some(error) = self.history_error.take() {
             step.events.push(Event::History {
@@ -2817,10 +2802,11 @@ impl Adapter for Claude {
                     .filter(|id| history.agent_status.get(*id) == Some(&ToolStatus::Running))
                     .cloned(),
             );
-            let frames = history.page()?;
+            let frames = history.page_for_start()?;
             let mut history_step = Step::default();
             for frame in frames {
-                self.history_message(&frame, &mut history_step)?;
+                self.history_message(&frame, &mut history_step)
+                    .map_err(super::SetupError::Invalid)?;
             }
             // Replayed Agent tool uses can reinsert completed background jobs.
             // The full history index is authoritative even when a sidecar is
@@ -6551,11 +6537,11 @@ fn skipped_parent(
 #[derive(Debug)]
 enum HistoryUnavailable {
     /// There is no transcript, so Claude Code has nothing to resume either.
-    Missing(String),
+    Missing(super::SetupError),
     /// The transcript is there, but cagents cannot read it, for example
     /// because it is too large to index. Claude Code may still resume from
     /// it.
-    Unreadable(String),
+    Unreadable(super::SetupError),
 }
 type HistoryCalls = HashMap<usize, std::sync::Arc<Value>>;
 #[derive(Debug)]
@@ -6624,8 +6610,8 @@ struct Compaction {
 impl History {
     /// The account configuration and resolved directory whose transcript a
     /// launch resumes. Only a launch that names neither exactly fails here.
-    fn locate(launch: &Launch, id: &str) -> Result<(PathBuf, PathBuf), String> {
-        validate_id(id)?;
+    fn locate(launch: &Launch, id: &str) -> Result<(PathBuf, PathBuf), super::SetupError> {
+        validate_id(id).map_err(super::SetupError::Invalid)?;
         let saved_cwd = &launch.recipe.working_directory;
         let cwd = match saved_cwd.canonicalize() {
             Ok(cwd) => cwd,
@@ -6641,7 +6627,11 @@ impl History {
             {
                 saved_cwd.clone()
             }
-            Err(error) => return Err(format!("Cannot resolve Claude session directory: {error}")),
+            Err(error) => {
+                return Err(super::SetupError::Unavailable(format!(
+                    "Cannot resolve Claude session directory: {error}"
+                )));
+            }
         };
         let config = launch
             .recipe
@@ -6672,7 +6662,15 @@ impl History {
     }
 
     fn open(config: &Path, cwd: &Path, id: &str) -> Result<Self, HistoryUnavailable> {
-        let path = crate::agent::claude_transcript(config, cwd, id).map_err(|error| {
+        let path = crate::agent::claude_transcript_for_start(config, cwd, id).map_err(|error| {
+            let error = match error {
+                crate::agent::ClaudeTranscriptError::Invalid(message) => {
+                    super::SetupError::Invalid(message)
+                }
+                crate::agent::ClaudeTranscriptError::Unavailable(message) => {
+                    super::SetupError::Unavailable(message)
+                }
+            };
             if crate::agent::claude_transcript_exists(config, cwd, id) {
                 HistoryUnavailable::Unreadable(error)
             } else {
@@ -6685,14 +6683,17 @@ impl History {
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         let file = options.open(&path).map_err(|error| {
-            let message = format!("Cannot open exact Claude transcript: {error}");
+            let failure = super::SetupError::Unavailable(format!(
+                "Cannot open exact Claude transcript: {error}"
+            ));
             if error.kind() == std::io::ErrorKind::NotFound {
-                HistoryUnavailable::Missing(message)
+                HistoryUnavailable::Missing(failure)
             } else {
-                HistoryUnavailable::Unreadable(message)
+                HistoryUnavailable::Unreadable(failure)
             }
         })?;
-        let mut history = Self::index(file, id).map_err(HistoryUnavailable::Unreadable)?;
+        let mut history = Self::index_for_start(file, id, 32 * 1024 * 1024, 200_000)
+            .map_err(HistoryUnavailable::Unreadable)?;
         history.subagent_dir = Some(path.with_extension("").join("subagents"));
         Ok(history)
     }
@@ -6700,13 +6701,24 @@ impl History {
         Self::index_with_tool_budget(file, id, 32 * 1024 * 1024, 200_000)
     }
     fn index_with_tool_budget(
-        mut file: File,
+        file: File,
         id: &str,
         tool_bytes_limit: usize,
         tool_count_limit: usize,
     ) -> Result<Self, String> {
+        Self::index_for_start(file, id, tool_bytes_limit, tool_count_limit)
+            .map_err(|error| error.to_string())
+    }
+    fn index_for_start(
+        mut file: File,
+        id: &str,
+        tool_bytes_limit: usize,
+        tool_count_limit: usize,
+    ) -> Result<Self, super::SetupError> {
         use std::io::BufRead as _;
-        let metadata = file.metadata().map_err(|e| e.to_string())?;
+        let metadata = file
+            .metadata()
+            .map_err(|e| super::SetupError::Unavailable(e.to_string()))?;
         if !metadata.is_file() || metadata.len() > 256 * 1024 * 1024 {
             return Err("Claude transcript must be a regular file smaller than 256 MiB".into());
         }
@@ -6727,7 +6739,7 @@ impl History {
             let count = std::io::Read::by_ref(&mut reader)
                 .take(MAX_PAYLOAD as u64 + 1)
                 .read_until(b'\n', &mut line)
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| super::SetupError::Unavailable(e.to_string()))?;
             if count == 0 {
                 break;
             }
@@ -6741,7 +6753,7 @@ impl History {
                     let more = std::io::Read::by_ref(&mut reader)
                         .take(MAX_PAYLOAD as u64)
                         .read_until(b'\n', &mut line)
-                        .map_err(|e| e.to_string())?;
+                        .map_err(|e| super::SetupError::Unavailable(e.to_string()))?;
                     if more == 0 {
                         break;
                     }
@@ -7166,7 +7178,8 @@ impl History {
             result_calls,
             tool_identities,
             ambiguous,
-        } = history_branches::index(&nodes, &seen, &mut parents)?;
+        } = history_branches::index(&nodes, &seen, &mut parents)
+            .map_err(super::SetupError::Invalid)?;
         gaps.sort_unstable_by_key(|gap| gap.at);
         let mut gaps = gaps.into_iter().peekable();
         let mut chain = Vec::with_capacity(records.len() + gaps.len());
@@ -7432,31 +7445,48 @@ impl History {
         Ok(children)
     }
     fn read_record(&mut self, offset: u64, len: u64, base: usize) -> Result<Value, String> {
+        self.read_record_for_start(offset, len, base)
+            .map_err(|error| error.to_string())
+    }
+    fn read_record_for_start(
+        &mut self,
+        offset: u64,
+        len: u64,
+        base: usize,
+    ) -> Result<Value, super::SetupError> {
         self.file
             .seek(SeekFrom::Start(offset))
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| super::SetupError::Unavailable(e.to_string()))?;
         let mut bytes = vec![0; len as usize];
         self.file
             .read_exact(&mut bytes)
-            .map_err(|e| e.to_string())?;
-        let mut frame: Value = serde_json::from_slice(&bytes)
-            .map_err(|e| format!("Claude history changed while reading: {e}"))?;
+            .map_err(|e| super::SetupError::Unavailable(e.to_string()))?;
+        let mut frame: Value = serde_json::from_slice(&bytes).map_err(|e| {
+            super::SetupError::Unavailable(format!("Claude history changed while reading: {e}"))
+        })?;
         // The provider can rewrite this inode after indexing. Revalidate the
         // record being published, including off-page tool-call dependencies.
+        // A mismatch here invalidates this read, not the immutable launch:
+        // another attempt can reindex the repaired or newly settled file.
         if frame["sessionId"]
             .as_str()
             .is_some_and(|id| id != self.session_id)
         {
-            return Err("Claude history changed session identity while reading".into());
+            return Err(super::SetupError::Unavailable(
+                "Claude history changed session identity while reading".into(),
+            ));
         }
-        frame["_cagents_block_base"] = json!(base);
-        frame
-            .as_object_mut()
-            .ok_or("Claude history message is not an object")?
-            .remove("supersedes");
+        let object = frame.as_object_mut().ok_or_else(|| {
+            super::SetupError::Unavailable("Claude history message is not an object".into())
+        })?;
+        object.insert("_cagents_block_base".into(), json!(base));
+        object.remove("supersedes");
         Ok(frame)
     }
     fn page(&mut self) -> Result<Vec<HistoryRecord>, String> {
+        self.page_for_start().map_err(|error| error.to_string())
+    }
+    fn page_for_start(&mut self) -> Result<Vec<HistoryRecord>, super::SetupError> {
         let mut start = self.offset;
         let mut total = 0;
         let mut charged = HashSet::new();
@@ -7505,7 +7535,7 @@ impl History {
                 Link::Record(offset, len, base) => {
                     positions.insert(offset, result.len());
                     HistoryRecord {
-                        frame: self.read_record(offset, len, base)?,
+                        frame: self.read_record_for_start(offset, len, base)?,
                         tool_calls: HashMap::new(),
                         gap: None,
                     }
@@ -7541,7 +7571,7 @@ impl History {
             let mut original = if positions.contains_key(&offset) {
                 None
             } else {
-                Some(self.read_record(offset, len, base)?)
+                Some(self.read_record_for_start(offset, len, base)?)
             };
             for index in indices {
                 let block = if let Some(position) = positions.get(&offset) {
@@ -7549,21 +7579,31 @@ impl History {
                         .as_array()
                         .and_then(|blocks| blocks.get(index))
                         .cloned()
-                        .ok_or("Claude indexed tool block changed while reading")?
+                        .ok_or_else(|| {
+                            super::SetupError::Unavailable(
+                                "Claude indexed tool block changed while reading".into(),
+                            )
+                        })?
                 } else {
                     let blocks = original.as_mut().unwrap()["message"]["content"]
                         .as_array_mut()
-                        .ok_or("Claude indexed tool call changed while reading")?;
-                    std::mem::take(
-                        blocks
-                            .get_mut(index)
-                            .ok_or("Claude indexed tool block changed while reading")?,
-                    )
+                        .ok_or_else(|| {
+                            super::SetupError::Unavailable(
+                                "Claude indexed tool call changed while reading".into(),
+                            )
+                        })?;
+                    std::mem::take(blocks.get_mut(index).ok_or_else(|| {
+                        super::SetupError::Unavailable(
+                            "Claude indexed tool block changed while reading".into(),
+                        )
+                    })?)
                 };
                 if !matches!(string(&block, "type"), "tool_use" | "server_tool_use") {
-                    return Err("Claude indexed tool call changed while reading".into());
+                    return Err(super::SetupError::Unavailable(
+                        "Claude indexed tool call changed while reading".into(),
+                    ));
                 }
-                required(&block, "name")?;
+                required(&block, "name").map_err(super::SetupError::Unavailable)?;
                 call_blocks.insert((offset, index), std::sync::Arc::new(block));
             }
         }
@@ -7578,14 +7618,19 @@ impl History {
                     let block = record.frame["message"]["content"]
                         .as_array()
                         .and_then(|blocks| blocks.get(result_index))
-                        .ok_or("Claude indexed tool result changed while reading")?;
+                        .ok_or_else(|| {
+                            super::SetupError::Unavailable(
+                                "Claude indexed tool result changed while reading".into(),
+                            )
+                        })?;
                     let context = call_blocks[&(call, call_index)].clone();
                     if string(block, "type") != "tool_result"
-                        || required(block, "tool_use_id")? != required(&context, "id")?
+                        || required(block, "tool_use_id").map_err(super::SetupError::Unavailable)?
+                            != required(&context, "id").map_err(super::SetupError::Unavailable)?
                     {
-                        return Err(
-                            "Claude indexed tool result identity changed while reading".into()
-                        );
+                        return Err(super::SetupError::Unavailable(
+                            "Claude indexed tool result identity changed while reading".into(),
+                        ));
                     }
                     let context =
                         if let Some(identity) = self.tool_identities.get(&(call, call_index)) {
@@ -18950,7 +18995,10 @@ mod tests {
             },
         };
         // Nothing saved at all.
-        assert!(create(&launch(id)).is_err());
+        assert!(matches!(
+            create_for_start(&launch(id)),
+            Err(super::super::SetupError::Unavailable(_))
+        ));
         // Too large for cagents to index, though Claude Code reads it.
         std::fs::create_dir_all(config.join("projects")).unwrap();
         let project = config.join("projects").join(
@@ -18965,12 +19013,12 @@ mod tests {
             .unwrap()
             .set_len(257 * 1024 * 1024)
             .unwrap();
-        let (spec, mut adapter) = create(&launch(id)).unwrap();
+        let (spec, mut adapter) = create_for_start(&launch(id)).unwrap();
         assert!(!matches!(
             spec.transport,
             super::super::TransportSpec::History
         ));
-        let step = adapter.initialize().unwrap();
+        let step = adapter.initialize_for_start().unwrap();
         let notice = step.events.iter().find_map(|event| match event {
             Event::History { items, .. } => items.iter().find_map(|item| match &item.content {
                 ItemContent::Delivery { summary, body, .. } => {
@@ -18988,10 +19036,103 @@ mod tests {
         assert!(body.starts_with("cagents could not read"), "{body}");
         assert!(body.contains("Details: "), "{body}");
         // Another conversation in the same project has no transcript.
-        assert!(create(&launch("00000000-0000-4000-8000-000000000002")).is_err());
+        assert!(matches!(
+            create_for_start(&launch("00000000-0000-4000-8000-000000000002")),
+            Err(super::super::SetupError::Unavailable(_))
+        ));
         // A reader with no provider has nothing to show and still refuses.
         std::fs::remove_dir(&cwd).unwrap();
-        assert!(create(&launch(id)).is_err());
+        assert!(matches!(
+            create_for_start(&launch(id)),
+            Err(super::super::SetupError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn typed_start_and_read_only_history_keep_damaged_message_markers() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("project");
+        std::fs::create_dir(&cwd).unwrap();
+        let cwd = cwd.canonicalize().unwrap();
+        let config = root.path().join("config");
+        let id = "00000000-0000-4000-8000-000000000001";
+        let project = config.join("projects").join(
+            cwd.to_str()
+                .unwrap()
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                .collect::<String>(),
+        );
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join(format!("{id}.jsonl")),
+            [
+                claude_line("before", None, "user", "", "Before the damaged message"),
+                cut(&claude_line(
+                    "lost",
+                    Some("before"),
+                    "assistant",
+                    "",
+                    "Interrupted answer",
+                )),
+                claude_line(
+                    "after",
+                    Some("lost"),
+                    "user",
+                    "",
+                    "After the damaged message",
+                ),
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        let launch = Launch {
+            provider: Provider::Claude,
+            session_id: Some(id.into()),
+            recipe: crate::model::LaunchRecipe {
+                program: "claude".into(),
+                arguments: Vec::new(),
+                working_directory: cwd,
+                environment: std::collections::BTreeMap::from([(
+                    "CLAUDE_CONFIG_DIR".into(),
+                    config.to_string_lossy().into_owned(),
+                )]),
+                unset_environment: Default::default(),
+            },
+        };
+        for read_only in [false, true] {
+            let (spec, mut adapter) = if read_only {
+                create_history_for_start(&launch)
+            } else {
+                create_for_start(&launch)
+            }
+            .unwrap();
+            assert_eq!(
+                matches!(spec.transport, super::super::TransportSpec::History),
+                read_only
+            );
+            let step = adapter.initialize_for_start().unwrap();
+            let items = step
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::History { items, .. } => Some(items),
+                    _ => None,
+                })
+                .flatten()
+                .collect::<Vec<_>>();
+            for text in ["Before the damaged message", "After the damaged message"] {
+                assert!(items.iter().any(|item| matches!(&item.content, ItemContent::Text { text: body, .. } if body == text)));
+            }
+            assert!(items.iter().any(|item| item.id.starts_with("history-gap:") && matches!(&item.content, ItemContent::Delivery { summary, .. } if summary == "A message here could not be read")));
+            if read_only {
+                assert!(
+                    step.writes.is_empty(),
+                    "paging damaged history must not initialize a provider"
+                );
+            }
+        }
     }
 
     /// Compaction rewrites what the session is carrying, and the context
@@ -19590,5 +19731,403 @@ mod tests {
         let page = history.page().unwrap();
         assert_eq!(page.len(), 2);
         assert_eq!(page[1].tool_calls[&0]["input"]["new_string"], "new-2");
+    }
+}
+
+#[cfg(test)]
+mod startup_history_retryability_tests {
+    use super::*;
+    use std::io::Write;
+
+    const SESSION: &str = "00000000-0000-4000-8000-000000000001";
+
+    fn indexed(path: &Path) -> History {
+        History::index_for_start(File::open(path).unwrap(), SESSION, 4096, 16).unwrap()
+    }
+
+    #[test]
+    fn indexed_transcript_mutation_and_repair_keep_retryable_startup_errors() {
+        let fixture = tempfile::NamedTempFile::new().unwrap();
+        let original = format!(
+            "{}\n",
+            json!({
+                "type":"user", "uuid":"prompt", "parentUuid":null, "sessionId":SESSION,
+                "message":{"role":"user","content":"kept prompt"}
+            })
+        )
+        .into_bytes();
+        let mut malformed = original.clone();
+        malformed[0] = b'[';
+        let replaced = String::from_utf8(original.clone())
+            .unwrap()
+            .replace(SESSION, "00000000-0000-4000-8000-000000000002")
+            .into_bytes();
+        let padded = |bytes: &[u8]| {
+            let mut bytes = bytes.to_vec();
+            bytes.resize(original.len(), b' ');
+            bytes
+        };
+        let truncated = original[..original.len() / 2].to_vec();
+        for (case, changed) in [
+            ("malformed rewrite", malformed),
+            ("replaced session", replaced),
+            ("null rewrite", padded(b"null")),
+            ("array rewrite", padded(b"[]")),
+            ("scalar rewrite", padded(b"1")),
+            ("truncated during read", truncated),
+        ] {
+            std::fs::write(fixture.path(), &original).unwrap();
+            let mut history = indexed(fixture.path());
+            let mut startup = Claude {
+                history: Some(indexed(fixture.path())),
+                ..Claude::default()
+            };
+            let offset = history.offset;
+            std::fs::write(fixture.path(), changed).unwrap();
+            let failure = history.page_for_start().unwrap_err();
+            assert!(
+                matches!(failure, super::super::SetupError::Unavailable(_)),
+                "{case}: {failure}"
+            );
+            assert_eq!(
+                history.offset, offset,
+                "a refused page must remain available after repair"
+            );
+            let failure = startup.initialize_for_start().unwrap_err();
+            assert!(
+                matches!(failure, super::super::SetupError::Unavailable(_)),
+                "startup {case}: {failure}"
+            );
+            std::fs::write(fixture.path(), &original).unwrap();
+            let page = history.page_for_start().unwrap();
+            assert_eq!(page.len(), 1);
+            assert_eq!(page[0]["sessionId"], SESSION);
+            assert_eq!(page[0]["message"]["content"], "kept prompt");
+            let mut repaired = Claude {
+                history: Some(indexed(fixture.path())),
+                ..Claude::default()
+            };
+            assert!(
+                repaired.initialize_for_start().is_ok(),
+                "startup repair: {case}"
+            );
+        }
+    }
+
+    fn padded_record(record: &Value) -> Vec<u8> {
+        let mut bytes = serde_json::to_vec(record).unwrap();
+        assert!(bytes.len() < 1024);
+        bytes.resize(1023, b' ');
+        bytes.push(b'\n');
+        bytes
+    }
+
+    #[test]
+    fn indexed_tool_mutation_and_repair_keep_retryable_startup_errors() {
+        let fixture = tempfile::NamedTempFile::new().unwrap();
+        let call = json!({"type":"assistant", "uuid":"call", "parentUuid":null,
+        "sessionId":SESSION, "message":{"id":"call-message", "role":"assistant", "content":[
+            {"type":"tool_use", "id":"tool-read", "name":"Read", "input":{"file_path":"/fixture/file"}}
+        ]}});
+        let result = json!({"type":"user", "uuid":"result", "parentUuid":"call",
+        "sessionId":SESSION, "message":{"role":"user", "content":[
+            {"type":"tool_result", "tool_use_id":"tool-read", "content":"kept result"}
+        ]}});
+        let original = [padded_record(&call), padded_record(&result)].concat();
+        for case in 0..8 {
+            std::fs::write(fixture.path(), &original).unwrap();
+            let mut history = indexed(fixture.path());
+            let mut startup = Claude {
+                history: Some(indexed(fixture.path())),
+                ..Claude::default()
+            };
+            let offset = history.offset;
+            let mut changed_call = call.clone();
+            let mut changed_result = result.clone();
+            match case {
+                0 => changed_call["message"]["content"] = json!([]),
+                1 => changed_call["message"]["content"][0]["type"] = json!("text"),
+                2 => {
+                    changed_call["message"]["content"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("name");
+                }
+                3 => changed_result["message"]["content"] = json!([]),
+                4 => changed_result["message"]["content"][0]["type"] = json!("text"),
+                5 => {
+                    changed_result["message"]["content"][0]["tool_use_id"] = json!("different-tool")
+                }
+                6 => {
+                    changed_result["message"]["content"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("tool_use_id");
+                }
+                7 => {
+                    changed_call["message"]["content"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("id");
+                }
+                _ => unreachable!(),
+            }
+            std::fs::write(
+                fixture.path(),
+                [padded_record(&changed_call), padded_record(&changed_result)].concat(),
+            )
+            .unwrap();
+            let failure = history.page_for_start().unwrap_err();
+            assert!(
+                matches!(failure, super::super::SetupError::Unavailable(_)),
+                "case {case}: {failure}"
+            );
+            assert_eq!(history.offset, offset);
+            let failure = startup.initialize_for_start().unwrap_err();
+            assert!(
+                matches!(failure, super::super::SetupError::Unavailable(_)),
+                "startup case {case}: {failure}"
+            );
+            std::fs::write(fixture.path(), &original).unwrap();
+            let page = history.page_for_start().unwrap();
+            assert_eq!(page.len(), 2);
+            assert_eq!(page[1].tool_calls[&0]["id"], "tool-read");
+            assert_eq!(page[1]["message"]["content"][0]["tool_use_id"], "tool-read");
+            let mut repaired = Claude {
+                history: Some(indexed(fixture.path())),
+                ..Claude::default()
+            };
+            assert!(
+                repaired.initialize_for_start().is_ok(),
+                "startup repair case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn transcript_read_failure_is_retryable_but_invalid_history_is_not() {
+        let session = "00000000-0000-4000-8000-000000000001";
+        let mut fixture = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            fixture,
+            "{}",
+            json!({
+                "type":"user", "uuid":"foreign-prompt", "parentUuid":null,
+                "sessionId":"00000000-0000-4000-8000-000000000002",
+                "message":{"role":"user","content":"foreign prompt"}
+            })
+        )
+        .unwrap();
+        assert!(matches!(
+            History::index_for_start(File::open(fixture.path()).unwrap(), session, 1024, 16),
+            Err(super::super::SetupError::Invalid(_))
+        ));
+        std::fs::write(
+            fixture.path(),
+            format!(
+                "{}\n",
+                json!({
+                    "type":"user", "uuid":"prompt", "parentUuid":null, "sessionId":session,
+                    "message":{"role":"user","content":"kept prompt"}
+                })
+            ),
+        )
+        .unwrap();
+        // A regular file with an unusable read handle models the same OS read
+        // failure as lost permissions/storage, without depending on test uid.
+        let write_only = || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(fixture.path())
+                .unwrap()
+        };
+        assert!(matches!(
+            History::index_for_start(write_only(), session, 1024, 16),
+            Err(super::super::SetupError::Unavailable(_))
+        ));
+        let mut history = History::index(File::open(fixture.path()).unwrap(), session).unwrap();
+        history.file = write_only();
+        let mut adapter = Claude {
+            history: Some(history),
+            ..Claude::default()
+        };
+        assert!(matches!(
+            adapter.initialize_for_start(),
+            Err(super::super::SetupError::Unavailable(_))
+        ));
+        // Repairing the read handle admits exactly the same saved history.
+        let history = History::index(File::open(fixture.path()).unwrap(), session).unwrap();
+        let mut adapter = Claude {
+            history: Some(history),
+            ..Claude::default()
+        };
+        assert!(adapter.initialize_for_start().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod fresh_recipe_constructor_tests {
+    use super::*;
+
+    const SAVED: &str = "00000000-0000-4000-8000-000000000001";
+    const FOREIGN: &str = "00000000-0000-4000-8000-000000000002";
+
+    fn source(root: &Path, arguments: Vec<String>) -> chat::Session {
+        let home = root.join("home");
+        let cwd = root.join("project");
+        let config = home.join(".claude");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        chat::Session {
+            id: crate::model::TerminalId::new(),
+            launch: Launch {
+                provider: Provider::Claude,
+                session_id: Some(SAVED.into()),
+                recipe: crate::model::LaunchRecipe {
+                    program: root.join("claude").to_string_lossy().into_owned(),
+                    arguments,
+                    working_directory: cwd,
+                    environment: std::collections::BTreeMap::from([
+                        ("HOME".into(), home.to_string_lossy().into_owned()),
+                        (
+                            "CLAUDE_CONFIG_DIR".into(),
+                            config.to_string_lossy().into_owned(),
+                        ),
+                    ]),
+                    unset_environment: ["ANTHROPIC_API_KEY".into()].into(),
+                },
+            },
+            proof: Some(crate::model::HostSessionProof {
+                host_session_id: "old-host".into(),
+                boot_id: "old-boot".into(),
+                host_incarnation: "old-incarnation".into(),
+            }),
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: chat::NativeContinuity::RetainedClaudeActor { protocol: 2 },
+        }
+    }
+
+    #[test]
+    fn fresh_recipe_constructor_admits_claude_selectors_without_reusing_identity_or_payload_flags()
+    {
+        let root = tempfile::tempdir().unwrap();
+        for (model, system, tool) in [
+            ("--resume", "resume", "--resume"),
+            ("resume", "--resume", "resume"),
+        ] {
+            let payload = vec![
+                "--model".to_owned(),
+                model.to_owned(),
+                "--system-prompt".to_owned(),
+                system.to_owned(),
+                format!("--tools={tool}"),
+            ];
+            let selectors = [
+                vec!["--resume".into(), SAVED.into()],
+                vec![format!("--resume={SAVED}")],
+                vec!["-r".into(), SAVED.into()],
+                vec![format!("-r={SAVED}")],
+                vec!["--session-id".into(), SAVED.into()],
+                vec![format!("--session-id={SAVED}")],
+                vec![
+                    "--resume".into(),
+                    SAVED.into(),
+                    format!("-r={SAVED}"),
+                    "--session-id".into(),
+                    SAVED.into(),
+                ],
+            ];
+            for selector in selectors {
+                let saved = source(root.path(), [payload.clone(), selector.clone()].concat());
+                let original = saved.clone();
+                let fresh = saved
+                    .fresh_start()
+                    .expect("an exact selector can be removed for Fresh");
+                assert_eq!(saved, original, "Fresh must leave the saved card untouched");
+                assert_eq!(
+                    fresh.id, saved.id,
+                    "Fresh replaces the same pane's conversation"
+                );
+                assert!(fresh.launch.session_id.is_none());
+                assert!(fresh.proof.is_none());
+                assert!(fresh.terminal.is_none());
+                assert!(fresh.owned_codex_listener.is_none());
+                assert_eq!(
+                    fresh.native_continuity,
+                    chat::NativeContinuity::ReconnectOnly
+                );
+                assert_eq!(fresh.launch.recipe.arguments, payload, "{selector:?}");
+                assert_eq!(
+                    fresh.launch.recipe.environment,
+                    saved.launch.recipe.environment
+                );
+                assert_eq!(
+                    fresh.launch.recipe.unset_environment,
+                    saved.launch.recipe.unset_environment
+                );
+                assert_eq!(
+                    fresh.launch.recipe.working_directory,
+                    saved.launch.recipe.working_directory
+                );
+                let (spec, mut adapter) = create_for_start(&fresh.launch).unwrap();
+                assert!(
+                    spec.arguments
+                        .windows(2)
+                        .any(|pair| pair == ["--model", model])
+                );
+                assert!(
+                    spec.arguments
+                        .windows(2)
+                        .any(|pair| pair == ["--system-prompt", system])
+                );
+                assert!(
+                    spec.arguments
+                        .windows(2)
+                        .any(|pair| pair == ["--tools", tool])
+                );
+                let generated: Vec<_> = spec
+                    .arguments
+                    .iter()
+                    .filter_map(|arg| arg.strip_prefix("--session-id="))
+                    .collect();
+                assert_eq!(generated.len(), 1);
+                assert_ne!(generated[0], SAVED);
+                assert!(uuid::Uuid::parse_str(generated[0]).is_ok());
+                assert!(!spec.arguments.iter().any(|arg| arg == SAVED));
+                let initial = adapter.initialize_for_start().unwrap();
+                assert!(
+                    !serde_json::to_string(&initial.writes)
+                        .unwrap()
+                        .contains(SAVED)
+                );
+                assert_eq!(saved, original);
+                assert!(
+                    !root.path().join("claude").exists(),
+                    "constructors must not execute a provider"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fresh_recipe_constructor_rejects_foreign_or_malformed_claude_selectors_without_mutating_source()
+     {
+        let root = tempfile::tempdir().unwrap();
+        for arguments in [
+            vec!["--resume".into()],
+            vec!["--resume=".into()],
+            vec!["-r=".into()],
+            vec!["--session-id".into()],
+            vec!["--resume".into(), FOREIGN.into()],
+            vec![format!("--session-id={FOREIGN}")],
+            vec!["--resume".into(), "latest".into()],
+            vec!["--resume".into(), SAVED.into(), format!("-r={FOREIGN}")],
+        ] {
+            let saved = source(root.path(), arguments.clone());
+            let original = saved.clone();
+            assert!(saved.fresh_start().is_none(), "{arguments:?}");
+            assert_eq!(saved, original);
+        }
     }
 }

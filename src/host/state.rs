@@ -2970,8 +2970,8 @@ pub(super) fn restore_upgrade(host: &SharedHost) -> Result<Vec<TerminalId>, Stri
     )
 }
 
-/// Lifecycle fixtures that prove their owned providers stopped can supply a
-/// controlled census without depending on unrelated protected host processes.
+/// Lifecycle fixtures inspect real kernel data for their owned process roster
+/// and prove provider retirement without unrelated protected host processes.
 #[cfg(test)]
 pub(in crate::host) fn restore_upgrade_with_process_fixture(
     host: &SharedHost,

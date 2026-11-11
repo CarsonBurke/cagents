@@ -36,7 +36,8 @@ fn start_failure(error: ipc::ProtocolError) -> StartFailure {
         recovery: match error.code {
             ipc::ProtocolErrorCode::AccountRemoved => super::Recovery::Account,
             ipc::ProtocolErrorCode::ChatCapacity => super::Recovery::Capacity,
-            _ => super::Recovery::Retry,
+            _ if error.retryable => super::Recovery::Retry,
+            _ => super::Recovery::Blocked,
         },
     }
 }
@@ -442,18 +443,34 @@ impl Publication {
     }
 }
 
+// Local readability ownership, independent of daemon/provider ownership and
+// ordinary offscreen interest. A frozen UI projection replaces the client's
+// final-body fallback only for this exact connection.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum BodyOwner {
+    #[default]
+    Client,
+    FrozenProjection,
+}
+
+#[derive(Default)]
+struct PublicationPolicy {
+    revision: u64,
+    body_owner: BodyOwner,
+}
+
 struct Publications {
     current: ArcSwap<Publication>,
     // Only writers use this gate. All body derivation and destruction happens
     // outside it; UI presentation readers never acquire a producer lock.
-    commit: Mutex<u64>,
+    commit: Mutex<PublicationPolicy>,
 }
 
 impl Publications {
     fn new(snapshot: Snapshot) -> Self {
         Self {
             current: ArcSwap::from(Publication::initial(snapshot)),
-            commit: Mutex::new(0),
+            commit: Mutex::new(PublicationPolicy::default()),
         }
     }
 
@@ -470,7 +487,7 @@ impl Publications {
     /// alone cannot fence a hide/show cycle while that response is built.
     fn capture(&self) -> (Arc<Publication>, u64) {
         let revision = self.commit.lock().unwrap_or_else(|p| p.into_inner());
-        (self.current.load_full(), *revision)
+        (self.current.load_full(), revision.revision)
     }
 
     fn replace(
@@ -522,9 +539,14 @@ impl Publications {
             if !final_body && current.snapshot.generation != base.snapshot.generation {
                 (None, current, None)
             } else {
+                // A final body is the cold kept-card fallback after ordinary
+                // hiding. Only an explicit handoff to an already readable
+                // frozen projection relinquishes that fallback. Final control
+                // and identity metadata remains authoritative in either mode.
                 let resident = full.is_some()
+                    && current_revision.body_owner == BodyOwner::Client
                     && (final_body
-                        || (*current_revision == revision
+                        || (current_revision.revision == revision
                             && Arc::ptr_eq(base, &current)
                             && body.load(Ordering::Acquire)));
                 let next = if resident {
@@ -1106,12 +1128,73 @@ fn append_text_copy_page(
     Ok(())
 }
 
+enum HandshakeError {
+    Protocol(ipc::ProtocolError),
+    /// No response from a different proof can attach. Only its well-framed
+    /// explicit refusal can describe why an initial hard target was rejected.
+    ProofChanged(Option<ipc::ProtocolError>),
+    Transport(String),
+}
+impl From<String> for HandshakeError {
+    fn from(message: String) -> Self {
+        Self::Transport(message)
+    }
+}
+impl From<&str> for HandshakeError {
+    fn from(message: &str) -> Self {
+        Self::Transport(message.into())
+    }
+}
 fn receive(
     stream: &mut UnixStream,
     codec: &mut FrameCodec,
     request_id: u64,
     proof: Option<&HostSessionProof>,
 ) -> Result<ServerResponse, String> {
+    receive_handshake(stream, codec, request_id, proof).map_err(|error| match error {
+        HandshakeError::Protocol(error) => error.message,
+        HandshakeError::ProofChanged(_) => "Daemon proof changed".into(),
+        HandshakeError::Transport(message) => message,
+    })
+}
+fn receive_start(
+    stream: &mut UnixStream,
+    codec: &mut FrameCodec,
+    request_id: u64,
+    proof: Option<&HostSessionProof>,
+) -> Result<ServerResponse, StartFailure> {
+    receive_handshake(stream, codec, request_id, proof).map_err(|error| match error {
+        HandshakeError::Protocol(error) => start_failure(error),
+        HandshakeError::ProofChanged(error) => StartFailure::retry(
+            error.map_or_else(|| "Daemon proof changed".into(), |error| error.message),
+        ),
+        HandshakeError::Transport(message) => StartFailure::retry(message),
+    })
+}
+fn receive_connect(
+    stream: &mut UnixStream,
+    codec: &mut FrameCodec,
+    request_id: u64,
+    expected: Option<&HostSessionProof>,
+) -> Result<ServerResponse, StartFailure> {
+    receive_handshake(stream, codec, request_id, expected).map_err(|error| match error {
+        HandshakeError::Protocol(error) | HandshakeError::ProofChanged(Some(error)) => {
+            start_failure(error)
+        }
+        HandshakeError::ProofChanged(None) if expected.is_some() => StartFailure {
+            message: "Daemon proof changed".into(),
+            recovery: super::Recovery::Blocked,
+        },
+        HandshakeError::ProofChanged(None) => StartFailure::retry("Daemon proof changed"),
+        HandshakeError::Transport(message) => StartFailure::retry(message),
+    })
+}
+fn receive_handshake(
+    stream: &mut UnixStream,
+    codec: &mut FrameCodec,
+    request_id: u64,
+    proof: Option<&HostSessionProof>,
+) -> Result<ServerResponse, HandshakeError> {
     #[cfg(feature = "ui")]
     let health_request = crate::daemon_health::begin();
     let frame = codec.read(stream);
@@ -1129,11 +1212,17 @@ fn receive(
         crate::daemon_health::incompatible_stream(stream, envelope.version, health_request);
         return Err("Daemon version mismatch; use matched cagents executables".into());
     }
-    if !envelope.proof.is_complete() || proof.is_some_and(|proof| proof != &envelope.proof) {
-        return Err("Daemon proof changed".into());
+    if !envelope.proof.is_complete() {
+        return Err(HandshakeError::ProofChanged(None));
     }
     if envelope.request_id != Some(request_id) {
         return Err("Unexpected daemon response ordering".into());
+    }
+    if proof.is_some_and(|proof| proof != &envelope.proof) {
+        return Err(HandshakeError::ProofChanged(match envelope.message {
+            ServerMessage::Error(error) => Some(error),
+            _ => None,
+        }));
     }
     match envelope.message {
         ServerMessage::Response { response } => {
@@ -1144,7 +1233,7 @@ fn receive(
         ServerMessage::Error(error) => {
             #[cfg(feature = "ui")]
             crate::daemon_health::frame(stream, None, health_request);
-            Err(error.message)
+            Err(HandshakeError::Protocol(error))
         }
         _ => Err("Unexpected daemon handshake frame".into()),
     }
@@ -1189,7 +1278,7 @@ fn restore(
     if session.proof.as_ref() == Some(proof) && !retry_explicit_start {
         return Ok(ClientRequest::ChatAttach { session });
     }
-    let mut refusal = None;
+    let mut refusal: Option<StartFailure> = None;
     if retry_explicit_start
         || !session
             .proof
@@ -1212,7 +1301,7 @@ fn restore(
                 },
             )
             .map_err(|error| error.to_string())?;
-        let sessions = match receive(stream, codec, request_id, Some(proof))? {
+        let sessions = match receive_start(stream, codec, request_id, Some(proof))? {
             ServerResponse::ChatListed { sessions } => sessions,
             _ => return Err("Daemon did not return its native chat inventory".into()),
         };
@@ -1246,7 +1335,7 @@ fn restore(
                         },
                     )
                     .map_err(|error| error.to_string())?;
-                let prepared = match receive(stream, codec, request_id, Some(proof))? {
+                let prepared = match receive_start(stream, codec, request_id, Some(proof))? {
                     ServerResponse::ChatResumePrepared { session } => session,
                     _ => {
                         return Err(
@@ -1306,7 +1395,7 @@ fn restore(
                 },
             )
             .map_err(|error| error.to_string())?;
-        match receive(stream, codec, request_id, Some(proof)) {
+        match receive_start(stream, codec, request_id, Some(proof)) {
             Ok(ServerResponse::UpgradeChatResolved { session: restored })
                 if restored.id == session.id
                     && restored.proof.as_ref() == Some(proof)
@@ -1335,10 +1424,10 @@ fn restore(
                 return Ok(ClientRequest::ChatAttach { session: restored });
             }
             Ok(_) => {
-                refusal = Some(
-                    "The daemon answered this chat's upgrade lineage with a different conversation."
-                        .to_owned(),
-                );
+                refusal = Some(StartFailure {
+                    message: "The daemon answered this chat's upgrade lineage with a different conversation.".into(),
+                    recovery: super::Recovery::Blocked,
+                });
             }
             // A daemon an installer stopped and restarted never wrote an
             // upgrade checkpoint, which is the ordinary case after an
@@ -1358,25 +1447,35 @@ fn restore(
             proof,
             session,
             resumed_from,
-            refusal,
+            refusal.map(|failure| failure.message),
         );
     }
     if session.native_continuity.retains_provider() {
-        return Err(StartFailure::from(format!(
+        let mut failure = refusal.unwrap_or_else(|| {
+            StartFailure::retry("No authenticated native holder was available.")
+        });
+        failure.message = format!(
             "The saved native conversation could not be reattached. Its uncertain work was not restarted or resubmitted. {}",
-            refusal.unwrap_or_else(|| "No authenticated native holder was available.".into())
-        )));
+            failure.message
+        );
+        return Err(failure);
     }
     if session.launch.provider == crate::agent::Provider::Claude && !retry_explicit_start {
-        return Err(StartFailure::from(format!(
+        let mut failure = refusal.unwrap_or_else(|| {
+            StartFailure::retry("No authenticated history attachment was available.")
+        });
+        failure.message = format!(
             "Saved Claude history could not be opened without starting a provider. Its exact conversation and draft are retained. {}",
-            refusal.unwrap_or_else(|| "No authenticated history attachment was available.".into())
-        )));
+            failure.message
+        );
+        return Err(failure);
     }
     if session.launch.session_id.is_none() {
         return Err(StartFailure::fresh(format!(
             "The daemon that was hosting this conversation is no longer running, and this card never recorded a conversation to resume. {}",
-            refusal.unwrap_or_else(|| "No saved daemon proof was available either.".to_owned())
+            refusal
+                .map(|failure| failure.message)
+                .unwrap_or_else(|| "No saved daemon proof was available either.".to_owned())
         )));
     }
     // The live daemon proved its identity during the handshake, so the start
@@ -1433,13 +1532,15 @@ fn resume_retained_claude(
             },
         )
         .map_err(|error| error.to_string())?;
-    let prepared = match receive(stream, codec, request_id, Some(proof)) {
+    let prepared = match receive_start(stream, codec, request_id, Some(proof)) {
         Ok(ServerResponse::ChatResumePrepared { session: prepared }) => prepared,
         Ok(_) => return Err("The daemon did not answer the saved conversation's resume".into()),
-        Err(reason) => {
-            return Err(StartFailure::retry(format!(
-                "The saved conversation could not be reopened yet, so nothing was restarted or resent. {reason}"
-            )));
+        Err(mut failure) => {
+            failure.message = format!(
+                "The saved conversation could not be reopened yet, so nothing was restarted or resent. {}",
+                failure.message
+            );
+            return Err(failure);
         }
     };
     if prepared == session {
@@ -1990,6 +2091,26 @@ impl ClientHandle {
         )
     }
 
+    #[cfg(all(test, feature = "host"))]
+    pub(crate) fn fixture_connect(
+        stream: UnixStream,
+        session: Session,
+        intent: Intent,
+        source: Option<HostSessionProof>,
+    ) -> Result<Self, StartFailure> {
+        Self::connect_on(
+            stream,
+            session,
+            intent,
+            source,
+            false,
+            None,
+            None,
+            None,
+            |_| {},
+        )
+    }
+
     fn connect_on(
         mut stream: UnixStream,
         session: Session,
@@ -2066,7 +2187,7 @@ impl ClientHandle {
                 },
             )
             .map_err(|e| e.to_string())?;
-        let proof = match receive(&mut stream, &mut codec, 1, expected.as_ref())? {
+        let proof = match receive_connect(&mut stream, &mut codec, 1, expected.as_ref())? {
             ServerResponse::Connected { proof, .. } => proof,
             _ => return Err("Daemon did not complete native chat handshake".into()),
         };
@@ -2106,7 +2227,7 @@ impl ClientHandle {
                     },
                 )
                 .map_err(|error| error.to_string())?;
-            match receive(&mut stream, &mut codec, request_id, Some(&proof))? {
+            match receive_start(&mut stream, &mut codec, request_id, Some(&proof))? {
                 ServerResponse::UpgradeChatResolved { session: resolved }
                     if resolved == expected => {}
                 _ => return Err("The daemon did not authenticate the exact canonical chat".into()),
@@ -2596,7 +2717,7 @@ impl ClientHandle {
                             let (old, current) = {
                                 let current_revision = publication.commit.lock().unwrap_or_else(|p| p.into_inner());
                                 let current = publication.current.load_full();
-                                let old = if *current_revision == revision && Arc::ptr_eq(&base, &current) { Some(publication.current.swap(proposed.take().unwrap())) } else { None };
+                                let old = if current_revision.revision == revision && Arc::ptr_eq(&base, &current) { Some(publication.current.swap(proposed.take().unwrap())) } else { None };
                                 (old, current)
                             };
                             let applied = old.is_some(); drop(old); drop(current);
@@ -2987,7 +3108,29 @@ impl ClientHandle {
     /// Keep control notifications flowing for queued commands without keeping
     /// renderable history resident in an offscreen UI card.
     pub(crate) fn set_interest(&self, interested: bool, retain_body: bool) -> Result<(), String> {
-        if !self.inner.alive.load(Ordering::Acquire) {
+        self.update_interest(
+            interested,
+            retain_body,
+            retain_body.then_some(BodyOwner::Client),
+        )
+    }
+
+    /// The caller now owns an already projected, readable source window. Release
+    /// this client's raw body even if its reader died before the UI saw its wake.
+    /// A late final frame still supplies identity/control state, but cannot take
+    /// body ownership back. A later live body request restores normal ownership.
+    pub(crate) fn hand_off_source_body(&self) -> Result<(), String> {
+        self.update_interest(false, false, Some(BodyOwner::FrozenProjection))
+    }
+
+    fn update_interest(
+        &self,
+        interested: bool,
+        retain_body: bool,
+        body_owner: Option<BodyOwner>,
+    ) -> Result<(), String> {
+        let handoff = body_owner == Some(BodyOwner::FrozenProjection);
+        if !handoff && !self.inner.alive.load(Ordering::Acquire) {
             return Err("Chat is disconnected".into());
         }
         let changed = self.inner.visible.swap(interested, Ordering::AcqRel) != interested;
@@ -2999,16 +3142,23 @@ impl ClientHandle {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
             let current = self.inner.publication.current.load_full();
-            if !self.inner.alive.load(Ordering::Acquire) {
+            if !handoff && !self.inner.alive.load(Ordering::Acquire) {
                 (None, current, Err("Chat is disconnected"))
             } else {
+                let owner_changed = body_owner.is_some_and(|owner| {
+                    let changed = revision.body_owner != owner;
+                    revision.body_owner = owner;
+                    changed
+                });
                 let body_changed = self
                     .inner
                     .body_requested
                     .swap(retain_body, Ordering::AcqRel)
-                    != retain_body;
+                    != retain_body
+                    || owner_changed;
                 if body_changed {
-                    *revision = revision
+                    revision.revision = revision
+                        .revision
                         .checked_add(1)
                         .expect("chat body-policy revision exhausted");
                 }
@@ -3025,7 +3175,7 @@ impl ClientHandle {
                     (None, current.resident, current.snapshot.generation)
                 };
                 let observation = (
-                    *revision,
+                    revision.revision,
                     published_resident,
                     published_generation,
                     old.is_some(),
@@ -3049,6 +3199,9 @@ impl ClientHandle {
                 requested_interested = interested, requested_retain_body = retain_body,
                 policy_revision = revision, published_generation, published_resident,
                 metadata_installed);
+        }
+        if !self.inner.alive.load(Ordering::Acquire) {
+            return Err("Chat is disconnected".into());
         }
         if interested && (changed || body_changed) {
             // Controls can use retained metadata immediately. The visibility
@@ -3259,6 +3412,54 @@ mod tests {
             .recovery,
             super::super::Recovery::Retry,
         );
+    }
+
+    #[test]
+    fn start_recovery_uses_retryability_without_losing_typed_recovery() {
+        use super::super::Recovery;
+        use ipc::ProtocolErrorCode;
+
+        for retryable in [false, true] {
+            for (code, recovery) in [
+                (ProtocolErrorCode::AccountRemoved, Recovery::Account),
+                (ProtocolErrorCode::ChatCapacity, Recovery::Capacity),
+                (
+                    ProtocolErrorCode::InvalidRequest,
+                    if retryable {
+                        Recovery::Retry
+                    } else {
+                        Recovery::Blocked
+                    },
+                ),
+                (
+                    ProtocolErrorCode::TerminalUnavailable,
+                    if retryable {
+                        Recovery::Retry
+                    } else {
+                        Recovery::Blocked
+                    },
+                ),
+                (
+                    ProtocolErrorCode::Internal,
+                    if retryable {
+                        Recovery::Retry
+                    } else {
+                        Recovery::Blocked
+                    },
+                ),
+            ] {
+                let failure = start_failure(ipc::ProtocolError::new(
+                    code,
+                    "the daemon's exact reason",
+                    retryable,
+                ));
+                assert_eq!(
+                    failure.recovery, recovery,
+                    "{code:?}, retryable={retryable}"
+                );
+                assert_eq!(failure.message, "the daemon's exact reason");
+            }
+        }
     }
 
     #[test]
@@ -4177,6 +4378,29 @@ mod tests {
     }
 
     #[test]
+    fn retained_resume_preparation_honors_typed_refusals() {
+        for (retryable, expected) in [
+            (true, super::super::Recovery::Retry),
+            (false, super::super::Recovery::Blocked),
+        ] {
+            let (result, resumed, _) = resume_stranded(
+                stranded_claude(Some("6f1f6f1e-4a4b-4c4d-8e8f-909192939495")),
+                move |_| {
+                    ServerMessage::Error(ipc::ProtocolError::new(
+                        ipc::ProtocolErrorCode::TerminalUnavailable,
+                        "Exact preparation refusal",
+                        retryable,
+                    ))
+                },
+            );
+            let failure = result.unwrap_err();
+            assert_eq!(failure.recovery, expected);
+            assert!(failure.message.contains("Exact preparation refusal"));
+            assert!(resumed.is_none());
+        }
+    }
+
+    #[test]
     fn stranded_retained_claude_card_never_replaces_a_live_or_unproved_owner() {
         let source = stranded_claude(Some("6f1f6f1e-4a4b-4c4d-8e8f-909192939495"));
         // A still-present owner is returned unchanged: attach, never replace.
@@ -4199,7 +4423,7 @@ mod tests {
             ServerMessage::Error(ipc::ProtocolError::new(
                 ipc::ProtocolErrorCode::TerminalUnavailable,
                 "The old provider owner has no confirmed close receipt.",
-                false,
+                true,
             ))
         });
         let failure = result.unwrap_err();
@@ -4266,7 +4490,7 @@ mod tests {
             assert!(resumed.is_none());
         }
         // Without a retirement that records the conversation, the daemon
-        // refuses, and the card keeps its conversation behind Retry.
+        // refuses permanently for this card; Resume can locate a new descriptor.
         let (result, resumed, _) = resume_stranded(stranded_claude(None), |_| {
             ServerMessage::Error(ipc::ProtocolError::new(
                 ipc::ProtocolErrorCode::TerminalUnavailable,
@@ -4274,13 +4498,13 @@ mod tests {
                 false,
             ))
         });
-        assert_eq!(result.unwrap_err().recovery, crate::chat::Recovery::Retry);
+        assert_eq!(result.unwrap_err().recovery, crate::chat::Recovery::Blocked);
         assert!(resumed.is_none());
     }
 
     #[test]
     fn explicit_retry_classifies_exact_history_reader_and_live_successor() {
-        for state in 0..5 {
+        for state in 0..7 {
             let proof = host_proof("current");
             let mut source = omp_card(Some(CONVERSATION), Some(proof.clone()));
             source.launch.provider = crate::agent::Provider::Claude;
@@ -4306,14 +4530,14 @@ mod tests {
                     let request: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
                     let response = match (step, request.request) {
                         (0, ClientRequest::ChatList) => ServerResponse::ChatListed {
-                            sessions: if state < 3 {
+                            sessions: if state < 3 || state >= 5 {
                                 vec![expected.clone()]
                             } else {
                                 vec![]
                             },
                         },
                         (1, ClientRequest::ChatPrepareResume { source })
-                            if state < 3 && source == expected =>
+                            if (state < 3 || state >= 5) && source == expected =>
                         {
                             ServerResponse::ChatResumePrepared {
                                 session: expected.clone(),
@@ -4335,7 +4559,15 @@ mod tests {
                                 version: PROTOCOL_VERSION,
                                 request_id: Some(request.request_id),
                                 proof: server_proof.clone(),
-                                message: ServerMessage::Response { response },
+                                message: if step == 1 && state >= 5 {
+                                    ServerMessage::Error(ipc::ProtocolError::new(
+                                        ipc::ProtocolErrorCode::InvalidRequest,
+                                        "Exact resume preparation refusal",
+                                        state == 5,
+                                    ))
+                                } else {
+                                    ServerMessage::Response { response }
+                                },
                             },
                         )
                         .unwrap();
@@ -4365,6 +4597,18 @@ mod tests {
                         .message
                         .contains("changed the explicit retry request")
                 ),
+                5 | 6 => {
+                    let failure = result.unwrap_err();
+                    assert_eq!(
+                        failure.recovery,
+                        if state == 5 {
+                            crate::chat::Recovery::Retry
+                        } else {
+                            crate::chat::Recovery::Blocked
+                        }
+                    );
+                    assert_eq!(failure.message, "Exact resume preparation refusal");
+                }
                 _ => unreachable!(),
             }
         }
@@ -4414,6 +4658,127 @@ mod tests {
             false,
         );
         (outcome, worker.join().unwrap(), recovery)
+    }
+
+    #[test]
+    fn a_changed_midstream_proof_retries_a_new_handshake_instead_of_binding() {
+        let expected = host_proof("expected");
+        let foreign = host_proof("foreign");
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        FrameCodec::new(ipc::MAX_FRAME_BYTES)
+            .write(
+                &mut server,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(2),
+                    proof: foreign,
+                    message: ServerMessage::Error(ipc::ProtocolError::new(
+                        ipc::ProtocolErrorCode::ProofMismatch,
+                        "The former connection changed its daemon proof",
+                        false,
+                    )),
+                },
+            )
+            .unwrap();
+        let failure = receive_start(
+            &mut client,
+            &mut FrameCodec::new(ipc::MAX_FRAME_BYTES),
+            2,
+            Some(&expected),
+        )
+        .unwrap_err();
+        assert_eq!(failure.recovery, crate::chat::Recovery::Retry);
+        assert!(failure.message.contains("former connection"));
+    }
+
+    #[test]
+    fn initial_hard_target_rejects_a_foreign_proof_response_without_attaching() {
+        let expected = host_proof("expected");
+        let foreign = host_proof("foreign");
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || {
+            server
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            let request: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(request.request, ClientRequest::Connect { .. }));
+            codec
+                .write(
+                    &mut server,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(request.request_id),
+                        proof: foreign.clone(),
+                        message: ServerMessage::Response {
+                            response: ServerResponse::Connected {
+                                proof: foreign,
+                                resumed: vec![],
+                            },
+                        },
+                    },
+                )
+                .unwrap();
+            assert!(
+                codec.read::<ClientEnvelope>(&mut server).unwrap().is_none(),
+                "a mismatched response cannot lead to an Attach or Start"
+            );
+        });
+        let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+        codec
+            .write(
+                &mut client,
+                &ClientEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: 1,
+                    proof: None,
+                    request: ClientRequest::Connect {
+                        expected_host: Some(expected.clone()),
+                        resume: vec![],
+                    },
+                },
+            )
+            .unwrap();
+        let failure = receive_connect(&mut client, &mut codec, 1, Some(&expected)).unwrap_err();
+        assert_eq!(failure.recovery, crate::chat::Recovery::Blocked);
+        drop(client);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn cold_retained_codex_resolve_refusal_keeps_the_daemons_recovery() {
+        let live = host_proof("current");
+        for retryable in [false, true] {
+            let mut source = omp_card(Some(CONVERSATION), Some(host_proof("previous")));
+            source.launch.provider = crate::agent::Provider::Codex;
+            source.launch.recipe.program = "codex".into();
+            source.native_continuity = super::super::NativeContinuity::Durable {
+                provider_version: "0.100.0".into(),
+            };
+            let (result, request, recovery) = negotiate_with_recovery(
+                &live,
+                source.clone(),
+                ServerMessage::Error(ipc::ProtocolError::new(
+                    ipc::ProtocolErrorCode::InvalidRequest,
+                    "Exact retained source refusal",
+                    retryable,
+                )),
+            );
+            assert!(
+                matches!(request, ClientRequest::ResolveUpgradeChat { source: requested } if requested == source)
+            );
+            let failure = result.unwrap_err();
+            assert_eq!(
+                failure.recovery,
+                if retryable {
+                    crate::chat::Recovery::Retry
+                } else {
+                    crate::chat::Recovery::Blocked
+                }
+            );
+            assert!(failure.message.contains("Exact retained source refusal"));
+            assert!(recovery.is_none());
+        }
     }
 
     #[test]
@@ -5093,32 +5458,30 @@ mod tests {
         }
     }
 
-    /// A card that cannot bring its conversation back has to show what refused
-    /// it word for word, because the reader decides what to do next from that
-    /// sentence and a generic failure tells them nothing.
+    /// Retry is offered only when the daemon says running the same resume
+    /// can help. Both paths keep its original diagnostic for the reader.
     #[test]
-    fn a_refused_resume_reports_the_daemons_own_sentence() {
-        let failure = restore_against(
-            omp_card(Some(CONVERSATION), Some(host_proof("before-the-update"))),
-            |_| {
-                ServerMessage::Error(crate::terminal_ipc::ProtocolError::new(
-                    crate::terminal_ipc::ProtocolErrorCode::InvalidRequest,
-                    "Provider executable omp is not executable in the preserved launch environment",
-                    false,
-                ))
-            },
-        )
-        .err()
-        .expect("the daemon refused this resume");
-        assert_eq!(
-            failure.message,
-            "Provider executable omp is not executable in the preserved launch environment"
-        );
-        assert_eq!(
-            failure.recovery,
-            crate::chat::Recovery::Retry,
-            "a refusal that can pass leaves the card a retry that runs the same resume"
-        );
+    fn a_refused_resume_honors_the_daemons_retryability_and_keeps_its_words() {
+        let reason = "Cannot join existing Codex daemon for this thread";
+        for (retryable, recovery) in [
+            (false, crate::chat::Recovery::Blocked),
+            (true, crate::chat::Recovery::Retry),
+        ] {
+            let failure = restore_against(
+                omp_card(Some(CONVERSATION), Some(host_proof("before-the-update"))),
+                move |_| {
+                    ServerMessage::Error(ipc::ProtocolError::new(
+                        ipc::ProtocolErrorCode::TerminalUnavailable,
+                        reason,
+                        retryable,
+                    ))
+                },
+            )
+            .err()
+            .expect("the daemon refused this resume");
+            assert_eq!(failure.message, reason);
+            assert_eq!(failure.recovery, recovery, "retryable={retryable}");
+        }
     }
 
     /// A conversation the provider has not named yet - one still loading, or
@@ -6115,6 +6478,205 @@ mod tests {
         assert_eq!(handle.snapshot().transcript_bytes(), 6 * 64 * 1024);
         advance_tx.send(()).unwrap();
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn final_wire_body_respects_frozen_handoff_and_keeps_ordinary_cold_fallback() {
+        #[derive(Clone, Copy, Debug)]
+        enum Case {
+            Visible,
+            HiddenBeforeClose,
+            HiddenAfterClose,
+            FrozenBeforeClose,
+            FrozenDuringFinalDerivation,
+            NewLiveBodyConsumer,
+        }
+        for case in [
+            Case::Visible,
+            Case::HiddenBeforeClose,
+            Case::HiddenAfterClose,
+            Case::FrozenBeforeClose,
+            Case::FrozenDuringFinalDerivation,
+            Case::NewLiveBodyConsumer,
+        ] {
+            let item = |body: &str| {
+                Arc::new(super::super::Item {
+                    id: "final-body".into(),
+                    role: super::super::Role::Assistant,
+                    started_at: None,
+                    at: None,
+                    content: super::super::ItemContent::Text {
+                        text: body.into(),
+                        thinking: false,
+                        phase: Default::default(),
+                    },
+                })
+            };
+            let initial = Snapshot {
+                generation: 1,
+                sampled_at: Some(1_000),
+                ready: true,
+                items: vec![item("original readable source")],
+                ..Default::default()
+            };
+            // Final identity/control state remains authoritative even when its
+            // generation is older and body ownership has moved to the UI.
+            let final_snapshot = Snapshot {
+                generation: 0,
+                session_id: Some("final-session".into()),
+                exited: true,
+                error: Some("Final close reason".into()),
+                items: vec![item("final readable source")],
+                ..Default::default()
+            };
+            let (client, mut server) = UnixStream::pair().unwrap();
+            let (send_tx, send_rx) = std::sync::mpsc::channel();
+            let worker = thread::spawn(move || {
+                server
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                server
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let proof = host_proof("final-body-policy");
+                let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+                let respond =
+                    |codec: &mut FrameCodec, server: &mut UnixStream, request_id, response| {
+                        codec
+                            .write(
+                                server,
+                                &ServerEnvelope {
+                                    version: PROTOCOL_VERSION,
+                                    request_id,
+                                    proof: proof.clone(),
+                                    message: ServerMessage::Response { response },
+                                },
+                            )
+                            .unwrap();
+                    };
+                let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                respond(
+                    &mut codec,
+                    &mut server,
+                    Some(connect.request_id),
+                    ServerResponse::Connected {
+                        proof: proof.clone(),
+                        resumed: vec![],
+                    },
+                );
+                let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                let ClientRequest::ChatStart { session, .. } = start.request else {
+                    panic!("expected start")
+                };
+                let chat_id = session.id;
+                respond(
+                    &mut codec,
+                    &mut server,
+                    Some(start.request_id),
+                    ServerResponse::ChatAttached {
+                        session,
+                        snapshot: initial,
+                    },
+                );
+                send_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                respond(
+                    &mut codec,
+                    &mut server,
+                    None,
+                    ServerResponse::ChatClosed {
+                        chat_id,
+                        snapshot: final_snapshot,
+                    },
+                );
+            });
+            let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+            let handle = ClientHandle::connect_on(
+                client,
+                omp_card(None, None),
+                Intent::Start,
+                None,
+                false,
+                None,
+                None,
+                None,
+                move |wake| {
+                    let _ = wake_tx.send(wake);
+                },
+            )
+            .unwrap();
+            match case {
+                Case::HiddenBeforeClose => handle.set_visible(false).unwrap(),
+                Case::FrozenBeforeClose => handle.hand_off_source_body().unwrap(),
+                Case::NewLiveBodyConsumer => {
+                    handle.hand_off_source_body().unwrap();
+                    handle.set_interest(true, true).unwrap();
+                }
+                _ => {}
+            }
+            let gate = if matches!(case, Case::FrozenDuringFinalDerivation) {
+                let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+                let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+                REPLACEMENT_GATES.lock().unwrap().insert(
+                    Arc::as_ptr(&handle.inner.publication) as usize,
+                    (paused_tx, resume_rx),
+                );
+                Some((paused_rx, resume_tx))
+            } else {
+                None
+            };
+            send_tx.send(()).unwrap();
+            if let Some((paused_rx, resume_tx)) = gate {
+                paused_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(!handle.is_connected());
+                assert!(handle.hand_off_source_body().is_err());
+                assert!(!handle.inner.body_requested.load(Ordering::Acquire));
+                assert!(handle.resident_snapshot_with_clock().is_none());
+                resume_tx.send(()).unwrap();
+            }
+            while handle.snapshot().generation != 0 {
+                wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            worker.join().unwrap();
+            assert!(!handle.is_connected());
+            if matches!(case, Case::HiddenAfterClose) {
+                assert!(handle.set_visible(false).is_err());
+            }
+            let snapshot = handle.snapshot();
+            assert_eq!(
+                snapshot.session_id.as_deref(),
+                Some("final-session"),
+                "{case:?}"
+            );
+            assert!(snapshot.exited && !snapshot.ready, "{case:?}");
+            assert_eq!(
+                snapshot.error.as_deref(),
+                Some("Final close reason"),
+                "{case:?}"
+            );
+            assert_eq!(handle.snapshot_with_clock().1.unwrap().sampled_at, 1_000);
+            let frozen = matches!(
+                case,
+                Case::FrozenBeforeClose | Case::FrozenDuringFinalDerivation
+            );
+            assert_eq!(
+                handle.resident_snapshot_with_clock().is_none(),
+                frozen,
+                "{case:?}"
+            );
+            if frozen {
+                assert_eq!(snapshot.transcript_bytes(), 0, "{case:?}");
+                assert!(handle.inner.publication.current.load().lineage.is_empty());
+            } else {
+                // An ordinary cold kept card reveals from this final body;
+                // its daemon/actor has already closed and cannot hydrate it.
+                let (readable, _) = handle.resident_snapshot_with_clock().unwrap();
+                assert!(
+                    matches!(&readable.items[0].content,
+                    super::super::ItemContent::Text { text, .. } if text == "final readable source"),
+                    "{case:?}"
+                );
+            }
+        }
     }
 
     fn paused_wire_publication(visibility: Option<bool>) {

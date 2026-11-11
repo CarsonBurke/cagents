@@ -196,6 +196,60 @@ fn change(registry: &Registry, scope: &Scope, change: Change) -> ModelEdit {
 }
 
 #[test]
+fn startup_occupied_reads_distinguish_database_pressure_from_corrupt_descriptors() {
+    use crate::chat::protocol::SetupError;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("model.sqlite3");
+    let (channel, _) = schema_22(&path);
+    let scope = Scope::Channel(channel);
+    let pane = terminal("retained source");
+    {
+        let db = Connection::open(&path).unwrap();
+        put_22(&db, &scope, 4, std::slice::from_ref(&pane), &[], &[]);
+    }
+    let registry = Registry::at(&path).unwrap();
+    registry
+        .db
+        .pragma_update(None, "journal_mode", "DELETE")
+        .unwrap();
+    registry.db.busy_timeout(std::time::Duration::ZERO).unwrap();
+    let blocker = Connection::open(&path).unwrap();
+    blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    assert!(matches!(
+        occupied_for_start(&registry.db),
+        Err(SetupError::Unavailable(_))
+    ));
+    blocker.execute_batch("ROLLBACK").unwrap();
+    let recovered = occupied_for_start(&registry.db).unwrap();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].scope, scope);
+    assert_eq!(recovered[0].panes, vec![pane.clone()]);
+
+    registry
+        .db
+        .execute(
+            "UPDATE panes SET descriptor='not-json' WHERE id=?1",
+            [pane.id.to_string()],
+        )
+        .unwrap();
+    assert!(matches!(
+        occupied_for_start(&registry.db),
+        Err(SetupError::Invalid(_))
+    ));
+    registry
+        .db
+        .execute(
+            "UPDATE panes SET descriptor=?2 WHERE id=?1",
+            params![
+                pane.id.to_string(),
+                serde_json::to_string(&pane.kind).unwrap()
+            ],
+        )
+        .unwrap();
+    assert_eq!(occupied_for_start(&registry.db).unwrap(), recovered);
+}
+
+#[test]
 fn schema_22_views_convert_whole_and_convert_back_unchanged() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("model.sqlite3");

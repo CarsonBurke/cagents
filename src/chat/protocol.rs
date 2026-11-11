@@ -32,6 +32,14 @@ impl std::fmt::Display for SetupError {
         }
     }
 }
+impl From<crate::account::scope::ScopeError> for SetupError {
+    fn from(error: crate::account::scope::ScopeError) -> Self {
+        match error {
+            crate::account::scope::ScopeError::Invalid(message) => Self::Invalid(message),
+            crate::account::scope::ScopeError::Unavailable(message) => Self::Unavailable(message),
+        }
+    }
+}
 impl From<&str> for SetupError {
     fn from(message: &str) -> Self {
         Self::Invalid(message.into())
@@ -137,35 +145,48 @@ impl ExecutionContext {
     /// The descriptor remains authoritative after a same-filesystem move;
     /// opening a replacement at the old spelling never changes its identity.
     pub(crate) fn capture(path: &std::path::Path) -> Result<Self, String> {
+        Self::capture_for_start(path).map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn capture_for_start(path: &std::path::Path) -> Result<Self, SetupError> {
         use std::os::unix::fs::OpenOptionsExt;
-        let relative = path
-            .strip_prefix("/")
-            .map_err(|_| "The selected provider directory must be absolute".to_owned())?;
-        let root = crate::fs_safety::Root::open("/".as_ref()).map_err(|error| error.to_string())?;
+        let relative = path.strip_prefix("/").map_err(|_| {
+            SetupError::Invalid("The selected provider directory must be absolute".into())
+        })?;
+        let root = crate::fs_safety::Root::open("/".as_ref())
+            .map_err(|error| SetupError::Unavailable(error.to_string()))?;
         let directory = if relative.as_os_str().is_empty() {
             std::fs::OpenOptions::new()
                 .read(true)
                 .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
                 .open("/")
-                .map_err(|error| error.to_string())
+                .map_err(|error| {
+                    SetupError::Unavailable(format!(
+                        "Cannot pin the selected provider directory {}: {error}",
+                        path.display()
+                    ))
+                })
         } else {
-            crate::fs_safety::open_beneath(&root, relative).map_err(|error| error.to_string())
-        }
-        .map_err(|error| {
-            format!(
-                "Cannot pin the selected provider directory {}: {error}",
-                path.display()
-            )
-        })?;
+            crate::fs_safety::open_beneath(&root, relative).map_err(|error| {
+                let message = format!(
+                    "Cannot pin the selected provider directory {}: {error}",
+                    path.display()
+                );
+                match error {
+                    crate::fs_safety::ResolveError::Escaped { .. } => SetupError::Invalid(message),
+                    crate::fs_safety::ResolveError::Io { .. } => SetupError::Unavailable(message),
+                }
+            })
+        }?;
         if !directory
             .metadata()
-            .map_err(|error| error.to_string())?
+            .map_err(|error| SetupError::Unavailable(error.to_string()))?
             .is_dir()
         {
             return Err("The selected provider directory is not a folder".into());
         }
         let context = Self::new(Some(std::sync::Arc::new(directory)));
-        context.verify_directory(path)?;
+        context.verify_directory_for_start(path)?;
         Ok(context)
     }
 
@@ -184,6 +205,12 @@ impl ExecutionContext {
     pub(crate) fn directory_identity(
         &self,
     ) -> Result<Option<crate::agent_execution::DirectoryIdentity>, String> {
+        self.directory_identity_for_start()
+            .map_err(|error| error.to_string())
+    }
+    pub(crate) fn directory_identity_for_start(
+        &self,
+    ) -> Result<Option<crate::agent_execution::DirectoryIdentity>, SetupError> {
         match &self.directory {
             Some(directory) => directory
                 .metadata()
@@ -192,7 +219,7 @@ impl ExecutionContext {
                         &metadata,
                     ))
                 })
-                .map_err(|error| error.to_string()),
+                .map_err(|error| SetupError::Unavailable(error.to_string())),
             None => Ok(self.expected_directory),
         }
     }
@@ -299,10 +326,18 @@ impl ExecutionContext {
         Ok(true)
     }
     pub(crate) fn verify_directory(&self, path: &std::path::Path) -> Result<(), String> {
-        let Some(expected) = self.directory_identity()? else {
+        self.verify_directory_for_start(path)
+            .map_err(|error| error.to_string())
+    }
+    pub(crate) fn verify_directory_for_start(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<(), SetupError> {
+        let Some(expected) = self.directory_identity_for_start()? else {
             return Ok(());
         };
-        let current = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+        let current = std::fs::symlink_metadata(path)
+            .map_err(|error| SetupError::Unavailable(error.to_string()))?;
         if !current.is_dir()
             || expected != crate::agent_execution::DirectoryIdentity::from_metadata(&current)
         {
@@ -369,6 +404,11 @@ pub trait Adapter: Send {
         None
     }
     fn initialize(&mut self) -> Result<Step, String>;
+    /// Preserve resource failures during history preparation without treating
+    /// malformed initialization data as an invitation to repeat it.
+    fn initialize_for_start(&mut self) -> Result<Step, SetupError> {
+        self.initialize().map_err(SetupError::Invalid)
+    }
     /// Whether the initial handshake still needs its matching provider reply.
     /// Advisory frames do not complete it; later readiness changes are separate.
     fn initialization_pending(&self) -> bool {
@@ -405,6 +445,16 @@ pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String
     launch.provider.create_chat(launch)
 }
 
+pub(crate) fn create_for_start(
+    launch: &Launch,
+) -> Result<(ProcessSpec, Box<dyn Adapter>), SetupError> {
+    match launch.provider {
+        crate::agent::Provider::Codex => codex::create_for_start(launch),
+        crate::agent::Provider::Claude => claude::create_for_start(launch),
+        _ => create(launch).map_err(SetupError::Invalid),
+    }
+}
+
 /// A bounded diagnostic prefix, with terminal controls escaped. Inspect only
 /// the prefix needed for the preview, even when the provider sends a huge line.
 pub(crate) fn diagnostic_preview(bytes: &[u8], limit: usize) -> String {
@@ -427,8 +477,14 @@ pub(crate) fn diagnostic_preview(bytes: &[u8], limit: usize) -> String {
 /// Reconstruct a saved reader without granting permission to launch a provider.
 /// Support is deliberately limited to adapters with a local history transport.
 pub(crate) fn create_history(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
+    create_history_for_start(launch).map_err(|error| error.to_string())
+}
+
+pub(crate) fn create_history_for_start(
+    launch: &Launch,
+) -> Result<(ProcessSpec, Box<dyn Adapter>), SetupError> {
     match launch.provider {
-        crate::agent::Provider::Claude => claude::create_history(launch),
+        crate::agent::Provider::Claude => claude::create_history_for_start(launch),
         _ => {
             Err("This provider does not support restoring a local read-only history reader".into())
         }
@@ -506,6 +562,44 @@ mod launch_tests {
         assert_eq!(context.directory_identity().unwrap(), Some(identity));
         assert!(context.provider_directory_observed(&original).is_err());
         assert!(!context.provider_directory_observed(&moved).unwrap());
+    }
+
+    #[test]
+    fn startup_directory_io_retries_same_pin_but_replacement_and_unsafe_paths_do_not() {
+        let root = tempfile::tempdir().unwrap();
+        let original = root.path().join("original");
+        let parked = root.path().join("parked");
+        assert!(matches!(
+            ExecutionContext::capture_for_start(&original),
+            Err(SetupError::Unavailable(_))
+        ));
+        std::fs::create_dir(&original).unwrap();
+        let context = ExecutionContext::capture_for_start(&original).unwrap();
+        let identity = context.directory_identity().unwrap();
+        std::fs::rename(&original, &parked).unwrap();
+        assert!(matches!(
+            context.verify_directory_for_start(&original),
+            Err(SetupError::Unavailable(_))
+        ));
+        std::fs::rename(&parked, &original).unwrap();
+        assert!(context.verify_directory_for_start(&original).is_ok());
+        assert_eq!(context.directory_identity().unwrap(), identity);
+        std::fs::rename(&original, &parked).unwrap();
+        std::fs::create_dir(&original).unwrap();
+        assert!(matches!(
+            context.verify_directory_for_start(&original),
+            Err(SetupError::Invalid(_))
+        ));
+        assert!(matches!(
+            ExecutionContext::capture_for_start(std::path::Path::new("relative")),
+            Err(SetupError::Invalid(_))
+        ));
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&parked, &alias).unwrap();
+        assert!(matches!(
+            ExecutionContext::capture_for_start(&alias),
+            Err(SetupError::Invalid(_))
+        ));
     }
 
     #[test]

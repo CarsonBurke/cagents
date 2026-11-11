@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "ui")]
 pub mod coordination;
 pub mod failure;
+mod fresh;
 pub mod notification;
 pub mod presentation;
 pub mod pricing;
@@ -351,6 +352,9 @@ pub enum Recovery {
     /// it - a stopped daemon, a busy writer, a provider that failed to launch -
     /// can succeed on the next attempt.
     Retry,
+    /// The daemon refused this start and reported that repeating it cannot help.
+    /// Keep the saved conversation and diagnostic without offering a retry.
+    Blocked,
     /// The daemon has no free resident chat slots. Retrying preserves this
     /// conversation; capacity must become available before it can start.
     Capacity,

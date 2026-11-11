@@ -335,6 +335,11 @@ case "$*" in
     fi
     printf 'Commands:\n  prepare-upgrade  Checkpoint supported sessions\n'
     ;;
+  'daemon store-schema --help'|'daemon downgrade-store --help')
+    [ "$#" -eq 3 ] || exit 98
+    # These read-only capability probes are unsupported by this older CLI.
+    exit 64
+    ;;
   'daemon prepare-upgrade --help')
     [ "$FIXTURE_RESTART" != relaunch-unsupported ] || exit 0
     printf 'Options:\n  --relaunch-agents  Accept fresh launches\n'

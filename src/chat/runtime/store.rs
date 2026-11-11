@@ -9,6 +9,80 @@ use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use std::{fs, io::Write, os::unix::fs::OpenOptionsExt, path::PathBuf};
 
+/// Keep storage failures distinct from malformed provider events until the
+/// startup boundary chooses recovery. Ordinary runtime callers still receive
+/// the same diagnostic string through their compatibility methods.
+#[derive(Debug)]
+pub(super) enum StoreError {
+    Invalid(String),
+    Unavailable(String),
+}
+impl std::fmt::Display for StoreError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(message) | Self::Unavailable(message) => message.fmt(formatter),
+        }
+    }
+}
+impl From<rusqlite::Error> for StoreError {
+    fn from(error: rusqlite::Error) -> Self {
+        use rusqlite::ErrorCode;
+        let repairable = matches!(
+            error.sqlite_error_code(),
+            Some(
+                ErrorCode::PermissionDenied
+                    | ErrorCode::DatabaseBusy
+                    | ErrorCode::DatabaseLocked
+                    | ErrorCode::OutOfMemory
+                    | ErrorCode::ReadOnly
+                    | ErrorCode::OperationInterrupted
+                    | ErrorCode::SystemIoFailure
+                    | ErrorCode::DiskFull
+                    | ErrorCode::CannotOpen
+                    | ErrorCode::FileLockingProtocolFailed
+            )
+        );
+        if repairable {
+            Self::Unavailable(error.to_string())
+        } else {
+            Self::Invalid(error.to_string())
+        }
+    }
+}
+impl From<std::io::Error> for StoreError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Unavailable(error.to_string())
+    }
+}
+impl From<postcard::Error> for StoreError {
+    fn from(error: postcard::Error) -> Self {
+        Self::Invalid(error.to_string())
+    }
+}
+impl From<String> for StoreError {
+    fn from(message: String) -> Self {
+        Self::Invalid(message)
+    }
+}
+impl From<&str> for StoreError {
+    fn from(message: &str) -> Self {
+        Self::Invalid(message.into())
+    }
+}
+impl From<StoreError> for String {
+    fn from(error: StoreError) -> Self {
+        error.to_string()
+    }
+}
+impl From<StoreError> for crate::chat::protocol::SetupError {
+    fn from(error: StoreError) -> Self {
+        match error {
+            StoreError::Invalid(message) => Self::Invalid(message),
+            StoreError::Unavailable(message) => Self::Unavailable(message),
+        }
+    }
+}
+
 const PART_BYTES: usize = crate::chat::TRANSCRIPT_PART_BYTES;
 const WINDOW_BYTES: usize = crate::chat::TRANSCRIPT_WINDOW_BYTES;
 const WINDOW_ITEMS: usize = 128;
@@ -89,7 +163,7 @@ impl Store {
         &self,
         id: &str,
     ) -> Result<Option<crate::chat::TextCopySource>, String> {
-        self.copy_parent_source(id)
+        self.copy_parent_source(id).map_err(String::from)
     }
     pub(super) fn diagnostic_boundary(&self, id: &str, offset: usize) -> Result<bool, String> {
         let byte = self.field(id, 0, offset, offset + 1)?;
@@ -347,20 +421,23 @@ impl Store {
             let _ = self.db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
         }
     }
-    fn exists(&self, id: &str) -> Result<bool, String> {
+    fn exists(&self, id: &str) -> Result<bool, StoreError> {
         self.db
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM items WHERE id=?1)",
                 [id],
                 |row| row.get(0),
             )
-            .map_err(|e| e.to_string())
+            .map_err(StoreError::from)
     }
     /// Every unbounded field becomes a byte-addressed chunk, so the serialized item
     /// holds identity alone. Returns a non-fatal warning instead of an error when an
     /// item's identity still cannot be cached intact: a single unrepresentable item
     /// must never end the conversation.
     pub(super) fn put(&mut self, item: Item, older: bool) -> Result<Option<String>, String> {
+        self.put_inner(item, older).map_err(String::from)
+    }
+    fn put_inner(&mut self, item: Item, older: bool) -> Result<Option<String>, StoreError> {
         self.put_at(item, older, None)
     }
     fn put_at(
@@ -368,7 +445,7 @@ impl Store {
         mut item: Item,
         older: bool,
         assigned: Option<i64>,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<Option<String>, StoreError> {
         let previous: Option<(i64, Vec<u8>, i64)> = self
             .db
             .query_row(
@@ -376,10 +453,9 @@ impl Store {
                 [&item.id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
-            .optional()
-            .map_err(|e| e.to_string())?;
+            .optional()?;
         let recovered_placeholder = if older && let Some((_, metadata, input_bytes)) = &previous {
-            let cached: Item = postcard::from_bytes(metadata).map_err(|e| e.to_string())?;
+            let cached: Item = postcard::from_bytes(metadata)?;
             // A completed result can arrive before its call metadata is known.
             // An indexed replay may classify that exact fallback, but must not
             // replace a known invocation or change its confirmed outcome.
@@ -414,7 +490,7 @@ impl Store {
         }
         let mut preserve_input = false;
         if let Some((_, metadata, _)) = &previous {
-            let old: Item = postcard::from_bytes(metadata).map_err(|e| e.to_string())?;
+            let old: Item = postcard::from_bytes(metadata)?;
             item.started_at = old.started_at.or(old.at).or(item.started_at);
             if recovered_placeholder {
                 item.at = item.at.or(old.at);
@@ -494,7 +570,7 @@ impl Store {
                 None => self.edge_ordinals(older, 1)?[0],
             },
         };
-        let mut metadata = postcard::to_stdvec(&item).map_err(|e| e.to_string())?;
+        let mut metadata = postcard::to_stdvec(&item)?;
         let shortened = metadata.len() > METADATA_LIMIT;
         if shortened {
             // Every identity field a provider controls is trimmed rather than
@@ -505,7 +581,7 @@ impl Store {
                 spans.truncate(changes.len());
                 body0.truncate(spans.iter().sum());
             }
-            metadata = postcard::to_stdvec(&item).map_err(|e| e.to_string())?;
+            metadata = postcard::to_stdvec(&item)?;
             warning = Some(format!(
                 "Provider item {} exceeded the 64 KiB identity budget and was shortened to fit",
                 brief(&item.id)
@@ -531,18 +607,14 @@ impl Store {
         } else {
             false
         };
-        let transaction = self.db.transaction().map_err(|e| e.to_string())?;
+        let transaction = self.db.transaction()?;
         let index_spans = spans.clone();
-        let spans = postcard::to_stdvec(&spans).map_err(|e| e.to_string())?;
-        transaction.execute("INSERT INTO items VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(id) DO UPDATE SET metadata=excluded.metadata,len0=excluded.len0,len1=excluded.len1,len2=excluded.len2,spans=excluded.spans", params![item.id,ordinal,metadata,len0,body1.len() as i64,body2.len() as i64,spans]).map_err(|e| e.to_string())?;
+        let spans = postcard::to_stdvec(&spans)?;
+        transaction.execute("INSERT INTO items VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(id) DO UPDATE SET metadata=excluded.metadata,len0=excluded.len0,len1=excluded.len1,len2=excluded.len2,spans=excluded.spans", params![item.id,ordinal,metadata,len0,body1.len() as i64,body2.len() as i64,spans])?;
         if preserve_input {
-            transaction
-                .execute("DELETE FROM chunks WHERE id=?1 AND field=1", [&item.id])
-                .map_err(|e| e.to_string())?;
+            transaction.execute("DELETE FROM chunks WHERE id=?1 AND field=1", [&item.id])?;
         } else {
-            transaction
-                .execute("DELETE FROM chunks WHERE id=?1", [&item.id])
-                .map_err(|e| e.to_string())?;
+            transaction.execute("DELETE FROM chunks WHERE id=?1", [&item.id])?;
             insert_body(&transaction, &item.id, 0, 0, &body0)?;
         }
         insert_body(&transaction, &item.id, 1, 0, &body1)?;
@@ -553,7 +625,7 @@ impl Store {
             item.logical_copy_body().is_some().then_some(len0 as usize),
             copy_prefix,
         )?;
-        transaction.commit().map_err(|e| e.to_string())?;
+        transaction.commit()?;
         if copy_invalidated {
             self.copy_revision = self.copy_revision.wrapping_add(1);
         }
@@ -568,13 +640,12 @@ impl Store {
         Ok(warning)
     }
 
-    fn ordinal(&self, id: &str) -> Result<Option<i64>, String> {
+    fn ordinal(&self, id: &str) -> Result<Option<i64>, StoreError> {
         self.db
-            .prepare_cached("SELECT ordinal FROM items WHERE id=?1")
-            .map_err(|e| e.to_string())?
+            .prepare_cached("SELECT ordinal FROM items WHERE id=?1")?
             .query_row([id], |row| row.get(0))
             .optional()
-            .map_err(|e| e.to_string())
+            .map_err(StoreError::from)
     }
 
     fn spaced(left: Option<i64>, right: Option<i64>, count: usize) -> Option<Vec<i64>> {
@@ -600,20 +671,17 @@ impl Store {
             .collect()
     }
 
-    fn edge_ordinals(&mut self, earlier: bool, count: usize) -> Result<Vec<i64>, String> {
+    fn edge_ordinals(&mut self, earlier: bool, count: usize) -> Result<Vec<i64>, StoreError> {
         for _ in 0..2 {
-            let edge: Option<i64> = self
-                .db
-                .query_row(
-                    if earlier {
-                        "SELECT MIN(ordinal) FROM items"
-                    } else {
-                        "SELECT MAX(ordinal) FROM items"
-                    },
-                    [],
-                    |row| row.get(0),
-                )
-                .map_err(|e| e.to_string())?;
+            let edge: Option<i64> = self.db.query_row(
+                if earlier {
+                    "SELECT MIN(ordinal) FROM items"
+                } else {
+                    "SELECT MAX(ordinal) FROM items"
+                },
+                [],
+                |row| row.get(0),
+            )?;
             if let Some(ordinals) = Self::spaced(
                 (!earlier).then_some(edge).flatten(),
                 earlier.then_some(edge).flatten(),
@@ -631,34 +699,28 @@ impl Store {
         before: Option<&str>,
         after: Option<&str>,
         count: usize,
-    ) -> Result<Vec<i64>, String> {
+    ) -> Result<Vec<i64>, StoreError> {
         if before.is_none() && after.is_none() {
             return self.edge_ordinals(true, count);
         }
         for _ in 0..2 {
             let bounds = if let Some(id) = before {
                 let right = self.ordinal(id)?.ok_or("History anchor disappeared")?;
-                let left = self
-                    .db
-                    .query_row(
-                        "SELECT MAX(ordinal) FROM items WHERE ordinal<?1",
-                        [right],
-                        |row| row.get(0),
-                    )
-                    .map_err(|e| e.to_string())?;
+                let left = self.db.query_row(
+                    "SELECT MAX(ordinal) FROM items WHERE ordinal<?1",
+                    [right],
+                    |row| row.get(0),
+                )?;
                 (left, Some(right))
             } else {
                 let left = self
                     .ordinal(after.unwrap())?
                     .ok_or("History anchor disappeared")?;
-                let right = self
-                    .db
-                    .query_row(
-                        "SELECT MIN(ordinal) FROM items WHERE ordinal>?1",
-                        [left],
-                        |row| row.get(0),
-                    )
-                    .map_err(|e| e.to_string())?;
+                let right = self.db.query_row(
+                    "SELECT MIN(ordinal) FROM items WHERE ordinal>?1",
+                    [left],
+                    |row| row.get(0),
+                )?;
                 (Some(left), right)
             };
             if let Some(ordinals) = Self::spaced(bounds.0, bounds.1, count) {
@@ -669,30 +731,24 @@ impl Store {
         Err("Transcript history cannot be ordered between its anchors".into())
     }
 
-    fn latest_ordinals(&mut self, count: usize) -> Result<Vec<i64>, String> {
+    fn latest_ordinals(&mut self, count: usize) -> Result<Vec<i64>, StoreError> {
         if self.latest_boundary.is_none() {
             return self.edge_ordinals(false, count);
         }
         for _ in 0..2 {
             let left: Option<i64> = match self.latest_boundary {
-                Some(LatestBoundary::After(ordinal)) => self
-                    .db
-                    .query_row(
-                        "SELECT MAX(ordinal) FROM items WHERE ordinal<=?1",
-                        [ordinal],
-                        |row| row.get(0),
-                    )
-                    .map_err(|e| e.to_string())?,
+                Some(LatestBoundary::After(ordinal)) => self.db.query_row(
+                    "SELECT MAX(ordinal) FROM items WHERE ordinal<=?1",
+                    [ordinal],
+                    |row| row.get(0),
+                )?,
                 _ => None,
             };
-            let right: Option<i64> = self
-                .db
-                .query_row(
-                    "SELECT MIN(ordinal) FROM items WHERE ordinal>?1",
-                    [left.unwrap_or(i64::MIN)],
-                    |row| row.get(0),
-                )
-                .map_err(|e| e.to_string())?;
+            let right: Option<i64> = self.db.query_row(
+                "SELECT MIN(ordinal) FROM items WHERE ordinal>?1",
+                [left.unwrap_or(i64::MIN)],
+                |row| row.get(0),
+            )?;
             if let Some(ordinals) = Self::spaced(left, right, count) {
                 return Ok(ordinals);
             }
@@ -704,17 +760,16 @@ impl Store {
     /// Rebalance only when repeated insertion has exhausted an integer gap.
     /// The temporary range is disjoint from every normally allocated ordinal,
     /// so UNIQUE stays enforced through both phases of the atomic update.
-    fn rebalance(&mut self) -> Result<(), String> {
-        let transaction = self.db.transaction().map_err(|e| e.to_string())?;
-        transaction.execute_batch("CREATE TEMP TABLE ordinal_remap(old INTEGER PRIMARY KEY, temporary INTEGER UNIQUE NOT NULL, new INTEGER UNIQUE NOT NULL);").map_err(|e| e.to_string())?;
-        let count: i64 = transaction
-            .query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
-            .map_err(|e| e.to_string())?;
+    fn rebalance(&mut self) -> Result<(), StoreError> {
+        let transaction = self.db.transaction()?;
+        transaction.execute_batch("CREATE TEMP TABLE ordinal_remap(old INTEGER PRIMARY KEY, temporary INTEGER UNIQUE NOT NULL, new INTEGER UNIQUE NOT NULL);")?;
+        let count: i64 =
+            transaction.query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))?;
         if count > ORDINAL_LIMIT / ORDINAL_STRIDE {
             return Err("Transcript item order exceeds cache capacity".into());
         }
-        transaction.execute("INSERT INTO ordinal_remap SELECT ordinal,?1+ROW_NUMBER() OVER(ORDER BY ordinal),?2*ROW_NUMBER() OVER(ORDER BY ordinal) FROM items", params![i64::MIN, ORDINAL_STRIDE]).map_err(|e| e.to_string())?;
-        let remap = |cursor: Option<Cursor>| -> Result<Option<Cursor>, String> {
+        transaction.execute("INSERT INTO ordinal_remap SELECT ordinal,?1+ROW_NUMBER() OVER(ORDER BY ordinal),?2*ROW_NUMBER() OVER(ORDER BY ordinal) FROM items", params![i64::MIN, ORDINAL_STRIDE])?;
+        let remap = |cursor: Option<Cursor>| -> Result<Option<Cursor>, StoreError> {
             cursor
                 .map(|(ordinal, part)| {
                     let mapped = transaction
@@ -723,8 +778,7 @@ impl Store {
                             [ordinal],
                             |row| row.get(0),
                         )
-                        .optional()
-                        .map_err(|e| e.to_string())?;
+                        .optional()?;
                     Ok(mapped.map(|ordinal| (ordinal, part)))
                 })
                 .transpose()
@@ -739,13 +793,11 @@ impl Store {
         );
         let latest_boundary = match self.latest_boundary {
             Some(LatestBoundary::After(ordinal)) => {
-                let mapped: Option<i64> = transaction
-                    .query_row(
-                        "SELECT MAX(new) FROM ordinal_remap WHERE old<=?1",
-                        [ordinal],
-                        |row| row.get(0),
-                    )
-                    .map_err(|e| e.to_string())?;
+                let mapped: Option<i64> = transaction.query_row(
+                    "SELECT MAX(new) FROM ordinal_remap WHERE old<=?1",
+                    [ordinal],
+                    |row| row.get(0),
+                )?;
                 Some(mapped.map_or(LatestBoundary::BeforeAll, LatestBoundary::After))
             }
             boundary => boundary,
@@ -753,14 +805,12 @@ impl Store {
         transaction.execute_batch("UPDATE items SET ordinal=(SELECT temporary FROM ordinal_remap WHERE old=items.ordinal);
             UPDATE items SET ordinal=(SELECT new FROM ordinal_remap WHERE temporary=items.ordinal);
             UPDATE file_edits SET ordinal=(SELECT new FROM ordinal_remap WHERE old=file_edits.ordinal) WHERE source='';
-            DROP TABLE ordinal_remap;").map_err(|e| e.to_string())?;
-        transaction
-            .execute(
-                "UPDATE file_totals SET revision=?1 WHERE source=''",
-                [self.file_revision.saturating_add(1)],
-            )
-            .map_err(|e| e.to_string())?;
-        transaction.commit().map_err(|e| e.to_string())?;
+            DROP TABLE ordinal_remap;")?;
+        transaction.execute(
+            "UPDATE file_totals SET revision=?1 WHERE source=''",
+            [self.file_revision.saturating_add(1)],
+        )?;
+        transaction.commit()?;
         self.file_revision = self.file_revision.saturating_add(1);
         self.end = end;
         self.first = first;
@@ -772,7 +822,11 @@ impl Store {
         Ok(())
     }
 
-    fn merge_history(&mut self, items: Vec<Item>, earlier: bool) -> Result<Vec<String>, String> {
+    fn merge_history(
+        &mut self,
+        items: Vec<Item>,
+        earlier: bool,
+    ) -> Result<Vec<String>, StoreError> {
         let mut run = Vec::new();
         let mut after = None;
         let mut warnings = Vec::new();
@@ -826,7 +880,19 @@ impl Store {
     }
     /// Returns the events the store does not own, plus any non-fatal warning raised
     /// while caching. Warnings are events, never errors: the caller must stay alive.
-    pub fn apply(&mut self, mut event: Event) -> Result<Vec<Event>, String> {
+    /// Runtime consumers retain the existing diagnostic-only interface.
+    pub fn apply(&mut self, event: Event) -> Result<Vec<Event>, String> {
+        self.apply_inner(event).map_err(String::from)
+    }
+    /// Startup preserves whether a private-cache failure can be repaired
+    /// without changing the provider event or launch identity.
+    pub(super) fn apply_for_start(
+        &mut self,
+        event: Event,
+    ) -> Result<Vec<Event>, crate::chat::protocol::SetupError> {
+        self.apply_inner(event).map_err(Into::into)
+    }
+    fn apply_inner(&mut self, mut event: Event) -> Result<Vec<Event>, StoreError> {
         self.diagnostics.observe(&mut event);
         if let Some(seal) = &self.messages {
             match &mut event {
@@ -854,8 +920,7 @@ impl Store {
                         [&id],
                         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                     )
-                    .optional()
-                    .map_err(|error| error.to_string())?;
+                    .optional()?;
                 let Some((metadata, len0, len1)) = cached else {
                     // Oversized identities are deliberately refused by put_at
                     // without terminating the provider. Their later appends
@@ -866,8 +931,7 @@ impl Store {
                     )));
                     return Ok(out);
                 };
-                let mut item: Item =
-                    postcard::from_bytes(&metadata).map_err(|error| error.to_string())?;
+                let mut item: Item = postcard::from_bytes(&metadata)?;
                 let (field, length) = match item.content {
                     ItemContent::Command { .. } => (0, len0),
                     ItemContent::Tool { .. } => (1, len1),
@@ -879,23 +943,21 @@ impl Store {
                 let at = observed_at();
                 item.started_at = item.started_at.or(item.at).or(at);
                 item.at = at;
-                let metadata = postcard::to_stdvec(&item).map_err(|error| error.to_string())?;
-                let transaction = self.db.transaction().map_err(|error| error.to_string())?;
+                let metadata = postcard::to_stdvec(&item)?;
+                let transaction = self.db.transaction()?;
                 insert_body(&transaction, &id, field, offset as i64, &delta)?;
                 let update = if field == 0 {
                     "UPDATE items SET len0=len0+?2,metadata=?3 WHERE id=?1"
                 } else {
                     "UPDATE items SET len1=len1+?2,metadata=?3 WHERE id=?1"
                 };
-                transaction
-                    .execute(update, params![id, delta.len(), metadata])
-                    .map_err(|error| error.to_string())?;
-                transaction.commit().map_err(|error| error.to_string())?;
+                transaction.execute(update, params![id, delta.len(), metadata])?;
+                transaction.commit()?;
                 self.changed(&id);
                 self.dirty = true;
             }
             Event::Item(item) => {
-                if let Some(warning) = self.put(item, false)? {
+                if let Some(warning) = self.put_inner(item, false)? {
                     out.push(nonfatal(warning));
                 }
             }
@@ -927,14 +989,11 @@ impl Store {
                     }));
                 }
                 if let Some(first) = self.pending_earlier.take()
-                    && self
-                        .db
-                        .query_row(
-                            "SELECT EXISTS(SELECT 1 FROM items WHERE ordinal<?1)",
-                            [first.0],
-                            |row| row.get::<_, bool>(0),
-                        )
-                        .map_err(|e| e.to_string())?
+                    && self.db.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM items WHERE ordinal<?1)",
+                        [first.0],
+                        |row| row.get::<_, bool>(0),
+                    )?
                 {
                     self.end = Some((first.0, first.1 + 1));
                     self.forward = None;
@@ -973,26 +1032,20 @@ impl Store {
             Event::ItemsRemoved { ids } => {
                 self.files_removed(&ids)?;
                 self.copy_remove(&ids)?;
-                let transaction = self.db.transaction().map_err(|e| e.to_string())?;
+                let transaction = self.db.transaction()?;
                 for id in ids {
-                    transaction
-                        .execute("DELETE FROM items WHERE id=?1", [id])
-                        .map_err(|e| e.to_string())?;
+                    transaction.execute("DELETE FROM items WHERE id=?1", [id])?;
                 }
-                transaction.commit().map_err(|e| e.to_string())?;
+                transaction.commit()?;
                 self.dirty = true;
             }
             Event::Reset { reason } => {
                 self.files_reset()?;
-                self.db
-                    .execute("DELETE FROM copy_sources", [])
-                    .map_err(|e| e.to_string())?;
+                self.db.execute("DELETE FROM copy_sources", [])?;
                 self.copy_cache = uuid::Uuid::new_v4();
                 self.copy_revision = self.copy_revision.wrapping_add(1);
                 self.copy_projection.clear();
-                self.db
-                    .execute("DELETE FROM items", [])
-                    .map_err(|e| e.to_string())?;
+                self.db.execute("DELETE FROM items", [])?;
                 self.end = None;
                 self.first = None;
                 self.newest = None;
@@ -1017,10 +1070,9 @@ impl Store {
                 return Ok(out);
             }
             Event::LatestHistoryStarted => {
-                let latest: Option<i64> = self
-                    .db
-                    .query_row("SELECT MAX(ordinal) FROM items", [], |row| row.get(0))
-                    .map_err(|e| e.to_string())?;
+                let latest: Option<i64> =
+                    self.db
+                        .query_row("SELECT MAX(ordinal) FROM items", [], |row| row.get(0))?;
                 self.latest_boundary =
                     Some(latest.map_or(LatestBoundary::BeforeAll, LatestBoundary::After));
                 out.push(Event::LatestHistoryStarted);
@@ -1040,7 +1092,7 @@ impl Store {
         self.trim_wal();
         Ok(out)
     }
-    fn flush_text(&mut self) -> Result<Option<String>, String> {
+    fn flush_text(&mut self) -> Result<Option<String>, StoreError> {
         match self.pending_text.take() {
             Some(pending) => match self.append(&pending.0, pending.1, pending.2, &pending.3) {
                 Ok(warning) => Ok(warning),
@@ -1058,10 +1110,10 @@ impl Store {
         role: Role,
         thinking: bool,
         delta: &str,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<Option<String>, StoreError> {
         let mut warning = None;
         if !self.exists(id)? {
-            warning = self.put(
+            warning = self.put_inner(
                 Item {
                     id: id.into(),
                     role,
@@ -1084,17 +1136,14 @@ impl Store {
                 return Ok(warning);
             }
         }
-        let (metadata, length): (Vec<u8>, i64) = self
-            .db
-            .query_row("SELECT metadata,len0 FROM items WHERE id=?1", [id], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })
-            .map_err(|e| e.to_string())?;
-        let mut item: Item = postcard::from_bytes(&metadata).map_err(|e| e.to_string())?;
+        let (metadata, length): (Vec<u8>, i64) =
+            self.db
+                .query_row("SELECT metadata,len0 FROM items WHERE id=?1", [id], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })?;
+        let mut item: Item = postcard::from_bytes(&metadata)?;
         if !matches!(item.content, ItemContent::Text { .. }) {
-            return Err(format!(
-                "Provider reused non-text item ID {id} for a text delta"
-            ));
+            return Err(format!("Provider reused non-text item ID {id} for a text delta").into());
         }
         if !delta.is_empty() {
             // A streaming item is restamped by every delta, so the stamp a
@@ -1102,17 +1151,15 @@ impl Store {
             let at = observed_at();
             item.started_at = item.started_at.or(item.at).or(at);
             item.at = at;
-            let stamped = postcard::to_stdvec(&item).map_err(|e| e.to_string())?;
-            let transaction = self.db.transaction().map_err(|e| e.to_string())?;
+            let stamped = postcard::to_stdvec(&item)?;
+            let transaction = self.db.transaction()?;
             insert_body(&transaction, id, 0, length, delta)?;
-            transaction
-                .execute(
-                    "UPDATE items SET len0=len0+?2,metadata=?3 WHERE id=?1",
-                    params![id, delta.len() as i64, stamped],
-                )
-                .map_err(|e| e.to_string())?;
+            transaction.execute(
+                "UPDATE items SET len0=len0+?2,metadata=?3 WHERE id=?1",
+                params![id, delta.len() as i64, stamped],
+            )?;
             Self::copy_parent_append(&transaction, id, delta.len())?;
-            transaction.commit().map_err(|e| e.to_string())?;
+            transaction.commit()?;
             self.changed(id);
         }
         self.trim_wal();
@@ -1157,30 +1204,28 @@ impl Store {
         self.pending_earlier = None;
         self.dirty = true;
     }
-    fn field(&self, id: &str, field: i64, start: usize, end: usize) -> Result<Vec<u8>, String> {
+    fn field(&self, id: &str, field: i64, start: usize, end: usize) -> Result<Vec<u8>, StoreError> {
         if end <= start {
             return Ok(Vec::new());
         }
-        let mut statement = self.db.prepare_cached("SELECT substr(data,MAX(?3-position,0)+1,MIN(position+length(data),?4)-MAX(position,?3)) FROM chunks WHERE id=?1 AND field=?2 AND position>=COALESCE((SELECT MAX(position) FROM chunks WHERE id=?1 AND field=?2 AND position<=?3),?3) AND position<?4 AND position+length(data)>?3 ORDER BY position").map_err(|e| e.to_string())?;
-        let rows = statement
-            .query_map(params![id, field, start as i64, end as i64], |row| {
-                row.get::<_, Vec<u8>>(0)
-            })
-            .map_err(|e| e.to_string())?;
+        let mut statement = self.db.prepare_cached("SELECT substr(data,MAX(?3-position,0)+1,MIN(position+length(data),?4)-MAX(position,?3)) FROM chunks WHERE id=?1 AND field=?2 AND position>=COALESCE((SELECT MAX(position) FROM chunks WHERE id=?1 AND field=?2 AND position<=?3),?3) AND position<?4 AND position+length(data)>?3 ORDER BY position")?;
+        let rows = statement.query_map(params![id, field, start as i64, end as i64], |row| {
+            row.get::<_, Vec<u8>>(0)
+        })?;
         let mut result = Vec::with_capacity(end - start);
         for row in rows {
-            result.extend(row.map_err(|e| e.to_string())?);
+            result.extend(row?);
         }
         Ok(result)
     }
-    fn body(&self, id: &str, len0: usize, start: usize, end: usize) -> Result<Vec<u8>, String> {
+    fn body(&self, id: &str, len0: usize, start: usize, end: usize) -> Result<Vec<u8>, StoreError> {
         let mut result = self.field(id, 0, start.min(len0), end.min(len0))?;
         if end > len0 {
             result.extend(self.field(id, 1, start.saturating_sub(len0), end - len0)?);
         }
         Ok(result)
     }
-    fn boundary(&self, id: &str, len0: usize, target: usize) -> Result<usize, String> {
+    fn boundary(&self, id: &str, len0: usize, target: usize) -> Result<usize, StoreError> {
         if target == 0 {
             return Ok(0);
         }
@@ -1196,7 +1241,7 @@ impl Store {
     /// within `LINE_BYTES` before it, so that a part starts where a line does
     /// and the first byte it shows is the one that says what the line is. A
     /// longer line is cut as any other text is.
-    fn line_boundary(&self, id: &str, len0: usize, target: usize) -> Result<usize, String> {
+    fn line_boundary(&self, id: &str, len0: usize, target: usize) -> Result<usize, StoreError> {
         let start = target.saturating_sub(LINE_BYTES);
         match self
             .field(id, 0, start, target)?
@@ -1734,24 +1779,20 @@ fn insert_body(
     field: i64,
     offset: i64,
     body: &str,
-) -> Result<(), String> {
-    let mut statement = transaction
-        .prepare_cached("INSERT INTO chunks VALUES(?1,?2,?3,?4)")
-        .map_err(|e| e.to_string())?;
+) -> Result<(), StoreError> {
+    let mut statement = transaction.prepare_cached("INSERT INTO chunks VALUES(?1,?2,?3,?4)")?;
     let mut start = 0;
     while start < body.len() {
         let mut end = (start + PART_BYTES).min(body.len());
         while !body.is_char_boundary(end) {
             end -= 1;
         }
-        statement
-            .execute(params![
-                id,
-                field,
-                offset + start as i64,
-                &body.as_bytes()[start..end]
-            ])
-            .map_err(|e| e.to_string())?;
+        statement.execute(params![
+            id,
+            field,
+            offset + start as i64,
+            &body.as_bytes()[start..end]
+        ])?;
         start = end;
     }
     Ok(())
@@ -1760,6 +1801,68 @@ fn insert_body(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_cache_write_failure_retries_the_same_event_after_repair() {
+        let mut store = Store::new().unwrap();
+        let event = Event::History {
+            items: vec![history_item("saved", "The exact saved body")],
+            has_earlier: false,
+        };
+        store.read_only_for_test().unwrap();
+        assert!(matches!(
+            store.apply_for_start(event.clone()),
+            Err(crate::chat::protocol::SetupError::Unavailable(_))
+        ));
+        store.db.pragma_update(None, "query_only", false).unwrap();
+        store.apply_for_start(event).unwrap();
+        assert_eq!(store.window().unwrap().items[0].id, "saved");
+        assert_copy(&store, "saved", "The exact saved body");
+    }
+
+    #[test]
+    fn startup_invalid_delta_and_sqlite_constraint_are_not_resource_failures() {
+        let mut store = Store::new().unwrap();
+        store
+            .apply(Event::Item(history_item("text", "saved")))
+            .unwrap();
+        store
+            .apply(Event::Item(Item {
+                id: "tool".into(),
+                role: Role::Assistant,
+                started_at: None,
+                at: None,
+                content: ItemContent::Tool {
+                    name: "exec".into(),
+                    input: String::new(),
+                    output: String::new(),
+                    status: crate::chat::ToolStatus::Running,
+                },
+            }))
+            .unwrap();
+        for (id, offset) in [("text", 0), ("tool", 1)] {
+            assert!(matches!(
+                store.apply_for_start(Event::OutputDelta {
+                    id: id.into(),
+                    offset,
+                    delta: "invalid continuation".into(),
+                }),
+                Err(crate::chat::protocol::SetupError::Invalid(_))
+            ));
+        }
+        store
+            .db
+            .execute_batch(
+                "CREATE TRIGGER refuse_item BEFORE INSERT ON items BEGIN
+                 SELECT RAISE(ABORT, 'fixture constraint'); END;",
+            )
+            .unwrap();
+        assert!(matches!(
+            store.apply_for_start(Event::Item(history_item("rejected", "body"))),
+            Err(crate::chat::protocol::SetupError::Invalid(_))
+        ));
+    }
+
     use crate::chat::Role;
     use std::os::unix::fs::PermissionsExt;
 

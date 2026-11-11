@@ -539,6 +539,201 @@ fn terminal_console_prints_each_line_once_without_tool_payloads() {
 }
 
 #[test]
+fn retained_agent_closes_during_a_delayed_fixture_stream() {
+    if retained_fixture::run_isolated() {
+        return;
+    }
+    use cagents::{
+        agent_execution::{Agent, HostedSession, Run},
+        chat::{ItemContent, NativeContinuity},
+        control::ControlClient,
+        terminal::ipc::{
+            ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage,
+            ServerResponse, read_frame, write_frame,
+        },
+    };
+    let fixture = Fixture::with_provider(include_str!("fixtures/chat-composer-claude.sh"));
+    let config = fixture.root.path().join("home/.claude");
+    let reply = "Offline background update for responsiveness comparison.\n".repeat(40000);
+    assert_eq!(reply.len(), 2_280_000);
+    fs::write(config.join("fixture-reply.md"), &reply).unwrap();
+    fs::write(config.join("fixture-stream-reply"), "0.5\n").unwrap();
+    let project = fixture.root.path().join("project");
+    let project = project.to_str().unwrap();
+    fixture.cli(&["project", "open", project]);
+    let accepted = fixture.cli(&[
+        "agent",
+        "spawn",
+        "--provider",
+        "claude",
+        "--repository",
+        project,
+        "--surface",
+        "chat",
+        "--prompt",
+        "Stream the offline background fixture.",
+        "--idempotency-key",
+        "close-delayed-stream",
+    ]);
+    let agent = accepted["agent"]["id"].as_str().unwrap();
+    // Spawn acknowledges durable acceptance before its asynchronous provider
+    // installation. Inventory also includes the uninstalled reservation, so
+    // wait for this exact agent's bound source before choosing its live view.
+    let binding_deadline = Instant::now() + Duration::from_secs(10);
+    let installed_source = loop {
+        let output = fixture.output_until(&["agent", "status", agent], binding_deadline);
+        assert!(output.status.success(), "agent status: {output:?}");
+        let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(status["ok"], true, "{status}");
+        let current: Agent = serde_json::from_value(status["data"]["agent"].clone()).unwrap();
+        let run: Run = serde_json::from_value(status["data"]["run"].clone()).unwrap();
+        assert_eq!(current.id.to_string(), agent);
+        assert_eq!(run.id.to_string(), accepted["run"]["id"].as_str().unwrap());
+        assert_eq!(run.agent, current.id);
+        assert!(
+            !current.closed && !run.state.is_terminal(),
+            "agent ended before the streaming close contract: {status}"
+        );
+        if let Some(source) = current.session {
+            let HostedSession::Chat(source) = source else {
+                panic!("the accepted chat agent bound another surface: {status}");
+            };
+            assert!(source.has_valid_native_continuity(), "{source:?}");
+            assert!(matches!(
+                &source.native_continuity,
+                NativeContinuity::RetainedClaudeActor { .. }
+            ));
+            break source;
+        }
+        assert!(
+            Instant::now() < binding_deadline,
+            "accepted agent never bound its installed chat: {status}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    let status = fixture.cli(&["daemon", "status"]);
+    let socket = Path::new(status["socket"].as_str().unwrap());
+    let mut inventory = ControlClient::connect(socket).unwrap();
+    let session = inventory
+        .list_chats()
+        .unwrap()
+        .into_iter()
+        .find(|session| session.id == installed_source.id)
+        .expect("the installed agent's exact chat must remain in inventory");
+    assert_eq!(session.launch.provider, installed_source.launch.provider);
+    assert_eq!(session.launch.recipe, installed_source.launch.recipe);
+    assert_eq!(session.proof, installed_source.proof);
+    assert!(session.has_valid_native_continuity(), "{session:?}");
+    assert!(
+        matches!(
+            &session.native_continuity,
+            NativeContinuity::RetainedClaudeActor { .. }
+        ),
+        "{session:?}"
+    );
+    let chat_id = session.id;
+    let mut observer = std::os::unix::net::UnixStream::connect(socket).unwrap();
+    observer
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    observer
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut proof = None;
+    let mut sequence = 0;
+    let mut request = |value| {
+        sequence += 1;
+        write_frame(
+            &mut observer,
+            &ClientEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: sequence,
+                proof: proof.clone(),
+                request: value,
+            },
+        )
+        .unwrap();
+        loop {
+            let envelope: ServerEnvelope = read_frame(&mut observer).unwrap().unwrap();
+            if let Some(expected) = &proof {
+                assert_eq!(&envelope.proof, expected);
+            } else {
+                proof = Some(envelope.proof.clone());
+            }
+            if envelope.request_id == Some(sequence) {
+                let ServerMessage::Response { response } = envelope.message else {
+                    panic!("unexpected private daemon response");
+                };
+                break response;
+            }
+        }
+    };
+    assert!(matches!(
+        request(ClientRequest::Connect {
+            expected_host: None,
+            resume: Vec::new(),
+        }),
+        ServerResponse::Connected { .. }
+    ));
+    assert!(matches!(
+        request(ClientRequest::ChatAttach { session }),
+        ServerResponse::ChatAttached { .. }
+    ));
+    assert!(matches!(
+        request(ClientRequest::ChatVisibility {
+            chat_id,
+            visible: true,
+        }),
+        ServerResponse::Accepted
+    ));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let ServerResponse::ChatSnapshot { snapshot, .. } = request(ClientRequest::ChatRead {
+            chat_id,
+            after_generation: None,
+        }) else {
+            panic!("expected the actual retained actor snapshot");
+        };
+        let snapshot = snapshot.unwrap();
+        if let Some(text) = snapshot.items.iter().find_map(|item| match &item.content {
+            ItemContent::Text { text, .. } if text.starts_with("Offline background update") => {
+                Some(text)
+            }
+            _ => None,
+        }) {
+            assert!(matches!(
+                &snapshot.native_continuity,
+                NativeContinuity::RetainedClaudeActor { .. }
+            ));
+            assert!(snapshot.busy, "close must start during the active stream");
+            assert!(text.len() < reply.len());
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the actor never received a delta"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let began = Instant::now();
+    let closed = fixture.cli(&["agent", "close", agent]);
+    assert_eq!(closed["agent"]["closed"], true);
+    assert!(
+        began.elapsed() < Duration::from_secs(10),
+        "close must serve control, not wait for the roughly 70-second reply"
+    );
+    assert!(inventory.list_chats().unwrap().is_empty());
+    assert!(
+        fs::read_dir(config).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".fixture-stream.")),
+        "provider teardown must remove its private stream state"
+    );
+}
+
+#[test]
 fn repeated_private_cli_capture_does_not_renew_original_deadline() {
     let root = tempfile::tempdir().unwrap();
     let command = |script: &str| {

@@ -50,6 +50,32 @@ impl Runtime {
             && self.attachment_chooser_pending.is_none()
             && self.pastes_pending == 0
             && (!saved_history || !snapshot.history_loading);
+        if self.start_retry_blocked {
+            return Stopped {
+                guidance: if saved_history {
+                    snapshot
+                        .read_only_reason
+                        .clone()
+                        .unwrap_or_else(|| "Saved conversation history is read-only.".into())
+                } else if unresumable {
+                    format!("{provider} stopped. The conversation and your draft are kept.")
+                } else if snapshot.exited {
+                    format!(
+                        "{provider} stopped, and this card can't start it again. To continue, copy your draft, close this card, then reopen the conversation with Resume conversation in the new tab (+) menu."
+                    )
+                } else {
+                    format!(
+                        "Lost the connection to this chat. {provider} may still be working; your draft is kept."
+                    )
+                },
+                primary: unresumable.then_some((
+                    "Start a new conversation",
+                    Press::StartFresh,
+                    enabled,
+                )),
+                secondary: None,
+            };
+        }
         if saved_history {
             return Stopped {
                 guidance: snapshot
@@ -160,7 +186,10 @@ impl Runtime {
                     .into(),
             );
         }
-        let mut rows = vec![design::caption(guidance).width(Length::Fill).into()];
+        let mut rows = Vec::new();
+        if !guidance.is_empty() {
+            rows.push(design::caption(guidance).width(Length::Fill).into());
+        }
         if !controls.is_empty() {
             rows.push(
                 widget::row::with_children(controls)

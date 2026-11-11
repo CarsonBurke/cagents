@@ -1,5 +1,5 @@
 //! Ingestion-owned edit metadata. Patch bytes remain pageable SQLite chunks.
-use super::Store;
+use super::{Store, StoreError};
 use crate::chat::{
     Command, Event, FileChangeKey, FileChangePage, FileChangePatch, FileChangeSource,
     FileChangeSummary, FileChangesCoverage, FileChangesSummary, FilePatchCursor, Item, ItemContent,
@@ -131,11 +131,11 @@ impl Store {
         imported: bool,
         counts: Option<(u64, u64)>,
         sign: i64,
-    ) -> Result<(), String> {
+    ) -> Result<(), StoreError> {
         let succeeded = i64::from(status == ToolStatus::Succeeded);
         let pending = i64::from(status == ToolStatus::Running);
         let failed = i64::from(succeeded == 0 && pending == 0);
-        let before:Option<(i64,i64,Option<String>)>=self.db.query_row("SELECT succeeded,succeeded+pending+failed,resolved FROM file_totals WHERE source=?1 AND path=?2",params![source,path],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(|e|e.to_string())?;
+        let before:Option<(i64,i64,Option<String>)>=self.db.query_row("SELECT succeeded,succeeded+pending+failed,resolved FROM file_totals WHERE source=?1 AND path=?2",params![source,path],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
         let (old_succeeded, old_count, resolved) =
             before.unwrap_or_else(|| (0, 0, self.resolved_file(source, path)));
         let new_succeeded = old_succeeded + sign * succeeded;
@@ -165,8 +165,7 @@ impl Store {
                     [&identity],
                     |r| r.get(0),
                 )
-                .optional()
-                .map_err(|e| e.to_string())?
+                .optional()?
                 .unwrap_or(0);
             let new = old + if new_succeeded > 0 { 1 } else { -1 };
             if new < 0 {
@@ -180,19 +179,16 @@ impl Store {
             }
             if new == 0 {
                 self.db
-                    .execute("DELETE FROM file_paths WHERE identity=?1", [identity])
-                    .map_err(|e| e.to_string())?;
+                    .execute("DELETE FROM file_paths WHERE identity=?1", [identity])?;
             } else {
-                self.db.execute("INSERT INTO file_paths VALUES(?1,?2) ON CONFLICT(identity) DO UPDATE SET applied=excluded.applied",params![identity,new]).map_err(|e|e.to_string())?;
+                self.db.execute("INSERT INTO file_paths VALUES(?1,?2) ON CONFLICT(identity) DO UPDATE SET applied=excluded.applied",params![identity,new])?;
             }
         }
         if new_count == 0 {
-            self.db
-                .execute(
-                    "DELETE FROM file_totals WHERE source=?1 AND path=?2",
-                    params![source, path],
-                )
-                .map_err(|e| e.to_string())?;
+            self.db.execute(
+                "DELETE FROM file_totals WHERE source=?1 AND path=?2",
+                params![source, path],
+            )?;
         } else {
             let (added, deleted) = counts.unwrap_or_default();
             self.db.execute("INSERT INTO file_totals VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
@@ -200,13 +196,13 @@ impl Store {
                 pending=pending+excluded.pending,failed=failed+excluded.failed,imported=imported+excluded.imported,
                 additions=additions+excluded.additions,deletions=deletions+excluded.deletions,unknown=unknown+excluded.unknown,revision=excluded.revision",
                 params![source,path,sign*succeeded,sign*pending,sign*failed,sign*i64::from(imported),sign*succeeded*added as i64,sign*succeeded*deleted as i64,
-                    sign*succeeded*i64::from(counts.is_none()),self.file_revision.saturating_add(1),resolved]).map_err(|e|e.to_string())?;
+                    sign*succeeded*i64::from(counts.is_none()),self.file_revision.saturating_add(1),resolved])?;
         }
         Ok(())
     }
-    fn remove_file_item(&mut self, source: &str, id: &str) -> Result<bool, String> {
+    fn remove_file_item(&mut self, source: &str, id: &str) -> Result<bool, StoreError> {
         let rows = {
-            let mut statement = self.db.prepare_cached("SELECT path,status,imported,additions,deletions FROM file_edits WHERE source=?1 AND item_id=?2").map_err(|e| e.to_string())?;
+            let mut statement = self.db.prepare_cached("SELECT path,status,imported,additions,deletions FROM file_edits WHERE source=?1 AND item_id=?2")?;
             statement
                 .query_map(params![source, id], |row| {
                     Ok((
@@ -216,23 +212,19 @@ impl Store {
                         row.get::<_, Option<u64>>(3)?,
                         row.get::<_, Option<u64>>(4)?,
                     ))
-                })
-                .map_err(|e| e.to_string())?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| e.to_string())?
+                })?
+                .collect::<Result<Vec<_>, _>>()?
         };
         for (path, status, imported, added, deleted) in &rows {
-            let status = postcard::from_bytes(status).map_err(|e| e.to_string())?;
+            let status = postcard::from_bytes(status)?;
             self.adjust_file_total(source, path, status, *imported, added.zip(*deleted), -1)?;
         }
-        self.db
-            .execute(
-                "DELETE FROM file_edits WHERE source=?1 AND item_id=?2",
-                params![source, id],
-            )
-            .map_err(|e| e.to_string())?;
+        self.db.execute(
+            "DELETE FROM file_edits WHERE source=?1 AND item_id=?2",
+            params![source, id],
+        )?;
         for (path, _, _, _, _) in &rows {
-            self.db.execute("DELETE FROM file_totals WHERE source=?1 AND path=?2 AND succeeded+pending+failed=0",params![source,path]).map_err(|e|e.to_string())?;
+            self.db.execute("DELETE FROM file_totals WHERE source=?1 AND path=?2 AND succeeded+pending+failed=0",params![source,path])?;
         }
         Ok(!rows.is_empty())
     }
@@ -246,17 +238,15 @@ impl Store {
         imported: bool,
         body: &str,
         spans: &[usize],
-    ) -> Result<(), String> {
-        self.db
-            .execute_batch("SAVEPOINT file_index")
-            .map_err(|e| e.to_string())?;
+    ) -> Result<(), StoreError> {
+        self.db.execute_batch("SAVEPOINT file_index")?;
         let revision = self.file_revision;
         let counts = (self.file_keys, self.applied_files);
         match self.index_file_item_inner(item, source, ordinal, imported, body, spans) {
             Ok(()) => self
                 .db
                 .execute_batch("RELEASE file_index")
-                .map_err(|e| e.to_string()),
+                .map_err(StoreError::from),
             Err(error) => {
                 let _ = self
                     .db
@@ -275,7 +265,7 @@ impl Store {
         imported: bool,
         body: &str,
         spans: &[usize],
-    ) -> Result<(), String> {
+    ) -> Result<(), StoreError> {
         let mut changed = self.remove_file_item(source, &item.id)?;
         if let ItemContent::Changes { changes, status } = &item.content {
             let identity =
@@ -304,40 +294,36 @@ impl Store {
                     &change.diff
                 };
                 let count = counts(patch);
-                self.db
-                    .execute(
-                        "INSERT INTO file_edits VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-                        params![
-                            source,
-                            item.id,
-                            index as i64,
-                            ordinal,
-                            change.path,
-                            postcard::to_stdvec(&change.kind).map_err(|e| e.to_string())?,
-                            postcard::to_stdvec(status).map_err(|e| e.to_string())?,
-                            imported,
-                            count.map(|v| v.0),
-                            count.map(|v| v.1),
-                            start as i64,
-                            length as i64
-                        ],
-                    )
-                    .map_err(|e| e.to_string())?;
+                self.db.execute(
+                    "INSERT INTO file_edits VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                    params![
+                        source,
+                        item.id,
+                        index as i64,
+                        ordinal,
+                        change.path,
+                        postcard::to_stdvec(&change.kind)?,
+                        postcard::to_stdvec(status)?,
+                        imported,
+                        count.map(|v| v.0),
+                        count.map(|v| v.1),
+                        start as i64,
+                        length as i64
+                    ],
+                )?;
                 self.adjust_file_total(source, &change.path, *status, imported, count, 1)?;
                 if !source.is_empty() {
                     for (part, bytes) in patch.as_bytes().chunks(super::PART_BYTES).enumerate() {
-                        self.db
-                            .execute(
-                                "INSERT INTO file_patch_chunks VALUES(?1,?2,?3,?4,?5)",
-                                params![
-                                    source,
-                                    item.id,
-                                    index as i64,
-                                    (part * super::PART_BYTES) as i64,
-                                    bytes
-                                ],
-                            )
-                            .map_err(|e| e.to_string())?;
+                        self.db.execute(
+                            "INSERT INTO file_patch_chunks VALUES(?1,?2,?3,?4,?5)",
+                            params![
+                                source,
+                                item.id,
+                                index as i64,
+                                (part * super::PART_BYTES) as i64,
+                                bytes
+                            ],
+                        )?;
                     }
                 }
                 start += length;
@@ -349,7 +335,7 @@ impl Store {
         }
         Ok(())
     }
-    pub(super) fn index_child_event(&mut self, event: &Event) -> Result<(), String> {
+    pub(super) fn index_child_event(&mut self, event: &Event) -> Result<(), StoreError> {
         match event {
             Event::SubagentItem { id, item } => {
                 self.child_files_seen = true;
@@ -361,8 +347,7 @@ impl Store {
                         params![key, item.id],
                         |r| r.get(0),
                     )
-                    .optional()
-                    .map_err(|e| e.to_string())?;
+                    .optional()?;
                 let ordinal = match old {
                     Some(value) => value,
                     None => {
@@ -383,7 +368,7 @@ impl Store {
         }
         Ok(())
     }
-    pub(super) fn files_removed(&mut self, ids: &[String]) -> Result<(), String> {
+    pub(super) fn files_removed(&mut self, ids: &[String]) -> Result<(), StoreError> {
         for id in ids {
             if self.remove_file_item("", id)? {
                 self.file_revision = self.file_revision.saturating_add(1);
@@ -391,19 +376,13 @@ impl Store {
         }
         Ok(())
     }
-    pub(super) fn files_reset(&mut self) -> Result<(), String> {
-        self.db
-            .execute("DELETE FROM file_edits", [])
-            .map_err(|e| e.to_string())?;
-        self.db
-            .execute("DELETE FROM file_totals", [])
-            .map_err(|e| e.to_string())?;
+    pub(super) fn files_reset(&mut self) -> Result<(), StoreError> {
+        self.db.execute("DELETE FROM file_edits", [])?;
+        self.db.execute("DELETE FROM file_totals", [])?;
         self.file_revision = self.file_revision.saturating_add(1);
         self.child_files_seen = false;
         self.file_index_incomplete = false;
-        self.db
-            .execute("DELETE FROM file_paths", [])
-            .map_err(|e| e.to_string())?;
+        self.db.execute("DELETE FROM file_paths", [])?;
         self.file_keys = 0;
         self.applied_files = 0;
         Ok(())

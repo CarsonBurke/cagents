@@ -252,7 +252,9 @@ impl Daemon {
                                             message: ServerMessage::Error(ProtocolError::new(
                                                 code,
                                                 message,
-                                                false,
+                                                // The deliberate first refusal passes on retry;
+                                                // an already-owned start must still be refused.
+                                                !already_admitted && !already_pending,
                                             )),
                                         },
                                     )

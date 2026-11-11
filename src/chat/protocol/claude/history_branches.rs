@@ -375,7 +375,7 @@ pub(super) fn index_activity(
     nodes: &HashMap<String, HistoryNode>,
     ambiguous: &HashSet<String>,
     notices: &[(u64, u64, usize)],
-) -> Result<(), String> {
+) -> Result<(), crate::chat::protocol::SetupError> {
     use super::{ToolStatus, string};
     use std::collections::BTreeMap;
     let mut identities = HashMap::new();
@@ -493,7 +493,7 @@ pub(super) fn index_activity(
         let Some((len, base)) = notice else {
             continue;
         };
-        let frame = history.read_record(offset, len, base)?;
+        let frame = history.read_record_for_start(offset, len, base)?;
         let mut notices = Vec::new();
         if string(&frame, "type") == "system"
             && matches!(
@@ -587,4 +587,48 @@ pub(super) fn index_activity(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod startup_read_tests {
+    use super::*;
+    use crate::chat::protocol::SetupError;
+    use std::io::Write;
+
+    #[test]
+    fn indexed_task_notifications_retry_mutation_and_reads_after_repair() {
+        let session = "00000000-0000-4000-8000-000000000001";
+        let record = serde_json::json!({
+            "type":"system", "subtype":"task_notification", "sessionId":session,
+            "tool_use_id":"child", "task_id":"task", "status":"completed"
+        });
+        let original = format!("{record}\n").into_bytes();
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&original).unwrap();
+        let mut history = super::super::History::index_for_start(
+            std::fs::File::open(file.path()).unwrap(),
+            session,
+            1024,
+            16,
+        )
+        .unwrap();
+        assert!(history.result_calls.is_empty());
+        let nodes = HashMap::new();
+        let ambiguous = HashSet::new();
+        let notices = [(0, original.len() as u64, 0)];
+        let mut malformed = original.clone();
+        malformed[0] = b'x';
+        let mut foreign = record;
+        foreign["sessionId"] = serde_json::json!("00000000-0000-4000-8000-000000000002");
+        for changed in [Vec::new(), malformed, format!("{foreign}\n").into_bytes()] {
+            std::fs::write(file.path(), changed).unwrap();
+            assert!(matches!(
+                index_activity(&mut history, &nodes, &ambiguous, &notices),
+                Err(SetupError::Unavailable(_))
+            ));
+            std::fs::write(file.path(), &original).unwrap();
+            index_activity(&mut history, &nodes, &ambiguous, &notices).unwrap();
+            assert_eq!(history.session_id, session);
+        }
+    }
 }

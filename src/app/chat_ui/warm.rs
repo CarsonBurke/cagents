@@ -16,6 +16,12 @@
 //! of themselves, and its parsed documents by their text and node count,
 //! calibrated against the heap cooling actually frees. Process RSS can stay
 //! higher once heap is freed; see `docs/performance.md`.
+//!
+//! A Resume that retires its source can keep one last projected window even
+//! after cooling: that source cannot reload it. The runtime owns that window
+//! independently of disposable warmth, with its old client's body interest
+//! released. This budget bounds warm presentations, not the sum of those
+//! unreloadable source windows, each still bounded by its publication limits.
 use std::cell::Cell;
 
 /// Conservative per-node allowance beyond the document's text. The parse

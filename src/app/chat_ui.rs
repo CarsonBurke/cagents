@@ -87,6 +87,8 @@ mod find;
 mod find_navigation;
 mod flow_layout;
 mod fold;
+#[cfg(test)]
+mod frozen_source_tests;
 mod hover;
 pub(super) mod images;
 mod layout;
@@ -864,6 +866,8 @@ pub(super) struct State {
     fresh_offers: HashSet<CardId>,
     /// Capacity failures before a chat runtime exists (saved-pane hydration).
     capacity_offers: HashSet<CardId>,
+    /// Starts refused as nonretryable before a runtime exists.
+    blocked_starts: HashMap<CardId, chat::Session>,
     removed_accounts: HashSet<CardId>,
     /// Cards refused because the account list does not name their account,
     /// whose home is still on the device and can be restored.
@@ -896,6 +900,7 @@ impl Default for State {
             parked: HashMap::new(),
             fresh_offers: HashSet::new(),
             capacity_offers: HashSet::new(),
+            blocked_starts: HashMap::new(),
             removed_accounts: HashSet::new(),
             restorable_accounts: HashMap::new(),
             last_models: HashMap::new(),
@@ -2630,9 +2635,14 @@ pub(super) struct Runtime {
     capacity_refused: bool,
     /// A Close the daemon refused, shown on the pane until it closes.
     close_refusal: Option<close_refusal::CloseRefusal>,
-    /// Resuming this card's stopped provider failed, so it offers to try
-    /// again; the failure itself stands in `error`.
+    /// Resuming this card's stopped provider failed; the reason stands in
+    /// `error`, and retry is offered only while it can help.
     resume_failed: bool,
+    /// The daemon says repeating this start cannot help.
+    start_retry_blocked: bool,
+    /// Resume may retire this actor before its replacement answers. Keep the
+    /// source body until a successful attachment supplies its successor.
+    resume_source_pinned: bool,
     /// Local send errors anchored to the exchange that produced them.
     failures: Vec<failure::Note>,
     /// Notices raised while an earlier page is shown. That page holds
@@ -3719,6 +3729,8 @@ impl Runtime {
             capacity_refused: false,
             close_refusal: None,
             resume_failed: false,
+            start_retry_blocked: false,
+            resume_source_pinned: false,
             failures: Vec::new(),
             unplaced_failures: Vec::new(),
             failure_ui: failure::State::default(),
@@ -4923,6 +4935,15 @@ impl Runtime {
     }
 
     fn refresh_snapshot(&mut self) {
+        if self.retains_source_body() {
+            // Warmth only owns disposable rendering. The retired source can
+            // no longer hydrate this window, so neither eviction nor later
+            // metadata from its connected client may replace it or its clock.
+            if self.visible.load(Ordering::Relaxed) && self.presentation_evicted {
+                self.install_presented_snapshot(self.snapshot.clone(), self.source_clock);
+            }
+            return;
+        }
         if self.warm.is_some()
             && self
                 .handle()
@@ -4957,17 +4978,13 @@ impl Runtime {
         let Some(handle) = self.handle() else {
             return;
         };
-        let publication = handle.resident_snapshot_with_clock().or_else(|| {
+        if let Some((snapshot, source_clock)) = handle.resident_snapshot_with_clock() {
+            self.install_snapshot(snapshot, source_clock);
+        } else if !handle.is_connected() && self.presentation_evicted {
             // A failed hide can leave the client with metadata while this
-            // runtime still owns the last readable body. Rebuild only its
-            // discarded presentation; a disconnected client cannot hydrate it.
-            (!handle.is_connected() && self.presentation_evicted)
-                .then(|| (self.snapshot.clone(), self.source_clock))
-        });
-        let Some((snapshot, source_clock)) = publication else {
-            return;
-        };
-        self.install_snapshot(snapshot, source_clock);
+            // runtime still owns its last already-presented publication.
+            self.install_presented_snapshot(self.snapshot.clone(), self.source_clock);
+        }
     }
 
     /// Install an authoritative hydrated publication without replacing reader
@@ -4987,7 +5004,18 @@ impl Runtime {
             self.source_clock = source_clock;
             return;
         }
-        let mut snapshot = self.logical_prose.project(snapshot);
+        let snapshot = self.logical_prose.project(snapshot);
+        self.install_presented_snapshot(snapshot, source_clock);
+    }
+
+    /// Rebuild disposable presentation from a publication that is already
+    /// projected. In particular a frozen Resume source has no raw-part owner
+    /// or cache-only read subscription left to recreate.
+    fn install_presented_snapshot(
+        &mut self,
+        mut snapshot: Arc<Snapshot>,
+        source_clock: Option<chat::client::SourceClock>,
+    ) {
         self.scroll_memory.latest_source(
             self.page_request
                 .filter(|(page, _)| *page == view::Page::Latest)
@@ -5534,14 +5562,15 @@ impl Runtime {
         self.visible.load(Ordering::Relaxed) || self.warm.is_some()
     }
 
-    /// Whether hiding this chat now may keep it warm: its client still holds
-    /// the transcript the presentation was built from, and it is small enough
-    /// to keep beside others.
+    /// Whether hiding this chat may keep its disposable presentation. A
+    /// frozen source owns its one projected window; other chats also need
+    /// their client to retain the body they can refresh.
     fn keeps_warm(&self) -> bool {
         !self.presentation_evicted
-            && self.handle().is_some_and(|handle| {
-                handle.is_connected() && handle.resident_snapshot_with_clock().is_some()
-            })
+            && (self.retains_source_body()
+                || self.handle().is_some_and(|handle| {
+                    handle.is_connected() && handle.resident_snapshot_with_clock().is_some()
+                }))
             && self.warm_bytes() <= warm::CHAT_BYTES
     }
 
@@ -5570,8 +5599,9 @@ impl Runtime {
         self.warm
     }
 
-    /// Release a warm hidden chat's presentation and its client's transcript,
-    /// as hiding did before it was kept. A visible or cold chat is unchanged.
+    /// Release a warm hidden chat's disposable presentation. A frozen source
+    /// keeps its one projected window after cooling; its actor cannot reload it.
+    /// A visible or cold chat is unchanged.
     pub(super) fn cool(&mut self) {
         if self.warm.take().is_none() || self.visible.load(Ordering::Relaxed) {
             return;
@@ -5587,6 +5617,20 @@ impl Runtime {
     /// hydrate it again, or only its render caches when it cannot, including
     /// when the client was not `told` it is hidden.
     fn release_hidden(&mut self, changed: bool, told: bool) {
+        if self.retains_source_body() {
+            // Keep the sole projected publication, not amplification or old
+            // read subscriptions. A connected socket need not own its actor.
+            self.release_transcript_caches();
+            self.logical_prose.release();
+            if self.history_cursor.is_none() {
+                self.history = Vec::new();
+                self.history_images = Vec::new();
+            }
+            tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "chat_runtime", chat_id = %self.session.id,
+                resident_bytes = self.snapshot.transcript_bytes(), cache_entries = 0usize,
+                exposed_presentation_bytes = 0usize);
+            return;
+        }
         if told
             && self.handle().is_some_and(|handle| {
                 // Notice suppression is not permission to discard the last
@@ -5659,26 +5703,55 @@ impl Runtime {
             evicted_cache_entries = cache_entries, exposed_presentation_bytes = 0usize);
     }
 
+    /// Resume can retire the old actor before its replacement answers. Keep
+    /// the last source body until an actual attachment replaces it, including
+    /// when that start fails while the old IPC stream remains open.
+    fn retains_source_body(&self) -> bool {
+        self.resume_source_pinned
+    }
+
+    fn freeze_resume_source(&mut self) {
+        self.resume_source_pinned = true;
+        // The frozen snapshot is already the visible logical projection.
+        // Raw parts, complete-read budgets and their subscriptions no longer
+        // belong to an actor Resume can retire before its reply arrives.
+        self.logical_prose.release();
+        if self.history_cursor.is_none() {
+            self.history = Vec::new();
+            self.history_images = Vec::new();
+        }
+        // Dropping the old client's interest also drops its resident body
+        // synchronously. A concurrent disconnect is handled by Resume itself.
+        let _ = self.present();
+    }
+
     /// Tells the connection whether to keep the card's snapshot current.
     ///
     /// A first message waiting to be sent keeps it current while the card is
     /// hidden, since its provider becoming ready, and the models it lists,
     /// reach the card only through that snapshot.
     ///
-    /// A connection already lost has nothing to tell: the pane reports the
-    /// disconnection itself, and the handle that replaces it is shown with the
-    /// visibility recorded here.
+    /// A frozen source has already taken readability from the connection and
+    /// releases its raw body even if the reader died before its UI wake. Ordinary
+    /// closed cards keep the client's final body as their cold readable fallback.
     ///
     /// A warm hidden chat keeps its body without reading further: what it
     /// missed arrives as one change, or nothing, when it is shown again.
     fn present(&self) -> Result<(), String> {
-        let retain_body = self.presents();
-        let interested = self.visible.load(Ordering::Relaxed)
-            || self.queued.is_some()
-            || !self.followups.is_empty();
+        let frozen = self.retains_source_body();
+        let retain_body = !frozen && self.presents();
+        let interested = !frozen
+            && (self.visible.load(Ordering::Relaxed)
+                || self.queued.is_some()
+                || !self.followups.is_empty());
         match self.handle() {
-            Some(handle) if handle.is_connected() => {
-                match handle.set_interest(interested, retain_body) {
+            Some(handle) if frozen || handle.is_connected() => {
+                let result = if frozen {
+                    handle.hand_off_source_body()
+                } else {
+                    handle.set_interest(interested, retain_body)
+                };
+                match result {
                     // The connection can drop between the check and the call, and
                     // is then as lost as one found lost: not this pass's to report.
                     Err(_) if !handle.is_connected() => Ok(()),
@@ -5735,6 +5808,7 @@ impl Runtime {
         self.session.launch.session_id.is_some()
             && self.snapshot.exited
             && self.snapshot.session_id != self.session.launch.session_id
+            && self.session.fresh_start().is_some()
     }
     /// Whether this card's provider stopped while the daemon that ran it still
     /// holds its ended actor, so a new provider can resume the same
@@ -8170,6 +8244,7 @@ impl Cagents {
     /// its provider.
     fn open_chat_draft(&mut self, card: CardId, session: chat::Session) -> Task<Message> {
         self.chat_ui.capacity_offers.remove(&card);
+        self.chat_ui.blocked_starts.remove(&card);
         let mut snapshot = self.chat_draft_snapshot(session.launch.provider);
         snapshot.permission_mode =
             draft_permission_mode(&session.launch.recipe, session.launch.provider);
@@ -8542,6 +8617,7 @@ impl Cagents {
         self.chat_ui.started_elsewhere.remove(&card);
         self.chat_ui.parked.remove(&card);
         self.chat_ui.fresh_offers.remove(&card);
+        self.chat_ui.blocked_starts.remove(&card);
         self.chat_ui.removed_accounts.remove(&card);
         self.chat_ui.restorable_accounts.remove(&card);
     }
@@ -8553,6 +8629,21 @@ impl Cagents {
                 Some(CardKind::Chat(_))
             ))
         .then_some(CAPACITY_GUIDANCE)
+    }
+
+    pub(super) fn chat_retry_blocked(&self, card: CardId) -> bool {
+        match self.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => runtime.start_retry_blocked,
+            _ => self
+                .chat_ui
+                .blocked_starts
+                .get(&card)
+                .is_some_and(|source| {
+                    self.card_state(card).is_some_and(
+                        |state| matches!(&state.kind, CardKind::Chat(current) if current == source),
+                    )
+                }),
+        }
     }
 
     pub(super) fn chat_start_pending(&self, card: CardId) -> bool {
@@ -8581,7 +8672,12 @@ impl Cagents {
         }
         match self.cards.get(&card) {
             Some(CardRuntime::Chat(runtime)) => runtime.offers_fresh_conversation(),
-            _ => self.chat_ui.fresh_offers.contains(&card),
+            _ => {
+                self.chat_ui.fresh_offers.contains(&card)
+                    && self.card_state(card).is_some_and(|state| {
+                        matches!(&state.kind, CardKind::Chat(session) if session.fresh_start().is_some())
+                    })
+            }
         }
     }
     pub(super) fn chat_fork_target(&self, card: CardId) -> Option<Target> {
@@ -9227,6 +9323,9 @@ impl Cagents {
         self.chat_ui.capacity_offers.remove(&card);
         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) {
             runtime.capacity_refused = false;
+            if intent == chat::Intent::Resume && runtime.resumes_in_place() {
+                runtime.freeze_resume_source();
+            }
         }
         let selection = None;
         let initially_visible = self.workspace.visibility(card) == Some(VisibilityClass::Visible)
@@ -11115,6 +11214,7 @@ impl Cagents {
                                 .remove(&target.card);
                         }
                         self.chat_ui.fresh_offers.remove(&target.card);
+                        self.chat_ui.blocked_starts.remove(&target.card);
                         self.chat_ui.removed_accounts.remove(&target.card);
                         self.chat_ui.restorable_accounts.remove(&target.card);
                         let mut session = handle.session();
@@ -11167,6 +11267,12 @@ impl Cagents {
                             if let Some(queued) = &mut runtime.queued {
                                 queued.presentation = prompt::LocalPresentation::default();
                             }
+                            if runtime.retains_source_body() {
+                                // The validated successor owns a new source,
+                                // even if its generation and item IDs repeat.
+                                runtime.warm = None;
+                                runtime.release_transcript_caches();
+                            }
                             runtime.retarget(target);
                             runtime.connection = Connection::Live(handle);
                             runtime.model_picker = None;
@@ -11184,6 +11290,9 @@ impl Cagents {
                             runtime.error = None;
                             runtime.capacity_refused = false;
                             runtime.resume_failed = false;
+                            runtime.start_retry_blocked = false;
+                            runtime.logical_prose.release();
+                            runtime.resume_source_pinned = false;
                             runtime.show(visible);
                             // Show the new connection's state at once, as a
                             // new runtime does, rather than the ended one's
@@ -11342,6 +11451,14 @@ impl Cagents {
                         ]);
                     }
                     Err(failure) => {
+                        let retry_blocked = failure.recovery == chat::Recovery::Blocked;
+                        if retry_blocked {
+                            self.chat_ui
+                                .blocked_starts
+                                .insert(target.card, attempt.session.clone());
+                        } else {
+                            self.chat_ui.blocked_starts.remove(&target.card);
+                        }
                         let terminal_switch = matches!(
                             self.card_state(target.card).map(|state| &state.kind),
                             Some(CardKind::Terminal(_))
@@ -11368,6 +11485,7 @@ impl Cagents {
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
                             runtime.capacity_refused = failure.recovery == chat::Recovery::Capacity;
                             runtime.error = Some(failure.message);
+                            runtime.start_retry_blocked = retry_blocked;
                             // A resume that failed leaves its card where it
                             // was, stopped with its conversation kept, so it
                             // tries again. Reconnecting instead would look for
@@ -11722,7 +11840,7 @@ impl Cagents {
                 return self.resume_after_sign_in(target);
             }
             Action::Reconnect(target) => {
-                if self.chat_start_pending(target.card) {
+                if self.chat_start_pending(target.card) || self.chat_retry_blocked(target.card) {
                     return Task::none();
                 }
                 let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -11754,7 +11872,7 @@ impl Cagents {
                 return self.start_chat(target.card, session, intent, None, false);
             }
             Action::ResumeSaved(target) => {
-                if self.chat_start_pending(target.card) {
+                if self.chat_start_pending(target.card) || self.chat_retry_blocked(target.card) {
                     return Task::none();
                 }
                 let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -11826,15 +11944,12 @@ impl Cagents {
                 {
                     return Task::none();
                 }
-                // The new conversation runs the saved launch verbatim - same
-                // program, same options including the session directory, same
-                // working directory and environment - with only the
-                // conversation it was resuming dropped. That is what makes
-                // this a new conversation in the same place rather than a
-                // different launch.
-                let mut session = session.clone();
-                session.launch.session_id = None;
-                session.proof = None;
+                // Keep the launch settings, but give up the ended actor's
+                // ownership and terminal pair. A fresh Codex thread asks for
+                // its own listener rather than reusing the old thread's socket.
+                let Some(session) = session.fresh_start() else {
+                    return Task::none();
+                };
                 self.chat_ui.fresh_offers.remove(&card);
                 // A chat runtime whose provider has exited still holds the
                 // daemon's record for the conversation that failed. Closing it
@@ -22215,11 +22330,11 @@ mod tests {
         assert!(errors(&app).is_empty(), "{:?}", errors(&app));
     }
 
-    /// Starting over is a start, not a reopen, and says so when it fails. A
-    /// conversation that turns out never to have been named opens as a draft,
-    /// with nothing left to reopen, so its failure notice goes too.
+    /// Starting over is a start, not a reopen, and says so when it fails.
+    /// Its cleared ownership also lets a later window open it as a draft
+    /// without asking the daemon to restore a conversation that never began.
     #[test]
-    fn a_fresh_start_reports_a_start_and_a_draft_withdraws_the_failure() {
+    fn a_fresh_start_reports_a_start_and_restores_as_an_unstarted_draft() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, Some(KNOWN_THREAD));
         let session = chat_runtime(&app, card).session.clone();
@@ -22247,20 +22362,62 @@ mod tests {
             Some(unavailable)
         );
 
-        // Restored later, the never-named conversation turns out to be gone.
         let Some(CardKind::Chat(unnamed)) = app.card_state(card).map(|state| state.kind.clone())
         else {
             unreachable!();
         };
+        assert!(unnamed.is_unstarted());
+        let mut restored = crate::app::tests::context_inspector_test_app(false);
+        restored.durable = app.durable.clone();
+        restored
+            .chat_ui
+            .drafts
+            .insert(card, "Keep this unsent note.".into());
+        let _ = restored.open_chat(card, unnamed.clone(), chat::Intent::Restore);
+        let runtime = chat_runtime(&restored, card);
+        assert!(runtime.is_draft());
+        assert_eq!(runtime.session, unnamed);
+        assert_eq!(runtime.composer.text().trim_end(), "Keep this unsent note.");
+        assert!(restored.chat_ui.attempt(card).is_none());
+        assert!(errors(&restored).is_empty(), "{:?}", errors(&restored));
+    }
+
+    /// Older versions could begin a provider before its first message or
+    /// confirmed name. If that actor is gone, its failure notice no longer
+    /// applies when the daemon tells the card to return to a draft.
+    #[test]
+    fn a_begun_but_unnamed_conversation_withdraws_its_failure_when_restored_as_a_draft() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, None);
+        let unnamed = chat_runtime(&app, card).session.clone();
         assert_eq!(unnamed.launch.session_id, None);
+        assert!(unnamed.proof.is_some());
+        assert!(!unnamed.is_unstarted());
         app.chat_forget(card);
         app.cards.insert(card, CardRuntime::Loading);
         let _ = app.open_chat(card, unnamed, chat::Intent::Restore);
         let attempt = chat_runtime_attempt(&app, card);
-        answer_start(&mut app, attempt, Err(chat::StartFailure::fresh(gone)));
-        assert!(
-            matches!(app.cards.get(&card), Some(CardRuntime::Chat(runtime)) if runtime.is_draft())
+        answer_start(
+            &mut app,
+            attempt,
+            Err(chat::StartFailure::retry("fixture: executable unavailable")),
         );
+        let pane = app.notice_pane_name(card).unwrap();
+        assert_eq!(errors(&app), [format!("Could not reopen {pane}.")]);
+
+        let _ = app.update(Message::RetryCard(card));
+        let attempt = chat_runtime_attempt(&app, card);
+        answer_start(
+            &mut app,
+            attempt,
+            Err(chat::StartFailure::fresh(
+                "the provider no longer has this conversation",
+            )),
+        );
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.is_draft());
+        assert!(runtime.session.is_unstarted());
+        assert!(app.chat_ui.attempt(card).is_none());
         assert!(errors(&app).is_empty(), "{:?}", errors(&app));
     }
 
@@ -25110,11 +25267,12 @@ mod tests {
         assert_ne!(session.id, moved.id);
         assert_eq!(session.launch.recipe, moved.launch.recipe);
         assert_eq!(identity(&flushed(&app)), identity(&session));
-        let handle = fixture_handle(&app, card, Some("replacement"));
+        let replacement = "33333333-4444-4aaa-8bbb-cccccccccccc";
+        let handle = fixture_handle(&app, card, Some(replacement));
         answer_start(&mut app, started, Ok(handle));
         let stored = flushed(&app);
         assert_eq!(identity(&stored), identity(&session));
-        assert_eq!(stored.launch.session_id.as_deref(), Some("replacement"));
+        assert_eq!(stored.launch.session_id.as_deref(), Some(replacement));
 
         // A resume the provider refused is offered a fresh start, which
         // drops the saved conversation on purpose.
@@ -25124,11 +25282,12 @@ mod tests {
         let attempt = app.chat_ui.attempt(card).unwrap();
         let (target, fresh) = (attempt.target, attempt.session.clone());
         assert_eq!(fresh.launch.session_id, None);
-        let handle = fixture_handle(&app, card, Some("fresh"));
+        let fresh_id = "44444444-5555-4bbb-8ccc-dddddddddddd";
+        let handle = fixture_handle(&app, card, Some(fresh_id));
         answer_start(&mut app, target, Ok(handle));
         let stored = flushed(&app);
         assert_eq!(identity(&stored), identity(&fresh));
-        assert_eq!(stored.launch.session_id.as_deref(), Some("fresh"));
+        assert_eq!(stored.launch.session_id.as_deref(), Some(fresh_id));
         // A late or repeated press, once nothing offers it, keeps it.
         let _ = app.update(Message::ChatUi(Action::StartFresh(card)));
         assert!(!app.chat_ui.attempt(card).is_some());
@@ -28257,8 +28416,11 @@ mod tests {
     }
 
     fn capacity_recovery_labels(app: &Cagents, card: CardId) -> Vec<String> {
+        recovery_labels(app.card_view(card, true, false))
+    }
+
+    fn recovery_labels(mut element: Element<'_, Message>) -> Vec<String> {
         use iced::advanced::{Layout, layout, widget::Tree};
-        let mut element = app.card_view(card, true, false);
         let renderer = crate::app::tests::headless_renderer();
         let mut tree = Tree::new(element.as_widget());
         let node = element.as_widget_mut().layout(
@@ -28277,6 +28439,507 @@ mod tests {
             .chain(accessible.children())
             .filter_map(|node| node.node().label().map(str::to_owned))
             .collect()
+    }
+
+    #[test]
+    fn nonretryable_start_refusal_keeps_the_saved_card_without_retry_or_replacement() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .replace_draft(text_editor::Content::with_text("keep this draft"));
+        let source = chat_runtime(&app, card).session.clone();
+        app.chat_forget(card);
+        app.cards.insert(card, CardRuntime::Loading);
+        drop(app.open_chat(card, source.clone(), chat::Intent::Restore));
+        let target = chat_runtime_attempt(&app, card);
+        let reason = "Codex recipe resume ID does not match the selected thread";
+        answer_start(
+            &mut app,
+            target,
+            Err(chat::StartFailure {
+                message: reason.into(),
+                recovery: chat::Recovery::Blocked,
+            }),
+        );
+        assert_eq!(attach_failure_details(&app, card).as_deref(), Some(reason));
+        assert!(app.chat_retry_blocked(card));
+        assert!(!app.chat_offers_fresh_conversation(card));
+        let labels = capacity_recovery_labels(&app, card);
+        assert!(
+            labels.iter().any(|label| label.contains("Close")),
+            "{labels:?}"
+        );
+        assert!(
+            labels.iter().all(|label| !label.contains("Retry")),
+            "{labels:?}"
+        );
+        app.workspace.resize_viewport(1280.0);
+        app.context_tab = crate::app::ContextTab::Details;
+        assert!(app.context_inspector_visible());
+        let labels = recovery_labels(cosmic::Application::view(&app));
+        assert!(
+            labels.iter().all(|label| !label.contains("Retry")),
+            "the inspector must honor the same refusal: {labels:?}"
+        );
+        drop(app.update(Message::RetryCard(card)));
+        drop(app.handle_context_inspector_action(crate::inspector::InspectorAction::Retry(card)));
+        drop(app.handle_chat_ui(Action::StartFresh(card)));
+        assert!(!app.chat_start_pending(card));
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Chat(source.clone())
+        );
+        assert_eq!(app.chat_ui.drafts.get(&card).unwrap(), "keep this draft");
+
+        // Another authoritative conversation on this card does not inherit
+        // the earlier conversation's refusal.
+        let mut replacement = source;
+        replacement.id = TerminalId::new();
+        app.replace_chat_conversation(card, replacement);
+        assert!(!app.chat_retry_blocked(card));
+    }
+
+    #[test]
+    fn nonretryable_failed_resume_preserves_an_explicit_fresh_start_offer() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target) = unresumable_chat(&mut app);
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .replace_draft(text_editor::Content::with_text("keep this draft"));
+        let source = chat_runtime(&app, card).session.clone();
+        drop(app.start_chat(card, source.clone(), chat::Intent::Resume, None, false));
+        let attempt = chat_runtime_attempt(&app, card);
+        let reason = "The saved conversation has a different exact recipe";
+        answer_start(
+            &mut app,
+            attempt,
+            Err(chat::StartFailure {
+                message: reason.into(),
+                recovery: chat::Recovery::Blocked,
+            }),
+        );
+        assert!(app.chat_retry_blocked(card));
+        assert!(app.chat_offers_fresh_conversation(card));
+        assert!(!app.chat_start_pending(card));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.session, source);
+        assert_eq!(runtime.error.as_deref(), Some(reason));
+        assert_eq!(runtime.composer.text(), "keep this draft");
+        let stopped = runtime.stopped(false, false);
+        assert_eq!(
+            stopped.guidance,
+            "Codex stopped. The conversation and your draft are kept."
+        );
+        assert_eq!(
+            stopped.primary,
+            Some(("Start a new conversation", stopped::Press::StartFresh, true)),
+        );
+        assert_eq!(stopped.secondary, None);
+        assert_eq!(runtime.stopped(true, false).primary.unwrap().2, false);
+        assert!(
+            matches!(stopped.primary.unwrap().1.action(runtime.target), Action::StartFresh(fresh) if fresh == card)
+        );
+
+        let target = runtime.target;
+        drop(app.update(Message::RetryCard(card)));
+        drop(app.handle_chat_ui(Action::Reconnect(target)));
+        drop(app.handle_chat_ui(Action::ResumeSaved(target)));
+        assert!(!app.chat_start_pending(card));
+        assert_eq!(chat_runtime(&app, card).session, source);
+
+        // Only this explicit existing action gives up the old pointer; the
+        // failure and stale Retry controls cannot take that choice for us.
+        drop(app.handle_chat_ui(Action::StartFresh(card)));
+        let Some(Phase::Closing {
+            restart: Some(fresh),
+            ..
+        }) = app.chat_ui.phases.get(&card)
+        else {
+            panic!("the explicit fresh action must close the failed attachment first");
+        };
+        assert_eq!(fresh.launch.session_id, None);
+        assert_eq!(fresh.launch.recipe.arguments, ["--remote", "unix://"]);
+        assert_eq!(
+            fresh.launch.recipe.environment,
+            source.launch.recipe.environment
+        );
+        assert_eq!(chat_runtime(&app, card).session, source);
+        assert_eq!(chat_runtime(&app, card).composer.text(), "keep this draft");
+        drop(app.handle_chat_ui(Action::CloseFinished(target, Ok(()))));
+        let fresh = app
+            .chat_ui
+            .attempt(card)
+            .expect("the selected fresh start resumes after Close");
+        assert_eq!(fresh.intent, chat::Intent::Start);
+        assert_eq!(fresh.session.launch.session_id, None);
+        assert_eq!(
+            fresh.session.launch.recipe.arguments,
+            ["--remote", "unix://"]
+        );
+        assert_eq!(
+            fresh.session.launch.recipe.environment,
+            source.launch.recipe.environment
+        );
+        assert_eq!(
+            app.chat_ui.drafts.get(&card).map(String::as_str),
+            Some("keep this draft")
+        );
+    }
+
+    #[test]
+    fn an_explicit_fresh_start_drops_retained_actor_and_pair_authority() {
+        let conversation = "33333333-4444-4aaa-8bbb-cccccccccccc";
+        for (provider, paired) in [Provider::Claude, Provider::Codex]
+            .into_iter()
+            .flat_map(|provider| [false, true].map(|paired| (provider, paired)))
+        {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat_for_provider(&mut app, provider, Some(conversation));
+            let target = chat_runtime(&app, card).target;
+            let mut source = chat_runtime(&app, card).session.clone();
+            source
+                .launch
+                .recipe
+                .arguments
+                .extend(["--model".into(), "fixture-model".into()]);
+            let account_home = crate::account::home_variable(provider).unwrap();
+            source
+                .launch
+                .recipe
+                .environment
+                .insert(account_home.into(), "/fixture/selected-account".into());
+            let mut expected_arguments = source.launch.recipe.arguments.clone();
+            if provider == Provider::Codex {
+                let remote = expected_arguments
+                    .iter()
+                    .position(|argument| argument == "--remote")
+                    .unwrap();
+                expected_arguments[remote + 1] = "unix://".into();
+                source
+                    .launch
+                    .recipe
+                    .arguments
+                    .splice(0..0, ["resume".into(), conversation.into()]);
+            } else {
+                source.launch.recipe.arguments.extend([
+                    "--resume".into(),
+                    conversation.into(),
+                    format!("--session-id={conversation}"),
+                ]);
+            }
+            source.native_continuity = match provider {
+                Provider::Claude => chat::NativeContinuity::RetainedClaudeActor { protocol: 2 },
+                Provider::Codex => chat::NativeContinuity::Durable {
+                    provider_version: "0.100.0".into(),
+                },
+                Provider::Omp => unreachable!(),
+            };
+            if paired {
+                let proof = source.proof.clone().unwrap();
+                source.terminal = Some(TerminalSession {
+                    id: source.id,
+                    launch: source.launch.recipe.clone(),
+                    continuity: TerminalContinuity::Live {
+                        host_session_id: proof.host_session_id,
+                        boot_id: proof.boot_id,
+                        host_incarnation: proof.host_incarnation,
+                    },
+                    transcript_path: None,
+                    resume_hint: None,
+                    owned_codex_listener: source.owned_codex_listener.clone(),
+                    recovery_origin: None,
+                    predecessor: None,
+                });
+            }
+            assert!(source.has_valid_native_continuity());
+            assert_eq!(source.owns_codex_listener(), provider == Provider::Codex);
+            app.card_state_mut(card).unwrap().kind = CardKind::Chat(source.clone());
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.session = source.clone();
+            runtime.start_retry_blocked = true;
+            runtime.replace_draft(text_editor::Content::with_text("keep the chosen draft"));
+            let snapshot = Arc::make_mut(&mut runtime.snapshot);
+            snapshot.exited = true;
+            snapshot.session_id = None;
+            assert!(app.chat_offers_fresh_conversation(card));
+
+            drop(app.handle_chat_ui(Action::StartFresh(card)));
+            let Some(Phase::Closing {
+                restart: Some(fresh),
+                ..
+            }) = app.chat_ui.phases.get(&card)
+            else {
+                panic!("the explicit choice must close its exact old attachment first");
+            };
+            assert!(
+                fresh.is_unstarted(),
+                "{provider:?}, paired={paired}: {fresh:?}"
+            );
+            assert!(fresh.has_valid_native_continuity());
+            assert_eq!(
+                fresh.native_continuity,
+                chat::NativeContinuity::ReconnectOnly
+            );
+            assert!(fresh.terminal.is_none());
+            assert!(fresh.owned_codex_listener.is_none());
+            assert_eq!(fresh.launch.recipe.program, source.launch.recipe.program);
+            assert_eq!(
+                fresh.launch.recipe.working_directory,
+                source.launch.recipe.working_directory
+            );
+            assert_eq!(
+                fresh.launch.recipe.environment,
+                source.launch.recipe.environment
+            );
+            assert_eq!(
+                fresh.launch.recipe.unset_environment,
+                source.launch.recipe.unset_environment
+            );
+            assert_eq!(fresh.launch.recipe.arguments, expected_arguments);
+            let fresh = fresh.clone();
+            assert_eq!(chat_runtime(&app, card).session, source);
+            assert_eq!(
+                chat_runtime(&app, card).composer.text(),
+                "keep the chosen draft"
+            );
+
+            drop(app.handle_chat_ui(Action::CloseFinished(
+                target,
+                Err("fixture: close not proved".into()),
+            )));
+            assert!(app.chat_ui.attempt(card).is_none());
+            assert_eq!(chat_runtime(&app, card).session, source);
+            assert_eq!(
+                chat_runtime(&app, card).composer.text(),
+                "keep the chosen draft"
+            );
+            // A late success from that failed close cannot adopt a new start.
+            drop(app.handle_chat_ui(Action::CloseFinished(target, Ok(()))));
+            assert!(app.chat_ui.attempt(card).is_none());
+            assert_eq!(chat_runtime(&app, card).session, source);
+            drop(app.handle_chat_ui(Action::StartFresh(card)));
+            drop(app.handle_chat_ui(Action::CloseFinished(target, Ok(()))));
+            let attempt = app
+                .chat_ui
+                .attempt(card)
+                .expect("Close admits the selected fresh start");
+            assert_eq!(attempt.intent, chat::Intent::Start);
+            assert_eq!(attempt.session, fresh);
+            assert!(attempt.session.is_unstarted());
+            assert_eq!(
+                app.chat_ui.drafts.get(&card).map(String::as_str),
+                Some("keep the chosen draft")
+            );
+        }
+    }
+
+    #[test]
+    fn unsafe_fresh_recipe_keeps_the_source_and_draft_without_a_close() {
+        for arguments in [
+            vec!["--resume".into(), "a-different-conversation".into()],
+            vec!["an already consumed prompt".into()],
+            vec!["--model".into()],
+            vec!["-c".into(), "model=\"o3\"".into()],
+        ] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let (card, target) = unresumable_chat(&mut app);
+            let mut source = chat_runtime(&app, card).session.clone();
+            source.reset_owned_codex_listener();
+            source.launch.recipe.arguments = arguments;
+            app.card_state_mut(card).unwrap().kind = CardKind::Chat(source.clone());
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.session = source.clone();
+            runtime.start_retry_blocked = true;
+            runtime.replace_draft(text_editor::Content::with_text("keep the draft"));
+            assert!(!app.chat_offers_fresh_conversation(card));
+            drop(app.handle_chat_ui(Action::StartFresh(card)));
+            assert!(!app.chat_start_pending(card));
+            assert_eq!(chat_runtime(&app, card).session, source);
+            assert_eq!(chat_runtime(&app, card).composer.text(), "keep the draft");
+            app.chat_forget(card);
+            app.cards.remove(&card);
+            app.chat_ui.fresh_offers.insert(card);
+            assert!(!app.chat_offers_fresh_conversation(card));
+            drop(app.handle_chat_ui(Action::StartFresh(card)));
+            assert!(!app.chat_start_pending(card));
+            assert_eq!(app.card_state(card).unwrap().kind, CardKind::Chat(source));
+            assert_eq!(
+                app.chat_ui.drafts.get(&card).map(String::as_str),
+                Some("keep the draft")
+            );
+        }
+    }
+
+    #[test]
+    fn nonretryable_resume_refusal_keeps_runtime_and_rejects_stale_retry_actions() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .replace_draft(text_editor::Content::with_text("keep this draft"));
+        let source = chat_runtime(&app, card).session.clone();
+        drop(app.start_chat(card, source.clone(), chat::Intent::Resume, None, false));
+        let target = chat_runtime_attempt(&app, card);
+        let reason = "Codex recipe resume ID does not match the selected thread";
+        answer_start(
+            &mut app,
+            target,
+            Err(chat::StartFailure {
+                message: reason.into(),
+                recovery: chat::Recovery::Blocked,
+            }),
+        );
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.error.as_deref(), Some(reason));
+        assert_eq!(runtime.composer.text(), "keep this draft");
+        assert_eq!(runtime.session, source);
+        let stopped = runtime.stopped(false, false);
+        assert_eq!(
+            stopped.guidance,
+            "Lost the connection to this chat. Codex may still be working; your draft is kept."
+        );
+        assert_eq!(stopped.primary, None);
+        assert_eq!(stopped.secondary, None);
+        assert!(!app.chat_offers_fresh_conversation(card));
+        let retry = runtime.target;
+        drop(app.update(Message::RetryCard(card)));
+        drop(app.handle_chat_ui(Action::Reconnect(retry)));
+        drop(app.handle_chat_ui(Action::ResumeSaved(retry)));
+        assert!(!app.chat_start_pending(card));
+        assert_eq!(chat_runtime(&app, card).session, source);
+
+        // A valid attachment from an independent recovery clears the refusal;
+        // a delayed reply from the old attempt cannot restore it.
+        drop(app.start_chat(card, source, chat::Intent::Restore, None, false));
+        let recovered = chat_runtime_attempt(&app, card);
+        let handle = fixture_handle(&app, card, Some(KNOWN_THREAD));
+        answer_start(&mut app, recovered, Ok(handle));
+        assert!(!app.chat_retry_blocked(card));
+        answer_start(
+            &mut app,
+            target,
+            Err(chat::StartFailure {
+                message: "stale refusal".into(),
+                recovery: chat::Recovery::Blocked,
+            }),
+        );
+        assert!(!app.chat_retry_blocked(card));
+        assert_eq!(chat_runtime(&app, card).composer.text(), "keep this draft");
+    }
+
+    #[test]
+    fn failed_resume_retains_history_and_refusal_when_a_stale_connected_handle_cannot_hydrate() {
+        for (recovery, hide_before_reply) in [chat::Recovery::Retry, chat::Recovery::Blocked]
+            .into_iter()
+            .flat_map(|recovery| [false, true].map(|hidden| (recovery, hidden)))
+        {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            app.workspace.resize_viewport(1280.0);
+            let card = live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
+            let target = chat_runtime(&app, card).target;
+            let mut source = chat_runtime(&app, card).session.clone();
+            source.native_continuity = chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+            let item = Arc::new(chat::Item {
+                id: "retained-answer".into(),
+                role: chat::Role::Assistant,
+                content: text("The original conversation is still readable"),
+                at: None,
+                started_at: None,
+            });
+            let handle = Arc::new(ClientHandle::fixture(
+                source.clone(),
+                Snapshot {
+                    ready: true,
+                    exited: true,
+                    session_id: source.launch.session_id.clone(),
+                    native_continuity: source.native_continuity.clone(),
+                    items: vec![item.clone()],
+                    ..Snapshot::default()
+                },
+            ));
+            let mut runtime = Runtime::new(
+                target,
+                source.clone(),
+                Connection::Live(handle.clone()),
+                true,
+                app.settings.editor_syntax_theme,
+            );
+            runtime.refresh();
+            runtime.replace_draft(text_editor::Content::with_text("keep this draft"));
+            assert!(runtime.resumes_in_place());
+            app.replace_chat_conversation(card, source.clone());
+            app.cards.insert(card, CardRuntime::Chat(Box::new(runtime)));
+            drop(app.start_chat(card, source, chat::Intent::Resume, None, false));
+            let attempt = chat_runtime_attempt(&app, card);
+            if hide_before_reply {
+                handle.set_interest(false, false).unwrap();
+                app.set_workspace_surfaces_visible(false);
+                let runtime = app.chat_runtime_mut(target).unwrap();
+                runtime.refresh();
+                assert_eq!(runtime.snapshot.items, [item.clone()]);
+            }
+            let reason =
+                "Provider executable claude is not executable in the preserved launch environment";
+            answer_start(
+                &mut app,
+                attempt,
+                Err(chat::StartFailure {
+                    message: reason.into(),
+                    recovery,
+                }),
+            );
+            let runtime = match app.cards.get_mut(&card) {
+                Some(CardRuntime::Chat(runtime)) => runtime,
+                _ => panic!("the failed resume keeps its runtime"),
+            };
+            assert!(runtime.resume_failed);
+            assert!(
+                handle.is_connected(),
+                "the IPC socket alone cannot hydrate a retired actor"
+            );
+            // A stale socket can hold metadata without a resident body. It
+            // must never replace the last readable runtime publication.
+            handle.set_interest(false, false).unwrap();
+            assert!(handle.resident_snapshot_with_clock().is_none());
+            runtime.set_visible(false).unwrap();
+            runtime.refresh();
+            assert_eq!(runtime.snapshot.items, [item.clone()]);
+            assert!(runtime.warm_stamp().is_some());
+            runtime.cool();
+            assert!(runtime.cache.is_empty());
+            assert_eq!(runtime.snapshot.items, [item.clone()]);
+            runtime.set_visible(true).unwrap();
+            preparation::drain_fixture(runtime);
+            assert_eq!(runtime.snapshot.items, [item]);
+            assert!(
+                shown(&runtime.cache["retained-answer"])
+                    .contains("The original conversation is still readable")
+            );
+            assert_eq!(runtime.failure_ui.local_error.as_deref(), Some(reason));
+            assert!(!runtime.failure_ui.incidents.is_empty());
+            assert_eq!(runtime.composer.text(), "keep this draft");
+            assert_eq!(runtime.error.as_deref(), Some(reason));
+            let incident = runtime.failure_ui.incidents.last().unwrap();
+            let labels = recovery_labels(runtime.failure_view(incident));
+            assert!(
+                labels.iter().any(|label| label.contains("Details")),
+                "{labels:?}"
+            );
+            assert!(
+                labels.iter().any(|label| label.contains("Copy")),
+                "{labels:?}"
+            );
+            assert_eq!(
+                labels
+                    .iter()
+                    .any(|label| label.contains("before trying again")),
+                recovery == chat::Recovery::Retry,
+                "{labels:?}",
+            );
+        }
     }
 
     #[test]
@@ -30024,6 +30687,9 @@ mod tests {
         assert!(app.chat_ui.attempt(card).is_none());
         app.chat_runtime_mut(target).unwrap().disconnected = true;
         app.chat_runtime_mut(target).unwrap().error = Some("Codex RPC error: Not logged in".into());
+        app.chat_runtime_mut(target).unwrap().start_retry_blocked = true;
+        drop(app.handle_chat_ui(Action::Reconnect(target)));
+        assert!(app.chat_ui.attempt(card).is_none());
         drop(app.handle_chat_ui(Action::ResumeAfterSignIn(target)));
         assert!(app.chat_ui.attempt(card).is_some());
         assert_eq!(chat_runtime(&app, card).session.launch, launch);

@@ -561,7 +561,15 @@ pub(super) fn forget_startup(
 }
 
 pub(super) fn reconcile_startup(host: &SharedHost, source: &Session) -> Result<bool, String> {
-    if prepare_failed_start(host, source)?.is_some() {
+    reconcile_startup_for_start(host, source).map_err(|failure| failure.to_string())
+}
+
+pub(super) fn reconcile_startup_for_start(
+    host: &SharedHost,
+    source: &Session,
+) -> Result<bool, chat::protocol::SetupError> {
+    use chat::protocol::SetupError;
+    if prepare_failed_start_for_start(host, source)?.is_some() {
         return Ok(true);
     }
     let pending = {
@@ -569,24 +577,32 @@ pub(super) fn reconcile_startup(host: &SharedHost, source: &Session) -> Result<b
         let Some(pending) = state.native_actor_startups.get(&source.id) else {
             return Ok(false);
         };
-        if state.chats.contains_key(&source.id)
-            || state.chat_spawning.contains_key(&source.id)
-            || (&pending.source != source && &pending.requested != source)
-        {
-            return Err("The retained startup belongs to another exact descriptor or is still transitioning".into());
+        if &pending.source != source && &pending.requested != source {
+            return Err(SetupError::Invalid(
+                "The retained startup belongs to another exact descriptor".into(),
+            ));
+        }
+        if state.chats.contains_key(&source.id) || state.chat_spawning.contains_key(&source.id) {
+            return Err(SetupError::Unavailable(
+                "The exact retained startup is still transitioning".into(),
+            ));
         }
         (pending.source.clone(), pending.context.clone())
     };
-    match pending.1.reconcile_cleanup()? {
+    match pending
+        .1
+        .reconcile_cleanup()
+        .map_err(SetupError::Unavailable)?
+    {
         chat::protocol::LaunchOutcome::NoProvider
         | chat::protocol::LaunchOutcome::TeardownProved => {
             forget_startup(host, &pending.0, &pending.1);
             Ok(true)
         }
-        chat::protocol::LaunchOutcome::Uncertain => Err(
+        chat::protocol::LaunchOutcome::Uncertain => Err(SetupError::Unavailable(
             "The exact retained startup has not proved cleanup; no second provider was started"
                 .into(),
-        ),
+        )),
     }
 }
 
@@ -598,40 +614,387 @@ pub(super) fn prepare_failed_start(
     host: &SharedHost,
     source: &Session,
 ) -> Result<Option<Session>, String> {
+    prepare_failed_start_for_start(host, source).map_err(|failure| failure.to_string())
+}
+
+pub(super) fn prepare_failed_start_for_start(
+    host: &SharedHost,
+    source: &Session,
+) -> Result<Option<Session>, chat::protocol::SetupError> {
+    use chat::protocol::SetupError;
     let failed = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        state
-            .native_actor_startups
-            .get(&source.id)
-            .and_then(|pending| {
-                pending.failed_close.as_ref().and_then(|target| {
-                    (source == &pending.requested || source == &target.source)
-                        .then(|| (pending.clone(), target.clone()))
-                })
-            })
+        match state.native_actor_startups.get(&source.id) {
+            Some(pending) => match &pending.failed_close {
+                Some(target) if source == &pending.requested || source == &target.source => {
+                    Some((pending.clone(), target.clone()))
+                }
+                Some(_) => {
+                    return Err(SetupError::Invalid(
+                        "The retained startup belongs to another exact descriptor".into(),
+                    ));
+                }
+                None => None,
+            },
+            None => None,
+        }
     };
     if let Some((pending, target)) = failed {
-        super::close_captured(host, target).map_err(|error| error.message)?;
+        if let Err(failure) = super::close_captured(host, target.clone()) {
+            // Only the same captured native/terminal owners may finish this
+            // cleanup on retry. An identity change needs fresh authority.
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            let same_source = state.chats.get(&target.source.id).is_some_and(|record| {
+                target.matches(record)
+                    && record.session.terminal.as_ref().is_none_or(|source| {
+                        state.terminals.get(&source.id).is_none_or(|terminal| {
+                            super::matches_paired_terminal(&terminal.session, source, state.proof())
+                                && record
+                                    .paired_terminal
+                                    .as_ref()
+                                    .is_some_and(|expected| terminal.handle.same_worker(expected))
+                        })
+                    })
+            });
+            return Err(if same_source {
+                SetupError::Unavailable(failure.message)
+            } else {
+                SetupError::Invalid(failure.message)
+            });
+        }
         forget_startup(host, &pending.source, &pending.context);
         return Ok(Some(pending.requested));
     }
     Ok(None)
 }
 
+#[cfg(test)]
+mod startup_retryability_tests {
+    use super::*;
+    use chat::protocol::{LaunchCleanup, LaunchOutcome, SetupError};
+    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+
+    struct Cleanup {
+        mode: AtomicU8,
+        calls: AtomicUsize,
+    }
+
+    impl LaunchCleanup for Cleanup {
+        fn cleanup(&self) -> Result<LaunchOutcome, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.mode.load(Ordering::SeqCst) {
+                0 => Err("fixture teardown has not committed".into()),
+                1 => Ok(LaunchOutcome::Uncertain),
+                _ => Ok(LaunchOutcome::TeardownProved),
+            }
+        }
+    }
+
+    fn pending(
+        root: &std::path::Path,
+    ) -> (SharedHost, Session, Arc<chat::protocol::ExecutionContext>) {
+        let proof = crate::model::HostSessionProof {
+            host_session_id: "startup-retryability".into(),
+            boot_id: crate::daemon::read_boot_id().unwrap(),
+            host_incarnation: "current".into(),
+        };
+        let source = Session {
+            id: TerminalId::new(),
+            proof: Some(proof.clone()),
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: Default::default(),
+            launch: chat::Launch {
+                provider: Provider::Claude,
+                session_id: None,
+                recipe: crate::model::LaunchRecipe {
+                    program: "/must-not-launch/claude".into(),
+                    arguments: vec![],
+                    working_directory: root.into(),
+                    environment: Default::default(),
+                    unset_environment: Default::default(),
+                },
+            },
+        };
+        let host = Arc::new(HostLock::new(HostState::new(proof)));
+        let context = Arc::new(chat::protocol::ExecutionContext::capture(root).unwrap());
+        host.lock().unwrap().native_actor_startups.insert(
+            source.id,
+            Startup {
+                source: source.clone(),
+                requested: source.clone(),
+                context: context.clone(),
+                failed_close: None,
+            },
+        );
+        (host, source, context)
+    }
+
+    #[test]
+    fn startup_descriptor_conflict_is_permanent_but_exact_transition_can_finish() {
+        let root = tempfile::tempdir().unwrap();
+        let (host, source, context) = pending(root.path());
+        let mut other = source.clone();
+        other
+            .launch
+            .recipe
+            .arguments
+            .push("--changed-recipe".into());
+        host.lock()
+            .unwrap()
+            .chat_spawning
+            .insert(source.id, source.clone());
+        assert!(matches!(
+            reconcile_startup_for_start(&host, &other),
+            Err(SetupError::Invalid(_)),
+        ));
+        assert!(matches!(
+            reconcile_startup_for_start(&host, &source),
+            Err(SetupError::Unavailable(_)),
+        ));
+        assert!(Arc::ptr_eq(
+            &host.lock().unwrap().native_actor_startups[&source.id].context,
+            &context,
+        ));
+        host.lock().unwrap().chat_spawning.remove(&source.id);
+        assert!(reconcile_startup_for_start(&host, &source).unwrap());
+        assert!(host.lock().unwrap().native_actor_startups.is_empty());
+        assert!(host.lock().unwrap().chats.is_empty());
+    }
+
+    #[test]
+    fn startup_cleanup_failure_and_uncertainty_can_be_retried_on_the_same_owner() {
+        let root = tempfile::tempdir().unwrap();
+        let (host, source, context) = pending(root.path());
+        let cleanup = Arc::new(Cleanup {
+            mode: AtomicU8::new(0),
+            calls: AtomicUsize::new(0),
+        });
+        context.claim_owner(cleanup.clone());
+        for mode in [0, 1] {
+            cleanup.mode.store(mode, Ordering::SeqCst);
+            assert!(matches!(
+                reconcile_startup_for_start(&host, &source),
+                Err(SetupError::Unavailable(_)),
+            ));
+            assert!(Arc::ptr_eq(
+                &host.lock().unwrap().native_actor_startups[&source.id].context,
+                &context,
+            ));
+            assert!(host.lock().unwrap().chats.is_empty());
+        }
+        cleanup.mode.store(2, Ordering::SeqCst);
+        assert!(reconcile_startup_for_start(&host, &source).unwrap());
+        assert_eq!(cleanup.calls.load(Ordering::SeqCst), 3);
+        assert!(host.lock().unwrap().native_actor_startups.is_empty());
+        assert_eq!(context.outcome(), LaunchOutcome::TeardownProved);
+    }
+
+    /// Tests only entry admission, before any private RPC or provider effect.
+    #[test]
+    fn retained_restore_distinguishes_fixed_identity_conflicts_from_daemon_shutdown() {
+        use crate::daemon::holder_registry::{Kind, Process, Record};
+        let root = tempfile::tempdir().unwrap();
+        let (host, source, _) = pending(root.path());
+        let proof = host.lock().unwrap().proof().clone();
+        let process = Process::read(std::process::id() as i32).unwrap();
+        let owner = Record {
+            version: 1,
+            build: Some(crate::daemon::holder_registry::BuildIdentity {
+                version: "fixture".into(),
+                commit: None,
+                capabilities: vec![
+                    crate::daemon::holder_registry::RETAINED_CLAUDE_CAPABILITY.into(),
+                ],
+            }),
+            kind: Kind::Native,
+            application: crate::instance::APPLICATION_ID.into(),
+            boot: proof.boot_id.clone(),
+            terminal: source.id,
+            holder: process.clone(),
+            root: process,
+        };
+        for conflict in 0..3 {
+            let mut requested = source.clone();
+            let mut conflicting_owner = owner.clone();
+            match conflict {
+                0 => conflicting_owner.terminal = TerminalId::new(),
+                1 => conflicting_owner.kind = Kind::Terminal,
+                _ => requested.launch.provider = Provider::Codex,
+            }
+            assert!(matches!(
+                restore_for_start(&host, 0, &requested, &proof, conflicting_owner),
+                Err(SetupError::Invalid(_)),
+            ));
+        }
+        host.lock().unwrap().shutting_down = true;
+        assert!(matches!(
+            restore_for_start(&host, 0, &source, &proof, owner),
+            Err(SetupError::Unavailable(_)),
+        ));
+        assert!(host.lock().unwrap().chats.is_empty());
+    }
+
+    #[test]
+    fn pending_enrollment_preserves_exact_owner_source_and_captured_scope() {
+        use crate::daemon::holder_registry::{Kind, Process, Record};
+        let root = tempfile::tempdir().unwrap();
+        let (host, source, _) = pending(root.path());
+        let proof = host.lock().unwrap().proof().clone();
+        let process = Process::read(std::process::id() as i32).unwrap();
+        let identity = chat::runtime::ActorIdentity {
+            instance: uuid::Uuid::new_v4(),
+            record: Record {
+                version: 4,
+                build: None,
+                kind: Kind::Native,
+                application: crate::instance::APPLICATION_ID.into(),
+                boot: proof.boot_id,
+                terminal: source.id,
+                holder: process.clone(),
+                root: process,
+            },
+        };
+        host.lock().unwrap().install_model(
+            super::super::super::model::Registry::at(&root.path().join("registry")).unwrap(),
+        );
+        assert!(matches!(
+            enroll_pending_for_start(&host, &identity, &source, &[], Err("captured"), true),
+            Err(SetupError::Invalid(_)),
+        ));
+        enroll_pending_for_start(&host, &identity, &source, &[], Err("captured"), false).unwrap();
+        for conflict in 0..3 {
+            let mut identity = identity.clone();
+            let mut source = source.clone();
+            let mut scope = Err("captured");
+            match conflict {
+                0 => identity.record.root.start += 1,
+                1 => source.launch.recipe.arguments.push("--changed".into()),
+                _ => scope = Err("another captured account"),
+            }
+            assert!(matches!(
+                enroll_pending_for_start(&host, &identity, &source, &[], scope, false),
+                Err(SetupError::Invalid(_)),
+            ));
+        }
+        enroll_pending_for_start(&host, &identity, &source, &[], Err("captured"), true).unwrap();
+        let registry = super::super::super::agent_execution::registry(&host).unwrap();
+        let owner = registry
+            .lock()
+            .unwrap()
+            .native_actor_ownership(identity.instance)
+            .unwrap()
+            .unwrap();
+        assert_eq!(owner.owner(), &identity.record);
+        assert_eq!(owner.source(), &source);
+        assert_eq!(owner.scope(), Err("captured"));
+        assert!(owner.is_pending());
+    }
+
+    #[test]
+    fn cleanup_recovery_without_a_resident_owner_can_be_retried() {
+        let root = tempfile::tempdir().unwrap();
+        let (host, source, _) = pending(root.path());
+        assert!(matches!(
+            recover_cleanup_attachment_for_start(&host, &source),
+            Err(SetupError::Unavailable(_)),
+        ));
+        assert!(host.lock().unwrap().chats.is_empty());
+    }
+
+    #[test]
+    fn retained_publication_rejects_changed_source_before_private_operations() {
+        let root = tempfile::tempdir().unwrap();
+        let (host, mut source, _) = pending(root.path());
+        let handle = Handle::fixture_failed_remote();
+        let identity = handle.actor_identity().unwrap();
+        source.id = identity.record.terminal;
+        source.proof.as_mut().unwrap().boot_id = identity.record.boot.clone();
+        for conflict in 0..3 {
+            let mut changed = source.clone();
+            match conflict {
+                0 => changed.id = TerminalId::new(),
+                1 => changed.proof = None,
+                _ => changed.launch.provider = Provider::Codex,
+            }
+            assert!(matches!(
+                publish_authenticated_source_for_start(
+                    &host,
+                    &handle,
+                    changed,
+                    &[],
+                    None,
+                    None,
+                    Publication::Install,
+                ),
+                Err(SetupError::Invalid(_)),
+            ));
+        }
+        assert!(host.lock().unwrap().chats.is_empty());
+    }
+
+    #[test]
+    fn exited_attachment_keeps_source_conflicts_blocked_and_registry_failure_retryable() {
+        let root = tempfile::tempdir().unwrap();
+        let (host, mut source, _) = pending(root.path());
+        let handle = Handle::fixture_failed_remote();
+        let identity = handle.actor_identity().unwrap();
+        source.id = identity.record.terminal;
+        host.lock().unwrap().chats.insert(
+            source.id,
+            super::super::Record {
+                session: source.clone(),
+                handle: handle.clone(),
+                execution_instance: identity.instance,
+                console_recipe: None,
+                paired_terminal: None,
+                source_process: None,
+                subscribers: Default::default(),
+                observations: Default::default(),
+                completion_observed: false,
+                returning_terminal: false,
+            },
+        );
+        let mut changed = source.clone();
+        changed
+            .launch
+            .recipe
+            .arguments
+            .push("--changed-source".into());
+        assert!(matches!(
+            finish_exited_attachment_for_start(&host, &changed),
+            Err(SetupError::Invalid(_)),
+        ));
+        // This exact owner reaches the operational registry lookup. The
+        // fixture has no registry, so cleanup remains pending and retryable.
+        assert!(matches!(
+            finish_exited_attachment_for_start(&host, &source),
+            Err(SetupError::Unavailable(_)),
+        ));
+        let state = host.lock().unwrap();
+        assert!(state.chats[&source.id].handle.same_attachment(&handle));
+        assert_eq!(state.chats[&source.id].session, source);
+        assert!(state.chat_spawning.is_empty());
+    }
+}
+
 /// Persist cleanup authority while the inspected source and captured scope are
 /// still authenticated, before installation or a new attachment can retire the
 /// previous epoch. Pending is never an input or history-resume grant.
-fn enroll_pending(
+
+fn enroll_pending_for_start(
     host: &SharedHost,
     identity: &chat::runtime::ActorIdentity,
     issued: &Session,
     aliases: &[Session],
     scope: Result<&crate::account::scope::LaunchAccountScope, &str>,
     installed: bool,
-) -> Result<(), String> {
-    let registry = super::super::agent_execution::registry(host)?;
+) -> Result<(), chat::protocol::SetupError> {
+    use chat::protocol::SetupError;
+    let registry =
+        super::super::agent_execution::registry(host).map_err(SetupError::Unavailable)?;
     let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-    let existing = registry.native_actor_ownership(identity.instance)?;
+    let existing = registry.native_actor_ownership_for_start(identity.instance)?;
     let source = if let Some(existing) = &existing {
         if existing.owner() != &identity.record
             || (existing.source() != issued && !aliases.contains(existing.source()))
@@ -648,12 +1011,9 @@ fn enroll_pending(
         }
         issued
     };
-    registry.register_pending_native_actor_ownership(
-        identity.instance,
-        &identity.record,
-        source,
-        scope,
-    )
+    registry
+        .register_pending_native_actor_ownership(identity.instance, &identity.record, source, scope)
+        .map_err(SetupError::Unavailable)
 }
 
 #[derive(Clone, Copy)]
@@ -670,30 +1030,62 @@ pub(super) enum Publication {
 pub(super) fn publish_authenticated_source(
     host: &SharedHost,
     handle: &Handle,
-    mut source: Session,
+    source: Session,
     retained: &[crate::agent_execution::HostedSession],
     console: Option<crate::model::LaunchRecipe>,
     pair: Option<crate::terminal::holder::Record>,
     publication: Publication,
 ) -> Result<Session, String> {
-    if handle.actor_identity().is_none() {
-        return Err("Retained publication lost its authenticated actor identity".into());
+    publish_authenticated_source_for_start(
+        host,
+        handle,
+        source,
+        retained,
+        console,
+        pair,
+        publication,
+    )
+    .map_err(|failure| failure.to_string())
+}
+
+pub(super) fn publish_authenticated_source_for_start(
+    host: &SharedHost,
+    handle: &Handle,
+    mut source: Session,
+    retained: &[crate::agent_execution::HostedSession],
+    console: Option<crate::model::LaunchRecipe>,
+    pair: Option<crate::terminal::holder::Record>,
+    publication: Publication,
+) -> Result<Session, chat::protocol::SetupError> {
+    use chat::protocol::SetupError;
+    let identity = handle
+        .actor_identity()
+        .ok_or("Retained publication lost its authenticated actor identity")?;
+    if source.id != identity.record.terminal || source.launch.provider != Provider::Claude {
+        return Err("Pending publication changed its exact authenticated actor".into());
     }
     let install = matches!(publication, Publication::Install);
     if install == handle.is_close_only() {
         return Err("Retained publication mode does not match its authenticated attachment".into());
     }
+    let proof = source
+        .proof
+        .clone()
+        .filter(HostSessionProof::is_complete)
+        .ok_or("Pending publication lacks daemon proof")?;
+    if identity.instance.is_nil()
+        || identity.record.kind != crate::daemon::holder_registry::Kind::Native
+        || identity.record.boot != proof.boot_id
+    {
+        return Err("Pending publication changed its exact authenticated actor".into());
+    }
     if install {
-        let proof = source
-            .proof
-            .clone()
-            .ok_or("Pending publication lacks daemon proof")?;
-        let identity = handle.actor_identity().unwrap();
-        let inspection = Handle::inspect_remote(&identity.record, proof)?;
+        let inspection =
+            Handle::inspect_remote(&identity.record, proof).map_err(SetupError::Unavailable)?;
         if inspection.identity != identity {
             return Err("Pending publication changed its exact authenticated actor".into());
         }
-        enroll_pending(
+        enroll_pending_for_start(
             host,
             &inspection.identity,
             &inspection.source,
@@ -704,7 +1096,9 @@ pub(super) fn publish_authenticated_source(
                 .map_err(String::as_str),
             inspection.state.installed,
         )?;
-        handle.commit_native_installation()?;
+        handle
+            .commit_native_installation()
+            .map_err(SetupError::Unavailable)?;
     }
     source.launch.session_id = handle.confirmed_session_id().or(source.launch.session_id);
     source.native_continuity = handle.native_continuity();
@@ -716,20 +1110,24 @@ pub(super) fn publish_authenticated_source(
     {
         return Err("Installed Claude actor did not prove retained ownership".into());
     }
-    handle.update_native_source(source.clone(), console, pair)?;
+    handle
+        .update_native_source(source.clone(), console, pair)
+        .map_err(SetupError::Unavailable)?;
     if install {
-        super::super::agent_execution::registry(host)?
+        super::super::agent_execution::registry(host)
+            .map_err(SetupError::Unavailable)?
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .adopt_authenticated_agent_session(
                 retained,
                 &crate::agent_execution::HostedSession::Chat(source.clone()),
-            )?;
+            )
+            .map_err(SetupError::Unavailable)?;
     }
     if install {
         // Promotion follows the exact helper ACK and Registry transaction and
         // precedes any ordinary HOST input record becoming visible.
-        register_ownership(host, handle, &source)?;
+        register_ownership(host, handle, &source).map_err(SetupError::Unavailable)?;
     }
     Ok(source)
 }
@@ -744,6 +1142,16 @@ pub(super) fn restore(
     owner: crate::daemon::holder_registry::Record,
 ) -> Result<ServerResponse, String> {
     restore_actor(host, client, requested, proof, owner, true, None)
+}
+
+pub(super) fn restore_for_start(
+    host: &SharedHost,
+    client: ClientId,
+    requested: &Session,
+    proof: &HostSessionProof,
+    owner: crate::daemon::holder_registry::Record,
+) -> Result<ServerResponse, chat::protocol::SetupError> {
+    restore_actor_for_start(host, client, requested, proof, owner, true, None)
 }
 
 /// An ordinary daemon exit closes each provider, then retires its helper once
@@ -762,18 +1170,34 @@ pub(in crate::host) fn finish_interrupted_exit(
     host: &SharedHost,
     owner: &crate::daemon::holder_registry::Record,
 ) -> Result<bool, String> {
+    finish_interrupted_exit_for_start(host, owner, None).map_err(|failure| failure.to_string())
+}
+
+fn finish_interrupted_exit_for_start(
+    host: &SharedHost,
+    owner: &crate::daemon::holder_registry::Record,
+    requested: Option<&Session>,
+) -> Result<bool, chat::protocol::SetupError> {
+    use chat::protocol::SetupError;
     let proof = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .proof()
         .clone();
-    let inspection = Handle::inspect_remote(owner, proof.clone())?;
+    let inspection =
+        Handle::inspect_remote(owner, proof.clone()).map_err(SetupError::Unavailable)?;
     if &inspection.identity.record != owner
-        || inspection.source.launch.provider != Provider::Claude
+        || requested.is_some_and(|requested| {
+            requested != &inspection.source && !inspection.previous_sources.contains(requested)
+        })
+    {
+        return Err("The retained actor does not recognize this exact cleanup descriptor".into());
+    }
+    if inspection.source.launch.provider != Provider::Claude
         || inspection.state.owns_work
         || !inspection.state.close.exited
         || !matches!(
-            Handle::inspect_retained_retirement(owner, &proof)?,
+            Handle::inspect_retained_retirement(owner, &proof).map_err(SetupError::Unavailable)?,
             RetirementInspection::Running
         )
     {
@@ -790,7 +1214,8 @@ pub(in crate::host) fn finish_interrupted_exit(
         None,
         None,
         Ending::Stopped,
-    )?;
+    )
+    .map_err(SetupError::Unavailable)?;
     Ok(true)
 }
 
@@ -800,7 +1225,15 @@ pub(in crate::host) fn finish_interrupted_exit_of(
     host: &SharedHost,
     session: &Session,
 ) -> Result<bool, String> {
+    finish_interrupted_exit_of_for_start(host, session).map_err(|failure| failure.to_string())
+}
+
+pub(in crate::host) fn finish_interrupted_exit_of_for_start(
+    host: &SharedHost,
+    session: &Session,
+) -> Result<bool, chat::protocol::SetupError> {
     use crate::daemon::holder_registry::{self as registry, Kind};
+    use chat::protocol::SetupError;
     if session.launch.provider != Provider::Claude
         || host
             .lock()
@@ -810,9 +1243,13 @@ pub(in crate::host) fn finish_interrupted_exit_of(
     {
         return Ok(false);
     }
-    let directory = registry::directory(Kind::Native)?;
-    match registry::recovery_candidate(&registry::socket(&directory, session.id), Kind::Native)? {
-        Some(owner) if Handle::is_remote_record(&owner) => finish_interrupted_exit(host, &owner),
+    let directory = registry::directory(Kind::Native).map_err(SetupError::Unavailable)?;
+    match registry::recovery_candidate(&registry::socket(&directory, session.id), Kind::Native)
+        .map_err(SetupError::Unavailable)?
+    {
+        Some(owner) if Handle::is_remote_record(&owner) => {
+            finish_interrupted_exit_for_start(host, &owner, Some(session))
+        }
         _ => Ok(false),
     }
 }
@@ -832,6 +1269,13 @@ pub(in crate::host) fn finish_exited_attachment(
     host: &SharedHost,
     source: &Session,
 ) -> Result<bool, String> {
+    finish_exited_attachment_for_start(host, source).map_err(|failure| failure.to_string())
+}
+
+pub(in crate::host) fn finish_exited_attachment_for_start(
+    host: &SharedHost,
+    source: &Session,
+) -> Result<bool, chat::protocol::SetupError> {
     let target = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let Some(record) = state.chats.get(&source.id) else {
@@ -846,9 +1290,15 @@ pub(in crate::host) fn finish_exited_attachment(
         {
             return Ok(false);
         }
+        if !recognizes_cleanup_source(&state, record, source) {
+            return Err(
+                "The retained actor does not recognize this exact cleanup descriptor".into(),
+            );
+        }
         super::CloseTarget::from_record(record)
     };
-    close_with_target(host, source, None, Some(&target), None, Ending::Stopped)?;
+    close_with_target(host, source, None, Some(&target), None, Ending::Stopped)
+        .map_err(chat::protocol::SetupError::Unavailable)?;
     Ok(true)
 }
 
@@ -918,21 +1368,49 @@ pub(super) fn recover_cleanup_attachment(
     host: &SharedHost,
     requested: &Session,
 ) -> Result<(), String> {
-    super::super::account_lifecycle::ensure_idle(host).map_err(|error| error.message)?;
+    recover_cleanup_attachment_for_start(host, requested).map_err(|failure| failure.to_string())
+}
+
+pub(super) fn recover_cleanup_attachment_for_start(
+    host: &SharedHost,
+    requested: &Session,
+) -> Result<(), chat::protocol::SetupError> {
+    use chat::protocol::SetupError;
+    let setup_failure = |failure: ProtocolError| {
+        if failure.retryable {
+            SetupError::Unavailable(failure.message)
+        } else {
+            SetupError::Invalid(failure.message)
+        }
+    };
+    super::super::account_lifecycle::ensure_idle(host).map_err(setup_failure)?;
     let (target, identity, proof, _reservation) = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         let record = state
             .chats
             .get(&requested.id)
-            .ok_or("Cleanup owner disappeared")?;
-        if !record.handle.is_close_only()
+            .ok_or_else(|| SetupError::Unavailable("Cleanup owner disappeared".into()))?;
+        if !recognizes_cleanup_source(&state, record, requested)
+            || !record.handle.is_close_only()
             || record.session.launch.provider != Provider::Claude
-            || record.handle.is_completed()
+        {
+            return Err("This conversation is not a running recoverable cleanup attachment".into());
+        }
+        if record.handle.is_completed()
             || state.shutting_down
             || state.chat_handoffs.contains_key(&requested.id)
             || state.native_closing.contains_key(&requested.id)
         {
-            return Err("This conversation is not a running recoverable cleanup attachment".into());
+            return Err(SetupError::Unavailable(
+                "This conversation is not a running recoverable cleanup attachment".into(),
+            ));
+        }
+        if let Some(pending) = state.chat_spawning.get(&requested.id) {
+            return Err(if pending == requested {
+                SetupError::Unavailable("Chat is already starting or closing".into())
+            } else {
+                SetupError::Invalid("Pending chat has a different exact launch".into())
+            });
         }
         let target = super::CloseTarget::from_record(record);
         let identity = record
@@ -940,11 +1418,11 @@ pub(super) fn recover_cleanup_attachment(
             .actor_identity()
             .ok_or("Cleanup lost its exact helper")?;
         let proof = state.proof().clone();
-        let reservation = capacity::Reservation::closing(host, &mut state, requested)
-            .map_err(|error| error.message)?;
+        let reservation =
+            capacity::Reservation::closing(host, &mut state, requested).map_err(setup_failure)?;
         (target, identity, proof, reservation)
     };
-    restore_actor(
+    restore_actor_for_start(
         host,
         0,
         requested,
@@ -998,25 +1476,72 @@ fn restore_actor(
     publish_snapshot: bool,
     replacing: Option<&super::CloseTarget>,
 ) -> Result<ServerResponse, String> {
-    let inspection = Handle::inspect_remote(&owner, proof.clone())?;
+    restore_actor_for_start(
+        host,
+        client,
+        requested,
+        proof,
+        owner,
+        publish_snapshot,
+        replacing,
+    )
+    .map_err(|failure| failure.to_string())
+}
+
+fn restore_actor_for_start(
+    host: &SharedHost,
+    client: ClientId,
+    requested: &Session,
+    proof: &HostSessionProof,
+    owner: crate::daemon::holder_registry::Record,
+    publish_snapshot: bool,
+    replacing: Option<&super::CloseTarget>,
+) -> Result<ServerResponse, chat::protocol::SetupError> {
+    use chat::protocol::SetupError;
+    if owner.terminal != requested.id
+        || requested.launch.provider != Provider::Claude
+        || !Handle::is_remote_record(&owner)
+    {
+        return Err("The retained Claude actor identity changed during inspection".into());
+    }
+    if host.lock().unwrap_or_else(|p| p.into_inner()).shutting_down {
+        return Err(SetupError::Unavailable(
+            "Daemon ownership changed before retained Claude registration; the provider remains owned by its holder".into(),
+        ));
+    }
+    // The private RPC still reports operational failures as opaque strings.
+    // Preserve Retry for those failures; classify only structured identities
+    // observed below, never words in a helper's diagnostic.
+    let inspection =
+        Handle::inspect_remote(&owner, proof.clone()).map_err(SetupError::Unavailable)?;
     if inspection.identity.record != owner
         || inspection.source.id != requested.id
         || inspection.source.launch.provider != Provider::Claude
     {
         return Err("The retained Claude actor identity changed during inspection".into());
     }
+    if requested != &inspection.source && !inspection.previous_sources.contains(requested) {
+        return Err("Retained actor source/account identity does not match this chat".into());
+    }
     if let Some(target) = replacing {
-        target
-            .require_current(host)
-            .map_err(|error| error.message)?;
-        if target.handle.actor_identity().as_ref() != Some(&inspection.identity)
-            || !inspection.state.installed
+        target.require_current(host).map_err(|error| {
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            if state.shutting_down || state.chat_handoffs.contains_key(&requested.id) {
+                SetupError::Unavailable(error.message)
+            } else {
+                SetupError::Invalid(error.message)
+            }
+        })?;
+        if target.handle.actor_identity().as_ref() != Some(&inspection.identity) {
+            return Err("The cleanup helper no longer owns a running provider; retirement evidence was preserved".into());
+        }
+        if !inspection.state.installed
             || inspection.state.completed
             || !inspection.state.owns_work
             || inspection.state.close.closing
             || inspection.state.close.exited
         {
-            return Err("The cleanup helper no longer owns a running provider; retirement evidence was preserved".into());
+            return Err(SetupError::Unavailable("The cleanup helper no longer owns a running provider; retirement evidence was preserved".into()));
         }
     }
     if !publish_snapshot {
@@ -1029,9 +1554,10 @@ fn restore_actor(
                 .launch_account_scope
                 .as_ref()
                 .map_err(String::as_str),
-        )?;
+        )
+        .map_err(SetupError::Unavailable)?;
     } else {
-        enroll_pending(
+        enroll_pending_for_start(
             host,
             &inspection.identity,
             &inspection.source,
@@ -1048,9 +1574,11 @@ fn restore_actor(
     let expected_instance = inspection.identity.instance;
     let notify = move |update| changed_owned(&weak, id, expected_instance, update);
     let handle = if publish_snapshot {
-        Handle::adopt_remote(&owner, requested.clone(), proof.clone(), notify)?
+        Handle::adopt_remote(&owner, requested.clone(), proof.clone(), notify)
+            .map_err(SetupError::Unavailable)?
     } else {
-        Handle::adopt_remote_for_close(&owner, requested.clone(), proof.clone(), notify)?
+        Handle::adopt_remote_for_close(&owner, requested.clone(), proof.clone(), notify)
+            .map_err(SetupError::Unavailable)?
     };
     let identity = handle
         .actor_identity()
@@ -1072,7 +1600,8 @@ fn restore_actor(
             &inspection.source,
             inspection.paired_holder.as_ref(),
             proof,
-        )?;
+        )
+        .map_err(SetupError::Unavailable)?;
     let paired = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         match (&mut session.terminal, inspection.paired_holder.as_ref()) {
@@ -1098,16 +1627,22 @@ fn restore_actor(
                 None
             }
             (Some(terminal), Some(owner)) => {
-                let current = state.terminals.get(&terminal.id).filter(|current|
-                    current.handle.holder_identity() == Some(owner)
-                    && current.session.launch == terminal.launch
-                    && current.session.owned_codex_listener == terminal.owned_codex_listener)
-                    .ok_or("The retained Claude console's exact worker could not be recovered; provider ownership was preserved")?;
-                *terminal = state.native_terminal_projection(terminal.id)?;
+                let current = state.terminals.get(&terminal.id).ok_or_else(|| SetupError::Unavailable(
+                    "The retained Claude console's exact worker could not be recovered; provider ownership was preserved".into(),
+                ))?;
+                if current.handle.holder_identity() != Some(owner)
+                    || current.session.launch != terminal.launch
+                    || current.session.owned_codex_listener != terminal.owned_codex_listener
+                {
+                    return Err("The retained Claude console's exact worker could not be recovered; provider ownership was preserved".into());
+                }
+                *terminal = state
+                    .native_terminal_projection(terminal.id)
+                    .map_err(SetupError::Unavailable)?;
                 if terminal.continuity.live_proof().as_ref() != Some(proof) {
-                    return Err(
+                    return Err(SetupError::Unavailable(
                         "The retained Claude console belongs to a different daemon owner".into(),
-                    );
+                    ));
                 }
                 Some(current.handle.clone())
             }
@@ -1124,7 +1659,7 @@ fn restore_actor(
     sources.push(requested.clone());
     sources.sort_by_key(|source| serde_json::to_vec(source).unwrap_or_default());
     sources.dedup();
-    session = publish_authenticated_source(
+    session = publish_authenticated_source_for_start(
         host,
         &handle,
         session,
@@ -1168,7 +1703,7 @@ fn restore_actor(
         returning_terminal: !publish_snapshot,
     };
     let response = if publish_snapshot {
-        session_snapshot(&record.session, &record.handle)?
+        session_snapshot(&record.session, &record.handle).map_err(SetupError::Unavailable)?
     } else {
         // Cleanup adopts ownership without reading a presentation window.
         ServerResponse::Accepted
@@ -1185,9 +1720,19 @@ fn restore_actor(
         }
         _ => false,
     };
-    if state.shutting_down
-        || state.proof() != proof
-        || !pair_unchanged
+    if state.shutting_down || state.proof() != proof {
+        return Err(SetupError::Unavailable("Daemon ownership changed before retained Claude registration; the provider remains owned by its holder".into()));
+    }
+    if replacing.is_none()
+        && state.chats.get(&id).is_some_and(|current| {
+            current.session == record.session
+                && current.execution_instance == record.execution_instance
+                && current.handle.same_actor(&handle)
+        })
+    {
+        return Err(SetupError::Unavailable("Daemon ownership changed before retained Claude registration; the provider remains owned by its holder".into()));
+    }
+    if !pair_unchanged
         || match replacing {
             Some(target) => state
                 .chats
@@ -1324,6 +1869,23 @@ impl Ending {
     }
 }
 
+/// The same issued, observed or authenticated upgrade alias accepted by cleanup.
+fn recognizes_cleanup_source(
+    state: &HostState,
+    record: &super::Record,
+    requested: &Session,
+) -> bool {
+    let mut observed = record.session.clone();
+    observed.launch.session_id = record.handle.session_id();
+    observed.native_continuity = record.handle.native_continuity();
+    record.session == *requested
+        || observed == *requested
+        || state
+            .upgrade_chats
+            .get(&requested.id)
+            .is_some_and(|aliases| aliases.iter().any(|alias| alias.source == *requested))
+}
+
 fn close_with_target(
     host: &SharedHost,
     requested: &Session,
@@ -1448,16 +2010,7 @@ fn close_with_target(
                 "The discovered retained actor differs from the current exact owner".into(),
             );
         }
-        let mut observed = record.session.clone();
-        observed.launch.session_id = record.handle.session_id();
-        observed.native_continuity = record.handle.native_continuity();
-        if record.session != *requested
-            && observed != *requested
-            && !state
-                .upgrade_chats
-                .get(&requested.id)
-                .is_some_and(|aliases| aliases.iter().any(|alias| alias.source == *requested))
-        {
+        if !recognizes_cleanup_source(&state, record, requested) {
             return Err(
                 "The retained actor does not recognize this exact cleanup descriptor".into(),
             );

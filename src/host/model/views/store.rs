@@ -21,9 +21,12 @@ use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
 use crate::{
+    chat::protocol::SetupError,
     model::{CardId, CardKind},
     workspace_model::views::{Pane, Scope, View},
 };
+
+use super::super::native_actor_retirement::read_error;
 
 /// The only descriptor format so far: `CardKind` as serde JSON. It changes
 /// only when a field changes meaning; a reader refuses a format it does not
@@ -372,7 +375,15 @@ pub(in crate::host::model) fn occupied(db: &Connection) -> Result<Vec<View>, Str
     collect(db, true)
 }
 
+pub(in crate::host::model) fn occupied_for_start(db: &Connection) -> Result<Vec<View>, SetupError> {
+    collect_for_start(db, true)
+}
+
 fn collect(db: &Connection, occupied: bool) -> Result<Vec<View>, String> {
+    collect_for_start(db, occupied).map_err(|error| error.to_string())
+}
+
+fn collect_for_start(db: &Connection, occupied: bool) -> Result<Vec<View>, SetupError> {
     let filter = if occupied {
         "WHERE EXISTS(SELECT 1 FROM panes p WHERE p.scope = s.id)"
     } else {
@@ -383,7 +394,7 @@ fn collect(db: &Connection, occupied: bool) -> Result<Vec<View>, String> {
             "SELECT id, channel, repository, worktree, revision FROM view_scopes s {filter}
              ORDER BY id"
         ))
-        .map_err(sql)?;
+        .map_err(read_error)?;
     let scopes = statement
         .query_map([], |row| {
             Ok((
@@ -395,13 +406,13 @@ fn collect(db: &Connection, occupied: bool) -> Result<Vec<View>, String> {
             ))
         })
         .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
-        .map_err(sql)?;
+        .map_err(read_error)?;
     let mut views = Vec::with_capacity(scopes.len());
     let mut index = HashMap::with_capacity(scopes.len());
     for (id, channel, repository, worktree, revision) in scopes {
         index.insert(id, views.len());
         views.push(View {
-            scope: scope_from(channel, repository, worktree)?,
+            scope: scope_from(channel, repository, worktree).map_err(SetupError::Invalid)?,
             revision: revision as u64,
             panes: Vec::new(),
             retired: Vec::new(),
@@ -411,33 +422,34 @@ fn collect(db: &Connection, occupied: bool) -> Result<Vec<View>, String> {
         .prepare_cached(&format!(
             "SELECT scope, {ROW_COLUMNS} FROM panes ORDER BY scope, position, id"
         ))
-        .map_err(sql)?;
+        .map_err(read_error)?;
     let rows = panes
         .query_map([], |r| Ok((r.get::<_, i64>(0)?, row(r, 1)?)))
-        .map_err(sql)?;
+        .map_err(read_error)?;
     for entry in rows {
-        let (scope, row) = entry.map_err(sql)?;
+        let (scope, row) = entry.map_err(read_error)?;
         let view = index
             .get(&scope)
             .ok_or("a saved pane names a view that does not exist")?;
-        views[*view].panes.push(row.pane()?);
+        views[*view]
+            .panes
+            .push(row.pane().map_err(SetupError::Invalid)?);
     }
     let mut retired = db
         .prepare_cached("SELECT scope, pane FROM retired_panes ORDER BY scope, ordinal")
-        .map_err(sql)?;
+        .map_err(read_error)?;
     let rows = retired
         .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
-        .map_err(sql)?;
+        .map_err(read_error)?;
     for entry in rows {
-        let (scope, pane) = entry.map_err(sql)?;
+        let (scope, pane) = entry.map_err(read_error)?;
         // Emptied views are skipped by `occupied`; their tombstones with them.
         let Some(view) = index.get(&scope) else {
             continue;
         };
-        views[*view].retired.push(
-            pane.parse()
-                .map_err(|error| format!("retired pane id `{pane}` is unreadable: {error}"))?,
-        );
+        views[*view].retired.push(pane.parse().map_err(|error| {
+            SetupError::Invalid(format!("retired pane id `{pane}` is unreadable: {error}"))
+        })?);
     }
     Ok(views)
 }

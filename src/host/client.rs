@@ -487,13 +487,33 @@ fn ensure_inspection_open(host: &SharedHost) -> Result<(), ProtocolError> {
     }
 }
 
+fn chat_startup_request(request: &ClientRequest) -> bool {
+    matches!(
+        request,
+        ClientRequest::ChatStart { .. }
+            | ClientRequest::ChatStartSelected { .. }
+            | ClientRequest::ChatAttach { .. }
+            | ClientRequest::ChatList
+            | ClientRequest::ResolveUpgradeChat { .. }
+            | ClientRequest::ChatPrepareResume { .. }
+    )
+}
+
 fn ensure_request_open(host: &SharedHost, request: &ClientRequest) -> Result<(), ProtocolError> {
     if !host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .ordinary_exit_cleanup_pending()
     {
-        return ensure_control_open(host);
+        return ensure_control_open(host).map_err(|mut failure| {
+            // This refused startup admitted no provider work. The same card
+            // may reconnect after shutdown finishes; other command policies
+            // retain their existing retry/replay contract.
+            if chat_startup_request(request) {
+                failure.retryable = true;
+            }
+            failure
+        });
     }
     if matches!(
         request,
@@ -523,7 +543,7 @@ fn ensure_request_open(host: &SharedHost, request: &ClientRequest) -> Result<(),
     Err(ProtocolError::new(
         ProtocolErrorCode::TerminalUnavailable,
         "Ordinary daemon exit is waiting for exact original child cleanup; only inspection and explicit checked Close remain available",
-        false,
+        chat_startup_request(request),
     ))
 }
 
@@ -2245,7 +2265,13 @@ fn prepare_resume(
 > {
     let gate = control_gate(host);
     let _control = gate.read().unwrap_or_else(|p| p.into_inner());
-    ensure_inspection_open(host)?;
+    ensure_inspection_open(host).map_err(|mut failure| {
+        // A refused Connect has admitted no mutations or uncertain writes.
+        // Only this shutdown gate is retryable; expected-host/proof validation
+        // below retains its permanent identity refusal.
+        failure.retryable = true;
+        failure
+    })?;
     let mut resumed = Vec::new();
     let mut replay = Vec::new();
     for cursor in cursors {
@@ -2433,7 +2459,9 @@ pub(in crate::host) mod tests {
                 ClientRequest::ChatList,
                 ClientRequest::ChatCloseRetained { session: source },
             ] {
+                let startup = chat_startup_request(&request);
                 let failure = process_request(&host, 0, request).unwrap_err();
+                assert_eq!(failure.retryable, startup);
                 assert_eq!(failure.code, ProtocolErrorCode::TerminalUnavailable);
                 assert_eq!(
                     failure.message,

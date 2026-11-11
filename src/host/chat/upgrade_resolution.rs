@@ -90,7 +90,7 @@ impl Grant {
         let resolved = self
             .handle
             .resolve_retained_source(&self.source)
-            .map_err(unavailable)?;
+            .map_err(retryable_unavailable)?;
         let mut expected = self.record.clone();
         expected.launch.session_id = resolved.launch.session_id.clone();
         expected.native_continuity = resolved.native_continuity.clone();
@@ -141,17 +141,18 @@ pub(in crate::host) fn resolve(
         )
     };
     if cleanup {
-        super::retained_actor::recover_cleanup_attachment(host, source).map_err(unavailable)?;
+        super::retained_actor::recover_cleanup_attachment_for_start(host, source)
+            .map_err(setup_error)?;
     }
     if missing {
         // Client zero is the existing unattached startup-adoption mode.
         // Resolve must not subscribe this connection before its Attach.
-        if let Err(native_error) = super::native_recovery::restore(host, 0, source) {
+        if let Err(native_error) = super::native_recovery::restore_for_start(host, 0, source) {
             // A missing holder is not permission to execute its old recipe.
             // The separate history constructor can only page saved data and
             // repeats owner/managed-work fences under its admission guard.
             if !source.is_saved_claude_history() {
-                return Err(unavailable(native_error));
+                return Err(native_error);
             }
             super::capacity::recover_saved_history(host, source)?;
         }
@@ -216,12 +217,17 @@ pub(in crate::host) fn attach(
         };
         let id = attempt.id();
         let Attempt::Ready(grant) = std::mem::replace(attempt, Attempt::Spent(id)) else {
-            return Err(unavailable(
+            return Err(retryable_unavailable(
                 "Native recovery attempt is spent; resolve again",
             ));
         };
-        if requested != &grant.resolved || !grant.current(&state, client) {
+        if requested != &grant.resolved {
             return Err(unavailable(
+                "Native recovery attachment no longer matches its exact resolved actor",
+            ));
+        }
+        if !grant.current(&state, client) {
+            return Err(retryable_unavailable(
                 "Native recovery attachment no longer matches its exact resolved actor",
             ));
         }
@@ -252,7 +258,8 @@ pub(in crate::host) fn attach(
         grant: &grant,
         rollback: newly_subscribed,
     };
-    let response = super::session_snapshot(&grant.record, &grant.handle).map_err(unavailable)?;
+    let response =
+        super::session_snapshot(&grant.record, &grant.handle).map_err(retryable_unavailable)?;
     #[cfg(test)]
     if let Some(action) = AFTER_SNAPSHOT.with(|slot| slot.borrow_mut().take()) {
         // A test-owned cutpoint, outside HostLock and without production state.

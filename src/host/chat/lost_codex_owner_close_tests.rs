@@ -1114,6 +1114,10 @@ fn codex_start_refuses_a_surviving_process_then_starts_after_it_exits() {
     assert!(!old_socket.exists());
     let failure = codex_start(&fixture).unwrap_err();
     assert!(
+        failure.retryable,
+        "the same pane can retry after its writer exits"
+    );
+    assert!(
         failure.message.ends_with(&named.refusal()),
         "{}",
         failure.message
@@ -1122,6 +1126,7 @@ fn codex_start_refuses_a_surviving_process_then_starts_after_it_exits() {
     // app-server, even after its ownership record and socket disappeared.
     fixture.source.proof.as_mut().unwrap().boot_id = crate::model::BootId::new("earlier-boot");
     let stale_failure = codex_start(&fixture).unwrap_err();
+    assert!(stale_failure.retryable);
     assert!(
         stale_failure.message.ends_with(&named.refusal()),
         "{}",
@@ -1447,12 +1452,29 @@ fn codex_picker_resume_refuses_the_old_panes_surviving_marked_process() {
     )
     .unwrap_err();
     assert!(
+        failure.retryable,
+        "the same saved source can retry after its writer exits"
+    );
+    assert!(
         failure.message.ends_with(&writer.refusal()),
         "{}",
         failure.message
     );
     assert!(!root.join("started-argv").exists());
     assert!(fixture.host.lock().unwrap().chat_spawning.is_empty());
+    drop(writer);
+    assert!(matches!(
+        process_inner(
+            &fixture.host,
+            1,
+            ClientRequest::ChatPrepareResume {
+                source: fixture.source.clone(),
+            },
+        )
+        .unwrap(),
+        ServerResponse::ChatResumePrepared { .. }
+    ));
+    assert!(!root.join("started-argv").exists());
 }
 
 #[test]
