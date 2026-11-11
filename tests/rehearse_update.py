@@ -70,8 +70,91 @@ class Comparison(unittest.TestCase):
                    "chats": 0, "terminals": 1, "paused_chats": ["chat-old"], "paused_terminals": []}}
         after["recovery"] = {"census": census, "digest": receipt["census_digest"],
                              "issued": receipt, "current": copy.deepcopy(receipt)}
+        before['fixture_events'] = [
+            {'event': 'listening', 'pid': 21, 'socket': '/private/original.sock'},
+            {'event': 'notification', 'method': 'turn/started', 'thread_id': 'provider-issued-thread',
+             'parent': True, 'pid': 21, 'socket': '/private/original.sock'},
+            {'event': 'notification', 'method': 'turn/started', 'thread_id': 'provider-child-thread',
+             'parent': False, 'pid': 21, 'socket': '/private/original.sock'},
+        ]
+        after['fixture_events'] = copy.deepcopy(before['fixture_events'])
         del after["sessions"]["lineage"]
         return before, after
+
+    def paused_codex_replacement(self):
+        before, after = self.paused_replacement()
+        original = before['stores']['windows/main/sessions.sqlite3']['rows']['cards'][1]['content']
+        original['launch']['provider'] = 'Codex'
+        after['recovery']['census']['chats'] = [copy.deepcopy(original)]
+        after['stores']['windows/main/sessions.sqlite3']['rows']['cards'][1]['content'] = records.paused_history_projection(before, after, original)
+        return before, after
+
+    def test_receipt_paused_codex_parent_or_bound_child_cannot_resume(self):
+        for thread in ('provider-issued-thread', 'provider-child-thread'):
+            with self.subTest(thread=thread):
+                before, after = self.paused_codex_replacement()
+                self.assertFalse(any(row['regression'] for row in records.compare(before, after)))
+                after['fixture_events'] += [
+                    {'event': 'listening', 'pid': 31, 'socket': '/private/successor.sock'},
+                    {'event': 'request', 'method': 'thread/resume', 'thread_id': thread,
+                     'parent': thread == 'provider-issued-thread', 'pid': 31,
+                     'socket': '/private/successor.sock', 'errors': []}]
+                failures = [row for row in records.compare(before, after) if row['regression']]
+                self.assertEqual({row['kind'] for row in failures}, {'paused-history'})
+                self.assertEqual(failures[0]['thread_id'], thread)
+
+    def test_paused_codex_binding_is_fail_closed_when_missing_or_ambiguous(self):
+        for case in ('thread', 'listener', 'missing-listening', 'late-listening', 'ambiguous-pane', 'ambiguous-parent', 'truncated-events'):
+            with self.subTest(case=case):
+                before, after = self.paused_codex_replacement()
+                rows = before['stores']['windows/main/sessions.sqlite3']['rows']['cards']
+                if case == 'thread':
+                    rows[1]['content']['launch']['session_id'] = None
+                elif case == 'listener':
+                    before['fixture_events'] = []
+                    after['fixture_events'] = []
+                elif case in ('missing-listening', 'late-listening'):
+                    listening = before['fixture_events'].pop(0)
+                    if case == 'late-listening':
+                        before['fixture_events'].append(listening)
+                    after['fixture_events'] = copy.deepcopy(before['fixture_events'])
+                elif case == 'ambiguous-pane':
+                    alias = copy.deepcopy(rows[1])
+                    alias['card_id'] = 'other-pane'
+                    alias['content']['launch']['session_id'] = 'foreign-thread'
+                    rows.append(alias)
+                elif case == 'ambiguous-parent':
+                    before['fixture_events'].append({'event': 'notification', 'method': 'turn/started',
+                        'thread_id': 'other-parent', 'parent': True, 'pid': 21, 'socket': '/private/original.sock'})
+                    after['fixture_events'] = copy.deepcopy(before['fixture_events'])
+                else:
+                    after['fixture_events'] = after['fixture_events'][1:]
+                self.assertTrue(any(row['regression'] and row['kind'] == 'paused-history'
+                                    for row in records.compare(before, after)))
+
+    def test_paused_codex_does_not_block_a_different_retained_listener_thread(self):
+        before, after = self.paused_codex_replacement()
+        before['fixture_events'] += [{'event': 'listening', 'pid': 41, 'socket': '/private/retained.sock'},
+            {'event': 'notification', 'method': 'turn/started', 'thread_id': 'retained-thread',
+             'parent': True, 'pid': 41, 'socket': '/private/retained.sock'}]
+        after['fixture_events'] = copy.deepcopy(before['fixture_events']) + [
+            {'event': 'request', 'method': 'thread/resume', 'thread_id': 'retained-thread',
+             'parent': True, 'pid': 41, 'socket': '/private/retained.sock', 'errors': []}]
+        self.assertFalse(any(row['regression'] for row in records.compare(before, after)))
+
+    def test_first_receipt_paused_history_stays_blocked_through_later_retry_events(self):
+        before, restored = self.paused_codex_replacement()
+        original_receipt = copy.deepcopy(restored['recovery'])
+        later = copy.deepcopy(restored['fixture_events']) + [
+            {'event': 'listening', 'pid': 51, 'socket': '/private/retry.sock'},
+            {'event': 'request', 'method': 'thread/resume', 'thread_id': 'provider-child-thread',
+             'parent': False, 'pid': 51, 'socket': '/private/retry.sock', 'errors': []}]
+        paused, _ = records.verified_pauses(before, restored)
+        changes = records.paused_codex_reattachments(before, restored, paused, observed_events=later)
+        self.assertEqual(len(changes), 1)
+        self.assertTrue(changes[0]['regression'])
+        self.assertEqual(changes[0]['thread_id'], 'provider-child-thread')
+        self.assertEqual(restored['recovery'], original_receipt)
 
     def test_same_record_does_not_lose_items(self):
         self.assertEqual(records.compare(snapshot(), snapshot()), [])
@@ -252,22 +335,24 @@ class Comparison(unittest.TestCase):
         before['agents']['agent'].update(run='same-run',state='Running')
         before['agents']['agent']['agent']['session'] = {'Chat':source}
         after['agents']['agent'].update(run='same-run',state='Cancelled')
-        identity = {'parent':True,'thread_id':'provider-issued-thread','turn_id':'parent-turn','socket':'/private/control.sock'}
-        before['fixture_events'] = [{**identity,'event':'notification','method':'turn/started','time':1}]
-        after['fixture_events'] = [{**identity,'event':'request','method':'turn/interrupt','time':2,'errors':[]},
-                                   {**identity,'event':'notification','method':'turn/completed','status':'interrupted','time':3}]
+        identity = {'parent':True,'thread_id':'provider-issued-thread','turn_id':'parent-turn','socket':'/private/control.sock','pid':21}
+        before['fixture_events'] = [{'event':'listening','pid':21,'socket':'/private/control.sock','time':0.5},
+                                   {**identity,'event':'notification','method':'turn/started','time':1}]
+        after['fixture_events'] = copy.deepcopy(before['fixture_events']) + [
+            {**identity,'event':'request','method':'turn/interrupt','time':2,'errors':[]},
+            {**identity,'event':'notification','method':'turn/completed','status':'interrupted','time':3}]
         self.assertTrue(records.confirmed_interruption(before,after,'agent'))
         self.assertFalse(any(row['regression'] for row in records.compare(before,after)))
         for name, mutate in {
             'enter':lambda a:a['target'].update(working=''),
             'new-run':lambda a:a['agents']['agent'].update(run='other'),
             'no-receipt':lambda a:a['fixture_events'].pop(),
-            'child-only':lambda a:a['fixture_events'][1].update(parent=False),
-            'wrong-turn':lambda a:a['fixture_events'][1].update(turn_id='other'),
-            'wrong-thread':lambda a:a['fixture_events'][1].update(thread_id='other'),
-            'normal-completion':lambda a:a['fixture_events'][1].update(status='completed'),
-            'no-request':lambda a:a['fixture_events'].pop(0),
-            'request-error':lambda a:a['fixture_events'][0].update(errors=['refused']),
+            'child-only':lambda a:a['fixture_events'][3].update(parent=False),
+            'wrong-turn':lambda a:a['fixture_events'][3].update(turn_id='other'),
+            'wrong-thread':lambda a:a['fixture_events'][3].update(thread_id='other'),
+            'normal-completion':lambda a:a['fixture_events'][3].update(status='completed'),
+            'no-request':lambda a:a['fixture_events'].pop(2),
+            'request-error':lambda a:a['fixture_events'][2].update(errors=['refused']),
             'stale-receipt':lambda a:a['target'].update(started=4),
         }.items():
             with self.subTest(name=name):

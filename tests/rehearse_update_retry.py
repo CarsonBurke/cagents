@@ -13,6 +13,9 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 import rehearse_update_retry as retry
 
+WORK = {'claude_chat_launches': 3, 'claude_user_prompts': 4, 'codex_chat_launches': 1,
+        'codex_thread_starts': 1, 'codex_turn_starts': 1}
+
 
 class RetryAdmission(unittest.TestCase):
     def test_only_exact_installer_command_can_select_retry(self):
@@ -39,12 +42,20 @@ class RetryAdmission(unittest.TestCase):
                 retry.review_prompts(bad, True)
 
     def test_provider_replay_is_a_hard_failure(self):
-        before = {'claude_chat_launches': 3, 'codex_thread_resumes': 0}
+        before = {'claude_chat_launches': 3, 'claude_user_prompts': 3,
+                  'codex_chat_launches': 1, 'codex_thread_starts': 1, 'codex_turn_starts': 1}
         retry.require_no_replay(before, dict(before))
-        for key in before:
+        retry.require_no_replay(before, {**before, 'codex_chat_launches': 2})
+        for key in ('claude_chat_launches', 'claude_user_prompts', 'codex_thread_starts', 'codex_turn_starts'):
             after = {**before, key: before[key] + 1}
             with self.subTest(key=key), self.assertRaises(RuntimeError):
                 retry.require_no_replay(before, after)
+
+    def test_shared_paused_history_violation_remains_a_hard_failure(self):
+        with patch.object(retry.records, 'compare', return_value=[{
+                'regression': True, 'kind': 'paused-history', 'change': 'paused chat resumed'}]):
+            with self.assertRaisesRegex(RuntimeError, 'paused chat resumed'):
+                retry.workload_preserved({}, {})
 
     def test_changed_run_or_membership_is_not_covered_by_a_green_comparison(self):
         snapshot = {name: {} for name in retry.records.COLLECTIONS}
@@ -119,6 +130,60 @@ class RawJobs(unittest.TestCase):
             for phase in ('Failed', 'Cancelled'):
                 with self.subTest(phase=phase), self.assertRaises(RuntimeError):
                     retry.archive_job(root, root / 'copy', phase)
+
+
+class Reattachments(unittest.TestCase):
+    def baseline(self):
+        return {'fixture_events': [
+            {'event': 'listening', 'pid': 10, 'socket': '/private/first.sock'},
+            {'event': 'notification', 'method': 'turn/started', 'thread_id': 'parent'},
+            {'event': 'notification', 'method': 'turn/started', 'thread_id': 'child'},
+            {'event': 'request', 'method': 'thread/resume', 'thread_id': 'parent',
+             'pid': 10, 'socket': '/private/first.sock', 'errors': []},
+        ]}
+
+    def resume(self, thread, pid=20, socket='/private/second.sock'):
+        return {'event': 'request', 'method': 'thread/resume', 'thread_id': thread,
+                'pid': pid, 'socket': socket, 'errors': []}
+
+    def test_known_parent_and_child_can_reattach_once_per_identified_listener(self):
+        before = self.baseline()
+        additions = [{'event': 'listening', 'pid': 20, 'socket': '/private/second.sock'},
+                     self.resume('parent'), self.resume('child')]
+        after = {'fixture_events': [*before['fixture_events'], *additions]}
+        evidence = retry.reattachment_evidence(before, after)
+        self.assertEqual(evidence['known_threads'], ['child', 'parent'])
+        self.assertEqual(evidence['new_thread_resumes'], additions[1:])
+        after['fixture_events'] += [{'event': 'listening', 'pid': 30, 'socket': '/private/third.sock'},
+                                   self.resume('parent', 30, '/private/third.sock')]
+        self.assertEqual(len(retry.reattachment_evidence(before, after)['new_thread_resumes']), 3)
+
+    def test_unknown_duplicate_unidentified_or_failed_reattachment_is_rejected(self):
+        before = self.baseline()
+        listener = {'event': 'listening', 'pid': 20, 'socket': '/private/second.sock'}
+        cases = ([listener, self.resume('unknown')],
+                 [listener, self.resume('parent'), self.resume('parent')],
+                 [self.resume('parent', 10, '/private/first.sock')],
+                 [self.resume('parent')],
+                 [listener, {**self.resume('parent'), 'errors': ['provider refused']}])
+        for additions in cases:
+            with self.subTest(additions=additions), self.assertRaises(RuntimeError):
+                retry.reattachment_evidence(before, {'fixture_events': [*before['fixture_events'], *additions]})
+
+    def test_new_thread_cannot_become_known_from_an_after_update_notification(self):
+        before = self.baseline()
+        after = {'fixture_events': [*before['fixture_events'],
+            {'event': 'listening', 'pid': 20, 'socket': '/private/second.sock'},
+            {'event': 'notification', 'method': 'turn/started', 'thread_id': 'new-thread'},
+            self.resume('new-thread')]}
+        with self.assertRaisesRegex(RuntimeError, 'absent before'):
+            retry.reattachment_evidence(before, after)
+
+    def test_event_log_replacement_or_truncation_cannot_hide_a_resume(self):
+        before = self.baseline()
+        for events in ([], before['fixture_events'][1:], [*before['fixture_events'][:-1], self.resume('child')]):
+            with self.subTest(events=events), self.assertRaisesRegex(RuntimeError, 'replaced or truncated'):
+                retry.reattachment_evidence(before, {'fixture_events': events})
 
 
 class ReviewEvidence(unittest.TestCase):
@@ -228,7 +293,7 @@ class FaultRelease(unittest.TestCase):
                             f'82\t{self.root}/home/.local/share/cagents-install/versions/old/bin/cagentsd\t{address}\tpass-source\n')
 
     def release(self):
-        retry.disarm_after_restore(self.root, {}, {'serving': {'proof': 'real'}}, 'old', {'launches': 4},
+        retry.disarm_after_restore(self.root, {}, {'serving': {'proof': 'real'}}, 'old', dict(WORK),
                                    self.candidate, 'cagents daemon exited before becoming ready: exit status: 1', self.diagnostics())
 
     def diagnostics(self):
@@ -237,7 +302,7 @@ class FaultRelease(unittest.TestCase):
             {'pid': 81, 'version': 'new', 'run': 'failed-run', 'event': {'kind': 'exit', 'success': False}}]}]}}
 
     def test_qualified_release_records_explicit_source_bound_disarm(self):
-        with patch.object(retry, 'require_restored', return_value=82), patch.object(retry, 'activity', return_value={'launches': 4}):
+        with patch.object(retry, 'require_restored', return_value=82), patch.object(retry, 'activity', return_value=dict(WORK)):
             self.release()
         self.assertFalse(self.sentinel.exists())
         self.assertTrue(self.sentinel.with_suffix('.disarmed').is_file())
@@ -249,7 +314,7 @@ class FaultRelease(unittest.TestCase):
         for recovery_error, count in ((True, 4), (False, 5)):
             with self.subTest(recovery_error=recovery_error), patch.object(retry, 'require_restored',
                     side_effect=RuntimeError('recovery not proved') if recovery_error else None, return_value=82), \
-                    patch.object(retry, 'activity', return_value={'launches': count}), self.assertRaises(RuntimeError):
+                    patch.object(retry, 'activity', return_value={**WORK, 'claude_user_prompts': count}), self.assertRaises(RuntimeError):
                 self.release()
             self.assertTrue(self.sentinel.exists())
             self.assertFalse((self.root / 'retry/first/disarm.json').exists())
@@ -259,26 +324,26 @@ class FaultRelease(unittest.TestCase):
         for bad in ('', original.replace('pass-source', 'pass-other'), original.replace('fail-armed', 'pass-disarmed')):
             self.log.write_text(bad)
             with self.subTest(log=bad), patch.object(retry, 'require_restored', return_value=82), \
-                    patch.object(retry, 'activity', return_value={'launches': 4}), self.assertRaises(RuntimeError):
+                    patch.object(retry, 'activity', return_value=dict(WORK)), self.assertRaises(RuntimeError):
                 self.release()
             self.assertTrue(self.sentinel.exists())
         self.log.write_text(original)
         with patch.object(retry, 'require_restored', return_value=82), \
-                patch.object(retry, 'activity', return_value={'launches': 4}), self.assertRaises(RuntimeError):
-            retry.disarm_after_restore(self.root, {}, {'serving': {}}, 'old', {'launches': 4}, self.candidate, 'unrelated failure', self.diagnostics())
+                patch.object(retry, 'activity', return_value=dict(WORK)), self.assertRaises(RuntimeError):
+            retry.disarm_after_restore(self.root, {}, {'serving': {}}, 'old', dict(WORK), self.candidate, 'unrelated failure', self.diagnostics())
         self.assertTrue(self.sentinel.exists())
 
     def test_changed_sentinel_and_duplicate_release_fail_closed(self):
         self.sentinel.write_text('another candidate\n')
         with patch.object(retry, 'require_restored', return_value=82), \
-                patch.object(retry, 'activity', return_value={'launches': 4}), self.assertRaises(RuntimeError):
+                patch.object(retry, 'activity', return_value=dict(WORK)), self.assertRaises(RuntimeError):
             self.release()
         self.assertTrue(self.sentinel.exists())
 
     def test_changed_injector_cannot_disarm(self):
         (self.root / '.fixture/startup-bind.so').write_bytes(b'another library')
         with patch.object(retry, 'require_restored', return_value=82), \
-                patch.object(retry, 'activity', return_value={'launches': 4}), self.assertRaisesRegex(RuntimeError, 'injector bytes changed'):
+                patch.object(retry, 'activity', return_value=dict(WORK)), self.assertRaisesRegex(RuntimeError, 'injector bytes changed'):
             self.release()
         self.assertTrue(self.sentinel.exists())
 
@@ -293,8 +358,8 @@ class FaultRelease(unittest.TestCase):
             else:
                 events[1]['event']['success'] = True
             with self.subTest(change=change), patch.object(retry, 'require_restored', return_value=82), \
-                    patch.object(retry, 'activity', return_value={'launches': 4}), self.assertRaisesRegex(RuntimeError, 'normal startup-error exit'):
-                retry.disarm_after_restore(self.root, {}, {'serving': {}}, 'old', {'launches': 4}, self.candidate,
+                    patch.object(retry, 'activity', return_value=dict(WORK)), self.assertRaisesRegex(RuntimeError, 'normal startup-error exit'):
+                retry.disarm_after_restore(self.root, {}, {'serving': {}}, 'old', dict(WORK), self.candidate,
                                            'cagents daemon exited before becoming ready: exit status: 1', diagnostic)
             self.assertTrue(self.sentinel.exists())
 

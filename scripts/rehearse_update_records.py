@@ -888,9 +888,73 @@ def paused_history_projection(before: dict, after: dict, saved: dict) -> dict | 
     return expected
 
 
+def paused_codex_reattachments(before: dict, after: dict, paused: set[str], *, observed_events=None) -> list[dict]:
+    """A usable receipt's paused Codex history never reattaches a provider."""
+    if not paused:
+        return []
+    changes = []
+    blocked = {}
+    previous = before.get('fixture_events', [])
+    observed = after.get('fixture_events', []) if observed_events is None else observed_events
+    listening = {}
+    for index, row in enumerate(previous):
+        if row.get('event') == 'listening':
+            listening.setdefault((row.get('pid'), row.get('socket')), index)
+    census = after.get('recovery', {}).get('census', {})
+    saved = list(panes(before).values())
+    for identifier in sorted(paused):
+        source = next(row for row in census['chats'] if row['id'] == identifier)
+        members = [row.get('content', {}) for row in saved if row.get('session_id') == identifier]
+        if source.get('launch', {}).get('provider') != 'Codex' and not any(
+                row.get('launch', {}).get('provider') == 'Codex' for row in members):
+            continue
+        threads = {row.get('launch', {}).get('session_id') for row in members
+                   if row.get('proof') == census['source'] and row.get('launch', {}).get('provider') == 'Codex'}
+        threads.discard(None)
+        source_thread = source.get('launch', {}).get('session_id')
+        if len(threads) != 1 or not all(isinstance(thread, str) and thread for thread in threads) or (
+                source_thread is not None and source_thread not in threads):
+            changes.append({'kind': 'paused-history', 'id': identifier, 'regression': True,
+                            'change': 'paused Codex chat has no exact original native-thread binding'})
+            continue
+        thread = next(iter(threads))
+        parents = [(index, row) for index, row in enumerate(previous)
+                   if row.get('thread_id') == thread and row.get('parent') is True]
+        listeners = {(row.get('pid'), row.get('socket')) for _, row in parents}
+        if not listeners or any(type(pid) is not int or pid <= 1 or not isinstance(path, str) or not path
+                                for pid, path in listeners) or any(
+                listening.get((row.get('pid'), row.get('socket')), index) >= index for index, row in parents):
+            changes.append({'kind': 'paused-history', 'id': identifier, 'regression': True,
+                            'change': 'paused Codex chat has no original fixture listener binding'})
+            continue
+        blocked[thread] = identifier
+        ambiguous = {listener for listener in listeners if {
+            row.get('thread_id') for row in previous if row.get('parent') is True
+            and (row.get('pid'), row.get('socket')) == listener} != {thread}}
+        if ambiguous:
+            changes.append({'kind': 'paused-history', 'id': identifier, 'regression': True,
+                            'change': 'paused Codex listener has ambiguous original parent ownership'})
+        for row in previous:
+            if ((row.get('pid'), row.get('socket')) in listeners - ambiguous and row.get('parent') is False
+                    and isinstance(row.get('thread_id'), str) and row['thread_id']):
+                blocked[row['thread_id']] = identifier
+    if blocked and observed[:len(previous)] != previous:
+        changes.append({'kind': 'paused-history', 'id': 'provider-events', 'regression': True,
+                        'change': 'paused Codex provider event history was replaced or truncated'})
+        return changes
+    for row in observed[len(previous):]:
+        if (row.get('event') == 'request' and row.get('method') == 'thread/resume'
+                and row.get('thread_id') in blocked):
+            changes.append({'kind': 'paused-history', 'id': blocked[row['thread_id']], 'regression': True,
+                            'change': 'paused Codex chat or its recorded child resumed',
+                            'thread_id': row['thread_id'], 'pid': row.get('pid')})
+    return changes
+
+
 def compare(before: dict, after: dict) -> list[dict]:
     changes = []
     paused_chats, paused_terminals = verified_pauses(before, after)
+    changes.extend(paused_codex_reattachments(before, after, paused_chats))
     for side, snapshot in (("before", before), ("after", after)):
         for error in snapshot["errors"]:
             changes.append({"kind": "evidence", "id": side, "change": str(error), "regression": True})

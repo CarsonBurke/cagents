@@ -46,3 +46,10 @@ confirmations, controlling-PTY transcripts, job/census/recovery files and native
 observations under `retry/` and `records/`. A failure preserves the root; cleanup
 stops the private processes but does not remove the evidence. Inspect
 `retry-result.json`; an unqualified first restoration never releases the fault.
+
+Claude launches and prompts, Codex thread starts, and Codex turn starts must stay
+unchanged. Codex listener launches and `thread/resume` are diagnostic: a compatible
+listener may attach to a thread already recorded before the update, once per
+thread per listener. The shared comparison separately forbids reattaching a
+receipt-accounted paused Codex chat or its recorded child. Missing original
+native-thread or listener bindings for paused Codex history fail validation.

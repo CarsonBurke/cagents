@@ -136,14 +136,45 @@ def workload_identities(before, after):
 
 
 def activity(root):
-    value = scenario.provider_activity(root)
-    events = [json.loads(line) for line in (root / 'logs/codex-provider.jsonl').read_text().splitlines()]
-    value['codex_thread_resumes'] = sum(row.get('event') == 'request' and row.get('method') == 'thread/resume' for row in events)
-    return value
+    return scenario.provider_activity(root)
+
+
+def reattachment_evidence(before, after):
+    """A listener can reattach each already recorded thread once, without work."""
+    previous = before.get('fixture_events', [])
+    observed = after.get('fixture_events', [])
+    if observed[:len(previous)] != previous:
+        raise RuntimeError('retry provider event history was replaced or truncated')
+    known = {row['thread_id'] for row in previous if row.get('thread_id') and (
+        row.get('event') == 'notification' or row.get('event') == 'request' and row.get('errors') == []
+        and row.get('method') in ('thread/read', 'thread/resume'))}
+    listeners = set()
+    counts = {}
+    resumed = []
+    for index, row in enumerate(observed):
+        listener = row.get('pid'), row.get('socket')
+        if row.get('event') == 'listening':
+            listeners.add(listener)
+        if row.get('event') != 'request' or row.get('method') != 'thread/resume':
+            continue
+        key = (*listener, row.get('thread_id'))
+        counts[key] = counts.get(key, 0) + 1
+        if index < len(previous):
+            continue
+        if (type(listener[0]) is not int or listener[0] <= 1 or not isinstance(listener[1], str)
+                or not listener[1] or listener not in listeners or row.get('errors') != []):
+            raise RuntimeError('thread reattachment lacks a successful identified listener')
+        if row.get('thread_id') not in known:
+            raise RuntimeError('retry reattached a thread absent before the update')
+        if counts[key] != 1:
+            raise RuntimeError('retry reattached the same thread more than once per listener')
+        resumed.append(row)
+    return {'known_threads': sorted(known), 'new_thread_resumes': resumed}
 
 
 def require_no_replay(before, after):
-    if before != after:
+    work = ('claude_chat_launches', 'claude_user_prompts', 'codex_thread_starts', 'codex_turn_starts')
+    if any(name not in before or name not in after or before[name] != after[name] for name in work):
         raise RuntimeError(f'retry launched or replayed provider work: {before} -> {after}')
 
 
@@ -211,6 +242,7 @@ def disarm_after_restore(root, before, after, old_version, original_activity, ca
     """Keep the fault armed if any independent recovery or workload check fails."""
     pid = require_restored(root, before, after, old_version, cancelled=False)
     require_no_replay(original_activity, activity(root))
+    reattachment_evidence(before, after)
     verify_bind_fixture(root)
     decisions = bind_decisions(root)
     serving_socket = str(root / 'rt/cagents/cagentsd.sock')
@@ -352,6 +384,7 @@ class RetryRehearsal(scenario.Rehearsal):
             shutil.copytree(self.root / 'shots', first_dir / 'shots')
             require_restored(self.root, before, restored, args.old_version, cancelled=cancelled)
             require_no_replay(original_activity, activity(self.root))
+            first_reattachments = reattachment_evidence(before, restored)
             pending_code, pending_output = self.call('env', candidate / 'bin/cagents', '--no-start', '--json',
                                                      'daemon', 'inspect-pending-update-recovery',
                                                      '--candidate-cli', candidate / 'bin/cagents', check=False)
@@ -364,8 +397,9 @@ class RetryRehearsal(scenario.Rehearsal):
             if binaries != {name: sha256(candidate / 'bin' / name) for name in binaries} or sha256(archive) != archive_digest:
                 raise RuntimeError('archive or candidate bytes changed before fault release')
             write_json(first_dir / 'qualification.json', {'job': first_job['id'], 'activity': original_activity,
+                                                         'activity_after': activity(self.root),
                                                          'restored_serving': restored['serving'], 'candidate_sha256': binaries,
-                                                         'archive_sha256': archive_digest})
+                                                         'archive_sha256': archive_digest, 'reattachments': first_reattachments})
             if not cancelled:
                 _, diagnostic_output = self.call('env', candidate / 'bin/cagents', '--no-start', '--json', 'diagnostics')
                 (first_dir / 'diagnostics.json').write_text(diagnostic_output)
@@ -390,7 +424,13 @@ class RetryRehearsal(scenario.Rehearsal):
             # require original membership and accepted runs across both hops.
             workload_preserved(restored, after)
             workload_identities(before, after)
+            originally_paused, _ = records.verified_pauses(before, restored)
+            earlier_paused_replay = records.paused_codex_reattachments(
+                before, restored, originally_paused, observed_events=after.get('fixture_events', []))
+            if earlier_paused_replay:
+                raise RuntimeError(f'retry reattached earlier paused history: {earlier_paused_replay}')
             require_no_replay(original_activity, activity(self.root))
+            reattachments = reattachment_evidence(before, after)
             if records.verified_recovery(restored, after) is None:
                 raise RuntimeError('second attempt lacks fresh source-bound usable recovery')
             if (prefix / 'current').resolve() != candidate:
@@ -406,8 +446,9 @@ class RetryRehearsal(scenario.Rehearsal):
                            and row['decision'] == 'pass-disarmed' for row in decisions):
                     raise RuntimeError('second attempt did not bind through the disarmed fixture')
             write_json(second_dir / 'qualification.json', {'job': second_job['id'], 'activity': original_activity,
+                                                          'activity_after': activity(self.root),
                                                           'serving': after['serving'], 'candidate_sha256': binaries,
-                                                          'archive_sha256': archive_digest})
+                                                          'archive_sha256': archive_digest, 'reattachments': reattachments})
             if fixture_sources() != sources:
                 raise RuntimeError('retry fixture source changed during native execution')
         except Exception as error:
