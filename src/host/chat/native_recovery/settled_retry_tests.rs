@@ -1155,12 +1155,13 @@ fn cold_host_hop(root: PathBuf, incarnation: &str) {
         eprintln!(
             "{incarnation}: original census is Usable; starting production retirement/refresh verification"
         );
-        let retired = with_private_socket(&fixture, || {
-            if incarnation == "cold-C" {
+        if incarnation == "cold-C" {
+            let retired = with_private_socket(&fixture, || {
                 // The cold-start helper and the final update verifier can
                 // discover the same pending retirement. Serialize the whole
-                // root proof so the loser observes durable completion rather
-                // than an intermediate canonical-custody window.
+                // root proof. The bounded loser reports Busy rather than
+                // blocking indefinitely or claiming completion; retry only
+                // after the winning helper has joined.
                 let results = thread::scope(|scope| {
                     let first = scope.spawn(crate::update::recovery::retire_current_service);
                     let second = scope.spawn(crate::update::recovery::retire_current_service);
@@ -1182,22 +1183,47 @@ fn cold_host_hop(root: PathBuf, incarnation: &str) {
                         .iter()
                         .filter(|result| matches!(
                             result,
-                            Ok(crate::update::recovery::RetirementStatus::AlreadyCompleted)
+                            Ok(crate::update::recovery::RetirementStatus::Busy)
                         ))
                         .count(),
                     1,
                     "{results:?}"
                 );
+                assert!(matches!(
+                    crate::update::recovery::retire_current_service().unwrap(),
+                    crate::update::recovery::RetirementStatus::AlreadyCompleted
+                ));
                 Ok(crate::update::recovery::RetirementStatus::Completed)
-            } else {
-                crate::update::recovery::refresh_completed_service()
-            }
-        })
-        .unwrap();
-        assert!(matches!(
-            retired,
-            crate::update::recovery::RetirementStatus::Completed
-        ));
+            })
+            .unwrap();
+            assert!(matches!(
+                retired,
+                crate::update::recovery::RetirementStatus::Completed
+            ));
+        } else {
+            assert!(
+                !crate::daemon::RuntimePaths::discover()
+                    .unwrap()
+                    .socket
+                    .exists()
+            );
+            let before = crate::upgrade::recovery::archived_proof(&data.checkpoint, &target)
+                .unwrap()
+                .unwrap();
+            let bytes = fs::read(&before.retirement_path).unwrap();
+            assert_eq!(
+                crate::update::recovery::refresh_completed_service().unwrap(),
+                crate::update::recovery::RetirementStatus::AlreadyCompleted
+            );
+            assert_eq!(
+                fs::read(&before.retirement_path).unwrap(),
+                bytes,
+                "cold start must not rewrite or extend issued history"
+            );
+            eprintln!(
+                "{incarnation}: completed archive skipped cold census/socket verification without rewriting history"
+            );
+        }
         assert_retired_fixture_evidence(&data, &target);
         let after = verify_over_private_socket(&fixture, &original);
         assert!(
@@ -1208,12 +1234,15 @@ fn cold_host_hop(root: PathBuf, incarnation: &str) {
         let issued = crate::upgrade::recovery::archived_discovery(&data.checkpoint, &target)
             .unwrap()
             .unwrap();
-        assert!(
-            issued.adopted_chat_descriptors.iter().any(|chat| {
-                chat.id == data.accepted.id && chat.proof.as_ref() == Some(&fixture.proof)
-            }),
-            "retirement must record only this authenticated current chat issuance"
-        );
+        if incarnation == "cold-C" {
+            assert!(
+                issued
+                    .adopted_chat_descriptors
+                    .iter()
+                    .any(|chat| chat.id == data.accepted.id
+                        && chat.proof.as_ref() == Some(&fixture.proof))
+            );
+        }
         eprintln!(
             "{incarnation}: production RootCensus completed retirement; canonical checkpoint absent, exact archive/outcome unchanged, original census still Usable"
         );
@@ -1256,6 +1285,19 @@ fn cold_host_hop(root: PathBuf, incarnation: &str) {
         );
     } else {
         assert_retired_fixture_evidence(&data, &target);
+        assert!(
+            !crate::daemon::RuntimePaths::discover()
+                .unwrap()
+                .socket
+                .exists()
+        );
+        assert_eq!(
+            crate::update::recovery::refresh_completed_service().unwrap(),
+            crate::update::recovery::RetirementStatus::AlreadyCompleted
+        );
+        eprintln!(
+            "{incarnation}: closed historical owner did not trigger a cold-start socket query or census recheck"
+        );
         let (retired, admitted, captured) = with_private_socket(&fixture, || {
             (
                 crate::update::recovery::retire_current_service(),

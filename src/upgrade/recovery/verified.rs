@@ -853,10 +853,8 @@ pub(super) mod tests {
         assert!(fixture.load(&[fixture.current.clone()]).unwrap().is_some());
         fs::rename(&fixture.checkpoint, &missing).unwrap();
         assert!(
-            archived_proof(&fixture.checkpoint, &fixture.target)
-                .unwrap()
-                .is_some(),
-            "retirement metadata can precede the actual archive"
+            archived_proof(&fixture.checkpoint, &fixture.target).is_err(),
+            "routing metadata without the actual archive is not archival proof"
         );
         assert!(
             fixture.load(&[fixture.current.clone()]).is_err(),
