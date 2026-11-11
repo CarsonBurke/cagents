@@ -337,7 +337,14 @@ pub fn downgrade_store(target: u32) -> Result<Option<u32>, String> {
     with_store_stopped(|| model::Registry::downgrade(target))
 }
 
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn observe_fixture_startup(phase: &'static str, error: Option<&str>) {
+    exit_drain_tests::observe_startup(phase, error);
+}
+
 pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
+    #[cfg(all(test, target_os = "linux"))]
+    observe_fixture_startup("host run entered", None);
     daemon::install_signal_handlers()?;
     descriptor_limit::raise();
     let proof = HostSessionProof {
@@ -355,6 +362,8 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
         Some(lease) => HostLease::acquire_with_handoff(&paths, &proof, Some(lease))?,
         None => HostLease::acquire(&paths, &proof)?,
     };
+    #[cfg(all(test, target_os = "linux"))]
+    observe_fixture_startup("daemon lease acquired", None);
     // Before anything is launched, so the epoch precedes every launch.
     crate::lineage_birth::open_instance_epoch(&proof.boot_id, first_this_boot);
     // Before anything is launched or adopted: sessions launched through this
@@ -376,6 +385,8 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     // The model is reported unavailable to the clients that ask for it, which is
     // what keeps a window from mistaking a broken store for an empty registry
     // and donating its state over and over.
+    #[cfg(all(test, target_os = "linux"))]
+    observe_fixture_startup("opening workspace model", None);
     match model::Registry::open() {
         Ok(registry) => host
             .lock()
@@ -386,6 +397,8 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
                                     not be shared between windows")
         }
     }
+    #[cfg(all(test, target_os = "linux"))]
+    observe_fixture_startup("workspace model opened", None);
     let notification_application = crate::instance::notification_daemon_application(
         &std::env::current_exe()?,
         std::env::args_os()
@@ -429,24 +442,36 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     // This mandatory thread service must be available before any adoption
     // can discard the holder's replay copy. It observes no process until the
     // same HostState publishes one; it initiates no execution.
+    #[cfg(all(test, target_os = "linux"))]
+    observe_fixture_startup("starting activity monitor", None);
     let _agent_activity = activity::Monitor::start(&host)?;
+    #[cfg(all(test, target_os = "linux"))]
+    observe_fixture_startup("activity monitor started", None);
     let mut recovered_prepared = false;
     let listener = listener_before_restore(&paths, || {
+        #[cfg(all(test, target_os = "linux"))]
+        observe_fixture_startup("restore inherited recovery", None);
         let restored = (|| -> io::Result<()> {
             if update_recovery::restore(&host).map_err(io::Error::other)? {
                 recovered_prepared = true;
                 return Ok(());
             }
+            #[cfg(all(test, target_os = "linux"))]
+            observe_fixture_startup("restore settled Prepared", None);
             if update_recovery::restore_settled(&host).map_err(io::Error::other)? {
                 recovered_prepared = true;
                 return Ok(());
             }
+            #[cfg(all(test, target_os = "linux"))]
+            observe_fixture_startup("restore ordinary", None);
             update_recovery::restore_ordinary(&host).map_err(io::Error::other)?;
             Ok(())
         })();
         match restored {
             Ok(()) => Ok(()),
             Err(error) => {
+                #[cfg(all(test, target_os = "linux"))]
+                observe_fixture_startup("restore error before cleanup", Some(&error.to_string()));
                 let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
                 if state
                     .terminals
@@ -466,7 +491,11 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
             }
         }
     })?;
+    #[cfg(all(test, target_os = "linux"))]
+    observe_fixture_startup("restore complete; release admission", None);
     drop(admission);
+    #[cfg(all(test, target_os = "linux"))]
+    observe_fixture_startup("admission released", None);
     crate::diagnostics::record(crate::diagnostics::Event::Ready);
     // After restore, so the first pass covers every conversation it carried.
     if let Err(error) = chat::keep_legacy_codex_listeners_fresh(&host) {
@@ -515,6 +544,8 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
             tracing::warn!(%error, "runtime directory caches will be reclaimed only at startup");
         }
     }
+    #[cfg(all(test, target_os = "linux"))]
+    observe_fixture_startup("starting automation broker", None);
     let mut automation_broker = if recovery_only {
         None
     } else {
@@ -526,6 +557,8 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
             }
         }
     };
+    #[cfg(all(test, target_os = "linux"))]
+    observe_fixture_startup("starting Work board", None);
     let mut work_board = if recovery_only {
         None
     } else {
@@ -540,6 +573,8 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
             }
         }
     };
+    #[cfg(all(test, target_os = "linux"))]
+    observe_fixture_startup("starting mailbox courier", None);
     let mut courier = if recovery_only {
         None
     } else {
@@ -552,6 +587,8 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
         }
     };
 
+    #[cfg(all(test, target_os = "linux"))]
+    observe_fixture_startup("startup services started", None);
     // Restoring a checkpoint above may hold the host for as long as its
     // inventory takes; from here on a hold that long is a deadlock.
     let mut stall_watch = match host.watch(lock::STALL_LIMIT) {

@@ -394,11 +394,16 @@ pub(crate) fn publish(
             });
         }
     }
+    #[cfg(all(test, feature = "host", target_os = "linux"))]
+    crate::host::observe_fixture_startup("Ready proof: hash executable", None);
+    let target_hash = executable_hash(target)?;
+    #[cfg(all(test, feature = "host", target_os = "linux"))]
+    crate::host::observe_fixture_startup("Ready proof: executable hashed", None);
     let publication = Publication {
         version: 1,
         serving: serving.clone(),
         target: target.to_owned(),
-        target_hash: executable_hash(target)?,
+        target_hash,
         partitions,
     };
     let bytes = serde_json::to_vec(&publication).map_err(|e| e.to_string())?;
@@ -407,6 +412,8 @@ pub(crate) fn publish(
     }
     let path = store.path.with_file_name(FILE);
     let temporary = path.with_file_name(format!(".ready-outcome-{}", uuid::Uuid::new_v4()));
+    #[cfg(all(test, feature = "host", target_os = "linux"))]
+    crate::host::observe_fixture_startup("Ready proof: publish file", None);
     let result = (|| {
         let mut file = OpenOptions::new()
             .write(true)
@@ -426,6 +433,11 @@ pub(crate) fn publish(
     if result.is_err() {
         let _ = fs::remove_file(temporary);
     }
+    #[cfg(all(test, feature = "host", target_os = "linux"))]
+    crate::host::observe_fixture_startup(
+        "Ready proof: publication returned",
+        result.as_ref().err().map(String::as_str),
+    );
     result
 }
 
