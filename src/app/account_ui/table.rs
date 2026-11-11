@@ -729,7 +729,16 @@ fn row<'a>(
         .map(|column| {
             let cell = match column {
                 Column::Plan => account.plan().map_or_else(dash, |plan| {
-                    crate::ui_controls::badge(plan, design::Tone::Themed(design::accent_color))
+                    let label = format!("Plan: {plan}");
+                    let badge = crate::ui_controls::bounded_badge(
+                        plan,
+                        design::Tone::Themed(design::accent_color),
+                        Column::Plan.width(layout.usage),
+                    );
+                    crate::interaction::tooltip(
+                        crate::ui_controls::labelled(badge, label.clone()),
+                        label,
+                    )
                 }),
                 Column::Session => usage_cell(
                     snapshot.and_then(|snapshot| window_of(snapshot, account::WindowKind::Session)),
@@ -2042,6 +2051,162 @@ mod tests {
                         messages.is_empty(),
                         "managed removal has no native callback"
                     );
+                }
+            }
+        }
+    }
+    #[test]
+    fn reported_plan_badges_stay_inside_their_columns_without_covering_usage_or_actions() {
+        use iced::advanced::{Renderer as _, clipboard, mouse, renderer, renderer::Headless as _};
+        use iced::runtime::{UserInterface, user_interface::Cache};
+        use iced::{Color, Event, Point, Rectangle, Size};
+
+        struct Rendered {
+            pixels: Vec<u8>,
+            plan: Option<Rectangle>,
+            session: Rectangle,
+        }
+        let mut renderer = crate::app::tests::headless_renderer();
+        let mut render = |reported: &str, width: f32| {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let now = 1_790_000_000_000;
+            app.account_ui.now_ms = now;
+            let id = Account::system(Provider::Claude).id();
+            let account = app.account_ui.account_mut(&id).unwrap();
+            account.present = true;
+            let mut snapshot = UsageSnapshot::state(UsageStatus::Warning, "", now);
+            snapshot.plan = Some(reported.into());
+            snapshot.windows = vec![UsageWindow {
+                key: "session".into(),
+                kind: account::WindowKind::Session,
+                label: "Session".into(),
+                used: 0.82,
+                resets_at: None,
+                span_secs: None,
+                binding: false,
+            }];
+            account.snapshot = Some(snapshot);
+            let full_plan = format!("Plan: {}", account.plan().unwrap());
+            let size = Size::new(width, 600.0);
+            let viewport = Rectangle::with_size(size);
+            let mut ui =
+                UserInterface::build(table(&app, width), size, Cache::new(), &mut renderer);
+            renderer.reset(viewport);
+            ui.draw(
+                &mut renderer,
+                &cosmic::theme::active(),
+                &renderer::Style::default(),
+                mouse::Cursor::Unavailable,
+            );
+            let pixels = renderer.screenshot(Size::new(width as u32, 600), 1.0, Color::BLACK);
+            let accessible = ui.a11y_nodes(mouse::Cursor::Unavailable);
+            let nodes = accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .collect::<Vec<_>>();
+            let bounds = |label: &str| {
+                nodes
+                    .iter()
+                    .find(|node| node.node().label() == Some(label))
+                    .map(|node| {
+                        let bounds = node.node().bounds().expect("named table cell geometry");
+                        Rectangle::new(
+                            Point::new(bounds.x0 as f32, bounds.y0 as f32),
+                            Size::new(
+                                (bounds.x1 - bounds.x0) as f32,
+                                (bounds.y1 - bounds.y0) as f32,
+                            ),
+                        )
+                    })
+            };
+            // The accessible label retains the entire reported name even
+            // when native text shaping shortens what fits in this cell.
+            let plan = bounds(&full_plan);
+            assert_eq!(
+                plan.is_some(),
+                layout(width).columns.contains(&Column::Plan)
+            );
+            let session = bounds("18% left").expect("session usage remains readable");
+            if let Some(plan) = plan {
+                assert!(plan.width > 0.0 && plan.width <= Column::Plan.width(USAGE_WIDTH) + 0.01);
+                assert!(
+                    plan.x + plan.width <= session.x,
+                    "plan cannot overlap session text"
+                );
+            }
+            for (label, expected) in [("Check now", true), ("Account actions", false)] {
+                let target = bounds(label).expect("essential action remains accessible");
+                assert_eq!(target.width, design::COMPACT_CONTROL_SIZE);
+                assert_eq!(target.height, design::COMPACT_CONTROL_SIZE);
+                if target.y < session.y + session.height && session.y < target.y + target.height {
+                    assert!(target.x >= session.x + session.width);
+                }
+                assert!(
+                    target.x + target.width <= width && target.y + target.height <= size.height
+                );
+                let point = target.center();
+                let mut messages = Vec::new();
+                let _ = ui.update(
+                    &[
+                        Event::Mouse(mouse::Event::CursorMoved { position: point }),
+                        Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                        Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                    ],
+                    mouse::Cursor::Available(point),
+                    &mut renderer,
+                    &mut clipboard::Null,
+                    &mut messages,
+                );
+                if expected {
+                    assert!(
+                        matches!(messages.as_slice(), [Message::AccountUi(Action::Refresh(account))] if account == &id)
+                    );
+                } else {
+                    assert!(
+                        matches!(messages.as_slice(), [Message::AccountUi(Action::Menu(Some(account)))] if account == &id)
+                    );
+                }
+            }
+            Rendered {
+                pixels,
+                plan,
+                session,
+            }
+        };
+        for width in [360.0, 520.0, 800.0, 920.0, 1_200.0] {
+            let baseline = render("Ultra", width);
+            for reported in [
+                "Max 5x",
+                "Max 20x",
+                "Ultra",
+                "Fixture Horizon",
+                "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+            ] {
+                let actual = render(reported, width);
+                assert_eq!(
+                    actual.session, baseline.session,
+                    "reported plan must not shift usage at {width}"
+                );
+                let allowed = actual.plan.map(|bounds| {
+                    (
+                        bounds.x.floor() as usize,
+                        (bounds.x + Column::Plan.width(USAGE_WIDTH)).ceil() as usize,
+                    )
+                });
+                for (index, (actual, before)) in actual
+                    .pixels
+                    .chunks_exact(4)
+                    .zip(baseline.pixels.chunks_exact(4))
+                    .enumerate()
+                {
+                    if actual != before {
+                        let x = index % width as usize;
+                        assert!(
+                            allowed.is_some_and(|(left, right)| x >= left && x < right),
+                            "plan {reported:?} painted outside its actual column at x={x}, width={width}"
+                        );
+                    }
                 }
             }
         }
