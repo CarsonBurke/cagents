@@ -94,6 +94,25 @@ impl std::fmt::Display for TargetRecoveryRequired {
 impl std::error::Error for TargetRecoveryRequired {}
 
 impl Census {
+    fn from_recovered(
+        transaction: String,
+        recovered: &crate::upgrade::recovery::AlreadyRecovered,
+    ) -> Result<Self, UpdateError> {
+        // Only the shared exact checkpoint/request/partition classifier can
+        // produce this value. Its complete original scope is distinct from a
+        // fresh current roster or metadata-only discovery candidate.
+        let census = Self {
+            version: VERSION,
+            transaction,
+            source: Some(recovered.source.clone()),
+            terminals: recovered.census.terminals.clone(),
+            chats: recovered.census.chats.clone(),
+            checkpoint_before: Some(recovered.checkpoint_hash().to_owned()),
+        };
+        census.validate()?;
+        Ok(census)
+    }
+
     pub(super) fn from_pending(
         transaction: String,
         pending: &crate::upgrade::recovery::PendingRecovery,
@@ -344,10 +363,36 @@ impl Census {
         state: &Path,
         job: &str,
     ) -> Result<Receipt, UpdateError> {
+        self.verify_with_target_mode(target, state, job, false)
+    }
+
+    pub(super) fn verify_with_target_retiring(
+        &self,
+        target: &Path,
+        state: &Path,
+        job: &str,
+    ) -> Result<Receipt, UpdateError> {
+        self.verify_with_target_mode(target, state, job, true)
+    }
+
+    fn verify_with_target_mode(
+        &self,
+        target: &Path,
+        state: &Path,
+        job: &str,
+        retire: bool,
+    ) -> Result<Receipt, UpdateError> {
         let executable = target.join("bin/cagents");
         let before = match fs::symlink_metadata(&executable) {
             Ok(m) => m,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return self.verify(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let receipt = self.verify()?;
+                if retire && receipt.usable() {
+                    retire_current_service()?;
+                    return self.verify();
+                }
+                return Ok(receipt);
+            }
             Err(e) => return self.unverified(e.to_string()),
         };
         if !before.is_file()
@@ -376,6 +421,9 @@ impl Census {
             .arg(&census_path)
             .arg("--outcome")
             .arg(&receipt_path);
+        if retire {
+            command.arg("--retire");
+        }
         crate::install_guard::sanitize_child_environment(&mut command);
         unsafe { command.pre_exec(crate::daemon::seal_inherited_descriptors) };
         let executed = bounded_command(
@@ -1009,6 +1057,201 @@ fn require_captured_owner(
     Ok(())
 }
 
+/// Complete immutable Prepared evidence only after the sole original-census
+/// verifier proves a fresh Ready socket and its complete live/paused inventory.
+/// This never starts, stops, attaches or replays any owner.
+pub(crate) fn retire_current_service() -> Result<RetirementStatus, UpdateError> {
+    retire_service(RetirementTrigger::CurrentJob)
+}
+
+#[cfg(feature = "host")]
+pub(crate) fn refresh_completed_service() -> Result<RetirementStatus, UpdateError> {
+    retire_service(RetirementTrigger::ColdStart)
+}
+
+/// Mechanical evidence status, not another daemon usability outcome.
+#[derive(Debug)]
+pub(crate) enum RetirementStatus {
+    NotRequired,
+    AlreadyCompleted,
+    Completed,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RetirementTrigger {
+    CurrentJob,
+    #[cfg(feature = "host")]
+    ColdStart,
+}
+
+enum RetirementWork {
+    NotRequired,
+    AlreadyCompleted,
+    Pending {
+        recovered: crate::upgrade::recovery::AlreadyRecovered,
+        original: Census,
+        target: PathBuf,
+        receipt: Receipt,
+    },
+}
+
+fn retire_service(trigger: RetirementTrigger) -> Result<RetirementStatus, UpdateError> {
+    let result = (|| {
+        let Some(store) = crate::upgrade::handoff::Store::existing().map_err(invalid)? else {
+            return Ok(RetirementStatus::NotRequired);
+        };
+        let socket = crate::terminal_ipc::daemon_socket_path()?;
+        let mut client = source::Client::connect(&socket).map_err(|e| invalid(e.to_string()))?;
+        let generation = client.inventory_generation()?;
+        let ((proof, terminals, chats, readiness), retirement) = read_inventory_with(
+            &mut client,
+            |proof, terminals, chats, target| {
+                let canonical_prepared = store
+                    .checkpoint_status()
+                    .map_err(invalid)?
+                    .is_some_and(|status| status.phase == crate::upgrade::handoff::Phase::Prepared);
+                let recovered = match crate::upgrade::recovery::pending_retirement(
+                    &store.path,
+                    target,
+                ) {
+                    Ok(recovered) => recovered,
+                    Err(error)
+                        if trigger == RetirementTrigger::CurrentJob && !canonical_prepared =>
+                    {
+                        tracing::warn!(%error, "unrelated historical recovery evidence was left untouched");
+                        return Ok(RetirementWork::NotRequired);
+                    }
+                    Err(error) => return Err(invalid(error)),
+                };
+                let Some(recovered) = recovered else {
+                    return Ok(RetirementWork::NotRequired);
+                };
+                if trigger == RetirementTrigger::CurrentJob && !canonical_prepared {
+                    // This job has its own fresh RootCensus. Finished history
+                    // must not gate it on owners the person later closed.
+                    return match crate::upgrade::recovery::verified::completed_archive(
+                        &store.path,
+                        target,
+                        &recovered,
+                    ) {
+                        Ok(true) => Ok(RetirementWork::AlreadyCompleted),
+                        Ok(false) => {
+                            tracing::warn!(
+                                "historical recovery archival is unverified; its evidence was left untouched"
+                            );
+                            Ok(RetirementWork::NotRequired)
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "historical recovery archival is unverified; its evidence was left untouched");
+                            Ok(RetirementWork::NotRequired)
+                        }
+                    };
+                }
+                if recovered.source == *proof {
+                    return Err(invalid(
+                        "The original source cannot prove its own replacement was completed",
+                    ));
+                }
+                let original =
+                    Census::from_recovered(uuid::Uuid::new_v4().to_string(), &recovered)?;
+                let receipt = original.verify()?;
+                let (paused_terminals, paused_chats) =
+                    retirement_partition(&receipt, proof, &StartupState::Ready, terminals, chats)?;
+                recovered
+                    .validate_current_inventory(
+                        proof,
+                        terminals,
+                        chats,
+                        &paused_terminals,
+                        &paused_chats,
+                    )
+                    .map_err(invalid)?;
+                Ok(RetirementWork::Pending {
+                    recovered,
+                    original,
+                    target: target.to_owned(),
+                    receipt,
+                })
+            },
+        )?;
+        let (recovered, original, target, receipt) = match retirement {
+            RetirementWork::NotRequired => return Ok(RetirementStatus::NotRequired),
+            RetirementWork::AlreadyCompleted => {
+                if readiness != StartupState::Ready {
+                    return Err(invalid(
+                        "The serving daemon was not Ready while inspecting completed recovery evidence",
+                    ));
+                }
+                return Ok(RetirementStatus::AlreadyCompleted);
+            }
+            RetirementWork::Pending {
+                recovered,
+                original,
+                target,
+                receipt,
+            } => (recovered, original, target, receipt),
+        };
+        let (paused_terminals, paused_chats) =
+            retirement_partition(&receipt, &proof, &readiness, &terminals, &chats)?;
+        if client.inventory_generation()? != generation
+            || client.startup_state()? != StartupState::Ready
+            || client.serving_executable()? != target
+        {
+            return Err(invalid(
+                "The Ready service or inventory changed before recovery completion",
+            ));
+        }
+        // Mechanical archival cannot establish user success. It follows the
+        // exact root receipt above while the authenticated client stays pinned.
+        recovered
+            .archive_completed(&proof, &terminals, &chats, &paused_terminals, &paused_chats)
+            .map_err(invalid)?;
+        // Independently open the archived evidence through the same root
+        // verifier. A planned pointer alone is not durable completion.
+        let refreshed = original.verify()?;
+        retirement_partition(&refreshed, &proof, &StartupState::Ready, &terminals, &chats)?;
+        if client.inventory_generation()? != generation
+            || client.startup_state()? != StartupState::Ready
+            || client.serving_executable()? != target
+        {
+            return Err(invalid(
+                "The Ready service or inventory changed while completing recovery",
+            ));
+        }
+        Ok(RetirementStatus::Completed)
+    })();
+    result.map_err(|error: UpdateError| invalid(format!("Recovery completion could not be durably verified: {error}. Any serving daemon was kept running and its checkpoint/outcome evidence was preserved. Run `cagents --no-start daemon status` and `cagents --no-start terminal list` before another update")))
+}
+
+fn retirement_partition(
+    receipt: &Receipt,
+    proof: &HostSessionProof,
+    readiness: &StartupState,
+    live_terminals: &[TerminalDescriptor],
+    live_chats: &[crate::chat::Session],
+) -> Result<(Vec<crate::model::TerminalId>, Vec<crate::model::TerminalId>), UpdateError> {
+    match &receipt.outcome {
+        Outcome::Usable {
+            serving,
+            terminals,
+            chats,
+            paused_terminals,
+            paused_chats,
+        } if serving == proof
+            && proof.is_complete()
+            && *readiness == StartupState::Ready
+            && *terminals == live_terminals.len()
+            && *chats == live_chats.len() =>
+        {
+            Ok((paused_terminals.clone(), paused_chats.clone()))
+        }
+        Outcome::Usable { .. } => Err(invalid(
+            "The root recovery receipt does not match this Ready serving proof and current inventory; completion was not authorized",
+        )),
+        _ => Err(receipt.failure()),
+    }
+}
+
 /// Resolve one private, request-bound job, rather than searching by timestamps
 /// or borrowing another update's census. A retry cannot overwrite this scope.
 fn retained_job_census(
@@ -1169,6 +1412,41 @@ pub(crate) fn verify_file(
         Ok(receipt)
     } else {
         Err(receipt.failure())
+    }
+}
+
+/// Final post-window verification may complete archival through the target
+/// CLI, including when the coordinator predates its wire protocol.
+pub(crate) fn verify_file_retiring(
+    census: &Path,
+    outcome: &Path,
+    allow_absent: bool,
+    require_original: bool,
+    require_absent: bool,
+) -> Result<Receipt, UpdateError> {
+    let receipt = verify_file(
+        census,
+        outcome,
+        false,
+        allow_absent,
+        require_original,
+        require_absent,
+    )?;
+    if !receipt.usable() {
+        // A file-only installation has no recovery to retire.
+        return Ok(receipt);
+    }
+    let original = Census::load(census)?;
+    if let Err(error) = retire_current_service() {
+        original.unverified(error.to_string())?.save(outcome)?;
+        return Err(error);
+    }
+    let refreshed = original.verify()?;
+    refreshed.save(outcome)?;
+    if refreshed.usable() {
+        Ok(refreshed)
+    } else {
+        Err(refreshed.failure())
     }
 }
 
@@ -1588,6 +1866,57 @@ mod tests {
             let error = require_captured_owner(Some(&serving), observed).unwrap_err();
             assert!(error.to_string().contains("no empty census was created"));
         }
+    }
+
+    #[test]
+    fn update_recovery_retirement_requires_the_root_ready_receipt_and_exact_live_partition() {
+        let expected = census(&terminal());
+        let mut serving = proof();
+        serving.host_incarnation = "replacement".into();
+        let paused = expected.terminals[0].id;
+        let receipt = expected
+            .receipt(Outcome::Usable {
+                serving: serving.clone(),
+                terminals: 0,
+                chats: 0,
+                paused_terminals: vec![paused],
+                paused_chats: vec![],
+            })
+            .unwrap();
+        let partition =
+            retirement_partition(&receipt, &serving, &StartupState::Ready, &[], &[]).unwrap();
+        assert_eq!(partition, (vec![paused], vec![]));
+        for rejected in [
+            expected.receipt(Outcome::NoSource).unwrap(),
+            expected.receipt(Outcome::RestartPermitted).unwrap(),
+            expected
+                .unverified("Current holders were not authenticated".into())
+                .unwrap(),
+        ] {
+            assert!(
+                retirement_partition(&rejected, &serving, &StartupState::Ready, &[], &[]).is_err()
+            );
+        }
+        assert!(retirement_partition(&receipt, &proof(), &StartupState::Ready, &[], &[]).is_err());
+        assert!(
+            retirement_partition(
+                &receipt,
+                &serving,
+                &StartupState::Retained {
+                    detail: "not Ready".into()
+                },
+                &[],
+                &[]
+            )
+            .is_err()
+        );
+        assert!(
+            retirement_partition(&receipt, &serving, &StartupState::Ready, &[terminal()], &[])
+                .is_err()
+        );
+        assert!(
+            retirement_partition(&receipt, &serving, &StartupState::Ready, &[], &[chat()]).is_err()
+        );
     }
 
     #[test]

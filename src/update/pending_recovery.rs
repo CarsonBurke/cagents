@@ -46,9 +46,11 @@ pub(crate) fn run(
     let before = candidate_stamp(&layout.version_root)?;
     // Re-observe AFTER taking the real fences. A settled recovery can be
     // verified without restarting or stopping the recognized serving owner.
-    if let Ok(outcome) = verify(&pending, &daemon) {
+    if verify(&pending, &daemon).is_ok() {
         guard.relaunch_windows(&pending.windows, &ui)?;
         verify(&pending, &daemon)?;
+        recovery::retire_current_service()?;
+        let outcome = verify(&pending, &daemon)?;
         return Ok(report(&outcome));
     }
     let paths = crate::daemon::RuntimePaths::discover().map_err(|e| invalid(e.to_string()))?;
@@ -129,17 +131,19 @@ pub(crate) fn run(
     })();
     // Close the coordinator's reservation without unlocking the serving daemon.
     drop(handoff);
+    let result = result.and_then(|_| {
+        guard.relaunch_windows(&windows, &ui)?;
+        // Opening saved panes may attach owners. Recheck actual serving
+        // identity and full inventory after reopening before claiming Ready.
+        let pending = PendingRecovery::inspect()
+            .map_err(invalid)?
+            .ok_or_else(|| invalid("The recovery checkpoint disappeared while reopening panes"))?;
+        verify(&pending, &daemon)?;
+        recovery::retire_current_service()?;
+        verify(&pending, &daemon)
+    });
     match result {
         Ok(outcome) => {
-            guard.relaunch_windows(&windows, &ui)?;
-            // Opening saved panes may attach owners. Recheck actual serving
-            // identity and full inventory after reopening before claiming Ready.
-            let pending = PendingRecovery::inspect()
-                .map_err(invalid)?
-                .ok_or_else(|| {
-                    invalid("The recovery checkpoint disappeared while reopening panes")
-                })?;
-            verify(&pending, &daemon)?;
             job.phase = UpdatePhase::Complete;
             job.message = report(&outcome);
             write_job(&state, &job)?;

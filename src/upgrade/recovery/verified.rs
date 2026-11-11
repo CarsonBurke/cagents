@@ -13,7 +13,91 @@ pub(crate) struct VerifiedView {
 
 #[derive(Deserialize)]
 struct IssuedCheckpoint {
+    proof: HostSessionProof,
+    phase: super::super::handoff::Phase,
     chats: Vec<super::super::handoff::Chat>,
+}
+
+/// Metadata may precede the archive rename. Verify the actual private bytes,
+/// retaining the original outcome identity through every retirement generation.
+fn archive_bytes(
+    checkpoint: &Path,
+    target: &Path,
+    settled: &AlreadyRecovered,
+) -> Result<Vec<u8>, String> {
+    let proof = archived_proof(checkpoint, target)?
+        .ok_or("The original recovery has no verified checkpoint archive metadata")?;
+    if proof.checkpoint_sha256 != settled.witness.checkpoint_hash
+        || proof.outcome_sha256 != settled.witness.record_hash
+        || proof.outcome_path
+            != checkpoint.with_file_name(recovery_name(&settled.witness.checkpoint_hash))
+    {
+        return Err("The checkpoint archive names a different original outcome".into());
+    }
+    let retirement = read_checkpoint(&proof.retirement_path)?
+        .ok_or("The immutable retirement record disappeared")?;
+    if digest(&retirement) != proof.retirement_sha256 {
+        return Err("The immutable retirement bytes changed during verification".into());
+    }
+    read_checkpoint(&proof.archive_path)?.ok_or(
+        "The Prepared archive move has not completed; metadata alone is not recovery proof".into(),
+    )
+}
+
+fn validate_bytes(
+    checkpoint: &Path,
+    settled: &AlreadyRecovered,
+    bytes: Vec<u8>,
+) -> Result<Vec<u8>, String> {
+    if digest(&bytes) != settled.witness.checkpoint_hash {
+        return Err("The actual Prepared checkpoint or archive changed".into());
+    }
+    super::super::handoff::validate_checkpoint_bytes(&bytes)?;
+    let issued: IssuedCheckpoint =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    if issued.phase != super::super::handoff::Phase::Prepared || issued.proof != settled.source {
+        return Err("The actual checkpoint archive belongs to a different source or phase".into());
+    }
+    let outcome = read_checkpoint(
+        &checkpoint.with_file_name(recovery_name(&settled.witness.checkpoint_hash)),
+    )?
+    .ok_or("The immutable original recovery outcome disappeared")?;
+    if digest(&outcome) != settled.witness.record_hash {
+        return Err("The actual immutable original recovery outcome changed".into());
+    }
+    Ok(bytes)
+}
+
+fn checkpoint_bytes(
+    checkpoint: &Path,
+    target: &Path,
+    settled: &AlreadyRecovered,
+) -> Result<Vec<u8>, String> {
+    let bytes = match read_checkpoint(checkpoint)? {
+        Some(bytes) => bytes,
+        None => archive_bytes(checkpoint, target, settled)?,
+    };
+    validate_bytes(checkpoint, settled, bytes)
+}
+
+/// Mechanical archival evidence only. This says nothing about whether the
+/// original inventory is still usable and grants no pending/replay authority.
+pub(crate) fn completed_archive(
+    checkpoint: &Path,
+    target: &Path,
+    recovered: &AlreadyRecovered,
+) -> Result<bool, String> {
+    if read_checkpoint(checkpoint)?.is_some() {
+        return Ok(false);
+    }
+    // Force an actual archive read: a canonical checkpoint appearing during
+    // verification must never substitute for a completed archive move.
+    validate_bytes(
+        checkpoint,
+        recovered,
+        archive_bytes(checkpoint, target, recovered)?,
+    )?;
+    Ok(read_checkpoint(checkpoint)?.is_none())
 }
 
 impl VerifiedView {
@@ -39,14 +123,10 @@ impl VerifiedView {
         terminals: &[TerminalDescriptor],
         chats: &[Session],
     ) -> Result<Option<Self>, String> {
-        let Some(pending) = PendingRecovery::inspect_at(checkpoint_path)? else {
+        let Some(settled) = pending_retirement(checkpoint_path, target)? else {
             return Ok(None);
         };
-        if !pending.original_census_complete {
-            return Err("The complete original recovery census is unavailable; retained state was not treated as usable recovery".into());
-        }
-        let settled = classify_retained_prepared(checkpoint_path, target)?
-            .ok_or("The retained checkpoint has no exact settled recovery")?;
+        let bytes = checkpoint_bytes(checkpoint_path, target, &settled)?;
         let cold = if &settled.witness.successor == serving {
             None
         } else {
@@ -70,9 +150,9 @@ impl VerifiedView {
         };
         let record = read_verified_record(
             checkpoint_path,
-            &pending.checkpoint_hash,
-            &pending.source,
-            &pending.census,
+            &settled.witness.checkpoint_hash,
+            &settled.source,
+            &settled.census,
             target,
             None,
             None,
@@ -80,9 +160,12 @@ impl VerifiedView {
             record_terminals,
             record_chats,
         )?;
-        let bytes = read_checkpoint(checkpoint_path)?
-            .ok_or("The Prepared checkpoint disappeared while verifying issued lineage")?;
-        pending.validate(&bytes)?;
+        if checkpoint_bytes(checkpoint_path, target, &settled)? != bytes {
+            return Err(
+                "The actual checkpoint evidence changed while verifying the serving inventory"
+                    .into(),
+            );
+        }
         let issued: IssuedCheckpoint = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
         Ok(Some(Self {
             record,
@@ -201,6 +284,15 @@ pub(super) mod tests {
             .open(path)
             .unwrap();
         file.write_all(bytes).unwrap();
+    }
+
+    pub(super) fn root_census(fixture: &Fixture) -> crate::update::recovery::Census {
+        serde_json::from_value(serde_json::json!({
+            "version":1, "transaction":fixture.record.job, "source":fixture.record.source,
+            "terminals":fixture.record.census.terminals, "chats":fixture.record.census.chats,
+            "checkpoint_before":null,
+        }))
+        .unwrap()
     }
 
     pub(super) struct Fixture {
@@ -400,6 +492,38 @@ pub(super) mod tests {
                 &serde_json::to_vec(&self.record).unwrap(),
             );
         }
+        pub(super) fn archive(&self) -> ArchiveProof {
+            let current = self.record.adopted_chat_descriptors.clone();
+            let view = self.load(&current).unwrap().unwrap();
+            let outcome = crate::update::recovery::compare_with_recovery(
+                &root_census(self),
+                &proof("successor"),
+                &self.record.adopted_terminal_descriptors,
+                &current,
+                &Default::default(),
+                Some(&view),
+                None,
+            );
+            assert!(matches!(
+                outcome,
+                crate::update::recovery::Outcome::Usable { .. }
+            ));
+            let settled = pending_retirement(&self.checkpoint, &self.target)
+                .unwrap()
+                .unwrap();
+            settled
+                .archive_completed(
+                    &proof("successor"),
+                    &self.record.adopted_terminal_descriptors,
+                    &current,
+                    &self.record.paused_terminals,
+                    &self.record.paused_chats,
+                )
+                .unwrap();
+            archived_proof(&self.checkpoint, &self.target)
+                .unwrap()
+                .unwrap()
+        }
         pub(super) fn load(&self, live: &[Session]) -> Result<Option<VerifiedView>, String> {
             VerifiedView::load_at(
                 &self.checkpoint,
@@ -484,6 +608,119 @@ pub(super) mod tests {
             &fixture.record.checkpoint_hash,
         ))
         .unwrap();
+        assert!(
+            fixture.load(&[fixture.current.clone()]).unwrap().is_some(),
+            "a settled read-only proof uses the immutable reviewed outcome, without minting a prepare receipt from its original capture"
+        );
+    }
+    #[test]
+    fn archived_recovery_view_preserves_live_and_paused_proof_and_normal_chat_journal() {
+        let fixture = Fixture::new(Provider::Claude, true);
+        let checkpoint = fs::read(&fixture.checkpoint).unwrap();
+        let original_path = fixture
+            .checkpoint
+            .with_file_name(recovery_name(&fixture.record.checkpoint_hash));
+        let original_outcome = fs::read(&original_path).unwrap();
+        let store = super::super::super::handoff::Store::open(fixture.checkpoint.parent().unwrap())
+            .unwrap();
+        store
+            .record_recovered(&[super::super::super::handoff::RecoveredChat {
+                evidence: super::super::super::handoff::Chat {
+                    source: fixture.source.clone(),
+                    launch: fixture.source.launch.clone(),
+                    previous_sources: vec![],
+                },
+                replacement: fixture.current.clone(),
+                aliases: vec![],
+            }])
+            .unwrap();
+        let journal_path = fixture
+            .checkpoint
+            .with_file_name("daemon-upgrade.recovered.json");
+        let journal = fs::read(&journal_path).unwrap();
+        let archive = fixture.archive();
+        assert!(!fixture.checkpoint.exists());
+        assert_eq!(fs::read(&archive.archive_path).unwrap(), checkpoint);
+        assert_eq!(fs::read(&original_path).unwrap(), original_outcome);
+        assert_eq!(
+            fs::read(&journal_path).unwrap(),
+            journal,
+            "retirement cannot overwrite normal issued chat lineage"
+        );
+        assert!(
+            PendingRecovery::inspect_at(&fixture.checkpoint)
+                .unwrap()
+                .is_none(),
+            "archive evidence is never pending prepare authority"
+        );
+        let view = fixture.load(&[fixture.current.clone()]).unwrap().unwrap();
+        assert!(view.proves_chat(&fixture.source, &fixture.current));
+        assert!(view.paused_chat(&fixture.record.census.chats[1]));
+        assert!(
+            matches!(crate::update::recovery::compare_with_recovery(&root_census(&fixture), &proof("successor"),
+            &fixture.record.adopted_terminal_descriptors, &[fixture.current.clone()], &Default::default(), Some(&view), None),
+            crate::update::recovery::Outcome::Usable { terminals:1, chats:1, paused_chats, .. } if paused_chats == fixture.record.paused_chats)
+        );
+    }
+
+    #[test]
+    fn archived_recovery_view_requires_actual_archive_bytes_beyond_planned_metadata() {
+        let fixture = Fixture::new(Provider::Claude, true);
+        let archive = fixture.archive();
+        let original = fs::read(&archive.archive_path).unwrap();
+        let recovered = pending_retirement(&fixture.checkpoint, &fixture.target)
+            .unwrap()
+            .unwrap();
+        assert!(completed_archive(&fixture.checkpoint, &fixture.target, &recovered).unwrap());
+        let missing = archive.archive_path.with_extension("temporarily-missing");
+        // The durable plan can precede its rename. Canonical bytes remain a
+        // valid pre-retirement proof even while its archive is still absent.
+        fs::rename(&archive.archive_path, &fixture.checkpoint).unwrap();
+        assert!(!archive.archive_path.exists());
+        assert!(
+            !completed_archive(&fixture.checkpoint, &fixture.target, &recovered).unwrap(),
+            "canonical proof is not mechanical archive completion"
+        );
+        assert!(fixture.load(&[fixture.current.clone()]).unwrap().is_some());
+        fs::rename(&fixture.checkpoint, &missing).unwrap();
+        assert!(
+            archived_proof(&fixture.checkpoint, &fixture.target)
+                .unwrap()
+                .is_some(),
+            "retirement metadata can precede the actual archive"
+        );
+        assert!(
+            fixture.load(&[fixture.current.clone()]).is_err(),
+            "metadata alone cannot prove missing actual archive bytes"
+        );
+        assert!(
+            completed_archive(&fixture.checkpoint, &fixture.target, &recovered).is_err(),
+            "a planned pointer with neither actual file is incomplete"
+        );
+        fs::rename(&missing, &archive.archive_path).unwrap();
+        write_private(&archive.archive_path, b"changed actual archive");
+        assert!(completed_archive(&fixture.checkpoint, &fixture.target, &recovered).is_err());
         assert!(fixture.load(&[fixture.current.clone()]).is_err());
+        write_private(&archive.archive_path, &original);
+        assert!(fixture.load(&[fixture.current.clone()]).unwrap().is_some());
+        let retirement = fs::read(&archive.retirement_path).unwrap();
+        write_private(&archive.retirement_path, b"changed immutable retirement");
+        assert!(fixture.load(&[fixture.current.clone()]).is_err());
+        write_private(&archive.retirement_path, &retirement);
+        assert!(fixture.load(&[fixture.current.clone()]).unwrap().is_some());
+    }
+    #[test]
+    fn canonical_ready_checkpoint_suppresses_older_archived_recovery_proof() {
+        let fixture = Fixture::new(Provider::Claude, true);
+        let archive = fixture.archive();
+        let mut next: serde_json::Value =
+            serde_json::from_slice(&fs::read(&archive.archive_path).unwrap()).unwrap();
+        next["phase"] = "Ready".into();
+        write_private(&fixture.checkpoint, &serde_json::to_vec(&next).unwrap());
+        assert!(
+            fixture.load(&[fixture.current.clone()]).unwrap().is_none(),
+            "an existing canonical checkpoint prevents falling through to unrelated archived scope"
+        );
+        assert!(archive.archive_path.exists());
     }
 }

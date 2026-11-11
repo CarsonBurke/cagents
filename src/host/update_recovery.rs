@@ -24,6 +24,37 @@ pub(super) fn restore_settled_from(
     };
     tracing::info!(checkpoint = %checkpoint.display(),
         "settled update checkpoint identified; adopting current holders and retaining paused history");
+    restore_recovered(host, checkpoint, daemon, settled, &[])
+}
+
+pub(super) fn restore_archived(
+    host: &SharedHost,
+    refused: &[crate::model::TerminalId],
+) -> Result<bool, String> {
+    let store = Store::discover()?;
+    let daemon = std::env::current_exe().map_err(|error| error.to_string())?;
+    restore_archived_from(host, &store.path, &daemon, refused)
+}
+
+fn restore_archived_from(
+    host: &SharedHost,
+    checkpoint: &std::path::Path,
+    daemon: &std::path::Path,
+    refused: &[crate::model::TerminalId],
+) -> Result<bool, String> {
+    let Some(archived) = recovery::archived_discovery(checkpoint, daemon)? else {
+        return Ok(false);
+    };
+    restore_recovered(host, checkpoint, daemon, archived, refused)
+}
+
+fn restore_recovered(
+    host: &SharedHost,
+    checkpoint: &std::path::Path,
+    daemon: &std::path::Path,
+    settled: recovery::AlreadyRecovered,
+    refused: &[crate::model::TerminalId],
+) -> Result<bool, String> {
     // Recreate missing history before accepting clients, including when its
     // index was pruned after the first recovery. Invalid existing records refuse
     // startup before any adoption. Every presentation
@@ -35,6 +66,7 @@ pub(super) fn restore_settled_from(
         &settled.paused_chats,
         settled.paused_terminals.clone(),
     )?;
+    retain_issued_aliases(&mut paused, &settled.adopted_chat_descriptors);
     for presentation in &mut paused.presentations {
         presentation.restored = true;
     }
@@ -43,11 +75,13 @@ pub(super) fn restore_settled_from(
         .unwrap_or_else(|p| p.into_inner())
         .pause_update_terminals(&settled.paused_terminals);
 
+    let ledger = crate::upgrade::floor::load()?;
     let preserved = settled
         .census
         .terminal_ids()
         .difference(&settled.paused_terminals.iter().copied().collect())
         .copied()
+        .filter(|id| !ledger.blocks_id_except_source(*id, &settled.source))
         .collect();
     super::chat::retained_actor::reconcile_previous_boot_history(host)?;
     state::restore_orphaned_holders_preserving(host, &preserved)?;
@@ -60,8 +94,9 @@ pub(super) fn restore_settled_from(
         .iter()
         .map(|chat| chat.id)
         .filter(|id| !settled.paused_chats.contains(id))
+        .filter(|id| !ledger.blocks_id_except_source(*id, &settled.source))
         .collect();
-    super::chat::restore_orphaned_native_preserving(host, &[], &preserved_chats)?;
+    super::chat::restore_orphaned_native_preserving(host, refused, &preserved_chats)?;
     ensure_no_ambiguous_adoption(host)?;
     super::chat::retained_actor::reconcile_retired_actors(host)?;
     super::chat::retained_actor::reconcile_startup_losses(host)?;
@@ -97,6 +132,7 @@ pub(super) fn restore_settled_from(
         &paused_chats,
         paused_terminals.clone(),
     )?;
+    retain_issued_aliases(&mut paused, &settled.adopted_chat_descriptors);
     for presentation in &mut paused.presentations {
         presentation.restored = true;
     }
@@ -210,16 +246,18 @@ pub(super) fn restore(host: &SharedHost) -> Result<bool, String> {
     }
     // Retained native adoption may also install its paired terminal. Account
     // for actual published owners after all adoption, including those pairs.
-    let (terminals, chats, successor) = {
+    let (terminals, chats, successor, descriptors) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         (
             state.terminals.keys().copied().collect::<BTreeSet<_>>(),
             state.chats.keys().copied().collect::<BTreeSet<_>>(),
             state.proof().clone(),
+            live_chat_descriptors(&state),
         )
     };
     record.adopted_terminals = terminals.iter().copied().collect();
     record.adopted_chats = chats.iter().copied().collect();
+    record.adopted_chat_descriptors = descriptors;
     record.paused_terminals = record
         .census
         .terminal_ids()
@@ -314,6 +352,35 @@ pub(super) fn restore(host: &SharedHost) -> Result<bool, String> {
     Ok(true)
 }
 
+fn live_chat_descriptors(state: &state::HostState) -> Vec<crate::chat::Session> {
+    state
+        .chats
+        .values()
+        .filter(|record| !record.handle.is_read_only_history())
+        .map(|record| {
+            let mut session = record.session.clone();
+            session.launch.session_id = record.handle.session_id();
+            session.native_continuity = record.handle.native_continuity();
+            session
+        })
+        .collect()
+}
+
+/// Issued descriptors were validated by the settled outcome against the exact
+/// original owner. They name saved displays only, never a new provider or run.
+fn retain_issued_aliases(
+    paused: &mut crate::upgrade::floor::Record,
+    issued: &[crate::chat::Session],
+) {
+    for alias in issued {
+        if paused.chats.iter().any(|source| source.id == alias.id)
+            && !paused.aliases.contains(alias)
+        {
+            paused.aliases.push(alias.clone());
+        }
+    }
+}
+
 fn paused_record(
     source: crate::model::HostSessionProof,
     census: &recovery::Census,
@@ -395,7 +462,7 @@ mod tests {
             name: None,
             origin: crate::agent_execution::Origin::User,
             spec: crate::agent_execution::Spec {
-                provider: crate::agent::Provider::Codex,
+                provider: alias.launch.provider,
                 account: None,
                 target: crate::agent_execution::Target {
                     repository: directory.to_owned(),
@@ -464,6 +531,15 @@ mod tests {
 
     #[test]
     fn settled_prepared_restart_restores_history_without_replaying_its_provider() {
+        settled_restart_case(crate::agent::Provider::Codex);
+    }
+
+    #[test]
+    fn settled_prepared_restart_keeps_the_latest_adopted_chat_as_a_history_alias() {
+        settled_restart_case(crate::agent::Provider::Claude);
+    }
+
+    fn settled_restart_case(provider_kind: crate::agent::Provider) {
         use sha2::{Digest, Sha256};
         use std::os::unix::fs::PermissionsExt;
 
@@ -507,7 +583,7 @@ mod tests {
         };
         let provider_dir = root.join("provider");
         crate::secure_file::prepare_private_directory(&provider_dir).unwrap();
-        let provider = provider_dir.join("codex");
+        let provider = provider_dir.join(provider_kind.executable());
         let sentinel = root.join("provider-was-replayed");
         fs::write(
             &provider,
@@ -518,10 +594,14 @@ mod tests {
         let mut source = Session {
             id: TerminalId::new(),
             launch: chat::Launch {
-                provider: crate::agent::Provider::Codex,
+                provider: provider_kind,
                 recipe: LaunchRecipe {
                     program: provider.to_string_lossy().into_owned(),
-                    arguments: vec!["--remote".into(), "unix://".into()],
+                    arguments: if provider_kind == crate::agent::Provider::Codex {
+                        vec!["--remote".into(), "unix://".into()]
+                    } else {
+                        Vec::new()
+                    },
                     working_directory: root.join("project"),
                     environment: [(
                         "CAGENTS_RECOVERY_SENTINEL".into(),
@@ -535,11 +615,22 @@ mod tests {
             proof: Some(proof("source")),
             terminal: None,
             owned_codex_listener: None,
-            native_continuity: Default::default(),
+            native_continuity: if provider_kind == crate::agent::Provider::Claude {
+                chat::NativeContinuity::RetainedClaudeActor { protocol: 2 }
+            } else {
+                Default::default()
+            },
         };
-        assert!(source.claim_owned_codex_listener(&root.join("run"), &proof("source")));
+        if provider_kind == crate::agent::Provider::Codex {
+            assert!(source.claim_owned_codex_listener(&root.join("run"), &proof("source")));
+        }
         let alias = source.clone();
         source.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        if provider_kind == crate::agent::Provider::Codex {
+            source.native_continuity = chat::NativeContinuity::Durable {
+                provider_version: "0.100.0".into(),
+            };
+        }
         let mut snapshots = recovery::SnapshotCapture::default();
         snapshots
             .push(
@@ -566,13 +657,35 @@ mod tests {
             .unwrap()
             .data_dir()
             .join("workspace-model.sqlite3");
-        let (registry, pane) = seed_managed_pane(&registry_path, &root.join("project"), &alias);
-        let original_agent = registry.agent_for_session(source.id).unwrap().unwrap();
+        let (mut registry, pane) =
+            seed_managed_pane(&registry_path, &root.join("project"), &source);
         let mut presentation =
             crate::upgrade::floor::Record::new(proof("source"), vec![source.clone()], Vec::new());
         registry.capture_update_floor(&mut presentation).unwrap();
-        assert_eq!(presentation.aliases, vec![alias.clone()]);
+        assert_eq!(presentation.aliases, vec![source.clone()]);
         assert_eq!(presentation.presentations[0].pane, pane);
+        // This is the live descriptor the initial recovery actually issued to
+        // the managed Agent and canonical pane, not a history retry shape.
+        let mut issued = source.clone();
+        issued.proof = Some(proof("first-recovery"));
+        assert!(
+            registry
+                .adopt_authenticated_agent_session(
+                    &[crate::agent_execution::HostedSession::Chat(source.clone())],
+                    &crate::agent_execution::HostedSession::Chat(issued.clone()),
+                )
+                .unwrap()
+        );
+        let original_agent = registry.agent_for_session(source.id).unwrap().unwrap();
+        let Some(crate::agent_execution::HostedSession::Chat(latest_saved)) =
+            &original_agent.session
+        else {
+            unreachable!()
+        };
+        let latest_saved = latest_saved.clone();
+        assert_eq!(latest_saved, issued);
+        assert!(registry.model().unwrap().views.iter().flat_map(|view| &view.panes)
+            .any(|pane| matches!(&pane.kind, crate::model::CardKind::Chat(session) if session == &latest_saved)));
         drop(registry);
         let census = recovery::Census {
             chats: vec![source.clone()],
@@ -643,7 +756,7 @@ mod tests {
             "version":2, "job":job, "request_identity":hash(&serde_json::to_vec(&reviewed).unwrap()),
             "job_request_hash":hash(&request), "reviewed":reviewed, "source":proof("source"),
             "checkpoint_hash":checkpoint_hash, "census":census,
-            "adopted_terminals":[], "adopted_chats":[], "paused_terminals":[], "paused_chats":[source.id],
+            "adopted_terminals":[], "adopted_chats":[source.id], "adopted_chat_descriptors":[latest_saved], "paused_terminals":[], "paused_chats":[],
             "settled":true, "successor":proof("first-recovery"),
             "target":daemon_binary, "target_hash":hash(&fs::read(&daemon_binary).unwrap()),
         });
@@ -654,46 +767,6 @@ mod tests {
             fs::write(&outcome, serde_json::to_vec(value).unwrap()).unwrap();
             fs::set_permissions(&outcome, fs::Permissions::from_mode(0o600)).unwrap();
         };
-        write_outcome(&settled);
-        let mut requested = alias.clone();
-        for epoch in ["cold-start", "subsequent-restart"] {
-            let mut initial = state::HostState::new(proof(epoch));
-            initial.install_model(super::super::model::Registry::open().unwrap());
-            let host = Arc::new(state::HostLock::new(initial));
-            assert!(restore_settled_from(&host, &store.path, &daemon_binary).unwrap());
-            assert!(matches!(
-                host.lock().unwrap().startup_state(),
-                crate::terminal_ipc::StartupState::Ready
-            ));
-            assert!(host.lock().unwrap().chats.is_empty());
-            let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
-            let server_host = host.clone();
-            let server =
-                std::thread::spawn(move || super::super::client::serve(server, 1, server_host));
-            let client =
-                chat::client::ClientHandle::fixture_restore(client, requested.clone()).unwrap();
-            requested = client.session();
-            assert_eq!(requested.launch.session_id, source.launch.session_id);
-            assert_eq!(requested.proof, Some(proof(epoch)));
-            let handle = host.lock().unwrap().chats[&source.id].handle.clone();
-            let page = handle.snapshot(None).unwrap();
-            assert!(page.exited && page.read_only_reason.is_some());
-            assert!(page.items.iter().any(|item| matches!(&item.content, chat::ItemContent::Text { text, .. } if text == "The captured page survived")));
-            assert!(handle.is_read_only_history() && !handle.owns_work());
-            assert!(!sentinel.exists());
-            assert_eq!(fs::read(&store.path).unwrap(), checkpoint);
-            let registry = super::super::model::Registry::open().unwrap();
-            assert_eq!(
-                registry.agent_for_session(source.id).unwrap(),
-                Some(original_agent.clone())
-            );
-            let ledger = crate::upgrade::floor::load().unwrap();
-            assert_eq!(ledger.records[0].presentations[0].pane, pane);
-            assert!(ledger.records[0].presentations[0].restored);
-            handle.close().unwrap();
-            drop(client);
-            server.join().unwrap();
-        }
         for changed in [
             "unsettled",
             "hash",
@@ -707,7 +780,7 @@ mod tests {
                 "unsettled" => invalid["settled"] = false.into(),
                 "hash" => invalid["checkpoint_hash"] = "0".repeat(64).into(),
                 "source" => invalid["source"]["host_incarnation"] = "foreign".into(),
-                "inventory" => invalid["paused_chats"] = serde_json::json!([]),
+                "inventory" => invalid["adopted_chats"] = serde_json::json!([]),
                 "request" => invalid["job_request_hash"] = "0".repeat(64).into(),
                 "target" => invalid["target_hash"] = "0".repeat(64).into(),
                 _ => unreachable!(),
@@ -725,6 +798,269 @@ mod tests {
             assert!(!sentinel.exists());
             assert_eq!(fs::read(&store.path).unwrap(), checkpoint);
         }
+        write_outcome(&settled);
+        let mut retained = state::HostState::new(proof("retained"));
+        retained.retain_startup_recovery("An original owner is still unresolved".into());
+        let retained = Arc::new(state::HostLock::new(retained));
+        let outcome_before = fs::read(&outcome).unwrap();
+        assert!(restore_settled_from(&retained, &store.path, &daemon_binary).is_err());
+        assert_eq!(fs::read(&store.path).unwrap(), checkpoint);
+        assert_eq!(fs::read(&outcome).unwrap(), outcome_before);
+        assert!(matches!(
+            retained.lock().unwrap().startup_state(),
+            crate::terminal_ipc::StartupState::Retained { .. }
+        ));
+        assert!(!sentinel.exists());
+        let mut restoring = state::HostState::new(proof("restoring"));
+        restoring.await_startup_for_test(TerminalId::new());
+        let restoring = Arc::new(state::HostLock::new(restoring));
+        assert!(restore_settled_from(&restoring, &store.path, &daemon_binary).is_err());
+        assert_eq!(fs::read(&store.path).unwrap(), checkpoint);
+        assert_eq!(fs::read(&outcome).unwrap(), outcome_before);
+        assert!(matches!(
+            restoring.lock().unwrap().startup_state(),
+            crate::terminal_ipc::StartupState::Restoring { .. }
+        ));
+        assert!(!sentinel.exists());
+        let mut requested = latest_saved;
+        let mut expected_agent = original_agent.clone();
+        for epoch in ["cold-start", "subsequent-restart"] {
+            let retirement_before = recovery::archived_proof(&store.path, &daemon_binary)
+                .unwrap()
+                .map(|proof| (proof.retirement_path, proof.retirement_sha256));
+            let mut initial = state::HostState::new(proof(epoch));
+            initial.install_model(super::super::model::Registry::open().unwrap());
+            let host = Arc::new(state::HostLock::new(initial));
+            if epoch == "cold-start" {
+                assert!(restore_settled_from(&host, &store.path, &daemon_binary).unwrap());
+            } else {
+                assert!(!restore_settled_from(&host, &store.path, &daemon_binary).unwrap());
+                assert!(state::restore_upgrade(&host).unwrap().is_empty());
+                assert!(restore_archived_from(&host, &store.path, &daemon_binary, &[]).unwrap());
+            }
+            assert!(matches!(
+                host.lock().unwrap().startup_state(),
+                crate::terminal_ipc::StartupState::Ready
+            ));
+            assert!(host.lock().unwrap().chats.is_empty());
+            if epoch == "cold-start" {
+                assert_eq!(fs::read(&store.path).unwrap(), checkpoint);
+                assert!(
+                    recovery::archived_proof(&store.path, &daemon_binary)
+                        .unwrap()
+                        .is_none()
+                );
+            } else {
+                let proof = recovery::archived_proof(&store.path, &daemon_binary)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    Some((proof.retirement_path, proof.retirement_sha256)),
+                    retirement_before
+                );
+            }
+            assert_eq!(fs::read(&outcome).unwrap(), outcome_before);
+            assert_eq!(
+                crate::upgrade::floor::load()
+                    .unwrap()
+                    .resume_source(&requested),
+                Some(&source)
+            );
+            let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+            let server_host = host.clone();
+            let server =
+                std::thread::spawn(move || super::super::client::serve(server, 1, server_host));
+            let client =
+                chat::client::ClientHandle::fixture_restore(client, requested.clone()).unwrap();
+            requested = client.session();
+            assert_eq!(requested.launch.session_id, source.launch.session_id);
+            assert_eq!(requested.proof, Some(proof(epoch)));
+            let handle = host.lock().unwrap().chats[&source.id].handle.clone();
+            let page = handle.snapshot(None).unwrap();
+            assert!(page.exited && page.read_only_reason.is_some());
+            assert!(page.items.iter().any(|item| matches!(&item.content, chat::ItemContent::Text { text, .. } if text == "The captured page survived")));
+            assert!(handle.is_read_only_history() && !handle.owns_work());
+            assert!(!sentinel.exists());
+            // Simulate the separate caller after it has verified Ready and
+            // the reopened pane. RootCensus::Usable belongs to lease6.
+            let verified = if epoch == "cold-start" {
+                recovery::classify_retained_prepared(&store.path, &daemon_binary)
+                    .unwrap()
+                    .unwrap()
+            } else {
+                recovery::archived_discovery(&store.path, &daemon_binary)
+                    .unwrap()
+                    .unwrap()
+            };
+            verified
+                .archive_completed(&proof(epoch), &[], &[], &[], &[source.id])
+                .unwrap();
+            assert!(!store.path.exists());
+            assert_eq!(
+                fs::read(&outcome).unwrap(),
+                outcome_before,
+                "settled outcome bytes remain immutable through archival and later issuance"
+            );
+            let preserved = fs::read_dir(store.path.parent().unwrap())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| fs::read(entry.path()).is_ok_and(|bytes| bytes == checkpoint))
+                .count();
+            assert_eq!(
+                preserved, 1,
+                "the archived Prepared bytes must remain intact exactly once"
+            );
+            let archived_proof = recovery::archived_proof(&store.path, &daemon_binary)
+                .unwrap()
+                .unwrap();
+            assert_eq!(fs::read(archived_proof.archive_path).unwrap(), checkpoint);
+            let registry = super::super::model::Registry::open().unwrap();
+            assert_eq!(
+                registry.agent_for_session(source.id).unwrap(),
+                Some(expected_agent.clone())
+            );
+            let ledger = crate::upgrade::floor::load().unwrap();
+            assert_eq!(ledger.records[0].presentations[0].pane, pane);
+            assert!(ledger.records[0].presentations[0].restored);
+            handle.close().unwrap();
+            drop(client);
+            server.join().unwrap();
+            if epoch == "cold-start" {
+                // The retained-holder fixture separately exercises ordinary
+                // authentication. Record its exact public issuance here, then
+                // lose that owner before the next archived startup.
+                let mut issued_after_archive = source.clone();
+                issued_after_archive.proof = Some(proof("adopted-after-archive"));
+                let mut registry = super::super::model::Registry::open().unwrap();
+                assert!(
+                    registry
+                        .adopt_authenticated_agent_session(
+                            &[expected_agent.session.clone().unwrap()],
+                            &crate::agent_execution::HostedSession::Chat(
+                                issued_after_archive.clone()
+                            ),
+                        )
+                        .unwrap()
+                );
+                expected_agent = registry.agent_for_session(source.id).unwrap().unwrap();
+                let Some(crate::agent_execution::HostedSession::Chat(saved)) =
+                    &expected_agent.session
+                else {
+                    unreachable!()
+                };
+                assert_eq!(saved, &issued_after_archive);
+                requested = saved.clone();
+                let archived = recovery::archived_discovery(&store.path, &daemon_binary)
+                    .unwrap()
+                    .unwrap();
+                archived
+                    .archive_completed(
+                        &proof("adopted-after-archive"),
+                        &[],
+                        &[issued_after_archive.clone()],
+                        &[],
+                        &[],
+                    )
+                    .unwrap();
+                let persisted = recovery::archived_discovery(&store.path, &daemon_binary)
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    persisted
+                        .adopted_chat_descriptors
+                        .contains(&issued_after_archive)
+                );
+            }
+        }
+        // A confirmed /clear keeps the authenticated actor but changes its
+        // conversation. It may count as live; it must never alias B to page A.
+        let mut switched = source.clone();
+        switched.proof = Some(proof("adopted-after-archive"));
+        switched.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        let mut registry = super::super::model::Registry::open().unwrap();
+        assert!(
+            registry
+                .adopt_authenticated_agent_session(
+                    &[expected_agent.session.clone().unwrap()],
+                    &crate::agent_execution::HostedSession::Chat(switched.clone()),
+                )
+                .unwrap()
+        );
+        let model = registry.model().unwrap();
+        let (scope, revision, before) = model
+            .views
+            .iter()
+            .find_map(|view| {
+                view.panes
+                    .iter()
+                    .find(|pane| {
+                        pane.id == crate::model::CardId::from_uuid(expected_agent.id.as_uuid())
+                    })
+                    .map(|pane| (view.scope.clone(), view.revision, pane.clone()))
+            })
+            .unwrap();
+        let mut after = before.clone();
+        after.kind = crate::model::CardKind::Chat(switched.clone());
+        registry
+            .apply(&crate::workspace_model::ModelEdit::ChangeView {
+                scope,
+                expected_revision: revision,
+                operation: uuid::Uuid::new_v4(),
+                change: crate::workspace_model::views::Change::Update {
+                    before,
+                    pane: after,
+                },
+            })
+            .unwrap();
+        let saved_agent = registry.agent_for_session(source.id).unwrap().unwrap();
+        let Some(crate::agent_execution::HostedSession::Chat(saved_b)) = saved_agent.session else {
+            unreachable!()
+        };
+        assert_eq!(saved_b, switched);
+        let archived = recovery::archived_discovery(&store.path, &daemon_binary)
+            .unwrap()
+            .unwrap();
+        archived
+            .archive_completed(
+                &proof("adopted-after-archive"),
+                &[],
+                &[switched.clone()],
+                &[],
+                &[],
+            )
+            .unwrap();
+        let archived = recovery::archived_discovery(&store.path, &daemon_binary)
+            .unwrap()
+            .unwrap();
+        assert!(!archived.adopted_chat_descriptors.contains(&switched));
+        assert!(
+            crate::upgrade::floor::load()
+                .unwrap()
+                .resume_source(&saved_b)
+                .is_none()
+        );
+        let mut initial = state::HostState::new(proof("missing-b"));
+        initial.install_model(registry);
+        let host = Arc::new(state::HostLock::new(initial));
+        assert!(restore_archived_from(&host, &store.path, &daemon_binary, &[]).unwrap());
+        assert!(
+            crate::upgrade::floor::load()
+                .unwrap()
+                .resume_source(&saved_b)
+                .is_none()
+        );
+        let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let server_host = host.clone();
+        let server =
+            std::thread::spawn(move || super::super::client::serve(server, 1, server_host));
+        let failure = match chat::client::ClientHandle::fixture_restore(client, saved_b) {
+            Err(failure) => failure,
+            Ok(_) => panic!("the switched conversation must not display the earlier captured page"),
+        };
+        assert_eq!(failure.recovery, chat::Recovery::Retry);
+        server.join().unwrap();
+        assert!(!sentinel.exists());
+        assert_eq!(fs::read(&outcome).unwrap(), outcome_before);
     }
 
     #[test]

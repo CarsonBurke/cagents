@@ -258,7 +258,7 @@ impl Ledger {
 
     pub fn blocks_chat(&self, source: &Session) -> bool {
         self.records.iter().any(|record| {
-            source.proof.as_ref() == Some(&record.source)
+            (source.proof.as_ref() == Some(&record.source) || record.aliases.contains(source))
                 && record.chats.iter().any(|chat| chat.id == source.id)
         })
     }
@@ -276,6 +276,27 @@ impl Ledger {
     }
     pub fn blocks_id(&self, id: TerminalId) -> bool {
         self.blocks_terminal(id)
+    }
+
+    /// A discovery retry can waive only its own source's earlier pause. A
+    /// different update's explicit stop for the same allocation still wins.
+    #[cfg(feature = "host")]
+    pub(crate) fn blocks_id_except_source(
+        &self,
+        id: TerminalId,
+        source: &HostSessionProof,
+    ) -> bool {
+        self.records.iter().any(|record| {
+            &record.source != source
+                && (record.terminals.contains(&id)
+                    || record.chats.iter().any(|chat| {
+                        chat.id == id
+                            || chat
+                                .terminal
+                                .as_ref()
+                                .is_some_and(|terminal| terminal.id == id)
+                    }))
+        })
     }
 }
 
@@ -552,6 +573,65 @@ mod tests {
             native_continuity: Default::default(),
         }
     }
+    #[test]
+    fn an_exact_issued_display_alias_can_resolve_only_its_stopped_chat() {
+        let original = chat();
+        let mut issued = original.clone();
+        issued.proof.as_mut().unwrap().host_incarnation =
+            crate::model::HostIncarnation::new("issued");
+        let mut record = Record::new(source(), vec![original.clone()], Vec::new());
+        record.aliases.push(issued.clone());
+        let ledger = Ledger {
+            records: vec![record],
+        };
+        assert_eq!(ledger.resume_source(&issued), Some(&original));
+        assert!(ledger.blocks_chat(&issued));
+        let mut unissued = issued.clone();
+        unissued.launch.recipe.arguments.push("unissued".into());
+        assert!(!ledger.blocks_chat(&unissued));
+        assert!(ledger.resume_source(&unissued).is_none());
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn discovery_retries_never_bypass_another_sources_terminal_chat_or_pair_stop() {
+        let original = chat();
+        let mut later = source();
+        later.host_incarnation = crate::model::HostIncarnation::new("later-stop");
+        let paired = TerminalId::new();
+        let mut later_chat = chat();
+        later_chat.id = TerminalId::new();
+        later_chat.proof = Some(later.clone());
+        later_chat.terminal = Some(crate::model::TerminalSession {
+            id: paired,
+            launch: later_chat.launch.recipe.clone(),
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+            transcript_path: None,
+            resume_hint: None,
+            continuity: crate::model::TerminalContinuity::DetachedSameBoot {
+                host_session_id: later.host_session_id.clone(),
+                boot_id: later.boot_id.clone(),
+                host_incarnation: later.host_incarnation.clone(),
+            },
+        });
+        let mut ledger = Ledger {
+            records: vec![Record::new(source(), vec![original.clone()], vec![paired])],
+        };
+        assert!(!ledger.blocks_id_except_source(original.id, &source()));
+        assert!(!ledger.blocks_id_except_source(paired, &source()));
+        ledger.records.push(Record::new(
+            later,
+            vec![later_chat.clone()],
+            vec![original.id],
+        ));
+        assert!(ledger.blocks_id_except_source(original.id, &source()));
+        assert!(ledger.blocks_id_except_source(later_chat.id, &source()));
+        assert!(ledger.blocks_id_except_source(paired, &source()));
+        assert!(!ledger.blocks_id_except_source(TerminalId::new(), &source()));
+    }
+
     #[test]
     fn a_stopped_source_blocks_automatic_recovery_but_not_a_resume_successor() {
         let chat = chat();

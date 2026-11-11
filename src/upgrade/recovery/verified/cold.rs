@@ -272,8 +272,9 @@ pub(crate) fn publish(
     chats: &[Session],
     aliases: &Aliases,
 ) -> Result<(), String> {
-    let current = classify_retained_prepared(checkpoint, target)?
-        .ok_or("The exact settled Prepared outcome disappeared before publication")?;
+    let current = pending_retirement(checkpoint, target)?
+        .ok_or("The exact settled Prepared or archived outcome disappeared before publication")?;
+    super::checkpoint_bytes(checkpoint, target, &current)?;
     if current.witness != settled.witness {
         return Err("The original settled recovery changed before publication".into());
     }
@@ -323,12 +324,12 @@ pub(crate) fn publish(
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{Fixture, proof};
+    use super::super::tests::{Fixture, proof, root_census};
     use super::*;
     use crate::{
         agent::Provider,
         model::TerminalContinuity,
-        update::recovery::{Census as RootCensus, Outcome, compare_with_recovery},
+        update::recovery::{Outcome, compare_with_recovery},
     };
 
     fn adopted(
@@ -370,15 +371,6 @@ mod tests {
         )
     }
 
-    fn census(fixture: &Fixture) -> RootCensus {
-        serde_json::from_value(serde_json::json!({
-            "version":1, "transaction":fixture.record.job, "source":fixture.record.source,
-            "terminals":fixture.record.census.terminals, "chats":fixture.record.census.chats,
-            "checkpoint_before":null,
-        }))
-        .unwrap()
-    }
-
     #[test]
     fn cold_recovery_current_proof_c_and_d_verify_live_terminal_native_and_original_paused_peer() {
         for provider in [Provider::Claude, Provider::Codex] {
@@ -391,7 +383,7 @@ mod tests {
             let settled = classify_retained_prepared(&fixture.checkpoint, &fixture.target)
                 .unwrap()
                 .unwrap();
-            let expected = census(&fixture);
+            let expected = root_census(&fixture);
             let mut prior_chats = Vec::new();
             let mut prior_terminals = fixture.record.adopted_terminal_descriptors.clone();
             for incarnation in ["cold-c", "cold-d"] {
@@ -564,7 +556,7 @@ mod tests {
         );
         assert!(matches!(
             compare_with_recovery(
-                &census(&fixture),
+                &root_census(&fixture),
                 &serving,
                 &terminals,
                 &[],
@@ -581,5 +573,78 @@ mod tests {
             settled.paused_chats, fixture.record.paused_chats,
             "missing accepted native was not relabeled paused"
         );
+    }
+    #[test]
+    fn archived_cold_recovery_c_and_d_keep_original_witness_and_paused_root_proof() {
+        let fixture = Fixture::new(Provider::Claude, true);
+        let archive = fixture.archive();
+        let checkpoint = fs::read(&archive.archive_path).unwrap();
+        let original_outcome = fs::read(&archive.outcome_path).unwrap();
+        let settled = pending_retirement(&fixture.checkpoint, &fixture.target)
+            .unwrap()
+            .unwrap();
+        let witness = settled.witness.clone();
+        let mut prior_chats = vec![];
+        let mut prior_terminals = fixture.record.adopted_terminal_descriptors.clone();
+        for incarnation in ["archived-c", "archived-d"] {
+            let (serving, terminals, chats, aliases) =
+                adopted(&fixture, incarnation, &prior_chats, &prior_terminals);
+            let settled = pending_retirement(&fixture.checkpoint, &fixture.target)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                settled.witness, witness,
+                "later display aliases cannot change original raw outcome identity"
+            );
+            publish(
+                &fixture.checkpoint,
+                &fixture.target,
+                &settled,
+                &serving,
+                &terminals,
+                &chats,
+                &aliases,
+            )
+            .unwrap();
+            let view = super::super::VerifiedView::load_at(
+                &fixture.checkpoint,
+                &serving,
+                &fixture.target,
+                &terminals,
+                &chats,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(
+                matches!(compare_with_recovery(&root_census(&fixture), &serving, &terminals, &chats, &Default::default(), Some(&view), None),
+                Outcome::Usable { terminals:1, chats:1, paused_chats, .. } if paused_chats == fixture.record.paused_chats)
+            );
+            settled
+                .archive_completed(
+                    &serving,
+                    &terminals,
+                    &chats,
+                    &fixture.record.paused_terminals,
+                    &fixture.record.paused_chats,
+                )
+                .unwrap();
+            assert!(
+                super::super::VerifiedView::load_at(
+                    &fixture.checkpoint,
+                    &serving,
+                    &fixture.target,
+                    &terminals,
+                    &chats
+                )
+                .unwrap()
+                .is_some(),
+                "appending retirement metadata must not invalidate the current exact cold observation"
+            );
+            assert_eq!(fs::read(&archive.archive_path).unwrap(), checkpoint);
+            assert_eq!(fs::read(&archive.outcome_path).unwrap(), original_outcome);
+            assert!(!fixture.checkpoint.exists());
+            prior_chats.extend(chats);
+            prior_terminals.extend(terminals);
+        }
     }
 }

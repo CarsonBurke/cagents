@@ -1683,7 +1683,7 @@ fn verify_reopened_service(
     let receipt = if let Some(absence) = absence {
         absence
     } else {
-        census.verify_with_target(
+        census.verify_with_target_retiring(
             &state
                 .parent()
                 .ok_or_else(|| invalid("Update state has no installation root"))?

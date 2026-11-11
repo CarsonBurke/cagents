@@ -299,6 +299,8 @@ pub enum DaemonCommand {
     },
     #[command(hide = true)]
     VerifyUpdateCensus {
+        #[arg(long, conflicts_with = "validate_only")]
+        retire: bool,
         #[arg(long)]
         require_absent: bool,
         #[arg(long)]
@@ -3650,6 +3652,7 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
             })
         }
         DaemonCommand::VerifyUpdateCensus {
+            retire,
             census,
             outcome,
             allow_absent,
@@ -3667,14 +3670,24 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                         .into(),
                 });
             }
-            let receipt = crate::update::recovery::verify_file(
-                &census,
-                &outcome,
-                false,
-                allow_absent,
-                require_original,
-                require_absent,
-            )
+            let receipt = if retire {
+                crate::update::recovery::verify_file_retiring(
+                    &census,
+                    &outcome,
+                    allow_absent,
+                    require_original,
+                    require_absent,
+                )
+            } else {
+                crate::update::recovery::verify_file(
+                    &census,
+                    &outcome,
+                    false,
+                    allow_absent,
+                    require_original,
+                    require_absent,
+                )
+            }
             .map_err(|e| AppError::new("update_recovery", e))?;
             Ok(CommandOutput {
                 command: "daemon.verify_update_census",
@@ -5373,6 +5386,34 @@ mod tests {
         // The installer asks the replacement it names, never a staged owner.
         assert!(!routed(&["cagents", "daemon", "store-schema"]));
         assert!(!routed(&["cagents", "daemon", "downgrade-store", "22"]));
+    }
+
+    #[test]
+    fn final_recovery_retirement_uses_the_explicit_verifier_and_never_validation_only() {
+        use clap::Parser;
+        let argv = [
+            "cagents",
+            "--no-start",
+            "daemon",
+            "verify-update-census",
+            "--census",
+            "/private/original-census.json",
+            "--outcome",
+            "/private/outcome.json",
+            "--retire",
+        ];
+        let parsed = super::Cli::try_parse_from(argv).unwrap();
+        assert!(matches!(
+            &parsed.command,
+            super::TopCommand::Daemon {
+                command: super::DaemonCommand::VerifyUpdateCensus { retire: true, .. }
+            }
+        ));
+        assert!(!super::routes_to_staged_owner(&parsed.command));
+        assert!(!super::staged_command_requires_daemon(&parsed.command));
+        let mut contradictory = argv.to_vec();
+        contradictory.push("--validate-only");
+        assert!(super::Cli::try_parse_from(contradictory).is_err());
     }
 
     #[test]

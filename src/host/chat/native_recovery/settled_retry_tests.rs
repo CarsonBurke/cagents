@@ -216,7 +216,50 @@ impl Fixture {
             || handle.attachment_snapshot().ready,
             "fake retained provider did not initialize",
         );
-        let session = self.host().lock().unwrap().chats[&id].session.clone();
+        // Claude confirms its prepared UUID on its first real turn. Seed that
+        // ordinary wire exchange before taking the no-replay baseline; a ready
+        // pre-ID helper alone cannot establish resumable checkpoint aliases.
+        handle
+            .command(chat::Command::Prompt {
+                text: "Confirm this private recovery fixture's conversation".into(),
+                attachments: Vec::new(),
+                mode: chat::PromptMode::Send,
+            })
+            .unwrap();
+        wait(
+            || {
+                handle.confirmed_session_id().is_some()
+                    && handle.is_idle()
+                    && handle
+                        .uncommitted_outcomes()
+                        .is_ok_and(|outcomes| outcomes.is_empty())
+            },
+            "fake provider turn and semantic acknowledgement did not settle",
+        );
+        let confirmed = handle.confirmed_session_id().unwrap();
+        uuid::Uuid::parse_str(&confirmed).expect("fixture must report a real provider UUID");
+        let ServerResponse::ChatListed { sessions } =
+            super::super::process(self.host(), 0, ClientRequest::ChatList).unwrap()
+        else {
+            panic!("wrong public chat list response")
+        };
+        let issued = sessions
+            .into_iter()
+            .find(|session| session.id == id)
+            .unwrap();
+        let ServerResponse::ChatAttached { session, snapshot } = super::super::process(
+            self.host(),
+            0,
+            ClientRequest::ChatAttach { session: issued },
+        )
+        .unwrap() else {
+            panic!("wrong public chat attach response")
+        };
+        assert_eq!(
+            session.launch.session_id.as_deref(),
+            Some(confirmed.as_str())
+        );
+        assert_eq!(snapshot.session_id.as_deref(), Some(confirmed.as_str()));
         assert!(matches!(
             session.native_continuity,
             chat::NativeContinuity::RetainedClaudeActor { protocol: 2 }
@@ -246,7 +289,9 @@ impl Fixture {
             .map(|record| record.handle.clone())
             .collect();
         for handle in &handles {
-            handle.preserve_for_restart().unwrap();
+            if handle.owns_work() {
+                handle.preserve_for_restart().unwrap();
+            }
         }
         drop(handles);
         drop(self.broker.take());
@@ -274,6 +319,32 @@ impl Fixture {
         record.protocol = PROTOCOL_VERSION;
         record.service_stopped = true;
         record.save().unwrap();
+    }
+
+    fn prepare_ready_checkpoint(
+        &self,
+    ) -> (
+        crate::upgrade::handoff::Checkpoint,
+        crate::upgrade::handoff::Checkpoint,
+    ) {
+        let control_gate = self.host().lock().unwrap().control_gate.clone();
+        let control = control_gate.write().unwrap();
+        let capability = self
+            .host()
+            .lock()
+            .unwrap()
+            .shutdown_preflight(Instant::now())
+            .unwrap()
+            .capability;
+        crate::host::state::prepare_upgrade(self.host(), capability, false).unwrap();
+        drop(control);
+        let store = crate::upgrade::handoff::Store::discover().unwrap();
+        let prepared = store.load().unwrap().unwrap();
+        assert_eq!(prepared.phase, crate::upgrade::handoff::Phase::Prepared);
+        crate::host::finish_chat_shutdown(self.host()).unwrap();
+        let ready = store.load().unwrap().unwrap();
+        ready.require_ready().unwrap();
+        (prepared, ready)
     }
 }
 
@@ -330,10 +401,20 @@ fn preserved_retry_authenticates_original_native_owner_without_reopening_paused_
     let mut fixture = Fixture::new(root);
     let original_retry = fixture.start();
     let originally_paused = fixture.start();
+    // A public descriptor projects the confirmed UUID; an untouched helper
+    // still owns the exact pre-ID descriptor issued at its first installation.
+    // Retain that real source separately instead of fabricating equality.
+    let paused_original =
+        Handle::inspect_remote(&fixture.owners[1].record, fixture.proof.clone()).unwrap();
+    assert_eq!(
+        paused_original.state.confirmed_session,
+        originally_paused.launch.session_id
+    );
     fixture.save_paused(originally_paused.clone());
     let launches = fs::read(fixture.root.join("launches")).unwrap();
     assert_eq!(String::from_utf8_lossy(&launches).lines().count(), 2);
-    assert!(!fixture.root.join("prompts").exists());
+    let prompts = fs::read(fixture.root.join("prompts")).unwrap();
+    assert_eq!(String::from_utf8_lossy(&prompts).lines().count(), 2);
 
     // The first cold owner genuinely adopts this helper. The other ID was
     // explicitly paused for the update and never belongs to the retry set.
@@ -389,13 +470,90 @@ fn preserved_retry_authenticates_original_native_owner_without_reopening_paused_
         "the original helper must acknowledge the new lease's issued source"
     );
     let paused = Handle::inspect_remote(&fixture.owners[1].record, fixture.proof.clone()).unwrap();
-    assert_eq!(paused.source, originally_paused);
+    assert_eq!(paused.identity, paused_original.identity);
+    assert_eq!(paused.source, paused_original.source);
+    assert_eq!(
+        paused.state.confirmed_session,
+        originally_paused.launch.session_id
+    );
     assert_ne!(paused.source.proof.as_ref(), Some(&fixture.proof));
     assert_eq!(fs::read(fixture.root.join("launches")).unwrap(), launches);
-    assert!(
-        !fixture.root.join("prompts").exists(),
+    assert_eq!(
+        fs::read(fixture.root.join("prompts")).unwrap(),
+        prompts,
         "native retry must neither launch a replacement nor replay provider input"
     );
+
+    // A later ordinary update now has a real Ready checkpoint from the daemon
+    // that owns the retried actor. Its older unavailable snapshot still exists,
+    // but cannot prevent the next daemon from authenticating this exact owner.
+    let (prepared, ready) = fixture.prepare_ready_checkpoint();
+    assert_eq!(ready.chats.len(), 1);
+    assert_eq!(ready.chats[0].source, adopted);
+    fixture.rotate("ready-successor");
+    assert!(crate::upgrade::floor::load().unwrap().blocks_id(adopted.id));
+    assert!(restore(fixture.host(), 0, &adopted).is_err());
+    assert!(restore_ready_checkpoint(fixture.host(), &adopted, &prepared).is_err());
+    let mut restoring = ready.clone();
+    restoring.phase = crate::upgrade::handoff::Phase::Restoring;
+    assert!(restore_ready_checkpoint(fixture.host(), &adopted, &restoring).is_err());
+    let mut absent = ready.clone();
+    absent.chats.clear();
+    absent.require_ready().unwrap();
+    assert!(restore_ready_checkpoint(fixture.host(), &adopted, &absent).is_err());
+    let mut wrong_proof = adopted.clone();
+    wrong_proof.proof = Some(fixture.proof.clone());
+    assert!(restore_ready_checkpoint(fixture.host(), &wrong_proof, &ready).is_err());
+    assert!(restore_ready_checkpoint(fixture.host(), &originally_paused, &ready).is_err());
+
+    // Even an internally consistent Ready payload cannot forge a descriptor
+    // the live helper never issued: the floor exception grants no attachment
+    // authority and must still execute the ordinary exact-source handshake.
+    let mut forged = ready.clone();
+    let unissued_directory = fixture.root.join("unissued-project");
+    fs::create_dir(&unissued_directory).unwrap();
+    let forged_chat = &mut forged.chats[0];
+    forged_chat.source.launch.recipe.working_directory = unissued_directory.clone();
+    forged_chat.launch.recipe.working_directory = unissued_directory;
+    forged_chat.previous_sources.clear();
+    forged.require_ready().unwrap();
+    assert!(restore_ready_checkpoint(fixture.host(), &forged.chats[0].source, &forged).is_err());
+    assert!(fixture.host().lock().unwrap().chats.is_empty());
+    let unchanged =
+        Handle::inspect_remote(&fixture.owners[0].record, fixture.proof.clone()).unwrap();
+    assert_eq!(unchanged.source, adopted);
+
+    restore_ready_checkpoint(fixture.host(), &adopted, &ready).unwrap();
+    let current = {
+        let state = fixture.host().lock().unwrap();
+        assert_eq!(state.chats.len(), 1);
+        assert!(!state.chats.contains_key(&originally_paused.id));
+        let record = &state.chats[&adopted.id];
+        assert_eq!(
+            record.handle.actor_identity(),
+            Some(fixture.owners[0].clone())
+        );
+        assert_eq!(record.session.proof.as_ref(), Some(&fixture.proof));
+        record.session.clone()
+    };
+    let authenticated =
+        Handle::inspect_remote(&fixture.owners[0].record, fixture.proof.clone()).unwrap();
+    assert_eq!(authenticated.source, current);
+    let paused = Handle::inspect_remote(&fixture.owners[1].record, fixture.proof.clone()).unwrap();
+    assert_eq!(paused.identity, paused_original.identity);
+    assert_eq!(paused.source, paused_original.source);
+    assert_eq!(
+        paused.state.confirmed_session,
+        originally_paused.launch.session_id
+    );
+    assert!(
+        fixture
+            .owners
+            .iter()
+            .all(|owner| { owner.record.root.is_current() && owner.record.holder.is_current() })
+    );
+    assert_eq!(fs::read(fixture.root.join("launches")).unwrap(), launches);
+    assert_eq!(fs::read(fixture.root.join("prompts")).unwrap(), prompts);
 }
 
 fn current_roster(
