@@ -1926,6 +1926,28 @@ chat and console agents, an offline Codex app-server, two untitled conversations
 in one project, a channel containing ` Details: `, a shell and `sleep 86400`.
 Use `--untitled 0|1|2`, `--no-codex`, `--no-console` and `--no-child` to vary that baseline.
 
+Use `--codex-pause 90` to keep the offline Codex turn active at the update
+prompt. `--codex-never-confirm-interrupt` acknowledges interruption without a
+completion receipt; `--codex-never-confirm-close` retains the connection to
+exercise Prepared recovery. These options configure the same fake peer through
+the private root's `codex-fixture.json`, restoring its `CAGENTS_TOOL_ROWS_*`
+settings after native launches filter the caller's environment. Accepted turn
+notifications and interruption requests are recorded in
+`logs/codex-provider.jsonl` with their thread and turn identities.
+
+Use `--expect-refusal interrupt` with the unconfirmed-interrupt peer, or
+`--expect-refusal cancel --answer no` to decline the review. These scenarios
+pass only when the exact expected refusal preserves OLD's installed version,
+daemon process, windows and inventory. The interrupt scenario also checks its
+30-second settlement bound and absence of an interrupted receipt.
+`--require-prepared` records the checkpoint transitions and requires this job's
+source proof in Prepared. `--plain-restart` then exercises an ordinary daemon
+start after recovery: it pins only the private daemon by its socket peer,
+executable, namespace and lock, simulates a crash with a pidfd, and verifies the
+original census again through the public command. Both windows must reopen the
+paused history and console without starting provider work. The original
+recovered views and records remain under `recovered/`.
+
 Optional problem states each have their own switch:
 
 - `--no-init`: a Claude peer that accepts work without reporting a session ID.

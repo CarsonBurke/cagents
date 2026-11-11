@@ -28,6 +28,39 @@ adapter = module("rehearsal_codex", "rehearsal-codex.py")
 peer = module("rehearsal_peer", "codex-tool-rows.py")
 
 
+class ConfigurationTests(unittest.TestCase):
+    def test_private_configuration_restores_existing_peer_knobs(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ):
+            root = Path(directory)
+            (root / "codex-fixture.json").write_text(json.dumps({
+                "pause": 90, "never_confirm_interrupt": True, "never_confirm_close": False}))
+            adapter.configure_peer(root)
+            self.assertEqual(os.environ["CAGENTS_TOOL_ROWS_PAUSE"], "90")
+            scenario = peer.Scenario()
+            self.assertTrue(scenario.never_confirm_interrupt)
+            self.assertFalse(scenario.never_confirm_close)
+            configured = module("configured_rehearsal_peer", "codex-tool-rows.py").Scenario()
+            replies = configured.request({'id':1,'method':'turn/start','params':{
+                'threadId':configured.thread}},str(root))
+            self.assertIn({'_sleep':90},replies)
+
+    def test_rejects_unknown_invalid_and_symlink_configuration(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ):
+            root = Path(directory)
+            path = root / "codex-fixture.json"
+            for settings in ({"arbitrary_env": "value"}, {"pause": True}, {"pause": 0},
+                             {"pause": 301}, {"never_confirm_close": "1"}):
+                path.write_text(json.dumps(settings))
+                with self.subTest(settings=settings), self.assertRaises(ValueError):
+                    adapter.configure_peer(root)
+            path.unlink()
+            target = root / "other.json"
+            target.write_text('{}')
+            path.symlink_to(target)
+            with self.assertRaises(OSError):
+                adapter.configure_peer(root)
+
+
 class ListenerTests(unittest.TestCase):
     def test_accepts_private_runtime_and_old_build_convention(self):
         with tempfile.TemporaryDirectory() as directory:

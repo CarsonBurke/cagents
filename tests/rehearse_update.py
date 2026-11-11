@@ -27,6 +27,7 @@ SCRIPT = REPOSITORY / "scripts/rehearse-update"
 spec = importlib.util.spec_from_file_location("rehearsal_records", REPOSITORY / "scripts/rehearse_update_records.py")
 records = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(records)
+sys.modules["rehearse_update_records"] = records
 AUTHORITY = ("CAGENTS_AGENT_AUTHORITY", "CAGENTS_AGENT_TOKEN", "CAGENTS_SESSION_TOKEN")
 
 
@@ -132,10 +133,57 @@ class Comparison(unittest.TestCase):
         regressions = [row for row in records.compare(before, after) if row["regression"]]
         self.assertEqual({row["kind"] for row in regressions}, {"panes", "terminal-child"})
 
+    def test_plain_restart_uses_fresh_verifier_on_the_original_census(self):
+        before, after = self.paused_replacement()
+        fresh = {**after['serving'],'host_session_id':'restarted','host_incarnation':'restarted-owner'}
+        after['serving'] = fresh
+        after['recovery']['current']['outcome']['serving'] = fresh
+        self.assertEqual(records.verified_pauses(before,after),({'chat-old'},set()))
+        for name, mutate in {
+            'old-serving':lambda a:a.update(serving=before['serving']),
+            'foreign-transaction':lambda a:a['recovery']['current'].update(transaction='foreign'),
+            'foreign-digest':lambda a:a['recovery']['current'].update(census_digest='foreign'),
+            'different-partition':lambda a:a['recovery']['current']['outcome'].update(paused_chats=[]),
+            'different-count':lambda a:a['recovery']['current']['outcome'].update(chats=999),
+            'unverified':lambda a:a['recovery']['current']['outcome'].update(state='unverified'),
+            'wrong-boot':lambda a:a['recovery']['current']['outcome']['serving'].update(boot_id='foreign'),
+        }.items():
+            with self.subTest(name=name):
+                candidate = copy.deepcopy(after)
+                mutate(candidate)
+                self.assertIsNone(records.verified_recovery(before,candidate))
+
     def test_verified_pause_does_not_accept_foreign_history_in_original_pane(self):
         before, after = self.paused_replacement()
         after["stores"]["windows/main/sessions.sqlite3"]["rows"]["cards"][1]["content"]["launch"]["session_id"] = "foreign-thread"
         self.assertTrue(any(row["regression"] for row in records.compare(before, after)))
+
+    def test_paused_history_requires_exact_verified_source_and_read_only_projection(self):
+        before, after = self.paused_replacement()
+        source = before['stores']['windows/main/sessions.sqlite3']['rows']['cards'][1]['content']
+        source.update(native_continuity='ReconnectOnly',terminal=None,
+                      owned_codex_listener={'socket':'/tmp/cagents-codex-chat-old/control.sock'})
+        source['launch'].update(provider='Codex',recipe={'program':'codex',
+                                'arguments':['--remote','unix:///tmp/cagents-codex-chat-old/control.sock']})
+        after['recovery']['census']['chats'] = [copy.deepcopy(source)]
+        after['recovery']['census']['chats'][0]['launch']['session_id'] = None
+        projection = records.paused_history_projection(before,after,source)
+        self.assertIsNotNone(projection)
+        self.assertEqual(projection['launch']['recipe']['arguments'],['--remote','unix://'])
+        target = after['stores']['windows/main/sessions.sqlite3']['rows']['cards'][1]
+        target['content'] = projection
+        self.assertFalse(any(row['regression'] for row in records.compare(before,after)))
+        for field, value in [('proof',before['serving']),('terminal',{'id':'writer'}),
+                             ('owned_codex_listener',source['owned_codex_listener'])]:
+            with self.subTest(field=field):
+                target['content'] = {**projection,field:value}
+                self.assertTrue(any(row['regression'] for row in records.compare(before,after)))
+        target['content'] = copy.deepcopy(projection)
+        target['content']['launch']['recipe']['program'] = 'foreign'
+        self.assertTrue(any(row['regression'] for row in records.compare(before,after)))
+        target['content'] = projection
+        after['recovery']['current']['outcome']['state'] = 'unverified'
+        self.assertIsNone(records.paused_history_projection(before,after,source))
 
     def test_paused_agent_state_requires_its_exact_source_chat_and_keeps_agent(self):
         before, after = self.paused_replacement()
@@ -148,6 +196,81 @@ class Comparison(unittest.TestCase):
         before["agents"]["agent"]["agent"]["session"]["Chat"]["id"] = "chat-old"
         del after["agents"]["agent"]
         self.assertTrue(any(row["regression"] for row in records.compare(before, after)))
+
+    def test_history_socket_reset_uses_only_the_first_remote_argument(self):
+        before, after = self.paused_replacement()
+        source = before['stores']['windows/main/sessions.sqlite3']['rows']['cards'][1]['content']
+        arguments = ['--remote','ssh://other','--remote','unix:///tmp/cagents-codex-chat-old/control.sock']
+        source['launch'].update(provider='Codex',recipe={'program':'codex','arguments':arguments})
+        after['recovery']['census']['chats'] = [copy.deepcopy(source)]
+        projection = records.paused_history_projection(before,after,source)
+        self.assertEqual(projection['launch']['recipe']['arguments'],arguments)
+
+    def test_console_program_change_requires_exact_target_same_run_and_pane(self):
+        before, after = self.paused_replacement()
+        before['root'] = after['root'] = '/var/tmp/cr/test'
+        after['target'] = {'version':'new'}
+        after['update_status'] = {'phase':'Complete','version':'new','id':after['recovery']['census']['transaction']}
+        program = '/var/tmp/cr/test/home/.local/share/cagents-install/versions/new/bin/cagents'
+        recipe = {'program':'old/cagents','arguments':['agent','console','agent'],'environment':{},
+                  'working_directory':'/private/project'}
+        for value in (before,after):
+            value['agents']['agent'].update(run='accepted-run',state='Running')
+            value['agents']['agent']['agent']['console'] = {'id':'terminal','launch':copy.deepcopy(recipe)}
+        after['agents']['agent']['agent']['console']['launch']['program'] = program
+        before['terminals']['terminal']['program'] = 'old/cagents'
+        after['terminals']['terminal']['program'] = program
+        self.assertTrue(records.console_relaunch(before,after,'terminal'))
+        changes = records.compare(before,after)
+        self.assertFalse(any(row['regression'] for row in changes),changes)
+        mutations = {
+            'wrong-target':lambda a:a['target'].update(version='other'),
+            'failed-update':lambda a:a['update_status'].update(phase='Failed'),
+            'new-run':lambda a:a['agents']['agent'].update(run='new-run'),
+            'interrupted':lambda a:a['agents']['agent'].update(state='Interrupted'),
+            'new-recipe':lambda a:a['agents']['agent']['agent']['console']['launch'].update(environment={'X':'other'}),
+            'new-pane':lambda a:a['stores']['windows/main/sessions.sqlite3']['rows']['terminal_recipes'][0].update(terminal_id='foreign'),
+            'unverified':lambda a:a['recovery']['current']['outcome'].update(state='unverified')}
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                candidate = copy.deepcopy(after)
+                mutate(candidate)
+                self.assertFalse(records.console_relaunch(before,candidate,'terminal'))
+                self.assertTrue(any(row['regression'] for row in records.compare(before,candidate)))
+
+    def test_cancelled_run_requires_consent_and_the_exact_parent_interrupt_receipt(self):
+        before, after = self.paused_replacement()
+        after['target'] = {'working':'i','started':1.5}
+        source = before['stores']['windows/main/sessions.sqlite3']['rows']['cards'][1]['content']
+        source['launch']['provider'] = 'Codex'
+        after['stores']['windows/main/sessions.sqlite3']['rows']['cards'][1]['content'] = copy.deepcopy(source)
+        after['recovery']['census']['chats'] = [copy.deepcopy(source)]
+        before['agents']['agent'].update(run='same-run',state='Running')
+        before['agents']['agent']['agent']['session'] = {'Chat':source}
+        after['agents']['agent'].update(run='same-run',state='Cancelled')
+        identity = {'parent':True,'thread_id':'provider-issued-thread','turn_id':'parent-turn','socket':'/private/control.sock'}
+        before['fixture_events'] = [{**identity,'event':'notification','method':'turn/started','time':1}]
+        after['fixture_events'] = [{**identity,'event':'request','method':'turn/interrupt','time':2,'errors':[]},
+                                   {**identity,'event':'notification','method':'turn/completed','status':'interrupted','time':3}]
+        self.assertTrue(records.confirmed_interruption(before,after,'agent'))
+        self.assertFalse(any(row['regression'] for row in records.compare(before,after)))
+        for name, mutate in {
+            'enter':lambda a:a['target'].update(working=''),
+            'new-run':lambda a:a['agents']['agent'].update(run='other'),
+            'no-receipt':lambda a:a['fixture_events'].pop(),
+            'child-only':lambda a:a['fixture_events'][1].update(parent=False),
+            'wrong-turn':lambda a:a['fixture_events'][1].update(turn_id='other'),
+            'wrong-thread':lambda a:a['fixture_events'][1].update(thread_id='other'),
+            'normal-completion':lambda a:a['fixture_events'][1].update(status='completed'),
+            'no-request':lambda a:a['fixture_events'].pop(0),
+            'request-error':lambda a:a['fixture_events'][0].update(errors=['refused']),
+            'stale-receipt':lambda a:a['target'].update(started=4),
+        }.items():
+            with self.subTest(name=name):
+                candidate = copy.deepcopy(after)
+                mutate(candidate)
+                self.assertFalse(records.confirmed_interruption(before,candidate,'agent'))
+                self.assertTrue(any(row['regression'] for row in records.compare(before,candidate)))
 
     def test_recovery_capture_keeps_raw_digest_and_requires_fresh_verifier(self):
         before, after = self.paused_replacement()
@@ -367,6 +490,82 @@ class ChatViews(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError,'no unique sidebar reference'):
             scenario.sidebar_channel_ref(observation,'Codex rehearsal')
 
+    def test_paused_capture_requires_connected_history_and_only_clicks_reconnect(self):
+        scenario = self.module()
+        with tempfile.TemporaryDirectory(prefix='ru-history-') as directory:
+            root = Path(directory)
+            (root/'logs').mkdir()
+            rehearsal = scenario.Rehearsal(root,str(SCRIPT))
+            window = {'id':42,'focused':True}
+            disconnected = {'window':window,'painted':True,'runs':[{'text':'Reconnect','ref':'reconnect','x':400}]}
+            connected = {'window':window,'painted':True,'runs':[
+                {'text':'Paused after an incomplete update','x':400},
+                {'text':'Resume conversation','ref':'resume','x':400}]}
+            replies = iter([disconnected,connected])
+            calls = []
+            def call(*args,**kwargs):
+                calls.append(args)
+                return 0,json.dumps(next(replies)) if args[:2]==('drive','--json') else ''
+            with patch.object(rehearsal,'call',side_effect=call),patch.object(scenario.time,'sleep'):
+                rehearsal.observe_paused(window,'after-codex-main')
+            self.assertIn(('drive','click','--stale-ok','reconnect'),calls)
+            self.assertFalse(any('resume' in args for args in calls))
+            self.assertTrue(json.loads((root/'logs/after-codex-main-history.json').read_text())['reconnected'])
+            incomplete = {**connected,'runs':[{'text':'Transcript preview could not attach','x':400}]}
+            with patch.object(rehearsal,'call',return_value=(0,json.dumps(incomplete))), \
+                    patch.object(scenario.time,'monotonic',side_effect=[0,1,31]), \
+                    patch.object(scenario.time,'sleep'):
+                with self.assertRaisesRegex(RuntimeError,'did not show'):
+                    rehearsal.observe_paused(window,'failed-codex-main')
+            self.assertTrue(scenario.visible_phrase('Resume Resu conversation','Resume conversation'))
+
+    def test_expected_refusal_requires_bound_old_processes_install_and_inventory(self):
+        scenario = self.module()
+        with tempfile.TemporaryDirectory(prefix='ru-refusal-') as directory:
+            root = Path(directory)
+            prefix = root/'home/.local/share/cagents-install'
+            (prefix/'versions/old').mkdir(parents=True)
+            (prefix/'current').symlink_to('versions/old')
+            (prefix/'.update').mkdir()
+            before = snapshot()
+            proof = {'host_session_id':'old','boot_id':'boot','host_incarnation':'old-owner'}
+            before['serving'] = proof
+            before['processes'] += [
+                {'pid':50,'start_ticks':2,'state':'S','executable':str(prefix/'versions/old/bin/cagentsd'),'argv':['cagentsd']},
+                {'pid':51,'start_ticks':3,'state':'S','argv':['/private/cagents-ui']},
+                {'pid':52,'start_ticks':4,'state':'S','argv':['/private/cagents-ui']}]
+            after = copy.deepcopy(before)
+            after['target'] = {'version':'new','started':10,'finished':40.5}
+            after['fixture_events'] = [{'event':'request','method':'turn/interrupt','parent':True,'errors':[],'time':10.1}]
+            status = {'version':'new','phase':'Failed','message':'did not stop in time; nothing was changed'}
+            def write(after_value,status_value):
+                for side,value in [('before',before),('after',after_value)]:
+                    path = root/'records'/side
+                    path.mkdir(parents=True,exist_ok=True)
+                    (path/'snapshot.json').write_text(json.dumps(value))
+                    (path/'terminals.json').write_text(json.dumps({'data':{'proof':value['serving']}}))
+                (prefix/'.update/status.json').write_text(json.dumps(status_value))
+            write(after,status)
+            self.assertEqual(scenario.expected_refusal(root,'interrupt','old'),[])
+            for name,mutate in {
+                'late':lambda a:a['target'].update(finished=90),
+                'new-daemon':lambda a:a['processes'][1].update(pid=60),
+                'new-run':lambda a:a['agents']['agent'].update(run='new-run'),
+                'missing-pane':lambda a:a['stores']['windows/main/sessions.sqlite3']['rows']['cards'].clear(),
+                'unexpected-receipt':lambda a:a['fixture_events'].append({'event':'notification','method':'turn/completed','status':'interrupted','time':20}),
+            }.items():
+                with self.subTest(name=name):
+                    candidate = copy.deepcopy(after)
+                    mutate(candidate)
+                    write(candidate,status)
+                    self.assertTrue(scenario.expected_refusal(root,'interrupt','old'))
+            cancelled = copy.deepcopy(after)
+            cancelled['fixture_events'] = []
+            write(cancelled,{**status,'phase':'Cancelled','message':'Update cancelled'})
+            self.assertEqual(scenario.expected_refusal(root,'cancel','old'),[])
+            write(after,{**status,'phase':'Cancelled'})
+            self.assertTrue(scenario.expected_refusal(root,'cancel','old'))
+
     def test_selection_requires_exact_card_channel_provider_and_thread(self):
         scenario = self.module()
         with tempfile.TemporaryDirectory(prefix='ru-selection-') as temporary:
@@ -433,7 +632,7 @@ class ChatViews(unittest.TestCase):
             window = {'id':42}
             def call(*args,**kwargs):
                 calls.append(args)
-                return 0, json.dumps({'window':window,'runs':[
+                return 0, json.dumps({'window':window,'painted':True,'runs':[
                     {'ref':'sidebar-row','text':'Visible canonical channel','x':33,'y':134}]})
             with patch.object(rehearsal,'cli',side_effect=cli), \
                     patch.object(rehearsal,'call',side_effect=call), \

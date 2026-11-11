@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 """Scenario orchestration for rehearse-update; all application commands use its private env."""
 import argparse
+import copy
 from contextlib import closing
 import json
 import os
@@ -12,6 +13,8 @@ import subprocess
 import sys
 import time
 
+import rehearse_update_records as records
+
 
 def sidebar_channel_ref(observation, title):
     """Resolve the visible sidebar row, excluding headers and hover tooltips."""
@@ -21,6 +24,26 @@ def sidebar_channel_ref(observation, title):
     if len(candidates) != 1:
         raise RuntimeError(f'canonical channel label has no unique sidebar reference: {title}')
     return candidates[0]
+
+
+def visible_phrase(text, phrase):
+    """Match OCR words in order, allowing repeated fragments between neighbors."""
+    words = re.findall(r'[a-z]+',text.lower())
+    expected = re.findall(r'[a-z]+',phrase.lower())
+    for start, word in enumerate(words):
+        if word != expected[0]:
+            continue
+        position = start
+        for wanted in expected[1:]:
+            following = next((index for index in range(position+1,min(position+4,len(words)))
+                              if words[index]==wanted and all(fragment in words[position] or fragment in wanted
+                                  for fragment in words[position+1:index])),None)
+            if following is None:
+                break
+            position = following
+        else:
+            return True
+    return False
 
 
 def selected_chat(root, slot, card_id, channel_id, expected, required_thread=None):
@@ -42,6 +65,9 @@ def selected_chat(root, slot, card_id, channel_id, expected, required_thread=Non
         launch = descriptor.get('launch', {})
         proof = expected.get('proof')
         thread = launch.get('session_id')
+        bound = copy.deepcopy(descriptor)
+        if expected.get('launch',{}).get('session_id') is None:
+            bound.get('launch',{}).update(session_id=None)
         if (descriptor.get('id') != expected['id']
                 or launch.get('provider') != expected['launch']['provider']
                 or launch.get('recipe') != expected['launch'].get('recipe')
@@ -52,6 +78,7 @@ def selected_chat(root, slot, card_id, channel_id, expected, required_thread=Non
                 or (expected['launch'].get('session_id') is not None
                     and thread != expected['launch']['session_id'])
                 or (required_thread is not None and thread != required_thread)
+                or bound != expected
                 or not active or json.loads(active[0]) != channel_id):
             return None
         return {'database':str(database), 'workspace':row[0], 'card':card_id,
@@ -76,6 +103,51 @@ def refusal_preserved_processes(records):
         return errors
     except (OSError, ValueError, KeyError, TypeError) as exc:
         return [f'console refusal identity evidence missing: {exc}']
+
+
+def expected_refusal(root, kind, old_version):
+    before, after = [json.loads((root/'records'/side/'snapshot.json').read_text())
+                     for side in ('before','after')]
+    errors = refusal_preserved_processes(root/'records')
+    status = json.loads((root/'home/.local/share/cagents-install/.update/status.json').read_text())
+    phase = 'Failed' if kind=='interrupt' else 'Cancelled'
+    if status.get('phase') != phase:
+        errors.append(f'expected {phase}, saw {status.get("phase")}')
+    target = after.get('target',{})
+    if status.get('version') != target.get('version'):
+        errors.append('refusal did not belong to the requested target')
+    if kind=='interrupt' and 'did not stop in time; nothing was changed' not in status.get('message',''):
+        errors.append('update did not report the interruption settlement bound')
+    current = root/'home/.local/share/cagents-install/current'
+    if current.resolve().name != old_version:
+        errors.append('refusal changed the installed current version')
+    executable = str(root/'home/.local/share/cagents-install/versions'/old_version/'bin/cagentsd')
+    def daemons(snapshot):
+        return {(row['pid'],row['start_ticks'],row.get('executable')) for row in snapshot['processes']
+                if row.get('executable')==executable and row.get('state') not in ('Z','X')}
+    if len(daemons(before))!=1 or daemons(before)!=daemons(after):
+        errors.append('refusal replaced the original daemon process')
+    for name in (*records.COLLECTIONS,'panes'):
+        left, right = ((records.panes(before),records.panes(after)) if name=='panes' else (before[name],after[name]))
+        if left.keys()!=right.keys() or any(records.project(row,name)!=records.project(right[key],name)
+                                         for key,row in left.items() if key in right):
+            errors.append(f'refusal changed the original {name}')
+    if (root/'home/.local/share/cagents/daemon-upgrade/daemon-upgrade.json').exists():
+        errors.append('refusal left a preparation checkpoint')
+    started, finished = target.get('started',0), target.get('finished',0)
+    events = [row for row in after.get('fixture_events',[]) if row.get('time',0)>=started]
+    interrupts = [row for row in events if row.get('event')=='request' and row.get('method')=='turn/interrupt']
+    if kind=='cancel':
+        if interrupts:
+            errors.append('review cancellation sent an interrupt request')
+    else:
+        parents = [row for row in interrupts if row.get('parent') is True and row.get('errors')==[]]
+        if not parents or not 25 <= finished-min(row['time'] for row in parents) <= 40:
+            errors.append('interruption refusal did not return at its expected 30-second bound')
+        if any(row.get('event')=='notification' and row.get('method')=='turn/completed'
+               and row.get('status')=='interrupted' for row in events):
+            errors.append('unconfirmed interruption emitted an interrupted receipt')
+    return errors
 
 
 class Rehearsal:
@@ -178,6 +250,8 @@ class Rehearsal:
         channels = response['data']['channels']
         originals = (json.loads((self.root/'ui-chats-before.json').read_text())
                      if side == 'after' else [])
+        snapshots = ([json.loads((self.root/'records'/name/'snapshot.json').read_text())
+                      for name in ('before','after')] if side == 'after' else None)
         evidence = []
         for item in targets:
             original = item['response']['data']['agent']
@@ -215,14 +289,22 @@ class Rehearsal:
                                     if view['agent']==original['id'] and view['slot']==slot)
                     required_thread = previous['selection']['session']['launch']['session_id']
                 _, status = self.cli('--no-start','agent','status',original['id'])
+                actual_agent = status['data']['agent']
                 actual = status['data']['agent']['session']['Chat']
                 if actual['id'] != chat['id'] or actual['launch']['provider'] != chat['launch']['provider']:
                     raise RuntimeError('opening a seeded chat allocated a different session')
+                expected = actual
+                projection = None
+                if snapshots:
+                    projection = records.paused_history_projection(*snapshots,previous['selection']['session'])
+                    if projection is not None:
+                        expected = projection
+                        self.observe_paused(window,f'{side}-{provider}-{slot}')
                 deadline = time.monotonic()+15
                 selected = None
                 while time.monotonic()<deadline:
                     try:
-                        selected = selected_chat(self.root,slot,original['id'],channel_id,actual,required_thread)
+                        selected = selected_chat(self.root,slot,original['id'],channel_id,expected,required_thread)
                     except (sqlite3.Error, OSError):
                         selected = None
                     if selected:
@@ -238,11 +320,13 @@ class Rehearsal:
                 _, status = self.cli('--no-start','agent','status',original['id'])
                 settled = status['data']['agent']['session']['Chat']
                 if (settled['id'] != actual['id'] or settled.get('proof') != actual.get('proof')
-                        or selected_chat(self.root,slot,original['id'],channel_id,settled,required_thread) is None):
+                        or (projection is not None and status['data']['agent'] != actual_agent)
+                        or selected_chat(self.root,slot,original['id'],channel_id,expected,required_thread) is None):
                     raise RuntimeError('seeded chat ownership or thread changed during native capture')
                 _, observed = self.call('drive','--json','observe',timeout=30)
                 observation = json.loads(observed)
-                if observation['window']['id'] != window['id']:
+                if (observation['window']['id'] != window['id'] or not observation.get('painted')
+                        or observation['window'].get('focused') is False):
                     raise RuntimeError(f'chat observation selected the wrong window for {slot}')
                 shot = f'{side}-{provider}-{slot}'
                 self.call('shot',shot,timeout=45)
@@ -251,6 +335,135 @@ class Rehearsal:
                                  'observation':observation,'shot':f'shots/{shot}.webp'})
         (self.root/f'ui-chats-{side}.json').write_text(json.dumps(evidence,indent=2,sort_keys=True)+'\n')
         return evidence
+
+    def observe_paused(self, window, label):
+        deadline = time.monotonic()+30
+        reconnected = False
+        observations = []
+        while time.monotonic()<deadline:
+            _, text = self.call('drive','--json','observe',timeout=30)
+            observed = json.loads(text)
+            observations.append(observed)
+            if observed['window']['id'] != window['id']:
+                raise RuntimeError('paused history observation selected another window')
+            words = ' '.join(row.get('text','') for row in observed.get('runs',[]))
+            if (observed.get('painted') and visible_phrase(words,'Resume conversation')
+                    and visible_phrase(words,'Paused after an incomplete update')):
+                (self.root/'logs'/f'{label}-history.json').write_text(json.dumps({
+                    'reconnected':reconnected,'observations':observations},indent=2)+'\n')
+                return
+            buttons = [row for row in observed.get('runs',[]) if row.get('text','').strip().lower()=='reconnect'
+                       and row.get('x',0)>260]
+            if len(buttons)==1 and not reconnected:
+                self.call('drive','click','--stale-ok',buttons[0]['ref'],timeout=30)
+                reconnected = True
+            time.sleep(.2)
+        (self.root/'logs'/f'{label}-history-failed.json').write_text(json.dumps(observations,indent=2)+'\n')
+        self.call('shot',f'{label}-history-failed',timeout=45,check=False)
+        raise RuntimeError('paused history did not show its recovery explanation and Resume control')
+
+    def capture_console(self, side):
+        """Select the seeded console by canonical identity in both windows."""
+        seed = next((item for item in json.loads((self.root/'seeds.json').read_text())['items']
+                     if item['state']=='console'),None)
+        if seed is None:
+            return
+        agent = seed['response']['data']['agent']
+        _, response = self.cli('--no-start','agent','list')
+        status = next(row for row in response['data']['agents'] if row['agent']['id']==agent['id'])
+        console = status['agent'].get('console')
+        if not console or status['state'] != 'Running' or not status.get('run'):
+            raise RuntimeError('the seeded console is not Running with a live run')
+        original = (json.loads((self.root/'ui-console-before.json').read_text()) if side=='after' else None)
+        if original and (status['run'] != original['run'] or console['id'] != original['terminal']):
+            raise RuntimeError('the update replaced the console run or terminal identity')
+        _, response = self.cli('--no-start','channel','list')
+        channel_id = status['agent']['placement']['Channel']
+        title = next(row['title'] for row in response['data']['channels'] if row['id']==channel_id)
+        views = []
+        for slot, window in sorted(self.mapped().items()):
+            if slot not in ('main','second'):
+                continue
+            self.call('wm','action','focus-window','--id',window['id'])
+            _, text = self.call('drive','--json','observe',timeout=30)
+            observation = json.loads(text)
+            if observation['window']['id'] != window['id']:
+                raise RuntimeError('console navigation selected another window')
+            self.call('drive','click','--stale-ok',sidebar_channel_ref(observation,title),timeout=30)
+            self.call('drive','move','850,750',timeout=30)
+            data = self.root/'home/.local/share/cagents'
+            database = data/'sessions.sqlite3' if slot=='main' else data/'windows'/slot/'sessions.sqlite3'
+            deadline = time.monotonic()+15
+            selected = None
+            while time.monotonic()<deadline:
+                with closing(sqlite3.connect(database.as_uri()+'?mode=ro',uri=True,timeout=1)) as db:
+                    db.execute('PRAGMA query_only=ON')
+                    selected = db.execute(
+                        'SELECT c.workspace_id,c.card_id,t.terminal_id FROM cards c '
+                        'JOIN workspaces w ON w.workspace_id=c.workspace_id '
+                        'JOIN terminal_recipes t ON t.card_id=c.card_id '
+                        'WHERE c.card_id=? AND w.focused_card_id=c.card_id AND c.kind_tag=? '
+                        'AND c.existence_json=? AND t.terminal_id=?',
+                        [agent['id'],'terminal','"open"',console['id']]).fetchone()
+                    if selected:
+                        active = db.execute('SELECT value FROM metadata WHERE key=?',
+                                            [f'workspace:{selected[0]}:navigation:active_thread']).fetchone()
+                        if not active or json.loads(active[0]) != channel_id:
+                            selected = None
+                if selected:
+                    break
+                time.sleep(.1)
+            if not selected:
+                raise RuntimeError(f'{slot} did not select the original console pane')
+            _, text = self.call('drive','--json','observe',timeout=30)
+            observed = json.loads(text)
+            if (observed['window']['id'] != window['id'] or not observed.get('painted')
+                    or observed['window'].get('focused') is False):
+                raise RuntimeError('console capture did not show the focused native window')
+            shot = f'{side}-console-{slot}'
+            self.call('shot',shot,timeout=45)
+            views.append({'slot':slot,'selection':selected,'observation':observed,
+                          'shot':f'shots/{shot}.webp'})
+        if len(views)!=2:
+            raise RuntimeError('both windows are required for console evidence')
+        result = {'agent':agent['id'],'terminal':console['id'],'run':status['run'],'state':status['state'],'views':views}
+        (self.root/f'ui-console-{side}.json').write_text(json.dumps(result,indent=2,sort_keys=True)+'\n')
+
+    def watch_checkpoint(self):
+        import hashlib
+        import threading
+        self.checkpoint_stop = threading.Event()
+        self.checkpoint_observations = []
+        def watch():
+            path = self.root/'home/.local/share/cagents/daemon-upgrade/daemon-upgrade.json'
+            previous = None
+            while not self.checkpoint_stop.is_set():
+                try:
+                    raw = path.read_bytes()
+                    phase = json.loads(raw)['phase']
+                    digest = hashlib.sha256(raw).hexdigest()
+                except FileNotFoundError:
+                    raw, phase, digest = None,'absent',None
+                except (OSError,ValueError,KeyError):
+                    self.checkpoint_stop.wait(.02)
+                    continue
+                observed = phase,digest
+                if observed!=previous:
+                    self.checkpoint_observations.append({'time':time.time(),'phase':phase,'sha256':digest})
+                    previous = observed
+                copy = self.root/'logs/checkpoint-first-prepared.json'
+                if phase=='Prepared' and not copy.exists():
+                    copy.write_bytes(raw)
+                self.checkpoint_stop.wait(.02)
+        self.checkpoint_thread = threading.Thread(target=watch,daemon=True)
+        self.checkpoint_thread.start()
+
+    def finish_checkpoint_watch(self):
+        if not hasattr(self,'checkpoint_stop'):
+            return
+        self.checkpoint_stop.set()
+        self.checkpoint_thread.join(2)
+        (self.root/'logs/checkpoint-observations.json').write_text(json.dumps(self.checkpoint_observations,indent=2)+'\n')
 
     def seed(self, args):
         evidence = []
@@ -436,6 +649,11 @@ class Rehearsal:
         failure = None
         try:
             self.call('init')
+            settings = {'pause': args.codex_pause,
+                        'never_confirm_interrupt': args.codex_never_confirm_interrupt,
+                        'never_confirm_close': args.codex_never_confirm_close}
+            (self.root/'codex-fixture.json').write_text(json.dumps(settings,sort_keys=True)+'\n')
+            (self.root/'rehearsal-target.json').write_text(json.dumps({'version':args.new_version,'working':args.working})+'\n')
             self.call('install', args.old_dir, args.old_version, args.old_installer, timeout=180)
             self.call('desktop','start','--limit','900', timeout=None)
             self.call('launch','main')
@@ -448,6 +666,7 @@ class Rehearsal:
                 self.call('ceditor','start',args.ceditor,timeout=60)
                 self.wait_windows(['main','second','ceditor'])
             self.capture_chats('before')
+            self.capture_console('before')
             code, _ = self.call('record','before',timeout=150,check=False)
             if code:
                 self.errors.append('before record has evidence gaps')
@@ -458,7 +677,20 @@ class Rehearsal:
                 update_args.append('--fail-new-daemon')
             for flag in args.upgrade_arg:
                 update_args.append(flag)
+            (self.root/'rehearsal-target.json').write_text(json.dumps({
+                'version':args.new_version,'working':args.working,'started':time.time()})+'\n')
+            self.watch_checkpoint()
             code, _ = self.call('update',args.new_dir,args.new_version,args.new_installer,*update_args,timeout=300,check=False)
+            self.finish_checkpoint_watch()
+            if args.require_prepared:
+                prepared = self.root/'logs/checkpoint-first-prepared.json'
+                baseline = json.loads((self.root/'records/before/snapshot.json').read_text())
+                if (not prepared.exists() or json.loads(prepared.read_text()).get('proof')!=baseline['serving']
+                        or not self.checkpoint_observations or self.checkpoint_observations[0]['phase']!='absent'):
+                    self.errors.append('this fresh job did not produce the required source-bound Prepared checkpoint')
+            target = json.loads((self.root/'rehearsal-target.json').read_text())
+            target['finished'] = time.time()
+            (self.root/'rehearsal-target.json').write_text(json.dumps(target)+'\n')
             if args.fail_new_daemon:
                 if not code:
                     self.errors.append('forced daemon startup failure unexpectedly succeeded')
@@ -486,19 +718,40 @@ class Rehearsal:
                 if (serving_code or serving.get('data',{}).get('running') is not True
                         or serving.get('data',{}).get('daemon_version') != args.old_version):
                     self.errors.append('old daemon is not serving after failed update')
+            elif args.expect_refusal:
+                if not code or code==124:
+                    self.errors.append('expected refusal did not return a normal nonzero result')
             elif code:
                 self.errors.append(f'update exited {code}')
             try:
-                self.wait_windows(['main','second'],timeout=args.reopen_timeout,version=args.old_version if args.fail_new_daemon else args.new_version if code==0 else None)
+                self.wait_windows(['main','second'],timeout=args.reopen_timeout,version=args.old_version if args.fail_new_daemon or args.expect_refusal else args.new_version if code==0 else None)
             except RuntimeError as exc:
                 self.errors.append(str(exc))
+            # The shared recovery verifier qualifies paused presentations before
+            # inspecting them. Capture again afterwards to retain the final UI.
+            self.call('record','after',timeout=150)
             self.capture_chats('after')
+            self.capture_console('after')
             code, _ = self.call('record','after',timeout=150,check=False)
             if code:
                 self.errors.append('after record has evidence gaps')
             if args.expect_console_refusal:
                 self.errors.extend(refusal_preserved_processes(self.root/'records'))
+            if args.expect_refusal:
+                self.errors.extend(expected_refusal(self.root,args.expect_refusal,args.old_version))
             self.observe(self.root/'records/after/windows.json',shots='after')
+            if args.plain_restart:
+                import rehearse_update_restart
+                recovered = self.root/'recovered'
+                recovered.mkdir()
+                for name in ('ui-chats-after.json','ui-console-after.json'):
+                    source = self.root/name
+                    if source.exists():
+                        shutil.copyfile(source,recovered/name)
+                for name in ('records/after','shots'):
+                    shutil.copytree(self.root/name,recovered/name)
+                rehearse_update_restart.restart(self,args.new_version)
+                self.observe(self.root/'records/after/windows.json',shots='after-restart')
             code, _ = self.call('compare','before','after',timeout=30,check=False)
             if code:
                 self.errors.append('comparison found regressions or missing evidence; see comparison step')
@@ -508,6 +761,7 @@ class Rehearsal:
             # Preserve an after inventory even when an earlier operation failed.
             self.call('record','after',timeout=150,check=False)
         finally:
+            self.finish_checkpoint_watch()
             if ((self.root/'records/before/snapshot.json').exists()
                     and (self.root/'records/after/snapshot.json').exists()
                     and not any(step['command'][0]=='compare' for step in self.steps)):
@@ -599,6 +853,12 @@ def main():
     run.add_argument('--expect-console-refusal', action='store_true', help='with --fail-new-daemon, require console refusal before startup and preserve all work')
     run.add_argument('--fail-new-daemon', action='store_true', help='fail private candidate startup; require old current, serving daemon and preserved work')
     run.add_argument('--reopen-timeout',type=float,default=45)
+    run.add_argument('--expect-refusal',choices=('interrupt','cancel'),help='require the exact refusal and unchanged old service, install, windows and inventory')
+    run.add_argument('--require-prepared',action='store_true',help='require this fresh job to reach source-bound Prepared before recovery')
+    run.add_argument('--plain-restart',action='store_true',help='after verified recovery, crash only the private daemon and start it normally; verify the original census again')
+    run.add_argument('--codex-pause',type=float,default=6,help='offline Codex turn pause in seconds (maximum 300)')
+    run.add_argument('--codex-never-confirm-interrupt',action='store_true',help='offline peer acknowledges interrupt without settling the turn')
+    run.add_argument('--codex-never-confirm-close',action='store_true',help='offline peer retains its connection to force Prepared recovery')
     seed_options(run)
     seed_options(commands.add_parser('seed'))
     wait=commands.add_parser('wait')
@@ -606,6 +866,10 @@ def main():
     observe=commands.add_parser('observe')
     observe.add_argument('output')
     args=parser.parse_args()
+    if args.command == 'run' and not 0 < args.codex_pause <= 300:
+        parser.error('--codex-pause must be between 0 and 300 seconds')
+    if args.command == 'run' and args.plain_restart and (args.expect_refusal or args.fail_new_daemon):
+        parser.error('--plain-restart requires a successful recovery scenario')
     if args.command == 'run' and args.expect_console_refusal and (not args.fail_new_daemon or args.no_console):
         parser.error('--expect-console-refusal requires --fail-new-daemon and a seeded console')
     rehearsal=Rehearsal(args.root,args.shell)

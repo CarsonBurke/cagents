@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 from contextlib import closing
 import hashlib
 import json
@@ -247,6 +248,15 @@ def record(root: Path, out: Path, windows: Path | None) -> dict:
     except (OSError, ValueError, AttributeError):
         snapshot["serving"] = None
     snapshot["recovery"] = recovery_evidence(out, errors)
+    target = root / "rehearsal-target.json"
+    if target.exists():
+        snapshot["target"] = read_json(target)
+    status = root / "home/.local/share/cagents-install/.update/status.json"
+    if status.exists():
+        snapshot["update_status"] = read_json(status)
+    events = root / "logs/codex-provider.jsonl"
+    if events.exists():
+        snapshot["fixture_events"] = [json.loads(line) for line in events.read_text().splitlines() if line]
     snapshot["stores"] = stores(root / "home", errors)
     snapshot["processes"] = processes(root, errors)
     snapshot["windows"] = {}
@@ -289,7 +299,7 @@ def project(row: dict, name: str) -> dict:
     if name == "agents":
         agent = row.get("agent", {})
         spec = agent.get("spec", {})
-        return {"state": row.get("state"), "name": agent.get("name"), "closed": agent.get("closed"),
+        return {"state": row.get("state"), "run": row.get("run"), "name": agent.get("name"), "closed": agent.get("closed"),
                 "placement": agent.get("placement", agent.get("channel")),
                 "provider": spec.get("provider"), "surface": spec.get("surface")}
     fields = {
@@ -322,28 +332,47 @@ def panes(snapshot: dict) -> dict:
     return result
 
 
-def verified_pauses(before: dict, after: dict) -> tuple[set[str], set[str]]:
-    """Receipts establish disposition; before records establish exact identity."""
+def verified_recovery(before: dict, after: dict) -> dict | None:
+    """Only the shared verifier establishes usable recovery."""
     evidence = after.get("recovery")
     if not isinstance(evidence, dict):
-        return set(), set()
+        return None
     census, issued, current = (evidence.get(name, {}) for name in ("census", "issued", "current"))
     source = census.get("source")
     if (not isinstance(source, dict) or not source or source != before.get("serving")
             or any(not isinstance(source.get(field), str) or not source[field]
                    for field in ("host_session_id", "boot_id", "host_incarnation"))):
-        return set(), set()
+        return None
     for receipt in (issued, current):
         if (receipt.get("version") != 1 or census.get("version") != 1
                 or receipt.get("transaction") != census.get("transaction")
                 or receipt.get("census_digest") != evidence.get("digest")
                 or receipt.get("checkpoint_before") != census.get("checkpoint_before")):
-            return set(), set()
+            return None
     outcome = current.get("outcome", {})
-    if (issued.get("outcome") != outcome or outcome.get("state") != "usable"
+    issued_outcome = issued.get("outcome", {})
+    issued_proof = issued_outcome.get("serving", {})
+    if (outcome.get("state") != "usable" or issued_outcome.get("state") != "usable"
+            or not isinstance(issued_proof,dict)
+            or any(not isinstance(issued_proof.get(field),str) or not issued_proof[field]
+                   for field in ("host_session_id","boot_id","host_incarnation"))
             or not isinstance(outcome.get("serving"), dict)
-            or outcome.get("serving") != after.get("serving")):
+            or any(not isinstance(outcome["serving"].get(field),str) or not outcome["serving"][field]
+                   for field in ("host_session_id","boot_id","host_incarnation"))
+            or outcome.get("serving") != after.get("serving")
+            or outcome["serving"].get("boot_id") != issued_proof["boot_id"]
+            or {**issued_outcome,"serving":outcome["serving"]} != outcome):
+        return None
+    return outcome
+
+
+def verified_pauses(before: dict, after: dict) -> tuple[set[str], set[str]]:
+    """Receipts establish disposition; before records establish exact identity."""
+    outcome = verified_recovery(before, after)
+    if outcome is None:
         return set(), set()
+    census = after["recovery"]["census"]
+    source = census["source"]
     chat_proofs = {card["content"].get("id"): card["content"].get("proof")
                    for card in panes(before).values()
                    if card.get("kind_tag") == "chat" and isinstance(card.get("content"), dict)}
@@ -360,6 +389,107 @@ def verified_pauses(before: dict, after: dict) -> tuple[set[str], set[str]]:
             or not set(chats) <= expected_chats or not set(terminals) <= expected_terminals):
         return set(), set()
     return set(chats), set(terminals)
+
+
+def console_relaunch(before: dict, after: dict, terminal_id: str) -> bool:
+    if verified_recovery(before, after) is None:
+        return False
+    target = after.get("target", {})
+    status = after.get("update_status", {})
+    if (not isinstance(target.get("version"), str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.+_-]{0,127}", target["version"])
+            or status.get("phase") != "Complete" or status.get("version") != target["version"]
+            or status.get("id") != after["recovery"]["census"]["transaction"]):
+        return False
+    program = str(Path(after["root"])/"home/.local/share/cagents-install/versions"/target["version"]/"bin/cagents")
+    for key, row in before["agents"].items():
+        agent = row.get("agent", {})
+        console = agent.get("console") or {}
+        if console.get("id") != terminal_id:
+            continue
+        current = after["agents"].get(key, {})
+        replacement = current.get("agent", {}).get("console") or {}
+        old_recipe, new_recipe = console.get("launch", {}), replacement.get("launch", {})
+        if (not row.get("run") or current.get("run") != row["run"]
+                or row.get("state") != "Running" or current.get("state") != "Running"
+                or replacement.get("id") != terminal_id or new_recipe.get("program") != program
+                or {**old_recipe,"program":program} != new_recipe
+                or new_recipe.get("arguments") != ["agent","console",agent.get("id")]):
+            return False
+        original_panes = {key for key, pane in panes(before).items() if pane.get("terminal_id") == terminal_id}
+        return bool(original_panes) and all(panes(after).get(key,{}).get("terminal_id") == terminal_id
+                                            for key in original_panes)
+    return False
+
+
+def confirmed_interruption(before: dict, after: dict, key: str) -> bool:
+    """A cancelled run needs this rehearsal's consent and exact parent receipt."""
+    if after.get("target",{}).get("working") != "i" or verified_recovery(before,after) is None:
+        return False
+    old, new = before["agents"][key], after["agents"].get(key,{})
+    source = old.get("agent",{}).get("session",{}).get("Chat",{})
+    if (not old.get("run") or old["run"] != new.get("run") or old.get("state") != "Running"
+            or new.get("state") != "Cancelled" or source.get("launch",{}).get("provider") != "Codex"):
+        return False
+    threads = {pane.get("content",{}).get("launch",{}).get("session_id")
+               for pane in panes(before).values()
+               if pane.get("session_id") == source.get("id") and pane.get("content",{}).get("proof") == before.get("serving")}
+    threads.discard(None)
+    if len(threads)!=1:
+        return False
+    thread = next(iter(threads))
+    starts = [row for row in before.get("fixture_events",[]) if row.get("event")=="notification"
+              and row.get("method")=="turn/started" and row.get("thread_id")==thread and row.get("parent") is True]
+    if not starts:
+        return False
+    started = starts[-1]
+    matching = [row for row in after.get("fixture_events",[]) if row.get("thread_id")==thread
+                and row.get("turn_id")==started.get("turn_id") and row.get("socket")==started.get("socket")
+                and row.get("parent") is True]
+    requests = [row for row in matching if row.get("event")=="request" and row.get("method")=="turn/interrupt"
+                and row.get("errors") == []]
+    receipts = [row for row in matching if row.get("event")=="notification"
+                and row.get("method")=="turn/completed" and row.get("status")=="interrupted"]
+    observed_at = max(row.get("time",0) for row in before.get("fixture_events",[]))
+    update_at = after.get("target",{}).get("started")
+    return isinstance(update_at,(int,float)) and any(started["time"] <= observed_at <= update_at <= request["time"] <= receipt["time"]
+               for request in requests for receipt in receipts)
+
+
+def paused_history_projection(before: dict, after: dict, saved: dict) -> dict | None:
+    """An exact presentation of a source the shared verifier reports paused."""
+    paused, _ = verified_pauses(before, after)
+    if saved.get("id") not in paused:
+        return None
+    source = next(row for row in after["recovery"]["census"]["chats"] if row["id"] == saved["id"])
+    bound = copy.deepcopy(saved)
+    # Frozen source descriptors can predate the provider's confirmed ID.
+    # The before pane supplies it; every other source field must still match.
+    if source.get("launch", {}).get("session_id") is None:
+        bound.get("launch", {}).update(session_id=None)
+    if bound != source:
+        return None
+    expected = copy.deepcopy(saved)
+    launch = expected.get("launch", {})
+    arguments = launch.get("recipe", {}).get("arguments", [])
+    if launch.get("provider") == "Codex":
+        for index, argument in enumerate(arguments):
+            if argument != "--remote" and not argument.startswith("--remote="):
+                continue
+            address = (arguments[index+1] if argument == "--remote" and index+1 < len(arguments)
+                       else argument.removeprefix("--remote=") if argument.startswith("--remote=") else "")
+            if address.startswith("unix://"):
+                socket = Path(address[len("unix://"):])
+                if (socket.is_absolute() and ".." not in socket.parts and socket.name == "control.sock"
+                        and socket.parent.name == "cagents-codex-"+saved["id"]):
+                    if argument == "--remote":
+                        arguments[index+1] = "unix://"
+                    else:
+                        arguments[index] = "--remote=unix://"
+            break
+    expected.update(proof=after["serving"], native_continuity="ReconnectOnly",
+                    terminal=None, owned_codex_listener=None)
+    return expected
 
 
 def compare(before: dict, after: dict) -> list[dict]:
@@ -385,8 +515,12 @@ def compare(before: dict, after: dict) -> list[dict]:
                 continue
             if (name == "panes" and original.get("session_id") in paused_chats
                     and original.get("content") != right[key].get("content")):
+                projection = paused_history_projection(before, after, original["content"])
+                preserved = projection is not None and projection == right[key].get("content")
                 changes.append({"kind": name, "id": key,
-                                "change": "paused chat descriptor changed", "regression": True})
+                                "change": "paused chat descriptor changed", "regression": not preserved,
+                                "before": original["content"], "after": right[key].get("content"),
+                                **({"disposition": "verified paused history presentation"} if preserved else {})})
             a, b = project(original, name), project(right[key], name)
             for field in sorted(a.keys() | b.keys()):
                 if a.get(field) != b.get(field):
@@ -399,10 +533,15 @@ def compare(before: dict, after: dict) -> list[dict]:
                     # title. Only a title that goes blank was lost.
                     retitled = field == "title" and (name == "windows" or bool(b.get(field)))
                     verified_pause = ((paused and field in {"state", "failure", "exit", "attached"})
-                                      or (paused_agent and field == "state"))
+                                      or (paused_agent and field == "state" and str(b.get(field)).lower() in {"stopped","paused"}))
+                    relaunched_console = (name == "terminals" and field == "program"
+                                          and console_relaunch(before,after,key))
+                    interrupted = name == "agents" and field == "state" and confirmed_interruption(before,after,key)
                     changes.append({"kind": name, "id": key, "change": field,
                                     "before": a.get(field), "after": b.get(field),
-                                    "regression": not (healthy_state or resumed_id or retitled or verified_pause),
+                                    "regression": not (healthy_state or resumed_id or retitled or verified_pause or relaunched_console or interrupted),
+                                    **({"disposition": "confirmed requested interruption"} if interrupted else {}),
+                                    **({"disposition": "verified console relaunch"} if relaunched_console else {}),
                                     **({"disposition": "verified paused by update"} if verified_pause else {})})
         for key in sorted(right.keys() - left.keys()):
             changes.append({"kind": name, "id": key, "change": "added", "regression": False})
