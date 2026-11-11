@@ -430,10 +430,14 @@ impl Cagents {
                 rows.push(
                     widget::container(
                         widget::scrollable::horizontal(
-                            widget::selectable_text(command)
-                                .size(design::TEXT_BODY)
-                                .font(iced::Font::MONOSPACE)
-                                .wrapping(iced::widget::text::Wrapping::None),
+                            widget::container(
+                                widget::selectable_text(command)
+                                    .size(design::TEXT_BODY)
+                                    .font(iced::Font::MONOSPACE)
+                                    .wrapping(iced::widget::text::Wrapping::None),
+                            )
+                            .padding(design::with_horizontal_rail(iced::Padding::ZERO))
+                            .class(design::transparent()),
                         )
                         .direction(iced::widget::scrollable::Direction::Horizontal(
                             design::scrollbar(),
@@ -526,6 +530,8 @@ impl Cagents {
                     .as_ref()
                     .is_some_and(|(nonce, _)| nonce == &confirmation.nonce);
                 crate::ui_controls::button::primary(if copied { "Copied" } else { "Copy command" })
+                    // Feedback must not move Cancel under a repeated copy click.
+                    .width(128)
                     .id(widget::Id::new("update.copy-command"))
                     .on_press(Message::UpdateUi(Action::CopyCommand))
                     .into()
