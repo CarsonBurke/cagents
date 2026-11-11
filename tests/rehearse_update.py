@@ -500,6 +500,8 @@ class CandidateNamespace(unittest.TestCase):
         changed=copy.deepcopy(evidence);changed['receipt']['outcome']={'state':'no_source'};cases.append(changed)
         changed=copy.deepcopy(evidence);changed['candidate_version']='cagents wrong';cases.append(changed)
         changed=copy.deepcopy(evidence);changed['source_snapshot']['processes'][0]['executable']='/usr/bin/foreign';cases.append(changed)
+        changed=copy.deepcopy(evidence);changed['source_snapshot']['processes'].append(
+            {'pid':101,'start_ticks':201,'executable':'/other/bin/cagentsd','argv':['/other/bin/cagentsd']});cases.append(changed)
         changed=copy.deepcopy(evidence);changed['source']['data']['instance']='development';cases.append(changed)
         changed=copy.deepcopy(evidence);changed['receipt']['census_digest']='foreign';cases.append(changed)
         for changed in cases:
@@ -549,6 +551,28 @@ class CandidateNamespace(unittest.TestCase):
             (root/'SHA256SUMS').write_text(f'{digest}  {archive.name}\n')
             with self.assertRaisesRegex(RuntimeError,'regular CLI'):
                 scenario.candidate_namespace_cli(root,root,'new')
+
+    def test_headless_namespace_capture_does_not_claim_full_window_or_store_evidence(self):
+        with tempfile.TemporaryDirectory(prefix='ru-namespace-headless-') as temporary:
+            root=Path(temporary)
+            (root/'.rehearse-update').write_text(str(root)+'\n')
+            proof={'host_session_id':'source','boot_id':'boot','host_incarnation':'original'}
+            terminals=root/'baseline-terminals.json'
+            terminals.write_text(json.dumps({'ok':True,'data':{'proof':proof,'terminals':[]}}))
+            terminals.chmod(0o600)
+            owner={'pid':100,'start_ticks':200,'executable':str(root/'old/bin/cagentsd')}
+            with patch.object(records,'processes',return_value=[owner]):
+                captured=records.namespace_source(root,terminals)
+                self.assertEqual(captured,{'root':str(root),'serving':proof,'processes':[owner],'errors':[]})
+                out=root/'full-record';out.mkdir()
+                for collection in records.COLLECTIONS:
+                    (out/f'{collection}.json').write_text(json.dumps({'ok':True,'data':{collection:[],'proof':proof}}))
+                full=records.record(root,out,None)
+                self.assertIn('window observations unavailable',full['errors'])
+                self.assertTrue(any('store' in error or 'sessions.sqlite3' in error for error in full['errors']))
+            terminals.write_text(json.dumps({'ok':True,'data':{'proof':None,'terminals':[]}}))
+            with self.assertRaisesRegex(ValueError,'socket proof'):
+                records.namespace_source(root,terminals)
 
 
 class ExistingOnlyReopen(unittest.TestCase):

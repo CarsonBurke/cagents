@@ -60,6 +60,8 @@ def candidate_namespace_contract(evidence, old_version, new_version):
     owner=[row for row in snapshot['processes'] if row.get('executable')==str(version_root/'bin/cagentsd')
            and row.get('argv')==[str(version_root/'bin/cagentsd')] and row.get('pid',0)>1
            and row.get('start_ticks',0)>0]
+    daemons=[row for row in snapshot['processes'] if Path(row.get('executable','')).name=='cagentsd'
+             and row.get('argv',[])[:1]==[row['executable']]]
     census=evidence['census']
     receipt=evidence['receipt']
     proof=snapshot.get('serving')
@@ -68,7 +70,7 @@ def candidate_namespace_contract(evidence, old_version, new_version):
             or expected.get('instance')!='production' or expected.get('daemon_version')!=old_version
             or expected.get('socket')!=str(root/'rt/cagents/cagentsd.sock')
             or evidence['candidate_version'].strip()!=f'cagents {new_version}'
-            or snapshot['errors'] or len(owner)!=1
+            or snapshot['errors'] or len(owner)!=1 or daemons!=owner
             or not isinstance(proof,dict) or any(not isinstance(proof.get(field),str) or not proof[field]
                 for field in ('host_session_id','boot_id','host_incarnation'))
             or census.get('source')!=proof or outcome.get('state')!='usable' or outcome.get('serving')!=proof
@@ -621,8 +623,13 @@ class Rehearsal:
                       'archive':json.loads((candidate.parent/'archive.json').read_text())}
             probe.write_text(json.dumps(evidence,indent=2,sort_keys=True)+'\n')
             probe.chmod(0o600)
-            self.call('record','namespace',timeout=150)
-            evidence['source_snapshot']=json.loads((self.root/'records/namespace/snapshot.json').read_text())
+            _, terminals=self.cli('--no-start','terminal','list','--all')
+            baseline=candidate.parent/'baseline-terminals.json'
+            baseline.write_text(json.dumps(terminals,indent=2,sort_keys=True)+'\n')
+            baseline.chmod(0o600)
+            _, output=self.call('env','/usr/bin/python3',Path(__file__).with_name('rehearse_update_records.py'),
+                               'namespace-source',self.root,baseline)
+            evidence['source_snapshot']=json.loads(output)
             census=candidate.parent/'census.json'
             receipt=candidate.parent/'receipt.json'
             self.call('env',candidate,'--no-start','--json','daemon','capture-update-census','--output',census)
