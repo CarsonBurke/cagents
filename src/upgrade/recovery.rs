@@ -1537,7 +1537,9 @@ pub(crate) fn classify_retained_prepared(
     )))
 }
 
-const ACTIVE_RECOVERY: &str = "daemon-upgrade.recovered.json";
+// The ordinary handoff Store owns daemon-upgrade.recovered.json for issued
+// conversation aliases. Retirement metadata must never read or replace it.
+const ACTIVE_RECOVERY: &str = "daemon-upgrade.retirement-active.json";
 
 #[derive(Serialize, Deserialize)]
 struct ActiveRecovery {
@@ -3556,6 +3558,11 @@ mod tests {
         let original = serde_json::to_vec(&record).unwrap();
         let outcome_path = path.with_file_name(recovery_name(&record.checkpoint_hash));
         save(&outcome_path, &original);
+        let handoff = super::super::handoff::Store::open(path.parent().unwrap()).unwrap();
+        handoff.record_recovered(&[]).unwrap();
+        let aliases = path.with_file_name("daemon-upgrade.recovered.json");
+        let alias_bytes = fs::read(&aliases).unwrap();
+        assert!(load_retirement(path, None).unwrap().is_none());
         let classified = classify_retained_prepared(path, &target).unwrap().unwrap();
         classified
             .archive_completed(
@@ -3567,6 +3574,7 @@ mod tests {
             )
             .unwrap();
         let first = archived_proof(path, &target).unwrap().unwrap();
+        assert_eq!(fs::read(&aliases).unwrap(), alias_bytes);
         let first_bytes = fs::read(&first.retirement_path).unwrap();
         classified
             .archive_completed(

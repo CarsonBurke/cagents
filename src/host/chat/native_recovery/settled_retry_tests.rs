@@ -450,6 +450,11 @@ fn preserved_retry_authenticates_original_native_owner_without_reopening_paused_
     // Exercise the real startup boundary: it writes Restoring before adopting
     // retained chats, but must preserve the authenticated Ready qualification.
     crate::host::state::restore_upgrade(fixture.host()).unwrap();
+    let store = crate::upgrade::handoff::Store::discover().unwrap();
+    let completed = store.path.with_file_name("daemon-upgrade.recovered.json");
+    let completed_bytes = fs::read(&completed).unwrap();
+    assert!(!crate::host::update_recovery::restore_archived(fixture.host(), &[]).unwrap());
+    assert_eq!(fs::read(&completed).unwrap(), completed_bytes);
     let current = {
         let state = fixture.host().lock().unwrap();
         assert_eq!(state.chats.len(), 1);
