@@ -25,31 +25,57 @@ pub(super) enum Press {
     Reconnect,
     /// Start a provider on a saved conversation the card is reading.
     ResumeSaved,
-    /// Leave the conversation that did not load and start one beside it.
+    /// Start a new conversation in this card after checked retirement.
     StartFresh,
+    Close,
 }
 
 impl Press {
-    pub(super) fn action(self, target: Target) -> Action {
+    pub(super) fn message(self, target: Target) -> Message {
         match self {
-            Self::Reconnect => Action::Reconnect(target),
-            Self::ResumeSaved => Action::ResumeSaved(target),
-            Self::StartFresh => Action::StartFresh(target.card),
+            Self::Reconnect => action(Action::Reconnect(target)),
+            Self::ResumeSaved => action(Action::ResumeSaved(target)),
+            Self::StartFresh => action(Action::StartFresh(target.card)),
+            Self::Close => Message::CloseCard(target.card),
         }
     }
 }
 
 impl Runtime {
     pub(super) fn stopped(&self, transitioning: bool, resuming: bool) -> Stopped {
+        self.stopped_with_offer(transitioning, resuming, self.offers_fresh_conversation())
+    }
+
+    fn stopped_with_offer(
+        &self,
+        transitioning: bool,
+        resuming: bool,
+        fresh_available: bool,
+    ) -> Stopped {
         let snapshot = &self.snapshot;
         let provider = self.session.launch.provider.label();
-        let unresumable = self.offers_fresh_conversation();
+        let unresumable = fresh_available;
         let saved_history = self.has_connected_saved_history(snapshot);
         let enabled = !transitioning
             && self.pending.is_none()
             && self.attachment_chooser_pending.is_none()
             && self.pastes_pending == 0
             && (!saved_history || !snapshot.history_loading);
+        if self.start_retry_blocked {
+            return Stopped {
+                guidance: if self.is_draft() {
+                    blocked_recovery::DRAFT_GUIDANCE.to_owned()
+                } else {
+                    blocked_recovery::guidance(unresumable)
+                },
+                primary: Some(if unresumable {
+                    ("Start a new conversation", Press::StartFresh, enabled)
+                } else {
+                    ("Close", Press::Close, !transitioning)
+                }),
+                secondary: unresumable.then_some(("Close", Press::Close, !transitioning)),
+            };
+        }
         if saved_history {
             return Stopped {
                 guidance: snapshot
@@ -72,7 +98,8 @@ impl Runtime {
                     )
                 } else if unresumable {
                     format!(
-                        "{provider} stopped before the saved conversation loaded. Try again, or start a new conversation beside it: the old one stays on disk, but this card stops pointing at it."
+                        "{provider} stopped before the saved conversation loaded. {}",
+                        blocked_recovery::FRESH_EXPLANATION
                     )
                 } else {
                     format!("{provider} stopped. The conversation and your draft are kept.")
@@ -97,13 +124,12 @@ impl Runtime {
         }
         if unresumable {
             return Stopped {
-                guidance: "The saved conversation did not load. Try again, or start a new conversation beside it: the old one stays on disk, but this card stops pointing at it.".into(),
+                guidance: format!(
+                    "The saved conversation did not load. {}",
+                    blocked_recovery::FRESH_EXPLANATION
+                ),
                 primary: Some(("Try again", Press::Reconnect, enabled)),
-                secondary: Some((
-                    "Start a new conversation",
-                    Press::StartFresh,
-                    enabled,
-                )),
+                secondary: Some(("Start a new conversation", Press::StartFresh, enabled)),
             };
         }
         if self.disconnected || !self.connected() {
@@ -139,33 +165,36 @@ impl Runtime {
         &self,
         transitioning: bool,
         resuming: bool,
+        fresh_available: bool,
     ) -> Element<'_, Message> {
         let Stopped {
             guidance,
             primary,
             secondary,
-        } = self.stopped(transitioning, resuming);
+        } = self.stopped_with_offer(transitioning, resuming, fresh_available);
         let mut controls = Vec::new();
         if let Some((label, pressed, enabled)) = primary {
             controls.push(
                 crate::ui_controls::button::primary(label)
-                    .on_press_maybe(enabled.then(|| action(pressed.action(self.target))))
+                    .on_press_maybe(enabled.then(|| pressed.message(self.target)))
                     .into(),
             );
         }
         if let Some((label, pressed, enabled)) = secondary {
             controls.push(
                 crate::ui_controls::button::secondary(label)
-                    .on_press_maybe(enabled.then(|| action(pressed.action(self.target))))
+                    .on_press_maybe(enabled.then(|| pressed.message(self.target)))
                     .into(),
             );
         }
-        let mut rows = vec![design::caption(guidance).width(Length::Fill).into()];
+        let mut rows = Vec::new();
+        if !guidance.is_empty() {
+            rows.push(design::caption(guidance).width(Length::Fill).into());
+        }
         if !controls.is_empty() {
             rows.push(
-                widget::row::with_children(controls)
-                    .spacing(step::GAP_S)
-                    .wrap()
+                widget::flex_row(controls)
+                    .spacing(step::GAP_S as u16)
                     .into(),
             );
         }

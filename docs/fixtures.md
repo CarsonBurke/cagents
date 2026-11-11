@@ -466,6 +466,206 @@ app-server example that sends no model prompt. Save the stopped fixture with
 `save-seed` before the comparison. This isolates state and credentials; it
 does not sandbox the real executable's network access.
 
+## Resume and retirement fixtures
+
+| Need | Helper |
+| --- | --- |
+| A populated saved Claude conversation before starting a provider | [`tests/fixtures/claude-resume-history.py`](#saved-claude-history) |
+| A permanent startup refusal for an already retired synthetic Claude actor | [`tests/fixtures/native-retired-ownership.py`](#a-permanent-retired-actor-refusal) |
+
+### Close a hosted legacy Codex actor without removing its pane
+
+The `native-codex-close` example uses the production public control client to
+publish, prepare and close one exact legacy Codex actor. This lets the still-saved pane
+exercise a normal reconnect refusal after a UI relaunch. Build it through
+`scripts/cargo-gate build --locked --no-default-features --example native-codex-close`
+before taking the native lock, against the same protocol as the fixture daemon.
+
+Run it only through the task's genuine-user `native-evidence env`, over plain SSH
+when hosted. It refuses inherited `CAGENTS_AGENT_AUTHORITY` and requires that the
+task marker, HOME, runtime and socket belong to the same private fixture. The
+`prepare TARGET.json` mode takes `task`, `socket`, `scope`, `pane`, `native` and
+`thread` fields, using the IDs of the already displayed ordinary user pane.
+Save its JSON output and pass that unchanged to `close PREPARED.json`.
+
+Start the ordinary empty native session first; `native-evidence cli` requires a
+live session. For an initial legacy fixture, create a new channel with
+`native-evidence cli channel spawn --repository "$task/fixture/project" --title 'Codex Fresh fixture'`,
+where `task` is the absolute task directory on the execution host.
+Use its channel ID for `scope` and new pane/native UUIDs in the target. Start
+only your own isolated Codex listener at
+`TASK/old/cagents-codex-NATIVE_UUID/control.sock`. `publish TARGET.json` inserts
+one saved descriptor through the normal public model edit, requiring an existing
+fixture channel, empty view and hosted-chat inventory, and no agent or resource
+identity collision. It fixes the recipe to the private fixture Codex executable,
+that legacy remote and the quoted `high` reasoning option. The descriptor has no
+host proof, listener ownership or retained capability. Normal UI activation
+obtains the real daemon proof and starts the conversation; the helper does not
+inject a runtime or start an actor. Once the pane and inventory converge,
+`prepare` captures the exact issued descriptor for the checked close.
+
+For a read-only view after Fresh, run `observe TARGET.json` with the same scope
+and pane ID. It authenticates as the fixture user, reads the workspace model and
+chat inventory, and reports the actual pane, model identity, current native ID
+and all inventory entries matching that current ID. The declared old native ID
+and thread remain in `target` as request context; they do not constrain this
+observation. An empty matching inventory remains an empty array. Observation
+requires exactly one canonical Codex pane, but permits its thread, native ID and
+owned-listener descriptor to change. It neither starts or attaches a provider
+nor proves readiness, confirmed thread identity or listener ownership. These
+reads are separate public requests, not an atomic model/inventory snapshot.
+
+The `prepare` and `close` modes still require the saved pane and live inventory
+to agree exactly, including the daemon-issued proof and complete recipe. They
+reject moved, replaced,
+ambiguous or managed-agent targets. Close uses that unmodified listed descriptor,
+requires the checked `ChatClosed` acknowledgement, then verifies that inventory
+no longer contains the actor and that the saved pane is unchanged. It does not
+edit runtime state, recipes, proofs or the saved model. An error after Close can
+mean the actor closed but a postcondition failed; inspect the evidence rather
+than repeating the mutation.
+
+An independently started app-server is separate from the hosted actor. Stop and
+reap only the fixture server you own, recording its identity and socket absence,
+before relying on its exit. A later Fresh completion for an unowned legacy
+descriptor may use the existing absent-inventory close policy; it is not an
+additional retained-close or execution-ended receipt.
+
+### Saved Claude history
+
+Seed a fresh private fixture with a parent-linked conversation before its first
+native start:
+
+```sh
+python3 tests/fixtures/claude-resume-history.py /path/to/private/fixture --turns 50
+python3 tests/fixtures/check-claude-resume-history.py
+```
+
+The generator writes 100 invented messages for 50 turns and prints the exact
+thread, transcript and project paths as JSON. It launches no provider and uses
+no credentials. It refuses an existing provider home and aliases of the real
+account's Claude home. Use a fresh evidence task when its provider home already
+exists. Save the stopped fixture with `native-evidence save-seed` so both sides
+restore the same transcript and physical provider-home identity, then open its
+project and choose **Resume conversation** in the app.
+
+### A permanent first-start refusal
+
+[`tests/fixtures/native-account-registry.py`](../tests/fixtures/native-account-registry.py)
+creates an invalid private accounts registry so an ordinary first **Send** can
+exercise a permanent startup refusal. It prepares an empty home, then faults
+only a registry whose Claude default was selected through the real public CLI.
+It neither registers an account nor changes a pane, recipe, proof or runtime.
+No provider or daemon is launched by the helper.
+
+Use your own isolated `native-evidence` task from a genuine User shell on the
+build host. The fixture's HOME, config and data directories must already exist.
+Prepare the home, then link it and choose the exact account ID returned by the
+CLI:
+
+```sh
+python3 tests/fixtures/native-account-registry.py prepare "$TASK/fixture"
+scripts/native-evidence --task "$TASK" cli account link claude \
+    "$TASK/fixture/data/cagents-development/accounts/claude/55555555-6666-4777-8888-999999999999"
+# Substitute the actual claude/UUID returned by account link:
+scripts/native-evidence --task "$TASK" cli account default claude claude/RETURNED_UUID
+```
+
+This is a linked account in the isolated installation's managed namespace,
+not a sign-in or imported credential. The public link command does not check
+login or execution readiness. Use the offline fixture provider only. Verify
+that the ordinary new draft actually selected this account and captured that
+exact `CLAUDE_CONFIG_DIR`; a project override can differ from the global
+default. The helper verifies the registration and default, not the UI choice.
+
+```sh
+python3 tests/fixtures/native-account-registry.py fault "$TASK/fixture"
+# Send the invented first message once and capture the refusal and recovery.
+python3 tests/fixtures/native-account-registry.py restore "$TASK/fixture"
+```
+
+Malformed TOML produces `InvalidData` during the selected managed home's
+startup authorization. A System-default Claude launch skips this registry
+check, so corrupting the file alone does not establish the intended failure.
+The existing public account selection must precede the fault.
+
+The helper refuses inherited agent authority, symlink aliases, real provider
+homes, unsafe ownership or modes, and ambiguous or unselected registrations.
+It takes the application's `accounts.toml.lock`, exclusively saves a mode-0600
+`fixture/original-account-registry.json` backup, and compares the registry's
+exact inode, owner, mode and bytes before writing invalid TOML in place.
+Restore accepts only the same helper revision, fixture and home identities,
+registry identity, and exact fault bytes. It restores the original bytes and
+writes `fixture/restored-account-registry.json`. It never overwrites an
+unknown replacement or rearms a used backup.
+
+The registry write and JSON receipt are separate operations. A command can
+fail after changing the file. Preserve its error and backup, inspect the exact
+current bytes and identity, and stop the task if its state is uncertain. Do
+not rerun blindly, delete a backup, or treat a missing restore receipt as proof
+that the file was not restored. The lock serializes cooperating application
+writers; it does not authorize concurrent manual edits.
+
+The focused checks use invented temporary directories and TOML only:
+
+```sh
+python3 -I -B tests/native_account_registry.py -v
+```
+
+### A permanent retired-actor refusal
+
+[`tests/fixtures/native-retired-ownership.py`](../tests/fixtures/native-retired-ownership.py)
+creates a deliberate saved-recipe conflict so the real daemon can refuse a
+startup permanently. Use it only in your own isolated `native-evidence` task,
+after the synthetic Claude actor has exited and normal daemon retirement has
+completed. The caller must establish that its provider process is reaped;
+the helper checks the saved retirement receipt, not kernel process liveness.
+It does not retire actors, stop processes, acquire a native lease or launch a
+provider.
+
+From the build host's genuine User shell, with the task's current fixture and
+exact invented conversation UUID:
+
+```sh
+python3 tests/fixtures/native-retired-ownership.py \
+    ~/.local/state/cev/TASK/fixture CONVERSATION_UUID
+# Exercise the pane's normal Retry once; the daemon reads the conflicted recipe.
+# Capture the diagnostic and available controls, then undo only this fault:
+python3 tests/fixtures/native-retired-ownership.py \
+    ~/.local/state/cev/TASK/fixture CONVERSATION_UUID --restore
+```
+
+The helper recognizes only schema 22 shared views or schema 23 normalized
+panes with descriptor format 1. It requires one current committed Claude pane
+for that exact thread, matching ownership source and proof, and a completed
+retirement. It appends one `--fixture-recipe-mismatch` argument to that retired
+ownership row using SQLite compare-and-swap. The card, transcript, provider
+home and retirement receipt stay as they were. This is synthetic database
+fault injection, not a claim that a provider produced the conflicting recipe.
+
+Before changing the row, it exclusively creates a private mode-0600
+`fixture/original-retired-ownership.json` backup. Restore accepts only that
+helper revision's recorded original and faulted strings, the same database
+inode, owner and mode, and unchanged pane, retirement and faulted row. It
+restores that one row by compare-and-swap and writes
+`fixture/restored-retired-ownership.json`; repeated or stale restores refuse.
+Injection is once per fixture. Do not delete the backup or edit it to rearm a
+fault or get past a refusal.
+
+The SQLite change and JSON report are separate writes. If either command
+fails, inspect its backup, report and exact ownership row before taking any
+further action: a missing report does not prove the database was unchanged.
+Do not rerun blindly, overwrite the backup or relax a guard. Stop your task
+and use a fresh fixture when its state cannot be established safely.
+
+The offline checks open only invented in-memory SQLite databases or temporary
+backup files, and need neither Cargo nor a native session:
+
+```sh
+python3 tests/fixtures/native-retired-ownership.py --self-test
+python3 tests/native_retired_ownership.py -v
+```
+
 ## Adding a provider behaviour
 
 The synthetic Claude provider reads switches from files in its config

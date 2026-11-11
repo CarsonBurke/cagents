@@ -1,6 +1,8 @@
 //! A closed historical execution can accompany an actually retired cleanup
 //! actor. The pending intent itself still grants no history or input access.
+use super::native_actor_retirement::read_error;
 use super::{NativeActorOwnership, NativeActorRetirement, Registry};
+use crate::chat::protocol::SetupError;
 use crate::{
     agent_execution::{Agent, HostedSession, Run, State},
     chat::{NativeContinuity, Session},
@@ -40,6 +42,17 @@ impl Registry {
         retirement: &NativeActorRetirement,
         boot: &BootId,
     ) -> Result<Option<ArchivedHistory>, String> {
+        self.archived_history_for_start(source, ownership, retirement, boot)
+            .map_err(|error| error.to_string())
+    }
+
+    pub(in crate::host) fn archived_history_for_start(
+        &self,
+        source: &Session,
+        ownership: &NativeActorOwnership,
+        retirement: &NativeActorRetirement,
+        boot: &BootId,
+    ) -> Result<Option<ArchivedHistory>, SetupError> {
         if !ownership.is_pending()
             || !retirement.is_pending()
             || ownership.actor() != retirement.actor()
@@ -78,27 +91,34 @@ impl Registry {
         }
         // A single snapshot joins the relevant rows, rather than a global
         // sequence which unrelated agent activity could continually invalidate.
-        let tx = self.db.unchecked_transaction().map_err(|e| e.to_string())?;
-        if self.native_actor_ownership(ownership.actor())?.as_ref() != Some(ownership)
-            || self.native_actor_retirement(ownership.actor())?.as_ref() != Some(retirement)
+        let tx = self.db.unchecked_transaction().map_err(read_error)?;
+        if self
+            .native_actor_ownership_for_start(ownership.actor())?
+            .as_ref()
+            != Some(ownership)
+            || self
+                .native_actor_retirement_for_start(ownership.actor())?
+                .as_ref()
+                != Some(retirement)
         {
             return Ok(None);
         }
         {
             let mut statement = tx
                 .prepare("SELECT actor,ownership FROM native_actor_ownerships LIMIT 4097")
-                .map_err(|e| e.to_string())?;
-            let mut rows = statement.query([]).map_err(|e| e.to_string())?;
+                .map_err(read_error)?;
+            let mut rows = statement.query([]).map_err(read_error)?;
             let (mut count, mut bytes, mut owners) = (0, 0usize, 0);
-            while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-                let key: String = row.get(0).map_err(|e| e.to_string())?;
-                let encoded: String = row.get(1).map_err(|e| e.to_string())?;
+            while let Some(row) = rows.next().map_err(read_error)? {
+                let key: String = row.get(0).map_err(read_error)?;
+                let encoded: String = row.get(1).map_err(read_error)?;
                 count += 1;
                 bytes = bytes.saturating_add(encoded.len());
                 if count > 4096 || encoded.len() > 256 * 1024 || bytes > 64 * 1024 * 1024 {
                     return Err("Archived history exceeds its ownership metadata bound".into());
                 }
-                let other: NativeActorOwnership = super::execution::decode(&encoded)?;
+                let other: NativeActorOwnership =
+                    super::execution::decode(&encoded).map_err(SetupError::Invalid)?;
                 if other.actor().is_nil() || key != other.actor().to_string() {
                     return Err("Archived history changed its actor census identity".into());
                 }
@@ -117,7 +137,9 @@ impl Registry {
                         },
                     )
                     && (other.is_pending()
-                        || self.native_actor_retirement(other.actor())?.is_none())
+                        || self
+                            .native_actor_retirement_for_start(other.actor())?
+                            .is_none())
                 {
                     return Ok(None);
                 }
@@ -133,11 +155,11 @@ impl Registry {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
-            .map_err(|e| e.to_string())?;
+            .map_err(read_error)?;
         let Some((key, record)) = record else {
             return Ok(None);
         };
-        let agent: Agent = super::execution::decode(&record)?;
+        let agent: Agent = super::execution::decode(&record).map_err(SetupError::Invalid)?;
         let Some(HostedSession::Chat(historical)) = &agent.session else {
             return Ok(None);
         };
@@ -168,9 +190,9 @@ impl Registry {
                 params![source.id.to_string(), agent.id.to_string()],
                 |row| row.get(0),
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(read_error)?;
         if blocked
-            || super::views::occupied(&tx)?.iter().any(|view| {
+            || super::views::occupied_for_start(&tx)?.iter().any(|view| {
                 view.panes.iter().any(|pane| {
                     matches!(&pane.kind,
                 crate::model::CardKind::Chat(chat) if chat.id == source.id)
@@ -184,23 +206,23 @@ impl Registry {
                 .prepare(
                     "SELECT id,state,record FROM agent_runs WHERE agent=?1 ORDER BY id LIMIT 4097",
                 )
-                .map_err(|e| e.to_string())?;
+                .map_err(read_error)?;
             let mut rows = statement
                 .query([agent.id.to_string()])
-                .map_err(|e| e.to_string())?;
+                .map_err(read_error)?;
             let mut runs = Vec::new();
             let mut bytes = 0usize;
-            while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            while let Some(row) = rows.next().map_err(read_error)? {
                 let (id, state, record): (String, String, String) = (
-                    row.get(0).map_err(|e| e.to_string())?,
-                    row.get(1).map_err(|e| e.to_string())?,
-                    row.get(2).map_err(|e| e.to_string())?,
+                    row.get(0).map_err(read_error)?,
+                    row.get(1).map_err(read_error)?,
+                    row.get(2).map_err(read_error)?,
                 );
                 bytes = bytes.saturating_add(record.len());
                 if runs.len() >= 4096 || record.len() > 256 * 1024 || bytes > 64 * 1024 * 1024 {
                     return Err("Archived history exceeds its completed-run metadata bound".into());
                 }
-                let run: Run = super::execution::decode(&record)?;
+                let run: Run = super::execution::decode(&record).map_err(SetupError::Invalid)?;
                 let terminal = match run.state {
                     State::Succeeded => "succeeded",
                     State::Failed => "failed",
@@ -218,7 +240,7 @@ impl Registry {
         if runs.is_empty() {
             return Ok(None);
         }
-        tx.commit().map_err(|e| e.to_string())?;
+        tx.commit().map_err(read_error)?;
         Ok(Some(ArchivedHistory {
             agent,
             runs,
@@ -233,8 +255,16 @@ impl Registry {
         &self,
         witness: &ArchivedHistory,
     ) -> Result<(), String> {
+        self.recheck_archived_history_for_start(witness)
+            .map_err(|error| error.to_string())
+    }
+
+    pub(in crate::host) fn recheck_archived_history_for_start(
+        &self,
+        witness: &ArchivedHistory,
+    ) -> Result<(), SetupError> {
         if self
-            .archived_history(
+            .archived_history_for_start(
                 &witness.source,
                 &witness.ownership,
                 &witness.retirement,

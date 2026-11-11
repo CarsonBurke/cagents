@@ -6,7 +6,7 @@ use crate::workspace_model::{
 
 pub(in crate::host::model) mod bindings;
 pub(in crate::host::model) mod store;
-pub(super) use store::{all, occupied, operation_seen, read};
+pub(super) use store::{all, occupied, occupied_for_start, operation_seen, read};
 
 /// What one edit changed beyond what it says, collected while it applies and
 /// resolved into [`EditEffects`] once every row is written, so a subscriber

@@ -1483,16 +1483,31 @@ impl Runtime {
         } else {
             incident.summary.clone()
         };
+        let current_local_error = incident.sources.iter().any(|source| {
+            matches!(source, Source::Local(text) if Some(text.as_ref()) == self.error.as_deref())
+        });
+        let blocked_start = self.start_retry_blocked && current_local_error;
         let mut rows = vec![
             widget::row::with_children(vec![
                 crate::ui_controls::passive_icon(Icon::Warning, design::COMPACT_ICON_SIZE),
-                design::body(summary).width(Length::Fill).into(),
+                design::body(if blocked_start {
+                    if self.is_draft() {
+                        blocked_recovery::DRAFT_HEADLINE
+                    } else {
+                        blocked_recovery::HEADLINE
+                    }
+                    .to_owned()
+                } else {
+                    summary
+                })
+                .width(Length::Fill)
+                .into(),
             ])
             .spacing(space::S)
             .align_y(Alignment::Start)
             .into(),
         ];
-        if !cleared {
+        if !cleared && !blocked_start {
             rows.push(
                 design::caption(reset_controls.as_ref().map_or_else(
                     || incident.guidance.to_owned(),

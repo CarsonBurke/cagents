@@ -1481,7 +1481,7 @@ impl ControlClient {
 
     /// The updater keeps the source's final transcript page after its own
     /// confirmed teardown, including output produced during interruption.
-    pub(crate) fn close_chat_with_snapshot(
+    pub fn close_chat_with_snapshot(
         &mut self,
         session: crate::chat::Session,
     ) -> Result<crate::chat::Snapshot, ControlError> {

@@ -794,6 +794,7 @@ fn held_child_diagnostic_controls_do_not_retarget_a_replacement_incident() {
             true,
             None,
             Vec::new(),
+            true,
         )
     }
     fn control_bounds(tree: &iced_accessibility::A11yTree, name: &str) -> iced::Rectangle {
@@ -1228,6 +1229,7 @@ fn child_chooser_actions_preserve_reader_and_cover_transcript_until_closed() {
                 true,
                 None,
                 Vec::new(),
+                true,
             ),
             iced::Size::new(360.0, 720.0),
             cache,

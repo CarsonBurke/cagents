@@ -8,7 +8,10 @@ CREATE TABLE copy_sources(
  revision INTEGER NOT NULL, bytes INTEGER NOT NULL);";
 
 impl Store {
-    pub(super) fn copy_parent_source(&self, id: &str) -> Result<Option<TextCopySource>, String> {
+    pub(super) fn copy_parent_source(
+        &self,
+        id: &str,
+    ) -> Result<Option<TextCopySource>, StoreError> {
         self.db
             .query_row(
                 "SELECT token,revision,bytes FROM copy_sources WHERE item=?1",
@@ -24,9 +27,9 @@ impl Store {
                 },
             )
             .optional()
-            .map_err(|error| error.to_string())
+            .map_err(StoreError::from)
     }
-    pub(super) fn copy_parent_prefix(&self, id: &str, text: &str) -> Result<bool, String> {
+    pub(super) fn copy_parent_prefix(&self, id: &str, text: &str) -> Result<bool, StoreError> {
         let Some(source) = self.copy_parent_source(id)? else {
             return Ok(false);
         };
@@ -49,22 +52,19 @@ impl Store {
         id: &str,
         bytes: Option<usize>,
         prefix: bool,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, StoreError> {
         let invalidated = !prefix
-            && db
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM copy_sources WHERE item=?1)",
-                    [id],
-                    |row| row.get::<_, bool>(0),
-                )
-                .map_err(|error| error.to_string())?;
+            && db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM copy_sources WHERE item=?1)",
+                [id],
+                |row| row.get::<_, bool>(0),
+            )?;
         match bytes {
             Some(bytes) => {
-                db.execute("INSERT INTO copy_sources(item,revision,bytes) VALUES(?1,1,?2) ON CONFLICT(item) DO UPDATE SET revision=revision+?3,bytes=excluded.bytes",params![id,bytes as i64,i64::from(!prefix)]).map_err(|error|error.to_string())?;
+                db.execute("INSERT INTO copy_sources(item,revision,bytes) VALUES(?1,1,?2) ON CONFLICT(item) DO UPDATE SET revision=revision+?3,bytes=excluded.bytes",params![id,bytes as i64,i64::from(!prefix)])?;
             }
             None => {
-                db.execute("DELETE FROM copy_sources WHERE item=?1", [id])
-                    .map_err(|error| error.to_string())?;
+                db.execute("DELETE FROM copy_sources WHERE item=?1", [id])?;
             }
         }
         Ok(invalidated)
@@ -73,25 +73,21 @@ impl Store {
         db: &Connection,
         id: &str,
         bytes: usize,
-    ) -> Result<(), String> {
+    ) -> Result<(), StoreError> {
         // A suffix without an authoritative initial Item is not a full message.
         db.execute(
             "UPDATE copy_sources SET bytes=bytes+?2 WHERE item=?1",
             params![id, bytes as i64],
-        )
-        .map_err(|error| error.to_string())?;
+        )?;
         Ok(())
     }
-    pub(super) fn copy_remove(&mut self, ids: &[String]) -> Result<(), String> {
-        let transaction = self.db.transaction().map_err(|error| error.to_string())?;
+    pub(super) fn copy_remove(&mut self, ids: &[String]) -> Result<(), StoreError> {
+        let transaction = self.db.transaction()?;
         let mut invalidated = false;
         for id in ids {
-            invalidated |= transaction
-                .execute("DELETE FROM copy_sources WHERE item=?1", [id])
-                .map_err(|error| error.to_string())?
-                > 0;
+            invalidated |= transaction.execute("DELETE FROM copy_sources WHERE item=?1", [id])? > 0;
         }
-        transaction.commit().map_err(|error| error.to_string())?;
+        transaction.commit()?;
         if invalidated {
             self.copy_revision = self.copy_revision.wrapping_add(1);
         }
