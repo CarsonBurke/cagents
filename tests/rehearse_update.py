@@ -18,6 +18,7 @@ import tempfile
 import tarfile
 import time
 import signal
+import shutil
 import unittest
 from unittest.mock import patch
 
@@ -272,6 +273,27 @@ class Comparison(unittest.TestCase):
             finally:
                 peer.terminate()
                 peer.wait()
+
+    def test_process_executable_is_kernel_image_even_when_argv_claims_other_daemon(self):
+        with tempfile.TemporaryDirectory(prefix="rehearse-exe-") as temporary:
+            root = Path(temporary)
+            sleep_image = str(Path(shutil.which("sleep")).resolve())
+            peer = subprocess.Popen(["bash", "-c", 'exec -a /fake/old-version/bin/cagentsd sleep 60'],
+                                    env={**os.environ, "HOME": str(root / "home")})
+            try:
+                deadline = time.monotonic() + 5
+                while os.readlink(f"/proc/{peer.pid}/exe") != sleep_image:
+                    self.assertIsNone(peer.poll())
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(.01)
+                row = next(row for row in records.processes(root) if row["pid"] == peer.pid)
+                self.assertEqual(row["argv"][0], "/fake/old-version/bin/cagentsd")
+                self.assertEqual(row["executable"], os.readlink(f"/proc/{peer.pid}/exe"))
+                self.assertEqual(row["executable"], sleep_image)
+                self.assertGreater(row["start_ticks"], 0)
+            finally:
+                peer.terminate()
+                peer.wait(timeout=5)
 
     def test_cli_accepts_record_directories_and_returns_failure(self):
         with tempfile.TemporaryDirectory(prefix="rehearse-record-") as temporary:

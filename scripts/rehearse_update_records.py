@@ -141,9 +141,13 @@ def processes(root: Path, errors: list[str] | None = None) -> list[dict]:
             stat = (proc / "stat").read_text().rsplit(")", 1)[1].split()
             terminal = next((item.split(b"=", 1)[1].decode(errors="replace") for item in env
                              if item.startswith(b"CAGENTS_TERMINAL_ID=")), None)
-            result.append({"pid": int(proc.name), "ppid": int(stat[1]), "state": stat[0],
-                           "start_ticks": int(stat[19]), "terminal_id": terminal,
-                           "argv": (proc / "cmdline").read_bytes().decode(errors="replace").rstrip("\0").split("\0")})
+            row = {"pid": int(proc.name), "ppid": int(stat[1]), "state": stat[0],
+                   "start_ticks": int(stat[19]), "terminal_id": terminal,
+                   "executable": os.readlink(proc / "exe"),
+                   "argv": (proc / "cmdline").read_bytes().decode(errors="replace").rstrip("\0").split("\0")}
+            confirmed = (proc / "stat").read_text().rsplit(")", 1)[1].split()
+            if int(confirmed[19]) == row["start_ticks"]:
+                result.append(row)
         except (OSError, ValueError, IndexError):
             continue
     by_identity = {(row["pid"], row["start_ticks"]): row for row in result}
