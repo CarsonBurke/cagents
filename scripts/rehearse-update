@@ -224,6 +224,11 @@ cmd_update() {
     local started=$SECONDS status=0 transcript
     transcript=$logs/update-$(date +%H%M%S).log
     local prefix=$user_home/.local/share/cagents-install
+    if [ "$fail_new_daemon" -eq 1 ]; then
+        [ ! -e "$prefix/versions/$version" ] || die 'startup failure requires an unstaged private candidate' 2
+        archive_dir=$(user_env /usr/bin/python3 "$tool_root/scripts/rehearse_update_fault.py" \
+            "$root" "$version" --archive-dir "$archive_dir")
+    fi
     if [[ $prefix/current -ef $prefix/versions/$version ]]; then
         printf '%s is already current; skipping staging.\n' "$version"
     elif [ -e "$prefix/versions/$version" ]; then
@@ -232,9 +237,6 @@ cmd_update() {
         local stage_status=0
         cmd_install "$archive_dir" "$version" "$installer" --stage-only 2>&1 | tee -a "$transcript" || stage_status=${PIPESTATUS[0]}
         [ "$stage_status" -eq 0 ] || return "$stage_status"
-    fi
-    if [ "$fail_new_daemon" -eq 1 ]; then
-        user_env /usr/bin/python3 "$tool_root/scripts/rehearse_update_fault.py" "$root" "$version"
     fi
     printf 'staged after %ss\n' "$((SECONDS - started))" | tee -a "$transcript"
     cmd_app_or_env /usr/bin/python3 "$tool_root/scripts/rehearse_update_pty.py" --answer "$answer" --working "$working" --stop "$stop" -- \

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import copy
 import hashlib
 import json
@@ -14,6 +15,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import tarfile
 import time
 import signal
 import unittest
@@ -726,6 +728,85 @@ class RefusalIdentity(unittest.TestCase):
 
 
 class StartupFault(unittest.TestCase):
+    def module(self):
+        spec = importlib.util.spec_from_file_location('rehearsal_fault', REPOSITORY/'scripts/rehearse_update_fault.py')
+        fault = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fault)
+        return fault
+
+    def test_fault_archive_is_verified_before_staging_without_changing_shared_build(self):
+        fault = self.module()
+        with tempfile.TemporaryDirectory(prefix='ru-fault-archive-') as temporary:
+            base = Path(temporary)
+            root, shared = base/'private', base/'shared'
+            root.mkdir()
+            shared.mkdir()
+            (root/'.rehearse-update').write_text(str(root)+'\n')
+            (root/'logs').mkdir()
+            candidate = base/'tree/cagents-new'
+            (candidate/'bin').mkdir(parents=True)
+            daemon = candidate/'bin/cagentsd'
+            daemon.write_text('#!/bin/sh\nprintf "maintenance %s\\n" "$*"\n')
+            daemon.chmod(0o755)
+            cli = candidate/'bin/cagents'
+            cli.write_text('#!/bin/sh\nprintf "cagents new\\n"\n')
+            cli.chmod(0o755)
+            name = 'cagents-new-x86_64-unknown-linux-gnu.tar.gz'
+            archive = shared/name
+            with tarfile.open(archive,'w:gz') as output:
+                output.add(candidate,arcname='cagents-new')
+            original = archive.read_bytes()
+            digest = hashlib.sha256(original).hexdigest()
+            (shared/'SHA256SUMS').write_text(f'{digest}  {name}\n')
+            destination = fault.failing_archive(root,'new',shared)
+            self.assertEqual(archive.read_bytes(),original)
+            self.assertEqual((shared/'SHA256SUMS').read_text(),f'{digest}  {name}\n')
+            actual = hashlib.sha256((destination/name).read_bytes()).hexdigest()
+            self.assertEqual((destination/'SHA256SUMS').read_text(),f'{actual}  {name}\n')
+            self.assertNotEqual(actual,digest)
+            extracted = root/'inspect'
+            extracted.mkdir()
+            with tarfile.open(destination/name,'r:gz') as output:
+                with tarfile.open(archive,'r:gz') as original_archive:
+                    self.assertEqual(set(output.getnames()),set(original_archive.getnames()))
+                output.extractall(extracted,filter='data')
+            wrapped = extracted/'cagents-new/bin/cagentsd'
+            result = subprocess.run([wrapped],capture_output=True,text=True)
+            self.assertEqual(result.returncode,1)
+            self.assertIn('forced rehearsal daemon startup failure',result.stderr)
+            self.assertEqual((root/'logs/daemon-start-failure.txt').read_text().split()[0],'new')
+            result = subprocess.run([wrapped,'--stored-schema'],capture_output=True,text=True)
+            self.assertEqual((result.returncode,result.stdout),(0,'maintenance --stored-schema\n'))
+            result = subprocess.run([wrapped,'--ceditor-notifications'],capture_output=True,text=True)
+            self.assertEqual(result.returncode,1)
+            with self.assertRaises(FileExistsError):
+                fault.failing_archive(root,'new',shared)
+
+    def test_fault_archive_refuses_unverified_or_escaping_members(self):
+        fault = self.module()
+        with tempfile.TemporaryDirectory(prefix='ru-fault-escape-') as temporary:
+            base = Path(temporary)
+            root, shared = base/'private', base/'shared'
+            root.mkdir()
+            shared.mkdir()
+            (root/'.rehearse-update').write_text(str(root)+'\n')
+            (root/'logs').mkdir()
+            name = 'cagents-new-x86_64-unknown-linux-gnu.tar.gz'
+            archive = shared/name
+            with tarfile.open(archive,'w:gz') as output:
+                entry = tarfile.TarInfo('cagents-new/../../escaped')
+                entry.size = 3
+                output.addfile(entry,io.BytesIO(b'bad'))
+            (shared/'SHA256SUMS').write_text(f'{"0"*64}  {name}\n')
+            with self.assertRaisesRegex(ValueError,'checksum-verified'):
+                fault.failing_archive(root,'new',shared)
+            self.assertFalse((root/'startup-fault-archive').exists())
+            digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+            (shared/'SHA256SUMS').write_text(f'{digest}  {name}\n')
+            with self.assertRaises(tarfile.TarError):
+                fault.failing_archive(root,'new',shared)
+            self.assertFalse((root/'escaped').exists())
+
     def test_fault_only_changes_marked_private_candidate_and_preserves_maintenance(self):
         spec = importlib.util.spec_from_file_location("rehearsal_fault", REPOSITORY / "scripts/rehearse_update_fault.py")
         fault = importlib.util.module_from_spec(spec)
