@@ -6266,18 +6266,19 @@ fn worktree_group_row(
     let content = if compact {
         grid.rail(glyph, rail::Badges::attention(attention))
     } else {
-        let mut trailing =
-            widget::row::with_children(vec![design::caption(count.to_string()).into()])
-                .spacing(space::XS)
-                .align_y(Alignment::Center);
-        if let Some(indicator) = attention_indicator(attention) {
-            trailing = trailing.push(indicator);
-        }
-        grid.content(
-            glyph,
-            Some(design::body("Worktrees").into()),
-            Some(trailing.into()),
-        )
+        let label = widget::row::with_children(vec![
+            design::body("Worktrees").width(Length::Fill).into(),
+            design::caption(count.to_string()).into(),
+        ])
+        .spacing(space::XS)
+        .align_y(Alignment::Center)
+        .width(Length::Fill);
+        let status = attention_indicator(attention).map(|indicator| {
+            widget::container(indicator)
+                .id(entity_id("worktrees.attention", project.id))
+                .into()
+        });
+        grid.content(glyph, Some(label.into()), status)
     };
     let control = grid
         .control(content, false)
@@ -14553,6 +14554,72 @@ pub(crate) mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn worktree_display_count_and_attention_fit_wide_and_narrow_rows() {
+        use cosmic::iced::advanced::widget::Operation;
+        struct Bounds {
+            status_id: widget::Id,
+            status: Option<Rectangle>,
+            count: Option<Rectangle>,
+        }
+        impl Operation for Bounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn container(&mut self, id: Option<&widget::Id>, bounds: Rectangle) {
+                if id == Some(&self.status_id) {
+                    self.status = Some(bounds);
+                }
+            }
+            fn text(&mut self, _: Option<&widget::Id>, bounds: Rectangle, text: &str) {
+                if text == "126" {
+                    self.count = Some(bounds);
+                }
+            }
+        }
+        let renderer = headless_renderer();
+        let mut project = display_project();
+        for index in 0..125 {
+            project
+                .worktrees
+                .push(worktree(index + 100, "topic", false));
+        }
+        let mut state = SidebarState::default();
+        state.set_agent_activity(
+            CardId::new(),
+            project.id,
+            project.worktrees[1].id,
+            crate::agent::Activity {
+                provider: crate::agent::Provider::Claude,
+                state: crate::agent::ActivityState::Waiting,
+            },
+        );
+        for width in [180.0, 260.0] {
+            let mut row = worktree_group_row(&project, &state, false, false);
+            let mut tree = Tree::new(&row);
+            let node = row.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(width, 40.0)),
+            );
+            let mut bounds = Bounds {
+                status_id: entity_id("worktrees.attention", project.id),
+                status: None,
+                count: None,
+            };
+            row.as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut bounds);
+            let status = bounds.status.unwrap();
+            let count = bounds.count.unwrap();
+            assert!(status.width >= f32::from(ROW_ICON_SIZE));
+            assert!(
+                count.x + count.width <= status.x,
+                "count overlaps attention at {width}px: {count:?}, {status:?}"
+            );
+            assert!(status.x + status.width <= width);
         }
     }
 
