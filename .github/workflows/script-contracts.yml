@@ -319,23 +319,27 @@ jobs:
 
           for name, source, fixture in (
               ("native evidence", "scripts/native-evidence", "tests/native_evidence.py"),
+              ("focused transfer probe", "tests/fixtures/focused-transfer-probe.py", "tests/focused_transfer_probe.py"),
           ):
-              source_present = present(Path(source))
-              fixture_present = present(Path(fixture))
-              if not source_present and not fixture_present:
+              members = [source, fixture]
+              if source == "tests/fixtures/focused-transfer-probe.py":
+                  members.append("tests/fixtures/focused-transfer-producer.json")
+              available = [present(Path(member)) for member in members]
+              if not any(available):
                   print(f"Not applicable: {name} (source and fixture both absent at this head)", flush=True)
                   continue
-              if not source_present or not fixture_present:
-                  print(f"Incomplete contract pair: {source} and {fixture} must both exist", file=sys.stderr)
+              if not all(available):
+                  print(f"Incomplete contract pair: {' and '.join(members)} must all exist", file=sys.stderr)
                   raise SystemExit(2)
               print(f"Checking: {name}", flush=True)
-              shells = [source]
-              if present(Path("scripts/native-evidence-remote")):
-                  shells.append("scripts/native-evidence-remote")
-              for shell in shells:
-                  result = subprocess.run(["bash", "-n", shell])
-                  if result.returncode:
-                      raise SystemExit(result.returncode)
+              if source == "scripts/native-evidence":
+                  shells = [source]
+                  if present(Path("scripts/native-evidence-remote")):
+                      shells.append("scripts/native-evidence-remote")
+                  for shell in shells:
+                      result = subprocess.run(["bash", "-n", shell])
+                      if result.returncode:
+                          raise SystemExit(result.returncode)
               result = subprocess.run([sys.executable, "-I", "-B", fixture, "-v"])
               if result.returncode:
                   raise SystemExit(result.returncode)
