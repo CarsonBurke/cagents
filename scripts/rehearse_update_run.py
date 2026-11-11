@@ -8,12 +8,15 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import sqlite3
 import subprocess
 import sys
 import tarfile
 import time
+import tomllib
+import uuid
 
 
 def candidate_namespace_cli(root, archive_dir, version):
@@ -92,6 +95,27 @@ def candidate_namespace_contract(evidence, old_version, new_version):
 def provider_activity(root):
     root=Path(root)
     claude=(root/'home/.claude/fixture-launches').read_text().splitlines()
+    claude_prompts=0
+    for path in (root/'home/.claude/projects').glob('*/*.jsonl'):
+        if path.is_symlink() or not path.is_file() or path.stat().st_size>16*1024**2:
+            raise RuntimeError('unsafe or oversized private Claude fixture transcript')
+        for line in path.read_text().splitlines():
+            try:
+                record=json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(record,dict):
+                continue
+            origin=record.get('origin')
+            if (record.get('type')!='user'
+                    or (isinstance(origin,dict) and origin.get('kind')=='task-notification')
+                    or any(record.get(flag) is True for flag in ('isMeta','isCompactSummary','repeatsCompactSummary'))):
+                continue
+            message=record.get('message')
+            content=message.get('content') if isinstance(message,dict) else None
+            if isinstance(content,str) or (isinstance(content,list) and any(
+                    isinstance(part,dict) and part.get('type')!='tool_result' for part in content)):
+                claude_prompts+=1
     events=[json.loads(line) for line in (root/'logs/codex-provider.jsonl').read_text().splitlines()]
     methods=Counter(event.get('method') for event in events)
     listeners=[event for event in events if event.get('event')=='launch'
@@ -100,8 +124,115 @@ def provider_activity(root):
     conversations.update(event['pid'] for event in events if event.get('method') in
         ('thread/start','thread/resume','turn/start','turn/interrupt'))
     launches=sum(event.get('event')=='launch' and event['pid'] in conversations for event in events)
-    return {'claude_chat_launches':len(claude),'codex_chat_launches':launches,
+    return {'claude_chat_launches':len(claude),'claude_user_prompts':claude_prompts,'codex_chat_launches':launches,
             'codex_thread_starts':methods['thread/start'],'codex_turn_starts':methods['turn/start']}
+
+
+def terminal_shortcut(root):
+    path=Path(root)/'home/.config/cagents/settings.toml'
+    raw=path.read_bytes()
+    configured=tomllib.loads(raw.decode()).get('keyboard_shortcuts',{}).get('new_terminal')
+    if not isinstance(configured,list) or not configured or not isinstance(configured[0],str):
+        raise RuntimeError('the actual private New terminal key binding is unavailable')
+    chord=configured[0].lower()
+    if not re.fullmatch(r'(?:(?:ctrl|shift|alt|super)\+)+(?:[a-z0-9]|f(?:[1-9]|1[0-9]|2[0-4]))',chord):
+        raise RuntimeError('the actual private New terminal key binding is unsupported by this rehearsal')
+    return {'path':str(path),'sha256':hashlib.sha256(raw).hexdigest(),'configured':configured,'chord':chord}
+
+
+def terminal_cards(root, slot='main'):
+    data=Path(root)/'home/.local/share/cagents'
+    database=data/'sessions.sqlite3' if slot=='main' else data/'windows'/slot/'sessions.sqlite3'
+    with closing(sqlite3.connect(database.as_uri()+'?mode=ro',uri=True,timeout=1)) as connection:
+        connection.execute('PRAGMA query_only=ON')
+        connection.execute('BEGIN')
+        return [{'database':str(database),'card':row[0],'workspace':row[1],'focused':row[2]==row[0],
+                 'terminal_id':row[3],'recipe':json.loads(row[4]),'continuity':json.loads(row[5])}
+                for row in connection.execute(
+                    "SELECT c.card_id,c.workspace_id,w.focused_card_id,r.terminal_id,r.recipe_json,r.continuity_json "
+                    "FROM cards c JOIN workspaces w ON w.workspace_id=c.workspace_id "
+                    "JOIN terminal_recipes r ON r.card_id=c.card_id "
+                    "WHERE c.kind_tag='terminal' AND c.existence_json=?",[json.dumps('open')])]
+
+
+def new_terminal_action_contract(evidence, version_root):
+    version_root=Path(version_root)
+    def ui(snapshot):
+        return {(row['pid'],row['start_ticks']) for row in snapshot['processes']
+                if row.get('executable')==str(version_root/'bin/cagents-ui')}
+    original=ui(evidence['before_processes'])
+    if (evidence['before_processes']['errors'] or evidence['after_processes']['errors']
+            or len(original)!=2 or original!=ui(evidence['after_processes'])
+            or evidence['before_windows']!=evidence['after_windows']):
+        raise RuntimeError('the normal user action did not remain in the two relaunched UI processes')
+    status=evidence['after_status'].get('data',{})
+    show=evidence['terminal'].get('data',{})
+    terminal=show.get('terminal',{}).get('session',{})
+    proof=show.get('proof')
+    receipt=evidence['receipt']
+    outcome=receipt.get('outcome',{})
+    census=evidence['census']
+    if (not isinstance(proof,dict) or proof==evidence['before_serving']
+            or any(not proof.get(field) for field in ('host_session_id','boot_id','host_incarnation'))
+            or evidence['after_status'].get('ok') is not True or status.get('running') is not True
+            or status.get('daemon_version')!=version_root.name or status.get('instance')!='production'
+            or status.get('socket')!=str(Path(evidence['after_processes']['root'])/'rt/cagents/cagentsd.sock')
+            or census.get('source')!=proof or outcome.get('state')!='usable' or outcome.get('serving')!=proof
+            or receipt.get('transaction')!=census.get('transaction')
+            or receipt.get('census_digest')!=evidence['census_digest']
+            or terminal not in census.get('terminals',[])):
+        raise RuntimeError('the new terminal has no verified Ready daemon and exact live descriptor')
+    card=evidence['selected_card']
+    if (not card['focused'] or card['card'] in evidence['cards_before_input']
+            or card['terminal_id']!=terminal.get('id') or card['recipe']!=terminal.get('launch')
+            or card['continuity']!={'live':proof} or terminal.get('continuity')!={'live':proof}):
+        raise RuntimeError('the native user action did not focus a newly issued terminal card')
+    line=evidence['output_line']
+    if (line not in evidence['terminal_snapshot'].get('data',{}).get('snapshot',{}).get('lines',[])
+            or line!=f"{evidence['token']} pid={evidence['shell_pid']}"):
+        raise RuntimeError('the typed shell command did not produce the exact terminal output')
+    shells=[row for row in evidence['after_processes']['processes']
+            if row['pid']==evidence['shell_pid'] and row.get('start_ticks',0)>0
+            and row.get('terminal_id')==terminal['id']
+            and row.get('executable')==str(Path(terminal['launch']['program']).resolve())]
+    daemons=[row for row in evidence['after_processes']['processes']
+             if row.get('executable')==str(version_root/'bin/cagentsd') and row.get('argv')==[row['executable']]]
+    if len(shells)!=1 or len(daemons)!=1:
+        raise RuntimeError('the user terminal shell or its matched daemon lacks kernel identity evidence')
+    for field in ('claude_user_prompts','codex_thread_starts','codex_turn_starts'):
+        if evidence['activity_before'][field]!=evidence['activity_after'][field]:
+            raise RuntimeError('a provider conversation or prompt was replayed during the normal terminal action')
+    return {'shell':shells[0],'daemon':daemons[0],'serving':proof,'terminal_id':terminal['id']}
+
+
+def terminal_restart_failure_contract(evidence, version_root):
+    """Only the observed old-policy failure qualifies as a before example."""
+    version_root=Path(version_root)
+    def ui(snapshot):
+        return {(row['pid'],row['start_ticks']) for row in snapshot['processes']
+                if row.get('executable')==str(version_root/'bin/cagents-ui')}
+    original=ui(evidence['before_processes'])
+    status=evidence['after_status'].get('data',{})
+    card=evidence['selected_card']
+    diagnostic=evidence['failure_diagnostic']
+    fields=dict(line.split(': ',1) for line in diagnostic.splitlines() if ': ' in line)
+    daemons=[row for row in evidence['after_processes']['processes']
+             if Path(row.get('executable','')).name=='cagentsd' and row.get('argv')==[row['executable']]]
+    if (evidence['before_processes']['errors'] or evidence['after_processes']['errors']
+            or len(original)!=2 or original!=ui(evidence['after_processes'])
+            or evidence['before_windows']!=evidence['after_windows']
+            or evidence['after_status'].get('ok') is not True or status.get('running') is not False
+            or status.get('daemon_present') is not False or status.get('instance')!='production'
+            or status.get('socket')!=str(Path(evidence['after_processes']['root'])/'rt/cagents/cagentsd.sock')
+            or daemons or not card['focused'] or card['card'] in evidence['cards_before_input']
+            or len(diagnostic)>16384 or not fields.get('Code') or not fields.get('Message')
+            or fields.get('Terminal')!=card['terminal_id']
+            or evidence['failure_observation'].get('window',{}).get('id')!=evidence['before_windows']['main']):
+        raise RuntimeError('the before example did not prove a failed new terminal in the same native window')
+    for field in ('claude_user_prompts','codex_thread_starts','codex_turn_starts'):
+        if evidence['activity_before'][field]!=evidence['activity_after'][field]:
+            raise RuntimeError('the before example replayed a provider conversation or prompt')
+    return {'outcome':'expected_terminal_restart_failure','failed_card':card,'status':evidence['after_status']}
 
 
 def existing_only_contract(before, after, activity_before, activity_after, version_root):
@@ -422,6 +553,147 @@ class Rehearsal:
         result['views']={'before':'ui-chats-after.json','after':'ui-chats-existing-only.json'}
         (self.root/'existing-only.json').write_text(json.dumps(result,indent=2,sort_keys=True)+'\n')
 
+    def private_processes(self, after_intentional_stop=False):
+        flags=['--after-intentional-stop'] if after_intentional_stop else []
+        _, output=self.call('env','/usr/bin/python3',Path(__file__).with_name('rehearse_update_records.py'),
+                           'private-processes',self.root,*flags)
+        return json.loads(output)
+
+    def new_terminal_after_restore(self, version, expect_failure=False):
+        """Exercise a normal native action after the completed restore boundary."""
+        destination=self.root/'new-terminal-after-restore'
+        destination.mkdir(mode=0o700)
+        version_root=self.root/f'home/.local/share/cagents-install/versions/{version}'
+        _, before_status=self.cli('--no-start','daemon','status')
+        _, inventory=self.cli('--no-start','terminal','list','--all')
+        before=self.private_processes()
+        before_windows={slot:window['id'] for slot,window in self.mapped().items() if slot in ('main','second')}
+        shortcut=terminal_shortcut(self.root)
+        status=before_status.get('data',{})
+        owners=[row for row in before['processes'] if row.get('executable')==str(version_root/'bin/cagentsd')
+                and row.get('argv')==[row['executable']]]
+        if (before['errors'] or len(owners)!=1 or before_windows.keys()!={'main','second'}
+                or status.get('instance')!='production' or status.get('running') is not True
+                or status.get('daemon_version')!=version
+                or status.get('socket')!=str(self.root/'rt/cagents/cagentsd.sock')):
+            raise RuntimeError('normal-action test requires the matched private serving daemon and both windows')
+        self.call('wm','action','focus-window','--id',before_windows['main'])
+        self.call('shot','new-terminal-before-stop',timeout=45)
+        evidence={'before_processes':before,'before_windows':before_windows,'before_status':before_status,
+                  'before_serving':inventory['data']['proof'],'original_terminals':inventory,
+                  'initial_verified_record':'records/existing-only-after',
+                  'activity_before':provider_activity(self.root),'shortcut':shortcut,'events':[]}
+        artifact=self.root/'new-terminal-after-restore.json'
+        def save():
+            artifact.write_text(json.dumps(evidence,indent=2,sort_keys=True)+'\n')
+            artifact.chmod(0o600)
+        save()
+        self.call('stop-daemon',timeout=45)
+        evidence['events'].append({'event':'counted_private_stop_completed','monotonic':time.monotonic()})
+        deadline=time.monotonic()+20
+        while time.monotonic()<deadline:
+            observed=self.private_processes(after_intentional_stop=True)
+            if not any((row['pid'],row['start_ticks'])==(owners[0]['pid'],owners[0]['start_ticks'])
+                       for row in observed['processes']):
+                break
+            time.sleep(.1)
+        else:
+            raise RuntimeError('the deliberately stopped daemon process did not exit')
+        evidence['after_stop_processes']=observed
+        _, stopped_status=self.cli('--no-start','daemon','status',check=False)
+        evidence['after_stop_status']=stopped_status
+        evidence['events'].append({'event':'status_after_counted_stop','monotonic':time.monotonic(),
+                                   'running':stopped_status.get('data',{}).get('running')})
+        evidence['cards_before_input']=[card['card'] for card in terminal_cards(self.root)]
+        self.call('wm','action','focus-window','--id',before_windows['main'])
+        self.call('shot','new-terminal-before-action',timeout=45)
+        _, input_status=self.cli('--no-start','daemon','status',check=False)
+        evidence['before_input_status']=input_status
+        evidence['events'].append({'event':'status_before_user_input','monotonic':time.monotonic(),
+                                   'running':input_status.get('data',{}).get('running')})
+        evidence['daemon_start_observation']=('serving_before_new_terminal_input'
+            if input_status.get('data',{}).get('running') is True else
+            'not_serving_before_input; later_start_may_be_action_or_background_reconnect')
+        save()
+        self.call('drive','key',shortcut['chord'],timeout=30)
+        evidence['events'].append({'event':'native_new_terminal_shortcut_sent','monotonic':time.monotonic()})
+        deadline=time.monotonic()+45
+        selected=None
+        while time.monotonic()<deadline:
+            try:
+                candidates=[card for card in terminal_cards(self.root) if card['focused']
+                            and card['card'] not in evidence['cards_before_input']]
+                if len(candidates)==1:
+                    selected=candidates[0]
+                    if expect_failure:
+                        code, copied=self.call('drive','click','Copy details',timeout=30,check=False)
+                        if not code:
+                            code, diagnostic=self.call('app','wl-paste','--no-newline',timeout=10,check=False)
+                            if not code:
+                                fields=dict(line.split(': ',1) for line in diagnostic.splitlines() if ': ' in line)
+                                if fields.get('Terminal')==selected['terminal_id'] and fields.get('Code'):
+                                    evidence['failure_diagnostic']=diagnostic
+                                    break
+                    code, shown=self.cli('--no-start','terminal','show',selected['terminal_id'],check=False)
+                    actual=shown.get('data',{}).get('terminal',{}).get('session',{})
+                    if (not code and actual.get('continuity')=={'live':shown.get('data',{}).get('proof')}
+                            and selected['continuity']==actual['continuity'] and selected['recipe']==actual['launch']):
+                        if expect_failure:
+                            raise RuntimeError('the expected before failure instead opened a live terminal')
+                        break
+            except (sqlite3.Error,OSError):
+                pass
+            time.sleep(.2)
+        else:
+            raise RuntimeError('the native New terminal action did not create a focused live terminal')
+        evidence['selected_card']=selected
+        if expect_failure:
+            _, observed=self.call('drive','--json','observe',timeout=30)
+            evidence['failure_observation']=json.loads(observed)
+            _, evidence['after_status']=self.cli('--no-start','daemon','status')
+            evidence['after_processes']=self.private_processes(after_intentional_stop=True)
+            evidence['after_windows']={slot:window['id'] for slot,window in self.mapped().items() if slot in ('main','second')}
+            evidence['activity_after']=provider_activity(self.root)
+            save()
+            evidence['verified']=terminal_restart_failure_contract(evidence,version_root)
+            self.call('drive','move','850,750',timeout=30)
+            self.call('shot','new-terminal-failed',timeout=45)
+            save()
+            return
+        evidence['terminal']=shown
+        self.call('shot','new-terminal-opened',timeout=45)
+        token='REHEARSAL_TERMINAL_'+uuid.uuid4().hex
+        receipt=destination/'typed-output.txt'
+        command=f"umask 077; printf '{token} pid=%s\\n' \"$$\" | tee {shlex.quote(str(receipt))}\n"
+        evidence['token']=token
+        evidence['typed_command']=command
+        self.call('drive','type',command,timeout=30)
+        deadline=time.monotonic()+15
+        while time.monotonic()<deadline:
+            line=receipt.read_text().strip() if receipt.exists() else ''
+            match=re.fullmatch(re.escape(token)+r' pid=([1-9][0-9]*)',line)
+            if match:
+                break
+            time.sleep(.1)
+        else:
+            raise RuntimeError('typing into the new native terminal did not execute the shell command')
+        evidence.update(output_line=line,shell_pid=int(match[1]))
+        _, evidence['terminal_snapshot']=self.cli('--no-start','terminal','snapshot',selected['terminal_id'])
+        _, evidence['after_status']=self.cli('--no-start','daemon','status')
+        evidence['after_processes']=self.private_processes(after_intentional_stop=True)
+        evidence['after_windows']={slot:window['id'] for slot,window in self.mapped().items() if slot in ('main','second')}
+        census,outcome=destination/'census.json',destination/'outcome.json'
+        self.cli('--no-start','daemon','capture-update-census','--output',census)
+        self.cli('--no-start','daemon','verify-update-census','--require-original','--census',census,'--outcome',outcome)
+        evidence.update(census=json.loads(census.read_text()),receipt=json.loads(outcome.read_text()),
+                        census_digest=hashlib.sha256(census.read_bytes()).hexdigest(),activity_after=provider_activity(self.root))
+        evidence['events'].append({'event':'new_terminal_output_and_ready_owner_verified','monotonic':time.monotonic()})
+        save()
+        evidence['verified']=new_terminal_action_contract(evidence,version_root)
+        self.call('drive','move','850,750',timeout=30)
+        self.call('shot','new-terminal-working',timeout=45)
+        save()
+
     def seed(self, args):
         evidence = []
         def seed(name, argv, project=None, provider=None):
@@ -708,11 +980,15 @@ class Rehearsal:
                 self.errors.append('comparison found regressions or missing evidence; see comparison step')
             if args.reopen_existing_only and not self.errors:
                 self.reopen_existing_only(args.new_version)
+            if args.new_terminal_after_restore and not self.errors:
+                self.new_terminal_after_restore(args.new_version,args.expect_terminal_restart_failure)
         except Exception as exc:
             failure = str(exc)
             self.errors.append(failure)
-            # Preserve an after inventory even when an earlier operation failed.
-            self.call('record','after',timeout=150,check=False)
+            # The later destructive test must never overwrite the verified
+            # preservation inventory captured before its intentional stop.
+            if not (self.root/'new-terminal-after-restore.json').exists():
+                self.call('record','after',timeout=150,check=False)
         finally:
             if ((self.root/'records/before/snapshot.json').exists()
                     and (self.root/'records/after/snapshot.json').exists()
@@ -740,6 +1016,9 @@ class Rehearsal:
             policy=self.root/'existing-only.json'
             if policy.exists():
                 report += ['',f'Existing-only UI process replacement: {policy}',policy.read_text()]
+            action=self.root/'new-terminal-after-restore.json'
+            if action.exists():
+                report += ['',f'Explicit daemon stop and native New terminal action: {action}',action.read_text()]
             for side in ('before','after','existing-only'):
                 views = self.root/f'ui-chats-{side}.json'
                 if views.exists():
@@ -808,6 +1087,8 @@ def main():
     run.add_argument('--expect-console-refusal', action='store_true', help='with --fail-new-daemon, require console refusal before startup and preserve all work')
     run.add_argument('--fail-new-daemon', action='store_true', help='fail private candidate startup; require old current, serving daemon and preserved work')
     run.add_argument('--reopen-existing-only',action='store_true',help='after a healthy update reopen both UI windows with --restore-existing-only; require unchanged daemon, providers and work')
+    run.add_argument('--new-terminal-after-restore',action='store_true',help='after verified existing-only reopening deliberately stop the private daemon, then open and use a new terminal through the same native UI')
+    run.add_argument('--expect-terminal-restart-failure',action='store_true',help='before example only: require the native new-terminal action to fail with no daemon after the deliberate stop')
     run.add_argument('--reopen-timeout',type=float,default=45)
     seed_options(run)
     seed_options(commands.add_parser('seed'))
@@ -820,6 +1101,10 @@ def main():
         parser.error('--expect-console-refusal requires --fail-new-daemon and a seeded console')
     if args.command == 'run' and args.reopen_existing_only and (args.fail_new_daemon or args.no_codex or args.ceditor):
         parser.error('--reopen-existing-only requires a healthy update with Claude and Codex and no ceditor')
+    if args.command == 'run' and args.new_terminal_after_restore and not args.reopen_existing_only:
+        parser.error('--new-terminal-after-restore requires --reopen-existing-only')
+    if args.command == 'run' and args.expect_terminal_restart_failure and not args.new_terminal_after_restore:
+        parser.error('--expect-terminal-restart-failure requires --new-terminal-after-restore')
     rehearsal=Rehearsal(args.root,args.shell)
     try:
         if args.command=='wait':

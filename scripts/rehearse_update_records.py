@@ -128,7 +128,7 @@ def stores(home: Path, errors: list[str]) -> dict:
     return result
 
 
-def processes(root: Path, errors: list[str] | None = None) -> list[dict]:
+def processes(root: Path, errors: list[str] | None = None, *, require_seeded_child: bool = True) -> list[dict]:
     result = []
     own = os.getpid()
     home_marker = f"HOME={root / 'home'}".encode()
@@ -165,7 +165,7 @@ def processes(root: Path, errors: list[str] | None = None) -> list[dict]:
             if errors is not None:
                 errors.append(f"{path.relative_to(root)}: invalid holder registry: {error}")
     child_file = root / "child.pid"
-    if child_file.exists():
+    if require_seeded_child and child_file.exists():
         try:
             child_pid = int(child_file.read_text().strip())
             child = next((row for row in result if row["pid"] == child_pid), None)
@@ -233,19 +233,27 @@ def recovery_evidence(out: Path, errors: list[str]) -> dict | None:
         return None
 
 
-def namespace_source(root: Path, terminals: Path) -> dict:
-    """Headless socket/owner evidence, without claiming any saved UI state."""
+def private_process_snapshot(root: Path, *, after_intentional_stop: bool = False) -> dict:
     marker = root / '.rehearse-update'
     if marker.is_symlink() or marker.read_text().strip() != str(root):
-        raise ValueError('namespace capture requires a matching private root')
+        raise ValueError('process capture requires a matching private root')
+    errors: list[str] = []
+    snapshot = {'root': str(root), 'processes': processes(root, errors, require_seeded_child=not after_intentional_stop), 'errors': errors}
+    if after_intentional_stop:
+        snapshot['after_intentional_stop'] = True
+    return snapshot
+
+
+def namespace_source(root: Path, terminals: Path) -> dict:
+    """Headless socket/owner evidence, without claiming any saved UI state."""
+    snapshot = private_process_snapshot(root)
     response = json.loads(private_evidence(terminals))
     proof = response.get('data', {}).get('proof')
     if response.get('ok') is not True or not isinstance(proof, dict) or any(
             not isinstance(proof.get(field), str) or not proof[field]
             for field in ('host_session_id', 'boot_id', 'host_incarnation')):
         raise ValueError('namespace capture requires the authenticated baseline socket proof')
-    errors: list[str] = []
-    return {'root': str(root), 'serving': proof, 'processes': processes(root, errors), 'errors': errors}
+    return {**snapshot, 'serving': proof}
 
 
 def record(root: Path, out: Path, windows: Path | None) -> dict:
@@ -449,12 +457,19 @@ def main() -> int:
     namespace = commands.add_parser("namespace-source")
     namespace.add_argument("root", type=Path)
     namespace.add_argument("terminals", type=Path)
+    process_capture = commands.add_parser("private-processes")
+    process_capture.add_argument("root", type=Path)
+    process_capture.add_argument("--after-intentional-stop", action="store_true")
     comparison = commands.add_parser("compare")
     comparison.add_argument("before", type=Path)
     comparison.add_argument("after", type=Path)
     comparison.add_argument("--json", action="store_true")
     args = parser.parse_args()
     try:
+        if args.command == "private-processes":
+            snapshot = private_process_snapshot(args.root.resolve(), after_intentional_stop=args.after_intentional_stop)
+            print(dump(snapshot), end="")
+            return int(bool(snapshot['errors']))
         if args.command == "namespace-source":
             snapshot = namespace_source(args.root.resolve(), args.terminals)
             print(dump(snapshot), end="")

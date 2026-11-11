@@ -30,7 +30,9 @@ DIR holds one private user. Its path must be short (sockets live below it).
                        --working TEXT, --stop TEXT,
                        --upgrade-arg=--interrupt, --untitled 0|1|2, --no-codex,
                        --no-child, --ignore-term, --no-init, --exit-mid-turn,
-                       --uncarryable, --unreachable, --reopen-existing-only.
+                       --uncarryable, --unreachable, --reopen-existing-only,
+                       --new-terminal-after-restore,
+                       --expect-terminal-restart-failure (before example).
                        See run --help.
   compare A B          Compare record names, directories or snapshot JSON.
   cleanup              Stop everything and remove this marked root.
@@ -61,6 +63,7 @@ DIR holds one private user. Its path must be short (sockets live below it).
   record NAME          Write DIR/records/NAME/: daemon status, terminals,
                        sessions, channels, saved panes and their processes.
   stop                 End everything the private user runs, the daemon too.
+  stop-daemon          Stop only the private daemon with counted confirmation.
   status               Report the desktop, daemon and processes.
 USAGE
 }
@@ -631,6 +634,16 @@ cmd_stop() {
     return "$cleanup_status"
 }
 
+cmd_stop_daemon() {
+    require_init
+    local prefix=$user_home/.local/share/cagents-install cli capability
+    cli=$(readlink -f -- "$user_home/.local/bin/cagents")
+    [[ $cli == "$prefix"/versions/*/bin/cagents ]] || die 'private daemon stop requires its installed CLI' 2
+    [ "$cli" = "$(readlink -f -- "$prefix/current/bin/cagents")" ] || die 'private daemon stop requires the current build' 2
+    capability=$(user_env timeout -k 5 20 "$cli" --no-start daemon preflight) || return
+    user_env timeout -k 5 30 "$cli" --no-start --json daemon stop --confirm "$capability"
+}
+
 cmd_status() {
     if desktop_live; then printf 'desktop: running (pid %s)\n' "$(cat "$desktop/pid")"; else printf 'desktop: stopped\n'; fi
     printf 'installed: %s\n' "$(readlink -- "$user_home/.local/share/cagents-install/current" 2>/dev/null || echo none)"
@@ -657,6 +670,7 @@ case $command in
     shot) cmd_shot "$@" ;;
     record) cmd_record "$@" ;;
     stop) cmd_stop ;;
+    stop-daemon) cmd_stop_daemon ;;
     status) cmd_status ;;
     __desktop) run_desktop "$@" ;;
     __inner) run_inner ;;

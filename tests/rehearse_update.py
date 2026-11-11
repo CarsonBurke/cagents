@@ -575,6 +575,142 @@ class CandidateNamespace(unittest.TestCase):
                 records.namespace_source(root,terminals)
 
 
+class NativeTerminalAfterRestore(unittest.TestCase):
+    def module(self):
+        spec=importlib.util.spec_from_file_location('native_terminal_rehearsal',REPOSITORY/'scripts/rehearse_update_run.py')
+        scenario=importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(scenario)
+        return scenario
+
+    def evidence(self):
+        root=Path('/var/tmp/native-action')
+        version=root/'home/.local/share/cagents-install/versions/new'
+        old={'host_session_id':'old','boot_id':'boot','host_incarnation':'old'}
+        new={'host_session_id':'new','boot_id':'boot','host_incarnation':'new'}
+        session={'id':'new-terminal','launch':{'program':'/bin/bash','working_directory':str(root)},'continuity':{'live':new}}
+        def process(pid,image,argv,**fields):
+            return {'pid':pid,'start_ticks':pid+1000,'executable':image,'argv':argv,**fields}
+        windows={'main':10,'second':20}
+        uis=[process(100,str(version/'bin/cagents-ui'),[str(version/'bin/cagents-ui'),'--restore-existing-only']),
+             process(200,str(version/'bin/cagents-ui'),[str(version/'bin/cagents-ui'),'--restore-existing-only','--window','second'])]
+        before={'root':str(root),'errors':[],'processes':uis+[process(300,str(version/'bin/cagentsd'),[str(version/'bin/cagentsd')])]}
+        after={'root':str(root),'errors':[],'processes':copy.deepcopy(uis)+[
+            process(400,str(version/'bin/cagentsd'),[str(version/'bin/cagentsd')]),
+            process(500,str(Path('/bin/bash').resolve()),['/bin/bash'],terminal_id='new-terminal')]}
+        activity={'claude_chat_launches':1,'claude_user_prompts':1,'codex_chat_launches':2,'codex_thread_starts':1,'codex_turn_starts':1}
+        return version,{'before_processes':before,'after_processes':after,'before_windows':windows,'after_windows':windows,
+            'before_serving':old,'after_status':{'ok':True,'data':{'instance':'production','running':True,'daemon_version':'new',
+                'socket':str(root/'rt/cagents/cagentsd.sock')}},'terminal':{'ok':True,'data':{'terminal':{'session':session},'proof':new}},
+            'census':{'transaction':'tx','source':new,'terminals':[session]},'census_digest':'digest',
+            'receipt':{'transaction':'tx','census_digest':'digest','outcome':{'state':'usable','serving':new}},
+            'selected_card':{'focused':True,'card':'new-card','terminal_id':'new-terminal','recipe':session['launch'],'continuity':{'live':new}},
+            'cards_before_input':['old-card'],'token':'UNIQUE_OUTPUT','output_line':'UNIQUE_OUTPUT pid=500','shell_pid':500,
+            'terminal_snapshot':{'data':{'snapshot':{'lines':['$ command','UNIQUE_OUTPUT pid=500']}}},
+            'activity_before':copy.deepcopy(activity),'activity_after':copy.deepcopy(activity)}
+
+    def test_normal_action_requires_native_focus_real_shell_and_new_ready_owner(self):
+        scenario=self.module()
+        version,evidence=self.evidence()
+        result=scenario.new_terminal_action_contract(evidence,version)
+        self.assertEqual(result['shell']['pid'],500)
+        self.assertEqual(result['daemon']['pid'],400)
+        cases=[]
+        changed=copy.deepcopy(evidence);changed['after_processes']['processes'][0]['pid']=101;cases.append(changed)
+        changed=copy.deepcopy(evidence);changed['after_windows']={'main':11,'second':20};cases.append(changed)
+        changed=copy.deepcopy(evidence);changed['before_serving']=changed['terminal']['data']['proof'];cases.append(changed)
+        changed=copy.deepcopy(evidence);changed['selected_card']['card']='old-card';cases.append(changed)
+        changed=copy.deepcopy(evidence);changed['selected_card']['focused']=False;cases.append(changed)
+        changed=copy.deepcopy(evidence);changed['after_processes']['processes'][-1]['terminal_id']='foreign';cases.append(changed)
+        changed=copy.deepcopy(evidence);changed['after_processes']['processes'][-1]['executable']='/usr/bin/foreign';cases.append(changed)
+        changed=copy.deepcopy(evidence);changed['receipt']['census_digest']='foreign';cases.append(changed)
+        changed=copy.deepcopy(evidence);changed['census']['terminals']=[];cases.append(changed)
+        changed=copy.deepcopy(evidence);changed['activity_after']['codex_turn_starts']=2;cases.append(changed)
+        changed=copy.deepcopy(evidence);changed['activity_after']['claude_user_prompts']=2;cases.append(changed)
+        changed=copy.deepcopy(evidence);changed['terminal_snapshot']['data']['snapshot']['lines']=['printf UNIQUE_OUTPUT pid=500'];cases.append(changed)
+        for changed in cases:
+            with self.subTest(evidence=changed),self.assertRaises(RuntimeError):
+                scenario.new_terminal_action_contract(changed,version)
+
+    def test_expected_before_failure_requires_typed_failure_and_absent_daemon(self):
+        scenario=self.module()
+        version,evidence=self.evidence()
+        evidence['after_status']['data'].update(running=False,daemon_present=False)
+        evidence['after_processes']['processes']=evidence['before_processes']['processes'][:2]
+        evidence['selected_card']['continuity']={'relaunch_available':{'recipe':{'program':'/bin/bash'},'last_exit':None}}
+        evidence['failure_diagnostic']='Code: runtime_hydration_failed\nMessage: The terminal could not be restored.\nTerminal: new-terminal\nDirectory: /var/tmp/native-action'
+        evidence['failure_observation']={'window':{'id':10}}
+        result=scenario.terminal_restart_failure_contract(evidence,version)
+        self.assertEqual(result['outcome'],'expected_terminal_restart_failure')
+        for mutation in ('missing-error','foreign-error','daemon','old-card','replayed-prompt','claude-replayed-prompt'):
+            changed=copy.deepcopy(evidence)
+            if mutation=='missing-error':changed['failure_diagnostic']=''
+            elif mutation=='foreign-error':changed['failure_diagnostic']=evidence['failure_diagnostic'].replace('new-terminal','foreign-terminal')
+            elif mutation=='daemon':changed['after_status']['data']['running']=True
+            elif mutation=='old-card':changed['selected_card']['card']='old-card'
+            elif mutation=='replayed-prompt':changed['activity_after']['codex_turn_starts']=2
+            else:changed['activity_after']['claude_user_prompts']=2
+            with self.subTest(mutation=mutation),self.assertRaises(RuntimeError):
+                scenario.terminal_restart_failure_contract(changed,version)
+
+    def test_shortcut_is_read_from_the_actual_private_settings_without_a_default(self):
+        scenario=self.module()
+        with tempfile.TemporaryDirectory(prefix='ru-action-key-') as temporary:
+            root=Path(temporary)
+            path=root/'home/.config/cagents/settings.toml';path.parent.mkdir(parents=True)
+            path.write_text('[keyboard_shortcuts]\nnew_terminal=["Ctrl+Shift+N"]\n')
+            result=scenario.terminal_shortcut(root)
+            self.assertEqual(result['chord'],'ctrl+shift+n')
+            self.assertEqual(result['sha256'],hashlib.sha256(path.read_bytes()).hexdigest())
+            path.write_text('[keyboard_shortcuts]\nnew_thread=["Ctrl+T"]\n')
+            with self.assertRaisesRegex(RuntimeError,'unavailable'):
+                scenario.terminal_shortcut(root)
+
+    def test_terminal_card_is_bound_through_normalized_recipe_and_live_proof(self):
+        scenario=self.module()
+        with tempfile.TemporaryDirectory(prefix='ru-action-card-') as temporary:
+            root=Path(temporary)
+            database=root/'home/.local/share/cagents/sessions.sqlite3'
+            database.parent.mkdir(parents=True)
+            recipe={'program':'/bin/bash'}
+            continuity={'live':{'host_session_id':'new','boot_id':'boot','host_incarnation':'new'}}
+            with closing(sqlite3.connect(database)) as connection, connection:
+                connection.executescript('CREATE TABLE cards(card_id TEXT,workspace_id TEXT,kind_tag TEXT,existence_json TEXT);'
+                    'CREATE TABLE workspaces(workspace_id TEXT,focused_card_id TEXT);'
+                    'CREATE TABLE terminal_recipes(card_id TEXT,terminal_id TEXT,recipe_json TEXT,continuity_json TEXT);')
+                connection.execute('INSERT INTO cards VALUES(?,?,?,?)',['card','workspace','terminal',json.dumps('open')])
+                connection.execute('INSERT INTO workspaces VALUES(?,?)',['workspace','card'])
+                connection.execute('INSERT INTO terminal_recipes VALUES(?,?,?,?)',['card','terminal',json.dumps(recipe),json.dumps(continuity)])
+            cards=scenario.terminal_cards(root)
+            self.assertEqual(len(cards),1)
+            self.assertEqual((cards[0]['card'],cards[0]['terminal_id'],cards[0]['focused']),('card','terminal',True))
+            self.assertEqual(cards[0]['recipe'],recipe)
+            self.assertEqual(cards[0]['continuity'],continuity)
+
+    def test_only_new_terminal_flags_require_the_complete_healthy_restore_flow(self):
+        scenario=self.module()
+        base=['script','/var/tmp/unused',str(SCRIPT),'run','--old-dir','old','--old-version','old',
+              '--old-installer','old/install.sh','--new-dir','new','--new-version','new','--new-installer','new/install.sh']
+        for flags in (['--new-terminal-after-restore'],['--expect-terminal-restart-failure']):
+            with self.subTest(flags=flags),patch.object(sys,'argv',base+flags),patch('sys.stderr',new=io.StringIO()):
+                with self.assertRaises(SystemExit) as error:
+                    scenario.main()
+                self.assertEqual(error.exception.code,2)
+
+    def test_ended_original_child_is_allowed_only_after_the_deliberate_stop(self):
+        with tempfile.TemporaryDirectory(prefix='ru-action-ended-child-') as temporary:
+            root=Path(temporary)
+            (root/'.rehearse-update').write_text(str(root)+'\n')
+            (root/'child.pid').write_text(str(int(Path('/proc/sys/kernel/pid_max').read_text())+1))
+            strict=records.private_process_snapshot(root)
+            self.assertTrue(any('child.pid' in error for error in strict['errors']))
+            after_stop=records.private_process_snapshot(root,after_intentional_stop=True)
+            self.assertEqual(after_stop['errors'],[])
+            self.assertIs(after_stop['after_intentional_stop'],True)
+            errors=[]
+            records.processes(root,errors)
+            self.assertTrue(any('child.pid' in error for error in errors))
+
+
 class ExistingOnlyReopen(unittest.TestCase):
     def module(self):
         spec=importlib.util.spec_from_file_location('existing_only_rehearsal',REPOSITORY/'scripts/rehearse_update_run.py')
@@ -637,6 +773,14 @@ class ExistingOnlyReopen(unittest.TestCase):
             root=Path(temporary)
             (root/'home/.claude').mkdir(parents=True);(root/'logs').mkdir()
             (root/'home/.claude/fixture-launches').write_text('new\nresumed-thread\n')
+            history=root/'home/.claude/projects/project/session.jsonl'
+            history.parent.mkdir(parents=True)
+            rows=[{'type':'user','message':{'content':'first prompt'}},
+                  {'type':'user','message':{'content':[{'type':'text','text':'second prompt'}]}},
+                  {'type':'user','message':{'content':[{'type':'tool_result','content':'tool output'}]}},
+                  {'type':'user','isMeta':True,'message':{'content':'metadata'}},
+                  {'type':'user','origin':{'kind':'task-notification'},'message':{'content':'background'}}]
+            history.write_text(''.join(json.dumps(row)+'\n' for row in rows))
             events=[
                 {'event':'launch','pid':1,'argv':['app-server','--listen','unix:///conversation/control.sock']},
                 {'event':'request','pid':1,'method':'thread/start'},
@@ -648,12 +792,15 @@ class ExistingOnlyReopen(unittest.TestCase):
             ]
             path=root/'logs/codex-provider.jsonl'
             path.write_text(''.join(json.dumps(event)+'\n' for event in events))
-            expected={'claude_chat_launches':2,'codex_chat_launches':2,'codex_thread_starts':1,'codex_turn_starts':1}
+            expected={'claude_chat_launches':2,'claude_user_prompts':2,'codex_chat_launches':2,'codex_thread_starts':1,'codex_turn_starts':1}
             self.assertEqual(scenario.provider_activity(root),expected)
             with path.open('a') as stream:
                 stream.write(json.dumps({'event':'launch','pid':4,'argv':['app-server']})+'\n')
                 stream.write(json.dumps({'event':'probe-request','pid':4,'method':'model/list'})+'\n')
             self.assertEqual(scenario.provider_activity(root),expected)
+            with history.open('a') as stream:
+                stream.write(json.dumps(rows[0])+'\n')
+            self.assertEqual(scenario.provider_activity(root)['claude_user_prompts'],3)
 
     def test_option_refuses_failure_or_missing_codex_before_actions(self):
         with tempfile.TemporaryDirectory(prefix='ru-policy-args-') as temporary:
@@ -808,6 +955,38 @@ class PrivateRoot(unittest.TestCase):
     def call(self, *args, **kwargs):
         return subprocess.run([str(SCRIPT), "--root", str(self.root), *args],
                               capture_output=True, text=True, timeout=20, **kwargs)
+
+    def test_counted_daemon_stop_is_private_and_leaves_other_private_processes_alive(self):
+        self.assertEqual(self.call('init').returncode,0)
+        prefix=self.root/'home/.local/share/cagents-install'
+        cli=prefix/'versions/new/bin/cagents';cli.parent.mkdir(parents=True)
+        cli.write_text('''#!/usr/bin/python3
+import json,os,sys
+from pathlib import Path
+args=sys.argv[1:]
+if args==['--no-start','daemon','preflight']:
+ print('fixture-private-counted-capability')
+elif args==['--no-start','--json','daemon','stop','--confirm','fixture-private-counted-capability']:
+ Path(os.environ['CAGENTS_REHEARSAL_ROOT'],'logs','stop-only.json').write_text(json.dumps({'home':os.environ['HOME']}))
+ print(json.dumps({'ok':True,'data':{'stopped':True}}))
+else:sys.exit(2)
+''')
+        cli.chmod(0o755)
+        (prefix/'current').symlink_to('versions/new')
+        launcher=self.root/'home/.local/bin/cagents';launcher.symlink_to(prefix/'current/bin/cagents')
+        peer=subprocess.Popen(['sleep','60'],env={**os.environ,'HOME':str(self.root/'home')})
+        try:
+            result=self.call('stop-daemon')
+            self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+            self.assertNotIn('fixture-private-counted-capability',result.stdout+result.stderr)
+            self.assertIsNone(peer.poll())
+            self.assertEqual(json.loads((self.root/'logs/stop-only.json').read_text())['home'],str(self.root/'home'))
+            launcher.unlink();launcher.symlink_to('/usr/bin/false')
+            refused=self.call('stop-daemon')
+            self.assertEqual(refused.returncode,2)
+            self.assertIn('installed CLI',refused.stderr)
+        finally:
+            peer.terminate();peer.wait(timeout=5)
 
     def test_init_records_root_and_cleanup_refuses_mismatched_or_symlink_marker(self):
         result = self.call("init")
