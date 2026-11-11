@@ -4484,14 +4484,22 @@ mod tests {
             assert!(!paths.lock.exists());
             // Eager background publishers and device/pane readers share this
             // entrypoint; they must not create a daemon admission either.
-            assert!(crate::terminal::ensure_daemon_ready().is_err());
+            let assert_socket_only = |result| match result {
+                Err(crate::terminal::HostedTerminalStartError::HostProtocol(
+                    crate::control::ControlError::Connect(error),
+                )) => assert!(matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                )),
+                other => panic!(
+                    "recovery must fail at the existing socket, before binary lookup or daemon admission: {other:?}"
+                ),
+            };
+            assert_socket_only(crate::terminal::ensure_daemon_ready());
             assert!(!paths.lock.exists());
-            assert!(
-                crate::terminal::ensure_daemon_ready_for(
-                    crate::notifications::Application::Cagents,
-                )
-                .is_err()
-            );
+            assert_socket_only(crate::terminal::ensure_daemon_ready_for(
+                crate::notifications::Application::Cagents,
+            ));
             assert!(!paths.lock.exists());
             let result = ClientHandle::connect(
                 stranded_claude(Some(CONVERSATION)),
@@ -4501,7 +4509,12 @@ mod tests {
                 None,
                 |_| {},
             );
-            assert!(result.is_err());
+            let failure = result.err().expect("missing daemon must refuse attachment");
+            assert!(
+                failure
+                    .message
+                    .starts_with("Cannot connect to the proven chat daemon:")
+            );
             assert!(
                 !paths.lock.exists(),
                 "a read-only recovery attachment tried daemon admission"
@@ -4514,7 +4527,8 @@ mod tests {
             std::fs::create_dir(root.path().join(directory)).unwrap();
         }
         let name = std::thread::current().name().unwrap().to_owned();
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
             .args(["--exact", &name, "--nocapture"])
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
@@ -4523,9 +4537,13 @@ mod tests {
             .env("XDG_CONFIG_HOME", root.path().join("config"))
             .env("XDG_DATA_HOME", root.path().join("data"))
             .env("XDG_CACHE_HOME", root.path().join("cache"))
-            .env(CHILD, "1")
-            .output()
-            .unwrap();
+            .env(CHILD, "1");
+        // Keep hosted authority: the exact socket-only error below must prove
+        // policy selection without relying on a separate lifecycle refusal.
+        if let Some(authority) = std::env::var_os(crate::agent_execution::AUTHORITY_ENV) {
+            command.env(crate::agent_execution::AUTHORITY_ENV, authority);
+        }
+        let output = command.output().unwrap();
         assert!(
             output.status.success(),
             "{}{}",
