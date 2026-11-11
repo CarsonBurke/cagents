@@ -105,13 +105,20 @@ pub enum WindowRestorePolicy {
 }
 
 pub const RESTORE_EXISTING_ONLY_ARGUMENT: &str = "--restore-existing-only";
-static WINDOW_RESTORE_POLICY: OnceLock<WindowRestorePolicy> = OnceLock::new();
+struct WindowRestore {
+    launch: WindowRestorePolicy,
+    finished: AtomicBool,
+}
+static WINDOW_RESTORE_POLICY: OnceLock<WindowRestore> = OnceLock::new();
 
 /// Set once from this UI process's argv. A launch policy is never inherited by
 /// ordinary children through an environment marker.
 pub fn initialize_window_restore_policy(policy: WindowRestorePolicy) -> io::Result<()> {
-    let selected = WINDOW_RESTORE_POLICY.get_or_init(|| policy);
-    if *selected != policy {
+    let selected = WINDOW_RESTORE_POLICY.get_or_init(|| WindowRestore {
+        launch: policy,
+        finished: AtomicBool::new(false),
+    });
+    if selected.launch != policy {
         return Err(io::Error::other(
             "window restore policy already initialized",
         ));
@@ -120,7 +127,30 @@ pub fn initialize_window_restore_policy(policy: WindowRestorePolicy) -> io::Resu
 }
 
 pub fn window_restore_policy() -> WindowRestorePolicy {
-    WINDOW_RESTORE_POLICY.get().copied().unwrap_or_default()
+    WINDOW_RESTORE_POLICY
+        .get()
+        .map_or(WindowRestorePolicy::Ordinary, |restore| {
+            if restore.finished.load(Ordering::Acquire) {
+                WindowRestorePolicy::Ordinary
+            } else {
+                restore.launch
+            }
+        })
+}
+
+pub(crate) fn window_launch_restore_policy() -> WindowRestorePolicy {
+    WINDOW_RESTORE_POLICY
+        .get()
+        .map_or(WindowRestorePolicy::Ordinary, |restore| restore.launch)
+}
+
+/// The startup gate reached its saved-pane verdict, including an incomplete
+/// recovery. Later work uses ordinary admission; already-issued pane tasks
+/// retain their explicitly captured attachment-only intent.
+pub(crate) fn finish_window_restore() {
+    if let Some(restore) = WINDOW_RESTORE_POLICY.get() {
+        restore.finished.store(true, Ordering::Release);
+    }
 }
 
 pub fn window_slot() -> &'static str {

@@ -9172,6 +9172,10 @@ impl Cagents {
         terminate_source: bool,
         upgrade_admission: Option<chat::Session>,
     ) -> Task<Message> {
+        let intent = self
+            .startup_gate
+            .initial_panes
+            .chat_intent(card, session.id, intent);
         if intent == chat::Intent::Start
             && source.is_none()
             && !terminate_source
@@ -9216,9 +9220,9 @@ impl Cagents {
                             let _ = sender.try_send((target, wake));
                         };
                         match upgrade_admission {
-                            Some(canonical) => {
-                                ClientHandle::connect_upgrade(session, canonical, wake)
-                            }
+                            Some(canonical) => ClientHandle::connect_upgrade_with_intent(
+                                session, canonical, intent, wake,
+                            ),
                             None => ClientHandle::connect(
                                 session,
                                 intent,
@@ -10920,6 +10924,9 @@ impl Cagents {
                     }
                     return Task::none();
                 }
+                self.startup_gate
+                    .initial_panes
+                    .settled(target.card, attempt.session.id);
                 if result.is_err() && attempt.upgrade_admission.is_some() {
                     // Unproved lineage cannot bind the saved Content to the
                     // canonical actor. Keep it as an inert copy and leave
@@ -33047,3 +33054,7 @@ mod absence_tests;
 #[cfg(test)]
 #[path = "chat_ui/peer_draft_tests.rs"]
 mod peer_draft_tests;
+
+#[cfg(test)]
+#[path = "chat_ui/startup_restore_tests.rs"]
+mod startup_restore_tests;

@@ -485,6 +485,12 @@ pub(crate) fn socket_path_for_explicit_action() -> io::Result<Option<PathBuf>> {
     socket_path_with_policy(crate::control::daemon_autostart_disabled())
 }
 
+/// An issued initial pane keeps its read-only transport even after the
+/// window's startup gate has finished and new operations use autostart.
+pub(crate) fn existing_socket_path() -> io::Result<Option<PathBuf>> {
+    socket_path_with_policy(true)
+}
+
 fn socket_path_with_policy(no_start: bool) -> io::Result<Option<PathBuf>> {
     SELECTED
         .get()
@@ -1320,6 +1326,83 @@ mod tests {
         );
         assert!(context.socket_path_with_policy(true).is_err());
         assert!(context.socket_path_with_policy(false).is_err());
+    }
+
+    #[test]
+    fn finishing_initial_restore_returns_default_remote_connections_to_the_ordinary_bridge() {
+        const CHILD: &str = "CAGENTS_TEST_REMOTE_RESTORE_FINISHED";
+        if std::env::var_os(CHILD).is_some() {
+            crate::instance::initialize_window_restore_policy(
+                crate::instance::WindowRestorePolicy::ExistingOnly,
+            )
+            .unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let context = ConnectionContext::new(Device {
+                name: "fixture".into(),
+                host: "must-not-connect".into(),
+                executable: "cagents".into(),
+            });
+            let mut captured = Vec::new();
+            for no_start in [false, true] {
+                let directory = root
+                    .path()
+                    .join(if no_start { "reader" } else { "ordinary" });
+                fs::create_dir(&directory).unwrap();
+                let mut transport = fixture_transport(context.device.clone(), directory);
+                Arc::get_mut(&mut transport).unwrap().no_start = no_start;
+                captured.push(transport.clone());
+                context.bridges.lock().unwrap()[usize::from(no_start)] = Some(Bridge {
+                    transport,
+                    worker: None,
+                });
+            }
+            let initial = context.socket_path().unwrap();
+            assert_eq!(initial, captured[1].directory.join("daemon.sock"));
+            crate::instance::finish_window_restore();
+            assert_eq!(
+                context.socket_path().unwrap(),
+                captured[0].directory.join("daemon.sock")
+            );
+            assert_eq!(context.socket_path_with_policy(true).unwrap(), initial);
+            let command = bridge_command(&captured[1], None);
+            assert_eq!(
+                command.get_args().last().unwrap(),
+                "'cagents' --no-start daemon bridge"
+            );
+            let command = bridge_command(&captured[0], None);
+            assert_eq!(
+                command.get_args().last().unwrap(),
+                "'cagents' daemon bridge"
+            );
+            context.close();
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        for leaf in ["home", "runtime", "config", "data", "cache"] {
+            fs::create_dir(root.path().join(leaf)).unwrap();
+        }
+        let name = std::thread::current().name().unwrap().to_owned();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", &name, "--nocapture"])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", root.path().join("home"))
+            .env("XDG_RUNTIME_DIR", root.path().join("runtime"))
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .env("XDG_CACHE_HOME", root.path().join("cache"))
+            .env(CHILD, "1");
+        if let Some(authority) = std::env::var_os(crate::agent_execution::AUTHORITY_ENV) {
+            command.env(crate::agent_execution::AUTHORITY_ENV, authority);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

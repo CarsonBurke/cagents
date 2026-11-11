@@ -721,7 +721,7 @@ impl Cagents {
         None
     }
 
-    fn local_view_scopes(&self) -> Vec<Scope> {
+    pub(super) fn local_view_scopes(&self) -> Vec<Scope> {
         self.discover_view_scopes().scopes
     }
 
@@ -1719,6 +1719,14 @@ impl Cagents {
         }
         self.shared_views.applying = true;
         let mut tasks = Vec::new();
+        // The first authoritative snapshot of an original scope still belongs
+        // to startup even if the gate already reported incomplete recovery.
+        // Capture before optimistic edits or alias projection add local panes.
+        for view in &self.workspace_model.views {
+            self.startup_gate
+                .initial_panes
+                .observe_initial_view(view, &self.durable.cards);
+        }
         let mut views = self.workspace_model.views.clone();
         for (_, source, change) in &self.shared_views.pending {
             if let Change::Transfer {

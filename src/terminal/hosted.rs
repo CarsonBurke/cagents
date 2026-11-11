@@ -1411,6 +1411,13 @@ pub fn ensure_daemon_ready() -> Result<PathBuf, HostedTerminalStartError> {
     ensure_daemon_ready_for(crate::notifications::Application::Cagents)
 }
 
+pub(crate) fn existing_daemon_socket_path() -> io::Result<PathBuf> {
+    match crate::device::existing_socket_path()? {
+        Some(socket) => Ok(socket),
+        None => daemon_socket_path(),
+    }
+}
+
 pub fn ensure_daemon_ready_for(
     application: crate::notifications::Application,
 ) -> Result<PathBuf, HostedTerminalStartError> {

@@ -44,6 +44,7 @@ mod settings_ui;
 mod shared_views;
 mod sidebar_selection_ui;
 mod startup_gate;
+mod startup_restore;
 mod terminal_adoption;
 mod terminal_close;
 mod terminal_end_ui;
@@ -5727,6 +5728,12 @@ impl Cagents {
     }
 
     fn initialize_runtimes(&mut self) -> Task<Message> {
+        let initial_views = self.local_view_scopes();
+        self.startup_gate.initial_panes.capture(
+            instance::window_launch_restore_policy(),
+            &self.durable.cards,
+        );
+        self.startup_gate.initial_panes.capture_views(initial_views);
         let mut repository_tasks = Vec::new();
         let open_terminals_exposed = |exposure| {
             self.durable
@@ -5874,6 +5881,11 @@ impl Cagents {
         if !explicit_retry && self.saved_terminal_current(card).is_some() {
             return Task::none();
         }
+        let existing_only = !explicit_retry
+            && self
+                .startup_gate
+                .initial_panes
+                .existing_only(card, session.id);
         // Recovery can replace the identity this start ends up with, so
         // adoption has to know a start is outstanding before the task runs.
         self.begin_terminal_start(card);
@@ -5890,6 +5902,9 @@ impl Cagents {
             .any(|pane| pane.id == card && pane.pending_terminal_start);
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
+                if existing_only {
+                    return attach_initial_terminal(card, session, sender);
+                }
                 let mut created = false;
                 let (recovered, mode) = if shared && !explicit_retry {
                     let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
@@ -5946,8 +5961,15 @@ impl Cagents {
         let sender = self.terminal_wake_tx.clone();
         let terminal = session.id;
         let shared = self.attaches_as_shared(card);
+        let existing_only = self
+            .startup_gate
+            .initial_panes
+            .existing_only(card, session.id);
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
+                if existing_only {
+                    return attach_initial_terminal(card, session, sender).map(Some);
+                }
                 let connect = || {
                     let socket = crate::terminal::ensure_daemon_ready()
                         .map_err(|error| error.to_string())?;
@@ -6103,6 +6125,7 @@ impl Cagents {
             // is free to decide about it.
             return self.finish_terminal_start(card);
         }
+        self.startup_gate.initial_panes.settled(card, terminal);
         // A card still hibernated when its start lands is a restored agent
         // attached only for its row.
         let hibernated = matches!(self.lifecycle.state(card), Some((_, Residency::Hibernated)));
@@ -8844,6 +8867,7 @@ impl Cagents {
         let surfaces_visible = self.workspace_surfaces_visible();
         match state.kind {
             CardKind::Terminal(session) => {
+                self.startup_gate.initial_panes.explicit_action(card);
                 self.terminal_recovery_attempts.remove(&session.id);
                 self.cards.insert(card, CardRuntime::Loading);
                 let task = self.start_terminal(
@@ -15336,6 +15360,9 @@ impl Application for Cagents {
                     // reports whatever still stands in the way; a startup gate
                     // reports it rather than waiting for that.
                     result => {
+                        if self.card_state(card).is_some_and(|state| matches!(&state.kind, CardKind::Terminal(session) if session.id == terminal)) {
+                            self.startup_gate.initial_panes.settled(card, terminal);
+                        }
                         let reason = result.err().unwrap_or_else(|| {
                             "the terminal service no longer hosts it; open it to relaunch".into()
                         });
@@ -19990,6 +20017,65 @@ fn load_repository_github(
 
 const SHARED_TERMINAL_DISCONNECTED: &str =
     "This terminal isn't connected. Use Retry or Close on its pane.";
+
+/// An initial recovered pane can only subscribe to an exact issued owner.
+/// Its captured endpoint remains read-only after the startup gate finishes.
+fn attach_initial_terminal(
+    card: CardId,
+    source: TerminalSession,
+    sender: async_channel::Sender<TerminalWakeup>,
+) -> Result<StartedTerminal, String> {
+    let socket =
+        crate::terminal::existing_daemon_socket_path().map_err(|error| error.to_string())?;
+    let mut client =
+        crate::control::ControlClient::connect(&socket).map_err(|error| error.to_string())?;
+    let proof = client.proof().clone();
+    let terminals = client.list().map_err(|error| error.to_string())?;
+    let session = initial_terminal_attachment(&source, &terminals, &proof)?
+        .ok_or("The recovered daemon no longer holds this terminal. Its saved pane is kept; use Retry explicitly to reconnect or relaunch it")?;
+    saved_terminal::attach_existing(
+        card,
+        daemon_recovery::RecoveredTerminal {
+            session,
+            expected_host: Some(proof.clone()),
+            attach_completed: false,
+            recovery_lease: None,
+        },
+        socket,
+        proof,
+        sender,
+    )
+}
+
+fn initial_terminal_attachment(
+    source: &TerminalSession,
+    terminals: &[crate::terminal::ipc::TerminalDescriptor],
+    proof: &HostSessionProof,
+) -> Result<Option<TerminalSession>, String> {
+    if terminals
+        .iter()
+        .any(|terminal| terminal.session.id == source.id)
+    {
+        return saved_terminal::attachment(source, terminals, proof);
+    }
+    let mut issued = terminals.iter().filter(|terminal| {
+        terminal.upgrade_sources.contains(source)
+            || terminal
+                .upgrade_relaunches
+                .iter()
+                .any(|relaunch| relaunch.source == *source)
+    });
+    let Some(terminal) = issued.next() else {
+        return Ok(None);
+    };
+    if issued.next().is_some()
+        || !proof.is_complete()
+        || !terminal.session.continuity.can_resume_live(proof)
+    {
+        return Err("The initial terminal has ambiguous or unconfirmed issued ownership".into());
+    }
+    Ok(Some(terminal.session.clone()))
+}
 
 /// Another client may own a shared terminal's recovery, so a shared pane only
 /// attaches the exact session its daemon hosts, under that daemon's proof.

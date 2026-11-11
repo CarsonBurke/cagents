@@ -40,6 +40,7 @@ const DETAILS_LABEL: &str = " Details: ";
 
 #[derive(Default)]
 pub(super) struct State {
+    pub(super) initial_panes: startup_restore::InitialPanes,
     opened: Option<Instant>,
     /// Fixed from the inventory announced to the launcher, which fixes its own
     /// deadline from that announcement once.
@@ -719,6 +720,7 @@ impl Cagents {
 
     pub(super) fn begin_startup_gate(&mut self) -> Task<Message> {
         if !instance::ui_launch_handshake_requested() {
+            instance::finish_window_restore();
             return report(Ok(()));
         }
         self.startup_gate.retire_inspections();
@@ -1146,6 +1148,7 @@ impl Cagents {
     fn report_startup_failure(&mut self, reason: String, notice: TransientNotice) -> Task<Message> {
         self.startup_gate.retire_inspections();
         self.startup_gate.reported = true;
+        instance::finish_window_restore();
         self.startup_gate.reported_notice = Some(notice.message.clone());
         self.status = Some(notice);
         report(Err(reason))
@@ -1167,6 +1170,7 @@ impl Cagents {
             }
         }
         self.startup_gate.reported = true;
+        instance::finish_window_restore();
         if let Err(reason) = &result {
             self.status = Some(incomplete_notice(reason));
         }

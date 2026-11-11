@@ -30,7 +30,10 @@ mod append;
 
 const CHAT_ATTACH_TIMEOUT: Duration = Duration::from_secs(70);
 
-fn restore_intent(intent: Intent, policy: crate::instance::WindowRestorePolicy) -> Intent {
+pub(crate) fn restore_intent(
+    intent: Intent,
+    policy: crate::instance::WindowRestorePolicy,
+) -> Intent {
     if intent == Intent::Restore && policy == crate::instance::WindowRestorePolicy::ExistingOnly {
         Intent::RestoreExisting
     } else {
@@ -40,7 +43,7 @@ fn restore_intent(intent: Intent, policy: crate::instance::WindowRestorePolicy) 
 
 fn chat_socket(intent: Intent) -> Result<std::path::PathBuf, StartFailure> {
     if intent == Intent::RestoreExisting {
-        ipc::daemon_socket_path().map_err(|error| error.to_string().into())
+        crate::terminal::existing_daemon_socket_path().map_err(|error| error.to_string().into())
     } else {
         crate::terminal::ensure_daemon_ready_for_explicit_action()
             .map_err(|error| error.to_string().into())
@@ -1917,7 +1920,6 @@ impl ClientHandle {
         selection: Option<String>,
         wake: impl Fn(Wake) + Send + Sync + 'static,
     ) -> Result<Self, StartFailure> {
-        let intent = restore_intent(intent, crate::instance::window_restore_policy());
         // A restore runs right after an application update has stopped the
         // daemon it is about to ask for, so it starts one for the same reason a
         // new conversation does instead of failing on an absent socket.
@@ -1944,10 +1946,21 @@ impl ClientHandle {
         expected: Session,
         wake: impl Fn(Wake) + Send + Sync + 'static,
     ) -> Result<Self, StartFailure> {
+        Self::connect_upgrade_with_intent(source, expected, Intent::Restore, wake)
+    }
+
+    pub(crate) fn connect_upgrade_with_intent(
+        source: Session,
+        expected: Session,
+        intent: Intent,
+        wake: impl Fn(Wake) + Send + Sync + 'static,
+    ) -> Result<Self, StartFailure> {
+        if !matches!(intent, Intent::Restore | Intent::RestoreExisting) {
+            return Err("Canonical recovery must attach an existing conversation".into());
+        }
         if UpgradeRecovery::candidate(&source, &expected).is_none() {
             return Err("The canonical chat is not an exact upgrade of the saved source".into());
         }
-        let intent = restore_intent(Intent::Restore, crate::instance::window_restore_policy());
         let socket = chat_socket(intent)?;
         let stream = connect_daemon(&socket).map_err(|error| error.to_string())?;
         Self::connect_on(
@@ -4503,7 +4516,7 @@ mod tests {
             assert!(!paths.lock.exists());
             let result = ClientHandle::connect(
                 stranded_claude(Some(CONVERSATION)),
-                Intent::Restore,
+                Intent::RestoreExisting,
                 None,
                 false,
                 None,
@@ -4520,6 +4533,51 @@ mod tests {
                 "a read-only recovery attachment tried daemon admission"
             );
             assert!(!paths.socket.exists());
+            crate::instance::finish_window_restore();
+            assert_eq!(
+                crate::instance::window_restore_policy(),
+                crate::instance::WindowRestorePolicy::Ordinary
+            );
+            // The ordinary terminal/new-work path now reaches autostart's
+            // executable lookup. This lib-test executable has no daemon
+            // companion, so it refuses there without launching anything.
+            assert!(matches!(
+                crate::terminal::ensure_daemon_ready(),
+                Err(crate::terminal::HostedTerminalStartError::HostBinaryMissing(_))
+            ));
+            // A queued initial attachment keeps its explicit intent even
+            // when the worker does not run until after the startup verdict.
+            let delayed = ClientHandle::connect(
+                stranded_claude(Some(CONVERSATION)),
+                Intent::RestoreExisting,
+                None,
+                false,
+                None,
+                |_| {},
+            )
+            .err()
+            .unwrap();
+            assert!(
+                delayed
+                    .message
+                    .starts_with("Cannot connect to the proven chat daemon:")
+            );
+            let ordinary = ClientHandle::connect(
+                stranded_claude(Some(CONVERSATION)),
+                Intent::Restore,
+                None,
+                false,
+                None,
+                |_| {},
+            )
+            .err()
+            .unwrap();
+            assert!(
+                !ordinary
+                    .message
+                    .starts_with("Cannot connect to the proven chat daemon:")
+            );
+            assert!(!paths.lock.exists());
             return;
         }
         let root = tempfile::tempdir().unwrap();
