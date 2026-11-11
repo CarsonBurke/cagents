@@ -3965,6 +3965,75 @@ mod tests {
     }
 
     #[test]
+    fn repository_refresh_relocates_managed_display_into_a_worktree_without_changing_its_source() {
+        use crate::workspace_model::views::{Scope, View};
+        let (mut app, agent, mut pane, unrelated) = managed_display_fixture();
+        let mut original_only = app.workspace_model.clone();
+        original_only.views.clear();
+        let display =
+            crate::workspace_model::views::managed_display(&original_only, &agent).unwrap();
+        assert!(app.adopt_execution_agent_display(&agent, display).is_some());
+        let source = app.card_state(pane.id).unwrap().kind.clone();
+        let path = PathBuf::from("/repo/relocated-worktree");
+        let scope = Scope::Worktree {
+            repository: agent.spec.target.repository.clone(),
+            path: path.clone(),
+        };
+        pane.scope = Some(path.clone());
+        app.workspace_model.views[1].scope = scope.clone();
+        app.workspace_model.views[1].panes = vec![pane.clone()];
+        app.workspace_model.views.push(View::empty(unrelated));
+        app.sidebar_model.projects[0].worktrees.push(
+            crate::sidebar::SidebarWorktree::from_durable(
+                crate::model::WorktreeId::new(),
+                path.clone(),
+                Some("relocated".into()),
+            ),
+        );
+        app.known_worktree_roots.insert(path.clone());
+        app.shared_views
+            .initialize(scope.clone(), vec![pane.clone()]);
+        Arc::make_mut(&mut app.durable).active_channel = Some(unrelated);
+        let before = (
+            app.workspace.focused(),
+            app.workspace.camera().offset(),
+            app.workspace.order().collect::<Vec<_>>(),
+        );
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+
+        drop(app.reconcile_workspace_model_for_repository(Path::new("/unrelated")));
+
+        let current = app.card_state(pane.id).unwrap();
+        assert_eq!(current.kind, source);
+        assert_eq!(current.title, pane.title);
+        assert_eq!(current.width_fraction, pane.width_fraction);
+        assert_eq!(app.durable.card_scopes.get(&pane.id), Some(&path));
+        assert_eq!(app.worktree_owners.get(&pane.id), Some(&path));
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .all(|channel| !channel.cards.contains(&pane.id))
+        );
+        assert!(matches!(
+            app.cards.get(&pane.id),
+            Some(CardRuntime::Loading)
+        ));
+        assert_eq!(app.durable.active_channel, Some(unrelated));
+        assert_eq!(
+            (
+                app.workspace.focused(),
+                app.workspace.camera().offset(),
+                app.workspace.order().collect::<Vec<_>>()
+            ),
+            before
+        );
+        assert!(!std::iter::from_fn(|| rx.try_recv().ok()).any(|edit|
+            matches!(edit, ModelEdit::ChangeView { scope: edited, .. } | ModelEdit::SeedView { scope: edited, .. } if edited == scope)));
+    }
+
+    #[test]
     fn observed_managed_terminal_exit_projects_without_live_adoption_or_relaunch() {
         for relaunch_available in [false, true] {
             let (mut app, agent, mut pane, destination) = managed_display_fixture();

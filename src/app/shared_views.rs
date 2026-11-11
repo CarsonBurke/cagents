@@ -4899,6 +4899,108 @@ mod tests {
     }
 
     #[test]
+    fn repository_path_change_uses_fresh_authority_without_rewriting_its_previous_scope() {
+        let (mut app, _, _, mut old) = channel_move_fixture();
+        let project = app.durable.channels[0].project_id;
+        let old_repository = PathBuf::from("/repo/.git");
+        let old_path = PathBuf::from("/repo/previous-root");
+        let new_repository = PathBuf::from("/moved/.git");
+        let new_path = PathBuf::from("/moved/new-root");
+        let old_scope = Scope::Worktree {
+            repository: old_repository.clone(),
+            path: old_path.clone(),
+        };
+        let new_scope = Scope::Worktree {
+            repository: new_repository.clone(),
+            path: new_path.clone(),
+        };
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "repo".into(),
+            old_repository.clone(),
+            vec![crate::sidebar::SidebarWorktree::from_durable(
+                crate::model::WorktreeId::new(),
+                old_path.clone(),
+                None,
+            )],
+            vec![],
+        ));
+        app.known_worktree_roots.insert(old_path.clone());
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.active_channel = None;
+        for channel in &mut durable.channels {
+            channel.cards.clear();
+        }
+        durable.card_scopes.insert(old.id, old_path.clone());
+        old.scope = Some(old_path.clone());
+        let mut view = View::empty(old_scope.clone());
+        view.panes.push(old.clone());
+        app.workspace_model.views = vec![view];
+        app.workspace_model
+            .projects
+            .push(crate::workspace_model::ModelProject {
+                repository: old_repository.clone(),
+                name: "Historical host repository".into(),
+                kind: Default::default(),
+                ordinal: 0,
+            });
+        drop(app.reconcile_shared_views_for_repository(&old_repository, &HashSet::new()));
+        let baseline = app.shared_views.baseline[&old_scope].clone();
+
+        // A later load changes this local row's path. The host still owns the
+        // previous view; its distinct resource must not be refiled implicitly.
+        app.sidebar_model.projects[0].repository = new_repository.clone();
+        app.sidebar_model.projects[0].worktrees =
+            vec![crate::sidebar::SidebarWorktree::from_durable(
+                crate::model::WorktreeId::new(),
+                new_path.clone(),
+                None,
+            )];
+        app.known_worktree_roots.insert(new_path.clone());
+        let mut new = old.clone();
+        new.id = CardId::new();
+        new.scope = Some(new_path.clone());
+        if let CardKind::Browser(browser) = &mut new.kind {
+            browser.id = BrowserId::new();
+        }
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.cards.push(CardState {
+            id: new.id,
+            generation: 0,
+            title: new.title.clone(),
+            width_fraction: new.width_fraction,
+            existence: Existence::Open,
+            kind: new.kind.clone(),
+        });
+        durable.card_scopes.insert(new.id, new_path.clone());
+        app.cards.insert(new.id, CardRuntime::Completed);
+        app.workspace_model
+            .views
+            .push(View::empty(new_scope.clone()));
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+
+        drop(app.reconcile_shared_views_for_repository(&new_repository, &HashSet::new()));
+
+        assert_eq!(app.shared_views.baseline[&old_scope], baseline);
+        assert_eq!(app.card_state(old.id).unwrap().kind, old.kind);
+        assert_eq!(app.durable.card_scopes.get(&old.id), Some(&old_path));
+        assert!(app.card_state(old.id).unwrap().existence.is_open());
+        let scopes = app.local_view_scopes();
+        assert!(scopes.contains(&new_scope));
+        assert!(!scopes.contains(&Scope::Worktree {
+            repository: new_repository,
+            path: old_path
+        }));
+        let edits = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(edits.iter().any(|edit|
+            matches!(edit, ModelEdit::SeedView { scope, panes, .. } if scope == &new_scope && panes.iter().any(|pane| pane.id == new.id))));
+        assert!(!edits.iter().any(|edit|
+            matches!(edit, ModelEdit::SeedView { scope, .. } | ModelEdit::ChangeView { scope, .. } if scope == &old_scope)));
+    }
+
+    #[test]
     fn repository_loads_project_only_their_affected_views() {
         let (mut app, unrelated, _, pane) = channel_move_fixture();
         let baseline = app.shared_views.baseline[&Scope::Channel(unrelated)].clone();
