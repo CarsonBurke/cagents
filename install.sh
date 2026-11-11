@@ -525,6 +525,7 @@ NEW_VERSION_FRESH=0
 NEW_VERSION_RETAINED=0
 EXISTING_INSTALLED=0
 CANDIDATE_MARKER_MISMATCH=0
+PENDING_RECOVERY_INSPECTED=0
 PREPARED_MARKER_TEMP=
 CURRENT_TEMP=
 CURRENT_SWITCHED=0
@@ -671,7 +672,7 @@ print_candidate_start_command() {
 }
 inspect_pending_update_recovery() {
     set -- daemon inspect-pending-update-recovery --candidate-cli "$NEW_VERSION_DIR/bin/cagents"
-    if [ -n "${CAGENTS_INSTALL_CENSUS_PATH:-}" ]; then
+    if [ "$CENSUS_CAPTURED" -eq 1 ] || [ -n "${CAGENTS_INSTALL_CENSUS_PATH:-}" ]; then
         set -- "$@" --census "$INSTALL_CENSUS_PATH"
     fi
     installer_tool "$CANDIDATE_COORDINATOR" "$@" >/dev/null
@@ -745,15 +746,35 @@ cleanup() {
             printf '%s: could not convert the shared-model store back to schema %s, which the previous version reads; retained the new installation, which reads the store\n' \
                 "$PROGRAM" "$restored_schema" >&2
             if inspect_update_recovery; then
-                if [ -z "${CAGENTS_DAEMON_LEASE_FD:-}" ] \
-                    && installer_tool "$NEW_VERSION_DIR/bin/cagents" daemon start >/dev/null \
-                    && verify_update_census; then
-                    RECOVERY_OUTCOME_SETTLED=1
-                else
+                if [ -n "${CAGENTS_DAEMON_LEASE_FD:-}" ]; then
                     retain_recovery_evidence
                     print_candidate_start_command
-                    RECOVERY_OUTCOME_SETTLED=1
+                else
+                    candidate_start_completed=0
+                    if installer_tool "$NEW_VERSION_DIR/bin/cagents" daemon start >/dev/null; then
+                        candidate_start_completed=1
+                    fi
+                    if ! verify_update_census; then
+                        # Either exit status can leave a serving or starting
+                        # process. Preserve it and the failed census receipt.
+                        read_daemon_status "$NEW_VERSION_DIR/bin/cagents"
+                        candidate_after_start=$DAEMON_STATUS
+                        pending_after_start=1
+                        if inspect_pending_update_recovery; then pending_after_start=0; fi
+                        retain_recovery_evidence
+                        if [ "$candidate_start_completed" -eq 1 ]; then
+                            printf '%s: the daemon start command completed, but readiness and the original inventory remain unverified; keep any serving daemon running and use the inspection commands above\n' \
+                                "$PROGRAM" >&2
+                        elif [ "$candidate_after_start" = stopped ] && [ "$pending_after_start" -eq 0 ] \
+                            && inspect_update_recovery; then
+                            print_candidate_start_command
+                        else
+                            printf '%s: the daemon start command failed, but a stopped service was not proven; keep any serving daemon running and use the inspection commands above\n' \
+                                "$PROGRAM" >&2
+                        fi
+                    fi
                 fi
+                RECOVERY_OUTCOME_SETTLED=1
             else
                 retain_recovery_evidence
                 RECOVERY_OUTCOME_SETTLED=1
@@ -1049,6 +1070,12 @@ elif [ "$STAGE_ONLY" -eq 1 ]; then
     supports_stage_guard "$CANDIDATE_COORDINATOR" \
         || fail 'this release does not support safe staging; installation was not changed'
     COORDINATOR=$CANDIDATE_COORDINATOR
+elif [ -e "$PREFIX/versions/$VERSION" ] || [ -L "$PREFIX/versions/$VERSION" ]; then
+    # The selected version may be an unvalidated retained tree, including
+    # current itself. Admission/probing executes only the authenticated archive.
+    supports_install_guard "$CANDIDATE_COORDINATOR" \
+        || fail 'the verified archive cannot inspect this retained installation; the existing version was preserved'
+    COORDINATOR=$CANDIDATE_COORDINATOR
 elif supports_selected_guard "$PREFIX/current/bin/cagents"; then
     # A newer installed coordinator also makes rollback to an older release
     # safe when that candidate predates the window-coordination commands.
@@ -1160,6 +1187,18 @@ if [ -n "$PREPARED_CANDIDATE" ] || [ -e "$PREFIX/versions/$VERSION" ] || [ -L "$
     prepared_root=$PREFIX/versions/$VERSION
     [ -d "$prepared_root" ] && [ ! -L "$prepared_root" ] \
         || fail 'the explicitly prepared candidate is missing or unsafe'
+    NEW_VERSION_DIR=$prepared_root
+    NEW_VERSION_EXISTING=1
+    if [ -z "$PREPARE_CANDIDATE" ] && [ -z "${CAGENTS_DAEMON_LEASE_FD:-}" ]; then
+        # Only the freshly authenticated archive coordinator executes here.
+        # The existing target is path data for shared recovery inspection;
+        # its markers or extra files cannot hide retained Prepared recovery.
+        if ! inspect_pending_update_recovery; then
+            RETAIN_RECOVERY=1
+            fail 'retained recovery requires the explicit command above; the candidate and original checkpoint were preserved'
+        fi
+        PENDING_RECOVERY_INSPECTED=1
+    fi
     prepared_marker=$prepared_root/$PREPARED_MARKER
     if [ -e "$prepared_marker" ] || [ -L "$prepared_marker" ] || [ -n "$PREPARED_CANDIDATE" ]; then
         [ -f "$prepared_marker" ] && [ ! -L "$prepared_marker" ] \
@@ -1406,7 +1445,7 @@ fi
 # Before rejecting an already published version, expose any retained Prepared
 # recovery through the shared owner. Never replace its original census with a
 # fresh empty capture, and never call an existing version "success" by itself.
-if [ -z "${CAGENTS_DAEMON_LEASE_FD:-}" ]; then
+if [ "$PENDING_RECOVERY_INSPECTED" -eq 0 ] && [ -z "${CAGENTS_DAEMON_LEASE_FD:-}" ]; then
     if ! inspect_pending_update_recovery; then
         RETAIN_RECOVERY=1
         mark_retained_candidate

@@ -38,9 +38,12 @@ that an update superseded it. The daemon answers that CLI in its protocol's
 version. It refuses requests to stop, update or hand off the daemon, and requests whose
 reply the CLI couldn't read, such as `automation history`, `automation run` and
 `automation run-now` on protocols before 156. It withholds notifications the CLI couldn't read.
+What a later protocol only added detail to is sent as the CLI knew it: on
+protocols before 166, a subagent waiting on its own background work reads as
+running.
 Each protocol's postcard wire format is recorded under
 `tests/fixtures/wire-formats/`. A test checks that every listed older protocol
-encodes the same way, except for what is refused or withheld. It checks
+encodes the same way, except for what is refused, withheld or restated. It checks
 encoding, not meaning, and not JSON carried as text inside a message.
 
 When a daemon takes the runtime lease, it points `bin` in its runtime
@@ -192,17 +195,27 @@ requires a fresh confirmation. The final check also waits behind previously
 accepted provider commands, so a queued prompt cannot masquerade as idle.
 
 `daemon upgrade` uses the served candidate's worker and this same confirmation.
-The candidate drives supported source daemons through a frozen lifecycle subset:
-the current protocol, historical current-wire protocols 128 and 156, and bespoke
-protocols 68 and 77. Other source protocols are refused with the build to update
-to first, or, for a newer service, the newer build to install;
-the update is never handed to an older build's worker. `--yes` skips the
+The candidate drives qualified source daemons through a frozen lifecycle subset:
+protocol 156 (the `991daa43e` desktop build) and the matched current protocol 166.
+Other source protocols, including 160 and 165, are refused before preparation,
+shutdown or checkpoint changes. Use a cold installation instead: finish and close
+hosted sessions, quit every window, then use the installed build's matching CLI
+to run `cagents --no-start daemon stop --require-empty`. Confirm that its
+`cagents --no-start daemon status` reports stopped, run the verified installer
+without `--restart-daemon`, and reopen the application. For a newer service,
+choose a newer release. The update is never handed to an older build's worker.
+`--yes` skips the
 interactive prompt; `--interrupt` additionally permits native turn interruption.
 Saved panes that cannot reconnect reopen stopped, with a reason and a recovery
 action in the review. A changed inventory requires another review.
 Unsaved window work blocks replacement, and failures remain visible in the
 application's update state. A compatible update closes and reopens windows
 without replacing the daemon or recovering sessions.
+
+Recovery windows first attach saved panes to existing work or display retained
+history, without starting replacement providers. Once startup finishes, new
+terminals and later reconnects use ordinary daemon startup behavior. Initial
+restores already in progress retain their attachment-only intent.
 
 ## Full daemon upgrades
 

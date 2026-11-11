@@ -1,7 +1,7 @@
 //! The terminal and its tests render the same reviewed outcome record.
 
 use super::{
-    impact::{Disposition, Preview, SessionKind},
+    impact::{Disposition, Preview, SessionKind, SessionReview},
     source_inspection::SavedOutcome,
 };
 use std::{
@@ -38,7 +38,7 @@ fn items(preview: &Preview) -> Vec<Item> {
         .daemon
         .iter()
         .flat_map(|daemon| &daemon.sessions)
-        .map(|session| (session.id, session))
+        .map(|session| (session.id, session.review()))
         .collect();
     let stopped: BTreeMap<_, _> = preview
         .stopped
@@ -76,6 +76,12 @@ fn items(preview: &Preview) -> Vec<Item> {
             let kind = live
                 .map(|session| session.kind)
                 .or_else(|| saved.map(|pane| pane.kind))
+                .or_else(|| {
+                    stopped.map(|pane| match pane.kind {
+                        super::source_inspection::StoppedKind::Chat => SessionKind::NativeChat,
+                        super::source_inspection::StoppedKind::Terminal => SessionKind::Terminal,
+                    })
+                })
                 .unwrap_or(SessionKind::NativeChat);
             let mut outcome = live
                 .map(|session| match session.disposition {
@@ -115,21 +121,11 @@ fn items(preview: &Preview) -> Vec<Item> {
             if let Some(stopped) = stopped {
                 // Live work and handoff problems take precedence, with the saved
                 // recovery on the same line rather than a second group entry.
-                let recovery = recovery_detail(
-                    &stopped.reason,
-                    &stopped.recovery,
-                    matches!(
-                        outcome,
-                        Outcome::Working | Outcome::Interrupted | Outcome::Attention
-                    ),
-                );
+                let recovery = recovery_detail(&stopped.reason, &stopped.recovery);
                 if outcome == Outcome::Interrupted {
                     outcome = Outcome::Paused;
                     let interruption = live.map(|session| live_fact(session)).unwrap_or_default();
-                    detail = format!(
-                        "{interruption}; after the update: {}",
-                        recovery_detail(&stopped.reason, &stopped.recovery, false)
-                    );
+                    detail = format!("{interruption}; after the update: {recovery}");
                 } else if matches!(outcome, Outcome::Working | Outcome::Attention) {
                     let reason = live.map(|session| live_fact(session)).unwrap_or_default();
                     detail = format!("{reason}; after the update: {recovery}");
@@ -140,7 +136,7 @@ fn items(preview: &Preview) -> Vec<Item> {
             } else if detail.is_empty() {
                 if let Some(live) = live {
                     if outcome == Outcome::Paused {
-                        detail = recovery_detail(&live.reason, CHAT_RECOVERY, false);
+                        detail = recovery_detail(&live_fact(live), CHAT_RECOVERY);
                     } else if matches!(
                         outcome,
                         Outcome::Attention | Outcome::Working | Outcome::Interrupted
@@ -154,11 +150,9 @@ fn items(preview: &Preview) -> Vec<Item> {
                 && (stops_service || live.disposition == Disposition::Blocked)
             {
                 outcome = Outcome::Stops;
-                // A completed turn can still own background agents. Explain
-                // why its idle wait became a stop review instead of hiding
-                // that change behind the ordinary group guidance.
-                if live.disposition != Disposition::Blocked || live.interrupted_subagents.is_empty()
-                {
+                // Keep safe recovery instructions for blocked work, including
+                // the background agents that outlived their parent's turn.
+                if live.disposition != Disposition::Blocked {
                     detail.clear();
                 }
             }
@@ -175,26 +169,87 @@ fn items(preview: &Preview) -> Vec<Item> {
     items
 }
 
+/// The content shown for consent. Keep rendering and equality on this model so
+/// added review content also invalidates an older confirmation.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct Review {
+    from_version: String,
+    to_version: String,
+    windows: usize,
+    same_panes: bool,
+    items: Vec<Item>,
+    sessions: Vec<SessionReview>,
+    notices: Vec<String>,
+}
+
+impl From<&Preview> for Review {
+    fn from(preview: &Preview) -> Self {
+        let mut notices = preview.labels.details.notices.clone();
+        notices.extend(
+            preview
+                .stopped_windows
+                .iter()
+                .map(|window| recovery_detail(&window.reason, &window.recovery)),
+        );
+        notices.extend(preview.editors.iter().filter_map(|editor| {
+            let relation = match editor.protocol {
+                Some(protocol) if protocol == preview.candidate.protocol => return None,
+                Some(protocol) if protocol > preview.candidate.protocol => "a newer",
+                Some(_) => "an older",
+                None => "a different",
+            };
+            let version = editor
+                .version
+                .as_deref()
+                .map_or_else(String::new, |version| format!(" ({version})"));
+            Some(format!(
+                "{name} is using {relation} cagents{version}. It keeps working; its agent features reconnect after {name} updates.",
+                name = editor.name
+            ))
+        }));
+        let sessions = if let Some(daemon) = &preview.daemon {
+            notices.extend(daemon.review_notices());
+            daemon
+                .sessions
+                .iter()
+                .map(|session| session.review())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Self {
+            from_version: preview.from_version.clone(),
+            to_version: preview.candidate.version.clone(),
+            windows: preview.windows,
+            same_panes: preview.stopped_windows.is_empty(),
+            items: items(preview),
+            sessions,
+            notices,
+        }
+    }
+}
+
 /// Describe what happens to the reviewed panes without consulting live state.
 pub fn render_review(preview: &Preview) -> String {
+    let review = Review::from(preview);
     let mut output = format!(
         "Update cagents {} -> {}\n",
-        preview.from_version, preview.candidate.version
+        review.from_version, review.to_version
     );
-    if preview.windows != 0 {
-        let (windows, action) = if preview.windows == 1 {
+    if review.windows != 0 {
+        let (windows, action) = if review.windows == 1 {
             ("window", "closes and reopens")
         } else {
             ("windows", "close and reopen")
         };
-        let panes = if preview.stopped_windows.is_empty() {
+        let panes = if review.same_panes {
             " with the same panes"
         } else {
             ""
         };
-        writeln!(output, "{} {windows} {action}{panes}.", preview.windows).unwrap();
+        writeln!(output, "{} {windows} {action}{panes}.", review.windows).unwrap();
     }
-    let items = items(preview);
+    let items = &review.items;
     let mut groups = String::new();
     for (outcome, name, description) in [
         (Outcome::KeepsRunning, "Keep running", String::new()),
@@ -221,7 +276,7 @@ pub fn render_review(preview: &Preview) -> String {
         (
             Outcome::Paused,
             "Come back paused",
-            "nothing is started; choose Resume conversation in the new tab (+) menu".into(),
+            "nothing is started; follow the recovery steps below".into(),
         ),
         (Outcome::Attention, "Needs attention", String::new()),
         (
@@ -270,30 +325,7 @@ pub fn render_review(preview: &Preview) -> String {
             .collect();
         group(&mut groups, name, members.len(), &description, &lines);
     }
-    let mut notices = preview.labels.details.notices.clone();
-    notices.extend(
-        preview
-            .stopped_windows
-            .iter()
-            .map(|window| recovery_detail(&window.reason, &window.recovery, true)),
-    );
-
-    notices.extend(preview.editors.iter().filter_map(|editor| {
-        let relation = match editor.protocol {
-            Some(protocol) if protocol == preview.candidate.protocol => return None,
-            Some(protocol) if protocol > preview.candidate.protocol => "a newer",
-            Some(_) => "an older",
-            None => "a different",
-        };
-        let version = editor
-            .version
-            .as_deref()
-            .map_or_else(String::new, |version| format!(" ({version})"));
-        Some(format!(
-            "{name} is using {relation} cagents{version}. It keeps working; its agent features reconnect after {name} updates.",
-            name = editor.name
-        ))
-    }));
+    let notices = &review.notices;
     if !groups.is_empty() || !notices.is_empty() {
         output.push('\n');
     }
@@ -389,19 +421,16 @@ pub(super) fn render_review_changes(previous: &Preview, current: &Preview) -> St
             writeln!(output, "  {}: no longer affected", item.label).unwrap();
         }
     }
-    for notice in &current.labels.details.notices {
-        if !previous.labels.details.notices.contains(notice) {
+    let previous_notices = Review::from(previous).notices;
+    let current_notices = Review::from(current).notices;
+    for notice in &current_notices {
+        if !previous_notices.contains(notice) {
             writeln!(output, "  {notice}").unwrap();
         }
     }
-    for window in &current.stopped_windows {
-        if !previous.stopped_windows.contains(window) {
-            writeln!(
-                output,
-                "  {}",
-                recovery_detail(&window.reason, &window.recovery, true)
-            )
-            .unwrap();
+    for notice in &previous_notices {
+        if !current_notices.contains(notice) {
+            writeln!(output, "  Resolved: {notice}").unwrap();
         }
     }
     for window in &previous.stopped_windows {
@@ -430,30 +459,6 @@ pub(super) fn render_review_changes(previous: &Preview, current: &Preview) -> St
         )
         .unwrap();
     }
-    if previous.daemon.as_ref().map(|daemon| &daemon.blockers)
-        != current.daemon.as_ref().map(|daemon| &daemon.blockers)
-    {
-        for blocker in current.daemon.iter().flat_map(|daemon| &daemon.blockers) {
-            if !previous
-                .daemon
-                .iter()
-                .flat_map(|daemon| &daemon.blockers)
-                .any(|old| old == blocker)
-            {
-                writeln!(output, "  {blocker}").unwrap();
-            }
-        }
-        for blocker in previous.daemon.iter().flat_map(|daemon| &daemon.blockers) {
-            if !current
-                .daemon
-                .iter()
-                .flat_map(|daemon| &daemon.blockers)
-                .any(|new| new == blocker)
-            {
-                writeln!(output, "  Resolved: {blocker}").unwrap();
-            }
-        }
-    }
     if output == "Update review changed:\n" {
         output.push_str(
             "  The running terminal service changed; review the update again before continuing.\n",
@@ -464,31 +469,13 @@ pub(super) fn render_review_changes(previous: &Preview, current: &Preview) -> St
 
 /// A source reason can combine live activity with its old destination plan.
 /// When merging outcomes, carry only activity; this review owns the destination.
-fn live_fact(session: &super::impact::SessionImpact) -> String {
-    match session.disposition {
-        Disposition::WaitsForIdle => {
-            let tasks = session.interrupted_subagents.len();
-            if tasks == 0 {
-                "finishing its turn".into()
-            } else {
-                let noun = if tasks == 1 { "task" } else { "tasks" };
-                format!(
-                    "finishing its turn; interrupting now also stops {tasks} background {noun}; background work will not resume automatically"
-                )
-            }
-        }
-        Disposition::Interrupted => {
-            let tasks = session.interrupted_subagents.len();
-            if tasks == 0 {
-                "its current turn is interrupted".into()
-            } else {
-                let noun = if tasks == 1 { "task" } else { "tasks" };
-                format!(
-                    "its current turn and {tasks} background {noun} stop; background work will not resume automatically"
-                )
-            }
-        }
-        _ => clause(&session.reason),
+fn live_fact(session: &SessionReview) -> String {
+    if session.disposition == Disposition::WaitsForIdle
+        && session.reason == "Finishing its turn; the update waits."
+    {
+        "finishing its turn".into()
+    } else {
+        clause(&session.reason)
     }
 }
 
@@ -513,11 +500,8 @@ fn clause(reason: &str) -> String {
     }
 }
 
-fn recovery_detail(reason: &str, recovery: &str, include_default: bool) -> String {
+fn recovery_detail(reason: &str, recovery: &str) -> String {
     let reason = clause(reason);
-    if recovery == CHAT_RECOVERY && !include_default {
-        return reason;
-    }
     format!("{reason}. {recovery}")
 }
 
@@ -679,7 +663,7 @@ mod tests {
         );
         preview.stopped_windows.push(StoppedWindow {
             window: 3,
-            reason: "A saved window (window-3.sqlite) could not be read; it may not reopen".into(),
+            reason: "Window 3 could not be read; it may not reopen".into(),
             recovery: "Its saved file stays as it is".into(),
         });
         preview
@@ -786,7 +770,9 @@ mod tests {
             .push("A process could not be checked".into());
         let output = render_review_changes(&blocked, &current);
         assert!(
-            output.contains("Resolved: A process could not be checked"),
+            output.contains(
+                "Resolved: The update could not confirm that running work can be preserved"
+            ),
             "{output}"
         );
         // Removing a service-wide stop also changes this agent's outcome.
@@ -838,13 +824,23 @@ mod tests {
             review.contains("  Working now (1)         finishing a turn; the update waits\n"),
             "{review}"
         );
-        assert!(review.contains("  Come back paused (1)    nothing is started; choose Resume conversation in the new tab (+) menu\n"), "{review}");
         assert!(
-            review
-                .contains("    parser · General · beta: its conversation could not be confirmed\n"),
+            review.contains(
+                "  Come back paused (1)    nothing is started; follow the recovery steps below\n"
+            ),
             "{review}"
         );
-        assert!(review.contains("  A saved window (window-3.sqlite) could not be read; it may not reopen. Its saved file stays as it is\n"), "{review}");
+        assert!(
+            review
+                .contains("    parser · General · beta: its conversation could not be confirmed. Choose Resume conversation in the new tab (+) menu\n"),
+            "{review}"
+        );
+        assert!(
+            review.contains(
+                "  Window 3 could not be read; it may not reopen. Its saved file stays as it is\n"
+            ),
+            "{review}"
+        );
         assert_eq!(
             review
                 .matches("    Untitled conversation in alpha, started ")
@@ -1123,7 +1119,7 @@ mod tests {
     }
 
     #[test]
-    fn pane_specific_controls_only_appear_when_different_from_group_guidance() {
+    fn paused_terminals_and_chats_each_show_their_own_recovery() {
         let mut preview = preview();
         let mut terminal = session("terminal · beta", Disposition::Continues, "");
         terminal.kind = SessionKind::Terminal;
@@ -1135,7 +1131,22 @@ mod tests {
             recovery: "Press Reconnect in the pane to check the saved terminal".into(),
         });
         preview.daemon.as_mut().unwrap().sessions.push(terminal);
+        let chat = saved(&mut preview, "chat · beta", SavedOutcome::Resumes);
+        preview.stopped.push(StoppedPane {
+            pane: chat,
+            kind: StoppedKind::Chat,
+            label: "chat · beta".into(),
+            reason: "its conversation could not be confirmed".into(),
+            recovery: CHAT_RECOVERY.into(),
+        });
         let review = render_review(&preview);
+        assert!(
+            review.contains(
+                "Come back paused (2)    nothing is started; follow the recovery steps below"
+            ),
+            "{review}"
+        );
+        assert!(review.contains("    chat · beta: its conversation could not be confirmed. Choose Resume conversation in the new tab (+) menu"), "{review}");
         assert!(review.contains("    terminal · beta: its terminal could not be matched. Press Reconnect in the pane to check the saved terminal"), "{review}");
         assert!(!review.contains("Keep running ("), "{review}");
     }
@@ -1162,5 +1173,130 @@ mod tests {
         assert!(review.contains("Working now (1)"), "{review}");
         assert!(review.contains("Unchanged (2)"), "{review}");
         assert!(review.contains("Come back paused (1)"), "{review}");
+    }
+
+    #[test]
+    fn attention_and_manual_resume_never_render_raw_source_errors() {
+        for disposition in [Disposition::Blocked, Disposition::ResumePicker] {
+            for saved_detail in ["", "its saved pane stays available"] {
+                let mut preview = preview();
+                let raw = "Cannot join existing Codex daemon at /run/private.socket: Source protocol transport failed";
+                let live = session("conversation · beta", disposition, raw);
+                if !saved_detail.is_empty() {
+                    preview.labels.details.panes.insert(
+                        live.id,
+                        super::super::source_inspection::InspectedPane {
+                            kind: SessionKind::NativeChat,
+                            outcome: SavedOutcome::Resumes,
+                            detail: saved_detail.into(),
+                        },
+                    );
+                }
+                let daemon = preview.daemon.as_mut().unwrap();
+                daemon.sessions.push(live);
+                daemon.blockers.push(raw.into());
+                let review = render_review(&preview);
+                assert!(!review.contains(raw), "{review}");
+                for internal in ["/run/", "socket", "daemon", "Source", "transport"] {
+                    assert!(!review.contains(internal), "{review}");
+                }
+                assert!(review.contains("try the update again"), "{review}");
+                if disposition == Disposition::Blocked {
+                    assert!(review.contains("Stops (1)"), "{review}");
+                    assert!(
+                        review.contains("Let its work finish, then try again"),
+                        "{review}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unfinished_work_keeps_its_specific_close_instruction() {
+        let mut preview = preview();
+        preview.daemon.as_mut().unwrap().sessions.push(session(
+            "conversation",
+            Disposition::Blocked,
+            super::super::impact::STOPPED_WITH_UNSETTLED_WORK,
+        ));
+        let review = render_review(&preview);
+        assert!(
+            review.contains("Close this conversation before updating"),
+            "{review}"
+        );
+    }
+
+    #[test]
+    fn native_session_content_stays_part_of_consent_when_cli_uses_a_saved_label() {
+        let mut preview = preview();
+        let live = session(
+            "native title",
+            Disposition::Blocked,
+            "Its provider is not ready yet. This clears on its own once it finishes starting; close the conversation if it does not.",
+        );
+        preview.labels.names.insert(live.id, "saved label".into());
+        preview.daemon.as_mut().unwrap().sessions.push(live);
+        let mut changed = preview.clone();
+        changed.daemon.as_mut().unwrap().sessions[0].title = "changed native title".into();
+        assert_eq!(render_review(&preview), render_review(&changed));
+        assert!(!preview.preserves_consent(&changed));
+        changed = preview.clone();
+        changed.daemon.as_mut().unwrap().sessions[0].reason =
+            super::super::impact::STOPPED_WITH_UNSETTLED_WORK.into();
+        assert!(!preview.preserves_consent(&changed));
+    }
+
+    #[test]
+    fn capability_renewal_keeps_consent_but_context_and_recovery_changes_do_not() {
+        let preview = representative();
+        let mut changed = preview.clone();
+        let capability = &mut changed.daemon.as_mut().unwrap().capability;
+        capability.token = "renewed".into();
+        capability.expires_at_unix_ms += 100;
+        assert!(preview.preserves_consent(&changed));
+        changed = preview.clone();
+        changed.from_version = "different source version".into();
+        assert!(!preview.preserves_consent(&changed));
+        changed = preview.clone();
+        changed.windows += 1;
+        assert!(!preview.preserves_consent(&changed));
+        changed = preview.clone();
+        changed.stopped[0].recovery = "Use a different recovery control".into();
+        assert!(!preview.preserves_consent(&changed));
+        changed = preview.clone();
+        changed.stopped_windows[0].recovery = "Recover this window separately".into();
+        assert!(!preview.preserves_consent(&changed));
+    }
+
+    #[test]
+    fn daemon_notices_keep_known_recovery_actions_and_hide_unknown_diagnostics() {
+        let mut preview = preview();
+        preview.daemon.as_mut().unwrap().blockers = vec![
+            "Finish saving the pending return to terminal.".into(),
+            "Wait for starting sessions to finish opening.".into(),
+            "Cannot join existing Codex daemon at /run/private.socket: raw detail".into(),
+        ];
+        let review = render_review(&preview);
+        assert!(
+            review.contains("Finish saving the pending return to terminal."),
+            "{review}"
+        );
+        assert!(
+            review.contains("Wait for starting sessions to finish opening."),
+            "{review}"
+        );
+        assert!(review.contains("try the update again"), "{review}");
+        assert!(!review.contains("private.socket"), "{review}");
+        let mut clear = preview.clone();
+        clear.daemon.as_mut().unwrap().blockers.clear();
+        for changes in [
+            render_review_changes(&clear, &preview),
+            render_review_changes(&preview, &clear),
+        ] {
+            assert!(changes.contains("try the update again"), "{changes}");
+            assert!(!changes.contains("private.socket"), "{changes}");
+            assert!(!changes.contains("raw detail"), "{changes}");
+        }
     }
 }

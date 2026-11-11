@@ -1843,6 +1843,8 @@ impl Cagents {
     /// Refresh cached rows after state changes, never during rendering.
     pub(super) fn refresh_sidebar_channels(&mut self) {
         self.sidebar_state
+            .set_channel_selected(self.durable.active_channel.is_some());
+        self.sidebar_state
             .refresh_attention_projection(&self.durable, &self.sidebar_model.projects);
         let durable = &self.durable;
         let mut cards = HashMap::new();

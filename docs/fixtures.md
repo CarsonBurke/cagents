@@ -16,7 +16,8 @@ person.
 | A chat that answers offline, with tools, subagents, errors or crashes | The synthetic Claude provider, [`tests/fixtures/chat-composer-claude.sh`](chat-composer-fixture.md) |
 | GitHub availability, project avatars or a worktree's pull request in the sidebar, offline | The fixture's forge, [`tests/fixtures/fixture-gh.sh`](#an-offline-github), switched on by `home/.config/fixture-forge` |
 | A saved Claude conversation damaged by a crash and a huge tool output, to resume | [`tests/fixtures/claude-damaged-history.py`](../tests/fixtures/claude-damaged-history.py)` PROJECT`, run in a session's fixture with `scripts/native-evidence env python3 ...`; it writes the transcript under the fixture HOME's `.claude` |
-| A Codex app-server peer that plays scripted items | `tests/fixtures/terminal-escape-codex.py` and the peers built on its transport, such as `codex-tool-rows.py` |
+| A Codex chat that answers offline, with tool rows, subagent errors or terminal escapes | A [Codex peer](#an-offline-codex), installed by `native-evidence start SIDE --codex PEER` |
+| Real Codex app-server ownership, saved-history loading or socket behaviour | [An isolated real executable](#a-real-codex-in-the-fixture), selected by `native-evidence start SIDE --codex-executable /absolute/path/to/codex` |
 | Test a script's contract without a compositor or Cargo | The stubbed Python suites in `tests/*.py`, such as `tests/native_evidence.py` |
 
 From a terminal or chat that cagents hosts, your shell carries
@@ -37,8 +38,10 @@ directories, so nothing reaches the real desktop, daemon or provider config:
    fixture data, logs and `shots/`.
 2. **Fixture** (`TASK/fixture`): the app's HOME and XDG directories, a
    project repository, and `bin/` with the synthetic `claude`, a `gh` that
-   fails until [switched on](#an-offline-github), and a `curl` that always
-   fails. `save-seed` keeps it as the data every later start restores,
+   fails until [switched on](#an-offline-github), a `curl` that always
+   fails and, for a session started with `--codex`, an
+   [offline `codex`](#an-offline-codex), or an explicitly selected
+   [real executable](#a-real-codex-in-the-fixture). The fixture is mode 0700. `save-seed` keeps it as the data every later start restores,
    so both sides open the same workspace.
 3. **Compositor**: KWin's virtual backend, with its own HOME, hosting a nested
    niri session that `niri-harness` drives (`drive observe`, `drive click`,
@@ -99,7 +102,8 @@ Avatars never come from the network. Put an
 image at `$CAGENTS_EVIDENCE_FIXTURE/avatars/OWNER.image`, PNG, JPEG, GIF or
 WebP, at most 1 MiB and 1024×1024 pixels. Each time the app resolves a
 repository, the forge copies every seed into the app's avatar cache,
-`$XDG_CACHE_HOME/cagents-development/github-avatars/github.com-OWNER.image`
+`$XDG_CACHE_HOME/cagents-development-NAME/github-avatars/github.com-OWNER.image`
+for the evidence task's named instance (`cagents-development` for an unnamed run)
 with the owner in lower case, and gives it a fresh modification time, so the
 app reads it instead of downloading. Write the seed first, as below. The app
 loads each owner's avatar once, as soon as an open project has both the remote
@@ -159,6 +163,71 @@ sleep 12
 evidence shot sidebar-avatar
 ```
 
+## An offline Codex
+
+A session started with `--codex PEER`, or a `pair` given it, has a `codex` on
+the fixture's PATH that runs one of the offline app-server peers in
+`tests/fixtures`. A plain start installs no Codex; a real executable requires
+the separate option below.
+
+| PEER | Script | Each prompt |
+| --- | --- | --- |
+| `tool-rows` | `codex-tool-rows.py` | plays one turn of MCP, dynamic and function tools, collaboration calls, a hook prompt, image generation, a compaction and a diff, started then completed |
+| `child-errors` | `codex-child-errors.py` | reports subagent diagnostics before a failed turn; the prompts `failed-turn`, `retry`, `disconnect` and `closed-after-finish` pick the neighbouring cases |
+| `terminal-escape` | `terminal-escape-codex.py` | streams terminal escapes; see the script for the file that completes the stream |
+
+`start` copies the three scripts into `TASK/fixture/libexec/codex`, since the
+peers load their transport from beside them, creates `home/.codex`, and
+installs [`tests/fixtures/fixture-codex.sh`](../tests/fixtures/fixture-codex.sh)
+as `bin/codex`. That passes the fixture as the peer's private root and
+`$HOME/.codex` as `CODEX_HOME` unless the app names another, and every peer
+checks that both are private to you. Each start installs the peer afresh, so a
+seed doesn't carry one into a session that didn't ask for it.
+
+```sh
+scripts/native-evidence --remote fw16 --task ~/.local/state/cev/pr1234-rows \
+    pair --before origin/main --after . --steps rows.sh --codex tool-rows
+```
+
+The peers model the app-server protocol only: no provider, account, model or
+network is contacted, and the app's account and usage-limit handling isn't
+exercised.
+
+## A real Codex in the fixture
+
+Use a real executable when the test depends on Codex's history reader,
+thread writer lock or app-server socket behaviour:
+
+```sh
+scripts/native-evidence --remote fw16 --task ~/.local/state/cev/pr1234-codex \
+    start after --codex-executable /absolute/path/on/fw16/to/codex
+```
+
+`--codex-executable` and `--codex` are mutually exclusive. The selected path
+must name a readable regular executable ELF on the execution host. Before
+waiting for the native lock, the runner reads and snapshots its bytes without
+executing it. A queued session keeps that snapshot if the original path is
+replaced. Normal fixture preparation installs a fresh copy as
+`TASK/fixture/libexec/codex/codex`, with a `bin/codex` link pointing to it.
+The copy is mode 0755 and inherits no set-id bits, extended attributes or
+capabilities. `TASK/session/codex-executable-installed.json` records the
+source path, source/snapshot/copy identities and SHA256 hashes; retain that
+receipt with each case's evidence. Each start installs only what it asks for,
+so a later plain or fake-peer session cannot inherit the real executable.
+
+Only the executable is copied. The app and provider use the fixture's private
+HOME and XDG directories, starting from the runner's empty environment; no
+provider config or credentials are imported. For offline history tests, seed
+invented data under `TASK/fixture/home/.codex`, configure an offline model
+provider there, and keep the rollout's `session_meta.model_provider` equal to
+that provider. Use
+[`codex-resume-history.py`](../tests/fixtures/codex-resume-history.py) for
+turn-framed history and
+[`tests/codex_resume_history.py`](../tests/codex_resume_history.py) for a real
+app-server example that sends no model prompt. Save the stopped fixture with
+`save-seed` before the comparison. This isolates state and credentials; it
+does not sandbox the real executable's network access.
+
 ## Adding a provider behaviour
 
 The synthetic Claude provider reads switches from files in its config
@@ -216,6 +285,29 @@ host. `pair` can wait 30 minutes for the native lock, so run it in the
 background rather than under a short command timeout, and run `clean` once the
 PR merges to remove the task's checkouts from the host.
 
+## Saved Codex history
+
+For saved Codex turns in the Resume conversation picker, use
+[`tests/fixtures/codex-resume-history.py`](../tests/fixtures/codex-resume-history.py).
+
+`/usr/bin/python3 tests/fixtures/codex-resume-history.py ROOT --turns 3`
+creates one invented conversation under `ROOT/home/.codex` and prints its
+thread ID, rollout path and working directory as JSON. Run it once in a new
+fixture before saving the seed; it refuses an existing Codex home. For native
+evidence, use that home with a real Codex executable and the ordinary development
+runner. The generator does not install or launch Codex, sign in, or call a model.
+
+Each user message has a `task_started` event before it, and each turn ends with
+`task_complete`. The rollout also includes the user and agent message events
+that Codex consumes for history. Model `response_item` records alone can leave
+the native history empty even though the Resume picker finds the conversation.
+`/usr/bin/python3 -I -B tests/codex_resume_history.py -v` checks the fixture;
+set `CAGENTS_TEST_CODEX` to an absolute native Codex executable to also verify
+`thread/resume` and `thread/turns/list` without starting a model turn. That
+optional check gives Codex fresh HOME, config and cache directories and an
+unreachable local model endpoint. It compares the original incomplete fixture
+shape with the corrected one, including message contents and turn identities.
+
 ## When a fixture fails
 
 Every refusal names its cause and the next command. The common ones:
@@ -233,8 +325,27 @@ Every refusal names its cause and the next command. The common ones:
 | `the SIDE side is running on HOST; stop it before rebuilding` | A side's checkout can't change under its session. Run the `stop` it names, then build. |
 | `task NAME on HOST belongs to OWNER` | Another agent's task has that name on the host. Give your task directory another name, such as your PR's. |
 | `... is not a task this route started` | A task of that name exists on the host without an owner: someone runs it there directly, or an earlier version of the route started it. If it is yours, run the command the message gives on the host; otherwise rename yours. |
+| `codex: the fixture has no Codex peer` | The session started without `--codex`, but something ran `codex`. Start it with `--codex tool-rows`, `child-errors` or `terminal-escape`. |
+| `fixture requires private owned root/runtime directories` | A Codex peer found the fixture or runtime directory readable by others. `start` makes both private; if you changed their modes, start again. |
 | `this task directory is the host's own` | You are on the build host. Run `scripts/native-evidence` without `--remote`. |
 
 If a fixture fails in a way that doesn't point to the fix, that is a fixture
 bug: make the message say what is wrong and what to do, and add a test for it
 beside the others in the fixture's contract suite.
+
+## A read-only native update review
+
+Development UI builds under `native-evidence` read
+`home/.config/fixture-update-review.json` in `CAGENTS_EVIDENCE_FIXTURE`.
+Copy `tests/fixtures/update-review.json` there with mode 0600, then start the
+session (or wait for the active review's next status poll). The example includes
+running work, a blocked conversation, a daemon notice and a paused terminal.
+The file must contain an awaiting-confirmation job named `fixture-update-review`
+with a blocked daemon preview. Apply is disabled; decisions fail before looking
+up an installation. Remove the file to end the fixture review.
+
+This loads data into the actual native dialog and supports scrolling and Copy
+details. It does not run providers, inspect a live update inventory, perform an
+update, or exercise cancellation/recovery. The grouped Paused heading belongs
+to the CLI review. The native dialog currently omits saved stopped panes, so
+the fixture's paused terminal does not appear in that dialog.

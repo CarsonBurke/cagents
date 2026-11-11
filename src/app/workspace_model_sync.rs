@@ -973,15 +973,27 @@ impl Cagents {
     /// emptiness is not a registry's emptiness. Publishing against it would be
     /// premature and retiring against it would be destruction.
     pub(super) fn reconcile_workspace_model(&mut self) -> Task<Message> {
+        self.reconcile_workspace_model_in(None)
+    }
+
+    pub(super) fn reconcile_workspace_model_for_repository(
+        &mut self,
+        repository: &Path,
+    ) -> Task<Message> {
+        self.reconcile_workspace_model_in(Some(repository))
+    }
+
+    fn reconcile_workspace_model_in(&mut self, repository: Option<&Path>) -> Task<Message> {
         if self.workspace_model.identity == NO_REGISTRY {
             return Task::none();
         }
         let history = crate::upgrade::floor::load().ok();
-        self.reconcile_workspace_model_with_history(history.as_ref())
+        self.reconcile_workspace_model_with_history(repository, history.as_ref())
     }
 
     fn reconcile_workspace_model_with_history(
         &mut self,
+        repository: Option<&Path>,
         history: Option<&crate::upgrade::floor::Ledger>,
     ) -> Task<Message> {
         // Taken rather than cloned: reconciling needs `&mut self` for the
@@ -1071,6 +1083,7 @@ impl Cagents {
         let display_index =
             crate::workspace_model::views::ManagedDisplayIndex::with_history(&model, history);
         let mut new_managed_panes = Vec::new();
+        let mut adopted_scopes = HashSet::new();
         for agent in &model.agents {
             // Scheduled agents stay headless until an explicit history or
             // notification action opens their exact live run.
@@ -1089,6 +1102,7 @@ impl Cagents {
                     continue;
                 }
                 if let Some(task) = self.adopt_execution_agent_display(agent, display) {
+                    adopted_scopes.insert(scope.clone());
                     if unpublished {
                         new_managed_panes.push((scope, card));
                     }
@@ -1113,7 +1127,10 @@ impl Cagents {
         // Fence canonical evidence and finish projecting authoritative pane
         // sources before reconciliation persists. Publishing earlier would mix
         // old descriptors with newly received pending-start flags.
-        tasks.push(self.reconcile_shared_views_with_history(history));
+        tasks.push(self.reconcile_shared_views_in(
+            repository.map(|repository| (repository, &adopted_scopes)),
+            history,
+        ));
         if changed {
             self.refresh_sidebar_channels();
             tasks.push(self.sync_chrome());
@@ -3928,6 +3945,37 @@ mod tests {
                 .cards
                 .contains(&pane.id)
         );
+    }
+
+    #[test]
+    fn repository_refresh_projects_managed_adoptions_outside_its_repository() {
+        let (mut app, agent, pane, destination) = managed_display_fixture();
+        let mut original_only = app.workspace_model.clone();
+        original_only.views.clear();
+        let display =
+            crate::workspace_model::views::managed_display(&original_only, &agent).unwrap();
+        assert!(app.adopt_execution_agent_display(&agent, display).is_some());
+        app.shared_views.initialize(
+            crate::workspace_model::views::Scope::Channel(destination),
+            vec![pane.clone()],
+        );
+        let actor = app.card_state(pane.id).unwrap().kind.clone();
+        assert_ne!(app.card_state(pane.id).unwrap().title, pane.title);
+        drop(app.reconcile_workspace_model_for_repository(Path::new("/unrelated")));
+        let current = app.card_state(pane.id).unwrap();
+        assert_eq!(current.kind, actor);
+        assert_eq!(current.title, pane.title);
+        assert_eq!(current.width_fraction, pane.width_fraction);
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .any(|channel| channel.id == destination && channel.cards.contains(&pane.id))
+        );
+        assert!(matches!(
+            app.cards.get(&pane.id),
+            Some(CardRuntime::Loading)
+        ));
     }
 
     #[test]

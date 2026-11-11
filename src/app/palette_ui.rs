@@ -2947,7 +2947,7 @@ mod settings_recorder_tests {
             third.id = CardId::new();
             let ids = [first.id, second.id, third.id];
             let durable = Arc::make_mut(&mut app.durable);
-            durable.cards = vec![first, second, third];
+            durable.cards = vec![first, second, third].into();
             durable.focused = Some(ids[2]);
             app.workspace = Cagents::rebuild_workspace(&app.durable);
             app.tab_history = crate::tab_history::TabHistory::from_recent([ids[2], ids[1], ids[0]]);

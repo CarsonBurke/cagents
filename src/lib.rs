@@ -141,7 +141,7 @@ mod retained_fixture_tests;
 /// measurement turns it on, so ordinary tests pay one relaxed load per
 /// allocation. The count is process-wide: read it from a measurement run
 /// alone.
-#[cfg(all(test, feature = "ui"))]
+#[cfg(all(test, feature = "ui", not(feature = "integrated-browser")))]
 pub(crate) mod test_heap {
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
@@ -202,6 +202,6 @@ pub(crate) mod test_heap {
     }
 }
 
-#[cfg(all(test, feature = "ui"))]
+#[cfg(all(test, feature = "ui", not(feature = "integrated-browser")))]
 #[global_allocator]
 static TEST_HEAP: test_heap::Counting = test_heap::Counting;

@@ -416,11 +416,10 @@ fn committed_upgrade_shutdown_preserves_real_native_owner_even_if_final_save_fai
                 "old-alias retry must retire the exact current adopted authority too"
             );
             let final_proof = restarted.lock().unwrap().proof().clone();
+            let receipt = crate::chat::native_holder::closed_source(&source, &final_proof).unwrap();
             assert!(
-                crate::chat::native_holder::closed_source(&source, &final_proof)
-                    .unwrap()
-                    .is_some(),
-                "the exact issued source retains its completed close proof"
+                receipt.as_ref().is_some_and(|(_, paired)| *paired),
+                "the exact issued source retains its completed paired close proof"
             );
             let mut unrelated = source;
             unrelated.launch.session_id = Some("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".into());
@@ -459,12 +458,19 @@ fn committed_upgrade_shutdown_preserves_real_native_owner_even_if_final_save_fai
                 super::super::client::process_request(
                     &restarted,
                     0,
-                    crate::terminal::ipc::ClientRequest::ChatCloseRetained { session: unrelated }
+                    crate::terminal::ipc::ClientRequest::ChatCloseRetained {
+                        session: unrelated.clone()
+                    }
                 )
                 .unwrap()
                 .0,
                 crate::terminal::ipc::ServerResponse::Accepted
             ));
+            assert!(
+                crate::chat::native_holder::closed_source(&unrelated, &final_proof)
+                    .unwrap()
+                    .is_none()
+            );
             assert_eq!(receipts(), receipts_before);
             assert_eq!(
                 serde_json::to_vec(

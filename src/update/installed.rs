@@ -160,7 +160,7 @@ pub(super) fn perform(
         )
         .map_err(io::Error::other)?
         .with_inspection(&inspected);
-        if !confirmed.preserves_consent(&latest)
+        if !confirmed.preserves_consent(&context.apply(latest))
             || digest(root).map_err(io::Error::other)? != staged.identity.digest
         {
             return Err(invalid(

@@ -10,6 +10,8 @@ mod handoff;
 mod installed;
 mod pending_recovery;
 pub(crate) mod recovery;
+#[cfg(all(feature = "ui", feature = "development"))]
+mod review_fixture;
 pub use recovery::TargetRecoveryRequired;
 pub(crate) mod source;
 pub use confirmation::{Choice as UpdateChoice, Confirmation as UpdateConfirmation, decide};
@@ -1189,6 +1191,12 @@ pub fn status() -> Result<Option<UpdateJob>, UpdateError> {
 /// installation failure as a warning in every subsequently installed window.
 #[cfg(feature = "ui")]
 pub(crate) fn status_for_ui() -> Result<Option<UpdateJob>, UpdateError> {
+    #[cfg(feature = "development")]
+    if let Some(root) = std::env::var_os("CAGENTS_EVIDENCE_FIXTURE")
+        && let Some(job) = review_fixture::read(Path::new(&root))?
+    {
+        return Ok(Some(job));
+    }
     let Some(job) = status()? else {
         return Ok(None);
     };
@@ -1564,7 +1572,7 @@ fn perform_update(
         )
         .map_err(io::Error::other)?
         .with_inspection(&inspected);
-        if !confirmed.preserves_consent(&latest) {
+        if !confirmed.preserves_consent(&context.apply(latest)) {
             return Err(invalid(
                 "Session ownership changed during pane inspection; existing windows were kept open",
             ));

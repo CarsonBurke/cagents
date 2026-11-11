@@ -44,6 +44,7 @@ mod settings_ui;
 mod shared_views;
 mod sidebar_selection_ui;
 mod startup_gate;
+mod startup_restore;
 mod terminal_adoption;
 mod terminal_close;
 mod terminal_end_ui;
@@ -3029,6 +3030,7 @@ pub enum SettingsField {
     ManagedWorktreeDirectory,
     AutoDeleteMergedWorktrees,
     WorktreeSort,
+    SidebarWorktrees,
     DefaultWorktreePane,
     DefaultChannelPane,
     DefaultColumnFraction,
@@ -3160,6 +3162,7 @@ impl SettingsField {
             Self::TerminalScrollbackMib => "Scrollback (MiB)",
             Self::ManagedWorktreeDirectory => "Managed worktree directory",
             Self::WorktreeSort => "Worktree order",
+            Self::SidebarWorktrees => "Worktrees in sidebar",
             Self::DefaultWorktreePane => "Default worktree pane",
             Self::DefaultChannelPane => "Default channel pane",
             Self::DefaultColumnFraction => "New pane width",
@@ -3253,6 +3256,7 @@ impl SettingsField {
             | Self::WorkStaleAfterDays
             | Self::ManagedWorktreeDirectory
             | Self::WorktreeSort
+            | Self::SidebarWorktrees
             | Self::DefaultWorktreePane
             | Self::DefaultChannelPane
             | Self::FocusFollowsMouse => SettingsCategory::General,
@@ -3440,6 +3444,7 @@ struct SettingsDraft {
     managed_worktree_directory: String,
     auto_delete_merged_worktrees: bool,
     worktree_sort: String,
+    sidebar_worktrees: settings::SidebarWorktrees,
     default_worktree_pane: settings::DefaultPane,
     default_channel_pane: settings::DefaultPane,
     default_column_fraction: String,
@@ -3501,6 +3506,7 @@ impl SettingsDraft {
                 settings::WorktreeSort::Alphabetical => "alphabetical",
             }
             .into(),
+            sidebar_worktrees: settings.sidebar_worktrees,
             default_column_fraction: settings.default_column_fraction.to_string(),
             default_worktree_pane: settings.default_worktree_pane,
             default_channel_pane: settings.default_channel_pane,
@@ -3553,6 +3559,11 @@ impl SettingsDraft {
                 self.auto_delete_merged_worktrees = value == "true"
             }
             SettingsField::WorktreeSort => self.worktree_sort = value,
+            SettingsField::SidebarWorktrees => {
+                if let Some(mode) = settings::SidebarWorktrees::from_key(&value) {
+                    self.sidebar_worktrees = mode;
+                }
+            }
             SettingsField::DefaultWorktreePane => {
                 if let Some(pane) = settings::DefaultPane::from_key(&value) {
                     self.default_worktree_pane = pane;
@@ -3839,6 +3850,9 @@ fn settings_update(
             .parse::<bool>()
             .map(|enabled| next.check_for_updates = enabled)
             .map_err(|_| "Choose whether to check for updates automatically.".to_owned()),
+        SettingsField::SidebarWorktrees => settings::SidebarWorktrees::from_key(value)
+            .map(|mode| next.sidebar_worktrees = mode)
+            .ok_or_else(|| "Choose Grouped, Expanded, or Hidden.".to_owned()),
         SettingsField::WorktreeSort => match value {
             "newest" => {
                 next.worktree_sort = settings::WorktreeSort::Newest;
@@ -4403,6 +4417,7 @@ pub enum Message {
         saved: Result<SettingsSaved, String>,
         result: Result<(), String>,
     },
+    SidebarPreferencesObserved(AppSettings),
     SettingsSaved {
         generation: u64,
         result: Result<SettingsSaved, String>,
@@ -5723,6 +5738,12 @@ impl Cagents {
     }
 
     fn initialize_runtimes(&mut self) -> Task<Message> {
+        let initial_views = self.local_view_scopes();
+        self.startup_gate.initial_panes.capture(
+            instance::window_launch_restore_policy(),
+            &self.durable.cards,
+        );
+        self.startup_gate.initial_panes.capture_views(initial_views);
         let mut repository_tasks = Vec::new();
         let open_terminals_exposed = |exposure| {
             self.durable
@@ -5870,6 +5891,11 @@ impl Cagents {
         if !explicit_retry && self.saved_terminal_current(card).is_some() {
             return Task::none();
         }
+        let existing_only = !explicit_retry
+            && self
+                .startup_gate
+                .initial_panes
+                .existing_only(card, session.id);
         // Recovery can replace the identity this start ends up with, so
         // adoption has to know a start is outstanding before the task runs.
         self.begin_terminal_start(card);
@@ -5886,6 +5912,9 @@ impl Cagents {
             .any(|pane| pane.id == card && pane.pending_terminal_start);
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
+                if existing_only {
+                    return attach_initial_terminal(card, session, sender);
+                }
                 let mut created = false;
                 let (recovered, mode) = if shared && !explicit_retry {
                     let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
@@ -5942,8 +5971,15 @@ impl Cagents {
         let sender = self.terminal_wake_tx.clone();
         let terminal = session.id;
         let shared = self.attaches_as_shared(card);
+        let existing_only = self
+            .startup_gate
+            .initial_panes
+            .existing_only(card, session.id);
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
+                if existing_only {
+                    return attach_initial_terminal(card, session, sender).map(Some);
+                }
                 let connect = || {
                     let socket = crate::terminal::ensure_daemon_ready()
                         .map_err(|error| error.to_string())?;
@@ -6099,6 +6135,7 @@ impl Cagents {
             // is free to decide about it.
             return self.finish_terminal_start(card);
         }
+        self.startup_gate.initial_panes.settled(card, terminal);
         // A card still hibernated when its start lands is a restored agent
         // attached only for its row.
         let hibernated = matches!(self.lifecycle.state(card), Some((_, Residency::Hibernated)));
@@ -8840,6 +8877,7 @@ impl Cagents {
         let surfaces_visible = self.workspace_surfaces_visible();
         match state.kind {
             CardKind::Terminal(session) => {
+                self.startup_gate.initial_panes.explicit_action(card);
                 self.terminal_recovery_attempts.remove(&session.id);
                 self.cards.insert(card, CardRuntime::Loading);
                 let task = self.start_terminal(
@@ -10970,6 +11008,16 @@ impl Cagents {
             }
         };
         if let Some(action) = action {
+            if let SidebarAction::OpenWorktree {
+                project_id,
+                worktree_id,
+                ..
+            } = &action
+                && let Some(project) = self.sidebar_model.project(*project_id)
+            {
+                self.sidebar_state
+                    .reveal_worktree(project, *worktree_id, false);
+            }
             self.sidebar_state.apply(&action);
         }
     }
@@ -14455,6 +14503,10 @@ impl Cagents {
                 .set_worktree_sort(self.settings.worktree_sort);
         }
         self.sidebar_state
+            .set_sidebar_worktrees(self.settings.sidebar_worktrees);
+        self.sidebar_state
+            .set_worktree_overrides(self.settings.sidebar_worktree_overrides.clone());
+        self.sidebar_state
             .set_show_worktree_changes_icons(self.settings.show_worktree_changes_icons);
         if previous.app_theme != self.settings.app_theme
             || previous.ui_scale != self.settings.ui_scale
@@ -14995,6 +15047,10 @@ impl Application for Cagents {
             .set_worktree_sort(app.settings.worktree_sort);
         app.sync_worktree_protections();
         app.sidebar_state
+            .set_sidebar_worktrees(app.settings.sidebar_worktrees);
+        app.sidebar_state
+            .set_worktree_overrides(app.settings.sidebar_worktree_overrides.clone());
+        app.sidebar_state
             .set_show_worktree_changes_icons(app.settings.show_worktree_changes_icons);
         // `view` lays the strip out against the width `Workspace` holds, which
         // starts at zero, and `PanSurface` only publishes its real bounds once
@@ -15332,6 +15388,9 @@ impl Application for Cagents {
                     // reports whatever still stands in the way; a startup gate
                     // reports it rather than waiting for that.
                     result => {
+                        if self.card_state(card).is_some_and(|state| matches!(&state.kind, CardKind::Terminal(session) if session.id == terminal)) {
+                            self.startup_gate.initial_panes.settled(card, terminal);
+                        }
                         let reason = result.err().unwrap_or_else(|| {
                             "the terminal service no longer hosts it; open it to relaunch".into()
                         });
@@ -15784,7 +15843,7 @@ impl Application for Cagents {
                             pending,
                             pr_enrichment,
                             self.project_avatar_task(project_id),
-                            self.reconcile_workspace_model(),
+                            self.reconcile_workspace_model_for_repository(&loaded.project.repository),
                         ]);
                     }
                     Err(error) => {
@@ -16212,6 +16271,11 @@ impl Application for Cagents {
                     .is_some_and(|directory| self.refuse_in_deleting_worktree(&directory))
                 {
                     return Task::none();
+                }
+                if let SidebarAction::OpenWorktree { project_id, worktree_id, .. } = &action
+                    && let Some(project) = self.sidebar_model.project(*project_id)
+                {
+                    self.sidebar_state.reveal_worktree(project, *worktree_id, true);
                 }
                 self.sidebar_state.apply(&action);
                 // Opening a row, by pointer or keyboard, is navigation: it
@@ -16685,7 +16749,17 @@ impl Application for Cagents {
                     }
                     SidebarAction::SearchChanged(_)
                     | SidebarAction::SetFilter(_)
-                    | SidebarAction::ToggleProject(_) => Task::none(),
+                    | SidebarAction::ToggleProject(_)
+                    | SidebarAction::ToggleWorktrees(_)
+                    => Task::none(),
+                    SidebarAction::SetWorktreeDisplay { project_id, mode } => {
+                        if let Some(mode) = mode {
+                            self.settings.sidebar_worktree_overrides.insert(project_id, mode);
+                        } else {
+                            self.settings.sidebar_worktree_overrides.remove(&project_id);
+                        }
+                        self.save_settings_task(false)
+                    },
                 }
             }
             Message::AcknowledgeVisiblePane { card, epoch } => {
@@ -16838,6 +16912,7 @@ impl Application for Cagents {
                     if self.startup_gate.window_opened() {
                         // The updater may have timed out and retained this
                         // usable recovery window while closing its pipe.
+                        self.startup_report_failed();
                         self.status = Some(TransientNotice::warning(format!(
                             "The updater could not verify this window's recovery: {error}. Your chats and drafts remain available; verify them and save before updating again."
                         )));
@@ -16877,6 +16952,27 @@ impl Application for Cagents {
                     self.status = Some(TransientNotice::error(format!(
                         "Could not open a new window: {error}"
                     )));
+                }
+                Task::none()
+            }
+            Message::SidebarPreferencesObserved(settings) => {
+                // A local edit owns these fields until its save is acknowledged.
+                if self.settings_save_generation == self.settings_ack_generation {
+                    // Never wait for a disk save on the event loop. An in-flight
+                    // save's acknowledgment restarts this observation.
+                    let Ok(mut lane) = self.settings_save_lane.try_lock() else { return Task::none(); };
+                    if let Some(saved) = lane.as_mut() {
+                        saved.settings.sidebar_worktrees = settings.sidebar_worktrees;
+                        saved.settings.sidebar_worktree_overrides = settings.sidebar_worktree_overrides.clone();
+                    }
+                    drop(lane);
+                    self.settings.sidebar_worktrees = settings.sidebar_worktrees;
+                    self.settings.sidebar_worktree_overrides = settings.sidebar_worktree_overrides.clone();
+                    self.settings_base.sidebar_worktrees = settings.sidebar_worktrees;
+                    self.settings_base.sidebar_worktree_overrides = settings.sidebar_worktree_overrides.clone();
+                    self.settings_draft.sidebar_worktrees = settings.sidebar_worktrees;
+                    self.sidebar_state.set_sidebar_worktrees(settings.sidebar_worktrees);
+                    self.sidebar_state.set_worktree_overrides(settings.sidebar_worktree_overrides);
                 }
                 Task::none()
             }
@@ -18907,6 +19003,13 @@ impl Application for Cagents {
                     _ => None,
                 }),
         );
+        subscriptions.push(
+            Subscription::run_with(
+                (self.settings_path.clone(), self.settings_ack_generation),
+                |(path, _)| settings_ui::sidebar_preferences_stream(path.clone()),
+            )
+            .map(Message::SidebarPreferencesObserved),
+        );
         subscriptions.extend(operation_subscriptions);
         if let Some(window) = self.core.main_window_id()
             && (self.workspace.is_animating() || self.context_inspector_transition.is_some())
@@ -19986,6 +20089,65 @@ fn load_repository_github(
 
 const SHARED_TERMINAL_DISCONNECTED: &str =
     "This terminal isn't connected. Use Retry or Close on its pane.";
+
+/// An initial recovered pane can only subscribe to an exact issued owner.
+/// Its captured endpoint remains read-only after the startup gate finishes.
+fn attach_initial_terminal(
+    card: CardId,
+    source: TerminalSession,
+    sender: async_channel::Sender<TerminalWakeup>,
+) -> Result<StartedTerminal, String> {
+    let socket =
+        crate::terminal::existing_daemon_socket_path().map_err(|error| error.to_string())?;
+    let mut client =
+        crate::control::ControlClient::connect(&socket).map_err(|error| error.to_string())?;
+    let proof = client.proof().clone();
+    let terminals = client.list().map_err(|error| error.to_string())?;
+    let session = initial_terminal_attachment(&source, &terminals, &proof)?
+        .ok_or("The recovered daemon no longer holds this terminal. Its saved pane is kept; use Retry explicitly to reconnect or relaunch it")?;
+    saved_terminal::attach_existing(
+        card,
+        daemon_recovery::RecoveredTerminal {
+            session,
+            expected_host: Some(proof.clone()),
+            attach_completed: false,
+            recovery_lease: None,
+        },
+        socket,
+        proof,
+        sender,
+    )
+}
+
+fn initial_terminal_attachment(
+    source: &TerminalSession,
+    terminals: &[crate::terminal::ipc::TerminalDescriptor],
+    proof: &HostSessionProof,
+) -> Result<Option<TerminalSession>, String> {
+    if terminals
+        .iter()
+        .any(|terminal| terminal.session.id == source.id)
+    {
+        return saved_terminal::attachment(source, terminals, proof);
+    }
+    let mut issued = terminals.iter().filter(|terminal| {
+        terminal.upgrade_sources.contains(source)
+            || terminal
+                .upgrade_relaunches
+                .iter()
+                .any(|relaunch| relaunch.source == *source)
+    });
+    let Some(terminal) = issued.next() else {
+        return Ok(None);
+    };
+    if issued.next().is_some()
+        || !proof.is_complete()
+        || !terminal.session.continuity.can_resume_live(proof)
+    {
+        return Err("The initial terminal has ambiguous or unconfirmed issued ownership".into());
+    }
+    Ok(Some(terminal.session.clone()))
+}
 
 /// Another client may own a shared terminal's recovery, so a shared pane only
 /// attaches the exact session its daemon hosts, under that daemon's proof.
@@ -22395,7 +22557,7 @@ mod tests {
         let (first, second) = (panes[0].id, panes[1].id);
         let mut state = WorkspaceState {
             focused: Some(second),
-            cards: panes,
+            cards: panes.into(),
             ..WorkspaceState::default()
         };
         retire_duplicate_utility_cards(&mut state);
@@ -22413,7 +22575,7 @@ mod tests {
         let id = pane.id;
         app.durable = Arc::new(WorkspaceState {
             focused: Some(id),
-            cards: vec![pane],
+            cards: vec![pane].into(),
             ..WorkspaceState::default()
         });
         app.workspace = Cagents::rebuild_workspace(&app.durable);
@@ -24831,7 +24993,7 @@ mod tests {
         let active = cards[0].id;
         app.durable = Arc::new(WorkspaceState {
             focused: Some(active),
-            cards,
+            cards: cards.into(),
             ..WorkspaceState::default()
         });
         app.workspace = Cagents::rebuild_workspace(&app.durable);
@@ -24860,7 +25022,7 @@ mod tests {
         let moved = cards[12].id;
         app.durable = Arc::new(WorkspaceState {
             focused: Some(active),
-            cards,
+            cards: cards.into(),
             ..WorkspaceState::default()
         });
         app.workspace = Cagents::rebuild_workspace(&app.durable);
@@ -24886,7 +25048,7 @@ mod tests {
         let retarget = cards[5].id;
         app.durable = Arc::new(WorkspaceState {
             focused: Some(origin),
-            cards,
+            cards: cards.into(),
             ..WorkspaceState::default()
         });
         app.workspace = Cagents::rebuild_workspace(&app.durable);
@@ -24929,7 +25091,7 @@ mod tests {
         let target = cards[2].id;
         app.durable = Arc::new(WorkspaceState {
             focused: Some(cards[0].id),
-            cards,
+            cards: cards.into(),
             ..WorkspaceState::default()
         });
         app.workspace = Cagents::rebuild_workspace(&app.durable);
@@ -24979,7 +25141,7 @@ mod tests {
             let source = terminal.clone();
             app.durable = Arc::new(WorkspaceState {
                 focused: Some(first),
-                cards,
+                cards: cards.into(),
                 ..WorkspaceState::default()
             });
             app.workspace = Cagents::rebuild_workspace(&app.durable);
@@ -25048,7 +25210,7 @@ mod tests {
         let terminal_id = terminal.id;
         app.durable = Arc::new(WorkspaceState {
             focused: Some(id),
-            cards: vec![card],
+            cards: vec![card].into(),
             ..WorkspaceState::default()
         });
         app.workspace = Cagents::rebuild_workspace(&app.durable);
@@ -26104,7 +26266,7 @@ mod tests {
         ];
         app.durable = Arc::new(WorkspaceState {
             focused: Some(visible.id),
-            cards: cards.to_vec(),
+            cards: cards.to_vec().into(),
             ..WorkspaceState::default()
         });
         app.set_exposure(visible.id, Exposure::Visible);
@@ -26144,7 +26306,7 @@ mod tests {
         let terminals = ["/bin/sh", "/usr/bin/omp", "/fixture/custom-wrapper"]
             .map(|program| restored_live_terminal(program));
         app.durable = Arc::new(WorkspaceState {
-            cards: terminals.to_vec(),
+            cards: terminals.to_vec().into(),
             ..WorkspaceState::default()
         });
         app.workspace = Cagents::rebuild_workspace(&app.durable);
@@ -26171,7 +26333,7 @@ mod tests {
         let mut app = context_inspector_test_app(false);
         let agent = restored_live_terminal("/usr/bin/claude");
         app.durable = Arc::new(WorkspaceState {
-            cards: vec![agent.clone()],
+            cards: vec![agent.clone()].into(),
             ..WorkspaceState::default()
         });
         app.workspace = Cagents::rebuild_workspace(&app.durable);
@@ -26202,7 +26364,7 @@ mod tests {
         }
         let session = session.clone();
         app.durable = Arc::new(WorkspaceState {
-            cards: vec![agent.clone()],
+            cards: vec![agent.clone()].into(),
             ..WorkspaceState::default()
         });
         app.workspace = Cagents::rebuild_workspace(&app.durable);
@@ -26522,7 +26684,7 @@ mod tests {
             .collect();
         let channel_card = cards[2].id;
         let durable = Arc::make_mut(&mut app.durable);
-        durable.cards = cards;
+        durable.cards = cards.into();
         durable.channels.push(ProjectChannel {
             title_source: Default::default(),
             id: channel,
@@ -30668,6 +30830,74 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sidebar_worktree_collapse_survives_selection_synchronization() {
+        let mut app = context_inspector_test_app(true);
+        let project = ProjectId::new();
+        let selected = WorktreeId::new();
+        let other = WorktreeId::new();
+        let row = |id, path: &str| {
+            sidebar::SidebarWorktree::new(
+                id,
+                path.into(),
+                Some("topic".into()),
+                false,
+                false,
+                None,
+                None,
+                None,
+            )
+        };
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            RepositoryId(uuid::Uuid::new_v4()),
+            "Example".into(),
+            "/repo".into(),
+            vec![row(selected, "/tmp"), row(other, "/other")],
+            vec![],
+        ));
+        app.synchronize_sidebar_selection();
+        drop(app.rebind_source_control());
+        let other_row = sidebar::SelectionRow::Worktree(project, other);
+        assert!(
+            sidebar::visible_selection_rows(&app.sidebar_model, &app.sidebar_state, false)
+                .contains(&other_row)
+        );
+        drop(app.update(Message::Sidebar(SidebarAction::ToggleWorktrees(project))));
+        app.synchronize_sidebar_selection();
+        let visible =
+            sidebar::visible_selection_rows(&app.sidebar_model, &app.sidebar_state, false);
+        assert!(!visible.contains(&other_row));
+        assert!(visible.contains(&sidebar::SelectionRow::Worktree(project, selected)));
+    }
+
+    #[test]
+    fn sidebar_preferences_observed_after_local_save_can_reset_external_override() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(false);
+        app.settings_write_blocked = false;
+        app.settings_path = Some(path.clone());
+        app.save_settings_now().unwrap();
+        let project = ProjectId::new();
+        let mut external = settings::load(&path).unwrap();
+        external.sidebar_worktrees = settings::SidebarWorktrees::Hidden;
+        external
+            .sidebar_worktree_overrides
+            .insert(project, settings::SidebarWorktrees::Expanded);
+        settings::save(&path, &external).unwrap();
+        drop(app.update(Message::SidebarPreferencesObserved(external)));
+        assert_eq!(
+            app.sidebar_state.worktree_display(project),
+            settings::SidebarWorktrees::Expanded
+        );
+        app.settings.sidebar_worktree_overrides.remove(&project);
+        app.save_settings_now().unwrap();
+        let saved = settings::load(&path).unwrap();
+        assert_eq!(saved.sidebar_worktrees, settings::SidebarWorktrees::Hidden);
+        assert!(!saved.sidebar_worktree_overrides.contains_key(&project));
+    }
+
     pub(super) fn context_inspector_test_app(with_focused_card: bool) -> Cagents {
         let card = with_focused_card.then(terminal_card_state);
         let card_id = card.as_ref().map(|card| card.id);
@@ -31751,7 +31981,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let card_ids = cards.iter().map(|card| card.id).collect::<Vec<_>>();
-        Arc::make_mut(&mut app.durable).cards = cards;
+        Arc::make_mut(&mut app.durable).cards = cards.into();
         let first_id = first.project.id;
         for loaded in [&first, &aliased, &linked_load] {
             app.repository_generations.insert(loaded.project.id, 1);
@@ -31805,7 +32035,7 @@ mod tests {
         card.width_fraction = 0.125;
         let card_id = card.id;
         let durable = WorkspaceState {
-            cards: vec![card],
+            cards: vec![card].into(),
             focused: Some(card_id),
             ..WorkspaceState::default()
         };
@@ -32512,7 +32742,7 @@ mod tests {
         let ids: Vec<_> = cards.iter().map(|card| card.id).collect();
         app.durable = Arc::new(WorkspaceState {
             focused: Some(ids[0]),
-            cards,
+            cards: cards.into(),
             ..WorkspaceState::default()
         });
         app.workspace = Cagents::rebuild_workspace(&app.durable);
@@ -32882,7 +33112,8 @@ mod tests {
                 repository(&"A".repeat(20_000_000)),
                 repository("safe\u{202e}gnitiops"),
                 repository("\u{202e}\u{7}"),
-            ],
+            ]
+            .into(),
             ..WorkspaceState::default()
         };
 
@@ -33467,7 +33698,7 @@ mod tests {
         };
         let feature = terminal("/repo/feature");
         let other = terminal("/repo/other");
-        Arc::make_mut(&mut app.durable).cards = vec![feature.clone(), other.clone()];
+        Arc::make_mut(&mut app.durable).cards = vec![feature.clone(), other.clone()].into();
         let rows = &mut app.sidebar_model.projects[0].worktrees;
         rows.extend(["/repo/feature", "/repo/other"].map(|path| {
             SidebarWorktree::from_durable(WorktreeId::new(), path.into(), Some("feature".into()))

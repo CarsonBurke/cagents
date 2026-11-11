@@ -1523,4 +1523,99 @@ mod tests {
             );
         }
     }
+
+    fn review_change_requires_new_confirmation(
+        change: impl Fn(&mut impact::Preview) + Send + 'static,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let changed = Arc::new(AtomicBool::new(false));
+        let worker_changed = changed.clone();
+        let path = directory.path().to_owned();
+        let pane = crate::model::TerminalId::new();
+        let worker = thread::spawn(move || {
+            let mut job = job(&path);
+            wait(&path, &mut job, |_| {
+                let mut preview = preview(false);
+                preview.labels.names.insert(pane, "reviewed pane".into());
+                preview.labels.details.panes.insert(
+                    pane,
+                    source_inspection::InspectedPane {
+                        kind: impact::SessionKind::NativeChat,
+                        outcome: source_inspection::SavedOutcome::Unchanged,
+                        detail: String::new(),
+                    },
+                );
+                if worker_changed.load(Ordering::Acquire) {
+                    change(&mut preview);
+                }
+                Ok(preview)
+            })
+        });
+        let first = published(directory.path(), None);
+        let first_confirmation = first.confirmation.as_ref().unwrap();
+        changed.store(true, Ordering::Release);
+        publish_decision(
+            directory.path(),
+            &first.id,
+            &first_confirmation.nonce,
+            Choice::Confirm,
+        )
+        .unwrap();
+        let second = published(directory.path(), Some(&first_confirmation.nonce));
+        let second_confirmation = second.confirmation.as_ref().unwrap();
+        assert_eq!(second.phase, UpdatePhase::AwaitingConfirmation);
+        assert!(!worker.is_finished());
+        assert_ne!(first_confirmation.nonce, second_confirmation.nonce);
+        assert_eq!(
+            first_confirmation.preview.candidate,
+            second_confirmation.preview.candidate
+        );
+        publish_decision(
+            directory.path(),
+            &second.id,
+            &second_confirmation.nonce,
+            Choice::Confirm,
+        )
+        .unwrap();
+        assert_eq!(worker.join().unwrap().unwrap(), second_confirmation.preview);
+    }
+
+    #[test]
+    fn pane_outcome_change_requires_a_new_nonce() {
+        review_change_requires_new_confirmation(|preview| {
+            preview
+                .labels
+                .details
+                .panes
+                .values_mut()
+                .next()
+                .unwrap()
+                .outcome = source_inspection::SavedOutcome::Resumes;
+        });
+    }
+
+    #[test]
+    fn added_notice_requires_a_new_nonce() {
+        review_change_requires_new_confirmation(|preview| {
+            preview
+                .labels
+                .details
+                .notices
+                .push("Some saved panes could not be checked. Review their recovery steps.".into());
+        });
+    }
+
+    #[test]
+    fn pane_kind_change_requires_a_new_nonce_even_in_a_collapsed_group() {
+        review_change_requires_new_confirmation(|preview| {
+            preview
+                .labels
+                .details
+                .panes
+                .values_mut()
+                .next()
+                .unwrap()
+                .kind = impact::SessionKind::Terminal;
+        });
+    }
 }

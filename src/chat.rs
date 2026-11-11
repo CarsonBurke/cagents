@@ -26,6 +26,10 @@ pub mod protocol;
 pub mod runtime;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod skills;
+#[cfg(any(feature = "ui", feature = "host"))]
+mod work_hold;
+#[cfg(any(feature = "ui", feature = "host"))]
+pub use work_hold::{Held, HeldSubagent, WorkHold};
 
 /// Whether answering a request with `action` turns its work down rather than
 /// authorizing it.
@@ -1168,7 +1172,8 @@ impl Session {
     }
 
     /// Point this Codex thread's first `--remote` at its own listener.
-    /// A bare `unix://` requests a new allocation, including for disk resume.
+    /// A new thread's bare `unix://` requests an allocation. Begun threads
+    /// require the daemon's separate shared-service and writer checks.
     ///
     /// Only the daemon chooses `root`. Existing evidence must have come from
     /// trusted retained/checkpointed state before invoking this method. Legacy
@@ -1177,6 +1182,33 @@ impl Session {
         &mut self,
         root: &std::path::Path,
         allocator: &crate::model::HostSessionProof,
+    ) -> bool {
+        let new_thread = self.launch.session_id.is_none();
+        self.claim_codex_listener(root, allocator, new_thread)
+    }
+
+    /// Point this existing Codex thread's bare `unix://` at its own listener.
+    ///
+    /// A begun thread's bare remote names the account's shared daemon, which
+    /// owns the thread whenever it is running. Only the daemon calls this,
+    /// after finding the shared endpoint unserved and checking for another
+    /// process writing the thread. This method only assigns the listener;
+    /// the caller remains responsible for those launch checks.
+    pub fn claim_owned_codex_listener_for_unserved_thread(
+        &mut self,
+        root: &std::path::Path,
+        allocator: &crate::model::HostSessionProof,
+    ) -> bool {
+        self.launch.session_id.is_some()
+            && self.terminal.is_none()
+            && self.claim_codex_listener(root, allocator, true)
+    }
+
+    fn claim_codex_listener(
+        &mut self,
+        root: &std::path::Path,
+        allocator: &crate::model::HostSessionProof,
+        allocate: bool,
     ) -> bool {
         if self.launch.provider != Provider::Codex {
             return false;
@@ -1195,7 +1227,7 @@ impl Session {
         let Some((index, remote)) = codex_remote_argument(arguments) else {
             return false;
         };
-        if remote != owned && remote != "unix://" {
+        if remote != owned && !(allocate && remote == "unix://") {
             return false;
         }
         set_codex_remote(arguments, index, owned);
@@ -1453,12 +1485,12 @@ pub struct Subagent {
 }
 
 impl Subagent {
-    /// Running delegated work that cancelling the parent's turn would also
-    /// stop, where the provider's interrupt does not spare it.
+    /// Delegated work, running or waiting on its own background work, that
+    /// cancelling the parent's turn would also stop, where the provider's
+    /// interrupt does not spare it. Claude Code's interrupt kills a waiting
+    /// agent and its own background work as it does a running one.
     pub fn stopped_by_interrupt(&self, capabilities: &Capabilities) -> bool {
-        self.status == ToolStatus::Running
-            && self.background
-            && capabilities.interrupt_stops_background
+        self.status.is_live() && self.background && capabilities.interrupt_stops_background
     }
 }
 
@@ -1537,6 +1569,12 @@ impl Snapshot {
     /// prompt, and which no usage limit from an earlier turn stops.
     pub fn turn_accepted(&self) -> bool {
         self.busy || self.waiting || !self.requests.is_empty()
+    }
+    /// Whether closing the conversation now would end or abandon something:
+    /// its turn, a question to the user, or a subagent working or waiting on
+    /// its own background work.
+    pub fn holds_work(&self) -> bool {
+        self.turn_accepted() || self.subagents.iter().any(|agent| agent.status.is_live())
     }
     /// Parent prompt controls use `busy`; card activity includes delegated work.
     pub fn is_working(&self) -> bool {
@@ -1874,7 +1912,7 @@ pub enum Phase {
     Commentary,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 pub enum ToolStatus {
     Running,
     Succeeded,
@@ -1883,6 +1921,46 @@ pub enum ToolStatus {
     /// Ended before it finished: cancelled by the user, interrupted with the
     /// work that started it, or cut short because its provider stopped.
     Stopped,
+    /// A delegated agent that stopped with background work of its own still
+    /// running. It's alive and what it has reported may be interim, but it
+    /// isn't doing anything itself and may never report again, so it neither
+    /// counts as working nor as finished. A later notice settles it, any sign
+    /// of life returns it to `Running`, and a Stop or the provider exiting
+    /// ends it as `Stopped`. Its parent's turn ending doesn't change it.
+    Waiting,
+}
+
+/// As derived, except that a client from before `Waiting` was added is sent
+/// `Running`: the agent hasn't finished.
+impl Serialize for ToolStatus {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let status = match self {
+            Self::Waiting
+                if crate::terminal_ipc::encoding_before(
+                    crate::terminal_ipc::WAITING_TOOL_STATUS,
+                ) =>
+            {
+                Self::Running
+            }
+            status => *status,
+        };
+        let name = match status {
+            Self::Running => "Running",
+            Self::Succeeded => "Succeeded",
+            Self::Failed => "Failed",
+            Self::Denied => "Denied",
+            Self::Stopped => "Stopped",
+            Self::Waiting => "Waiting",
+        };
+        serializer.serialize_unit_variant("ToolStatus", status as u32, name)
+    }
+}
+
+impl ToolStatus {
+    /// Whether the agent or tool has yet to end.
+    pub fn is_live(self) -> bool {
+        matches!(self, Self::Running | Self::Waiting)
+    }
 }
 
 /// What a shell command was actually for.
@@ -2967,6 +3045,37 @@ mod tests {
     }
 
     #[test]
+    fn an_agent_waiting_on_its_background_work_neither_works_nor_asks_for_the_user() {
+        let mut snapshot = Snapshot::default();
+        snapshot.subagents.push(Subagent {
+            id: "tool".into(),
+            kind: String::new(),
+            description: String::new(),
+            status: ToolStatus::Waiting,
+            model: None,
+            waiting: false,
+            detail: String::new(),
+            background: true,
+            items: Vec::new(),
+        });
+        assert!(!snapshot.is_working());
+        // Closing the conversation would end it, so an update or a cleanup
+        // that waits for idle waits for it too.
+        assert!(snapshot.holds_work());
+        // `Waiting` means the person is needed, and nothing here needs them.
+        assert_eq!(snapshot.activity(), crate::agent::ActivityState::Idle);
+        // An interrupt kills it, as recorded from Claude Code, so a person is
+        // warned as for running work.
+        let capabilities = Capabilities {
+            interrupt_stops_background: true,
+            ..Capabilities::default()
+        };
+        assert!(snapshot.subagents[0].stopped_by_interrupt(&capabilities));
+        snapshot.exited = true;
+        assert_eq!(snapshot.activity(), crate::agent::ActivityState::Unknown);
+    }
+
+    #[test]
     fn older_subagent_snapshots_default_to_unknown_model_and_child_waiting_is_visible() {
         let mut agent: super::Subagent = serde_json::from_value(serde_json::json!({
             "id":"child", "kind":"Codex agent", "description":"", "status":"Running", "items":[]
@@ -3002,8 +3111,10 @@ mod tests {
         assert!(!snapshot.busy);
         assert!(snapshot.is_working());
         assert_eq!(snapshot.activity(), super::ActivityState::Working);
+        assert!(snapshot.holds_work());
         snapshot.subagents[0].status = super::ToolStatus::Succeeded;
         assert_eq!(snapshot.activity(), super::ActivityState::Idle);
+        assert!(!snapshot.holds_work());
     }
 
     use super::*;
@@ -3476,6 +3587,12 @@ mod tests {
         asked.proof = Some(allocator.clone());
         assert!(asked.owns_codex_listener());
         assert!(unstarted.resolved_to_owned_codex_listener(&asked));
+        let mut learned = asked.clone();
+        learned.launch.session_id = Some("learned".into());
+        assert!(
+            unstarted.resolved_to_owned_codex_listener(&learned),
+            "a new thread learns its identity as it starts"
+        );
         let claimed = asked.clone();
         assert!(
             asked.claim_owned_codex_listener(
@@ -3504,7 +3621,12 @@ mod tests {
 
         let mut resumed = session(&["--remote", "unix://"], Some("begun"));
         let requested = resumed.clone();
-        assert!(resumed.claim_owned_codex_listener(root, &allocator));
+        assert!(!resumed.claim_owned_codex_listener(root, &allocator));
+        assert_eq!(
+            resumed, requested,
+            "a begun bare remote needs launch checks"
+        );
+        assert!(resumed.claim_owned_codex_listener_for_unserved_thread(root, &allocator));
         resumed.proof = Some(allocator.clone());
         assert!(resumed.owns_codex_listener());
         assert!(requested.resolved_to_owned_codex_listener(&resumed));
@@ -3513,10 +3635,41 @@ mod tests {
         assert!(!requested.resolved_to_owned_codex_listener(&changed));
         let mut resumed = session(&["--remote=unix://"], Some("begun"));
         let requested = resumed.clone();
-        assert!(resumed.claim_owned_codex_listener(root, &allocator));
+        assert!(!resumed.claim_owned_codex_listener(root, &allocator));
+        assert_eq!(
+            resumed, requested,
+            "a begun bare remote needs launch checks"
+        );
+        assert!(resumed.claim_owned_codex_listener_for_unserved_thread(root, &allocator));
         resumed.proof = Some(allocator.clone());
         assert!(resumed.owns_codex_listener());
         assert!(requested.resolved_to_owned_codex_listener(&resumed));
+
+        // Reopened from history, a thread nothing serves takes a listener of
+        // its own only when the daemon asks on its behalf, and only in place
+        // of the shared daemon its bare remote names.
+        let mut reopened = session(&["resume", "begun", "--remote", "unix://"], Some("begun"));
+        let saved = reopened.clone();
+        assert!(reopened.claim_owned_codex_listener_for_unserved_thread(root, &allocator));
+        reopened.proof = Some(allocator.clone());
+        assert!(reopened.owns_codex_listener());
+        assert!(saved.resolved_to_owned_codex_listener(&reopened));
+        let mut renamed = reopened.clone();
+        renamed.launch.session_id = Some("other".into());
+        assert!(!saved.resolved_to_owned_codex_listener(&renamed));
+        for (arguments, session_id) in [
+            (&["--remote", "unix://"][..], None),
+            (&["--remote", "unix:///shared/elsewhere"][..], Some("begun")),
+            (&["--search"][..], Some("begun")),
+        ] {
+            let mut other = session(arguments, session_id);
+            let before = other.clone();
+            assert!(
+                !other.claim_owned_codex_listener_for_unserved_thread(root, &allocator),
+                "{arguments:?}"
+            );
+            assert_eq!(other, before);
+        }
 
         // Proof rotation does not rewrite the allocator or the saved endpoint.
         let mut restored: Session =

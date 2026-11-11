@@ -33,9 +33,17 @@ pub(super) fn restore_settled_from(
 /// Ordinary startup restores only current, authenticated holders and the
 /// current Ready checkpoint. Archived update evidence cannot recreate panes.
 pub(super) fn restore_ordinary(host: &SharedHost) -> Result<(), String> {
+    #[cfg(all(test, target_os = "linux"))]
+    super::observe_fixture_startup("ordinary: previous boot history", None);
     chat::retained_actor::reconcile_previous_boot_history(host)?;
+    #[cfg(all(test, target_os = "linux"))]
+    super::observe_fixture_startup("ordinary: capture Ready", None);
     let ready_capture = crate::upgrade::recovery::verified::ready::capture()?;
+    #[cfg(all(test, target_os = "linux"))]
+    super::observe_fixture_startup("ordinary: restore upgrade checkpoint", None);
     let unattached = state::restore_upgrade(host)?;
+    #[cfg(all(test, target_os = "linux"))]
+    super::observe_fixture_startup("ordinary: restore terminal holders", None);
     state::restore_orphaned_holders(host)?;
     if let Some(detail) = host
         .lock()
@@ -44,6 +52,8 @@ pub(super) fn restore_ordinary(host: &SharedHost) -> Result<(), String> {
     {
         return Err(detail.to_owned());
     }
+    #[cfg(all(test, target_os = "linux"))]
+    super::observe_fixture_startup("ordinary: restore native holders", None);
     chat::restore_orphaned_native(host, &unattached)?;
     if let Some(detail) = host
         .lock()
@@ -52,9 +62,17 @@ pub(super) fn restore_ordinary(host: &SharedHost) -> Result<(), String> {
     {
         return Err(detail.to_owned());
     }
+    #[cfg(all(test, target_os = "linux"))]
+    super::observe_fixture_startup("ordinary: reconcile retired actors", None);
     chat::retained_actor::reconcile_retired_actors(host)?;
+    #[cfg(all(test, target_os = "linux"))]
+    super::observe_fixture_startup("ordinary: reconcile startup losses", None);
     chat::retained_actor::reconcile_startup_losses(host)?;
+    #[cfg(all(test, target_os = "linux"))]
+    super::observe_fixture_startup("ordinary: restore current presentations", None);
     model::floor::restore_presentations()?;
+    #[cfg(all(test, target_os = "linux"))]
+    super::observe_fixture_startup("ordinary: reconcile retained runs", None);
     let retained_runs = chat::retained_actor::retained_runs(host);
     // A committed acceptance is not proof of provider delivery. Until a
     // restored actor supplies exact run evidence, never authorize a resend.
@@ -82,6 +100,8 @@ pub(super) fn restore_ordinary(host: &SharedHost) -> Result<(), String> {
         (state.proof().clone(), state.list(0), chats)
     };
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    #[cfg(all(test, target_os = "linux"))]
+    super::observe_fixture_startup("ordinary: publish Ready proof", None);
     crate::upgrade::recovery::verified::ready::publish(
         ready_capture,
         &proof,
@@ -89,7 +109,11 @@ pub(super) fn restore_ordinary(host: &SharedHost) -> Result<(), String> {
         &terminals,
         &chats,
     )?;
+    #[cfg(all(test, target_os = "linux"))]
+    super::observe_fixture_startup("ordinary: optional archived proof", None);
     publish_archived_proof(host);
+    #[cfg(all(test, target_os = "linux"))]
+    super::observe_fixture_startup("ordinary: complete", None);
     Ok(())
 }
 

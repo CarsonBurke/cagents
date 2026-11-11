@@ -8,7 +8,7 @@ import copy
 import hashlib
 import json
 import fcntl
-from contextlib import closing
+from contextlib import closing, contextmanager
 import os
 from pathlib import Path
 import sqlite3
@@ -18,6 +18,10 @@ import tempfile
 import tarfile
 import time
 import signal
+import select
+import struct
+import termios
+import threading
 import shutil
 import unittest
 from unittest.mock import patch
@@ -793,6 +797,693 @@ class CandidateNamespace(unittest.TestCase):
                 records.namespace_source(root,terminals)
 
 
+class NativeLockWaiter(unittest.TestCase):
+    def waiting_child(self, peer):
+        deadline=time.monotonic()+5
+        while time.monotonic()<deadline:
+            self.assertIsNone(peer.poll())
+            try:
+                children=Path(f'/proc/{peer.pid}/task/{peer.pid}/children').read_text().split()
+                for name in children:
+                    p=Path('/proc')/name
+                    args=p.joinpath('cmdline').read_bytes().split(b'\0')
+                    if args and Path(args[0].decode()).name=='flock':
+                        stat=p.joinpath('stat').read_text().rsplit(')',1)[1].split()
+                        return int(name),int(stat[19])
+            except OSError:
+                pass
+            time.sleep(.02)
+        self.fail('the single blocking native-lock waiter did not enter flock')
+
+    def assert_child_gone(self, identity):
+        pid,start=identity
+        deadline=time.monotonic()+5
+        while time.monotonic()<deadline:
+            try:
+                stat=Path(f'/proc/{pid}/stat').read_text().rsplit(')',1)[1].split()
+                if int(stat[19])!=start:
+                    return
+            except OSError:
+                return
+            time.sleep(.02)
+        self.fail(f'owned lock waiter {pid}/{start} survived cancellation')
+
+    def exercise(self, mode):
+        with tempfile.TemporaryDirectory(prefix='ru-native-lock-',dir='/var/tmp') as temporary:
+            root=Path(temporary)
+            (root/'.rehearse-update').write_text(str(root)+'\n')
+            (root/'desktop').mkdir()
+            path=root/'native.lock'
+            with path.open('w') as holder,path.open('w') as inherited,path.open('w') as probe:
+                fcntl.flock(holder,fcntl.LOCK_EX)
+                command=[sys.executable,str(REPOSITORY/'scripts/rehearse_update_run.py'),str(root),str(SCRIPT),
+                         'wait-native-lock','--fd',str(inherited.fileno()),'--parent-pid',str(os.getpid())]
+                peer=subprocess.Popen(command,pass_fds=(inherited.fileno(),),stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE,text=True,start_new_session=True)
+                try:
+                    child=self.waiting_child(peer)
+                    child_pidfd=os.pidfd_open(child[0])
+                    time.sleep(1.2)
+                    self.assertEqual(self.waiting_child(peer),child)
+                    if mode=='acquire':
+                        fcntl.flock(holder,fcntl.LOCK_UN)
+                        output,error=peer.communicate(timeout=5)
+                        self.assertEqual(peer.returncode,0,output+error)
+                        self.assert_child_gone(child)
+                        with self.assertRaises(BlockingIOError):
+                            fcntl.flock(probe,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                        inherited.close()
+                    else:
+                        if mode=='stop':
+                            (root/'desktop/stop').touch()
+                        else:
+                            peer.send_signal(signal.SIGTERM if mode=='signal' else signal.SIGKILL)
+                        output,error=peer.communicate(timeout=5)
+                        self.assertEqual(peer.returncode,{'stop':75,'signal':143,'abandon':-signal.SIGKILL}[mode],output+error)
+                        if mode=='abandon':
+                            self.assertEqual(select.select([child_pidfd],[],[],5)[0],[child_pidfd])
+                            self.assertFalse(any(Path(f'/proc/{child[0]}/fd').glob('*')))
+                        else:
+                            self.assert_child_gone(child)
+                        fcntl.flock(holder,fcntl.LOCK_UN)
+                    # A forgotten child would later lock the inherited open
+                    # description, which remains open here after cancellation.
+                    for _ in range(2):
+                        fcntl.flock(probe,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                        fcntl.flock(probe,fcntl.LOCK_UN)
+                        time.sleep(.1)
+                finally:
+                    if 'child_pidfd' in locals():
+                        os.close(child_pidfd)
+                    if peer.poll() is None:
+                        os.killpg(peer.pid,signal.SIGKILL)
+                        peer.communicate(timeout=5)
+
+    def test_one_stable_waiter_transfers_the_lock_to_the_inherited_description(self):
+        self.exercise('acquire')
+
+    def test_stop_marker_cancels_and_joins_without_any_later_lock_grab(self):
+        self.exercise('stop')
+
+    def test_termination_cancels_and_joins_without_any_later_lock_grab(self):
+        self.exercise('signal')
+
+    def test_abandoned_supervisor_cannot_leave_a_future_lock_owner(self):
+        self.exercise('abandon')
+
+    def test_supervisor_refuses_an_already_missing_expected_parent(self):
+        with tempfile.TemporaryDirectory(prefix='ru-lock-parent-',dir='/var/tmp') as temporary:
+            root=Path(temporary)
+            (root/'.rehearse-update').write_text(str(root)+'\n')
+            with (root/'native.lock').open('w') as inherited:
+                result=subprocess.run([sys.executable,str(REPOSITORY/'scripts/rehearse_update_run.py'),str(root),str(SCRIPT),
+                    'wait-native-lock','--fd',str(inherited.fileno()),'--parent-pid',str(os.getpid()+10000000)],
+                    pass_fds=(inherited.fileno(),),capture_output=True,text=True,timeout=5)
+                self.assertEqual(result.returncode,75,result.stdout+result.stderr)
+
+    def test_parent_death_before_child_arms_pdeathsig_cannot_enter_flock(self):
+        with tempfile.TemporaryDirectory(prefix='ru-lock-arm-',dir='/var/tmp') as temporary:
+            root=Path(temporary)
+            (root/'.rehearse-update').write_text(str(root)+'\n')
+            (root/'desktop').mkdir();(root/'bin').mkdir()
+            ready,release=root/'ready',root/'release'
+            real_setpriv=shutil.which('setpriv')
+            shim=root/'bin/setpriv'
+            shim.write_text(f'#!{sys.executable}\nimport os,sys,time\nfrom pathlib import Path\n'
+                f'Path({str(ready)!r}).touch()\nwhile not Path({str(release)!r}).exists(): time.sleep(.01)\n'
+                f'os.execv({real_setpriv!r},[{real_setpriv!r},*sys.argv[1:]])\n')
+            shim.chmod(0o755)
+            path=root/'native.lock'
+            with path.open('w') as holder,path.open('w') as inherited,path.open('w') as probe:
+                fcntl.flock(holder,fcntl.LOCK_EX)
+                command=[sys.executable,str(REPOSITORY/'scripts/rehearse_update_run.py'),str(root),str(SCRIPT),
+                         'wait-native-lock','--fd',str(inherited.fileno()),'--parent-pid',str(os.getpid())]
+                peer=subprocess.Popen(command,pass_fds=(inherited.fileno(),),stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+                    text=True,start_new_session=True,env={**os.environ,'PATH':str(root/'bin')+':'+os.environ['PATH']})
+                child_fd=None
+                try:
+                    deadline=time.monotonic()+5
+                    child=None
+                    while time.monotonic()<deadline:
+                        self.assertIsNone(peer.poll())
+                        if ready.exists():
+                            children=Path(f'/proc/{peer.pid}/task/{peer.pid}/children').read_text().split()
+                            if children:
+                                child=int(children[0])
+                                fd=os.open(f'/proc/{child}/fd/0',os.O_RDONLY|os.O_NONBLOCK)
+                                try:
+                                    available=struct.unpack('I',fcntl.ioctl(fd,termios.FIONREAD,struct.pack('I',0)))[0]
+                                finally:
+                                    os.close(fd)
+                                if available==1:
+                                    break
+                        time.sleep(.02)
+                    else:self.fail('the lock child was not gated before its delayed prctl')
+                    child_fd=os.pidfd_open(child)
+                    peer.kill();peer.wait(timeout=5)
+                    release.touch()
+                    self.assertEqual(select.select([child_fd],[],[],5)[0],[child_fd])
+                    self.assertFalse(any(Path(f'/proc/{child}/fd').glob('*')))
+                    peer.communicate(timeout=5)
+                    fcntl.flock(holder,fcntl.LOCK_UN)
+                    fcntl.flock(probe,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                    fcntl.flock(probe,fcntl.LOCK_UN)
+                finally:
+                    release.touch()
+                    if peer.poll() is None:
+                        peer.kill();peer.communicate(timeout=5)
+                    if child_fd is not None:
+                        try:signal.pidfd_send_signal(child_fd,signal.SIGTERM)
+                        except ProcessLookupError:pass
+                        os.close(child_fd)
+
+
+class WindowCloseTracing(unittest.TestCase):
+    @contextmanager
+    def private_locked_process(self, sanitized=False):
+        """A copied sleep models only process/lease ownership, never an application."""
+        with tempfile.TemporaryDirectory(prefix='ru-window-trace-',dir='/var/tmp') as temporary:
+            root=Path(temporary)
+            (root/'.rehearse-update').write_text(str(root)+'\n')
+            (root/'rt').mkdir()
+            executable=root/'home/.local/share/cagents-install/versions/fixture/bin/cagents-ui'
+            executable.parent.mkdir(parents=True)
+            shutil.copyfile(shutil.which('sleep'),executable)
+            executable.chmod(0o700)
+            slot=root/'rt/cagents-ui.lock.primary'
+            owner=slot.open('w')
+            fcntl.flock(owner,fcntl.LOCK_EX)
+            peer=subprocess.Popen([executable,'60'],pass_fds=(owner.fileno(),),
+                env={} if sanitized else {**os.environ,'HOME':str(root/'home'),'XDG_RUNTIME_DIR':str(root/'rt')})
+            try:
+                fields=(Path('/proc')/str(peer.pid)/'stat').read_text().rsplit(')',1)[1].split()
+                row={'pid':peer.pid,'start_ticks':int(fields[19]),'executable':str(executable),
+                     'argv':[str(executable),'60']}
+                before=root/'records/before/snapshot.json'
+                before.parent.mkdir(parents=True)
+                before.write_text(json.dumps({'processes':[row]}))
+                yield root,slot,owner,peer,row
+            finally:
+                if peer.poll() is None:
+                    peer.terminate()
+                peer.wait(timeout=5)
+                owner.close()
+
+    def test_real_window_lease_observation_cannot_retain_or_acquire_the_lock(self):
+        with self.private_locked_process() as (root,slot,owner,peer,row):
+            with records.WindowCloseMonitor(root) as monitor:
+                first=json.loads((root/'window-close-trace.jsonl').read_text().splitlines()[1])
+                sampled=next(item for item in first['snapshot']['processes'] if item['pid']==peer.pid)
+                self.assertTrue(sampled['original_ui'])
+                self.assertTrue(any('FLOCK' in item['fdinfo'] for item in sampled['slot_descriptors']))
+                self.assertEqual(first['snapshot']['slots'][0]['inode'],slot.stat().st_ino)
+                peer.terminate();peer.wait(timeout=5);owner.close()
+                # This succeeds while the observer and its pidfd are still alive.
+                with slot.open('r') as probe:
+                    fcntl.flock(probe,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                self.assertTrue(monitor.thread.is_alive())
+                descriptors=list(monitor.pidfds)
+            self.assertFalse(monitor.thread.is_alive())
+            self.assertTrue(monitor.output.closed)
+            for descriptor in descriptors:
+                with self.assertRaises(OSError):os.fstat(descriptor)
+
+    def test_original_slot_identity_survives_path_replacement(self):
+        with self.private_locked_process() as (root,slot,owner,peer,row):
+            first=records.window_close_snapshot(root,[row])
+            old=slot.stat().st_ino
+            slot.unlink();slot.touch()
+            self.assertNotEqual(slot.stat().st_ino,old)
+            second=records.window_close_snapshot(root,[row],original_slots=first['slots'])
+            process=next(item for item in second['processes'] if item['pid']==peer.pid)
+            self.assertTrue(any(item['inode']==old and 'FLOCK' in item['fdinfo']
+                                for item in process['slot_descriptors']))
+            self.assertEqual(second['original_slots'][0]['inode'],old)
+            self.assertEqual(second['slots'][0]['inode'],slot.stat().st_ino)
+
+    def test_sanitized_inheritor_is_found_by_its_actual_private_slot_descriptor(self):
+        with self.private_locked_process(sanitized=True) as (root,slot,owner,peer,row):
+            self.assertNotIn(peer.pid,[item['pid'] for item in records.processes(root,require_seeded_child=False)])
+            captured=records.window_close_snapshot(root,[])
+            process=next(item for item in captured['processes'] if item['pid']==peer.pid)
+            self.assertEqual(process['discovery'],'matching_private_slot_descriptor')
+            self.assertTrue(any('FLOCK' in item['fdinfo'] for item in process['slot_descriptors']))
+
+    def test_kernel_lock_identity_excludes_foreign_devices_and_binds_btrfs_bridge(self):
+        slot={'device':os.makedev(1,2),'inode':123}
+        local='1: FLOCK ADVISORY WRITE 42 01:02:123 0 EOF'
+        foreign='2: FLOCK ADVISORY WRITE 43 01:03:123 0 EOF'
+        btrfs='3: FLOCK ADVISORY WRITE 42 00:45:123 0 EOF'
+        self.assertEqual(records.traced_kernel_locks([local,foreign,btrfs],[slot],[]),[local])
+        descriptor={**slot,'fdinfo':'ino:\t123\nlock: 1: FLOCK ADVISORY WRITE 42 00:45:123 0 EOF'}
+        self.assertEqual(records.traced_kernel_locks([local,foreign,btrfs],[slot],[descriptor]),[local,btrfs])
+        descriptor['device']=os.makedev(1,9)
+        self.assertEqual(records.traced_kernel_locks([local,foreign,btrfs],[slot],[descriptor]),[local])
+
+    def test_reused_process_diagnostics_are_discarded(self):
+        with self.private_locked_process() as (root,slot,owner,peer,row):
+            identity=(row['start_ticks'],row['executable'])
+            original=records.trace_process_identity
+            calls=[]
+            def identity_read(path):
+                if path==Path('/proc')/str(peer.pid):
+                    calls.append(path)
+                    return identity if len(calls)==1 else (identity[0]+1,identity[1])
+                return original(path)
+            with patch.object(records,'trace_process_identity',side_effect=identity_read):
+                captured=records.window_close_snapshot(root,[row])
+            process=next(item for item in captured['processes'] if item['pid']==peer.pid)
+            self.assertEqual(process['state'],'ended_or_reused')
+            self.assertNotIn('threads',process)
+            self.assertNotIn('slot_descriptors',process)
+
+    def test_reused_descriptor_is_not_attributed_to_the_slot(self):
+        with self.private_locked_process() as (root,slot,owner,peer,row):
+            target=Path('/proc')/str(peer.pid)/'fd'/str(owner.fileno())
+            original=Path.stat
+            reads=[]
+            def metadata(path,*args,**kwargs):
+                value=original(path,*args,**kwargs)
+                if path==target:
+                    reads.append(path)
+                    if len(reads)>1:
+                        changed=list(value);changed[2]+=1
+                        return os.stat_result(changed)
+                return value
+            with patch.object(Path,'stat',metadata):
+                captured=records.window_close_snapshot(root,[row])
+            process=next(item for item in captured['processes'] if item['pid']==peer.pid)
+            self.assertGreaterEqual(len(reads),2)
+            self.assertEqual(process['slot_descriptors'],[])
+
+    def test_body_exception_cancels_and_joins_the_observer(self):
+        with self.private_locked_process() as (root,slot,owner,peer,row):
+            ready=threading.Event()
+            monitor=records.WindowCloseMonitor(root)
+            def observe():
+                ready.set()
+                monitor.stop.wait(5)
+            with patch.object(monitor,'observe',side_effect=observe):
+                with self.assertRaisesRegex(RuntimeError,'update failed'):
+                    with monitor:
+                        self.assertTrue(ready.wait(2))
+                        raise RuntimeError('update failed')
+            self.assertFalse(monitor.thread.is_alive())
+            self.assertTrue(monitor.stop.is_set())
+            self.assertTrue(monitor.output.closed)
+            events=[json.loads(line)['event'] for line in (root/'window-close-trace.jsonl').read_text().splitlines()]
+            self.assertEqual(events[-1],'update_command_exited')
+
+    def test_thread_start_failure_closes_every_pinned_pidfd(self):
+        with self.private_locked_process() as (root,slot,owner,peer,row):
+            monitor=records.WindowCloseMonitor(root)
+            descriptors=[]
+            original_open=os.pidfd_open
+            def opened(pid):
+                descriptor=original_open(pid)
+                descriptors.append(descriptor)
+                return descriptor
+            with patch.object(records.os,'pidfd_open',side_effect=opened), \
+                    patch.object(threading.Thread,'start',side_effect=RuntimeError('thread start failed')):
+                with self.assertRaisesRegex(RuntimeError,'thread start failed'):
+                    monitor.__enter__()
+            self.assertTrue(monitor.output.closed)
+            self.assertTrue(monitor.stop.is_set())
+            self.assertTrue(descriptors)
+            for descriptor in descriptors:
+                with self.assertRaises(OSError):os.fstat(descriptor)
+
+    def test_interruption_during_exit_still_cancels_and_joins_before_reraising(self):
+        with self.private_locked_process() as (root,slot,owner,peer,row):
+            ready,release=threading.Event(),threading.Event()
+            monitor=records.WindowCloseMonitor(root)
+            def observe():
+                ready.set()
+                monitor.stop.wait(5)
+                release.wait(2)
+            waited=monitor.finished.wait
+            interruptions=[]
+            def interrupted_wait(timeout):
+                if not interruptions:
+                    interruptions.append(True);release.set()
+                    raise KeyboardInterrupt()
+                return waited(timeout)
+            with patch.object(monitor,'observe',side_effect=observe), \
+                    patch.object(monitor.finished,'wait',side_effect=interrupted_wait):
+                with self.assertRaises(KeyboardInterrupt):
+                    with monitor:
+                        self.assertTrue(ready.wait(2))
+            self.assertTrue(monitor.finished.is_set())
+            self.assertFalse(monitor.thread.is_alive())
+            self.assertTrue(monitor.output.closed)
+            self.assertEqual(monitor.pidfds,[])
+
+    def test_failed_post_pin_identity_check_closes_and_excludes_the_pidfd(self):
+        with self.private_locked_process() as (root,slot,owner,peer,row):
+            monitor=records.WindowCloseMonitor(root)
+            identity=(row['start_ticks'],row['executable'])
+            opened=os.pidfd_open(peer.pid)
+            with patch.object(records,'trace_process_identity',side_effect=[identity,(identity[0]+1,identity[1])]), \
+                    patch.object(records.os,'pidfd_open',return_value=opened), \
+                    patch.object(records,'window_close_snapshot',return_value={'slots':[]}):
+                with monitor:
+                    self.assertEqual(monitor.pidfds,[])
+                    self.assertEqual(monitor.pinned,[])
+                    with self.assertRaises(OSError):os.fstat(opened)
+            begin=json.loads((root/'window-close-trace.jsonl').read_text().splitlines()[0])
+            self.assertIn('pin_error',begin['pinned'][0])
+            self.assertNotIn('pidfd_pinned',begin['pinned'][0])
+
+    def test_phase_milestones_are_observed_without_asserting_commit_ack(self):
+        with tempfile.TemporaryDirectory(prefix='ru-trace-timeline-',dir='/var/tmp') as temporary:
+            root=Path(temporary)
+            status=root/'home/.local/share/cagents-install/.update/status.json'
+            status.parent.mkdir(parents=True)
+            status.write_text(json.dumps({'id':'job','phase':'ClosingWindows'}))
+            monitor=records.WindowCloseMonitor(root)
+            monitor.output=io.StringIO()
+            clock=[0]
+            reasons=[]
+            def advance(_):
+                clock[0]+=1
+                if clock[0]>45:monitor.stop.set()
+            with patch.object(records.time,'monotonic',side_effect=lambda:clock[0]), \
+                    patch.object(monitor.stop,'wait',side_effect=advance), \
+                    patch.object(monitor,'sample',side_effect=reasons.append):
+                monitor.observe()
+            for seconds in (1,5,15,40,45):
+                self.assertIn(f'ClosingWindows+{seconds}s (not a commit ACK timestamp)',reasons)
+            events=[json.loads(line) for line in monitor.output.getvalue().splitlines()]
+            self.assertEqual(events[0]['event'],'phase')
+            self.assertEqual(events[-1]['event'],'observer_stopped')
+
+    def test_trace_size_and_private_root_bounds(self):
+        with tempfile.TemporaryDirectory(prefix='ru-trace-bound-',dir='/var/tmp') as temporary:
+            root=Path(temporary)
+            with self.assertRaises(FileNotFoundError):
+                records.WindowCloseMonitor(root).__enter__()
+            self.assertFalse((root/'window-close-trace.jsonl').exists())
+            monitor=records.WindowCloseMonitor(root)
+            monitor.output=io.StringIO()
+            monitor.write({'event':'sample','snapshot':'x'*(512*1024)})
+            self.assertEqual(json.loads(monitor.output.getvalue())['event'],'sample_truncated')
+            monitor.bytes=16*1024*1024-1024
+            monitor.write({'event':'sample','snapshot':'x'*2048})
+            self.assertTrue(monitor.stop.is_set())
+            size=len(monitor.output.getvalue())
+            monitor.write({'event':'ignored_after_bound'})
+            self.assertEqual(len(monitor.output.getvalue()),size)
+
+
+class NativeTerminalAfterRestore(unittest.TestCase):
+    def module(self):
+        spec=importlib.util.spec_from_file_location('native_terminal_rehearsal',REPOSITORY/'scripts/rehearse_update_run.py')
+        scenario=importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(scenario)
+        return scenario
+
+    def evidence(self):
+        root=Path('/var/tmp/native-action')
+        version=root/'home/.local/share/cagents-install/versions/new'
+        old={'host_session_id':'old','boot_id':'boot','host_incarnation':'old'}
+        new={'host_session_id':'new','boot_id':'boot','host_incarnation':'new'}
+        session={'id':'new-terminal','launch':{'program':'/bin/bash','working_directory':str(root)},'continuity':{'live':new}}
+        def process(pid,image,argv,**fields):
+            return {'pid':pid,'start_ticks':pid+1000,'executable':image,'argv':argv,**fields}
+        windows={'main':10,'second':20}
+        uis=[process(100,str(version/'bin/cagents-ui'),[str(version/'bin/cagents-ui'),'--restore-existing-only']),
+             process(200,str(version/'bin/cagents-ui'),[str(version/'bin/cagents-ui'),'--restore-existing-only','--window','second'])]
+        before={'root':str(root),'errors':[],'processes':uis+[process(300,str(version/'bin/cagentsd'),[str(version/'bin/cagentsd')])]}
+        after={'root':str(root),'errors':[],'processes':copy.deepcopy(uis)+[
+            process(400,str(version/'bin/cagentsd'),[str(version/'bin/cagentsd')]),
+            process(500,str(Path('/bin/bash').resolve()),['/bin/bash'],terminal_id='new-terminal')]}
+        activity={'claude_chat_launches':1,'claude_user_prompts':1,'codex_chat_launches':2,'codex_thread_starts':1,'codex_turn_starts':1}
+        return version,{'before_processes':before,'after_processes':after,'before_windows':windows,'after_windows':windows,
+            'before_serving':old,'after_status':{'ok':True,'data':{'instance':'production','running':True,'daemon_version':'new',
+                'socket':str(root/'rt/cagents/cagentsd.sock')}},'terminal':{'ok':True,'data':{'terminal':{'session':session},'proof':new}},
+            'census':{'transaction':'tx','source':new,'terminals':[session]},'census_digest':'digest',
+            'receipt':{'transaction':'tx','census_digest':'digest','outcome':{'state':'usable','serving':new}},
+            'selected_card':{'focused':True,'card':'new-card','terminal_id':'new-terminal','recipe':session['launch'],'continuity':{'live':new}},
+            'cards_before_input':['old-card'],'token':'UNIQUE_OUTPUT','output_line':'UNIQUE_OUTPUT pid=500','shell_pid':500,
+            'terminal_snapshot':{'data':{'snapshot':{'terminal_id':'new-terminal','lines':['$ command','UNIQUE_OUTPUT pid=500']}}},
+            'activity_before':copy.deepcopy(activity),'activity_after':copy.deepcopy(activity)}
+
+    def test_normal_action_requires_native_focus_real_shell_and_new_ready_owner(self):
+        scenario=self.module()
+        version,evidence=self.evidence()
+        result=scenario.new_terminal_action_contract(evidence,version)
+        self.assertEqual(result['shell']['pid'],500)
+        self.assertEqual(result['daemon']['pid'],400)
+        cases=[]
+        changed=copy.deepcopy(evidence);changed['after_processes']['processes'][0]['pid']=101;cases.append(changed)
+        changed=copy.deepcopy(evidence);changed['after_windows']={'main':11,'second':20};cases.append(changed)
+        changed=copy.deepcopy(evidence);changed['before_serving']=changed['terminal']['data']['proof'];cases.append(changed)
+        changed=copy.deepcopy(evidence);changed['selected_card']['card']='old-card';cases.append(changed)
+        changed=copy.deepcopy(evidence);changed['selected_card']['focused']=False;cases.append(changed)
+        changed=copy.deepcopy(evidence);changed['after_processes']['processes'][-1]['terminal_id']='foreign';cases.append(changed)
+        changed=copy.deepcopy(evidence);changed['after_processes']['processes'][-1]['executable']='/usr/bin/foreign';cases.append(changed)
+        changed=copy.deepcopy(evidence);changed['receipt']['census_digest']='foreign';cases.append(changed)
+        changed=copy.deepcopy(evidence);changed['census']['terminals']=[];cases.append(changed)
+        changed=copy.deepcopy(evidence);changed['activity_after']['codex_turn_starts']=2;cases.append(changed)
+        changed=copy.deepcopy(evidence);changed['activity_after']['claude_user_prompts']=2;cases.append(changed)
+        changed=copy.deepcopy(evidence);changed['terminal_snapshot']['data']['snapshot']['lines']=['printf UNIQUE_OUTPUT pid=500'];cases.append(changed)
+        changed=copy.deepcopy(evidence);changed['terminal_snapshot']['data']['snapshot']['terminal_id']='foreign';cases.append(changed)
+        for changed in cases:
+            with self.subTest(evidence=changed),self.assertRaises(RuntimeError):
+                scenario.new_terminal_action_contract(changed,version)
+
+    def test_live_and_detached_terminal_variants_require_the_entire_current_proof(self):
+        scenario=self.module()
+        for shown_state in ('live','detached_same_boot'):
+            for captured_state in ('live','detached_same_boot'):
+                version,evidence=self.evidence()
+                proof=evidence['terminal']['data']['proof']
+                evidence['terminal']['data']['terminal']['session']=copy.deepcopy(evidence['terminal']['data']['terminal']['session'])
+                evidence['terminal']['data']['terminal']['session']['continuity']={shown_state:proof}
+                evidence['census']['terminals'][0]['continuity']={captured_state:proof}
+                with self.subTest(shown=shown_state,captured=captured_state):
+                    scenario.new_terminal_action_contract(evidence,version)
+        for field in ('host_session_id','boot_id','host_incarnation'):
+            version,evidence=self.evidence()
+            proof=evidence['terminal']['data']['proof']
+            evidence['selected_card']['continuity']={'detached_same_boot':{**proof,field:'stale'}}
+            with self.subTest(stale=field),self.assertRaises(RuntimeError):
+                scenario.new_terminal_action_contract(evidence,version)
+        for mutation in ('non-live','foreign-terminal','changed-recipe'):
+            version,evidence=self.evidence()
+            if mutation=='non-live':evidence['terminal']['data']['terminal']['session']['continuity']={'relaunch_available':{}}
+            elif mutation=='foreign-terminal':evidence['census']['terminals']=[{**evidence['census']['terminals'][0],'id':'foreign'}]
+            else:evidence['census']['terminals']=[{**evidence['census']['terminals'][0],'launch':{'program':'/usr/bin/foreign'}}]
+            with self.subTest(mutation=mutation),self.assertRaises(RuntimeError):
+                scenario.new_terminal_action_contract(evidence,version)
+
+    def test_expected_before_failure_requires_typed_failure_and_absent_daemon(self):
+        scenario=self.module()
+        version,evidence=self.evidence()
+        evidence['after_status']['data'].update(running=False,daemon_present=False)
+        evidence['after_processes']['processes']=evidence['before_processes']['processes'][:2]
+        evidence['selected_card']['continuity']={'relaunch_available':{'recipe':{'program':'/bin/bash'},'last_exit':None}}
+        evidence['failure_diagnostic']='Code: runtime_hydration_failed\nMessage: The terminal could not be restored.\nTerminal: new-terminal\nDirectory: /var/tmp/native-action'
+        evidence['failure_observation']={'window':{'id':10}}
+        result=scenario.terminal_restart_failure_contract(evidence,version)
+        self.assertEqual(result['outcome'],'expected_terminal_restart_failure')
+        for mutation in ('missing-error','foreign-error','daemon','old-card','replayed-prompt','claude-replayed-prompt'):
+            changed=copy.deepcopy(evidence)
+            if mutation=='missing-error':changed['failure_diagnostic']=''
+            elif mutation=='foreign-error':changed['failure_diagnostic']=evidence['failure_diagnostic'].replace('new-terminal','foreign-terminal')
+            elif mutation=='daemon':changed['after_status']['data']['running']=True
+            elif mutation=='old-card':changed['selected_card']['card']='old-card'
+            elif mutation=='replayed-prompt':changed['activity_after']['codex_turn_starts']=2
+            else:changed['activity_after']['claude_user_prompts']=2
+            with self.subTest(mutation=mutation),self.assertRaises(RuntimeError):
+                scenario.terminal_restart_failure_contract(changed,version)
+
+    def test_pending_before_failure_requires_exact_bounded_native_and_typed_absence_evidence(self):
+        scenario=self.module()
+        version,evidence=self.evidence()
+        evidence['after_status']['data'].update(running=False,daemon_present=False)
+        evidence['after_processes']['processes']=evidence['before_processes']['processes'][:2]
+        evidence['selected_card']['continuity']={'relaunch_available':{'recipe':{'program':'/bin/bash'},'last_exit':None}}
+        evidence['failure_kind']='pending_without_daemon'
+        observation={'window':{'id':10},'runs':[{'text':'Starting terminal…'},{'text':'The daemon is unreachable'}]}
+        evidence['failure_observation']=observation
+        sample={'monotonic':100,'card':copy.deepcopy(evidence['selected_card']),'snapshot_terminal_id':'new-terminal',
+                'snapshot_exit':1,'snapshot_refusal':{'ok':False,'error':{'kind':'daemon_not_running'}},
+                'status':copy.deepcopy(evidence['after_status']),'observation':observation,
+                'processes':copy.deepcopy(evidence['after_processes']),'windows':dict(evidence['after_windows'])}
+        evidence['pending_observations']=[copy.deepcopy(sample),{**copy.deepcopy(sample),'monotonic':104}]
+        self.assertEqual(scenario.terminal_restart_failure_contract(evidence,version)['observed_state'],'pending_without_daemon')
+        cases=[]
+        changed=copy.deepcopy(evidence);changed['pending_observations']=[];cases.append(changed)
+        changed=copy.deepcopy(evidence);changed['pending_observations'][1]['monotonic']=101;cases.append(changed)
+        changed=copy.deepcopy(evidence);changed['pending_observations'][1]['observation']['runs']=[{'text':'Unknown state'}];cases.append(changed)
+        changed=copy.deepcopy(evidence);changed['pending_observations'][1]['snapshot_refusal']['error']['kind']='protocol';cases.append(changed)
+        changed=copy.deepcopy(evidence);changed['pending_observations'][1]['snapshot_terminal_id']='foreign';cases.append(changed)
+        changed=copy.deepcopy(evidence);changed['pending_observations'][1]['status']['data']['running']=True;cases.append(changed)
+        changed=copy.deepcopy(evidence);changed['pending_observations'][1]['processes']['processes'].append(
+            {'pid':500,'start_ticks':1500,'terminal_id':'new-terminal','executable':'/usr/bin/bash','argv':['bash']});cases.append(changed)
+        changed=copy.deepcopy(evidence);changed['pending_observations'][1]['windows']['main']=99;cases.append(changed)
+        for changed in cases:
+            with self.subTest(evidence=changed),self.assertRaises(RuntimeError):
+                scenario.terminal_restart_failure_contract(changed,version)
+
+    def test_shortcut_is_read_from_the_actual_private_settings_without_a_default(self):
+        scenario=self.module()
+        with tempfile.TemporaryDirectory(prefix='ru-action-key-') as temporary:
+            root=Path(temporary)
+            path=root/'home/.config/cagents/settings.toml';path.parent.mkdir(parents=True)
+            path.write_text('[keyboard_shortcuts]\nnew_terminal=["Ctrl+Shift+N"]\n')
+            result=scenario.terminal_shortcut(root)
+            self.assertEqual(result['chord'],'ctrl+shift+n')
+            self.assertEqual(result['sha256'],hashlib.sha256(path.read_bytes()).hexdigest())
+            path.write_text('[keyboard_shortcuts]\nnew_thread=["Ctrl+T"]\n')
+            with self.assertRaisesRegex(RuntimeError,'unavailable'):
+                scenario.terminal_shortcut(root)
+
+    def test_output_probe_uses_the_issued_shell_syntax_and_refuses_unknown_programs(self):
+        scenario=self.module()
+        for program,variable in (('/usr/bin/fish','$fish_pid'),('/bin/bash','$$'),('/bin/sh','$$')):
+            probe=scenario.terminal_probe_command({'launch':{'program':program}},'TOKEN','/var/tmp/private/output.txt')
+            self.assertEqual(probe['pid_variable'],variable)
+            self.assertIn(f'"{variable}"',probe['command'])
+            self.assertNotIn('\n',probe['command'])
+        with self.assertRaisesRegex(RuntimeError,'unsupported'):
+            scenario.terminal_probe_command({'launch':{'program':'/usr/bin/unknown-shell'}},'TOKEN','/var/tmp/private/output.txt')
+
+    def test_native_probe_submits_the_same_command_with_a_separate_return(self):
+        scenario=self.module()
+        with tempfile.TemporaryDirectory(prefix='ru-input-') as temporary:
+            root=Path(temporary)
+            rehearsal=scenario.Rehearsal(root,str(SCRIPT))
+            receipt=root/'typed-output.txt'
+            probe=scenario.terminal_probe_command({'launch':{'program':'/bin/fish'}},'TOKEN',receipt)
+            evidence={'events':[]}
+            saved=[]
+            actions=[]
+            def call(*args,**kwargs):
+                if args[0]=='drive':
+                    actions.append(args)
+                    self.assertEqual(saved[-1]['typed_command'],probe['command'])
+                    if args==('drive','key','Return'):
+                        receipt.write_text('TOKEN pid=123\n')
+                return 0,''
+            with patch.object(rehearsal,'call',side_effect=call), \
+                    patch.object(rehearsal,'cli',return_value=(0,{'data':{}})), \
+                    patch.object(rehearsal,'private_processes',return_value={'processes':[]}):
+                result=rehearsal.type_terminal_probe({'terminal_id':'issued'},probe,'TOKEN',receipt,
+                    evidence,lambda:saved.append(copy.deepcopy(evidence)))
+            self.assertEqual(actions,[('drive','type',probe['command']),('drive','key','Return')])
+            self.assertEqual(result,('TOKEN pid=123',123))
+            self.assertIn('before-type',saved[-1])
+            self.assertEqual([event['event'] for event in evidence['events']],
+                ['native_terminal_text_requested','native_terminal_text_completed',
+                 'native_terminal_return_requested','native_terminal_return_completed'])
+
+    def test_input_process_diagnostics_discard_fields_if_pid_is_reused(self):
+        scenario=self.module()
+        original='123 (fish) '+' '.join(['0']*19+['456'])
+        reused='123 (other) '+' '.join(['0']*19+['789'])
+        process={'pid':123,'start_ticks':456}
+        with patch.object(Path,'read_text',side_effect=[original,'wait_woken','read',original]):
+            self.assertEqual(scenario.terminal_process_input_state(process),
+                {'state':'same_process','wchan':'wait_woken','syscall':'read'})
+        with patch.object(Path,'read_text',side_effect=[original,'unrelated_wait','other_syscall',reused]):
+            self.assertEqual(scenario.terminal_process_input_state(process),{'state':'ended_or_reused'})
+        with patch.object(Path,'read_text',side_effect=FileNotFoundError('exited')):
+            self.assertEqual(scenario.terminal_process_input_state(process)['state'],'unavailable')
+
+    def test_native_probe_failure_preserves_command_and_exact_terminal_evidence(self):
+        scenario=self.module()
+        with tempfile.TemporaryDirectory(prefix='ru-input-failure-') as temporary:
+            root=Path(temporary)
+            rehearsal=scenario.Rehearsal(root,str(SCRIPT))
+            receipt=root/'typed-output.txt'
+            probe=scenario.terminal_probe_command({'launch':{'program':'/bin/fish'}},'TOKEN',receipt)
+            evidence={'events':[]}
+            saved=[]
+            def call(*args,**kwargs):
+                if args==('drive','key','Return'):
+                    raise RuntimeError('native Return failed')
+                return 0,''
+            with patch.object(rehearsal,'call',side_effect=call), \
+                    patch.object(rehearsal,'cli',return_value=(0,{'exact_terminal':'issued'})) as cli, \
+                    patch.object(rehearsal,'private_processes',return_value={'processes':[]}):
+                with self.assertRaisesRegex(RuntimeError,'native Return failed'):
+                    rehearsal.type_terminal_probe({'terminal_id':'issued'},probe,'TOKEN',receipt,
+                        evidence,lambda:saved.append(copy.deepcopy(evidence)))
+            failure=saved[-1]
+            self.assertEqual(failure['typed_command'],probe['command'])
+            self.assertIn('native Return failed',failure['input_failure'])
+            self.assertEqual(failure['input-failed']['show']['value'],{'exact_terminal':'issued'})
+            self.assertFalse(failure['input-failed']['receipt_exists'])
+            cli.assert_any_call('--no-start','terminal','snapshot','issued',check=False)
+            cli.assert_any_call('--no-start','terminal','show','issued',check=False)
+
+    def test_successful_native_input_without_shell_output_still_fails_with_evidence(self):
+        scenario=self.module()
+        with tempfile.TemporaryDirectory(prefix='ru-input-no-output-') as temporary:
+            root=Path(temporary)
+            rehearsal=scenario.Rehearsal(root,str(SCRIPT))
+            receipt=root/'typed-output.txt'
+            probe=scenario.terminal_probe_command({'launch':{'program':'/bin/fish'}},'TOKEN',receipt)
+            evidence={'events':[]}
+            saved=[]
+            with patch.object(rehearsal,'call',return_value=(0,'')), \
+                    patch.object(rehearsal,'cli',return_value=(0,{'data':{}})), \
+                    patch.object(rehearsal,'private_processes',return_value={'processes':[]}), \
+                    patch.object(scenario.time,'monotonic',side_effect=[0,1,2,3,4,20]):
+                with self.assertRaisesRegex(RuntimeError,'did not execute'):
+                    rehearsal.type_terminal_probe({'terminal_id':'issued'},probe,'TOKEN',receipt,
+                        evidence,lambda:saved.append(copy.deepcopy(evidence)))
+            self.assertFalse(saved[-1]['input-failed']['receipt_exists'])
+            self.assertIn('did not execute',saved[-1]['input_failure'])
+
+    def test_terminal_card_is_bound_through_normalized_recipe_and_live_proof(self):
+        scenario=self.module()
+        with tempfile.TemporaryDirectory(prefix='ru-action-card-') as temporary:
+            root=Path(temporary)
+            database=root/'home/.local/share/cagents/sessions.sqlite3'
+            database.parent.mkdir(parents=True)
+            recipe={'program':'/bin/bash'}
+            continuity={'live':{'host_session_id':'new','boot_id':'boot','host_incarnation':'new'}}
+            with closing(sqlite3.connect(database)) as connection, connection:
+                connection.executescript('CREATE TABLE cards(card_id TEXT,workspace_id TEXT,kind_tag TEXT,existence_json TEXT);'
+                    'CREATE TABLE workspaces(workspace_id TEXT,focused_card_id TEXT);'
+                    'CREATE TABLE terminal_recipes(card_id TEXT,terminal_id TEXT,recipe_json TEXT,continuity_json TEXT);')
+                connection.execute('INSERT INTO cards VALUES(?,?,?,?)',['card','workspace','terminal',json.dumps('open')])
+                connection.execute('INSERT INTO workspaces VALUES(?,?)',['workspace','card'])
+                connection.execute('INSERT INTO terminal_recipes VALUES(?,?,?,?)',['card','terminal',json.dumps(recipe),json.dumps(continuity)])
+            cards=scenario.terminal_cards(root)
+            self.assertEqual(len(cards),1)
+            self.assertEqual((cards[0]['card'],cards[0]['terminal_id'],cards[0]['focused']),('card','terminal',True))
+            self.assertEqual(cards[0]['recipe'],recipe)
+            self.assertEqual(cards[0]['continuity'],continuity)
+
+    def test_only_new_terminal_flags_require_the_complete_healthy_restore_flow(self):
+        scenario=self.module()
+        base=['script','/var/tmp/unused',str(SCRIPT),'run','--old-dir','old','--old-version','old',
+              '--old-installer','old/install.sh','--new-dir','new','--new-version','new','--new-installer','new/install.sh']
+        for flags in (['--new-terminal-after-restore'],['--expect-terminal-restart-failure']):
+            with self.subTest(flags=flags),patch.object(sys,'argv',base+flags),patch('sys.stderr',new=io.StringIO()):
+                with self.assertRaises(SystemExit) as error:
+                    scenario.main()
+                self.assertEqual(error.exception.code,2)
+
+    def test_ended_original_child_is_allowed_only_after_the_deliberate_stop(self):
+        with tempfile.TemporaryDirectory(prefix='ru-action-ended-child-') as temporary:
+            root=Path(temporary)
+            (root/'.rehearse-update').write_text(str(root)+'\n')
+            (root/'child.pid').write_text(str(int(Path('/proc/sys/kernel/pid_max').read_text())+1))
+            strict=records.private_process_snapshot(root)
+            self.assertTrue(any('child.pid' in error for error in strict['errors']))
+            after_stop=records.private_process_snapshot(root,after_intentional_stop=True)
+            self.assertEqual(after_stop['errors'],[])
+            self.assertIs(after_stop['after_intentional_stop'],True)
+            errors=[]
+            records.processes(root,errors)
+            self.assertTrue(any('child.pid' in error for error in errors))
+
+
 class ExistingOnlyReopen(unittest.TestCase):
     def module(self):
         spec=importlib.util.spec_from_file_location('existing_only_rehearsal',REPOSITORY/'scripts/rehearse_update_run.py')
@@ -855,6 +1546,14 @@ class ExistingOnlyReopen(unittest.TestCase):
             root=Path(temporary)
             (root/'home/.claude').mkdir(parents=True);(root/'logs').mkdir()
             (root/'home/.claude/fixture-launches').write_text('new\nresumed-thread\n')
+            history=root/'home/.claude/projects/project/session.jsonl'
+            history.parent.mkdir(parents=True)
+            rows=[{'type':'user','message':{'content':'first prompt'}},
+                  {'type':'user','message':{'content':[{'type':'text','text':'second prompt'}]}},
+                  {'type':'user','message':{'content':[{'type':'tool_result','content':'tool output'}]}},
+                  {'type':'user','isMeta':True,'message':{'content':'metadata'}},
+                  {'type':'user','origin':{'kind':'task-notification'},'message':{'content':'background'}}]
+            history.write_text(''.join(json.dumps(row)+'\n' for row in rows))
             events=[
                 {'event':'launch','pid':1,'argv':['app-server','--listen','unix:///conversation/control.sock']},
                 {'event':'request','pid':1,'method':'thread/start'},
@@ -866,12 +1565,15 @@ class ExistingOnlyReopen(unittest.TestCase):
             ]
             path=root/'logs/codex-provider.jsonl'
             path.write_text(''.join(json.dumps(event)+'\n' for event in events))
-            expected={'claude_chat_launches':2,'codex_chat_launches':2,'codex_thread_starts':1,'codex_turn_starts':1}
+            expected={'claude_chat_launches':2,'claude_user_prompts':2,'codex_chat_launches':2,'codex_thread_starts':1,'codex_turn_starts':1}
             self.assertEqual(scenario.provider_activity(root),expected)
             with path.open('a') as stream:
                 stream.write(json.dumps({'event':'launch','pid':4,'argv':['app-server']})+'\n')
                 stream.write(json.dumps({'event':'probe-request','pid':4,'method':'model/list'})+'\n')
             self.assertEqual(scenario.provider_activity(root),expected)
+            with history.open('a') as stream:
+                stream.write(json.dumps(rows[0])+'\n')
+            self.assertEqual(scenario.provider_activity(root)['claude_user_prompts'],3)
 
     def test_option_refuses_failure_or_missing_codex_before_actions(self):
         with tempfile.TemporaryDirectory(prefix='ru-policy-args-') as temporary:
@@ -1026,6 +1728,38 @@ class PrivateRoot(unittest.TestCase):
     def call(self, *args, **kwargs):
         return subprocess.run([str(SCRIPT), "--root", str(self.root), *args],
                               capture_output=True, text=True, timeout=20, **kwargs)
+
+    def test_counted_daemon_stop_is_private_and_leaves_other_private_processes_alive(self):
+        self.assertEqual(self.call('init').returncode,0)
+        prefix=self.root/'home/.local/share/cagents-install'
+        cli=prefix/'versions/new/bin/cagents';cli.parent.mkdir(parents=True)
+        cli.write_text('''#!/usr/bin/python3
+import json,os,sys
+from pathlib import Path
+args=sys.argv[1:]
+if args==['--no-start','daemon','preflight']:
+ print('fixture-private-counted-capability')
+elif args==['--no-start','--json','daemon','stop','--confirm','fixture-private-counted-capability']:
+ Path(os.environ['CAGENTS_REHEARSAL_ROOT'],'logs','stop-only.json').write_text(json.dumps({'home':os.environ['HOME']}))
+ print(json.dumps({'ok':True,'data':{'stopped':True}}))
+else:sys.exit(2)
+''')
+        cli.chmod(0o755)
+        (prefix/'current').symlink_to('versions/new')
+        launcher=self.root/'home/.local/bin/cagents';launcher.symlink_to(prefix/'current/bin/cagents')
+        peer=subprocess.Popen(['sleep','60'],env={**os.environ,'HOME':str(self.root/'home')})
+        try:
+            result=self.call('stop-daemon')
+            self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+            self.assertNotIn('fixture-private-counted-capability',result.stdout+result.stderr)
+            self.assertIsNone(peer.poll())
+            self.assertEqual(json.loads((self.root/'logs/stop-only.json').read_text())['home'],str(self.root/'home'))
+            launcher.unlink();launcher.symlink_to('/usr/bin/false')
+            refused=self.call('stop-daemon')
+            self.assertEqual(refused.returncode,2)
+            self.assertIn('installed CLI',refused.stderr)
+        finally:
+            peer.terminate();peer.wait(timeout=5)
 
     def test_init_records_root_and_cleanup_refuses_mismatched_or_symlink_marker(self):
         result = self.call("init")

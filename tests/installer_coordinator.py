@@ -35,6 +35,10 @@ log = pathlib.Path(os.environ['FIXTURE_CALLS'])
 def record(event, **fields):
     with log.open('a') as output:
         output.write(json.dumps(dict(event=event, **fields)) + '\n')
+forbidden = os.environ.get('FIXTURE_FORBIDDEN_CLI')
+if forbidden and pathlib.Path(sys.argv[0]).resolve() == pathlib.Path(forbidden):
+    pathlib.Path(os.environ['FIXTURE_FORBIDDEN_EXECUTION']).write_text('executed\n')
+    sys.exit(97)
 # Fixture-only readiness is represented by a private marker, never a native
 # serving socket. Census/receipt envelopes still use the production schema.
 fixture_proof = {'host_session_id': 'fixture-daemon', 'boot_id': 'fixture-boot',
@@ -73,7 +77,7 @@ elif args[:2] == ['daemon', 'inspect-pending-update-recovery']:
     assert args[2] == '--candidate-cli' and len(args) in (4, 6)
     if len(args) == 6:
         assert args[4] == '--census'
-    record('pending-inspect')
+    record('pending-inspect', executable=str(pathlib.Path(sys.argv[0]).resolve()), candidate=args[3])
     if os.environ.get('FIXTURE_PENDING_RECOVERY'):
         print(f"Run '{args[3]}' --no-start daemon recover-update --checkpoint " + 'a' * 64 + ' --yes', file=sys.stderr)
         sys.exit(1)
@@ -100,7 +104,7 @@ elif args[:2] in (['daemon', 'verify-update-census'], ['daemon', 'inspect-update
         state, accepted = 'unverified', True
     elif '--require-original' in flags:
         state, accepted = ('no_source', True) if not ready and '--allow-absent' in flags else ('unverified', False)
-    elif ready:
+    elif ready and not os.environ.get('FIXTURE_CENSUS_VERIFICATION_FAILS'):
         state, accepted = 'usable', True
     elif '--allow-absent' in flags:
         state, accepted = 'no_source', True
@@ -136,11 +140,13 @@ elif args == ['--json', 'daemon', 'status']:
     print(json.dumps({'ok': True, 'command': 'daemon.status', 'data': {'running': pathlib.Path(os.environ['FIXTURE_DAEMON_STATE']).exists()}},
                      separators=(',', ':')))
 elif args == ['daemon', 'start']:
-    record('daemon-start-fixture')
+    record('daemon-start-fixture', executable=str(pathlib.Path(sys.argv[0]).resolve()))
     starts = sum(json.loads(line)['event'] == 'daemon-start-fixture' for line in log.read_text().splitlines())
     if os.environ.get('FIXTURE_DAEMON_START_FAILS') and (not os.environ.get('FIXTURE_FAIL_FIRST_DAEMON_START') or starts == 1):
         sys.exit(1)
     pathlib.Path(os.environ['FIXTURE_DAEMON_STATE']).write_text('ready\n')
+    if os.environ.get('FIXTURE_START_NONZERO_AFTER_READY'):
+        sys.exit(1)
 elif args[:2] in (['daemon', 'store-schema'], ['daemon', 'downgrade-store']) \
         and not os.environ.get('FIXTURE_CLI_PREDATES_STORE_COMMANDS'):
     if args[2:] == ['--help']:
@@ -645,6 +651,43 @@ os.execv({real_tar!r}, [{real_tar!r}, *args])
         self.assertEqual(os.readlink(self.prefix / 'current'), f'versions/{VERSION}')
         self.assertFalse(Path(self.environment['FIXTURE_DAEMON_STATE']).exists())
 
+    def test_downgrade_refusal_with_started_unverified_service_gives_inspection_without_another_start(self):
+        result, _ = self.failed_update(FIXTURE_DOWNGRADE_FAILS='1', FIXTURE_FAIL_FIRST_DAEMON_START='1',
+                                       FIXTURE_CENSUS_VERIFICATION_FAILS='1')
+        cli = self.prefix / 'versions' / VERSION / 'bin/cagents'
+        self.assertIn('daemon start command completed, but readiness and the original inventory remain unverified', result.stderr)
+        self.assertIn(f"'{cli}' --no-start daemon status", result.stderr)
+        self.assertIn(f"'{cli}' --no-start terminal list", result.stderr)
+        self.assertNotIn('Start it with', result.stderr)
+        self.assertNotIn(f"'{cli}' daemon start", result.stderr)
+        starts = [e['executable'] for e in self.events() if e['event'] == 'daemon-start-fixture']
+        self.assertEqual(starts, [str(cli), str(cli)], 'a completed target start must not be retried or replaced')
+        self.assertTrue(Path(self.environment['FIXTURE_DAEMON_STATE']).exists())
+        self.assertEqual(os.readlink(self.prefix / 'current'), f'versions/{VERSION}')
+        paths = list(self.downloads.glob('*/update-outcome.json'))
+        self.assertEqual(len(paths), 1)
+        receipt = json.loads(paths[0].read_text())['outcome']
+        self.assertEqual(receipt['state'], 'unverified')
+        self.assertEqual(receipt['serving']['host_session_id'], 'fixture-daemon')
+        self.assertEqual(receipt['readiness'], 'ready')
+
+    def test_downgrade_refusal_with_nonzero_start_but_serving_unverified_service_is_not_restarted(self):
+        result, _ = self.failed_update(FIXTURE_DOWNGRADE_FAILS='1', FIXTURE_FAIL_FIRST_DAEMON_START='1',
+                                       FIXTURE_CENSUS_VERIFICATION_FAILS='1', FIXTURE_START_NONZERO_AFTER_READY='1')
+        cli = self.prefix / 'versions' / VERSION / 'bin/cagents'
+        self.assertIn('daemon start command failed, but a stopped service was not proven', result.stderr)
+        self.assertIn(f"'{cli}' --no-start daemon status", result.stderr)
+        self.assertIn(f"'{cli}' --no-start terminal list", result.stderr)
+        self.assertNotIn('Start it with', result.stderr)
+        self.assertNotIn(f"'{cli}' daemon start", result.stderr)
+        self.assertEqual([e['executable'] for e in self.events() if e['event'] == 'daemon-start-fixture'],
+                         [str(cli), str(cli)])
+        self.assertTrue(Path(self.environment['FIXTURE_DAEMON_STATE']).exists())
+        self.assertEqual(os.readlink(self.prefix / 'current'), f'versions/{VERSION}')
+        receipts = list(self.downloads.glob('*/update-outcome.json'))
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(json.loads(receipts[0].read_text())['outcome']['state'], 'unverified')
+
     def test_same_version_pending_recovery_is_reported_before_already_installed_or_capture(self):
         first = self.install()
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
@@ -696,6 +739,44 @@ os.execv({real_tar!r}, [{real_tar!r}, *args])
         self.assertIn('daemon recover-update --checkpoint', retry.stderr)
         self.assertNotIn('archive differs', retry.stderr)
         self.assertEqual([e['event'] for e in self.events()], ['verify', 'pending-inspect'])
+
+    def test_pending_recovery_precedes_existing_tree_errors_without_executing_that_tree(self):
+        candidate = self.prepare_candidate()
+        self.environment.pop('FIXTURE_WINDOWS_PREPARED')
+        extra = candidate / '.older-retained-layout'
+        extra.write_text('retained older-layout evidence\n')
+        forbidden_execution = self.directory / 'untrusted-candidate-executed'
+        self.environment.update(FIXTURE_FORBIDDEN_CLI=str(candidate / 'bin/cagents'),
+                                FIXTURE_FORBIDDEN_EXECUTION=str(forbidden_execution),
+                                FIXTURE_PENDING_RECOVERY='1')
+        before = {str(p.relative_to(candidate)): (p.read_bytes(), p.stat().st_mode & 0o777)
+                  for p in candidate.rglob('*') if p.is_file()}
+        for selected in ('versions/old', f'versions/{VERSION}'):
+            with self.subTest(current=selected):
+                (self.prefix / 'current').unlink()
+                (self.prefix / 'current').symlink_to(selected)
+                pending = self.install('--restart-daemon')
+                self.assertNotEqual(pending.returncode, 0)
+                self.assertIn(f"'{candidate / 'bin/cagents'}' --no-start daemon recover-update", pending.stderr)
+                self.assertNotIn('unexpected entries', pending.stderr)
+                self.assertFalse(forbidden_execution.exists(), 'inspection must execute only the authenticated archive CLI')
+                events = self.events()
+                self.assertEqual([e['event'] for e in events], ['verify', 'pending-inspect'])
+                inspector = Path(events[1]['executable'])
+                self.assertTrue(inspector.is_relative_to(self.downloads), inspector)
+                self.assertEqual(events[1]['candidate'], str(candidate / 'bin/cagents'))
+                self.assertEqual(os.readlink(self.prefix / 'current'), selected)
+                after = {str(p.relative_to(candidate)): (p.read_bytes(), p.stat().st_mode & 0o777)
+                         for p in candidate.rglob('*') if p.is_file()}
+                self.assertEqual(after, before, 'pending inspection may not modify or replace retained evidence')
+                self.calls.unlink()
+        self.environment.pop('FIXTURE_PENDING_RECOVERY')
+        rejected = self.install('--restart-daemon')
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn('unexpected entries', rejected.stderr, 'no-pending retries still require complete tree validation')
+        self.assertEqual([e['event'] for e in self.events()], ['verify', 'pending-inspect'])
+        self.assertFalse(forbidden_execution.exists())
+        self.assertEqual(os.readlink(self.prefix / 'current'), f'versions/{VERSION}')
 
     def prepare_candidate(self, *, serving=False):
         self.installed_cli(guarded=True)
@@ -784,7 +865,7 @@ os.execv({real_tar!r}, [{real_tar!r}, *args])
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(os.readlink(self.prefix / 'current'), 'versions/old')
                 self.assertTrue(candidate.exists(), 'a prepared target must survive failure')
-                self.assertEqual([e['event'] for e in self.events()], ['verify'])
+                self.assertEqual([e['event'] for e in self.events()], ['verify', 'pending-inspect'])
                 self.calls.unlink()
                 executable.write_bytes(original)
                 executable.chmod(0o755)

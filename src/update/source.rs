@@ -586,12 +586,10 @@ pub(crate) enum ClientFamily {
     V68,
 }
 
-/// Current-wire entries must pass the recorded lifecycle/inspector proof.
-/// Unrecorded mainline protocols 99–103 and 119 are deliberately not admitted.
+/// Live updates are qualified only for the frozen desktop baseline and the
+/// current matched release. Historical DTO recordings do not grant admission:
+/// every source also needs the complete readiness, census and recovery flow.
 const SOURCE_CLIENTS: &[(u16, ClientFamily)] = &[
-    (68, ClientFamily::V68),
-    (77, ClientFamily::V77),
-    (128, ClientFamily::Current),
     (156, ClientFamily::Current),
     (crate::terminal_ipc::PROTOCOL_VERSION, ClientFamily::Current),
 ];
@@ -621,13 +619,14 @@ pub(crate) fn is_qualified_source(protocol: u16) -> bool {
 }
 
 pub(super) fn unsupported_source(protocol: u16) -> UpdateError {
-    if protocol > crate::terminal_ipc::PROTOCOL_VERSION {
-        return invalid(format!(
-            "The running cagents service is newer than this build (protocol {protocol}). Install the newer build instead."
-        ));
-    }
+    let release = if protocol > crate::terminal_ipc::PROTOCOL_VERSION {
+        " Choose a newer release for the cold install."
+    } else {
+        ""
+    };
     invalid(format!(
-        "The running cagents service uses protocol {protocol}. Update it to a build serving protocol 156 (such as 0.1.3+local.991daa43e) first."
+        "The running cagents service uses protocol {protocol}; live updates support only protocol 156 (desktop 0.1.3+local.991daa43e) and protocol {}. This source check did not request preparation or shutdown, or create an update checkpoint.{release} To cold-install safely: save your work, finish or close every hosted session, and quit every cagents window. Using the running build's matching CLI, run `cagents --no-start daemon stop --require-empty` (it refuses while sessions remain), then verify `cagents --no-start daemon status` reports stopped. Run the downloaded release's `sh /path/to/install.sh` without --restart-daemon, then reopen cagents.",
+        crate::terminal_ipc::PROTOCOL_VERSION,
     ))
 }
 
@@ -827,26 +826,27 @@ mod admission_message_tests {
     use super::*;
 
     #[test]
-    fn newer_service_requires_the_newer_build() {
-        let protocol = crate::terminal_ipc::PROTOCOL_VERSION + 1;
+    fn live_sources_are_only_the_frozen_desktop_and_current_release() {
         assert_eq!(
-            unsupported_source(protocol).to_string(),
-            format!(
-                "The running cagents service is newer than this build (protocol {protocol}). Install the newer build instead."
-            )
+            protocols().collect::<Vec<_>>(),
+            [156, crate::terminal_ipc::PROTOCOL_VERSION]
         );
+        for protocol in [0, 56, 68, 77, 119, 128, 160, 165] {
+            assert!(!is_qualified_source(protocol), "protocol {protocol}");
+            let message = unsupported_source(protocol).to_string();
+            assert!(message.contains(&format!("uses protocol {protocol}")));
+            assert!(message.contains("live updates support only protocol 156"));
+            assert!(message.contains("did not request preparation or shutdown"));
+            assert!(message.contains("--no-start daemon stop --require-empty"));
+            assert!(message.contains("sh /path/to/install.sh"));
+            assert!(!message.contains("Update it to a build serving protocol 156"));
+        }
     }
 
     #[test]
-    fn older_and_between_supported_protocols_name_the_exact_intermediate_build() {
-        for protocol in [119, 56] {
-            assert!(!is_qualified_source(protocol));
-            assert_eq!(
-                unsupported_source(protocol).to_string(),
-                format!(
-                    "The running cagents service uses protocol {protocol}. Update it to a build serving protocol 156 (such as 0.1.3+local.991daa43e) first."
-                )
-            );
-        }
+    fn newer_service_names_a_newer_cold_install_without_stopping_it() {
+        let message = unsupported_source(crate::terminal_ipc::PROTOCOL_VERSION + 1).to_string();
+        assert!(message.contains("Choose a newer release for the cold install"));
+        assert!(message.contains("did not request preparation or shutdown"));
     }
 }

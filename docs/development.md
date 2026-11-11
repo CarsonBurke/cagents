@@ -580,6 +580,13 @@ at a time, under the registry's `.decision` lock. A slot held by a plain
 `flock`, by a gate from before the registry or by an offload agent sent from
 such a checkout writes no record, so only its own family prices it.
 
+When room refuses a build whose own slot is free, the gate names the build
+host and reports the available memory, the memory still reserved for running
+builds, and this build's expected cost. A slot/queue message still describes a
+slot/queue wait. Memory diagnostics use the same snapshot as the admission
+decision and print after releasing its registry lock, once per memory-wait
+episode.
+
 So that no build waits forever behind smaller ones from other families that
 keep fitting, a build refused room while it holds a free slot records itself
 as waiting. Once refused for 120 seconds (`CAGENTS_BUILD_WAIT_PRIORITY_SECS`,
@@ -589,6 +596,18 @@ pressure. Only one such build ramps up at a time: while one admitted that way
 started less than 10 minutes ago and its holder lives, the next waits. Time
 spent queued behind its own family, or waiting for one of its slots, does not
 count, and a build no longer refused for 10 seconds loses its place.
+
+Set `CAGENTS_BUILD_PRIORITY=urgent` for urgent work (`normal` is the default).
+It changes only the order among room waiters that have already passed their
+overdue age: urgent first, then refusal age and PID. It does not skip a family's
+FIFO queue, grant ordinary resource admission, reduce the overdue age or bypass
+the current overdue build's 600-second ramp. An urgent waiter that is still too
+young cannot block an eligible normal one. Offload carries the priority to the
+build host; legacy one-line waiter records count as normal. The gate does not
+infer urgency from a lock file's name.
+
+UI builds retain their 9 GiB expected cost. A warm incremental result alone
+cannot price a future command whose dependencies may have changed.
 
 The first slot is the plain lock file `/var/tmp/cagents-cargo.lock`, so a
 command still run under `flock --close /var/tmp/cagents-cargo.lock` takes exactly
@@ -1514,20 +1533,57 @@ workloads are described in [Performance](performance.md).
 Use the shared, on-demand status cache instead of a watcher per agent:
 
 ```sh
-cagents gh pr-status 1234 -R CarsonBurke/cagents --json
+scripts/gh-pr-status 1234 -R CarsonBurke/cagents --json
 ```
 
-The command requires an explicit repository, needs no daemon, and reads PR,
-head, CI, review and merge state in one GraphQL request. Local callers with
-the same gh credential context share one refresh per PR every 120 seconds;
+The repository entry point works even when the installed CLI has no `gh`
+subcommand. It pins the local `origin/main` commit without fetching, then one
+background builder uses `scripts/cargo-gate` to build the CLI in a private
+snapshot under `.worktrees/`. The executable and build records live under
+`$(git rev-parse --git-common-dir)/gh-pr-status/`; no installed executable or
+shell PATH changes. GitHub/status, CLI dispatch, process/locking and
+Cargo/toolchain input changes invalidate the executable; unrelated app and documentation commits do
+not. A failed build is retried on demand after ten minutes, rather than once
+per caller. Its `build.log` records failures. `--source-ref HEAD` qualifies a
+candidate deliberately; normal agent reads use the default `origin/main`.
+
+While the build is queued, failed or otherwise unavailable, the command makes
+at most one REST `GET /repos/OWNER/REPO/pulls/NUMBER`. It uses the same private
+credential-scoped cache, per-PR flight and host cooldowns as the built CLI.
+The fallback reports PR/head/merge state; **CI and review decision are unknown**
+(`checks_state=null`, `checks_complete=false`, `reviewDecision=null`), with an
+explicit `limitations` entry. It never adds checks/review requests. Failed
+reads are cached too; actual `Retry-After` and primary reset deadlines prevent
+further reads without delaying unrelated API resources. REST primary deadlines
+remain separate from GraphQL deadlines, including when the cached CLI takes
+over. Budget-lock contention returns promptly with a stale/error result; if a
+response's host-wide cooldown could not be saved, its PR-specific deadline is
+retained and the error reports that limitation. A running CLI's GitHub
+error does not trigger REST fallback. Concurrent callers of an in-progress
+fallback return a stale/error result instead of sending another request.
+
+Once the cached CLI is available, it requires an explicit repository, needs
+no daemon, and reads PR, head, CI, review and merge state in one GraphQL
+request. Local callers with the same gh credential context share one refresh
+per PR every 120 seconds;
 when nobody reads it, it makes no requests. Check `data.stale`, `data.error`,
 `data.retry_at` and `data.snapshot.pull_request.headRefOid` before acting.
 A failed refresh exits nonzero and labels any retained snapshot stale.
 Exit zero confirms a readable snapshot; inspect `checks_state` to decide
 whether CI passed, failed or is pending.
-The aggregate check state covers all contexts; `checks_complete=false` means
-the displayed context list stops at 100. No reported checks means unknown,
+For GraphQL snapshots, the aggregate check state covers all contexts;
+`checks_complete=false` means the displayed context list stops at 100.
+REST bootstrap snapshots have no check aggregate. No reported checks means unknown,
 not passing. Enterprise repositories also accept `--hostname HOST`.
+
+To clear bootstrap artifacts, first ensure no status command or builder is
+running. Remove only inactive `gh-pr-status-*` worktrees with `git worktree
+remove`, then remove the `gh-pr-status/` directory under the Git common dir.
+This leaves the user-state status cache intact. Offline bootstrap/concurrency
+coverage runs with `/usr/bin/python3 -B tests/gh-pr-status.py -v` and builds no
+Rust or live GitHub requests. To include interoperability checks with an
+already gated CLI, set `GH_PR_STATUS_TEST_CLI=/absolute/path/to/cagents` for
+that test command; it still uses isolated state and fake GitHub responses.
 
 The app and Ceditor share a resumable review-request scan per repository and
 credential context. A settled scan waits 60 seconds, and continuation pages
@@ -1629,6 +1685,12 @@ cropped image. This changes the capture viewport, not application layouts.
 app, from a shell where the desktop session or `DISPLAY` is unavailable, such as
 plain SSH. It runs headless: KWin's virtual backend hosts a nested niri session,
 driven by `niri-harness`, running `scripts/run-development --browserless`.
+Add `start SIDE --instance NAME` to opt a new task into a named instance.
+It stays in the existing private compositor through the runner's `--in-session`
+mode; CLI and cleanup use the same name. The task keeps that selection across
+starts and refuses a different name. This needs a source runner supporting
+`--in-session`; default unnamed tasks retain compatibility with older runners
+and saved seeds.
 Each task keeps everything in one directory outside Git ancestry. Avoid `/tmp`,
 `/var/tmp` and `~/.cache`, where Codex sandboxes can leave an empty `.git` that
 fixtures refuse.
@@ -1708,11 +1770,28 @@ harness, it provides:
   (override with `CAGENTS_EVIDENCE_NATIVE_LOCK`). Stop as soon as you have the
   evidence. A session gives the lock up after `--limit` seconds even if its
   owner has gone. `build` uses `/var/tmp/cagents-fw16-cargo.lock` the same way.
+- **Startup deadline.** `start SIDE --startup-timeout 900` allows a large seed
+  up to 900 seconds to show its app window. The default is 180 seconds; use a
+  whole number from 1 to 3600. Readiness still requires the mapped window.
+  This deadline does not extend the independent `--limit` session lifetime.
 - **File choosers.** `start SIDE --portal gtk` runs xdg-desktop-portal with
   the GTK backend on the session's private bus, so the app's Attach dialog
   opens inside the session, where `drive` can operate it: `drive key ctrl+l`,
   `drive type PATH`, `drive key Return`. `kde`, `gnome` and `cosmic` select
   those backends where they are installed.
+- **Codex chats.** `start SIDE --codex tool-rows` (or `child-errors`,
+  `terminal-escape`) installs that offline Codex app-server peer as the
+  fixture's `codex`; see [An offline Codex](fixtures.md#an-offline-codex).
+  For real app-server lifecycle or saved-history tests, use
+  `--codex-executable /absolute/path/to/codex` instead. The path is on the
+  execution host (`fw16` with `--remote fw16`); the runner validates and
+  snapshots the ELF before waiting for the native lock, then installs an
+  isolated mode-0755 copy. Validation never runs the executable. The receipt
+  in `TASK/session/codex-executable-installed.json` records source, snapshot
+  and installed identities and SHA256 hashes. The options are mutually
+  exclusive. With neither option, the app lists Codex as not installed.
+  See [A real Codex in the fixture](fixtures.md#a-real-codex-in-the-fixture)
+  for private offline config and saved-history setup.
 - **Who holds the lock.** `scripts/lock-holders /var/tmp/cagents-fw16-native.lock` shows
   the holder and whether it is doing anything, when `start` seems stuck.
 - **Cleanup.** `stop` stops the fixture daemon, then ends any process that

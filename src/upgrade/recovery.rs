@@ -2771,8 +2771,8 @@ pub(crate) fn pending_retirement_for_source(
     archived_discovery_strict(checkpoint, daemon, Some(source))
 }
 
-/// Strict read-only planned retirement evidence. Actual archive material and
-/// its hashes remain mandatory before the root verifier can report continuity.
+/// Strict actual archive evidence. A durable routing pointer may precede the
+/// move, so its presence alone never establishes completed archival.
 pub(crate) fn archived_proof(
     checkpoint: &Path,
     daemon: &Path,
@@ -2781,7 +2781,12 @@ pub(crate) fn archived_proof(
     let Some((_, proof, record)) = scoped_retirement(checkpoint, &target, None, None)? else {
         return Ok(None);
     };
-    validate_settled_identity(&record, checkpoint, &target)?;
+    let bytes = read_checkpoint(&proof.archive_path)?
+        .ok_or("The routed recovery has no actual checkpoint archive")?;
+    if digest(&bytes) != proof.checkpoint_sha256 {
+        return Err("The actual checkpoint archive differs from its routing evidence".into());
+    }
+    validate_settled_record(&record, &bytes, checkpoint, &target)?;
     Ok(Some(proof))
 }
 
@@ -2966,7 +2971,11 @@ impl AlreadyRecovered {
         paused_terminals: &[TerminalId],
         paused_chats: &[TerminalId],
     ) -> Result<(), String> {
-        let guard = RetirementGuard::acquire(&self.checkpoint_path)?;
+        let RetirementAcquisition::Acquired(guard) =
+            RetirementGuard::acquire(&self.checkpoint_path)?
+        else {
+            return Err("Recovery evidence is busy; no completion was recorded".into());
+        };
         self.archive_completed_with(
             &guard,
             serving,
@@ -3047,12 +3056,26 @@ impl AlreadyRecovered {
 /// Serializes retirement helpers only. Daemon checkpoint writers never take
 /// this guard, so callers may hold it across read-only socket proofs without
 /// introducing a daemon/control-lock cycle. It conveys no restore authority.
+#[derive(Debug)]
 pub(crate) struct RetirementGuard {
     lock: File,
     checkpoint: PathBuf,
 }
+#[derive(Debug)]
+pub(crate) enum RetirementAcquisition {
+    Acquired(RetirementGuard),
+    Busy,
+}
+
 impl RetirementGuard {
-    pub(crate) fn acquire(checkpoint: &Path) -> Result<Self, String> {
+    pub(crate) fn acquire(checkpoint: &Path) -> Result<RetirementAcquisition, String> {
+        Self::acquire_for(checkpoint, std::time::Duration::from_secs(2))
+    }
+
+    fn acquire_for(
+        checkpoint: &Path,
+        timeout: std::time::Duration,
+    ) -> Result<RetirementAcquisition, String> {
         let directory = checkpoint
             .parent()
             .ok_or("Recovery storage has no directory")?;
@@ -3075,24 +3098,33 @@ impl RetirementGuard {
         if !private_single_file(&metadata) {
             return Err("Retirement lock is not a private regular file".into());
         }
+        let deadline = std::time::Instant::now() + timeout;
         loop {
-            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
                 break;
             }
             let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
+            if !matches!(
+                error.kind(),
+                io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+            ) {
                 return Err(error.to_string());
             }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(RetirementAcquisition::Busy);
+            }
+            std::thread::sleep(remaining.min(std::time::Duration::from_millis(20)));
         }
         let current = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
         if current.dev() != metadata.dev() || current.ino() != metadata.ino() {
             return Err("Retirement lock changed while it was acquired".into());
         }
         sweep_archive_temporaries(&directory);
-        Ok(Self {
+        Ok(RetirementAcquisition::Acquired(Self {
             lock,
             checkpoint: directory.join(name),
-        })
+        }))
     }
     fn matches(&self, checkpoint: &Path) -> Result<(), String> {
         let directory = fs::canonicalize(
@@ -3543,8 +3575,10 @@ fn commit_archive(
         }
         hash
     };
-    // Only the active pointer is mutable. The original settled outcome and all
-    // content-addressed retirement generations remain byte-for-byte unchanged.
+    // This mutable pointer is durable routing intent, not completion proof.
+    // Keeping it before the claim makes a crash discoverable; archived_proof
+    // independently requires the actual exact archive before proving a move.
+    // Original outcomes and content-addressed generations remain immutable.
     if read_checkpoint(&checkpoint.with_file_name(recovery_name(&record.checkpoint_hash)))?
         .as_deref()
         != Some(outcome)
@@ -6374,6 +6408,138 @@ mod tests {
     }
 
     #[test]
+    fn retirement_guard_contention_is_bounded_and_leaves_no_waiter() {
+        const ISOLATED: &str = "CAGENTS_TEST_RETIREMENT_CONTENTION_ISOLATED";
+        if std::env::var_os(ISOLATED).is_none() {
+            // Sibling libtests may fork and transiently inherit a locked OFD.
+            // Test release and immediate reacquisition after a private exec.
+            let selector = std::thread::current().name().unwrap().to_owned();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &selector, "--nocapture", "--test-threads=1"])
+                .env(ISOLATED, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        let files = settled_files();
+        let RetirementAcquisition::Acquired(held) =
+            RetirementGuard::acquire(&files.checkpoint).unwrap()
+        else {
+            panic!("private retirement fixture unexpectedly busy");
+        };
+        let checkpoint = files.checkpoint.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let contender = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let busy = matches!(
+                RetirementGuard::acquire_for(&checkpoint, std::time::Duration::from_millis(40))
+                    .unwrap(),
+                RetirementAcquisition::Busy
+            );
+            let _ = sender.send((busy, started.elapsed()));
+        });
+        let result = receiver.recv_timeout(std::time::Duration::from_secs(2));
+        // No blocked flock or background waiter remains to steal custody
+        // after the busy caller has returned. Release before asserting so a
+        // regression to blocking flock can still be joined and cleaned up.
+        drop(held);
+        contender.join().unwrap();
+        let (busy, elapsed) = result.expect("retirement contention exceeded its bounded deadline");
+        assert!(busy);
+        assert!(elapsed >= std::time::Duration::from_millis(40));
+        assert!(matches!(
+            RetirementGuard::acquire_for(&files.checkpoint, std::time::Duration::ZERO).unwrap(),
+            RetirementAcquisition::Acquired(_)
+        ));
+        assert_eq!(fs::read(&files.checkpoint).unwrap(), files.checkpoint_bytes);
+        assert!(!files.checkpoint.with_file_name(ACTIVE_RECOVERY).exists());
+    }
+
+    #[test]
+    fn failed_archive_claim_leaves_routing_intent_without_completion_proof() {
+        let files = settled_files();
+        let recovered = pending_retirement(&files.checkpoint, &files.target)
+            .unwrap()
+            .unwrap();
+        let mut ready: serde_json::Value = serde_json::from_slice(&files.checkpoint_bytes).unwrap();
+        ready["phase"] = "Ready".into();
+        let ready = serde_json::to_vec(&ready).unwrap();
+        let canonical = files.checkpoint.clone();
+        let replacement = ready.clone();
+        ARCHIVE_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |stage| {
+                if stage == "before-claim" {
+                    let temporary = canonical.with_file_name("new-ready.json");
+                    save(&temporary, &replacement);
+                    fs::rename(temporary, &canonical).unwrap();
+                }
+            }));
+        });
+        let result = recovered.archive_completed(
+            files.record.successor.as_ref().unwrap(),
+            &[],
+            &[],
+            &files.record.paused_terminals,
+            &[],
+        );
+        ARCHIVE_TEST_HOOK.with(|hook| hook.borrow_mut().take());
+        assert!(result.unwrap_err().contains("safely restored"));
+        assert!(files.checkpoint.with_file_name(ACTIVE_RECOVERY).exists());
+        assert_eq!(fs::read(&files.checkpoint).unwrap(), ready);
+        assert!(!archive_path(&files.checkpoint, &files.record.checkpoint_hash).exists());
+        assert!(archived_proof(&files.checkpoint, &files.target).is_err());
+        assert_eq!(fs::read(&files.outcome).unwrap(), files.outcome_bytes);
+    }
+
+    #[test]
+    fn planned_archive_retry_requires_material_and_then_completes_idempotently() {
+        let files = settled_files();
+        complete_files(&files);
+        let proof = archived_proof(&files.checkpoint, &files.target)
+            .unwrap()
+            .unwrap();
+        let pointer = fs::read(files.checkpoint.with_file_name(ACTIVE_RECOVERY)).unwrap();
+        let retirement = fs::read(&proof.retirement_path).unwrap();
+        // Reproduce a crash after routing intent was synced but before the
+        // canonical checkpoint was moved. Intent can route recovery reads,
+        // but must never count as an archive or completion.
+        fs::rename(&proof.archive_path, &files.checkpoint).unwrap();
+        assert!(archived_proof(&files.checkpoint, &files.target).is_err());
+        assert!(
+            pending_retirement(&files.checkpoint, &files.target)
+                .unwrap()
+                .is_some()
+        );
+        complete_files(&files);
+        assert!(
+            archived_proof(&files.checkpoint, &files.target)
+                .unwrap()
+                .is_some()
+        );
+        // Crash after the move but before the caller sees completion: retry
+        // validates existing exact bytes without rewriting any generation.
+        complete_files(&files);
+        assert!(!files.checkpoint.exists());
+        assert_eq!(
+            fs::read(&proof.archive_path).unwrap(),
+            files.checkpoint_bytes
+        );
+        assert_eq!(fs::read(&files.outcome).unwrap(), files.outcome_bytes);
+        assert_eq!(fs::read(&proof.retirement_path).unwrap(), retirement);
+        assert_eq!(
+            fs::read(files.checkpoint.with_file_name(ACTIVE_RECOVERY)).unwrap(),
+            pointer
+        );
+    }
+
+    #[test]
     fn retained_job_routing_binds_the_producers_exact_job_and_capture() {
         let files = settled_files();
         let mut pending = PendingRecovery::inspect_at(&files.checkpoint)
@@ -6828,6 +6994,9 @@ mod tests {
 
         #[test]
         fn bash_cli_forwards_recovery_only_to_the_verified_daemon() {
+            if crate::retained_fixture::run_isolated() {
+                return;
+            }
             if let Some(mode) = std::env::var_os(MODE) {
                 let root = PathBuf::from(std::env::var_os(ROOT).unwrap());
                 crate::daemon::lease_handoff::initialize_inherited_lease().unwrap();

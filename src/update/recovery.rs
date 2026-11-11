@@ -1173,8 +1173,10 @@ pub(crate) fn refresh_completed_service() -> Result<RetirementStatus, UpdateErro
 }
 
 /// Mechanical evidence status, not another daemon usability outcome.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum RetirementStatus {
+    /// Another helper owns the evidence transaction; no completion is claimed.
+    Busy,
     NotRequired,
     AlreadyCompleted,
     Completed,
@@ -1206,8 +1208,24 @@ fn retire_service(trigger: RetirementTrigger) -> Result<RetirementStatus, Update
         // Serialize discovery, the root proof and the mechanical move as one
         // retirement attempt. A concurrent verifier cannot observe another
         // caller's canonical-byte custody window and report a false failure.
-        let retirement_guard =
-            crate::upgrade::recovery::RetirementGuard::acquire(&store.path).map_err(invalid)?;
+        let retirement_guard = match crate::upgrade::recovery::RetirementGuard::acquire(&store.path)
+            .map_err(invalid)?
+        {
+            crate::upgrade::recovery::RetirementAcquisition::Acquired(guard) => guard,
+            crate::upgrade::recovery::RetirementAcquisition::Busy => {
+                return Ok(RetirementStatus::Busy);
+            }
+        };
+        #[cfg(feature = "host")]
+        if trigger == RetirementTrigger::ColdStart {
+            // This is local mechanical evidence only. No socket self-query,
+            // old census reconstruction, pause inspection or live-owner claim
+            // is needed once the exact archive transaction has completed.
+            let target = std::env::current_exe()?;
+            if let Some(status) = completed_cold_retirement(&store.path, &target)? {
+                return Ok(status);
+            }
+        }
         let socket = crate::terminal_ipc::daemon_socket_path()?;
         let mut client = source::Client::connect(&socket).map_err(|e| invalid(e.to_string()))?;
         let generation = client.inventory_generation()?;
@@ -1335,7 +1353,48 @@ fn retire_service(trigger: RetirementTrigger) -> Result<RetirementStatus, Update
         }
         Ok(RetirementStatus::Completed)
     })();
+    if matches!(&result, Ok(RetirementStatus::Busy)) {
+        if trigger == RetirementTrigger::CurrentJob {
+            eprintln!(
+                "Recovery evidence is busy with another verifier; no archival completion was recorded. Any serving daemon was kept running. Readiness and terminal preservation still require this update's independent census verification."
+            );
+        } else {
+            tracing::debug!(
+                "recovery evidence is busy; optional cold-start completion was deferred without querying the daemon"
+            );
+        }
+    }
     result.map_err(|error: UpdateError| invalid(format!("Recovery completion could not be durably verified: {error}. Any serving daemon was kept running and its checkpoint/outcome evidence was preserved. Run `cagents --no-start daemon status` and `cagents --no-start terminal list` before another update")))
+}
+
+#[cfg(feature = "host")]
+fn completed_cold_retirement(
+    checkpoint: &Path,
+    target: &Path,
+) -> Result<Option<RetirementStatus>, UpdateError> {
+    match std::fs::symlink_metadata(checkpoint) {
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    // Structural proof uses immutable record/archive bytes, never the current
+    // or original live census. Later explicit owner/pane closes are irrelevant
+    // to whether this historical filesystem transaction completed.
+    let status = match crate::upgrade::recovery::archived_proof(checkpoint, target) {
+        Ok(Some(_)) => RetirementStatus::AlreadyCompleted,
+        Ok(None) => RetirementStatus::NotRequired,
+        Err(error) => {
+            tracing::debug!(%error,"historical recovery has no verified actual archive; evidence was kept");
+            RetirementStatus::NotRequired
+        }
+    };
+    // A new canonical transaction always takes precedence over old history.
+    // Do not turn its appearance into an AlreadyCompleted claim.
+    match std::fs::symlink_metadata(checkpoint) {
+        Ok(_) => Ok(Some(RetirementStatus::NotRequired)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Some(status)),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn retirement_partition(
