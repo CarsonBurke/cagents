@@ -31361,7 +31361,8 @@ mod tests {
             .contains(&row)
     }
 
-    /// Gives the project holding `channel` a worktree.
+    /// Gives the project holding `channel` a worktree and shows its row so
+    /// attention retention is exercised independently of group disclosure.
     fn add_attention_worktree(
         app: &mut Cagents,
         channel: crate::model::ChannelId,
@@ -31385,6 +31386,8 @@ mod tests {
                 "/repo/feature".into(),
                 Some("feature".into()),
             ));
+        app.sidebar_state
+            .set_sidebar_worktrees(settings::SidebarWorktrees::Expanded);
         sidebar::SelectionRow::Worktree(project, worktree)
     }
 
