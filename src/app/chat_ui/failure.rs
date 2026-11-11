@@ -1615,15 +1615,21 @@ mod tests {
 
     #[test]
     fn reset_evidence_rejects_a_new_rejection_without_any_usage_update() {
-        let raw = "You've hit your limit · resets 9pm (UTC)";
+        let raw = "You've hit your Fable limit · resets 9pm (UTC)";
         let (mut runtime, handle) = live_fixture(
             Provider::Claude,
             vec![
                 text("prompt-1", chat::Role::User, "Fixture question"),
-                text("failure-1", chat::Role::System, raw),
+                provider_error(Provider::Claude, "failure-1", raw),
             ],
         );
         runtime.refresh_failure_ui();
+        assert_eq!(runtime.failure_ui.incidents.len(), 1);
+        assert_eq!(
+            runtime.failure_ui.incidents[0].kind,
+            Some(FailureKind::AccountLimit)
+        );
+        let original_summary = runtime.failure_ui.incidents[0].summary.clone();
         let original = runtime.reset_limit_incidents();
         assert!(
             !original.0.is_empty(),
@@ -1634,8 +1640,12 @@ mod tests {
             next.items
                 .push(Arc::new(text("prompt-2", chat::Role::User, "Continue")));
             next.items
-                .push(Arc::new(text("failure-2", chat::Role::System, raw)));
+                .push(Arc::new(provider_error(Provider::Claude, "failure-2", raw)));
         });
+        assert_eq!(runtime.failure_ui.incidents.len(), 2);
+        assert!(runtime.failure_ui.incidents.iter().all(|incident| {
+            incident.kind == Some(FailureKind::AccountLimit) && incident.summary == original_summary
+        }));
         let current = runtime.reset_limit_incidents();
         assert!(current.0.keys().any(|key| !original.0.contains_key(key)));
         assert!(
