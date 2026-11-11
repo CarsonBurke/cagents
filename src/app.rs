@@ -3029,6 +3029,7 @@ pub enum SettingsField {
     ManagedWorktreeDirectory,
     AutoDeleteMergedWorktrees,
     WorktreeSort,
+    SidebarWorktrees,
     DefaultWorktreePane,
     DefaultChannelPane,
     DefaultColumnFraction,
@@ -3160,6 +3161,7 @@ impl SettingsField {
             Self::TerminalScrollbackMib => "Scrollback (MiB)",
             Self::ManagedWorktreeDirectory => "Managed worktree directory",
             Self::WorktreeSort => "Worktree order",
+            Self::SidebarWorktrees => "Worktrees in sidebar",
             Self::DefaultWorktreePane => "Default worktree pane",
             Self::DefaultChannelPane => "Default channel pane",
             Self::DefaultColumnFraction => "New pane width",
@@ -3253,6 +3255,7 @@ impl SettingsField {
             | Self::WorkStaleAfterDays
             | Self::ManagedWorktreeDirectory
             | Self::WorktreeSort
+            | Self::SidebarWorktrees
             | Self::DefaultWorktreePane
             | Self::DefaultChannelPane
             | Self::FocusFollowsMouse => SettingsCategory::General,
@@ -3440,6 +3443,7 @@ struct SettingsDraft {
     managed_worktree_directory: String,
     auto_delete_merged_worktrees: bool,
     worktree_sort: String,
+    sidebar_worktrees: settings::SidebarWorktrees,
     default_worktree_pane: settings::DefaultPane,
     default_channel_pane: settings::DefaultPane,
     default_column_fraction: String,
@@ -3501,6 +3505,7 @@ impl SettingsDraft {
                 settings::WorktreeSort::Alphabetical => "alphabetical",
             }
             .into(),
+            sidebar_worktrees: settings.sidebar_worktrees,
             default_column_fraction: settings.default_column_fraction.to_string(),
             default_worktree_pane: settings.default_worktree_pane,
             default_channel_pane: settings.default_channel_pane,
@@ -3553,6 +3558,11 @@ impl SettingsDraft {
                 self.auto_delete_merged_worktrees = value == "true"
             }
             SettingsField::WorktreeSort => self.worktree_sort = value,
+            SettingsField::SidebarWorktrees => {
+                if let Some(mode) = settings::SidebarWorktrees::from_key(&value) {
+                    self.sidebar_worktrees = mode;
+                }
+            }
             SettingsField::DefaultWorktreePane => {
                 if let Some(pane) = settings::DefaultPane::from_key(&value) {
                     self.default_worktree_pane = pane;
@@ -3839,6 +3849,9 @@ fn settings_update(
             .parse::<bool>()
             .map(|enabled| next.check_for_updates = enabled)
             .map_err(|_| "Choose whether to check for updates automatically.".to_owned()),
+        SettingsField::SidebarWorktrees => settings::SidebarWorktrees::from_key(value)
+            .map(|mode| next.sidebar_worktrees = mode)
+            .ok_or_else(|| "Choose Grouped, Expanded, or Hidden.".to_owned()),
         SettingsField::WorktreeSort => match value {
             "newest" => {
                 next.worktree_sort = settings::WorktreeSort::Newest;
@@ -4403,6 +4416,7 @@ pub enum Message {
         saved: Result<SettingsSaved, String>,
         result: Result<(), String>,
     },
+    SidebarPreferencesObserved(AppSettings),
     SettingsSaved {
         generation: u64,
         result: Result<SettingsSaved, String>,
@@ -10970,6 +10984,16 @@ impl Cagents {
             }
         };
         if let Some(action) = action {
+            if let SidebarAction::OpenWorktree {
+                project_id,
+                worktree_id,
+                ..
+            } = &action
+                && let Some(project) = self.sidebar_model.project(*project_id)
+            {
+                self.sidebar_state
+                    .reveal_worktree(project, *worktree_id, false);
+            }
             self.sidebar_state.apply(&action);
         }
     }
@@ -14455,6 +14479,10 @@ impl Cagents {
                 .set_worktree_sort(self.settings.worktree_sort);
         }
         self.sidebar_state
+            .set_sidebar_worktrees(self.settings.sidebar_worktrees);
+        self.sidebar_state
+            .set_worktree_overrides(self.settings.sidebar_worktree_overrides.clone());
+        self.sidebar_state
             .set_show_worktree_changes_icons(self.settings.show_worktree_changes_icons);
         if previous.app_theme != self.settings.app_theme
             || previous.ui_scale != self.settings.ui_scale
@@ -14994,6 +15022,10 @@ impl Application for Cagents {
         app.sidebar_state
             .set_worktree_sort(app.settings.worktree_sort);
         app.sync_worktree_protections();
+        app.sidebar_state
+            .set_sidebar_worktrees(app.settings.sidebar_worktrees);
+        app.sidebar_state
+            .set_worktree_overrides(app.settings.sidebar_worktree_overrides.clone());
         app.sidebar_state
             .set_show_worktree_changes_icons(app.settings.show_worktree_changes_icons);
         // `view` lays the strip out against the width `Workspace` holds, which
@@ -16213,6 +16245,11 @@ impl Application for Cagents {
                 {
                     return Task::none();
                 }
+                if let SidebarAction::OpenWorktree { project_id, worktree_id, .. } = &action
+                    && let Some(project) = self.sidebar_model.project(*project_id)
+                {
+                    self.sidebar_state.reveal_worktree(project, *worktree_id, true);
+                }
                 self.sidebar_state.apply(&action);
                 // Opening a row, by pointer or keyboard, is navigation: it
                 // ends any explicit selection and anchors a later range, but
@@ -16685,7 +16722,17 @@ impl Application for Cagents {
                     }
                     SidebarAction::SearchChanged(_)
                     | SidebarAction::SetFilter(_)
-                    | SidebarAction::ToggleProject(_) => Task::none(),
+                    | SidebarAction::ToggleProject(_)
+                    | SidebarAction::ToggleWorktrees(_)
+                    => Task::none(),
+                    SidebarAction::SetWorktreeDisplay { project_id, mode } => {
+                        if let Some(mode) = mode {
+                            self.settings.sidebar_worktree_overrides.insert(project_id, mode);
+                        } else {
+                            self.settings.sidebar_worktree_overrides.remove(&project_id);
+                        }
+                        self.save_settings_task(false)
+                    },
                 }
             }
             Message::AcknowledgeVisiblePane { card, epoch } => {
@@ -16877,6 +16924,27 @@ impl Application for Cagents {
                     self.status = Some(TransientNotice::error(format!(
                         "Could not open a new window: {error}"
                     )));
+                }
+                Task::none()
+            }
+            Message::SidebarPreferencesObserved(settings) => {
+                // A local edit owns these fields until its save is acknowledged.
+                if self.settings_save_generation == self.settings_ack_generation {
+                    // Never wait for a disk save on the event loop. An in-flight
+                    // save's acknowledgment restarts this observation.
+                    let Ok(mut lane) = self.settings_save_lane.try_lock() else { return Task::none(); };
+                    if let Some(saved) = lane.as_mut() {
+                        saved.settings.sidebar_worktrees = settings.sidebar_worktrees;
+                        saved.settings.sidebar_worktree_overrides = settings.sidebar_worktree_overrides.clone();
+                    }
+                    drop(lane);
+                    self.settings.sidebar_worktrees = settings.sidebar_worktrees;
+                    self.settings.sidebar_worktree_overrides = settings.sidebar_worktree_overrides.clone();
+                    self.settings_base.sidebar_worktrees = settings.sidebar_worktrees;
+                    self.settings_base.sidebar_worktree_overrides = settings.sidebar_worktree_overrides.clone();
+                    self.settings_draft.sidebar_worktrees = settings.sidebar_worktrees;
+                    self.sidebar_state.set_sidebar_worktrees(settings.sidebar_worktrees);
+                    self.sidebar_state.set_worktree_overrides(settings.sidebar_worktree_overrides);
                 }
                 Task::none()
             }
@@ -18906,6 +18974,13 @@ impl Application for Cagents {
                     }
                     _ => None,
                 }),
+        );
+        subscriptions.push(
+            Subscription::run_with(
+                (self.settings_path.clone(), self.settings_ack_generation),
+                |(path, _)| settings_ui::sidebar_preferences_stream(path.clone()),
+            )
+            .map(Message::SidebarPreferencesObserved),
         );
         subscriptions.extend(operation_subscriptions);
         if let Some(window) = self.core.main_window_id()
@@ -30666,6 +30741,74 @@ mod tests {
             advanced,
             "and every pass over that frame measures it identically",
         );
+    }
+
+    #[test]
+    fn sidebar_worktree_collapse_survives_selection_synchronization() {
+        let mut app = context_inspector_test_app(true);
+        let project = ProjectId::new();
+        let selected = WorktreeId::new();
+        let other = WorktreeId::new();
+        let row = |id, path: &str| {
+            sidebar::SidebarWorktree::new(
+                id,
+                path.into(),
+                Some("topic".into()),
+                false,
+                false,
+                None,
+                None,
+                None,
+            )
+        };
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            RepositoryId(uuid::Uuid::new_v4()),
+            "Example".into(),
+            "/repo".into(),
+            vec![row(selected, "/tmp"), row(other, "/other")],
+            vec![],
+        ));
+        app.synchronize_sidebar_selection();
+        drop(app.rebind_source_control());
+        let other_row = sidebar::SelectionRow::Worktree(project, other);
+        assert!(
+            sidebar::visible_selection_rows(&app.sidebar_model, &app.sidebar_state, false)
+                .contains(&other_row)
+        );
+        drop(app.update(Message::Sidebar(SidebarAction::ToggleWorktrees(project))));
+        app.synchronize_sidebar_selection();
+        let visible =
+            sidebar::visible_selection_rows(&app.sidebar_model, &app.sidebar_state, false);
+        assert!(!visible.contains(&other_row));
+        assert!(visible.contains(&sidebar::SelectionRow::Worktree(project, selected)));
+    }
+
+    #[test]
+    fn sidebar_preferences_observed_after_local_save_can_reset_external_override() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(false);
+        app.settings_write_blocked = false;
+        app.settings_path = Some(path.clone());
+        app.save_settings_now().unwrap();
+        let project = ProjectId::new();
+        let mut external = settings::load(&path).unwrap();
+        external.sidebar_worktrees = settings::SidebarWorktrees::Hidden;
+        external
+            .sidebar_worktree_overrides
+            .insert(project, settings::SidebarWorktrees::Expanded);
+        settings::save(&path, &external).unwrap();
+        drop(app.update(Message::SidebarPreferencesObserved(external)));
+        assert_eq!(
+            app.sidebar_state.worktree_display(project),
+            settings::SidebarWorktrees::Expanded
+        );
+        app.settings.sidebar_worktree_overrides.remove(&project);
+        app.save_settings_now().unwrap();
+        let saved = settings::load(&path).unwrap();
+        assert_eq!(saved.sidebar_worktrees, settings::SidebarWorktrees::Hidden);
+        assert!(!saved.sidebar_worktree_overrides.contains_key(&project));
     }
 
     pub(super) fn context_inspector_test_app(with_focused_card: bool) -> Cagents {
