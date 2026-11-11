@@ -3439,7 +3439,7 @@ mod tests {
             "a readiness lookup must not allocate another repository path value"
         );
         for path in [
-            &shared,
+            shared.as_path(),
             Path::new("/first"),
             Path::new("/first/.git"),
             Path::new("/second"),
