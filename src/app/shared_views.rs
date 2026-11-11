@@ -563,14 +563,23 @@ impl Cagents {
     /// and it is being opened. A listed terminal is admitted to hydrate again
     /// and only attaches, since another window may host it.
     pub(super) fn release_held_terminals(&mut self) -> Task<Message> {
+        self.release_held_terminals_with_topology(None)
+    }
+
+    fn release_held_terminals_with_topology(
+        &mut self,
+        topology: Option<&ViewScopeTopology<'_>>,
+    ) -> Task<Message> {
         if self.shared_registry_connecting() {
             return Task::none();
         }
         self.retire_startup_registry_waits();
         // An unopened terminal is not asking to start, so it can wait until
         // the view that may yet list it has been admitted.
-        let views_settled =
-            self.shared_views.registry_unavailable || self.shared_views_ready_for_startup();
+        let views_settled = self.shared_views.registry_unavailable
+            || self
+                .shared_views_startup_hold_with_topology(topology)
+                .is_none();
         let held = self
             .durable
             .cards
@@ -671,6 +680,13 @@ impl Cagents {
 
     /// Why a view this window shows is not admitted by the registry yet.
     pub(super) fn shared_views_startup_hold(&self) -> Option<&'static str> {
+        self.shared_views_startup_hold_with_topology(None)
+    }
+
+    fn shared_views_startup_hold_with_topology(
+        &self,
+        topology: Option<&ViewScopeTopology<'_>>,
+    ) -> Option<&'static str> {
         if self.durable.workspace_model_identity.is_none() && self.shared_views.attached.is_empty()
         {
             return None;
@@ -678,7 +694,10 @@ impl Cagents {
         if self.workspace_model.identity == crate::workspace_model::NO_REGISTRY {
             return Some("the shared workspace has not answered this window");
         }
-        let scopes = self.local_view_scopes();
+        let scopes = match topology {
+            Some(topology) => self.discover_view_scopes_with(topology).scopes,
+            None => self.local_view_scopes(),
+        };
         view_scope_hold(&self.shared_views, scopes.iter())
     }
 
@@ -2259,7 +2278,7 @@ impl Cagents {
             }
         }
         self.reproject_notification_unread();
-        tasks.push(self.release_held_terminals());
+        tasks.push(self.release_held_terminals_with_topology(Some(&topology)));
         // Restored shared panes queued for an attach wait for the registry.
         tasks.push(self.attach_next_restored_agent());
         Task::batch(tasks)
