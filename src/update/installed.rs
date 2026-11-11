@@ -413,12 +413,13 @@ fn candidate_maintenance(
     unsafe { command.pre_exec(crate::daemon::seal_inherited_descriptors) };
     guard.inherit_for_install(&mut command)?;
     handoff.inherit(&mut command)?;
-    bounded_command(
+    bounded_maintenance_command(
         &mut command,
         "Preparing terminal service recovery",
         SMALL_ASSET_LIMIT,
         Duration::from_secs(30),
         &CancellationToken::new(),
+        &mut io::stderr().lock(),
     )
 }
 
@@ -840,6 +841,10 @@ mod tests {
                 .output()
                 .unwrap();
             assert!(output.status.success(), "{output:?}");
+            let log = String::from_utf8_lossy(&output.stderr);
+            assert!(log.contains("maintenance-start"), "{log}");
+            assert!(log.contains("maintenance-end"), "{log}");
+            assert!(log.contains("store lease fixture refused"), "{log}");
             return;
         };
         let root = PathBuf::from(root);
@@ -859,9 +864,14 @@ assert 'FLOCK' in pathlib.Path('/proc/self/fdinfo/199').read_text()
 fcntl.flock(199, fcntl.LOCK_EX | fcntl.LOCK_NB)
 root=pathlib.Path(__file__).resolve().parents[3]
 if sys.argv[1:] == ['daemon', 'store-schema']:
+ if (root/'fail-schema').exists():
+  print('\nstore lease fixture refused\nsecond detail',file=sys.stderr)
+  sys.exit(7)
  print(23)
 elif sys.argv[1:] == ['daemon', 'downgrade-store', '23']:
- if (root/'fail-conversion').exists(): sys.exit(1)
+ if (root/'fail-conversion').exists():
+  print('store conversion fixture refused',file=sys.stderr)
+  sys.exit(1)
  (root/'converted').write_text('23')
 else: raise AssertionError(sys.argv)
 "#,
@@ -893,20 +903,31 @@ else: raise AssertionError(sys.argv)
         let guard = crate::instance::UiUpdateGuard::acquire().unwrap();
         let schema = stopped_store_schema(&candidate, &guard, lease.as_ref().unwrap()).unwrap();
         assert_eq!(schema, 23);
+        fs::write(root.join("fail-schema"), "fail").unwrap();
+        let error = stopped_store_schema(&candidate, &guard, lease.as_ref().unwrap()).unwrap_err();
+        assert!(
+            error.to_string().ends_with(": store lease fixture refused"),
+            "{error}"
+        );
+        fs::remove_file(root.join("fail-schema")).unwrap();
         // Conversion failure must leave the only readable installation selected.
         fs::write(root.join("fail-conversion"), "fail").unwrap();
+        let error = rollback_stopped_candidate(
+            &root,
+            &candidate,
+            &old,
+            &candidate,
+            Some(schema),
+            true,
+            &guard,
+            &mut lease,
+        )
+        .unwrap_err();
         assert!(
-            rollback_stopped_candidate(
-                &root,
-                &candidate,
-                &old,
-                &candidate,
-                Some(schema),
-                true,
-                &guard,
-                &mut lease
-            )
-            .is_err()
+            error
+                .to_string()
+                .ends_with(": store conversion fixture refused"),
+            "{error}"
         );
         assert_eq!(root.join("current").canonicalize().unwrap(), candidate);
         // A command that never spawned cannot have converted the store; old

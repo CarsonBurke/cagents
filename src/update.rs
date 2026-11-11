@@ -2719,6 +2719,161 @@ fn bounded_command(
     timeout: Duration,
     cancellation: &CancellationToken,
 ) -> Result<File, UpdateError> {
+    bounded_command_output(command, operation, limit, timeout, cancellation, None)
+}
+
+const MAINTENANCE_STDERR_LIMIT: usize = 16 * 1024;
+
+/// Only matched, internal store-maintenance commands opt into diagnostics.
+/// The update worker's stderr is its private job log; never log Command's
+/// Debug representation, which includes environment overrides.
+fn bounded_maintenance_command(
+    command: &mut Command,
+    operation: &'static str,
+    limit: u64,
+    timeout: Duration,
+    cancellation: &CancellationToken,
+    log: &mut dyn Write,
+) -> Result<File, UpdateError> {
+    let argv: Vec<_> = std::iter::once(command.get_program())
+        .chain(command.get_args())
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect();
+    let timestamp = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    };
+    let _ = writeln!(
+        log,
+        "{}",
+        serde_json::json!({
+            "phase": "maintenance-start", "at_unix_ms": timestamp(),
+            "argv": argv, "stderr_limit_bytes": MAINTENANCE_STDERR_LIMIT,
+        })
+    );
+    let mut stderr = MaintenanceStderr::default();
+    let result = bounded_command_output(
+        command,
+        operation,
+        limit,
+        timeout,
+        cancellation,
+        Some(&mut stderr),
+    );
+    let _ = writeln!(
+        log,
+        "{}",
+        serde_json::json!({
+            "phase": "maintenance-end", "at_unix_ms": timestamp(), "argv": argv,
+            "status": stderr.status.map(|status| status.to_string()),
+            "outcome": result.as_ref().map(|_| "success".to_owned()).unwrap_or_else(|error| error.to_string()),
+            "stderr_limit_bytes": MAINTENANCE_STDERR_LIMIT,
+            "stderr_truncated": stderr.truncated,
+            "stderr": String::from_utf8_lossy(&stderr.bytes),
+        })
+    );
+    result
+}
+
+#[derive(Default)]
+struct MaintenanceStderr {
+    bytes: Vec<u8>,
+    truncated: bool,
+    eof: bool,
+    status: Option<std::process::ExitStatus>,
+}
+
+impl MaintenanceStderr {
+    /// Drain beyond the retained prefix too, so a verbose child cannot block
+    /// on stderr while we wait for stdout or its exit status.
+    fn read(&mut self, pipe: &mut std::process::ChildStderr) -> io::Result<bool> {
+        let mut buffer = [0u8; 64 * 1024];
+        match pipe.read(&mut buffer) {
+            Ok(0) => {
+                self.eof = true;
+                Ok(false)
+            }
+            Ok(length) => {
+                let retained = length.min(MAINTENANCE_STDERR_LIMIT - self.bytes.len());
+                self.bytes.extend_from_slice(&buffer[..retained]);
+                self.truncated |= retained != length;
+                Ok(true)
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn first_line(&self) -> Option<String> {
+        let raw = String::from_utf8_lossy(&self.bytes);
+        let mut characters = raw.chars();
+        let mut text = String::new();
+        while let Some(character) = characters.next() {
+            match character {
+                // Discard complete ANSI sequences, including their payload,
+                // so a color reset or terminal title is not the error line.
+                '\u{1b}' => match characters.next() {
+                    Some('[') => {
+                        for character in characters.by_ref() {
+                            if ('@'..='~').contains(&character) {
+                                break;
+                            }
+                        }
+                    }
+                    Some(']' | 'P' | '_' | '^') => {
+                        let mut escape = false;
+                        for character in characters.by_ref() {
+                            if character == '\u{7}' || (escape && character == '\\') {
+                                break;
+                            }
+                            escape = character == '\u{1b}';
+                        }
+                    }
+                    Some(' '..='/') => {
+                        for character in characters.by_ref() {
+                            if ('0'..='~').contains(&character) {
+                                break;
+                            }
+                        }
+                    }
+                    _ => (),
+                },
+                '\n' => text.push('\n'),
+                '\t' => text.push(' '),
+                character
+                    if !character.is_control()
+                        && !matches!(character,
+                    '\u{061C}' | '\u{200E}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}') =>
+                {
+                    text.push(character)
+                }
+                _ => (),
+            }
+        }
+        text.lines().find_map(|line| {
+            let line = line.trim();
+            (!line.is_empty()).then(|| line.chars().take(512).collect())
+        })
+    }
+}
+
+fn bounded_command_output(
+    command: &mut Command,
+    operation: &'static str,
+    limit: u64,
+    timeout: Duration,
+    cancellation: &CancellationToken,
+    mut stderr: Option<&mut MaintenanceStderr>,
+) -> Result<File, UpdateError> {
     if cancellation.cancelled() {
         return Err(UpdateError::Cancelled);
     }
@@ -2726,21 +2881,32 @@ fn bounded_command(
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(if stderr.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .process_group(0);
     let child = command
         .spawn()
         .map_err(|error| invalid(format!("cannot start {operation}: {error}")))?;
     let mut child = StreamingChild::new(child)?;
     let mut pipe = child.child.stdout.take().expect("piped stdout");
+    let mut error_pipe = child.child.stderr.take();
+    let mut nonblocking = false;
     let result = (|| {
-        let fd = pipe.as_raw_fd();
-        // SAFETY: flags are changed on the live stdout descriptor only.
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+        for fd in
+            std::iter::once(pipe.as_raw_fd()).chain(error_pipe.as_ref().map(AsRawFd::as_raw_fd))
         {
-            return Err(io::Error::last_os_error().into());
+            // SAFETY: flags are changed on the owned live pipe descriptors only.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            if flags == -1
+                || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+            {
+                return Err(io::Error::last_os_error().into());
+            }
         }
+        nonblocking = true;
         let start = Instant::now();
         let mut total = 0u64;
         let mut buffer = [0u8; 64 * 1024];
@@ -2752,6 +2918,12 @@ fn bounded_command(
             if start.elapsed() > timeout {
                 return Err(UpdateError::Timeout(operation));
             }
+            // Give both streams one bounded read each per iteration. A busy
+            // stdout must not starve stderr (or timeout/cancellation checks).
+            let mut progress = false;
+            if let (Some(stderr), Some(pipe)) = (stderr.as_deref_mut(), error_pipe.as_mut()) {
+                progress |= stderr.read(pipe)?;
+            }
             match pipe.read(&mut buffer) {
                 Ok(0) => eof = true,
                 Ok(length) => {
@@ -2760,19 +2932,32 @@ fn bounded_command(
                         return Err(invalid(format!("{operation} exceeds its size limit")));
                     }
                     file.write_all(&buffer[..length])?;
-                    continue;
+                    progress = true;
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => (),
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) => return Err(error.into()),
             }
-            if eof && let Some(status) = child.observed_exit_status()? {
+            if eof
+                && stderr.as_ref().is_none_or(|stderr| stderr.eof)
+                && let Some(status) = child.observed_exit_status()?
+            {
+                if let Some(stderr) = stderr.as_deref_mut() {
+                    stderr.status = Some(status);
+                }
                 if !status.success() {
-                    return Err(invalid(format!("{operation} failed ({status})")));
+                    let detail = stderr
+                        .as_ref()
+                        .and_then(|stderr| stderr.first_line())
+                        .map(|line| format!(": {line}"))
+                        .unwrap_or_default();
+                    return Err(invalid(format!("{operation} failed ({status}){detail}")));
                 }
                 break;
             }
-            thread::sleep(Duration::from_millis(20));
+            if !progress {
+                thread::sleep(Duration::from_millis(20));
+            }
         }
         seal_file(&file)?;
         file.seek(SeekFrom::Start(0))?;
@@ -2782,6 +2967,15 @@ fn bounded_command(
     // errors, since each still needs original-group cleanup. Success preserves
     // the existing policy of leaving independently running descendants alone.
     let cleanup = child.finish(result.is_err());
+    if let Some(stderr) = stderr {
+        stderr.status = child.final_status.or(stderr.status);
+        // Preserve pending diagnostics on timeout/cancellation/size failure.
+        // One nonblocking read is enough to fill the retained prefix, and is
+        // bounded even if an independently running descendant keeps writing.
+        if nonblocking && let Some(pipe) = error_pipe.as_mut() {
+            let _ = stderr.read(pipe);
+        }
+    }
     match (result, cleanup) {
         (Err(operation), Err(cleanup)) => Err(UpdateError::Cleanup {
             operation: Box::new(operation),
@@ -2799,6 +2993,7 @@ struct StreamingChild {
     child: std::process::Child,
     identity: OwnedFd,
     finished: bool,
+    final_status: Option<std::process::ExitStatus>,
 }
 
 impl StreamingChild {
@@ -2851,6 +3046,7 @@ impl StreamingChild {
             child,
             identity,
             finished: false,
+            final_status: None,
         })
     }
 
@@ -2939,9 +3135,11 @@ impl StreamingChild {
         // on indefinitely just to report cleanup uncertainty.
         if cleanup.is_ok() || observed.is_some() {
             let reap = self.status(libc::WEXITED).and_then(|status| {
-                status.ok_or_else(|| {
+                let status = status.ok_or_else(|| {
                     io::Error::other("streaming child final reap returned no status")
-                })
+                })?;
+                self.final_status = Some(status);
+                Ok(status)
             });
             if let Err(reap) = reap {
                 return Err(match cleanup {
@@ -3292,6 +3490,168 @@ mod tests {
             .to_string()
             .contains("size limit")
         );
+    }
+
+    fn maintenance_records(log: &[u8]) -> Vec<serde_json::Value> {
+        String::from_utf8_lossy(log)
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn maintenance_diagnostics_keep_failure_and_private_bounded_log() {
+        let directory = tempfile::tempdir().unwrap();
+        let log_path = directory.path().join("job.log");
+        let mut log = private_create(&log_path).unwrap();
+        let error = bounded_maintenance_command(
+            Command::new("/bin/sh")
+                .args(["-c", "printf '\\n\\007\\nstore lease refused\\033\\r\\nsecond detail\\n' >&2; exit 7", "daemon", "store-schema"])
+                .env("CAGENTS_TEST_SECRET", "must-not-appear-in-diagnostics"),
+            "Preparing terminal service recovery", 100, Duration::from_secs(2),
+            &CancellationToken::new(), &mut log,
+        ).unwrap_err();
+        assert!(
+            error.to_string().ends_with(": store lease refused"),
+            "{error}"
+        );
+        assert!(!error.to_string().contains(char::is_control));
+        assert_eq!(fs::metadata(&log_path).unwrap().mode() & 0o777, 0o600);
+        let bytes = fs::read(log_path).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("must-not-appear"));
+        let records = maintenance_records(&bytes);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["phase"], "maintenance-start");
+        assert_eq!(records[1]["phase"], "maintenance-end");
+        assert_eq!(records[0]["argv"], records[1]["argv"]);
+        assert_eq!(records[0]["argv"][4], "store-schema");
+        assert!(
+            records[0]["at_unix_ms"].as_u64().unwrap()
+                <= records[1]["at_unix_ms"].as_u64().unwrap()
+        );
+        assert!(records[1]["status"].as_str().unwrap().contains('7'));
+        assert!(
+            records[1]["stderr"]
+                .as_str()
+                .unwrap()
+                .contains("second detail")
+        );
+        assert_eq!(records[1]["stderr_truncated"], false);
+        let quiet = bounded_command(
+            Command::new("/bin/sh").args(["-c", "echo authentication-detail >&2; exit 7"]),
+            "GitHub request",
+            100,
+            Duration::from_secs(2),
+            &CancellationToken::new(),
+        )
+        .unwrap_err();
+        assert!(!quiet.to_string().contains("authentication-detail"));
+    }
+
+    #[test]
+    fn maintenance_diagnostics_drain_oversized_dual_streams_without_deadlock() {
+        let mut log = Vec::new();
+        let mut output = bounded_maintenance_command(
+            Command::new("/usr/bin/python3").args([
+                "-c",
+                r#"import os, threading
+def emit(fd, byte):
+ for _ in range(256): os.write(fd, byte * 4096)
+a=threading.Thread(target=emit,args=(1,b'o'))
+a.start()
+emit(2,b'e')
+a.join()
+"#,
+            ]),
+            "maintenance fixture",
+            2 * 1024 * 1024,
+            Duration::from_secs(5),
+            &CancellationToken::new(),
+            &mut log,
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        output.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, vec![b'o'; 1024 * 1024]);
+        assert!(output.write_all(b"sealed").is_err());
+        let records = maintenance_records(&log);
+        assert_eq!(
+            records[1]["stderr"].as_str().unwrap(),
+            "e".repeat(MAINTENANCE_STDERR_LIMIT)
+        );
+        assert_eq!(records[1]["stderr_limit_bytes"], MAINTENANCE_STDERR_LIMIT);
+        assert_eq!(records[1]["stderr_truncated"], true);
+        assert_eq!(records[1]["outcome"], "success");
+    }
+
+    #[test]
+    fn maintenance_diagnostics_preserve_timeout_and_cancellation_cleanup() {
+        for cancel in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let ready = directory.path().join("ready");
+            let cancellation = CancellationToken::new();
+            let signal = cancellation.clone();
+            let marker = ready.clone();
+            let canceller = cancel.then(|| {
+                thread::spawn(move || {
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    while !marker.exists() && Instant::now() < deadline {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    signal.cancel();
+                })
+            });
+            let mut log = Vec::new();
+            let started = Instant::now();
+            let result = bounded_maintenance_command(
+                Command::new("/bin/sh")
+                    .args([
+                        "-c",
+                        "printf 'waiting for store\\n' >&2; echo $$ > \"$1\"; exec sleep 30",
+                        "fixture",
+                    ])
+                    .arg(&ready),
+                "maintenance fixture",
+                100,
+                if cancel {
+                    Duration::from_secs(5)
+                } else {
+                    Duration::from_millis(500)
+                },
+                &cancellation,
+                &mut log,
+            );
+            if let Some(canceller) = canceller {
+                canceller.join().unwrap();
+            }
+            if cancel {
+                assert!(matches!(result, Err(UpdateError::Cancelled)), "{result:?}");
+            } else {
+                assert!(
+                    matches!(result, Err(UpdateError::Timeout("maintenance fixture"))),
+                    "{result:?}"
+                );
+            }
+            assert!(started.elapsed() < Duration::from_secs(3));
+            let pid: libc::pid_t = fs::read_to_string(ready).unwrap().trim().parse().unwrap();
+            assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+            let records = maintenance_records(&log);
+            assert_eq!(records[1]["stderr"], "waiting for store\n");
+            assert!(records[1]["status"].as_str().unwrap().contains("signal"));
+        }
+    }
+
+    #[test]
+    fn maintenance_diagnostics_bound_failure_line_and_ignore_display_controls() {
+        let stderr = MaintenanceStderr {
+            bytes: format!("\n\t\u{7}\u{1b}[0m\n\u{1b}]0;private title\u{7}\n\u{1b}[31mrefused\u{1b}[0m\u{202e} {}", "界".repeat(1000)).into_bytes(),
+            ..MaintenanceStderr::default()
+        };
+        let line = stderr.first_line().unwrap();
+        assert!(line.starts_with("refused "));
+        assert_eq!(line.chars().count(), 512);
+        assert!(!line.contains('\u{202e}'));
     }
 
     #[test]
