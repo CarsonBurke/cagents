@@ -103,7 +103,10 @@ fn encoded_size(value: &impl Serialize, limit: usize) -> Result<usize, String> {
                 .checked_add(bytes.len())
                 .filter(|size| *size <= self.limit)
                 .ok_or_else(|| {
-                    io::Error::other("Recovery evidence exceeds 8 MiB; the source was not prepared")
+                    io::Error::other(format!(
+                        "Recovery evidence exceeds its {}-byte limit; the source was not prepared",
+                        self.limit
+                    ))
                 })?;
             Ok(bytes.len())
         }
@@ -129,21 +132,7 @@ impl Census {
             .collect()
     }
     fn validate_capture(&self, source: &HostSessionProof) -> Result<(), String> {
-        if self.snapshots.len() != self.chats.len()
-            || self.chats.iter().any(|chat| {
-                self.snapshots
-                    .iter()
-                    .filter(|saved| saved.source == *chat)
-                    .count()
-                    != 1
-            })
-        {
-            return Err(
-                "Recovery preparation requires one exact captured page per source conversation"
-                    .into(),
-            );
-        }
-        self.validate_presentations()?;
+        self.validate_evidence(source)?;
         let existing = super::floor::existing_capture_size(source)?;
         let available = SNAPSHOT_LIMIT
             .checked_sub(existing)
@@ -158,6 +147,73 @@ impl Census {
         record.aliases = self.aliases.clone();
         record.presentations = self.presentations.clone();
         encoded_size(&record, available)?;
+        Ok(())
+    }
+
+    fn validate_evidence(&self, source: &HostSessionProof) -> Result<(), String> {
+        if self.snapshots.len() != self.chats.len()
+            || self.chats.iter().any(|chat| {
+                self.snapshots
+                    .iter()
+                    .filter(|saved| saved.source == *chat)
+                    .count()
+                    != 1
+            })
+        {
+            return Err(
+                "Recovery preparation requires one exact captured page per source conversation"
+                    .into(),
+            );
+        }
+        let terminals: BTreeSet<_> = self.terminals.iter().map(|item| item.id).collect();
+        let chats: BTreeSet<_> = self.chats.iter().map(|item| item.id).collect();
+        if !source.is_complete()
+            || terminals.len() != self.terminals.len()
+            || chats.len() != self.chats.len()
+            || self.terminals.iter().any(|item| {
+                item.continuity
+                    .live_proof()
+                    .as_ref()
+                    .is_some_and(|proof| proof != source)
+            })
+            || self.chats.iter().any(|item| {
+                item.proof.as_ref() != Some(source)
+                    || item.terminal.as_ref().is_some_and(|terminal| {
+                        terminal.id != item.id
+                            || terminal
+                                .continuity
+                                .live_proof()
+                                .as_ref()
+                                .is_some_and(|proof| proof != source)
+                            || self
+                                .terminals
+                                .iter()
+                                .any(|known| known.id == terminal.id && known != terminal)
+                    })
+            })
+            || self.terminals.iter().any(|item| {
+                chats.contains(&item.id)
+                    && !self
+                        .chats
+                        .iter()
+                        .any(|chat| chat.terminal.as_ref() == Some(item))
+            })
+        {
+            return Err(
+                "Recovery capture has duplicate, ambiguous, or different source owners".into(),
+            );
+        }
+        self.validate_presentations()?;
+        encoded_size(self, SNAPSHOT_LIMIT)?;
+        let mut record = super::floor::Record::new(
+            source.clone(),
+            self.chats.clone(),
+            self.terminal_ids().into_iter().collect(),
+        );
+        record.snapshots = self.snapshots.clone();
+        record.aliases = self.aliases.clone();
+        record.presentations = self.presentations.clone();
+        encoded_size(&record, SNAPSHOT_LIMIT)?;
         Ok(())
     }
 
@@ -203,6 +259,7 @@ struct Authority {
     job: String,
     request_identity: String,
     job_request_hash: String,
+    reviewed: DaemonImpact,
     source: HostSessionProof,
     census: Census,
     expected: Vec<(SessionKind, TerminalId)>,
@@ -214,6 +271,27 @@ struct Authority {
     daemon_path: PathBuf,
     target: PathBuf,
     target_hash: String,
+}
+
+/// Count the complete receipt plus more owner bookkeeping than any valid
+/// outcome can contain. Leave room for the two future Linux paths (including
+/// JSON escaping), hashes, successor identifiers and record field names.
+fn preflight_preparation_size(authority: &Authority) -> Result<(), String> {
+    const FUTURE_METADATA: usize = 64 * 1024;
+    let terminals: Vec<_> = authority.census.terminal_ids().into_iter().collect();
+    let chats: Vec<_> = authority.census.chats.iter().map(|chat| chat.id).collect();
+    encoded_size(
+        &(
+            authority,
+            &terminals,
+            &terminals,
+            &chats,
+            &chats,
+            &authority.source,
+        ),
+        LIMIT as usize - FUTURE_METADATA,
+    )?;
+    Ok(())
 }
 
 pub(crate) struct Preparation {
@@ -308,12 +386,13 @@ impl Preparation {
             &read_checkpoint(&state.join(format!("{job}.request")))?
                 .ok_or("The update's exact request is unavailable")?,
         );
-        Ok(Self {
+        let preparation = Self {
             authority: Authority {
                 version: 1,
                 job: job.into(),
                 request_identity,
                 job_request_hash,
+                reviewed: daemon.clone(),
                 source: daemon.capability.proof.clone(),
                 census,
                 expected: daemon
@@ -333,7 +412,9 @@ impl Preparation {
             worker,
             fence,
             legacy,
-        })
+        };
+        preflight_preparation_size(&preparation.authority)?;
+        Ok(preparation)
     }
 
     /// Call only after the exact peer acknowledges PrepareConfirmedUpgrade.
@@ -489,9 +570,12 @@ impl Receipt {
             .read_bytes()?
             .ok_or("The Prepared checkpoint disappeared after recovery")?;
         if !record.settled
-            || record.version != 1
+            || record.version != 2
             || record.job != self.authority.job
             || record.request_identity != self.authority.request_identity
+            || record.job_request_hash != self.authority.job_request_hash
+            || record.reviewed != self.authority.reviewed
+            || record.target != self.authority.target
             || record.source != self.authority.source
             || record.checkpoint_hash != self.authority.checkpoint_hash
             || digest(&checkpoint) != record.checkpoint_hash
@@ -665,6 +749,7 @@ pub(crate) fn require_ready(daemon: &DaemonImpact, census: &Census) -> Result<()
         job: String::new(),
         request_identity: String::new(),
         job_request_hash: String::new(),
+        reviewed: daemon.clone(),
         source: daemon.capability.proof.clone(),
         census: census.clone(),
         expected: daemon
@@ -892,7 +977,7 @@ fn digest(bytes: &[u8]) -> String {
 fn read_checkpoint(path: &Path) -> Result<Option<Vec<u8>>, String> {
     let mut file = match OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(path)
     {
         Ok(file) => file,
@@ -1183,6 +1268,9 @@ pub(crate) struct RecoveryRecord {
     version: u16,
     pub job: String,
     pub request_identity: String,
+    job_request_hash: String,
+    reviewed: DaemonImpact,
+    target: PathBuf,
     pub source: HostSessionProof,
     pub checkpoint_hash: String,
     pub census: Census,
@@ -1202,6 +1290,143 @@ pub(crate) struct RecoveryRecord {
 
 fn recovery_name(hash: &str) -> String {
     format!("daemon-upgrade.recovery.{hash}.json")
+}
+
+/// Durable evidence that these exact Prepared bytes have already been handled.
+/// This value carries no locks, receipt, or authority to replay or adopt owners.
+#[derive(Clone, Debug)]
+pub(crate) struct AlreadyRecovered {
+    pub source: HostSessionProof,
+    pub census: Census,
+    pub paused_terminals: Vec<TerminalId>,
+    pub paused_chats: Vec<TerminalId>,
+}
+
+/// Recognize a completed recovery without changing its retained checkpoint.
+/// A later daemon still authenticates every surviving owner through ordinary
+/// orphan adoption; the historical outcome only restores absent paused panes.
+pub(crate) fn classify_retained_prepared(
+    checkpoint_path: &Path,
+    daemon_binary: &Path,
+) -> Result<Option<AlreadyRecovered>, String> {
+    let Some(checkpoint) = read_checkpoint(checkpoint_path)? else {
+        return Ok(None);
+    };
+    #[derive(Deserialize)]
+    struct Phase {
+        phase: String,
+    }
+    let phase: Phase = serde_json::from_slice(&checkpoint).map_err(|e| e.to_string())?;
+    if phase.phase != "Prepared" {
+        return Ok(None);
+    }
+    let index: CheckpointIndex = serde_json::from_slice(&checkpoint).map_err(|e| e.to_string())?;
+    let directory = checkpoint_path
+        .parent()
+        .ok_or("Prepared checkpoint has no directory")?;
+    validate_private_directory(directory)?;
+    let hash = digest(&checkpoint);
+    let sidecar = checkpoint_path.with_file_name(recovery_name(&hash));
+    let bytes = read_checkpoint(&sidecar)?.ok_or(
+        "Prepared checkpoint has no matching settled recovery record; evidence was preserved",
+    )?;
+    let record: RecoveryRecord = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    let job = uuid::Uuid::parse_str(&record.job).map_err(|e| e.to_string())?;
+    let target = fs::canonicalize(daemon_binary).map_err(|e| e.to_string())?;
+    if record.version != 2
+        || !record.settled
+        || job.to_string() != record.job
+        || record.checkpoint_hash != hash
+        || record.source != index.proof
+        || record.successor.as_ref().is_none_or(|proof| {
+            !proof.is_complete()
+                || proof == &record.source
+                || proof.boot_id != record.source.boot_id
+        })
+        || record.target != target
+        || target.file_name().is_none_or(|name| name != "cagentsd")
+        || executable_hash(&target)? != record.target_hash
+    {
+        return Err("Prepared checkpoint has no exact settled recovery for this daemon; evidence was preserved".into());
+    }
+    validate_reviewed(&record.reviewed, &record.source, &record.request_identity)?;
+    record.census.validate_evidence(&record.source)?;
+    record.validate_census()?;
+    let layout = crate::update::locate(&target).map_err(|e| e.to_string())?;
+    let state = layout.prefix.join(".update");
+    validate_private_directory(&state)?;
+    let request = read_checkpoint(&state.join(format!("{}.request", record.job)))?
+        .ok_or("Settled recovery's original update request disappeared")?;
+    if digest(&request) != record.job_request_hash {
+        return Err(
+            "Settled recovery's original update request changed; evidence was preserved".into(),
+        );
+    }
+    let authority = Authority {
+        version: 1,
+        job: record.job.clone(),
+        request_identity: record.request_identity.clone(),
+        job_request_hash: record.job_request_hash.clone(),
+        reviewed: record.reviewed.clone(),
+        source: record.source.clone(),
+        census: record.census.clone(),
+        expected: record
+            .reviewed
+            .sessions
+            .iter()
+            .map(|item| (item.kind, item.id))
+            .collect(),
+        checkpoint_path: checkpoint_path.to_owned(),
+        checkpoint_hash: hash,
+        worker_path: PathBuf::new(),
+        fence_path: PathBuf::new(),
+        legacy_path: PathBuf::new(),
+        daemon_path: PathBuf::new(),
+        target,
+        target_hash: record.target_hash,
+    };
+    if validate_checkpoint(&authority, &checkpoint)? != "Prepared" {
+        return Err("Settled recovery no longer names a Prepared checkpoint".into());
+    }
+    Ok(Some(AlreadyRecovered {
+        source: record.source,
+        census: record.census,
+        paused_terminals: record.paused_terminals,
+        paused_chats: record.paused_chats,
+    }))
+}
+
+fn validate_private_directory(path: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if !metadata.is_dir()
+        || metadata.uid() != crate::daemon::current_uid()
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err("Recovery evidence directory is not privately owned".into());
+    }
+    Ok(())
+}
+
+fn validate_reviewed(
+    reviewed: &DaemonImpact,
+    source: &HostSessionProof,
+    identity: &str,
+) -> Result<(), String> {
+    let owners: BTreeSet<_> = reviewed
+        .sessions
+        .iter()
+        .map(|item| (item.kind, item.id))
+        .collect();
+    if !source.is_complete()
+        || reviewed.capability.proof != *source
+        || owners.len() != reviewed.sessions.len()
+        || digest(&serde_json::to_vec(reviewed).map_err(|e| e.to_string())?) != identity
+    {
+        return Err(
+            "Recovery record changed the original reviewed source or request identity".into(),
+        );
+    }
+    Ok(())
 }
 
 impl RecoveryRecord {
@@ -1257,6 +1482,11 @@ pub(crate) fn take_for_host() -> Result<Option<RecoveryRecord>, String> {
         return Err("Update recovery receipt exceeds its byte limit".into());
     }
     let authority: Authority = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    validate_reviewed(
+        &authority.reviewed,
+        &authority.source,
+        &authority.request_identity,
+    )?;
     validate_host_context(&authority)?;
     if authority.version != 1
         || fs::canonicalize(&authority.target).map_err(|e| e.to_string())?
@@ -1293,9 +1523,12 @@ pub(crate) fn take_for_host() -> Result<Option<RecoveryRecord>, String> {
         return Err("Recovery checkpoint belongs to another application".into());
     }
     let record = RecoveryRecord {
-        version: 1,
+        version: 2,
         job: authority.job,
         request_identity: authority.request_identity,
+        job_request_hash: authority.job_request_hash,
+        reviewed: authority.reviewed,
+        target: authority.target,
         source: authority.source,
         checkpoint_hash: authority.checkpoint_hash,
         census: authority.census,
@@ -1445,6 +1678,31 @@ mod tests {
         file
     }
 
+    fn reviewed(proof: &HostSessionProof, terminal: TerminalId) -> DaemonImpact {
+        DaemonImpact {
+            capability: crate::terminal_ipc::ShutdownCapability {
+                proof: proof.clone(),
+                token: "reviewed".into(),
+                inventory_generation: 1,
+                live_terminals: 1,
+                background_subagents: 0,
+                background_identity: String::new(),
+                expires_at_unix_ms: 1,
+            },
+            policy: crate::update::impact::Policy::WhenIdle,
+            sessions: vec![crate::update::impact::SessionImpact {
+                id: terminal,
+                kind: SessionKind::Terminal,
+                title: String::new(),
+                identity: "exact-owner".into(),
+                disposition: crate::update::impact::Disposition::Resumes,
+                reason: String::new(),
+                interrupted_subagents: Vec::new(),
+            }],
+            blockers: Vec::new(),
+        }
+    }
+
     fn preparation(root: &Path) -> Preparation {
         let source = HostSessionProof {
             host_session_id: HostSessionId::new("acknowledged-source"),
@@ -1485,6 +1743,7 @@ mod tests {
                 job: uuid::Uuid::new_v4().to_string(),
                 request_identity: "accepted-request-digest".into(),
                 job_request_hash: "exact-private-request".into(),
+                reviewed: reviewed(&source, terminal.id),
                 source,
                 expected: vec![(SessionKind::Terminal, terminal.id)],
                 census: Census {
@@ -2228,9 +2487,12 @@ mod tests {
         let preparation = preparation(root.path());
         let terminal = preparation.authority.census.terminals[0].clone();
         let mut record = RecoveryRecord {
-            version: 1,
+            version: 2,
             job: preparation.authority.job.clone(),
             request_identity: preparation.authority.request_identity.clone(),
+            job_request_hash: preparation.authority.job_request_hash.clone(),
+            reviewed: preparation.authority.reviewed.clone(),
+            target: PathBuf::new(),
             source: preparation.authority.source.clone(),
             checkpoint_hash: String::new(),
             census: preparation.authority.census.clone(),
@@ -2283,6 +2545,192 @@ mod tests {
             "paired console adoption is part of the original chat's census"
         );
     }
+    #[test]
+    fn reviewed_payload_budget_is_rejected_before_source_preparation() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let mut preparation = preparation(root.path());
+        preflight_preparation_size(&preparation.authority).unwrap();
+        preparation.authority.reviewed.sessions[0].reason = "x".repeat(LIMIT as usize);
+        let error = preflight_preparation_size(&preparation.authority).unwrap_err();
+        assert!(error.contains("byte limit"), "{error}");
+        assert!(!preparation.authority.checkpoint_path.exists());
+        assert!(preparation.authority.checkpoint_hash.is_empty());
+    }
+
+    #[test]
+    fn settled_prepared_is_read_only_history_without_active_update_authority() {
+        let root = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir_in("/var/tmp")
+            .unwrap();
+        let preparation = preparation(root.path());
+        let checkpoint_bytes = checkpoint(&preparation, "Prepared");
+        let authority = preparation.authority.clone();
+        drop(preparation); // Cold startup has no worker or window fence authority.
+        save(&authority.checkpoint_path, &checkpoint_bytes);
+        let prefix = root.path().join("install");
+        let bin = prefix.join("versions/fixture/bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(
+            prefix.join(".cagents-install-root"),
+            "cagents install root\n",
+        )
+        .unwrap();
+        for name in ["cagents", "cagents-ui", "cagentsd"] {
+            fs::write(bin.join(name), format!("private fake {name}")).unwrap();
+        }
+        let target = fs::canonicalize(bin.join("cagentsd")).unwrap();
+        let state = prefix.join(".update");
+        fs::create_dir(&state).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+        let request = b"the immutable original job request";
+        save(&state.join(format!("{}.request", authority.job)), request);
+        let successor = HostSessionProof {
+            host_session_id: HostSessionId::new("first-recovered-daemon"),
+            boot_id: authority.source.boot_id.clone(),
+            host_incarnation: HostIncarnation::new("recovered-incarnation"),
+        };
+        let record = RecoveryRecord {
+            version: 2,
+            job: authority.job,
+            request_identity: digest(&serde_json::to_vec(&authority.reviewed).unwrap()),
+            job_request_hash: digest(request),
+            reviewed: authority.reviewed,
+            source: authority.source,
+            checkpoint_hash: digest(&checkpoint_bytes),
+            census: authority.census,
+            adopted_terminals: Vec::new(),
+            adopted_chats: Vec::new(),
+            paused_terminals: vec![authority.expected[0].1],
+            paused_chats: Vec::new(),
+            settled: true,
+            successor: Some(successor),
+            target: target.clone(),
+            target_hash: executable_hash(&target).unwrap(),
+            #[cfg(feature = "host")]
+            authority: None,
+        };
+        let sidecar = authority
+            .checkpoint_path
+            .with_file_name(recovery_name(&record.checkpoint_hash));
+        let original = serde_json::to_vec(&record).unwrap();
+        save(&sidecar, &original);
+        // No status.json or update lock exists; a later plain restart uses the
+        // original immutable request and exact finished outcome only.
+        for _ in 0..2 {
+            let classified = classify_retained_prepared(&authority.checkpoint_path, &target)
+                .unwrap()
+                .unwrap();
+            assert_eq!(classified.source, record.source);
+            assert_eq!(classified.census, record.census);
+            assert_eq!(classified.paused_terminals, record.paused_terminals);
+            assert!(classified.paused_chats.is_empty());
+            assert_eq!(
+                fs::read(&authority.checkpoint_path).unwrap(),
+                checkpoint_bytes
+            );
+            assert_eq!(fs::read(&sidecar).unwrap(), original);
+        }
+        let baseline: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        for (field, replacement) in [
+            ("version", serde_json::json!(1)),
+            ("settled", serde_json::json!(false)),
+            ("job", serde_json::json!(uuid::Uuid::new_v4().to_string())),
+            ("request_identity", serde_json::json!("0".repeat(64))),
+            ("job_request_hash", serde_json::json!("0".repeat(64))),
+            ("checkpoint_hash", serde_json::json!("0".repeat(64))),
+            (
+                "source",
+                serde_json::to_value(record.successor.as_ref().unwrap()).unwrap(),
+            ),
+            ("successor", serde_json::Value::Null),
+            ("successor", serde_json::to_value(&record.source).unwrap()),
+            (
+                "successor",
+                serde_json::json!({
+                    "host_session_id": "recovered-session",
+                    "boot_id": "different-boot",
+                    "host_incarnation": "recovered-daemon",
+                }),
+            ),
+            ("target", serde_json::to_value(bin.join("cagents")).unwrap()),
+            ("target_hash", serde_json::json!("0".repeat(64))),
+            ("paused_terminals", serde_json::json!([])),
+            (
+                "adopted_terminals",
+                serde_json::json!(record.paused_terminals),
+            ),
+        ] {
+            let mut changed = baseline.clone();
+            changed[field] = replacement;
+            save(&sidecar, &serde_json::to_vec(&changed).unwrap());
+            assert!(
+                classify_retained_prepared(&authority.checkpoint_path, &target).is_err(),
+                "accepted changed {field}"
+            );
+            assert_eq!(
+                fs::read(&authority.checkpoint_path).unwrap(),
+                checkpoint_bytes
+            );
+        }
+        let mut duplicate = baseline.clone();
+        duplicate["census"]["terminals"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::to_value(&record.census.terminals[0]).unwrap());
+        save(&sidecar, &serde_json::to_vec(&duplicate).unwrap());
+        assert!(classify_retained_prepared(&authority.checkpoint_path, &target).is_err());
+        save(&sidecar, &original);
+        let original_target = fs::read(&target).unwrap();
+        fs::write(&target, b"different daemon bytes at the same path").unwrap();
+        assert!(classify_retained_prepared(&authority.checkpoint_path, &target).is_err());
+        fs::write(&target, original_target).unwrap();
+        let request_path = state.join(format!("{}.request", record.job));
+        save(&request_path, b"a different request for the same job");
+        assert!(classify_retained_prepared(&authority.checkpoint_path, &target).is_err());
+        save(&request_path, request);
+        save(&sidecar, &original);
+        fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(classify_retained_prepared(&authority.checkpoint_path, &target).is_err());
+        fs::remove_file(&sidecar).unwrap();
+        assert!(classify_retained_prepared(&authority.checkpoint_path, &target).is_err());
+        assert_eq!(
+            fs::read(&authority.checkpoint_path).unwrap(),
+            checkpoint_bytes
+        );
+    }
+
+    #[test]
+    fn retained_checkpoint_without_prepared_phase_has_no_settled_classification() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let preparation = preparation(root.path());
+        let path = &preparation.authority.checkpoint_path;
+        assert!(
+            classify_retained_prepared(path, Path::new("/no/daemon"))
+                .unwrap()
+                .is_none()
+        );
+        save(path, &checkpoint(&preparation, "Ready"));
+        let before = fs::read(path).unwrap();
+        assert!(
+            classify_retained_prepared(path, Path::new("/no/daemon"))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(fs::read(path).unwrap(), before);
+        // A legacy Ready checkpoint may use recipe DTOs outside this
+        // classifier's current census contract. Ordinary restore owns it.
+        save(
+            path,
+            br#"{"phase":"Ready","chats":[{"legacy_recipe":"opaque"}]}"#,
+        );
+        assert!(
+            classify_retained_prepared(path, Path::new("/no/daemon"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
     mod forwarding_tests {
         use super::*;
         use std::process::Stdio;
