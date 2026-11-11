@@ -3013,6 +3013,26 @@ mod tests {
 
     #[test]
     fn recovery_receipt_releases_its_daemon_reservation_before_owner_discovery() {
+        const ISOLATED: &str = "CAGENTS_TEST_RECOVERY_RESERVATION_ISOLATED";
+        if std::env::var_os(ISOLATED).is_none() {
+            // Parallel libtests may fork while this test owns a flock. Even a
+            // CLOEXEC duplicate extends that open-file description until exec.
+            // Allocate every tested lock only after this single-test exec.
+            let selector = std::thread::current().name().unwrap().to_owned();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &selector, "--nocapture", "--test-threads=1"])
+                .env(ISOLATED, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
         let root = tempfile::tempdir_in("/var/tmp").unwrap();
         let preparation = preparation(root.path());
         save(
@@ -3032,14 +3052,16 @@ mod tests {
             .open(path)
             .unwrap();
         drop(handoff);
-        assert_ne!(
-            unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0
-        );
+        let held = unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        let held_error = io::Error::last_os_error();
+        assert_eq!(held, -1, "the receipt must retain the daemon lease");
+        assert_eq!(held_error.kind(), io::ErrorKind::WouldBlock, "{held_error}");
         receipt.release_daemon_reservation();
+        let released = unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        let released_error = io::Error::last_os_error();
         assert_eq!(
-            unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0
+            released, 0,
+            "the daemon lease was not released: {released_error}"
         );
         assert!(receipt.inherit(&mut Command::new("/bin/true")).is_err());
     }
