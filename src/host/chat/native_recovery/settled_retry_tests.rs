@@ -1159,9 +1159,9 @@ fn cold_host_hop(root: PathBuf, incarnation: &str) {
             let retired = with_private_socket(&fixture, || {
                 // The cold-start helper and the final update verifier can
                 // discover the same pending retirement. Serialize the whole
-                // root proof. The bounded loser reports Busy rather than
-                // blocking indefinitely or claiming completion; retry only
-                // after the winning helper has joined.
+                // root proof. The loser observes completed evidence or reports
+                // bounded Busy; it cannot claim a second completion. Retry
+                // only after the winning helper has joined.
                 let results = thread::scope(|scope| {
                     let first = scope.spawn(crate::update::recovery::retire_current_service);
                     let second = scope.spawn(crate::update::recovery::retire_current_service);
@@ -1183,7 +1183,8 @@ fn cold_host_hop(root: PathBuf, incarnation: &str) {
                         .iter()
                         .filter(|result| matches!(
                             result,
-                            Ok(crate::update::recovery::RetirementStatus::Busy)
+                            Ok(crate::update::recovery::RetirementStatus::Busy
+                                | crate::update::recovery::RetirementStatus::AlreadyCompleted)
                         ))
                         .count(),
                     1,
