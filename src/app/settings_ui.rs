@@ -430,6 +430,13 @@ fn settings_category_controls<'a>(
                 settings::DefaultPane::ALL
                     .map(|pane| (pane.label(), pane.key(), draft.default_channel_pane == pane)),
             );
+            let sidebar_worktrees = settings_choice(
+                "Worktrees in sidebar",
+                "Group worktrees after channels, list them directly, or hide them. Projects can override this default. Main stays visible.",
+                SettingsField::SidebarWorktrees,
+                settings::SidebarWorktrees::ALL
+                    .map(|mode| (mode.label(), mode.key(), draft.sidebar_worktrees == mode)),
+            );
             let order = settings_choice(
                 "Worktree order",
                 "Main stays first. Imported worktrees with unknown creation dates follow dated worktrees, ordered by path.",
@@ -478,7 +485,7 @@ fn settings_category_controls<'a>(
                 settings_group(
                     "Worktrees",
                     "Locations, ordering and the first pane in a worktree.",
-                    vec![directory, worktree_pane, cleanup, order],
+                    vec![sidebar_worktrees, directory, worktree_pane, cleanup, order],
                 ),
                 settings_group(
                     "Work board",
@@ -1859,5 +1866,95 @@ mod keyboard_table_tests {
         drop(app.palette_key_event(&shifted));
         drop(app.update(Message::SelectSettingsCategory(SettingsCategory::Keyboard)));
         assert!(app.palette.pressed_key_filter().is_none());
+    }
+}
+
+/// Observe shared sidebar preferences off the UI thread. The subscription restarts
+/// after a local save, so a skipped observation during that save is read again.
+pub(super) fn sidebar_preferences_stream(
+    path: Option<PathBuf>,
+) -> impl cosmic::iced::futures::Stream<Item = AppSettings> {
+    use cosmic::iced::futures::SinkExt;
+    cosmic::iced::stream::channel(1, async move |mut output| {
+        let Some(path) = path else {
+            return;
+        };
+        let mut previous = None;
+        let mut stamp = None;
+        loop {
+            let path = path.clone();
+            let old_stamp = stamp;
+            let loaded = tokio::task::spawn_blocking(move || {
+                use std::os::unix::fs::MetadataExt;
+                let metadata = std::fs::metadata(&path).ok()?;
+                let next_stamp = (
+                    metadata.ino(),
+                    metadata.mtime(),
+                    metadata.mtime_nsec(),
+                    metadata.len(),
+                );
+                if old_stamp == Some(next_stamp) {
+                    return None;
+                }
+                settings::load(path)
+                    .ok()
+                    .map(|settings| (next_stamp, settings))
+            })
+            .await;
+            if let Ok(Some((next_stamp, settings))) = loaded {
+                stamp = Some(next_stamp);
+                let current = (
+                    settings.sidebar_worktrees,
+                    settings.sidebar_worktree_overrides.clone(),
+                );
+                if previous.as_ref() != Some(&current) {
+                    previous = Some(current);
+                    if output.send(settings).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn sidebar_preferences_observes_global_and_project_changes() {
+        use cosmic::iced::futures::{StreamExt, pin_mut};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let initial = AppSettings::default();
+        settings::save(&path, &initial).unwrap();
+        let stream = sidebar_preferences_stream(Some(path.clone()));
+        pin_mut!(stream);
+        let first = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.sidebar_worktrees, settings::SidebarWorktrees::Grouped);
+        let mut changed = initial;
+        let project = ProjectId::new();
+        changed.sidebar_worktrees = settings::SidebarWorktrees::Hidden;
+        changed
+            .sidebar_worktree_overrides
+            .insert(project, settings::SidebarWorktrees::Expanded);
+        settings::save(&path, &changed).unwrap();
+        let observed = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            observed.sidebar_worktrees,
+            settings::SidebarWorktrees::Hidden
+        );
+        assert_eq!(
+            observed.sidebar_worktree_overrides.get(&project),
+            Some(&settings::SidebarWorktrees::Expanded)
+        );
     }
 }
