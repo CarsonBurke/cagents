@@ -5,11 +5,22 @@ from contextlib import closing
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import sqlite3
 import subprocess
 import sys
 import time
+
+
+def sidebar_channel_ref(observation, title):
+    """Resolve the visible sidebar row, excluding headers and hover tooltips."""
+    candidates = [run['ref'] for run in observation.get('runs',[])
+                  if run.get('x',260)<260 and run.get('y',0)>80
+                  and re.sub(r'^\W+','',run.get('text','')).strip().casefold()==title.casefold()]
+    if len(candidates) != 1:
+        raise RuntimeError(f'canonical channel label has no unique sidebar reference: {title}')
+    return candidates[0]
 
 
 def selected_chat(root, slot, card_id, channel_id, expected, required_thread=None):
@@ -190,7 +201,14 @@ class Rehearsal:
                 if slot not in ('main','second'):
                     continue
                 self.call('wm','action','focus-window','--id',window['id'])
-                self.call('drive','click',title,timeout=30)
+                _, navigation = self.call('drive','--json','observe',timeout=30)
+                navigation = json.loads(navigation)
+                if navigation['window']['id'] != window['id']:
+                    raise RuntimeError(f'chat navigation selected the wrong window for {slot}')
+                reference = sidebar_channel_ref(navigation,title)
+                self.call('drive','click','--stale-ok',reference,timeout=30)
+                # Keep hover labels away from subsequent navigation and shots.
+                self.call('drive','move','850,750',timeout=30)
                 required_thread = None
                 if side == 'after':
                     previous = next(view for view in originals

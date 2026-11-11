@@ -332,6 +332,17 @@ class ChatViews(unittest.TestCase):
         spec.loader.exec_module(scenario)
         return scenario
 
+    def test_channel_navigation_uses_sidebar_reference_not_header_or_tooltip(self):
+        scenario = self.module()
+        observation = {'runs':[
+            {'ref':'header','text':'Codex rehearsal','x':269,'y':71},
+            {'ref':'row','text':'© Codex rehearsal','x':12,'y':134},
+            {'ref':'tooltip','text':'Codex rehearsal - 1 chat','x':40,'y':168}]}
+        self.assertEqual(scenario.sidebar_channel_ref(observation,'Codex rehearsal'),'row')
+        observation['runs'].append({'ref':'other','text':'Codex rehearsal','x':33,'y':200})
+        with self.assertRaisesRegex(RuntimeError,'no unique sidebar reference'):
+            scenario.sidebar_channel_ref(observation,'Codex rehearsal')
+
     def test_selection_requires_exact_card_channel_provider_and_thread(self):
         scenario = self.module()
         with tempfile.TemporaryDirectory(prefix='ru-selection-') as temporary:
@@ -398,7 +409,8 @@ class ChatViews(unittest.TestCase):
             window = {'id':42}
             def call(*args,**kwargs):
                 calls.append(args)
-                return 0, json.dumps({'window':window})
+                return 0, json.dumps({'window':window,'runs':[
+                    {'ref':'sidebar-row','text':'Visible canonical channel','x':33,'y':134}]})
             with patch.object(rehearsal,'cli',side_effect=cli), \
                     patch.object(rehearsal,'call',side_effect=call), \
                     patch.object(rehearsal,'mapped',return_value={'main':window,'second':window}), \
@@ -408,7 +420,7 @@ class ChatViews(unittest.TestCase):
             self.assertTrue(all(item['agent']=='seed-agent' for item in evidence))
             for selection_call in selected.call_args_list:
                 self.assertEqual(selection_call.args[2:4],('seed-agent','seed-channel'))
-            self.assertIn(('drive','click','Visible canonical channel'),calls)
+            self.assertIn(('drive','click','--stale-ok','sidebar-row'),calls)
             self.assertFalse(any('spawn' in call for call in calls))
             chat['launch']['session_id'] = None
             def conflicting_view(root,slot,*args):
