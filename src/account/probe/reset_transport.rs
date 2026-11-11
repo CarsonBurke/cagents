@@ -861,55 +861,53 @@ mod offer_context_tests {
 
     #[tokio::test]
     async fn profile_plan_is_shared_once_across_windows_and_access_token_refreshes() {
-        let (mut client, server) = read_server(vec![(
-            "/api/oauth/profile",
-            named_profile("Future: Ultra / 20x"),
-        )]);
-        let directory = tempfile::tempdir().unwrap();
-        let first_window = Cache::at(directory.path());
-        let second_window = Cache::at(directory.path());
-        let expected = identity();
-        let report = reported();
-        let (first, second) = tokio::join!(
-            client.plan(
-                &expected,
-                &report,
-                Some(&first_window),
-                Some("claude:/home")
-            ),
-            client.plan(
-                &expected,
-                &report,
-                Some(&second_window),
-                Some("claude:/home")
-            ),
-        );
-        assert_eq!(
-            first.unwrap().name().as_deref(),
-            Some("Future: Ultra / 20x")
-        );
-        assert_eq!(
-            second.unwrap().name().as_deref(),
-            Some("Future: Ultra / 20x")
-        );
-        server.join().unwrap();
-        // The server is now closed. A force usage refresh or a changed access
-        // token must still use this login's stored result without another GET.
-        client.bearer = "cagents-fixture-refreshed-token".into();
-        let result = client
-            .plan(
-                &expected,
-                &report,
-                Some(&second_window),
-                Some("claude:/home"),
-            )
-            .await
-            .unwrap();
-        assert_eq!(result.name().as_deref(), Some("Future: Ultra / 20x"));
-        assert_eq!(
-            result.rate_limit_tier.as_deref(),
-            Some("default_claude_max_20x")
-        );
+        for (profile_name, expected_label) in [
+            ("Future: Ultra / 20x", "Future: Ultra / 20x"),
+            ("Max", "Max 20x"),
+            ("Ultra", "Ultra"),
+        ] {
+            let (mut client, server) =
+                read_server(vec![("/api/oauth/profile", named_profile(profile_name))]);
+            let directory = tempfile::tempdir().unwrap();
+            let first_window = Cache::at(directory.path());
+            let second_window = Cache::at(directory.path());
+            let expected = identity();
+            let report = reported();
+            let (first, second) = tokio::join!(
+                client.plan(
+                    &expected,
+                    &report,
+                    Some(&first_window),
+                    Some("claude:/home")
+                ),
+                client.plan(
+                    &expected,
+                    &report,
+                    Some(&second_window),
+                    Some("claude:/home")
+                ),
+            );
+            assert_eq!(first.unwrap().name().as_deref(), Some(expected_label));
+            assert_eq!(second.unwrap().name().as_deref(), Some(expected_label));
+            server.join().unwrap();
+            // The server is now closed. A force usage refresh or a changed access
+            // token must still use this login's stored result without another GET.
+            client.bearer = "cagents-fixture-refreshed-token".into();
+            let result = client
+                .plan(
+                    &expected,
+                    &report,
+                    Some(&second_window),
+                    Some("claude:/home"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.name().as_deref(), Some(expected_label));
+            assert_eq!(
+                result.rate_limit_tier.as_deref(),
+                Some("default_claude_max_20x")
+            );
+        }
     }
 
     #[tokio::test]
@@ -925,9 +923,20 @@ mod offer_context_tests {
             .plan(&identity(), &reported(), Some(&cache), Some("claude:/home"))
             .await
             .unwrap();
-        assert_eq!(first.name().as_deref(), Some("max"));
+        assert_eq!(first.name().as_deref(), Some("max 20x"));
         assert_eq!(first.display_name, None);
         server.join().unwrap();
+        client.bearer = "cagents-fixture-refreshed-token".into();
+        assert_eq!(
+            client
+                .plan(&identity(), &reported(), Some(&cache), Some("claude:/home"))
+                .await
+                .unwrap()
+                .name()
+                .as_deref(),
+            Some("max 20x"),
+            "missing-name cache keeps the qualified CLI fallback without another profile read",
+        );
         let next = super::super::super::claude::plan_metadata(
             &json!({"subscription_type":"future-subscription"}),
         );

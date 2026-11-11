@@ -55,7 +55,7 @@
         "rate_limit_tier": "default_claude_max_5x"
       }
     },
-    "expected_label": "Max"
+    "expected_label": "Max 5x"
   },
   {
     "case": "max-20x",
@@ -84,7 +84,7 @@
         "rate_limit_tier": "default_claude_max_20x"
       }
     },
-    "expected_label": "Max"
+    "expected_label": "Max 20x"
   },
   {
     "case": "ultra",
@@ -143,6 +143,6 @@
         "rate_limit_tier": "default_claude_fixture_horizon_37x"
       }
     },
-    "expected_label": "Fixture-Horizon"
+    "expected_label": "Fixture-Horizon 37x"
   }
 ]

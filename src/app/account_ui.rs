@@ -1064,18 +1064,24 @@ impl AccountState {
         if self.refresh_plan {
             return None;
         }
-        self.snapshot
+        let subscription = self
+            .snapshot
             .as_ref()
-            .and_then(|snapshot| snapshot.plan_display_name.as_ref())
-            .filter(|name| !name.trim().is_empty())
-            .cloned()
-            .or_else(|| {
-                self.snapshot
-                    .as_ref()
-                    .and_then(|snapshot| snapshot.plan.as_deref())
-                    .or_else(|| self.identity.as_ref()?.plan.as_deref())
-                    .map(account::plan_label)
-            })
+            .and_then(|snapshot| snapshot.plan.as_deref())
+            .or_else(|| self.identity.as_ref()?.plan.as_deref())
+            .map(account::plan_label);
+        if self.account.provider != Provider::Claude {
+            return subscription;
+        }
+        account::claude::plan_name(
+            subscription.as_deref(),
+            self.snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.plan_display_name.as_deref()),
+            self.snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.rate_limit_tier.as_deref()),
+        )
     }
 
     fn plan_tooltip(&self) -> Option<String> {
@@ -13081,25 +13087,23 @@ mod app_tests {
         );
     }
     #[test]
-    fn profile_plan_name_is_verbatim_and_tier_is_disclosed_only_in_the_tooltip() {
+    fn profile_plan_name_preserves_reported_text_and_discloses_raw_tier_in_tooltip() {
         let mut state = AccountState::new(Account::system(Provider::Claude));
         let mut snapshot = UsageSnapshot::state(UsageStatus::Ok, "", now_ms());
         snapshot.plan = Some("max".into());
         snapshot.plan_display_name = Some("mAX / EDU · Preview!".into());
-        snapshot.rate_limit_tier = Some("default_claude_max_17x-beta".into());
+        snapshot.rate_limit_tier = Some("default_claude_ultra_17x".into());
         state.snapshot = Some(snapshot);
         assert_eq!(state.plan().as_deref(), Some("mAX / EDU · Preview!"));
         assert_eq!(
             state.plan_tooltip().as_deref(),
-            Some(
-                "Plan: mAX / EDU · Preview!\nReported rate-limit tier: default_claude_max_17x-beta"
-            )
+            Some("Plan: mAX / EDU · Preview!\nReported rate-limit tier: default_claude_ultra_17x")
         );
         state.snapshot.as_mut().unwrap().plan_display_name = None;
         assert_eq!(state.plan().as_deref(), Some("Max"));
         assert_eq!(
             state.plan_tooltip().as_deref(),
-            Some("Plan: Max\nReported rate-limit tier: default_claude_max_17x-beta")
+            Some("Plan: Max\nReported rate-limit tier: default_claude_ultra_17x")
         );
         state.snapshot.as_mut().unwrap().plan = None;
         state.identity = Some(Identity {
@@ -13109,6 +13113,64 @@ mod app_tests {
         assert_eq!(state.plan().as_deref(), Some("Pro"));
         state.snapshot.as_mut().unwrap().plan_display_name = Some("   ".into());
         assert_eq!(state.plan().as_deref(), Some("Pro"));
+    }
+
+    #[test]
+    fn profile_plan_badges_share_matching_family_tiers_without_duplicating_suffixes() {
+        let mut state = AccountState::new(Account::system(Provider::Claude));
+        for (subscription, display, tier, expected) in [
+            ("max", Some("Max"), "default_claude_max_5x", "Max 5x"),
+            ("max", Some("Max"), "default_claude_max_20x", "Max 20x"),
+            ("max", Some("Ultra"), "default_claude_max_20x", "Ultra"),
+            ("max", Some("Max 20x"), "default_claude_max_20x", "Max 20x"),
+            ("max", Some("Max 20x"), "default_claude_max_5x", "Max 20x"),
+            (
+                "future_subscription",
+                Some("qUANTUM"),
+                "default_claude_quantum_7x",
+                "qUANTUM 7x",
+            ),
+            (
+                "future_subscription",
+                Some("qUANTUM 7x"),
+                "default_claude_quantum_7x",
+                "qUANTUM 7x",
+            ),
+            ("max", None, "default_claude_max_20x", "Max 20x"),
+        ] {
+            let mut snapshot = UsageSnapshot::state(UsageStatus::Ok, "", now_ms());
+            snapshot.plan = Some(subscription.into());
+            snapshot.plan_display_name = display.map(str::to_owned);
+            snapshot.rate_limit_tier = Some(tier.into());
+            state.snapshot = Some(snapshot);
+            assert_eq!(
+                state.plan().as_deref(),
+                Some(expected),
+                "{display:?} with {tier}"
+            );
+            assert_eq!(
+                state.plan_tooltip(),
+                Some(format!(
+                    "Plan: {expected}\nReported rate-limit tier: {tier}"
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn non_claude_plan_badges_keep_legacy_labels_without_claude_tier_rules() {
+        for (provider, subscription, expected) in [
+            (Provider::Codex, "plus", "Plus"),
+            (Provider::Omp, "pro", "Pro"),
+        ] {
+            let mut state = AccountState::new(Account::system(provider));
+            let mut snapshot = UsageSnapshot::state(UsageStatus::Ok, "", now_ms());
+            snapshot.plan = Some(subscription.into());
+            snapshot.plan_display_name = Some("Max".into());
+            snapshot.rate_limit_tier = Some("default_claude_max_20x".into());
+            state.snapshot = Some(snapshot);
+            assert_eq!(state.plan().as_deref(), Some(expected));
+        }
     }
 
     #[test]

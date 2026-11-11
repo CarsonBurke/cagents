@@ -21,11 +21,13 @@ credits, source, observation time, age, and stale/reset indicators.
 Reset inventory includes each grant's scope, count, expiry where reported,
 and whether it can be used now.
 
-Claude plan badges show the profile's reported display name unchanged, including
-Ultra and future names. Without that name, they retain the CLI's subscription
-label. The raw reported rate-limit tier appears in plan details and the tooltip,
-separately from the badge. Allowances use the reported usage windows; cagents
-does not convert a plan name or tier into hours of model work.
+Claude plan badges prefer the profile's reported display name. A matching-family
+reported tier adds its multiplier, such as Max 5x or Max 20x. A legacy Max tier
+never renames Ultra or another reported plan. Without a display name, badges
+use the CLI subscription label and any matching reported tier. Unknown plans
+retain their names; there is no plan table. The raw rate-limit tier is also
+available in details and tooltips. Allowances use reported usage windows,
+without converting a plan name or multiplier into hours of model work.
 
 `--refresh` requires one explicit `--account` ID and reuses that provider CLI's
 isolated usage probe. It requests usage, without submitting a paid model turn.
