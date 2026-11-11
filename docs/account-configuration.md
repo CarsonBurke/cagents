@@ -21,10 +21,11 @@ credits, source, observation time, age, and stale/reset indicators.
 Reset inventory includes each grant's scope, count, expiry where reported,
 and whether it can be used now.
 
-Claude plan names come from its reported profile or usage metadata. Max tiers
-such as 5x and 20x remain distinct, and a reported Ultra or future plan keeps
-its own name. Allowances use the reported usage windows; cagents does not
-convert a plan name or multiplier into hours of model work.
+Claude plan badges show the profile's reported display name unchanged, including
+Ultra and future names. Without that name, they retain the CLI's subscription
+label. The raw reported rate-limit tier appears in plan details and the tooltip,
+separately from the badge. Allowances use the reported usage windows; cagents
+does not convert a plan name or tier into hours of model work.
 
 `--refresh` requires one explicit `--account` ID and reuses that provider CLI's
 isolated usage probe. It requests usage, without submitting a paid model turn.
@@ -91,8 +92,12 @@ The durable protection applies to the original request key.
 Codex uses its supported app-server reset-credit methods. Claude Code does not
 expose a reset operation through its control protocol, so Claude reset inventory
 and consumption use the private endpoint its own client uses. The same probe
-reads its identity-verified profile for dynamic plan names and tiers. This
-adapter reads the selected Claude home's OAuth login without copying or
+reads its identity-verified profile for dynamic plan names and tiers. The result,
+including a missing-name or failed lookup, is cached for that login and identity.
+Ordinary usage refreshes do not refetch it; a sign-in or changed identity does.
+An external same-identity sign-in is detectable only if cagents observes the
+intervening logout; access-token refresh does not invalidate display metadata.
+This adapter reads the selected Claude home's OAuth login without copying or
 refreshing credentials. Normal sign-in remains the provider CLI's responsibility.
 
 ## Choosing defaults from the CLI

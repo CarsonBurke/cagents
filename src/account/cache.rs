@@ -75,6 +75,95 @@ struct Document {
         deserialize_with = "readable_settlements"
     )]
     settled: BTreeMap<String, Settled>,
+    /// Optional profile display metadata is tied to one login, not usage age.
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "readable_plan_profiles"
+    )]
+    plan_profiles: BTreeMap<String, PlanProfile>,
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "readable_plan_epochs"
+    )]
+    plan_epochs: BTreeMap<String, u64>,
+}
+
+/// Only allowlisted, bounded display metadata survives a verified profile.
+/// A failed lookup is retained too, so usage probes never become a profile poll.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PlanProfile {
+    pub binding: String,
+    pub verified: bool,
+    pub display_name: Option<String>,
+    pub rate_limit_tier: Option<String>,
+    observed_at: u64,
+}
+
+impl PlanProfile {
+    pub(crate) fn new(
+        binding: String,
+        verified: bool,
+        display_name: Option<String>,
+        rate_limit_tier: Option<String>,
+    ) -> Self {
+        Self {
+            binding,
+            verified,
+            display_name,
+            rate_limit_tier,
+            observed_at: crate::chat::now_ms().unwrap_or_default(),
+        }
+    }
+
+    fn valid(&self) -> bool {
+        let bounded = |value: &Option<String>| {
+            value.as_ref().is_none_or(|value| {
+                !value.is_empty()
+                    && value.chars().count() <= 256
+                    && !value.chars().any(char::is_control)
+            })
+        };
+        self.binding.len() == 64
+            && self.binding.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && bounded(&self.display_name)
+            && bounded(&self.rate_limit_tier)
+            && (self.verified || self.display_name.is_none() && self.rate_limit_tier.is_none())
+    }
+}
+
+fn readable_plan_profiles<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, PlanProfile>, D::Error> {
+    let serde_json::Value::Object(profiles) = serde_json::Value::deserialize(deserializer)? else {
+        return Ok(BTreeMap::new());
+    };
+    Ok(profiles
+        .into_iter()
+        .filter_map(|(key, value)| {
+            let profile = PlanProfile::deserialize(value).ok()?;
+            profile.valid().then_some((key, profile))
+        })
+        .collect())
+}
+
+fn readable_plan_epochs<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, u64>, D::Error> {
+    let serde_json::Value::Object(epochs) = serde_json::Value::deserialize(deserializer)? else {
+        return Ok(BTreeMap::new());
+    };
+    Ok(epochs
+        .into_iter()
+        .filter_map(|(key, value)| value.as_u64().map(|value| (key, value)))
+        .collect())
+}
+
+fn invalidate_document_plan(document: &mut Document, key: &str) {
+    document.plan_profiles.remove(key);
+    let epoch = document.plan_epochs.entry(key.to_owned()).or_default();
+    *epoch = epoch.wrapping_add(1);
 }
 
 /// How two records of one login's identity, which named different logins,
@@ -227,6 +316,72 @@ impl Cache {
         self.write(&document)
     }
 
+    /// Serializes just this account's profile lookup across windows. This is
+    /// separate from the short document lock; usage writes stay independent.
+    pub(crate) fn lock_plan(&self, key: &str) -> io::Result<crate::instance::OwnedLock> {
+        use sha2::{Digest, Sha256};
+        crate::secure_file::prepare_private_directory(&self.directory)?;
+        let digest = Sha256::digest(key.as_bytes());
+        let name = digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        crate::instance::owned_lock(
+            &self.directory.join(format!("account-plan.{name}.lock")),
+            libc::LOCK_EX,
+        )
+    }
+
+    /// Current login generation and its one profile attempt, independent of
+    /// usage timestamps, force refreshes and rotating access tokens.
+    pub(crate) fn plan_profile(&self, key: &str, binding: &str) -> (u64, Option<PlanProfile>) {
+        let document = read_document(&self.path()).unwrap_or_default();
+        let epoch = document.plan_epochs.get(key).copied().unwrap_or_default();
+        let profile = document
+            .plan_profiles
+            .get(key)
+            .filter(|profile| profile.binding == binding)
+            .cloned();
+        (epoch, profile)
+    }
+
+    /// Publishes only into the login generation that started the request. A
+    /// sign-out/sign-in while HTTP is pending cannot resurrect its old plan.
+    pub(crate) fn store_plan_profile(
+        &self,
+        key: &str,
+        epoch: u64,
+        profile: PlanProfile,
+    ) -> io::Result<bool> {
+        if !profile.valid() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Profile display metadata is invalid",
+            ));
+        }
+        crate::secure_file::prepare_private_directory(&self.directory)?;
+        let _lock = self.lock(libc::LOCK_EX)?;
+        let mut document = read_document(&self.path()).unwrap_or_default();
+        if document.plan_epochs.get(key).copied().unwrap_or_default() != epoch {
+            return Ok(false);
+        }
+        document.version = VERSION;
+        document.plan_profiles.insert(key.to_owned(), profile);
+        self.write(&document)?;
+        Ok(true)
+    }
+
+    /// Explicit login transitions invalidate successful and failed profile
+    /// attempts, including a sign-in that returns to the same email address.
+    pub fn invalidate_plan(&self, key: &str) -> io::Result<()> {
+        crate::secure_file::prepare_private_directory(&self.directory)?;
+        let _lock = self.lock(libc::LOCK_EX)?;
+        let mut document = read_document(&self.path()).unwrap_or_default();
+        document.version = VERSION;
+        invalidate_document_plan(&mut document, key);
+        self.write(&document)
+    }
+
     /// How the disagreement between two records of the login of the account
     /// filed under `key` was last settled, if it was.
     pub fn settled(&self, key: &str) -> Option<Settled> {
@@ -259,7 +414,12 @@ impl Cache {
         let changed = match settle {
             None => false,
             Some(Some(settled)) => {
-                document.settled.insert(key.to_owned(), settled.clone()) != Some(settled)
+                let changed = document.settled.get(key) != Some(&settled);
+                if changed && matches!(settled, Settled::SignedIn { .. }) {
+                    invalidate_document_plan(&mut document, key);
+                }
+                document.settled.insert(key.to_owned(), settled);
+                changed
             }
             Some(None) => document.settled.remove(key).is_some(),
         };
@@ -286,6 +446,11 @@ impl Cache {
                     .settled
                     .keys()
                     .any(|key| !keep.contains(key) && !document.entries.contains_key(key))
+                || document.plan_profiles.iter().any(|(key, profile)| {
+                    !keep.contains(key)
+                        && (profile.observed_at > now.saturating_add(CLOCK_SLACK)
+                            || now.saturating_sub(profile.observed_at) >= ORPHAN_AFTER)
+                })
         };
         if !read_document(&path).is_some_and(|document| orphaned(&document)) {
             return Ok(());
@@ -301,6 +466,15 @@ impl Cache {
         document
             .settled
             .retain(|key, _| keep.contains(key) || entries.contains_key(key));
+        document.plan_profiles.retain(|key, profile| {
+            keep.contains(key)
+                || profile.observed_at <= now.saturating_add(CLOCK_SLACK)
+                    && now.saturating_sub(profile.observed_at) < ORPHAN_AFTER
+        });
+        // Keep invalidation tombstones even after an orphan's data is pruned:
+        // deleting one could let a generation-zero in-flight read publish if
+        // an account key is recreated. The document size remains bounded.
+
         self.write(&document)
     }
 
@@ -400,6 +574,103 @@ mod tests {
             }),
             snapshot,
         }
+    }
+
+    #[test]
+    fn profile_plan_generation_blocks_old_writes_and_login_changes_keep_usage() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        let key = "claude:/fixture/home";
+        let binding = "a".repeat(64);
+        cache.store(key, entry(10, "usage retained")).unwrap();
+        let profile = PlanProfile::new(
+            binding.clone(),
+            true,
+            Some("Ultra".into()),
+            Some("default_claude_max_20x".into()),
+        );
+        assert!(cache.store_plan_profile(key, 0, profile.clone()).unwrap());
+        assert_eq!(
+            cache
+                .plan_profile(key, &binding)
+                .1
+                .unwrap()
+                .display_name
+                .as_deref(),
+            Some("Ultra")
+        );
+        cache
+            .settle(key, Some(Settled::SignedIn { at: 20 }))
+            .unwrap();
+        let (epoch, cached) = cache.plan_profile(key, &binding);
+        assert_eq!(epoch, 1);
+        assert!(cached.is_none());
+        assert!(
+            !cache.store_plan_profile(key, 0, profile.clone()).unwrap(),
+            "old request cannot publish after sign-in"
+        );
+        assert!(
+            cache
+                .store_plan_profile(key, epoch, profile.clone())
+                .unwrap()
+        );
+        cache
+            .settle(key, Some(Settled::SignedIn { at: 20 }))
+            .unwrap();
+        assert!(
+            cache.plan_profile(key, &binding).1.is_some(),
+            "reobserving one settlement isn't a new sign-in"
+        );
+        cache.invalidate_plan(key).unwrap();
+        assert!(!cache.store_plan_profile(key, epoch, profile).unwrap());
+        assert_eq!(
+            cache.load(100)[key].snapshot.detail.as_deref(),
+            Some("usage retained")
+        );
+    }
+
+    #[test]
+    fn pruning_orphaned_data_does_not_reset_profile_invalidation_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        let key = "claude:/removed-and-recreated";
+        let binding = "c".repeat(64);
+        cache.invalidate_plan(key).unwrap();
+        cache.store("old-usage", entry(1, "orphan")).unwrap();
+        cache.prune(&BTreeSet::new(), ORPHAN_AFTER + 2).unwrap();
+        assert_eq!(cache.plan_profile(key, &binding).0, 1);
+        let stale = PlanProfile::new(binding, true, Some("Old login".into()), None);
+        assert!(!cache.store_plan_profile(key, 0, stale).unwrap());
+    }
+
+    #[test]
+    fn malformed_optional_profile_metadata_preserves_usage_and_other_profiles() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        cache.store("usage", entry(10, "retained")).unwrap();
+        let binding = "b".repeat(64);
+        let failed = PlanProfile::new(binding.clone(), false, None, None);
+        assert!(cache.store_plan_profile("claude:/good", 0, failed).unwrap());
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&fs::read(cache.path()).unwrap()).unwrap();
+        document["plan_profiles"]["bad"] =
+            serde_json::json!({"binding":"bad","verified":true,"display_name":"poisoned"});
+        document["plan_epochs"] = serde_json::json!({"bad":"not a generation","claude:/good":0});
+        fs::write(cache.path(), serde_json::to_vec(&document).unwrap()).unwrap();
+        assert_eq!(
+            cache.load(100)["usage"].snapshot.detail.as_deref(),
+            Some("retained")
+        );
+        assert!(
+            !cache
+                .plan_profile("claude:/good", &binding)
+                .1
+                .unwrap()
+                .verified
+        );
+        assert!(cache.plan_profile("bad", "bad").1.is_none());
+        let invalid = PlanProfile::new(binding, true, Some("control\nname".into()), None);
+        assert!(cache.store_plan_profile("bad", 0, invalid).is_err());
     }
 
     #[test]

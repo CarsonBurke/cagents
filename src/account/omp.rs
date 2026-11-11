@@ -204,6 +204,8 @@ fn snapshot(reading: &[&Row], observed_at: u64) -> UsageSnapshot {
         observed_at,
         source: UsageSource::Recorded,
         plan: None,
+        plan_display_name: None,
+        rate_limit_tier: None,
         detail: None,
     }
 }

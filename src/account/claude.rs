@@ -46,78 +46,27 @@ pub fn parse_auth_status(status: &Value) -> Result<Identity, UsageStatus> {
     })
 }
 
-/// A reported name and tier, without assuming a fixed set of subscriptions.
-/// Claude's profile name takes precedence over its older subscription enum.
-/// A multiplier belongs only to the family named by the tier: a legacy Max
-/// tier must never turn a reported Ultra (or future plan) back into Max.
+/// A provider-reported display name, or the existing subscription identifier.
+/// The tier is separate detail, never a rule for renaming a plan or estimating
+/// model-work hours. In particular, Ultra can carry a legacy Max tier.
 pub(super) fn plan_name(
     subscription_type: Option<&str>,
     display_name: Option<&str>,
-    rate_limit_tier: Option<&str>,
+    _rate_limit_tier: Option<&str>,
 ) -> Option<String> {
-    let name = display_name.and_then(valid_plan_display_name).or_else(|| {
-        subscription_type
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-    });
-    let Some(name) = name else {
-        // A tier-only response still names what the account reports. This is
-        // a display fallback, never an enum or an estimate of allowance hours.
-        return rate_limit_tier
-            .map(str::trim)
-            .filter(|tier| !tier.is_empty())
-            .map(|tier| {
-                tier.strip_prefix("default_claude_")
-                    .unwrap_or(tier)
-                    .split(['_', '-', ' '])
-                    .filter(|word| !word.is_empty())
-                    .map(humanize)
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
-            .filter(|label| !label.is_empty());
-    };
-    let multiplier = rate_limit_tier
-        .map(str::trim)
-        .and_then(|tier| tier.strip_prefix("default_claude_"))
-        .and_then(|tier| tier.rsplit_once('_'))
-        .filter(|(family, _)| {
-            let words = |value: &str| {
-                value
-                    .split(['_', '-', ' '])
-                    .filter(|word| !word.is_empty())
-                    .map(str::to_lowercase)
-                    .collect::<Vec<_>>()
-            };
-            words(family) == words(name)
+    display_name
+        .and_then(valid_plan_display_name)
+        .or_else(|| {
+            subscription_type
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
         })
-        .and_then(|(_, multiplier)| {
-            multiplier
-                .strip_suffix('x')
-                .filter(|digits| digits.bytes().all(|byte| byte.is_ascii_digit()))
-                .and_then(|digits| digits.parse::<u64>().ok())
-                .filter(|number| *number > 0)
-                .map(|_| multiplier)
-        });
-    Some(match multiplier {
-        Some(multiplier) => format!("{name} {multiplier}"),
-        None => name.to_owned(),
-    })
+        .map(str::to_owned)
 }
 
 fn valid_plan_display_name(name: &str) -> Option<&str> {
     let name = name.trim();
-    let count = name.chars().count();
-    ((1..=40).contains(&count)
-        && name
-            .chars()
-            .all(|c| c.is_alphanumeric() || " .+-".contains(c))
-        && name.chars().next().is_some_and(char::is_alphanumeric)
-        && name
-            .chars()
-            .last()
-            .is_some_and(|c| c.is_alphanumeric() || c == '+'))
-    .then_some(name)
+    (!name.is_empty() && name.len() <= 256 && !name.chars().any(char::is_control)).then_some(name)
 }
 
 /// Temporary probe metadata keeps explicit names distinct from legacy enums
@@ -286,7 +235,8 @@ pub fn settle_dispute(
 /// when that list is absent, and every other key in `rate_limits` - of which
 /// the CLI carries a growing set of internal codenames - is ignored.
 pub fn parse_usage(response: &Value, observed_at: u64) -> UsageSnapshot {
-    let plan = plan_metadata(response).name();
+    let metadata = plan_metadata(response);
+    let plan = metadata.name();
     let limits = &response["rate_limits"];
     if response["rate_limits_available"].as_bool() == Some(false) || !limits.is_object() {
         let mut snapshot = UsageSnapshot::state(
@@ -295,6 +245,8 @@ pub fn parse_usage(response: &Value, observed_at: u64) -> UsageSnapshot {
             observed_at,
         );
         snapshot.plan = plan;
+        snapshot.plan_display_name = metadata.display_name;
+        snapshot.rate_limit_tier = metadata.rate_limit_tier;
         return snapshot;
     }
     let mut provider_warning = false;
@@ -332,6 +284,8 @@ pub fn parse_usage(response: &Value, observed_at: u64) -> UsageSnapshot {
         observed_at,
         source: UsageSource::Probe,
         plan,
+        plan_display_name: metadata.display_name,
+        rate_limit_tier: metadata.rate_limit_tier,
         detail,
     }
 }
@@ -1058,7 +1012,7 @@ mod tests {
                 "future",
                 "Future Horizon",
                 "default_claude_future_horizon_37x",
-                "Future Horizon 37x",
+                "Future Horizon",
             ),
             ("pro", "Pro", "default_claude_pro_0x", "Pro"),
             ("pro", "Pro", "default_claude_pro_-5x", "Pro"),
@@ -1087,29 +1041,39 @@ mod tests {
     }
 
     #[test]
-    fn tier_only_reports_keep_known_multipliers_and_title_case_unknown_names() {
-        for (tier, expected) in [
-            ("default_claude_max_5x", "Max 5x"),
-            ("default_claude_max_20x", "Max 20x"),
-            ("default_claude_zero", "Zero"),
-            ("future_research_plan", "Future Research Plan"),
-            ("default_claude_horizon_37x", "Horizon 37x"),
+    fn tier_details_never_replace_the_subscription_or_rename_a_display_name() {
+        for tier in [
+            "default_claude_max_5x",
+            "default_claude_max_20x",
+            "default_claude_zero",
+            "future_research_plan",
+            "default_claude_horizon_37x",
         ] {
-            assert_eq!(plan_name(None, None, Some(tier)).as_deref(), Some(expected));
+            assert_eq!(plan_name(None, None, Some(tier)), None);
+            assert_eq!(
+                plan_name(Some("max"), None, Some(tier)).as_deref(),
+                Some("max")
+            );
             let usage = parse_usage(&json!({"rate_limit_tier":tier}), 1);
-            assert_eq!(usage.plan.as_deref(), Some(expected));
+            assert_eq!(usage.plan, None);
+            assert_eq!(usage.rate_limit_tier.as_deref(), Some(tier));
             assert!(
                 usage.windows.is_empty(),
-                "a tier name never supplies usage hours"
+                "a tier never supplies usage hours"
             );
             assert_eq!(usage.status, UsageStatus::Unavailable);
         }
-        assert_eq!(plan_name(None, None, Some("  ")), None);
-        assert_eq!(plan_name(None, None, Some("___")), None);
-        assert_eq!(
-            plan_name(Some("max"), Some("Ultra"), Some("default_claude_max_20x")).as_deref(),
-            Some("Ultra")
-        );
+        for display in ["Ultra", "Max", "Max 20x", "iResearch / future (beta)"] {
+            let usage = parse_usage(
+                &json!({
+                    "subscription_type":"max", "plan_display_name":display,
+                    "rate_limit_tier":"default_claude_max_20x"
+                }),
+                1,
+            );
+            assert_eq!(usage.plan.as_deref(), Some(display));
+            assert_eq!(usage.plan_display_name.as_deref(), Some(display));
+        }
     }
 
     /// The recorded response carries a dozen codename keys beside the

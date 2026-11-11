@@ -879,6 +879,7 @@ pub struct ProbeTicket {
     identity: std::sync::Arc<()>,
     force: bool,
     limit_identity: Option<Option<Identity>>,
+    plan_invalidated: Option<u64>,
 }
 
 impl ProbeTicket {
@@ -887,6 +888,7 @@ impl ProbeTicket {
             identity: std::sync::Arc::new(()),
             force,
             limit_identity: None,
+            plan_invalidated: None,
         }
     }
 
@@ -935,6 +937,10 @@ struct AccountState {
     /// disagreement between two records of its login (see
     /// [`Identity::disputed_by`]).
     settle_records: bool,
+    /// A Claude sign-in can replace profile metadata without changing the account ID.
+    /// Invalidate its shared cached profile before the next usage probe.
+    refresh_plan: bool,
+    plan_generation: u64,
     reset: resets::State,
 }
 
@@ -952,6 +958,23 @@ impl AccountState {
         self.schedule.abandon();
         self.schedule.await_login(now);
         self.signing_in_from = self.identity.clone();
+        self.invalidate_plan_profile();
+    }
+
+    fn invalidate_plan_profile(&mut self) {
+        if self.account.provider != Provider::Claude {
+            return;
+        }
+        self.refresh_plan = true;
+        self.plan_generation = self.plan_generation.wrapping_add(1);
+        if let Some(snapshot) = &mut self.snapshot {
+            snapshot.plan = None;
+            snapshot.plan_display_name = None;
+            snapshot.rate_limit_tier = None;
+        }
+        if let Some(identity) = &mut self.identity {
+            identity.plan = None;
+        }
     }
 
     fn new(account: Account) -> Self {
@@ -974,6 +997,8 @@ impl AccountState {
             signing_in_from: None,
             sign_in_terminal: None,
             settle_records: false,
+            refresh_plan: false,
+            plan_generation: 0,
             reset: resets::State::default(),
         }
     }
@@ -1022,11 +1047,35 @@ impl AccountState {
     }
 
     fn plan(&self) -> Option<String> {
+        if self.refresh_plan {
+            return None;
+        }
         self.snapshot
             .as_ref()
-            .and_then(|snapshot| snapshot.plan.as_deref())
-            .or_else(|| self.identity.as_ref()?.plan.as_deref())
-            .map(account::plan_label)
+            .and_then(|snapshot| snapshot.plan_display_name.as_ref())
+            .filter(|name| !name.trim().is_empty())
+            .cloned()
+            .or_else(|| {
+                self.snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.plan.as_deref())
+                    .or_else(|| self.identity.as_ref()?.plan.as_deref())
+                    .map(account::plan_label)
+            })
+    }
+
+    fn plan_tooltip(&self) -> Option<String> {
+        let mut text = format!("Plan: {}", self.plan()?);
+        if let Some(tier) = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.rate_limit_tier.as_deref())
+            .filter(|tier| !tier.trim().is_empty())
+        {
+            text.push_str("\nReported rate-limit tier: ");
+            text.push_str(tier);
+        }
+        Some(text)
     }
 
     /// The login this account is known as: the one it was added with, and
@@ -1379,6 +1428,14 @@ fn merge_complete_inventory(current: &mut UsageSnapshot, full: &UsageSnapshot) {
     }
     if current.plan.is_none() {
         current.plan.clone_from(&full.plan);
+    }
+    if current.plan_display_name.is_none() {
+        current
+            .plan_display_name
+            .clone_from(&full.plan_display_name);
+    }
+    if current.rate_limit_tier.is_none() {
+        current.rate_limit_tier.clone_from(&full.rate_limit_tier);
     }
     if current.ordinary_usage_allowed == Some(false)
         && matches!(
@@ -2588,6 +2645,11 @@ impl Cagents {
         let account = state.account.clone();
         let id = state.id.clone();
         let owner = state.owner;
+        let login_changed = state.refresh_plan;
+        let plan_generation = state.plan_generation;
+        let invalidate_plan = login_changed
+            .then(|| cache.clone().zip(account.cache_key()))
+            .flatten();
         // Only the system Claude login can have a second record, and only
         // while it exports no home of its own (as the probe reads it).
         let settle = (std::mem::take(&mut state.settle_records)
@@ -2597,6 +2659,28 @@ impl Cagents {
         .then(|| cache.clone().zip(account.cache_key()))
         .flatten();
         let probe = cosmic::task::future(async move {
+            let mut ticket = ticket;
+            if !crate::device::is_remote()
+                && let Some((cache, key)) = invalidate_plan
+            {
+                let invalidated = tokio::task::spawn_blocking(move || cache.invalidate_plan(&key))
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result.map_err(|error| error.to_string()));
+                if let Err(error) = invalidated {
+                    return Message::AccountUi(Action::Probed {
+                        owner,
+                        id,
+                        ticket,
+                        outcome: Outcome::Failed(format!(
+                            "The signed-in account’s plan could not be refreshed: {error}"
+                        )),
+                    });
+                }
+            }
+            if login_changed && !crate::device::is_remote() {
+                ticket.plan_invalidated = Some(plan_generation);
+            }
             if let Some((cache, key)) = settle
                 && !crate::device::is_remote()
             {
@@ -2614,7 +2698,11 @@ impl Cagents {
             let outcome = if crate::device::is_remote() {
                 tokio::task::spawn_blocking(move || {
                     match crate::device_service::request(
-                        crate::device_service::Operation::AccountProbe { account, force },
+                        crate::device_service::Operation::AccountProbe {
+                            account,
+                            force,
+                            login_changed,
+                        },
                     )? {
                         crate::device_service::Reply::AccountProbe(value) => {
                             serde_json::from_value(value).map_err(|error| error.to_string())
@@ -2629,6 +2717,12 @@ impl Cagents {
             } else {
                 probe::run(account, cache, force).await
             };
+            if login_changed
+                && crate::device::is_remote()
+                && matches!(outcome, Outcome::Answered { .. })
+            {
+                ticket.plan_invalidated = Some(plan_generation);
+            }
             Message::AccountUi(Action::Probed {
                 owner,
                 id,
@@ -2767,7 +2861,9 @@ impl Cagents {
                 state.present = true;
                 state.failure = None;
             }
-            state.schedule.login_settled();
+            if !state.refresh_plan {
+                state.schedule.login_settled();
+            }
         }
         if login_changed {
             state.schedule.invalidate();
@@ -3680,6 +3776,11 @@ impl Cagents {
         {
             return Task::none();
         }
+        if let Some(state) = self.account_ui.account_mut(&id)
+            && ticket.plan_invalidated == Some(state.plan_generation)
+        {
+            state.refresh_plan = false;
+        }
         let provider = self
             .account_ui
             .account(&id)
@@ -3698,6 +3799,22 @@ impl Cagents {
         let now = now_ms();
         self.refresh_login_watch(&id, now);
         self.account_ui.now_ms = now;
+        if self.account_ui.account(&id).is_some_and(|state| {
+            state.refresh_plan && ticket.plan_invalidated != Some(state.plan_generation)
+        }) && let Outcome::Answered {
+            identity, snapshot, ..
+        } = &mut outcome
+        {
+            // Completion may have changed the login while this older read
+            // was in flight. Its quota can remain useful history; its profile
+            // must wait for the new generation's verified read.
+            snapshot.plan = None;
+            snapshot.plan_display_name = None;
+            snapshot.rate_limit_tier = None;
+            if let Some(identity) = identity {
+                identity.plan = None;
+            }
+        }
         // The probe cached what its CLI listed itself.
         if let Outcome::Answered { catalog, .. } = &mut outcome
             && let Some(catalog) = catalog.take()
@@ -3769,7 +3886,10 @@ impl Cagents {
                     state.schedule.awaiting_login(now) && !signed_in_here && !was_signed_out;
                 state.schedule.succeed(snapshot.observed_at);
                 state.inventory_observed_at = Some(snapshot.observed_at);
-                if snapshot.status != UsageStatus::NeedsLogin && !unchanged_by_login {
+                if snapshot.status != UsageStatus::NeedsLogin
+                    && !unchanged_by_login
+                    && !state.refresh_plan
+                {
                     state.schedule.login_settled();
                     state.signing_in_from = None;
                     state.sign_in_terminal = None;
@@ -4086,6 +4206,7 @@ impl Cagents {
                 // The login it finished wrote the record the CLI reads,
                 // which settles a disagreement with an older one.
                 state.settle_records = succeeded;
+                state.invalidate_plan_profile();
             }
         }
     }
@@ -4635,6 +4756,7 @@ impl Cagents {
                         crate::device_service::Operation::AccountProbe {
                             account,
                             force: true,
+                            login_changed: false,
                         },
                     )? {
                         crate::device_service::Reply::AccountProbe(value) => {
@@ -5792,9 +5914,13 @@ impl Cagents {
                 .into(),
         ];
         if let Some(plan) = account.plan() {
-            identity.push(crate::ui_controls::badge(
-                plan,
-                design::Tone::Themed(design::accent_color),
+            let label = account.plan_tooltip().expect("plan is present");
+            identity.push(crate::interaction::tooltip(
+                crate::ui_controls::labelled(
+                    crate::ui_controls::badge(plan, design::Tone::Themed(design::accent_color)),
+                    label.clone(),
+                ),
+                label,
             ));
         }
         // Reserve the trailing actions before measuring any identity metadata.
@@ -6407,6 +6533,11 @@ mod tests {
         let owner = state.owner;
         assert_ne!(owner, before);
         assert!(state.sign_in_terminal.is_some());
+        assert!(
+            !state.refresh_plan,
+            "Codex login does not enter Claude profile verification"
+        );
+        assert_eq!(state.plan_generation, 0);
         assert!(state.schedule.awaiting_login(now_ms()));
         drop(app.accounts_focus_changed(true, true));
         drop(app.update(Message::AccountUi(Action::Tick)));
@@ -6452,6 +6583,10 @@ mod tests {
         })));
         let state = app.account_ui.account(&id).unwrap();
         assert!(state.sign_in_terminal.is_none());
+        assert!(
+            !state.refresh_plan,
+            "Codex completion keeps its existing sign-in lifecycle"
+        );
         assert!(!state.schedule.awaiting_login(now_ms()));
         assert_eq!(
             state.identity.as_ref().unwrap().email.as_deref(),
@@ -7084,6 +7219,10 @@ mod app_tests {
             let state = app.account_ui.account(&id).unwrap();
             assert!(state.sign_in_terminal.is_none());
             assert_eq!(state.settle_records, settles, "{code:?} {signal:?}");
+            assert!(
+                state.refresh_plan,
+                "every completed sign-in verifies fresh profile metadata, independently of settlement eligibility"
+            );
         }
     }
 
@@ -7870,7 +8009,15 @@ mod app_tests {
     }
 
     fn signed_in_as(app: &mut Cagents, id: &AccountId, email: &str) -> Message {
-        let (owner, ticket) = app.account_ui.begin_probe_for_test(id, Trigger::Focus, NOW);
+        let (owner, mut ticket) = app.account_ui.begin_probe_for_test(id, Trigger::Focus, NOW);
+        // This helper represents a completed provider read. Its unpolled
+        // synthetic pre-probe has acknowledged the same invalidation that the
+        // production async path performs before reading the signed-in home.
+        if let Some(state) = app.account_ui.account(id)
+            && state.refresh_plan
+        {
+            ticket.plan_invalidated = Some(state.plan_generation);
+        }
         Message::AccountUi(Action::Probed {
             owner,
             ticket,
@@ -10314,6 +10461,8 @@ mod app_tests {
                 observed_at: now,
                 source: UsageSource::Probe,
                 plan: None,
+                plan_display_name: None,
+                rate_limit_tier: None,
                 detail: None,
             },
         };
@@ -12890,5 +13039,130 @@ mod app_tests {
                 .count(),
             1
         );
+    }
+    #[test]
+    fn profile_plan_name_is_verbatim_and_tier_is_disclosed_only_in_the_tooltip() {
+        let mut state = AccountState::new(Account::system(Provider::Claude));
+        let mut snapshot = UsageSnapshot::state(UsageStatus::Ok, "", now_ms());
+        snapshot.plan = Some("max".into());
+        snapshot.plan_display_name = Some("mAX / EDU · Preview!".into());
+        snapshot.rate_limit_tier = Some("default_claude_max_17x-beta".into());
+        state.snapshot = Some(snapshot);
+        assert_eq!(state.plan().as_deref(), Some("mAX / EDU · Preview!"));
+        assert_eq!(
+            state.plan_tooltip().as_deref(),
+            Some(
+                "Plan: mAX / EDU · Preview!\nReported rate-limit tier: default_claude_max_17x-beta"
+            )
+        );
+        state.snapshot.as_mut().unwrap().plan_display_name = None;
+        assert_eq!(state.plan().as_deref(), Some("Max"));
+        assert_eq!(
+            state.plan_tooltip().as_deref(),
+            Some("Plan: Max\nReported rate-limit tier: default_claude_max_17x-beta")
+        );
+        state.snapshot.as_mut().unwrap().plan = None;
+        state.identity = Some(Identity {
+            plan: Some("pro".into()),
+            ..Identity::default()
+        });
+        assert_eq!(state.plan().as_deref(), Some("Pro"));
+        state.snapshot.as_mut().unwrap().plan_display_name = Some("   ".into());
+        assert_eq!(state.plan().as_deref(), Some("Pro"));
+    }
+
+    #[test]
+    fn claude_sign_in_plan_invalidation_covers_system_managed_and_only_its_generation_can_complete_it()
+     {
+        for managed in [false, true] {
+            let mut app = context_inspector_test_app(false);
+            let id = if managed {
+                app.account_ui.add_managed_fixture(Provider::Claude, 919211)
+            } else {
+                Account::system(Provider::Claude).id()
+            };
+            let now = now_ms();
+            let state = app.account_ui.account_mut(&id).unwrap();
+            let mut snapshot = UsageSnapshot::state(UsageStatus::Ok, "", now);
+            snapshot.plan = Some("max".into());
+            snapshot.plan_display_name = Some("Old display".into());
+            snapshot.rate_limit_tier = Some("old-tier".into());
+            state.snapshot = Some(snapshot);
+            state.begin_sign_in(now);
+            assert!(state.refresh_plan);
+            assert!(
+                state.plan().is_none(),
+                "sign-in must not fall back to an old profile-derived label"
+            );
+            assert!(state.snapshot.as_ref().unwrap().plan_display_name.is_none());
+            assert!(state.snapshot.as_ref().unwrap().rate_limit_tier.is_none());
+            let owner = state.owner;
+            let earlier_generation = state.plan_generation;
+            let mut earlier = state.start_probe(Trigger::Focus, now);
+            earlier.plan_invalidated = Some(earlier_generation);
+            state.invalidate_plan_profile();
+            let current_generation = state.plan_generation;
+            let mut old = UsageSnapshot::state(UsageStatus::Ok, "", now + 1);
+            old.plan = Some("Ultra 200x".into());
+            old.plan_display_name = Some("Superseded display".into());
+            drop(app.account_probed(
+                id.clone(),
+                owner,
+                earlier,
+                Outcome::Answered {
+                    identity: None,
+                    catalog: None,
+                    snapshot: old,
+                },
+            ));
+            let state = app.account_ui.account_mut(&id).unwrap();
+            assert!(
+                state.refresh_plan,
+                "a read admitted before terminal completion cannot acknowledge its new profile invalidation"
+            );
+            assert!(state.snapshot.as_ref().unwrap().plan_display_name.is_none());
+            assert!(
+                state.schedule.awaiting_login(now_ms()),
+                "a newer pending profile generation keeps the existing verification watch alive"
+            );
+            let recipe = recipe_on(&app, &id);
+            drop(app.account_reported(
+                Provider::Claude,
+                &recipe,
+                vec![(claude_report(0.2), now + 2)],
+            ));
+            let state = app.account_ui.account_mut(&id).unwrap();
+            assert!(
+                state.schedule.awaiting_login(now_ms()),
+                "partial quota events do not finish profile verification"
+            );
+            let failed = state.start_probe(Trigger::Focus, now + 2);
+            drop(app.account_probed(
+                id.clone(),
+                owner,
+                failed,
+                Outcome::Failed("fixture invalidation failure".into()),
+            ));
+            let state = app.account_ui.account_mut(&id).unwrap();
+            assert!(state.refresh_plan, "failed invalidation remains pending");
+            let mut current = state.start_probe(Trigger::Focus, now + 3);
+            current.plan_invalidated = Some(current_generation);
+            let mut fresh = UsageSnapshot::state(UsageStatus::Ok, "", now + 4);
+            fresh.plan_display_name = Some("Current DISPLAY / Preview".into());
+            fresh.rate_limit_tier = Some("new-tier".into());
+            drop(app.account_probed(
+                id.clone(),
+                owner,
+                current,
+                Outcome::Answered {
+                    identity: None,
+                    catalog: None,
+                    snapshot: fresh,
+                },
+            ));
+            let state = app.account_ui.account(&id).unwrap();
+            assert!(!state.refresh_plan);
+            assert_eq!(state.plan().as_deref(), Some("Current DISPLAY / Preview"));
+        }
     }
 }

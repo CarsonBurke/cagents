@@ -739,7 +739,7 @@ impl Account {
 pub struct Identity {
     pub email: Option<String>,
     pub organization: Option<String>,
-    /// The reported plan name, including a reported tier where available.
+    /// The reported plan name, or a legacy subscription identifier.
     /// Older providers may supply only an identifier; see [`plan_label`].
     pub plan: Option<String>,
     /// The login another record of the same credentials names, when the
@@ -1054,6 +1054,12 @@ pub struct UsageSnapshot {
     pub source: UsageSource,
     /// The plan the usage response named, where it named one.
     pub plan: Option<String>,
+    /// The provider's literal display name, kept separate from legacy labels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_display_name: Option<String>,
+    /// Reported allowance tier for details; never used to invent a plan name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_tier: Option<String>,
     /// Why a snapshot has no figures, in the provider's or cagents' words.
     pub detail: Option<String>,
 }
@@ -1074,6 +1080,8 @@ impl UsageSnapshot {
             observed_at,
             source: UsageSource::Probe,
             plan: None,
+            plan_display_name: None,
+            rate_limit_tier: None,
             detail: Some(detail.into()),
         }
     }
@@ -1526,6 +1534,8 @@ mod tests {
             observed_at: 0,
             source: UsageSource::Probe,
             plan: None,
+            plan_display_name: None,
+            rate_limit_tier: None,
             detail: None,
         }
     }
@@ -2185,6 +2195,8 @@ mod tests {
             observed_at,
             source: UsageSource::Probe,
             plan: Some("max".into()),
+            plan_display_name: None,
+            rate_limit_tier: None,
             detail: None,
         };
 

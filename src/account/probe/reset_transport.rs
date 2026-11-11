@@ -5,6 +5,7 @@
 //! never its arguments, logs, cache, or a response to the caller. We never
 //! refresh or write credentials. The existing CLI probe owns token refresh.
 use super::*;
+use std::os::unix::fs::MetadataExt;
 
 const BASE: &str = "https://api.anthropic.com";
 const FILE_LIMIT: u64 = 256 * 1024;
@@ -16,8 +17,7 @@ pub(super) struct Client {
     version: String,
     subscription_type: Option<String>,
     rate_limit_tier: Option<String>,
-    plan_display_name: Option<String>,
-    plan_email: Option<String>,
+    home_identity: Option<(u64, u64)>,
     fixture: bool,
 }
 
@@ -116,12 +116,10 @@ impl Client {
             version,
             subscription_type: oauth["subscriptionType"].as_str().map(str::to_owned),
             rate_limit_tier: oauth["rateLimitTier"].as_str().map(str::to_owned),
-            plan_display_name: config["oauthAccount"]["planDisplayName"]
-                .as_str()
-                .map(str::to_owned),
-            plan_email: config["oauthAccount"]["emailAddress"]
-                .as_str()
-                .map(str::to_owned),
+            home_identity: tokio::fs::metadata(&home)
+                .await
+                .ok()
+                .map(|metadata| (metadata.dev(), metadata.ino())),
             fixture: false,
         })
     }
@@ -170,48 +168,143 @@ impl Client {
         self.verified_profile(expected).await.map(|_| ())
     }
 
-    /// Display metadata belongs to the same verified login as the usage probe.
-    /// Missing profile fields retain the subscription type the CLI knows.
+    /// Optional display metadata is fetched once per login, separately from
+    /// the usage cadence. Consume verification never uses this display cache.
     pub(super) async fn plan(
         &self,
         expected: &Identity,
         reported: &super::super::claude::PlanMetadata,
-    ) -> Result<Option<String>, String> {
-        let profile = self.verified_profile(expected).await?;
-        let organization = &profile["organization"];
-        // Only these profile fields can become plan metadata. Identity and
-        // unrelated profile content stay inside this credential adapter.
-        let mut profile = super::super::claude::plan_metadata(&json!({
-            "subscription_type": organization["organization_type"].as_str()
-                .and_then(|kind| kind.strip_prefix("claude_")),
-            "plan_display_name": organization["plan_display_name"],
-            "rate_limit_tier": organization["rate_limit_tier"],
-        }));
-        // A CLI-reported subscription outranks the profile's legacy org type;
-        // the profile's explicit display name and current tier remain primary.
-        profile.subscription_type = reported
-            .subscription_type
-            .clone()
-            .or(profile.subscription_type);
-        // The config cache is independent of the frozen bearer. Its display
-        // name is only a fallback after profile verification, for this email.
-        let same_owner = self
-            .plan_email
-            .as_deref()
-            .zip(expected.email.as_deref())
-            .is_some_and(|(cached, expected)| {
-                !cached.trim().is_empty() && cached.trim().eq_ignore_ascii_case(expected.trim())
-            });
-        let cached = super::super::claude::plan_metadata(&json!({
-            "subscription_type": self.subscription_type,
-            "plan_display_name": same_owner.then_some(self.plan_display_name.as_deref()).flatten(),
-            "rate_limit_tier": self.rate_limit_tier,
-        }));
-        let fallback = super::super::claude::PlanMetadata {
-            subscription_type: expected.plan.clone(),
-            ..Default::default()
+        cache: Option<&Cache>,
+        account_key: Option<&str>,
+    ) -> Result<super::super::claude::PlanMetadata, String> {
+        let Some((cache, key)) = cache.zip(account_key) else {
+            return self
+                .read_plan_profile(expected)
+                .await
+                .map(|profile| profile.or(self.plan_fallback(expected, reported)));
         };
-        Ok(profile.or(reported.clone()).or(cached).or(fallback).name())
+        let binding = self.plan_binding(key, expected);
+        let cache = cache.clone();
+        let key = key.to_owned();
+        // This per-account flight lock spans HTTP; the shared document lock
+        // is held only during small reads/writes, never across provider I/O.
+        let lock_cache = cache.clone();
+        let lock_key = key.clone();
+        let _flight = tokio::task::spawn_blocking(move || lock_cache.lock_plan(&lock_key))
+            .await
+            .map_err(|_| "The profile cache could not be opened")?
+            .map_err(|_| "The profile cache could not be opened")?;
+        let read_cache = cache.clone();
+        let read_key = key.clone();
+        let read_binding = binding.clone();
+        let (epoch, profile) =
+            tokio::task::spawn_blocking(move || read_cache.plan_profile(&read_key, &read_binding))
+                .await
+                .map_err(|_| "The profile cache could not be read")?;
+        if let Some(profile) = profile {
+            return self.cached_plan(profile, expected, reported);
+        }
+        // Persist the attempted lookup before sending. Crashes and failures
+        // must not turn regular usage probes into repeated profile requests.
+        let pending = super::super::cache::PlanProfile::new(binding.clone(), false, None, None);
+        if !publish_plan(&cache, &key, epoch, pending).await? {
+            return Err("This account's login changed; refresh and confirm again".into());
+        }
+        let result = self.read_plan_profile(expected).await;
+        let profile = match &result {
+            Ok(plan) => super::super::cache::PlanProfile::new(
+                binding,
+                true,
+                plan.display_name.clone(),
+                plan.rate_limit_tier.clone(),
+            ),
+            Err(_) => super::super::cache::PlanProfile::new(binding, false, None, None),
+        };
+        if !publish_plan(&cache, &key, epoch, profile).await? {
+            return Err("This account's login changed; refresh and confirm again".into());
+        }
+        result.map(|profile| profile.or(self.plan_fallback(expected, reported)))
+    }
+
+    fn plan_binding(&self, key: &str, expected: &Identity) -> String {
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        for value in [
+            key.to_owned(),
+            expected
+                .email
+                .as_deref()
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase(),
+            self.organization.clone(),
+            expected
+                .organization
+                .as_deref()
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase(),
+        ] {
+            digest.update((value.len() as u64).to_be_bytes());
+            digest.update(value.as_bytes());
+        }
+        if let Some((device, inode)) = self.home_identity {
+            digest.update(device.to_be_bytes());
+            digest.update(inode.to_be_bytes());
+        }
+        digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    fn cached_plan(
+        &self,
+        profile: super::super::cache::PlanProfile,
+        expected: &Identity,
+        reported: &super::super::claude::PlanMetadata,
+    ) -> Result<super::super::claude::PlanMetadata, String> {
+        if !profile.verified {
+            return Err("Claude profile metadata is unavailable for this login".into());
+        }
+        let mut plan = self.plan_fallback(expected, reported);
+        plan.display_name = profile.display_name;
+        // A missing profile tier may still be reported by the current CLI.
+        plan.rate_limit_tier = profile.rate_limit_tier.or(plan.rate_limit_tier);
+        Ok(plan)
+    }
+
+    fn plan_fallback(
+        &self,
+        expected: &Identity,
+        reported: &super::super::claude::PlanMetadata,
+    ) -> super::super::claude::PlanMetadata {
+        super::super::claude::PlanMetadata {
+            subscription_type: reported
+                .subscription_type
+                .clone()
+                .or(self.subscription_type.clone())
+                .or(expected.plan.clone()),
+            display_name: None,
+            rate_limit_tier: reported
+                .rate_limit_tier
+                .clone()
+                .or(self.rate_limit_tier.clone()),
+        }
+    }
+
+    async fn read_plan_profile(
+        &self,
+        expected: &Identity,
+    ) -> Result<super::super::claude::PlanMetadata, String> {
+        let profile = self.verified_profile(expected).await?;
+        // No organization_type or cached oauthAccount display-name fallback:
+        // a verified profile name is literal; its absence uses the CLI type.
+        Ok(super::super::claude::plan_metadata(&json!({
+            "plan_display_name": profile["organization"]["plan_display_name"],
+            "rate_limit_tier": profile["organization"]["rate_limit_tier"],
+        })))
     }
 
     async fn verified_profile(&self, expected: &Identity) -> Result<Value, String> {
@@ -353,6 +446,75 @@ write-out = "\n%{{http_code}}"
     }
 }
 
+/// A missing or unreadable-format file-store login is an observed login
+/// transition. Expiry and unrelated transport/version failures are not.
+/// Called only after Client::load failed; no provider request is performed.
+pub(super) async fn login_was_removed(account: &Account) -> bool {
+    if account.provider != Provider::Claude {
+        return false;
+    }
+    let Some(home) = account.resolved_home() else {
+        return false;
+    };
+    // A malformed marker or stopped fixture must never inspect credentials.
+    // The ancestor check also protects a fixture whose provider home vanished.
+    if tokio::fs::symlink_metadata(home.join("fixture-reset-api.json"))
+        .await
+        .is_ok()
+        || fixture_root(&home).await
+        || home
+            .ancestors()
+            .any(|path| path.join(".cagents-reset-fixture").is_file())
+    {
+        return false;
+    }
+    let file = match tokio::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(home.join(".credentials.json"))
+        .await
+    {
+        Ok(file) => file,
+        Err(error) => return error.kind() == io::ErrorKind::NotFound,
+    };
+    match file.metadata().await {
+        Ok(metadata) if metadata.is_file() => {}
+        _ => return false,
+    }
+    let mut bytes = Vec::new();
+    if file
+        .take(FILE_LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    if bytes.len() as u64 > FILE_LIMIT {
+        return true;
+    }
+    let Ok(stored) = serde_json::from_slice::<Value>(&bytes) else {
+        return true;
+    };
+    stored["claudeAiOauth"]["accessToken"]
+        .as_str()
+        .is_none_or(|token| token.trim().is_empty())
+}
+
+async fn publish_plan(
+    cache: &Cache,
+    key: &str,
+    epoch: u64,
+    profile: super::super::cache::PlanProfile,
+) -> Result<bool, String> {
+    let cache = cache.clone();
+    let key = key.to_owned();
+    tokio::task::spawn_blocking(move || cache.store_plan_profile(&key, epoch, profile))
+        .await
+        .map_err(|_| "The profile cache could not be written".to_owned())?
+        .map_err(|_| "The profile cache could not be written".into())
+}
+
 async fn read_json(path: &Path) -> Result<Value, String> {
     let file = tokio::fs::File::open(path)
         .await
@@ -408,8 +570,10 @@ async fn fixture_client(home: &Path, marker: &Path) -> Result<Client, String> {
         version: "0.0.0-fixture".into(),
         subscription_type: value["subscription_type"].as_str().map(str::to_owned),
         rate_limit_tier: value["rate_limit_tier"].as_str().map(str::to_owned),
-        plan_display_name: value["plan_display_name"].as_str().map(str::to_owned),
-        plan_email: value["plan_email"].as_str().map(str::to_owned),
+        home_identity: tokio::fs::metadata(&home)
+            .await
+            .ok()
+            .map(|metadata| (metadata.dev(), metadata.ino())),
         fixture: true,
     })
 }
@@ -478,8 +642,6 @@ mod tests {
         assert_eq!(client.bearer, "cagents-fixture-only");
         assert_eq!(client.subscription_type, None);
         assert_eq!(client.rate_limit_tier, None);
-        assert_eq!(client.plan_display_name, None);
-        assert_eq!(client.plan_email, None);
         std::fs::write(
             &marker,
             json!({"base_url":"http://127.0.0.1:1234","fixture":true,
@@ -496,14 +658,70 @@ mod tests {
             client.rate_limit_tier.as_deref(),
             Some("default_claude_max_5x")
         );
-        assert_eq!(client.plan_display_name.as_deref(), Some("Ultra"));
-        assert_eq!(client.plan_email.as_deref(), Some("fixture@example.test"));
         std::fs::remove_file(&marker).unwrap();
         assert!(
             Client::load(&account, Path::new("/missing/claude"), None)
                 .await
                 .is_err(),
             "a stopped fixture cannot fall back to production"
+        );
+    }
+    #[tokio::test]
+    async fn removed_login_detection_distinguishes_absent_auth_from_expiry() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("provider");
+        std::fs::create_dir(&home).unwrap();
+        let account = Account::linked(Provider::Claude, uuid::Uuid::new_v4(), home.clone());
+        assert!(login_was_removed(&account).await);
+        let credentials = home.join(".credentials.json");
+        for body in [
+            "not-json",
+            "{}",
+            r#"{"claudeAiOauth":{}}"#,
+            r#"{"claudeAiOauth":{"accessToken":null}}"#,
+            r#"{"claudeAiOauth":{"accessToken":""}}"#,
+        ] {
+            std::fs::write(&credentials, body).unwrap();
+            assert!(login_was_removed(&account).await);
+        }
+        // A fake stored token exists even when expired or profile scope is
+        // absent. Neither state proves a sign-out, and no command is run.
+        std::fs::write(
+            &credentials,
+            json!({"claudeAiOauth":{"accessToken":"fake-stored-token","expiresAt":0,"scopes":[]}})
+                .to_string(),
+        )
+        .unwrap();
+        std::fs::write(home.join(".claude.json"), "unreadable config").unwrap();
+        assert!(!login_was_removed(&account).await);
+    }
+
+    #[tokio::test]
+    async fn removed_login_detection_never_reads_fixture_credentials() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("provider");
+        std::fs::create_dir(&home).unwrap();
+        let account = Account::linked(Provider::Claude, uuid::Uuid::new_v4(), home.clone());
+        std::fs::write(
+            home.join(".credentials.json"),
+            "malformed credentials must stay irrelevant",
+        )
+        .unwrap();
+        let marker = home.join("fixture-reset-api.json");
+        std::fs::write(&marker, "malformed fixture marker").unwrap();
+        assert!(!login_was_removed(&account).await);
+        std::fs::remove_file(marker).unwrap();
+        std::fs::write(
+            root.path().join(".cagents-reset-fixture"),
+            "isolated fixture",
+        )
+        .unwrap();
+        assert!(!login_was_removed(&account).await);
+        std::fs::remove_file(home.join(".credentials.json")).unwrap();
+        std::fs::remove_dir(home).unwrap();
+        assert!(
+            !login_was_removed(&account).await,
+            "removed fixture home cannot fall through to real credential discovery"
         );
     }
 }
@@ -573,8 +791,7 @@ mod offer_context_tests {
                 version: "0.0.0-fixture".into(),
                 subscription_type: None,
                 rate_limit_tier: None,
-                plan_display_name: None,
-                plan_email: None,
+                home_identity: Some((1, 1)),
                 fixture: true,
             },
             worker,
@@ -630,24 +847,226 @@ mod offer_context_tests {
         }
     }
 
+    fn reported() -> super::super::super::claude::PlanMetadata {
+        super::super::super::claude::plan_metadata(&json!({"subscription_type":"max"}))
+    }
+
+    fn named_profile(name: &str) -> Value {
+        let mut value = profile();
+        value["organization"]["plan_display_name"] = json!(name);
+        value["organization"]["organization_type"] = json!("claude_max");
+        value["organization"]["rate_limit_tier"] = json!("default_claude_max_20x");
+        value
+    }
+
     #[tokio::test]
-    async fn plan_metadata_requires_the_same_email_organization_and_name_as_consume() {
+    async fn profile_plan_is_shared_once_across_windows_and_access_token_refreshes() {
+        let (mut client, server) = read_server(vec![(
+            "/api/oauth/profile",
+            named_profile("Future: Ultra / 20x"),
+        )]);
+        let directory = tempfile::tempdir().unwrap();
+        let first_window = Cache::at(directory.path());
+        let second_window = Cache::at(directory.path());
+        let expected = identity();
+        let report = reported();
+        let (first, second) = tokio::join!(
+            client.plan(
+                &expected,
+                &report,
+                Some(&first_window),
+                Some("claude:/home")
+            ),
+            client.plan(
+                &expected,
+                &report,
+                Some(&second_window),
+                Some("claude:/home")
+            ),
+        );
+        assert_eq!(
+            first.unwrap().name().as_deref(),
+            Some("Future: Ultra / 20x")
+        );
+        assert_eq!(
+            second.unwrap().name().as_deref(),
+            Some("Future: Ultra / 20x")
+        );
+        server.join().unwrap();
+        // The server is now closed. A force usage refresh or a changed access
+        // token must still use this login's stored result without another GET.
+        client.bearer = "cagents-fixture-refreshed-token".into();
+        let result = client
+            .plan(
+                &expected,
+                &report,
+                Some(&second_window),
+                Some("claude:/home"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.name().as_deref(), Some("Future: Ultra / 20x"));
+        assert_eq!(
+            result.rate_limit_tier.as_deref(),
+            Some("default_claude_max_20x")
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_profile_name_is_cached_and_falls_back_to_current_cli_type() {
+        let mut legacy = profile();
+        legacy["organization"]["organization_type"] = json!("claude_unrelated-type");
+        legacy["organization"]["rate_limit_tier"] = json!("default_claude_max_20x");
+        let (mut client, server) = read_server(vec![("/api/oauth/profile", legacy)]);
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        client.subscription_type = Some("stored-type".into());
+        let first = client
+            .plan(&identity(), &reported(), Some(&cache), Some("claude:/home"))
+            .await
+            .unwrap();
+        assert_eq!(first.name().as_deref(), Some("max"));
+        assert_eq!(first.display_name, None);
+        server.join().unwrap();
+        let next = super::super::super::claude::plan_metadata(
+            &json!({"subscription_type":"future-subscription"}),
+        );
+        assert_eq!(
+            client
+                .plan(&identity(), &next, Some(&cache), Some("claude:/home"))
+                .await
+                .unwrap()
+                .name()
+                .as_deref(),
+            Some("future-subscription")
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_home_and_explicit_login_changes_refresh_profile() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        let key = "claude:/home";
+        let expected = identity();
+        let (client, server) = read_server(vec![("/api/oauth/profile", named_profile("Original"))]);
+        client
+            .plan(&expected, &reported(), Some(&cache), Some(key))
+            .await
+            .unwrap();
+        server.join().unwrap();
+        let mut changed = named_profile("Changed login");
+        changed["account"]["email"] = json!("changed@example.test");
+        let (client, server) = read_server(vec![("/api/oauth/profile", changed)]);
+        let mut changed_identity = identity();
+        changed_identity.email = Some("changed@example.test".into());
+        assert_eq!(
+            client
+                .plan(&changed_identity, &reported(), Some(&cache), Some(key))
+                .await
+                .unwrap()
+                .name()
+                .as_deref(),
+            Some("Changed login")
+        );
+        server.join().unwrap();
+        let mut replacement = named_profile("Recreated home");
+        replacement["account"]["email"] = json!("changed@example.test");
+        let (mut client, server) = read_server(vec![("/api/oauth/profile", replacement)]);
+        client.home_identity = Some((1, 2));
+        assert_eq!(
+            client
+                .plan(&changed_identity, &reported(), Some(&cache), Some(key))
+                .await
+                .unwrap()
+                .name()
+                .as_deref(),
+            Some("Recreated home")
+        );
+        server.join().unwrap();
+        cache
+            .settle(
+                key,
+                Some(super::super::super::cache::Settled::SignedIn { at: 1 }),
+            )
+            .unwrap();
+        let mut relogin = named_profile("Same identity new sign-in");
+        relogin["account"]["email"] = json!("changed@example.test");
+        let (mut client, server) = read_server(vec![("/api/oauth/profile", relogin)]);
+        client.home_identity = Some((1, 2));
+        assert_eq!(
+            client
+                .plan(&changed_identity, &reported(), Some(&cache), Some(key))
+                .await
+                .unwrap()
+                .name()
+                .as_deref(),
+            Some("Same identity new sign-in")
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_or_mismatched_profile_is_not_polled_or_replaced_by_stale_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        let key = "claude:/home";
+        let (client, server) = read_server(vec![("/api/oauth/profile", named_profile("Original"))]);
+        client
+            .plan(&identity(), &reported(), Some(&cache), Some(key))
+            .await
+            .unwrap();
+        server.join().unwrap();
+        let mut changed = identity();
+        changed.email = Some("changed@example.test".into());
+        let (client, server) =
+            read_server(vec![("/api/oauth/profile", named_profile("Wrong login"))]);
+        assert!(
+            client
+                .plan(&changed, &reported(), Some(&cache), Some(key))
+                .await
+                .is_err()
+        );
+        server.join().unwrap();
+        assert!(
+            client
+                .plan(&changed, &reported(), Some(&cache), Some(key))
+                .await
+                .is_err(),
+            "negative result prevents repeated profile requests"
+        );
+        let binding = client.plan_binding(key, &changed);
+        let (_, profile) = cache.plan_profile(key, &binding);
+        let profile = profile.unwrap();
+        assert!(!profile.verified);
+        assert_eq!(profile.display_name, None);
+        assert_eq!(profile.rate_limit_tier, None);
+        // Consumption still checks a fresh profile even when display metadata
+        // is cached. It must never trust this negative or positive record.
+        let (client, server) =
+            read_server(vec![("/api/oauth/profile", named_profile("Wrong login"))]);
+        assert!(client.verify_identity(&changed).await.is_err());
+        server.join().unwrap();
+    }
+    #[tokio::test]
+    async fn profile_metadata_and_consume_verification_require_all_identity_fields() {
         for field in ["email", "organization", "name"] {
-            let mut profile = profile();
+            let mut body = named_profile("Unrelated profile");
             match field {
-                "email" => profile["account"]["email"] = json!("other@example.test"),
+                "email" => body["account"]["email"] = json!("other@example.test"),
                 "organization" => {
-                    profile["organization"]["uuid"] = json!("00000000-0000-4000-8000-000000000002")
+                    body["organization"]["uuid"] = json!("00000000-0000-4000-8000-000000000002")
                 }
-                _ => profile["organization"]["name"] = json!("Other workspace"),
+                _ => body["organization"]["name"] = json!("Other workspace"),
             }
-            profile["organization"]["plan_display_name"] = json!("Unrelated plan");
             let (client, server) = read_server(vec![
-                ("/api/oauth/profile", profile.clone()),
-                ("/api/oauth/profile", profile),
+                ("/api/oauth/profile", body.clone()),
+                ("/api/oauth/profile", body),
             ]);
             assert!(
-                client.plan(&identity(), &Default::default()).await.is_err(),
+                client
+                    .plan(&identity(), &reported(), None, None)
+                    .await
+                    .is_err(),
                 "{field}"
             );
             assert!(
@@ -656,191 +1075,5 @@ mod offer_context_tests {
             );
             server.join().unwrap();
         }
-    }
-
-    #[tokio::test]
-    async fn optional_plan_metadata_falls_back_to_cached_and_cli_subscription() {
-        let (mut client, server) = read_server(vec![
-            ("/api/oauth/profile", profile()),
-            ("/api/oauth/profile", profile()),
-        ]);
-        assert_eq!(
-            client
-                .plan(&identity(), &Default::default())
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("legacy-subscription")
-        );
-        client.subscription_type = Some("future-subscription".into());
-        assert_eq!(
-            client
-                .plan(&identity(), &Default::default())
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("future-subscription")
-        );
-        server.join().unwrap();
-    }
-
-    #[tokio::test]
-    async fn profile_display_name_and_tier_override_cached_legacy_metadata() {
-        let mut explicit = profile();
-        explicit["organization"]["organization_type"] = json!("claude_max");
-        explicit["organization"]["plan_display_name"] = json!("Ultra");
-        // Synthetic matching-family tier exercises generic suffix handling;
-        // it does not claim this is a real provider tier identifier.
-        explicit["organization"]["rate_limit_tier"] = json!("default_claude_ultra_20x");
-        // Confirmed read-only provider shape: Ultra can retain the legacy Max
-        // organization type and tier. That tier must not rename the plan.
-        let mut legacy_alias = profile();
-        legacy_alias["organization"]["plan_display_name"] = json!("Ultra");
-        legacy_alias["organization"]["organization_type"] = json!("claude_max");
-        legacy_alias["organization"]["rate_limit_tier"] = json!("default_claude_max_20x");
-        legacy_alias["organization"]["seat_tier"] = Value::Null;
-        let mut generic = profile();
-        generic["organization"]["organization_type"] = json!("claude_future-subscription");
-        let (mut client, server) = read_server(vec![
-            ("/api/oauth/profile", explicit),
-            ("/api/oauth/profile", legacy_alias),
-            ("/api/oauth/profile", generic),
-        ]);
-        client.subscription_type = Some("max".into());
-        client.rate_limit_tier = Some("default_claude_max_5x".into());
-        assert_eq!(
-            client
-                .plan(&identity(), &Default::default())
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("Ultra 20x")
-        );
-        let reported =
-            super::super::super::claude::plan_metadata(&json!({"subscription_type":"max"}));
-        assert_eq!(
-            client
-                .plan(&identity(), &reported)
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("Ultra")
-        );
-        assert_eq!(
-            client
-                .plan(&identity(), &Default::default())
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("future-subscription")
-        );
-        server.join().unwrap();
-    }
-    #[tokio::test]
-    async fn legacy_profile_types_do_not_downgrade_explicit_reported_plans() {
-        let mut legacy = profile();
-        legacy["organization"]["organization_type"] = json!("claude_max");
-        let mut malformed = legacy.clone();
-        malformed["organization"]["plan_display_name"] = json!("untrusted\nlabel");
-        let cases = [
-            (
-                json!({"subscription_type":"max","plan_display_name":"Ultra","rate_limit_tier":"default_claude_max_20x"}),
-                legacy.clone(),
-                "Ultra",
-            ),
-            (
-                json!({"subscription_type":"future-subscription","rate_limit_tier":"default_claude_future_subscription_17x"}),
-                legacy,
-                "future-subscription 17x",
-            ),
-            (
-                json!({"subscription_type":"max","plan_display_name":"Future Plan"}),
-                malformed,
-                "Future Plan",
-            ),
-        ];
-        let (mut client, server) = read_server(
-            cases
-                .iter()
-                .map(|(_, profile, _)| ("/api/oauth/profile", profile.clone()))
-                .collect(),
-        );
-        client.subscription_type = Some("max".into());
-        client.rate_limit_tier = Some("default_claude_max_5x".into());
-        for (reported, _, expected) in cases {
-            let reported = super::super::super::claude::plan_metadata(&reported);
-            assert_eq!(
-                client
-                    .plan(&identity(), &reported)
-                    .await
-                    .unwrap()
-                    .as_deref(),
-                Some(expected)
-            );
-        }
-        server.join().unwrap();
-    }
-    #[tokio::test]
-    async fn cached_display_requires_verified_profile_and_matching_owner() {
-        let mut legacy = profile();
-        legacy["organization"]["organization_type"] = json!("claude_max");
-        let mut explicit = legacy.clone();
-        explicit["organization"]["plan_display_name"] = json!("Profile Plan");
-        let mut mismatch = legacy.clone();
-        mismatch["account"]["email"] = json!("other@example.test");
-        let cases = [
-            (
-                " FIXTURE@EXAMPLE.TEST ",
-                json!({"subscription_type":"max"}),
-                legacy.clone(),
-                Some("Ultra"),
-            ),
-            (
-                "other@example.test",
-                json!({"subscription_type":"max"}),
-                legacy.clone(),
-                Some("max 5x"),
-            ),
-            (
-                "fixture@example.test",
-                json!({"subscription_type":"max"}),
-                explicit,
-                Some("Profile Plan"),
-            ),
-            (
-                "fixture@example.test",
-                json!({"subscription_type":"max","plan_display_name":"Reported Plan"}),
-                legacy,
-                Some("Reported Plan"),
-            ),
-            (
-                "fixture@example.test",
-                json!({"subscription_type":"max"}),
-                mismatch,
-                None,
-            ),
-        ];
-        let (mut client, server) = read_server(
-            cases
-                .iter()
-                .map(|(_, _, profile, _)| ("/api/oauth/profile", profile.clone()))
-                .collect(),
-        );
-        client.subscription_type = Some("max".into());
-        client.rate_limit_tier = Some("default_claude_max_5x".into());
-        client.plan_display_name = Some("Ultra".into());
-        for (owner, reported, _, expected) in cases {
-            client.plan_email = Some(owner.into());
-            let reported = super::super::super::claude::plan_metadata(&reported);
-            let result = client.plan(&identity(), &reported).await;
-            match expected {
-                Some(expected) => assert_eq!(result.unwrap().as_deref(), Some(expected)),
-                None => assert!(
-                    result.is_err(),
-                    "cached display must not survive profile mismatch"
-                ),
-            }
-        }
-        server.join().unwrap();
     }
 }

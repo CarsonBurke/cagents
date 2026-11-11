@@ -196,7 +196,7 @@ async fn run_reading(
     };
     let probed = tokio::time::timeout(
         TIMEOUT,
-        probe_cli(&account, &program, search_path.as_deref()),
+        probe_cli(&account, &program, search_path.as_deref(), cache.as_ref()),
     )
     .await;
     let mut outcome = match probed {
@@ -423,9 +423,10 @@ async fn probe_cli(
     account: &Account,
     program: &Path,
     search_path: Option<&OsStr>,
+    cache: Option<&Cache>,
 ) -> Result<Probed, String> {
     match account.provider {
-        Provider::Claude => probe_claude_with_path(account, program, search_path).await,
+        Provider::Claude => probe_claude_with_path(account, program, search_path, cache).await,
         Provider::Codex => probe_codex_with_path(account, program, search_path).await,
         Provider::Omp => Err("Omp does not report account usage".into()),
     }
@@ -961,13 +962,14 @@ pub async fn logout(account: Account) -> Result<(), String> {
 /// user's hooks and leaves nothing behind in their history.
 #[cfg(test)]
 async fn probe_claude(account: &Account, program: &Path) -> Result<Probed, String> {
-    probe_claude_with_path(account, program, current_search_path().as_deref()).await
+    probe_claude_with_path(account, program, current_search_path().as_deref(), None).await
 }
 
 async fn probe_claude_with_path(
     account: &Account,
     program: &Path,
     search_path: Option<&OsStr>,
+    cache: Option<&Cache>,
 ) -> Result<Probed, String> {
     let mut status = command_with_path(account, program, search_path);
     status.args(["auth", "status", "--json"]);
@@ -986,6 +988,18 @@ async fn probe_claude_with_path(
         "--disable-slash-commands",
     ]);
     let mut probed = join_claude(run_json(status), claude_usage(usage)).await?;
+    // Identity transitions must invalidate even when this login's adapter
+    // cannot load. Otherwise A -> unavailable B -> A could reuse old A data.
+    if let (Some(cache), Some(key)) = (cache.cloned(), account.cache_key()) {
+        let identity = probed.identity.clone();
+        let signed_out = probed.snapshot.status == UsageStatus::NeedsLogin;
+        tokio::task::spawn_blocking(move || {
+            invalidate_changed_profile(&cache, &key, identity.as_ref(), signed_out)
+        })
+        .await
+        .map_err(|_| "Claude's profile cache could not be updated")?
+        .map_err(|_| "Claude's profile cache could not be updated")?;
+    }
     if confirms_login(probed.identity.as_ref(), probed.snapshot.status) {
         match reset_transport::Client::load(account, program, search_path).await {
             Ok(client) => {
@@ -994,19 +1008,26 @@ async fn probe_claude_with_path(
                 let plan = async {
                     match probed.identity.as_ref() {
                         Some(identity) => client
-                            .plan(identity, &probed.plan_metadata)
+                            .plan(
+                                identity,
+                                &probed.plan_metadata,
+                                cache,
+                                account.cache_key().as_deref(),
+                            )
                             .await
-                            .ok()
-                            .flatten(),
+                            .ok(),
                         None => None,
                     }
                 };
                 let (plan, inventory) = tokio::join!(plan, client.inventory());
-                if let Some(plan) = plan {
+                if let Some(metadata) = plan {
+                    let plan = metadata.name();
                     if let Some(identity) = &mut probed.identity {
-                        identity.plan = Some(plan.clone());
+                        identity.plan = plan.clone();
                     }
-                    probed.snapshot.plan = Some(plan);
+                    probed.snapshot.plan = plan;
+                    probed.snapshot.plan_display_name = metadata.display_name;
+                    probed.snapshot.rate_limit_tier = metadata.rate_limit_tier;
                 }
                 match inventory {
                     Ok(resets) => probed.snapshot.resets = resets,
@@ -1017,11 +1038,47 @@ async fn probe_claude_with_path(
                 }
             }
             Err(_) => {
+                if reset_transport::login_was_removed(account).await
+                    && let (Some(cache), Some(key)) = (cache.cloned(), account.cache_key())
+                {
+                    tokio::task::spawn_blocking(move || cache.invalidate_plan(&key))
+                        .await
+                        .map_err(|_| "Claude's profile cache could not be updated")?
+                        .map_err(|_| "Claude's profile cache could not be updated")?;
+                }
                 probed.snapshot.detail = Some("Reset availability could not be refreshed".into())
             }
         }
     }
     Ok(probed)
+}
+
+fn invalidate_changed_profile(
+    cache: &Cache,
+    key: &str,
+    current: Option<&Identity>,
+    signed_out: bool,
+) -> io::Result<()> {
+    let normalized = |text: Option<&str>| {
+        text.map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_lowercase)
+    };
+    let changed = cache.load(now_ms()).remove(key).is_some_and(|previous| {
+        match (previous.identity.as_ref(), current) {
+            (Some(previous), Some(current)) => {
+                normalized(previous.email.as_deref()) != normalized(current.email.as_deref())
+                    || normalized(previous.organization.as_deref())
+                        != normalized(current.organization.as_deref())
+            }
+            (None, None) => false,
+            _ => true,
+        }
+    });
+    if signed_out || changed {
+        cache.invalidate_plan(key)?;
+    }
+    Ok(())
 }
 
 /// The home whose record of `account`'s login may disagree with the one its
@@ -1159,6 +1216,8 @@ fn finish_claude_probe(
             identity.plan = Some(plan.clone());
         }
         snapshot.plan = Some(plan);
+        snapshot.plan_display_name = plan_metadata.display_name.clone();
+        snapshot.rate_limit_tier = plan_metadata.rate_limit_tier.clone();
     }
     Ok(Probed {
         identity,
@@ -1713,6 +1772,82 @@ mod tests {
             rpc_result(json!({"id": 3, "error": null, "result": 5})),
             Ok(json!(5))
         );
+    }
+
+    #[test]
+    fn observed_identity_transitions_invalidate_profile_before_adapter_availability() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        let key = "claude:/fixture";
+        let binding = "c".repeat(64);
+        let identity = |email: &str, plan: &str| Identity {
+            email: Some(email.into()),
+            plan: Some(plan.into()),
+            ..Identity::default()
+        };
+        let first = identity("fixture@example.test", "max");
+        cache
+            .store(
+                key,
+                Entry {
+                    identity: Some(first.clone()),
+                    snapshot: UsageSnapshot::state(UsageStatus::Ok, "fixture", now_ms()),
+                },
+            )
+            .unwrap();
+        assert!(
+            cache
+                .store_plan_profile(
+                    key,
+                    0,
+                    super::super::cache::PlanProfile::new(
+                        binding.clone(),
+                        true,
+                        Some("Ultra".into()),
+                        None
+                    )
+                )
+                .unwrap()
+        );
+        // Plan changes and capitalization are not a different login.
+        let same = identity("FIXTURE@example.test", "future-subscription");
+        invalidate_changed_profile(&cache, key, Some(&same), false).unwrap();
+        assert!(cache.plan_profile(key, &binding).1.is_some());
+        // B is observed before adapter loading. It may never reach plan().
+        let other = identity("other@example.test", "pro");
+        invalidate_changed_profile(&cache, key, Some(&other), false).unwrap();
+        assert!(cache.plan_profile(key, &binding).1.is_none());
+        assert!(
+            !cache
+                .store_plan_profile(
+                    key,
+                    0,
+                    super::super::cache::PlanProfile::new(
+                        binding.clone(),
+                        true,
+                        Some("Superseded".into()),
+                        None
+                    )
+                )
+                .unwrap()
+        );
+        let epoch = cache.plan_profile(key, &binding).0;
+        assert!(
+            cache
+                .store_plan_profile(
+                    key,
+                    epoch,
+                    super::super::cache::PlanProfile::new(
+                        binding.clone(),
+                        true,
+                        Some("New login".into()),
+                        None
+                    )
+                )
+                .unwrap()
+        );
+        invalidate_changed_profile(&cache, key, None, true).unwrap();
+        assert!(cache.plan_profile(key, &binding).1.is_none());
     }
 
     #[test]

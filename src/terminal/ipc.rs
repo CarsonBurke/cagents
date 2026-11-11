@@ -222,7 +222,8 @@ use crate::{
 /// Version 166 adds a tool status for an agent waiting on its own background
 /// work, which an older client is sent as running.
 /// Version 167 adds reset inventories to account readings and an explicit
-/// account-reset device operation, with JSON-framed refreshed snapshots.
+/// account-reset device operation, with JSON-framed refreshed snapshots and
+/// separate reported plan display names and tier details.
 pub const PROTOCOL_VERSION: u16 = 167;
 /// The install candidate line's protocol. Every message an update exchanges
 /// with its daemon (Connect, the upgrade preview and preparation, and the

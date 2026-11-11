@@ -729,7 +729,7 @@ fn row<'a>(
         .map(|column| {
             let cell = match column {
                 Column::Plan => account.plan().map_or_else(dash, |plan| {
-                    let label = format!("Plan: {plan}");
+                    let label = account.plan_tooltip().expect("plan is present");
                     let badge = crate::ui_controls::bounded_badge(
                         plan,
                         design::Tone::Themed(design::accent_color),
@@ -2075,7 +2075,9 @@ mod tests {
             let account = app.account_ui.account_mut(&id).unwrap();
             account.present = true;
             let mut snapshot = UsageSnapshot::state(UsageStatus::Warning, "", now);
-            snapshot.plan = Some(reported.into());
+            snapshot.plan = Some("max".into());
+            snapshot.plan_display_name = Some(reported.into());
+            snapshot.rate_limit_tier = Some("fixture-rate-tier_999x".into());
             snapshot.windows = vec![UsageWindow {
                 key: "session".into(),
                 kind: account::WindowKind::Session,
@@ -2086,7 +2088,13 @@ mod tests {
                 binding: false,
             }];
             account.snapshot = Some(snapshot);
-            let full_plan = format!("Plan: {}", account.plan().unwrap());
+            assert_eq!(
+                account.plan().as_deref(),
+                Some(reported),
+                "reported casing and punctuation are not reformatted"
+            );
+            let full_plan =
+                format!("Plan: {reported}\nReported rate-limit tier: fixture-rate-tier_999x");
             let size = Size::new(width, 600.0);
             let viewport = Rectangle::with_size(size);
             let mut ui =
@@ -2181,6 +2189,7 @@ mod tests {
                 "Max 20x",
                 "Ultra",
                 "Fixture Horizon",
+                "mAX / EDU · Preview!",
                 "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
             ] {
                 let actual = render(reported, width);

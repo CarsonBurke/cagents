@@ -102,6 +102,8 @@ pub fn parse_rate_limits(result: &Value, observed_at: u64) -> UsageSnapshot {
         observed_at,
         source: UsageSource::Probe,
         plan,
+        plan_display_name: None,
+        rate_limit_tier: None,
         detail,
     }
 }

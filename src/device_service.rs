@@ -39,6 +39,9 @@ pub enum Operation {
     AccountProbe {
         account: crate::account::Account,
         force: bool,
+        /// A sign-in changed this home; discard its cached profile metadata.
+        #[serde(default)]
+        login_changed: bool,
     },
     Discover {
         path: PathBuf,
@@ -259,15 +262,28 @@ pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
             registry,
         } => update_accounts(expected_revision, registry),
         Operation::AccountLogin { account } => account_login(account),
-        Operation::AccountProbe { account, force } => {
+        Operation::AccountProbe {
+            account,
+            force,
+            login_changed,
+        } => {
+            let cache = crate::account::cache::Cache::installation();
+            if login_changed
+                && account.provider == crate::agent::Provider::Claude
+                && let (Some(cache), Some(key)) = (&cache, account.cache_key())
+            {
+                cache
+                    .invalidate_plan(&key)
+                    .map_err(|error| error.to_string())?;
+            }
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .map_err(|error| error.to_string())?;
             let outcome = runtime.block_on(crate::account::probe::run(
                 account,
-                crate::account::cache::Cache::installation(),
-                force,
+                cache,
+                force || login_changed,
             ));
             serde_json::to_value(outcome)
                 .map(Reply::AccountProbe)
@@ -1917,6 +1933,16 @@ fn account_login(account: crate::account::Account) -> Result<Reply, String> {
             .collect(),
     };
     account.bind_home(&mut recipe)?;
+    if account.provider == Provider::Claude
+        && let (Some(cache), Some(key)) = (
+            crate::account::cache::Cache::installation(),
+            account.cache_key(),
+        )
+    {
+        cache
+            .invalidate_plan(&key)
+            .map_err(|error| error.to_string())?;
+    }
     Ok(Reply::Login(recipe))
 }
 
@@ -2062,6 +2088,7 @@ mod wire_tests {
             roundtrip(&Operation::AccountProbe {
                 account,
                 force: true,
+                login_changed: false,
             });
         }
         use crate::account::remote::Operation as Lifecycle;

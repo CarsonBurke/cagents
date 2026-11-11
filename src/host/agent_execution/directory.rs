@@ -703,6 +703,8 @@ mod tests {
             observed_at,
             source: UsageSource::Live,
             plan: None,
+            plan_display_name: None,
+            rate_limit_tier: None,
             detail: None,
         };
         let remaining = RemainingWindow::of(&usage, now);

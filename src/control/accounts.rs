@@ -215,6 +215,9 @@ fn human(report: &Report) -> String {
                 usage.observed_at,
                 if account.stale { " (stale)" } else { "" }
             ));
+            if let Some(tier) = &usage.rate_limit_tier {
+                lines.push(format!("  Reported tier: {tier}"));
+            }
             for remaining in &account.remaining {
                 lines.push(format!(
                     "  {}: {:.0}% remaining; resets {}{}",
