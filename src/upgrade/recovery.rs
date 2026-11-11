@@ -19,6 +19,7 @@ use std::{
     os::{
         fd::{AsRawFd, BorrowedFd, FromRawFd},
         unix::{
+            ffi::OsStrExt,
             fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
             process::CommandExt,
         },
@@ -288,6 +289,8 @@ fn preflight_preparation_size(authority: &Authority) -> Result<(), String> {
             &chats,
             &chats,
             &authority.source,
+            &authority.census.chats,
+            &authority.census.chats,
         ),
         LIMIT as usize - FUTURE_METADATA,
     )?;
@@ -540,6 +543,35 @@ impl Receipt {
         self.daemon.take();
     }
 
+    pub(crate) fn target(&self) -> &Path {
+        &self.authority.target
+    }
+
+    /// Call only after the authenticated successor is Ready and the update's
+    /// final start/retry decisions are complete, while its fences remain held.
+    pub(crate) fn archive_verified(
+        &self,
+        serving: &HostSessionProof,
+        live_terminals: &[crate::terminal_ipc::TerminalDescriptor],
+        live_chats: &[Session],
+    ) -> Result<RecoveryOutcome, String> {
+        let outcome = self.verify(serving, live_terminals, live_chats)?;
+        let store = super::handoff::Store::discover()?;
+        let settled = match classify_retained_prepared(&store.path, self.target())? {
+            Some(settled) => settled,
+            None => archived_discovery(&store.path, self.target())?
+                .ok_or("Verified recovery no longer has its exact Prepared archive record")?,
+        };
+        settled.archive_completed(
+            serving,
+            live_terminals,
+            live_chats,
+            &outcome.paused_terminals,
+            &outcome.paused_chats,
+        )?;
+        Ok(outcome)
+    }
+
     pub(crate) fn inherit(&self, command: &mut Command) -> io::Result<()> {
         forward(
             command,
@@ -566,9 +598,18 @@ impl Receipt {
         let bytes = read_checkpoint(&store.path.with_file_name(name))?
             .ok_or("The recovery daemon has no durable outcome")?;
         let record: RecoveryRecord = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-        let checkpoint = store
-            .read_bytes()?
-            .ok_or("The Prepared checkpoint disappeared after recovery")?;
+        let checkpoint = match store.read_bytes()? {
+            Some(bytes) => bytes,
+            None => {
+                let (_, proof, _) = load_retirement(&store.path, Some(&record.checkpoint_hash))?
+                    .ok_or("The Prepared checkpoint disappeared after recovery")?;
+                if proof.outcome_sha256 != digest(&bytes) {
+                    return Err("Prepared retirement names a different original outcome".into());
+                }
+                read_checkpoint(&proof.archive_path)?
+                    .ok_or("The verified recovery's Prepared archive disappeared")?
+            }
+        };
         if !record.settled
             || record.version != 2
             || record.job != self.authority.job
@@ -588,6 +629,7 @@ impl Receipt {
             );
         }
         record.validate_census()?;
+        record.validate_issued_chats()?;
         let terminals: BTreeSet<_> = live_terminals.iter().map(|item| item.session.id).collect();
         let chats: BTreeSet<_> = live_chats.iter().map(|item| item.id).collect();
         if terminals.len() != live_terminals.len()
@@ -719,15 +761,96 @@ fn verified_chat(
 }
 
 fn recovered_chat(known: &Session, actual: &Session, serving: &HostSessionProof) -> bool {
+    recovered_chat_owner(known, actual, serving, true)
+}
+
+/// Durable display lineage permits only this receipt's matched thin-console
+/// executable substitution. Live adoption still authenticates its real holder.
+fn recovered_chat_at(
+    known: &Session,
+    actual: &Session,
+    serving: &HostSessionProof,
+    target: &Path,
+    exact_thread: bool,
+) -> bool {
+    let mut normalized = actual.clone();
+    if let (Some(before), Some(after)) = (&known.terminal, &mut normalized.terminal)
+        && before.launch.program != after.launch.program
+    {
+        if known.launch.provider != crate::agent::Provider::Claude
+            || !matches!(
+                known.native_continuity,
+                crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 }
+            )
+            || crate::agent_execution::console_agent(&before.launch).is_none()
+            || Path::new(&after.launch.program)
+                != target.with_file_name(crate::companion::Product::Cli.file_name())
+        {
+            return false;
+        }
+        after.launch.program.clone_from(&before.launch.program);
+    }
+    recovered_chat_owner(known, &normalized, serving, exact_thread)
+}
+
+// Ordinary holder authentication may retain the same actor after /clear or a
+// confirmed thread switch. That counts as a live original owner, but never as
+// an alias for the original conversation's captured page.
+fn current_recovered_chat(known: &Session, actual: &Session, serving: &HostSessionProof) -> bool {
+    recovered_chat_owner(known, actual, serving, false)
+}
+
+fn captured_chat_alias(
+    census: &Census,
+    known: &Session,
+    actual: &Session,
+    serving: &HostSessionProof,
+) -> bool {
+    let captured = known.launch.session_id.as_ref().or_else(|| {
+        census
+            .snapshots
+            .iter()
+            .find(|saved| saved.source == *known)
+            .and_then(|saved| saved.snapshot.session_id.as_ref())
+    });
+    captured == actual.launch.session_id.as_ref() && recovered_chat(known, actual, serving)
+}
+
+fn captured_chat_alias_at(
+    census: &Census,
+    known: &Session,
+    actual: &Session,
+    serving: &HostSessionProof,
+    target: &Path,
+) -> bool {
+    let mut bound = known.clone();
+    if bound.launch.session_id.is_none() {
+        bound.launch.session_id = census
+            .snapshots
+            .iter()
+            .find(|saved| saved.source == *known)
+            .and_then(|saved| saved.snapshot.session_id.clone());
+    }
+    bound.launch.session_id == actual.launch.session_id
+        && recovered_chat_at(&bound, actual, serving, target, true)
+}
+
+fn recovered_chat_owner(
+    known: &Session,
+    actual: &Session,
+    serving: &HostSessionProof,
+    exact_thread: bool,
+) -> bool {
     known.id == actual.id
         && actual.proof.as_ref() == Some(serving)
         && known.launch.provider == actual.launch.provider
         && known.launch.recipe == actual.launch.recipe
-        && known
-            .launch
-            .session_id
-            .as_ref()
-            .is_none_or(|id| actual.launch.session_id.as_ref() == Some(id))
+        && (!exact_thread
+            || known
+                .launch
+                .session_id
+                .as_ref()
+                .is_none_or(|id| actual.launch.session_id.as_ref() == Some(id)))
         && known.native_continuity == actual.native_continuity
         && actual.native_continuity.retains_provider()
         && known.owned_codex_listener == actual.owned_codex_listener
@@ -1276,6 +1399,8 @@ pub(crate) struct RecoveryRecord {
     pub census: Census,
     pub adopted_terminals: Vec<TerminalId>,
     pub adopted_chats: Vec<TerminalId>,
+    #[serde(default)]
+    pub adopted_chat_descriptors: Vec<Session>,
     pub paused_terminals: Vec<TerminalId>,
     pub paused_chats: Vec<TerminalId>,
     pub settled: bool,
@@ -1300,75 +1425,13 @@ pub(crate) struct AlreadyRecovered {
     pub census: Census,
     pub paused_terminals: Vec<TerminalId>,
     pub paused_chats: Vec<TerminalId>,
-    target: PathBuf,
-}
-
-impl AlreadyRecovered {
-    /// Saved display lineage for an owner previously adopted by this outcome.
-    /// This comparison neither authenticates a live worker nor permits dispatch.
-    pub(crate) fn history_alias(
-        &self,
-        known: &Session,
-        agent: crate::model::AgentId,
-        candidate: &Session,
-    ) -> bool {
-        let Some(proof) = candidate.proof.as_ref().filter(|proof| proof.is_complete()) else {
-            return false;
-        };
-        if proof.boot_id != self.source.boot_id
-            || self.paused_chats.contains(&known.id)
-            || candidate
-                .launch
-                .session_id
-                .as_ref()
-                .is_some_and(|id| id.is_empty() || id.len() > 1024)
-        {
-            return false;
-        }
-        let original = self
-            .census
-            .chats
-            .iter()
-            .find(|source| source.id == known.id);
-        let Some(original) = original else {
-            return false;
-        };
-        let mut bound = original.clone();
-        if bound.launch.session_id.is_none() {
-            bound.launch.session_id = known.launch.session_id.clone();
-        }
-        if bound != *known {
-            return false;
-        }
-        if known
-            .terminal
-            .as_ref()
-            .and_then(|terminal| crate::agent_execution::console_agent(&terminal.launch))
-            .is_some_and(|owner| owner != agent)
-        {
-            return false;
-        }
-        let mut normalized = candidate.clone();
-        if let (Some(before), Some(after)) = (&known.terminal, &mut normalized.terminal)
-            && before.launch.program != after.launch.program
-        {
-            if known.launch.provider != crate::agent::Provider::Claude
-                || !matches!(
-                    known.native_continuity,
-                    crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 }
-                )
-                || crate::agent_execution::console_agent(&before.launch) != Some(agent)
-                || Path::new(&after.launch.program)
-                    != self
-                        .target
-                        .with_file_name(crate::companion::Product::Cli.file_name())
-            {
-                return false;
-            }
-            after.launch.program.clone_from(&before.launch.program);
-        }
-        recovered_chat(known, &normalized, proof)
-    }
+    pub adopted_chat_descriptors: Vec<Session>,
+    pub adopted_terminals: Vec<TerminalId>,
+    pub adopted_chats: Vec<TerminalId>,
+    checkpoint_path: PathBuf,
+    daemon_binary: PathBuf,
+    checkpoint_hash: String,
+    outcome_hash: String,
 }
 
 /// Recognize a completed recovery without changing its retained checkpoint.
@@ -1400,37 +1463,11 @@ pub(crate) fn classify_retained_prepared(
         "Prepared checkpoint has no matching settled recovery record; evidence was preserved",
     )?;
     let record: RecoveryRecord = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-    let job = uuid::Uuid::parse_str(&record.job).map_err(|e| e.to_string())?;
+    validate_settled_record(&record, checkpoint_path, daemon_binary)?;
+    if record.checkpoint_hash != hash || record.source != index.proof {
+        return Err("Settled recovery does not match the exact Prepared checkpoint".into());
+    }
     let target = fs::canonicalize(daemon_binary).map_err(|e| e.to_string())?;
-    if record.version != 2
-        || !record.settled
-        || job.to_string() != record.job
-        || record.checkpoint_hash != hash
-        || record.source != index.proof
-        || record.successor.as_ref().is_none_or(|proof| {
-            !proof.is_complete()
-                || proof == &record.source
-                || proof.boot_id != record.source.boot_id
-        })
-        || record.target != target
-        || target.file_name().is_none_or(|name| name != "cagentsd")
-        || executable_hash(&target)? != record.target_hash
-    {
-        return Err("Prepared checkpoint has no exact settled recovery for this daemon; evidence was preserved".into());
-    }
-    validate_reviewed(&record.reviewed, &record.source, &record.request_identity)?;
-    record.census.validate_evidence(&record.source)?;
-    record.validate_census()?;
-    let layout = crate::update::locate(&target).map_err(|e| e.to_string())?;
-    let state = layout.prefix.join(".update");
-    validate_private_directory(&state)?;
-    let request = read_checkpoint(&state.join(format!("{}.request", record.job)))?
-        .ok_or("Settled recovery's original update request disappeared")?;
-    if digest(&request) != record.job_request_hash {
-        return Err(
-            "Settled recovery's original update request changed; evidence was preserved".into(),
-        );
-    }
     let authority = Authority {
         version: 1,
         job: record.job.clone(),
@@ -1452,18 +1489,560 @@ pub(crate) fn classify_retained_prepared(
         legacy_path: PathBuf::new(),
         daemon_path: PathBuf::new(),
         target: target.clone(),
-        target_hash: record.target_hash,
+        target_hash: record.target_hash.clone(),
     };
     if validate_checkpoint(&authority, &checkpoint)? != "Prepared" {
         return Err("Settled recovery no longer names a Prepared checkpoint".into());
     }
-    Ok(Some(AlreadyRecovered {
+    let additional = match load_retirement(checkpoint_path, Some(&record.checkpoint_hash))? {
+        Some((retired, proof, _)) => {
+            if proof.outcome_sha256 != digest(&bytes) {
+                return Err("Planned retirement changed the original outcome".into());
+            }
+            retired.adopted_chat_descriptors
+        }
+        None => Vec::new(),
+    };
+    Ok(Some(recovered_data(
+        record,
+        checkpoint_path,
+        target,
+        additional,
+        digest(&bytes),
+    )))
+}
+
+const ACTIVE_RECOVERY: &str = "daemon-upgrade.recovered.json";
+
+#[derive(Serialize, Deserialize)]
+struct ActiveRecovery {
+    version: u16,
+    checkpoint_hash: String,
+    retirement_hash: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Retirement {
+    version: u16,
+    checkpoint_hash: String,
+    outcome_hash: String,
+    source: HostSessionProof,
+    job: String,
+    request_identity: String,
+    archive_path: PathBuf,
+    adopted_chat_descriptors: Vec<Session>,
+    previous: Option<String>,
+}
+
+/// Read-only evidence for an independent verifier. Neither the retirement nor
+/// the archived checkpoint grants replay, lease transfer, or adoption authority.
+#[derive(Clone, Debug)]
+pub(crate) struct ArchiveProof {
+    pub archive_path: PathBuf,
+    pub checkpoint_sha256: String,
+    pub outcome_path: PathBuf,
+    pub outcome_sha256: String,
+    pub retirement_path: PathBuf,
+    pub retirement_sha256: String,
+}
+
+fn archive_path(checkpoint: &Path, hash: &str) -> PathBuf {
+    checkpoint.with_file_name(format!("daemon-upgrade.prepared.{hash}.json"))
+}
+fn retirement_path(checkpoint: &Path, hash: &str) -> PathBuf {
+    checkpoint.with_file_name(format!("daemon-upgrade.retirement.{hash}.json"))
+}
+
+fn load_retirement(
+    checkpoint: &Path,
+    expected: Option<&str>,
+) -> Result<Option<(Retirement, ArchiveProof, RecoveryRecord)>, String> {
+    let Some(bytes) = read_checkpoint(&checkpoint.with_file_name(ACTIVE_RECOVERY))? else {
+        return Ok(None);
+    };
+    validate_private_directory(
+        checkpoint
+            .parent()
+            .ok_or("Recovery storage has no directory")?,
+    )?;
+    #[derive(Deserialize)]
+    struct Scope {
+        checkpoint_hash: String,
+    }
+    let scope: Scope = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    if expected.is_some_and(|hash| hash != scope.checkpoint_hash) {
+        return Ok(None);
+    }
+    let active: ActiveRecovery = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    if active.version != 2
+        || !valid_hash(&active.checkpoint_hash)
+        || !valid_hash(&active.retirement_hash)
+    {
+        return Err("Active retirement pointer has an invalid identity".into());
+    }
+    let path = retirement_path(checkpoint, &active.retirement_hash);
+    let bytes = read_checkpoint(&path)?.ok_or("Active immutable retirement record disappeared")?;
+    if digest(&bytes) != active.retirement_hash {
+        return Err("Immutable retirement record changed".into());
+    }
+    let retired: Retirement = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    if retired.version != 1
+        || retired.checkpoint_hash != active.checkpoint_hash
+        || !valid_hash(&retired.outcome_hash)
+        || retired
+            .previous
+            .as_ref()
+            .is_some_and(|hash| !valid_hash(hash))
+        || retired.archive_path != archive_path(checkpoint, &active.checkpoint_hash)
+    {
+        return Err("Active retirement has a mismatched archive identity".into());
+    }
+    let outcome_path = checkpoint.with_file_name(recovery_name(&active.checkpoint_hash));
+    let bytes =
+        read_checkpoint(&outcome_path)?.ok_or("Retirement's original outcome disappeared")?;
+    if digest(&bytes) != retired.outcome_hash {
+        return Err("Retirement's immutable original outcome changed".into());
+    }
+    let record: RecoveryRecord = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    if record.checkpoint_hash != retired.checkpoint_hash
+        || record.source != retired.source
+        || record.job != retired.job
+        || record.request_identity != retired.request_identity
+    {
+        return Err("Retirement names a different original recovery outcome".into());
+    }
+    record.validate_additional_issued_chats(&retired.adopted_chat_descriptors)?;
+    let proof = ArchiveProof {
+        archive_path: retired.archive_path.clone(),
+        checkpoint_sha256: retired.checkpoint_hash.clone(),
+        outcome_path,
+        outcome_sha256: retired.outcome_hash.clone(),
+        retirement_path: path,
+        retirement_sha256: active.retirement_hash,
+    };
+    Ok(Some((retired, proof, record)))
+}
+
+/// Metadata only; a single active retirement selects historical candidates for
+/// ordinary authenticated holder discovery. Any canonical checkpoint suppresses
+/// these hints, and another source's explicit stop always takes precedence.
+pub(crate) fn archived_discovery(
+    checkpoint: &Path,
+    daemon: &Path,
+) -> Result<Option<AlreadyRecovered>, String> {
+    match fs::symlink_metadata(checkpoint) {
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    let Some((retired, proof, record)) = load_retirement(checkpoint, None)? else {
+        return Ok(None);
+    };
+    let target = fs::canonicalize(daemon).map_err(|e| e.to_string())?;
+    if record.target != target {
+        return Ok(None);
+    }
+    validate_settled_record(&record, checkpoint, &target)?;
+    Ok(Some(recovered_data(
+        record,
+        checkpoint,
+        target,
+        retired.adopted_chat_descriptors,
+        proof.outcome_sha256,
+    )))
+}
+
+/// Discover retirement metadata without completing retirement or granting
+/// execution authority. A canonical Prepared checkpoint keeps its strict
+/// classifier; only its absence permits archived metadata discovery.
+pub(crate) fn pending_retirement(
+    checkpoint: &Path,
+    daemon: &Path,
+) -> Result<Option<AlreadyRecovered>, String> {
+    match classify_retained_prepared(checkpoint, daemon)? {
+        Some(recovered) => Ok(Some(recovered)),
+        None => archived_discovery(checkpoint, daemon),
+    }
+}
+
+/// Return read-only planned retirement evidence. The caller must independently
+/// read and hash every named file to prove that the archive move completed.
+/// A pointer for a different installed daemon version is unrelated history.
+pub(crate) fn archived_proof(
+    checkpoint: &Path,
+    daemon: &Path,
+) -> Result<Option<ArchiveProof>, String> {
+    let Some((_, proof, record)) = load_retirement(checkpoint, None)? else {
+        return Ok(None);
+    };
+    let target = fs::canonicalize(daemon).map_err(|e| e.to_string())?;
+    if record.target != target {
+        return Ok(None);
+    }
+    validate_settled_record(&record, checkpoint, &target)?;
+    Ok(Some(proof))
+}
+
+fn recovered_data(
+    record: RecoveryRecord,
+    checkpoint: &Path,
+    target: PathBuf,
+    additional: Vec<Session>,
+    outcome_hash: String,
+) -> AlreadyRecovered {
+    let mut descriptors = record.adopted_chat_descriptors;
+    descriptors.extend(additional);
+    AlreadyRecovered {
         source: record.source,
         census: record.census,
         paused_terminals: record.paused_terminals,
         paused_chats: record.paused_chats,
-        target,
-    }))
+        adopted_chat_descriptors: descriptors,
+        adopted_terminals: record.adopted_terminals,
+        adopted_chats: record.adopted_chats,
+        checkpoint_path: checkpoint.to_owned(),
+        daemon_binary: target,
+        checkpoint_hash: record.checkpoint_hash,
+        outcome_hash,
+    }
+}
+
+impl AlreadyRecovered {
+    /// Validate fresh authenticated owners and the complete current live/paused
+    /// partition without changing the checkpoint, original outcome or metadata.
+    /// This mechanical check does not establish RootCensus Usable.
+    pub(crate) fn validate_current_inventory(
+        &self,
+        serving: &HostSessionProof,
+        live_terminals: &[crate::terminal_ipc::TerminalDescriptor],
+        live_chats: &[Session],
+        paused_terminals: &[TerminalId],
+        paused_chats: &[TerminalId],
+    ) -> Result<(), String> {
+        if !serving.is_complete() {
+            return Err("Recovery archival requires the serving daemon proof".into());
+        }
+        let current = match classify_retained_prepared(&self.checkpoint_path, &self.daemon_binary)?
+        {
+            Some(current) => current,
+            None => archived_discovery(&self.checkpoint_path, &self.daemon_binary)?
+                .ok_or("Recovery archival no longer has its exact settled record")?,
+        };
+        if current.checkpoint_hash != self.checkpoint_hash
+            || current.source != self.source
+            || current.census != self.census
+            || current.outcome_hash != self.outcome_hash
+        {
+            return Err("The settled recovery changed before archival".into());
+        }
+        let terminal_ids = self.census.terminal_ids();
+        let chat_ids: BTreeSet<_> = self.census.chats.iter().map(|chat| chat.id).collect();
+        let mut terminals = BTreeSet::new();
+        let mut chats = BTreeSet::new();
+        for actual in live_terminals
+            .iter()
+            .filter(|item| terminal_ids.contains(&item.session.id))
+        {
+            if current.paused_terminals.contains(&actual.session.id)
+                || !terminals.insert(actual.session.id)
+                || !verified_terminal(&self.census, actual, serving, &self.daemon_binary)
+            {
+                return Err(
+                    "Recovery archival found a changed or duplicate original terminal owner".into(),
+                );
+            }
+        }
+        for actual in live_chats.iter().filter(|item| chat_ids.contains(&item.id)) {
+            if current.paused_chats.contains(&actual.id)
+                || !chats.insert(actual.id)
+                || !self.census.chats.iter().any(|known| {
+                    recovered_chat_at(known, actual, serving, &self.daemon_binary, false)
+                })
+            {
+                return Err(
+                    "Recovery archival found a changed or duplicate original conversation owner"
+                        .into(),
+                );
+            }
+        }
+        fn accounted(
+            expected: &BTreeSet<TerminalId>,
+            live: &BTreeSet<TerminalId>,
+            paused: &[TerminalId],
+        ) -> bool {
+            let missing: BTreeSet<_> = paused.iter().copied().collect();
+            missing.len() == paused.len()
+                && live.is_disjoint(&missing)
+                && live.union(&missing).copied().collect::<BTreeSet<_>>() == *expected
+        }
+        if !accounted(&terminal_ids, &terminals, paused_terminals)
+            || !accounted(&chat_ids, &chats, paused_chats)
+        {
+            return Err("Recovery archival requires every original owner to be currently authenticated or durably paused, without overlap".into());
+        }
+        let sidecar = self
+            .checkpoint_path
+            .with_file_name(recovery_name(&self.checkpoint_hash));
+        let bytes = read_checkpoint(&sidecar)?
+            .ok_or("Settled recovery record disappeared before archival")?;
+        if digest(&bytes) != self.outcome_hash {
+            return Err("Original settled outcome changed before completion".into());
+        }
+        let record: RecoveryRecord = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        validate_settled_record(&record, &self.checkpoint_path, &self.daemon_binary)?;
+        Ok(())
+    }
+
+    /// Complete archival only after the caller's fresh RootCensus reports
+    /// Usable, following ordinary authenticated adoption, paused history
+    /// restoration, and Ready. The live/paused counts below are mechanical
+    /// safety checks; they do not establish that the user's recovery succeeded.
+    /// Unrelated owners created since the original recovery are left alone.
+    pub(crate) fn archive_completed(
+        &self,
+        serving: &HostSessionProof,
+        live_terminals: &[crate::terminal_ipc::TerminalDescriptor],
+        live_chats: &[Session],
+        paused_terminals: &[TerminalId],
+        paused_chats: &[TerminalId],
+    ) -> Result<(), String> {
+        self.validate_current_inventory(
+            serving,
+            live_terminals,
+            live_chats,
+            paused_terminals,
+            paused_chats,
+        )?;
+        let current = pending_retirement(&self.checkpoint_path, &self.daemon_binary)?
+            .ok_or("Recovery completion no longer has its exact settled record")?;
+        if current.checkpoint_hash != self.checkpoint_hash
+            || current.outcome_hash != self.outcome_hash
+        {
+            return Err("The settled recovery changed before archival".into());
+        }
+        let sidecar = self
+            .checkpoint_path
+            .with_file_name(recovery_name(&self.checkpoint_hash));
+        let bytes = read_checkpoint(&sidecar)?
+            .ok_or("Settled recovery record disappeared before archival")?;
+        if digest(&bytes) != self.outcome_hash {
+            return Err("Original settled outcome changed before completion".into());
+        }
+        let record: RecoveryRecord = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        validate_settled_record(&record, &self.checkpoint_path, &self.daemon_binary)?;
+        let chats: BTreeSet<_> = live_chats.iter().map(|chat| chat.id).collect();
+        let mut additional = current.adopted_chat_descriptors;
+        additional.retain(|chat| !record.adopted_chat_descriptors.contains(chat));
+        for chat in live_chats.iter().filter(|chat| {
+            chats.contains(&chat.id)
+                && record.census.chats.iter().any(|known| {
+                    captured_chat_alias_at(&record.census, known, chat, serving, &record.target)
+                })
+        }) {
+            if !record.adopted_chat_descriptors.contains(chat) && !additional.contains(chat) {
+                additional.push(chat.clone());
+            }
+        }
+        record.validate_additional_issued_chats(&additional)?;
+        commit_archive(&self.checkpoint_path, &record, &bytes, additional)
+    }
+}
+
+fn valid_hash(hash: &str) -> bool {
+    hash.len() == 64
+        && hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn atomic_metadata(path: &Path, value: &impl Serialize) -> Result<(), String> {
+    let directory = path.parent().ok_or("Recovery metadata has no directory")?;
+    validate_private_directory(directory)?;
+    // Refuse unsafe existing entries rather than replacing a symlink or a
+    // multiply linked file, even though rename itself would not follow it.
+    read_checkpoint(path)?;
+    encoded_size(value, LIMIT as usize)?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".recovery-")
+        .permissions(fs::Permissions::from_mode(0o600))
+        .tempfile_in(directory)
+        .map_err(|e| e.to_string())?;
+    serde_json::to_writer(temporary.as_file_mut(), value).map_err(|e| e.to_string())?;
+    temporary.as_file().sync_all().map_err(|e| e.to_string())?;
+    temporary.persist(path).map_err(|e| e.to_string())?;
+    sync_directory(directory)
+}
+
+fn sync_directory(directory: &Path) -> Result<(), String> {
+    File::open(directory)
+        .and_then(|file| file.sync_all())
+        .map_err(|e| e.to_string())
+}
+
+fn commit_archive(
+    checkpoint: &Path,
+    record: &RecoveryRecord,
+    outcome: &[u8],
+    additional: Vec<Session>,
+) -> Result<(), String> {
+    let archive = archive_path(checkpoint, &record.checkpoint_hash);
+    let prior = load_retirement(checkpoint, Some(&record.checkpoint_hash))?;
+    let current = read_checkpoint(checkpoint)?;
+    if let Some(bytes) = &current {
+        if digest(bytes) != record.checkpoint_hash {
+            return Err(
+                "Prepared checkpoint changed before archival; all evidence was preserved".into(),
+            );
+        }
+        if fs::symlink_metadata(&archive).is_ok() {
+            return Err(
+                "Prepared archive destination already exists; no checkpoint was moved".into(),
+            );
+        }
+    } else {
+        let (_, proof, _) = prior
+            .as_ref()
+            .ok_or("Prepared checkpoint has no matching immutable retirement")?;
+        let bytes = read_checkpoint(&archive)?
+            .ok_or("Prepared checkpoint and its archive are both missing")?;
+        if proof.outcome_sha256 != digest(outcome) || digest(&bytes) != record.checkpoint_hash {
+            return Err("Prepared archive does not match its immutable original outcome".into());
+        }
+    }
+    let previous = prior
+        .as_ref()
+        .map(|(_, proof, _)| proof.retirement_sha256.clone());
+    let same = prior
+        .as_ref()
+        .is_some_and(|(retired, _, _)| retired.adopted_chat_descriptors == additional);
+    let retirement_hash = if same {
+        previous.unwrap()
+    } else {
+        let retired = Retirement {
+            version: 1,
+            checkpoint_hash: record.checkpoint_hash.clone(),
+            outcome_hash: digest(outcome),
+            source: record.source.clone(),
+            job: record.job.clone(),
+            request_identity: record.request_identity.clone(),
+            archive_path: archive.clone(),
+            adopted_chat_descriptors: additional,
+            previous,
+        };
+        encoded_size(&retired, LIMIT as usize)?;
+        let bytes = serde_json::to_vec(&retired).map_err(|e| e.to_string())?;
+        let hash = digest(&bytes);
+        let path = retirement_path(checkpoint, &hash);
+        match read_checkpoint(&path)? {
+            Some(existing) if existing == bytes => {}
+            Some(_) => {
+                return Err("Immutable retirement destination contains different bytes".into());
+            }
+            None => {
+                let directory = path.parent().ok_or("Retirement has no directory")?;
+                let mut file = tempfile::Builder::new()
+                    .prefix(".retirement-")
+                    .permissions(fs::Permissions::from_mode(0o600))
+                    .tempfile_in(directory)
+                    .map_err(|e| e.to_string())?;
+                file.write_all(&bytes)
+                    .and_then(|()| file.as_file().sync_all())
+                    .map_err(|e| e.to_string())?;
+                if let Err(error) = file.persist_noclobber(&path) {
+                    if read_checkpoint(&path)?.as_deref() != Some(&bytes) {
+                        return Err(error.to_string());
+                    }
+                }
+                sync_directory(directory)?;
+            }
+        }
+        hash
+    };
+    // Only the active pointer is mutable. The original settled outcome and all
+    // content-addressed retirement generations remain byte-for-byte unchanged.
+    if read_checkpoint(&checkpoint.with_file_name(recovery_name(&record.checkpoint_hash)))?
+        .as_deref()
+        != Some(outcome)
+    {
+        return Err("Original settled outcome changed before archival".into());
+    }
+    atomic_metadata(
+        &checkpoint.with_file_name(ACTIVE_RECOVERY),
+        &ActiveRecovery {
+            version: 2,
+            checkpoint_hash: record.checkpoint_hash.clone(),
+            retirement_hash,
+        },
+    )?;
+    if let Some(bytes) = current {
+        if read_checkpoint(checkpoint)?.as_ref() != Some(&bytes) {
+            return Err(
+                "Prepared checkpoint changed during archival; no checkpoint was moved".into(),
+            );
+        }
+        let from =
+            std::ffi::CString::new(checkpoint.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+        let to =
+            std::ffi::CString::new(archive.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+        if unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                from.as_ptr(),
+                libc::AT_FDCWD,
+                to.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error().to_string());
+        }
+    }
+    sync_directory(
+        checkpoint
+            .parent()
+            .ok_or("Recovery storage has no directory")?,
+    )
+}
+
+fn validate_settled_record(
+    record: &RecoveryRecord,
+    _checkpoint_path: &Path,
+    daemon_binary: &Path,
+) -> Result<(), String> {
+    let job = uuid::Uuid::parse_str(&record.job).map_err(|e| e.to_string())?;
+    let target = fs::canonicalize(daemon_binary).map_err(|e| e.to_string())?;
+    if record.version != 2
+        || !record.settled
+        || job.to_string() != record.job
+        || record.successor.as_ref().is_none_or(|proof| {
+            !proof.is_complete()
+                || proof == &record.source
+                || proof.boot_id != record.source.boot_id
+        })
+        || record.target != target
+        || target.file_name().is_none_or(|name| name != "cagentsd")
+        || executable_hash(&target)? != record.target_hash
+    {
+        return Err("Prepared checkpoint has no exact settled recovery for this daemon; evidence was preserved".into());
+    }
+    validate_reviewed(&record.reviewed, &record.source, &record.request_identity)?;
+    record.census.validate_evidence(&record.source)?;
+    record.validate_census()?;
+    record.validate_issued_chats()?;
+    let layout = crate::update::locate(&target).map_err(|e| e.to_string())?;
+    let state = layout.prefix.join(".update");
+    validate_private_directory(&state)?;
+    let request = read_checkpoint(&state.join(format!("{}.request", record.job)))?
+        .ok_or("Settled recovery's original update request disappeared")?;
+    if digest(&request) != record.job_request_hash {
+        return Err(
+            "Settled recovery's original update request changed; evidence was preserved".into(),
+        );
+    }
+    if !valid_hash(&record.checkpoint_hash) {
+        return Err("Settled recovery has an invalid checkpoint or archive identity".into());
+    }
+    Ok(())
 }
 
 fn validate_private_directory(path: &Path) -> Result<(), String> {
@@ -1500,6 +2079,58 @@ fn validate_reviewed(
 }
 
 impl RecoveryRecord {
+    fn validate_issued_chats(&self) -> Result<(), String> {
+        self.validate_additional_issued_chats(&[])
+    }
+    fn validate_additional_issued_chats(&self, additional: &[Session]) -> Result<(), String> {
+        let mut issued = BTreeSet::new();
+        for (descriptor, later) in self
+            .adopted_chat_descriptors
+            .iter()
+            .map(|chat| (chat, false))
+            .chain(additional.iter().map(|chat| (chat, true)))
+        {
+            let proof = descriptor
+                .proof
+                .as_ref()
+                .ok_or("Recovered chat alias has no issued host proof")?;
+            if !proof.is_complete()
+                || (!later && self.successor.as_ref() != Some(proof))
+                || proof.boot_id != self.source.boot_id
+                || !self.adopted_chats.contains(&descriptor.id)
+                || !self
+                    .census
+                    .chats
+                    .iter()
+                    .any(|known| recovered_chat_at(known, descriptor, proof, &self.target, true))
+                || later
+                    && !self.census.chats.iter().any(|known| {
+                        captured_chat_alias_at(&self.census, known, descriptor, proof, &self.target)
+                    })
+                || !issued.insert((
+                    descriptor.id,
+                    digest(&serde_json::to_vec(proof).map_err(|e| e.to_string())?),
+                ))
+            {
+                return Err(
+                    "Recovery chat descriptor changed its original owner or issued host proof"
+                        .into(),
+                );
+            }
+        }
+        if self.adopted_chats.iter().any(|id| {
+            !self
+                .adopted_chat_descriptors
+                .iter()
+                .any(|chat| chat.id == *id)
+        }) {
+            return Err(
+                "Recovery lacks the exact issued descriptor for an adopted conversation".into(),
+            );
+        }
+        Ok(())
+    }
+
     fn validate_census(&self) -> Result<(), String> {
         fn complete(
             expected: BTreeSet<TerminalId>,
@@ -1604,6 +2235,7 @@ pub(crate) fn take_for_host() -> Result<Option<RecoveryRecord>, String> {
         census: authority.census,
         adopted_terminals: Vec::new(),
         adopted_chats: Vec::new(),
+        adopted_chat_descriptors: Vec::new(),
         paused_terminals: Vec::new(),
         paused_chats: Vec::new(),
         settled: false,
@@ -1721,6 +2353,7 @@ impl RecoveryRecord {
         self.validate_continuity()?;
         self.validate_census()?;
         self.successor = Some(successor.clone());
+        self.validate_issued_chats()?;
         self.settled = true;
         self.save()?;
         drop(self.authority.take());
@@ -2489,65 +3122,17 @@ mod tests {
             target
         ));
         assert!(!verified_chat(&census, &chat, &serving, &[], target));
-
-        let settled = AlreadyRecovered {
-            source: preparation.authority.source.clone(),
-            census: census.clone(),
-            paused_terminals: Vec::new(),
-            paused_chats: Vec::new(),
-            target: target.to_owned(),
-        };
-        let agent = crate::agent_execution::console_agent(&known.launch).unwrap();
-        assert!(settled.history_alias(&source, agent, &chat));
-        let invalid: [fn(&mut Session); 9] = [
-            |chat| chat.launch.session_id = Some("unrelated-thread".into()),
-            |chat| chat.proof = None,
-            |chat| chat.id = TerminalId::new(),
-            |chat| chat.launch.recipe.arguments.push("different".into()),
-            |chat| chat.terminal.as_mut().unwrap().launch.program = "/wrong/bin/cagents".into(),
-            |chat| {
-                chat.terminal
-                    .as_mut()
-                    .unwrap()
-                    .launch
-                    .arguments
-                    .push("different".into())
-            },
-            |chat| {
-                chat.terminal
-                    .as_mut()
-                    .unwrap()
-                    .launch
-                    .working_directory
-                    .push("different")
-            },
-            |chat| {
-                chat.terminal
-                    .as_mut()
-                    .unwrap()
-                    .launch
-                    .environment
-                    .insert("OTHER".into(), "value".into());
-            },
-            |chat| {
-                chat.terminal
-                    .as_mut()
-                    .unwrap()
-                    .launch
-                    .unset_environment
-                    .insert("OTHER".into());
-            },
-        ];
-        for mutate in invalid {
-            let mut changed = chat.clone();
-            mutate(&mut changed);
-            assert!(!settled.history_alias(&source, agent, &changed));
-        }
-        assert!(!settled.history_alias(&source, crate::model::AgentId::new(), &chat));
-        let mut unchanged_program = chat.clone();
-        unchanged_program.terminal.as_mut().unwrap().launch.program = known.launch.program.clone();
-        assert!(settled.history_alias(&source, agent, &unchanged_program));
-        assert!(!settled.history_alias(&source, crate::model::AgentId::new(), &unchanged_program));
+        assert!(recovered_chat_at(&source, &chat, &serving, target, true));
+        assert!(captured_chat_alias_at(
+            &census, &source, &chat, &serving, target
+        ));
+        assert!(!recovered_chat_at(
+            &source,
+            &chat,
+            &serving,
+            Path::new("/unrelated/bin/cagentsd"),
+            true
+        ));
 
         let mut changed = actual.clone();
         changed.upgrade_relaunches.clear();
@@ -2585,6 +3170,15 @@ mod tests {
             mutate(&mut changed.session.launch);
             changed.upgrade_relaunches[0].recipe = changed.session.launch.clone();
             assert!(!verified_terminal(&census, &changed, &serving, target));
+            let mut changed_chat = chat.clone();
+            changed_chat.terminal = Some(changed.session);
+            assert!(!recovered_chat_at(
+                &source,
+                &changed_chat,
+                &serving,
+                target,
+                true
+            ));
         }
         let mut unpaired = census.clone();
         unpaired.chats.clear();
@@ -2627,6 +3221,7 @@ mod tests {
             census: preparation.authority.census.clone(),
             adopted_terminals: Vec::new(),
             adopted_chats: Vec::new(),
+            adopted_chat_descriptors: Vec::new(),
             paused_terminals: vec![terminal.id],
             paused_chats: Vec::new(),
             settled: false,
@@ -2674,6 +3269,239 @@ mod tests {
             "paired console adoption is part of the original chat's census"
         );
     }
+    #[test]
+    fn issued_chat_aliases_bind_the_original_allocation_and_each_serving_proof() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let preparation = preparation(root.path());
+        let terminal = &preparation.authority.census.terminals[0];
+        let known = Session {
+            id: terminal.id,
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Codex,
+                recipe: crate::model::LaunchRecipe {
+                    program: "/offline/codex".into(),
+                    ..terminal.launch.clone()
+                },
+                session_id: Some("11111111-1111-4111-8111-111111111111".into()),
+            },
+            proof: Some(preparation.authority.source.clone()),
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: crate::chat::NativeContinuity::Durable {
+                provider_version: "fixture".into(),
+            },
+        };
+        let mut issued = known.clone();
+        issued.proof.as_mut().unwrap().host_incarnation = HostIncarnation::new("first-successor");
+        let mut later = issued.clone();
+        later.proof.as_mut().unwrap().host_incarnation = HostIncarnation::new("later-successor");
+        let mut record = RecoveryRecord {
+            version: 2,
+            job: preparation.authority.job.clone(),
+            request_identity: String::new(),
+            job_request_hash: String::new(),
+            reviewed: preparation.authority.reviewed.clone(),
+            target: PathBuf::new(),
+            source: preparation.authority.source.clone(),
+            checkpoint_hash: String::new(),
+            census: Census {
+                chats: vec![known],
+                ..Default::default()
+            },
+            adopted_terminals: Vec::new(),
+            adopted_chats: vec![issued.id],
+            adopted_chat_descriptors: vec![issued.clone()],
+            paused_terminals: Vec::new(),
+            paused_chats: Vec::new(),
+            settled: true,
+            successor: issued.proof.clone(),
+            target_hash: String::new(),
+            #[cfg(feature = "host")]
+            authority: None,
+        };
+        record.adopted_chat_descriptors = vec![issued.clone()];
+        record.validate_issued_chats().unwrap();
+        record
+            .validate_additional_issued_chats(&[later.clone()])
+            .unwrap();
+        record.adopted_chat_descriptors = vec![later.clone()];
+        assert!(
+            record.validate_issued_chats().is_err(),
+            "original outcome descriptors must use its original successor proof"
+        );
+        record.adopted_chat_descriptors = vec![issued.clone()];
+        for mutation in ["thread", "recipe", "boot", "proof", "duplicate"] {
+            let mut additional = vec![later.clone()];
+            match mutation {
+                "thread" => additional[0].launch.session_id = Some("unrelated".into()),
+                "recipe" => additional[0]
+                    .launch
+                    .recipe
+                    .arguments
+                    .push("different".into()),
+                "boot" => additional[0].proof.as_mut().unwrap().boot_id = BootId::new("other-boot"),
+                "proof" => additional[0].proof = None,
+                "duplicate" => additional.push(issued.clone()),
+                _ => unreachable!(),
+            }
+            assert!(
+                record
+                    .validate_additional_issued_chats(&additional)
+                    .is_err(),
+                "accepted changed {mutation}"
+            );
+        }
+        record.adopted_chat_descriptors.clear();
+        assert!(
+            record.validate_issued_chats().is_err(),
+            "adopted owners need their exact original descriptor"
+        );
+        record.adopted_chat_descriptors = vec![issued.clone()];
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let bin = root.path().join("install/versions/fixture/bin");
+        fs::create_dir_all(&bin).unwrap();
+        let prefix = root.path().join("install");
+        fs::write(
+            prefix.join(".cagents-install-root"),
+            "cagents install root\n",
+        )
+        .unwrap();
+        for executable in ["cagents", "cagents-ui", "cagentsd"] {
+            fs::write(bin.join(executable), "private fake binary").unwrap();
+        }
+        let target = fs::canonicalize(bin.join("cagentsd")).unwrap();
+        let state = prefix.join(".update");
+        fs::create_dir(&state).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+        let request = b"original immutable native update request";
+        save(&state.join(format!("{}.request", record.job)), request);
+        record.reviewed.sessions[0].kind = SessionKind::NativeChat;
+        record.request_identity = digest(&serde_json::to_vec(&record.reviewed).unwrap());
+        record.job_request_hash = digest(request);
+        record.target = target.clone();
+        record.target_hash = executable_hash(&target).unwrap();
+        let known = record.census.chats[0].clone();
+        let mut captured = SnapshotCapture::default();
+        captured
+            .push(
+                known.clone(),
+                crate::chat::Snapshot {
+                    session_id: known.launch.session_id.clone(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        record.census.snapshots = captured.finish();
+        let checkpoint = serde_json::to_vec(&serde_json::json!({
+            "version":2,"phase":"Prepared","proof":record.source,"terminals":[],
+            "chats":[{"source":known,"launch":known.launch}],
+        }))
+        .unwrap();
+        record.checkpoint_hash = digest(&checkpoint);
+        let path = &preparation.authority.checkpoint_path;
+        save(path, &checkpoint);
+        let original = serde_json::to_vec(&record).unwrap();
+        let outcome_path = path.with_file_name(recovery_name(&record.checkpoint_hash));
+        save(&outcome_path, &original);
+        let classified = classify_retained_prepared(path, &target).unwrap().unwrap();
+        classified
+            .archive_completed(
+                issued.proof.as_ref().unwrap(),
+                &[],
+                &[issued.clone()],
+                &[],
+                &[],
+            )
+            .unwrap();
+        let first = archived_proof(path, &target).unwrap().unwrap();
+        let first_bytes = fs::read(&first.retirement_path).unwrap();
+        classified
+            .archive_completed(
+                later.proof.as_ref().unwrap(),
+                &[],
+                &[later.clone()],
+                &[],
+                &[],
+            )
+            .unwrap();
+        let second = archived_proof(path, &target).unwrap().unwrap();
+        assert_ne!(first.retirement_sha256, second.retirement_sha256);
+        assert_eq!(fs::read(&first.retirement_path).unwrap(), first_bytes);
+        assert_eq!(fs::read(&outcome_path).unwrap(), original);
+        assert_eq!(fs::read(&second.archive_path).unwrap(), checkpoint);
+        let retired: Retirement =
+            serde_json::from_slice(&fs::read(&second.retirement_path).unwrap()).unwrap();
+        assert_eq!(retired.previous.as_ref(), Some(&first.retirement_sha256));
+        assert!(
+            archived_discovery(path, &target)
+                .unwrap()
+                .unwrap()
+                .adopted_chat_descriptors
+                .contains(&later)
+        );
+
+        let mut rotated = later.clone();
+        rotated.proof.as_mut().unwrap().host_incarnation = HostIncarnation::new("third-successor");
+        rotated.launch.session_id = Some("22222222-2222-4222-8222-222222222222".into());
+        assert!(current_recovered_chat(
+            &known,
+            &rotated,
+            rotated.proof.as_ref().unwrap()
+        ));
+        assert!(!recovered_chat(
+            &known,
+            &rotated,
+            rotated.proof.as_ref().unwrap()
+        ));
+        classified
+            .archive_completed(
+                rotated.proof.as_ref().unwrap(),
+                &[],
+                &[rotated.clone()],
+                &[],
+                &[],
+            )
+            .unwrap();
+        assert!(
+            !archived_discovery(path, &target)
+                .unwrap()
+                .unwrap()
+                .adopted_chat_descriptors
+                .contains(&rotated)
+        );
+        for mutation in ["provider", "recipe", "proof"] {
+            let mut invalid = rotated.clone();
+            match mutation {
+                "provider" => invalid.launch.provider = crate::agent::Provider::Claude,
+                "recipe" => invalid
+                    .launch
+                    .recipe
+                    .arguments
+                    .push("changed static option".into()),
+                "proof" => invalid.proof = issued.proof.clone(),
+                _ => unreachable!(),
+            }
+            assert!(
+                classified
+                    .archive_completed(rotated.proof.as_ref().unwrap(), &[], &[invalid], &[], &[])
+                    .is_err(),
+                "accepted changed {mutation}"
+            );
+        }
+        let mut unknown = known.clone();
+        unknown.launch.session_id = None;
+        let mut unknown_census = record.census.clone();
+        unknown_census.chats[0] = unknown.clone();
+        unknown_census.snapshots[0].source = unknown.clone();
+        assert!(!captured_chat_alias(
+            &unknown_census,
+            &unknown,
+            &rotated,
+            rotated.proof.as_ref().unwrap()
+        ));
+        assert_eq!(fs::read(&outcome_path).unwrap(), original);
+    }
+
     #[test]
     fn reviewed_payload_budget_is_rejected_before_source_preparation() {
         let root = tempfile::tempdir_in("/var/tmp").unwrap();
@@ -2730,6 +3558,7 @@ mod tests {
             census: authority.census,
             adopted_terminals: Vec::new(),
             adopted_chats: Vec::new(),
+            adopted_chat_descriptors: Vec::new(),
             paused_terminals: vec![authority.expected[0].1],
             paused_chats: Vec::new(),
             settled: true,
@@ -2826,6 +3655,233 @@ mod tests {
         assert_eq!(
             fs::read(&authority.checkpoint_path).unwrap(),
             checkpoint_bytes
+        );
+        // Archival is a byte-for-byte no-clobber rename. A conflicting entry
+        // cannot be replaced, including a symlink to these same bytes.
+        save(&sidecar, &original);
+        let classified = classify_retained_prepared(&authority.checkpoint_path, &target)
+            .unwrap()
+            .unwrap();
+        assert!(
+            classified
+                .archive_completed(record.successor.as_ref().unwrap(), &[], &[], &[], &[])
+                .is_err(),
+            "missing current owners require durable paused evidence before archival"
+        );
+        assert_eq!(
+            fs::read(&authority.checkpoint_path).unwrap(),
+            checkpoint_bytes
+        );
+        let known = record.census.terminals[0].clone();
+        let serving = record.successor.as_ref().unwrap();
+        let mut unexpectedly_live = crate::terminal_ipc::TerminalDescriptor::relaunchable(
+            known.id,
+            known.launch.clone(),
+            None,
+        );
+        unexpectedly_live.session = known.clone();
+        unexpectedly_live.session.continuity = TerminalContinuity::DetachedSameBoot {
+            host_session_id: serving.host_session_id.clone(),
+            boot_id: serving.boot_id.clone(),
+            host_incarnation: serving.host_incarnation.clone(),
+        };
+        unexpectedly_live.upgrade_sources.push(known);
+        assert!(verified_terminal(
+            &record.census,
+            &unexpectedly_live,
+            serving,
+            &target,
+        ));
+        assert!(
+            classified
+                .archive_completed(
+                    serving,
+                    &[unexpectedly_live],
+                    &[],
+                    &record.paused_terminals,
+                    &record.paused_chats
+                )
+                .is_err(),
+            "an originally paused owner cannot silently become adopted"
+        );
+        let archive = archive_path(&authority.checkpoint_path, &record.checkpoint_hash);
+        save(&archive, b"unrelated archive evidence");
+        assert!(
+            classified
+                .archive_completed(
+                    record.successor.as_ref().unwrap(),
+                    &[],
+                    &[],
+                    &record.paused_terminals,
+                    &record.paused_chats
+                )
+                .is_err()
+        );
+        assert_eq!(fs::read(&archive).unwrap(), b"unrelated archive evidence");
+        fs::remove_file(&archive).unwrap();
+        std::os::unix::fs::symlink(&authority.checkpoint_path, &archive).unwrap();
+        assert!(
+            classified
+                .archive_completed(
+                    record.successor.as_ref().unwrap(),
+                    &[],
+                    &[],
+                    &record.paused_terminals,
+                    &record.paused_chats
+                )
+                .is_err()
+        );
+        fs::remove_file(&archive).unwrap();
+        assert_eq!(
+            fs::read(&authority.checkpoint_path).unwrap(),
+            checkpoint_bytes
+        );
+
+        // An older settled outcome which adopted this ID must not override
+        // the active later outcome that explicitly paused it.
+        let mut earlier: RecoveryRecord = serde_json::from_slice(&original).unwrap();
+        earlier.checkpoint_hash = digest(b"earlier unrelated Prepared bytes");
+        earlier.adopted_terminals = earlier.paused_terminals.clone();
+        earlier.paused_terminals.clear();
+        atomic_metadata(
+            &authority
+                .checkpoint_path
+                .with_file_name(recovery_name(&earlier.checkpoint_hash)),
+            &earlier,
+        )
+        .unwrap();
+        let earlier_bytes = serde_json::to_vec(&earlier).unwrap();
+        let earlier_retired = Retirement {
+            version: 1,
+            checkpoint_hash: earlier.checkpoint_hash.clone(),
+            outcome_hash: digest(&earlier_bytes),
+            source: earlier.source.clone(),
+            job: earlier.job.clone(),
+            request_identity: earlier.request_identity.clone(),
+            archive_path: archive_path(&authority.checkpoint_path, &earlier.checkpoint_hash),
+            adopted_chat_descriptors: Vec::new(),
+            previous: None,
+        };
+        let earlier_retirement_bytes = serde_json::to_vec(&earlier_retired).unwrap();
+        let earlier_retirement_hash = digest(&earlier_retirement_bytes);
+        save(
+            &retirement_path(&authority.checkpoint_path, &earlier_retirement_hash),
+            &earlier_retirement_bytes,
+        );
+        atomic_metadata(
+            &authority.checkpoint_path.with_file_name(ACTIVE_RECOVERY),
+            &ActiveRecovery {
+                version: 2,
+                checkpoint_hash: earlier.checkpoint_hash,
+                retirement_hash: earlier_retirement_hash,
+            },
+        )
+        .unwrap();
+        assert!(
+            archived_discovery(&authority.checkpoint_path, &target)
+                .unwrap()
+                .is_none()
+        );
+
+        // Simulate a crash after the durable plan but before rename. Ordinary
+        // classification remains retryable and nothing reads archive recipes.
+        let planned = Retirement {
+            version: 1,
+            checkpoint_hash: record.checkpoint_hash.clone(),
+            outcome_hash: digest(&original),
+            source: record.source.clone(),
+            job: record.job.clone(),
+            request_identity: record.request_identity.clone(),
+            archive_path: archive.clone(),
+            adopted_chat_descriptors: Vec::new(),
+            previous: None,
+        };
+        let planned_bytes = serde_json::to_vec(&planned).unwrap();
+        let planned_hash = digest(&planned_bytes);
+        let planned_path = retirement_path(&authority.checkpoint_path, &planned_hash);
+        save(&planned_path, &planned_bytes);
+        atomic_metadata(
+            &authority.checkpoint_path.with_file_name(ACTIVE_RECOVERY),
+            &ActiveRecovery {
+                version: 2,
+                checkpoint_hash: record.checkpoint_hash.clone(),
+                retirement_hash: planned_hash.clone(),
+            },
+        )
+        .unwrap();
+        let inode = fs::metadata(&authority.checkpoint_path).unwrap().ino();
+        classified
+            .archive_completed(
+                record.successor.as_ref().unwrap(),
+                &[],
+                &[],
+                &record.paused_terminals,
+                &record.paused_chats,
+            )
+            .unwrap();
+        assert_eq!(
+            fs::read(&sidecar).unwrap(),
+            original,
+            "archival must never rewrite the original settled outcome"
+        );
+        assert_eq!(fs::read(&planned_path).unwrap(), planned_bytes);
+        let proof = archived_proof(&authority.checkpoint_path, &target)
+            .unwrap()
+            .unwrap();
+        assert_eq!(proof.outcome_sha256, digest(&original));
+        assert_eq!(proof.checkpoint_sha256, digest(&checkpoint_bytes));
+        assert_eq!(proof.retirement_sha256, planned_hash);
+        assert!(!authority.checkpoint_path.exists());
+        assert_eq!(fs::metadata(&archive).unwrap().ino(), inode);
+        assert_eq!(fs::read(&archive).unwrap(), checkpoint_bytes);
+        let discovery = archived_discovery(&authority.checkpoint_path, &target)
+            .unwrap()
+            .unwrap();
+        assert!(
+            discovery.adopted_terminals.is_empty(),
+            "earlier adopted IDs must not be unioned into a later paused outcome"
+        );
+        assert_eq!(discovery.paused_terminals, record.paused_terminals);
+        // A completed rename can be retried without altering its bytes.
+        classified
+            .archive_completed(
+                record.successor.as_ref().unwrap(),
+                &[],
+                &[],
+                &record.paused_terminals,
+                &record.paused_chats,
+            )
+            .unwrap();
+        assert_eq!(fs::read(&archive).unwrap(), checkpoint_bytes);
+        // Discovery is deliberately metadata-only, even if archive storage is
+        // unavailable. It conveys only a candidate for ordinary holder auth.
+        let hidden = archive.with_extension("hidden");
+        fs::rename(&archive, &hidden).unwrap();
+        assert!(
+            archived_discovery(&authority.checkpoint_path, &target)
+                .unwrap()
+                .is_some()
+        );
+        fs::rename(&hidden, &archive).unwrap();
+        save(&authority.checkpoint_path, br#"{"phase":"Ready"}"#);
+        assert!(
+            archived_discovery(&authority.checkpoint_path, &target)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(fs::read(&archive).unwrap(), checkpoint_bytes);
+    }
+
+    #[test]
+    fn archived_discovery_ignores_a_fresh_install_without_recovery_storage() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        assert!(
+            archived_discovery(
+                &root.path().join("not-created/daemon-upgrade.json"),
+                Path::new("/no/daemon")
+            )
+            .unwrap()
+            .is_none()
         );
     }
 

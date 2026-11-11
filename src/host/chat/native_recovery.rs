@@ -191,6 +191,24 @@ pub(super) fn restore_with_admission(
     restore_with_policy(host, client, source, admission, false)
 }
 
+/// A Ready checkpoint proves the exact prior daemon issued this retained
+/// source. An older unavailable-history floor must not prevent authenticating
+/// its still-owned provider. This retained-owner path never replays a recipe.
+pub(in crate::host) fn restore_ready_checkpoint(
+    host: &SharedHost,
+    source: &Session,
+    checkpoint: &crate::upgrade::handoff::Checkpoint,
+) -> Result<ServerResponse, String> {
+    checkpoint.require_ready()?;
+    if !source.native_continuity.retains_provider()
+        || source.proof.as_ref() != Some(&checkpoint.proof)
+        || !checkpoint.chats.iter().any(|chat| &chat.source == source)
+    {
+        return Err("The Ready checkpoint does not identify this exact retained source".into());
+    }
+    restore_with_policy(host, 0, source, None, true)
+}
+
 fn restore_with_policy(
     host: &SharedHost,
     client: ClientId,

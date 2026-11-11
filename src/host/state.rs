@@ -2037,6 +2037,11 @@ impl HostState {
         }
     }
 
+    #[cfg(test)]
+    pub(in crate::host) fn await_startup_for_test(&mut self, id: TerminalId) {
+        self.startup_custody.insert(id);
+    }
+
     pub(super) fn retain_startup_recovery(&mut self, message: String) {
         if self.startup_recovery.is_none() {
             self.startup_recovery = Some(message);
@@ -3317,6 +3322,7 @@ fn restore_upgrade_from(
         );
         return Ok(Vec::new());
     }
+    let ready_checkpoint = (checkpoint.phase == Phase::Ready).then(|| checkpoint.clone());
     checkpoint.phase = Phase::Restoring;
     store.save(&checkpoint)?;
     host.lock()
@@ -3387,7 +3393,12 @@ fn restore_upgrade_from(
             if crate::daemon::termination_requested() {
                 return Err(RESTORE_TERMINATED.to_owned());
             }
-            if let Err(reason) = super::chat::restore_upgrade(host, chat) {
+            let restore = if let Some(ready) = &ready_checkpoint {
+                super::chat::restore_ready_checkpoint(host, &chat.source, ready).map(|_| ())
+            } else {
+                super::chat::restore_upgrade(host, chat)
+            };
+            if let Err(reason) = restore {
                 if crate::daemon::termination_requested() {
                     return Err(RESTORE_TERMINATED.to_owned());
                 }
