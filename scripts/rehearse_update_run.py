@@ -1,13 +1,41 @@
 #!/usr/bin/python3
 """Scenario orchestration for rehearse-update; all application commands use its private env."""
 import argparse
+from contextlib import closing
 import json
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
+
+
+def selected_chat(root, slot, card_id, channel_id, expected):
+    """Read the exact saved selection; visible labels grant no identity."""
+    data = Path(root)/'home/.local/share/cagents'
+    database = data/'sessions.sqlite3' if slot == 'main' else data/'windows'/slot/'sessions.sqlite3'
+    with closing(sqlite3.connect(database.as_uri()+'?mode=ro', uri=True, timeout=1)) as connection:
+        connection.execute('PRAGMA query_only=ON')
+        connection.execute('BEGIN')
+        row = connection.execute(
+            'SELECT c.workspace_id,c.kind_tag,c.content_json,w.focused_card_id,c.existence_json '
+            'FROM cards c JOIN workspaces w ON w.workspace_id=c.workspace_id WHERE c.card_id=?',
+            [card_id]).fetchone()
+        if not row or row[1] != 'chat' or row[3] != card_id or json.loads(row[4]) != 'open':
+            return None
+        descriptor = json.loads(row[2])
+        active = connection.execute('SELECT value FROM metadata WHERE key=?',
+            [f'workspace:{row[0]}:navigation:active_thread']).fetchone()
+        launch = descriptor.get('launch', {})
+        if (descriptor.get('id') != expected['id']
+                or launch.get('provider') != expected['launch']['provider']
+                or launch.get('session_id') != expected['launch'].get('session_id')
+                or not active or json.loads(active[0]) != channel_id):
+            return None
+        return {'database':str(database), 'workspace':row[0], 'card':card_id,
+                'channel':channel_id, 'session':descriptor}
 
 
 def refusal_preserved_processes(records):
@@ -118,6 +146,68 @@ class Rehearsal:
         Path(output).write_text(json.dumps(observed, indent=2, sort_keys=True)+'\n')
         return observed
 
+    def capture_chats(self, side):
+        """Exercise the seeded chats themselves, preserving UUID-bound evidence."""
+        seeds = json.loads((self.root/'seeds.json').read_text())['items']
+        targets = [item for item in seeds if item['state'] in ('named-chat','codex-chat')]
+        if not targets or not any(item['state']=='named-chat' for item in targets):
+            raise RuntimeError('the seeded Claude chat identity is unavailable for native evidence')
+        _, response = self.cli('--no-start','agent','list')
+        agents = {row['agent']['id']:row['agent'] for row in response['data']['agents']}
+        _, response = self.cli('--no-start','channel','list')
+        channels = response['data']['channels']
+        evidence = []
+        for item in targets:
+            original = item['response']['data']['agent']
+            current = agents[original['id']]
+            channel_id = original['placement']['Channel']
+            if (current['placement'] != original['placement']
+                    or current['spec']['target']['repository'] != original['spec']['target']['repository']):
+                raise RuntimeError(f'seeded chat {original["id"]} changed its canonical placement')
+            chat = current['session']['Chat']
+            provider = original['spec']['provider'].lower()
+            if chat['launch']['provider'] != original['spec']['provider']:
+                raise RuntimeError('seeded chat changed provider')
+            channel = next(row for row in channels if row['id']==channel_id)
+            title = channel['title']
+            if not title or sum(row['title']==title for row in channels) != 1:
+                raise RuntimeError(f'canonical chat channel {channel_id} has no unique visible label')
+            windows = self.mapped()
+            if not {'main','second'} <= windows.keys():
+                raise RuntimeError('both native windows are required for chat evidence')
+            for slot, window in sorted(windows.items()):
+                if slot not in ('main','second'):
+                    continue
+                self.call('wm','action','focus-window','--id',window['id'])
+                self.call('drive','click',title,timeout=30)
+                deadline = time.monotonic()+15
+                selected = None
+                while time.monotonic()<deadline:
+                    _, status = self.cli('--no-start','agent','status',original['id'])
+                    actual = status['data']['agent']['session']['Chat']
+                    if actual['id'] != chat['id'] or actual['launch']['provider'] != chat['launch']['provider']:
+                        raise RuntimeError('opening a seeded chat allocated a different session')
+                    try:
+                        selected = selected_chat(self.root,slot,original['id'],channel_id,actual)
+                    except (sqlite3.Error, OSError):
+                        selected = None
+                    if selected:
+                        break
+                    time.sleep(.1)
+                if not selected:
+                    raise RuntimeError(f'{slot} did not focus exact seeded {provider} card {original["id"]}')
+                _, observed = self.call('drive','--json','observe',timeout=30)
+                observation = json.loads(observed)
+                if observation['window']['id'] != window['id']:
+                    raise RuntimeError(f'chat observation selected the wrong window for {slot}')
+                shot = f'{side}-{provider}-{slot}'
+                self.call('shot',shot,timeout=45)
+                evidence.append({'provider':provider,'slot':slot,'agent':original['id'],
+                                 'selection':selected,'navigation_label':title,
+                                 'observation':observation,'shot':f'shots/{shot}.webp'})
+        (self.root/f'ui-chats-{side}.json').write_text(json.dumps(evidence,indent=2,sort_keys=True)+'\n')
+        return evidence
+
     def seed(self, args):
         evidence = []
         def seed(name, argv, project=None, provider=None):
@@ -159,7 +249,10 @@ class Rehearsal:
         if not args.no_console:
             seed('console', ['agent','spawn','--provider','claude','--surface','terminal','--name','console-alpha','Seeded console'], 'alpha')
         if not args.no_codex:
-            seed('codex-chat', ['agent','spawn','--provider','codex','--surface','chat','--name','codex-alpha','Offline Codex rehearsal'], 'alpha')
+            codex_channel = seed('codex-channel', ['channel','spawn','--repository',alpha,'--title','Codex rehearsal'])
+            codex_channel_id = codex_channel['response']['data']['channel']['id']
+            seed('codex-chat', ['agent','spawn','--provider','codex','--surface','chat','--name','codex-alpha',
+                               '--channel',codex_channel_id,'Offline Codex rehearsal'], 'alpha')
         for index in range(args.untitled):
             # Empty channel title is the product's actual untitled state.
             channel = seed(f'untitled-channel-{index+1}', ['channel','spawn','--repository',beta])
@@ -310,6 +403,7 @@ class Rehearsal:
             if args.ceditor:
                 self.call('ceditor','start',args.ceditor,timeout=60)
                 self.wait_windows(['main','second','ceditor'])
+            self.capture_chats('before')
             code, _ = self.call('record','before',timeout=150,check=False)
             if code:
                 self.errors.append('before record has evidence gaps')
@@ -354,6 +448,7 @@ class Rehearsal:
                 self.wait_windows(['main','second'],timeout=args.reopen_timeout,version=args.old_version if args.fail_new_daemon else args.new_version if code==0 else None)
             except RuntimeError as exc:
                 self.errors.append(str(exc))
+            self.capture_chats('after')
             code, _ = self.call('record','after',timeout=150,check=False)
             if code:
                 self.errors.append('after record has evidence gaps')
@@ -392,6 +487,16 @@ class Rehearsal:
             receipt = self.root/'records/after/recovery-current.json'
             if receipt.exists():
                 report += ['', f'Fresh readiness and inventory verification: {receipt}', receipt.read_text()]
+            for side in ('before','after'):
+                views = self.root/f'ui-chats-{side}.json'
+                if views.exists():
+                    report += ['', f'Native chat selection evidence: {views}']
+                    for view in json.loads(views.read_text()):
+                        selected = view['selection']
+                        report.append(f'{side} {view["provider"]} {view["slot"]}: card={selected["card"]} '
+                                      f'channel={selected["channel"]} session={selected["session"]["id"]} '
+                                      f'thread={selected["session"]["launch"].get("session_id")} '
+                                      f'screenshot={view["shot"]}')
             seeds = self.root/'seeds.json'
             if seeds.exists():
                 report += ['', 'Seed verification (full inventories and diagnostics: seeds.json):']

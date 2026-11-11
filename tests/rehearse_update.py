@@ -325,6 +325,82 @@ class ReopenedWindows(unittest.TestCase):
                 rehearsal.wait_windows(['main','second'], timeout=1, version='new')
 
 
+class ChatViews(unittest.TestCase):
+    def module(self):
+        spec = importlib.util.spec_from_file_location('rehearsal_chat_views', REPOSITORY/'scripts/rehearse_update_run.py')
+        scenario = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(scenario)
+        return scenario
+
+    def test_selection_requires_exact_card_channel_provider_and_thread(self):
+        scenario = self.module()
+        with tempfile.TemporaryDirectory(prefix='ru-selection-') as temporary:
+            root = Path(temporary)
+            path = root/'home/.local/share/cagents/sessions.sqlite3'
+            path.parent.mkdir(parents=True)
+            descriptor = {'id':'session','launch':{'provider':'Claude','session_id':'issued-thread'}}
+            with closing(sqlite3.connect(path)) as db, db:
+                db.executescript('CREATE TABLE workspaces(workspace_id TEXT,focused_card_id TEXT);'
+                                 'CREATE TABLE cards(card_id TEXT,workspace_id TEXT,kind_tag TEXT,content_json TEXT,existence_json TEXT);'
+                                 'CREATE TABLE metadata(key TEXT,value TEXT);')
+                db.execute('INSERT INTO workspaces VALUES (?,?)', ['workspace','exact-card'])
+                db.execute('INSERT INTO cards VALUES (?,?,?,?,?)',
+                           ['exact-card','workspace','chat',json.dumps(descriptor),'"open"'])
+                db.execute('INSERT INTO metadata VALUES (?,?)',
+                           ['workspace:workspace:navigation:active_thread','"exact-channel"'])
+                db.commit()
+                original = path.read_bytes()
+                selected = scenario.selected_chat(root,'main','exact-card','exact-channel',descriptor)
+                self.assertEqual(selected['session'], descriptor)
+                self.assertEqual(path.read_bytes(), original)
+                for expected in ({**descriptor,'id':'foreign'},
+                                 {'id':'session','launch':{'provider':'Codex','session_id':'issued-thread'}},
+                                 {'id':'session','launch':{'provider':'Claude','session_id':'foreign-thread'}}):
+                    self.assertIsNone(scenario.selected_chat(root,'main','exact-card','exact-channel',expected))
+                self.assertIsNone(scenario.selected_chat(root,'main','foreign-card','exact-channel',descriptor))
+                self.assertIsNone(scenario.selected_chat(root,'main','exact-card','foreign-channel',descriptor))
+                db.execute('UPDATE workspaces SET focused_card_id=?',['foreign-card'])
+                db.commit()
+                self.assertIsNone(scenario.selected_chat(root,'main','exact-card','exact-channel',descriptor))
+
+    def test_capture_uses_seed_ids_and_labels_only_to_navigate(self):
+        scenario = self.module()
+        with tempfile.TemporaryDirectory(prefix='ru-chat-view-') as temporary:
+            root = Path(temporary)
+            seed = {'id':'seed-agent','name':'old-name','placement':{'Channel':'seed-channel'},
+                    'spec':{'provider':'Claude','target':{'repository':'/private/alpha/.git'}}}
+            chat = {'id':'seed-session','launch':{'provider':'Claude','session_id':'issued-thread'}}
+            current = {**seed,'name':'changed-name','session':{'Chat':chat}}
+            (root/'seeds.json').write_text(json.dumps({'items':[
+                {'state':'named-chat','response':{'data':{'agent':seed}}}]}))
+            rehearsal = scenario.Rehearsal(root,str(SCRIPT))
+            calls = []
+            def cli(*args):
+                calls.append(args)
+                if args[1:]==('agent','list'):
+                    foreign = {**current,'id':'foreign-agent','name':'old-name'}
+                    return 0, {'data':{'agents':[{'agent':foreign},{'agent':current}]}}
+                if args[1:]==('channel','list'):
+                    return 0, {'data':{'channels':[{'id':'seed-channel','title':'Visible canonical channel'}]}}
+                self.assertEqual(args,('--no-start','agent','status','seed-agent'))
+                return 0, {'data':{'agent':current}}
+            window = {'id':42}
+            def call(*args,**kwargs):
+                calls.append(args)
+                return 0, json.dumps({'window':window})
+            with patch.object(rehearsal,'cli',side_effect=cli), \
+                    patch.object(rehearsal,'call',side_effect=call), \
+                    patch.object(rehearsal,'mapped',return_value={'main':window,'second':window}), \
+                    patch.object(scenario,'selected_chat',return_value={'session':chat}) as selected:
+                evidence = rehearsal.capture_chats('before')
+            self.assertEqual(len(evidence),2)
+            self.assertTrue(all(item['agent']=='seed-agent' for item in evidence))
+            for call in selected.call_args_list:
+                self.assertEqual(call.args[2:4],('seed-agent','seed-channel'))
+            self.assertIn(('drive','click','Visible canonical channel'),calls)
+            self.assertFalse(any('spawn' in call for call in calls))
+
+
 class Pty(unittest.TestCase):
     def run_peer(self, body, *options):
         command = [sys.executable, str(REPOSITORY / "scripts/rehearse_update_pty.py"),
