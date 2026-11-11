@@ -34,7 +34,7 @@ DIR holds one private user. Its path must be short (sockets live below it).
                        --upgrade-arg=--interrupt, --untitled 0|1|2, --no-codex,
                        --no-child, --ignore-term, --no-init, --exit-mid-turn,
                        --uncarryable, --unreachable, --reopen-existing-only,
-                       --new-terminal-after-restore,
+                       --new-terminal-after-restore, --natural-idle,
                        --expect-terminal-restart-failure (before example).
                        See run --help.
   compare A B          Compare record names, directories or snapshot JSON.
@@ -47,7 +47,7 @@ DIR holds one private user. Its path must be short (sockets live below it).
                        console, named and untitled) and terminals through the
                        installed CLI.
   update DIR VERSION INSTALLER [--answer TEXT] [--working TEXT] [--stop TEXT]
-         [--use-staged] [--require-working] [UPGRADE-ARGS...]
+         [--use-staged] [--require-working|--require-idle] [UPGRADE-ARGS...]
                        What scripts/install-local does after its build: stage
                        the archive with --stage-only, then run the staged
                        `cagents daemon upgrade` in a terminal (inside the
@@ -58,6 +58,8 @@ DIR holds one private user. Its path must be short (sockets live below it).
                        --use-staged verifies the exact earlier stage receipt
                        without running the installer again. --require-working
                        declines an ordinary review before any consent.
+                       --require-idle checks the natural-idle receipt against
+                       the actual published Resumes (1) review before consent.
   desktop start [--limit SECONDS]
                        Start a headless desktop (KWin virtual + nested niri)
                        under the native lock. Windows open there.
@@ -262,6 +264,7 @@ cmd_update() {
             --fail-new-daemon) fail_new_daemon=1; shift ;;
             --use-staged) use_staged=1; shift ;;
             --require-working) pty_args+=(--require-working); shift ;;
+            --require-idle) pty_args+=(--require-idle --review-root "$root" --review-output "$root/reviews/natural-idle"); shift ;;
             --answer) answer=${2?}; shift 2 ;;
             --working) working=${2?}; shift 2 ;;
             --stop) stop=${2?}; shift 2 ;;
@@ -271,7 +274,7 @@ cmd_update() {
     if [ "${#pty_args[@]}" -gt 0 ]; then
         local arg
         for arg in "${upgrade_args[@]}"; do
-            case $arg in --yes | --yes=*) die '--require-working forbids --yes' 2 ;; esac
+            case $arg in --yes | --yes=*) die 'required review forbids --yes' 2 ;; esac
         done
     fi
     local started=$SECONDS status=0 transcript

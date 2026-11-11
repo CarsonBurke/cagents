@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Pure staging/working-intent contracts; no native app or provider is started."""
 import copy
+from contextlib import redirect_stderr
 import hashlib
 import importlib.util
 import io
@@ -141,6 +142,153 @@ class WorkingIntent(unittest.TestCase):
                 if mutation=='new-turn': events.append({**events[0],'turn_id':'replacement-turn'})
                 with self.assertRaisesRegex(RuntimeError,'case-invalid'):
                     self.check(before,agents,proof,events,panes)
+
+
+class NaturalIdle(unittest.TestCase):
+    def setUp(self):
+        self.temporary=tempfile.TemporaryDirectory(prefix='ru-idle-',dir='/var/tmp')
+        self.addCleanup(self.temporary.cleanup)
+        self.root=Path(self.temporary.name)
+        (self.root/'logs').mkdir()
+        self.proof={'host_session_id':'source','boot_id':'boot','host_incarnation':'incarnation'}
+        self.agent={'agent':{'id':'agent','session':{'Chat':{'id':'chat','proof':self.proof,
+            'launch':{'provider':'Codex','session_id':None},'owned_codex_listener':{'socket':'private-socket'}}}},
+            'run':'run','state':'Running'}
+        (self.root/'seeds.json').write_text(json.dumps({'items':[{'state':'codex-chat',
+            'response':{'data':{'agent':{'id':'agent'},'run':{'id':'run','agent':'agent'}}},
+            'verified_agents':[self.agent]}]}))
+        self.start={'event':'notification','method':'turn/started','parent':True,'socket':'private-socket',
+                    'thread_id':'thread','turn_id':'turn','time':1}
+        self.events=[self.start,{**self.start,'method':'turn/completed','status':'completed','time':2}]
+
+    def wait(self,current=None,events=None,proof=None,initial=None):
+        (self.root/'logs/codex-provider.jsonl').write_text(''.join(json.dumps(row)+'\n' for row in (events or self.events)))
+        rehearsal=scenario.Rehearsal(self.root,'/unused-shell')
+        current=current or {**self.agent,'state':'Succeeded'}
+        with patch.object(rehearsal,'cli',side_effect=[(0,{'data':{'agents':[initial or self.agent]}}),
+                (0,{'data':{'proof':proof or self.proof}}),(0,{'data':{'agents':[current]}})]), \
+             patch.object(scenario.time,'sleep',side_effect=AssertionError('unexpected provider wait')):
+            rehearsal.wait_natural_idle(90)
+        return json.loads((self.root/'natural-idle.json').read_text())
+
+    def test_exact_parent_normal_completion_preserves_original_agent_and_run(self):
+        result=self.wait()
+        self.assertTrue(result['valid'])
+        self.assertEqual((result['agent_id'],result['run'],result['chat_id']),('agent','run','chat'))
+        self.assertEqual(result['completed']['status'],'completed')
+
+    def test_interrupted_replaced_or_wrong_source_cannot_qualify_as_natural_idle(self):
+        variants={
+            'interrupt':{'events':self.events+[{**self.start,'event':'request','method':'turn/interrupt'}]},
+            'cancelled':{'events':[self.start,{**self.events[1],'status':'interrupted'}]},
+            'replay':{'events':self.events+[{**self.start,'turn_id':'another-turn'}]},
+            'run':{'current':{**self.agent,'run':'another-run','state':'Succeeded'}},
+            'initial-run':{'initial':{**self.agent,'run':'replacement-before-first-poll'}},
+            'proof':{'proof':{'host_session_id':'replacement'}},
+        }
+        for name,options in variants.items():
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(RuntimeError,'natural-idle preflight failed'):
+                    self.wait(**options)
+                self.assertFalse(json.loads((self.root/'natural-idle.json').read_text())['valid'])
+
+    def test_natural_idle_rejects_incompatible_modes_before_running(self):
+        command=['fixture',str(self.root),'/unused-shell','run','--old-dir','/old','--old-version','old',
+            '--old-installer','/installer','--new-dir','/new','--new-version','new','--new-installer','/installer',
+            '--natural-idle','--codex-pause','90']
+        incompatible=(['--require-working'],['--codex-never-confirm-interrupt'],['--codex-never-confirm-close'],
+                      ['--require-prepared'],['--yes'],['--upgrade-arg=--yes'],['--expect-refusal','cancel'],
+                      ['--no-init'],['--exit-mid-turn'],['--ignore-term'],['--uncarryable'],['--unreachable'])
+        for flags in incompatible:
+            with self.subTest(flags=flags),patch.object(sys,'argv',command+flags), \
+                 patch.object(scenario.Rehearsal,'run',side_effect=AssertionError('must not start')), \
+                 redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as error:
+                    scenario.main()
+                self.assertEqual(error.exception.code,2)
+        with patch.object(sys,'argv',command),patch.object(scenario.Rehearsal,'run',return_value=0) as run:
+            self.assertEqual(scenario.main(),0)
+        self.assertEqual(run.call_args.args[0].codex_pause,90)
+        self.assertTrue(run.call_args.args[0].natural_idle)
+
+    def test_failure_console_snapshot_uses_original_terminal_even_when_cli_fails(self):
+        (self.root/'ui-console-before.json').write_text(json.dumps({'terminal':'original-console'}))
+        rehearsal=scenario.Rehearsal(self.root,'/unused-shell')
+        with patch.object(rehearsal,'call',return_value=(1,'public original output')) as call:
+            rehearsal.failure_console_snapshot()
+        self.assertEqual(call.call_args.args[-1],'original-console')
+        self.assertIn('--no-start',call.call_args.args)
+        result=json.loads((self.root/'logs/failure-console-snapshot.json').read_text())
+        self.assertEqual(result,{'terminal':'original-console','exit':1,'output':'public original output'})
+
+
+class IdleReview(unittest.TestCase):
+    def fixture(self):
+        proof={'host_session_id':'source','boot_id':'boot','host_incarnation':'incarnation'}
+        expected={'valid':True,'chat_id':'chat','serving':proof}
+        job={'phase':'AwaitingConfirmation','confirmation':{'stop':None,'preview':{'daemon':{
+            'policy':'when_idle','capability':{'proof':proof},'sessions':[
+                {'id':'chat','kind':'native_chat','disposition':'resumes'},
+                {'id':'console','kind':'terminal','disposition':'continues'}]}}}}
+        return job,expected
+
+    def test_only_the_exact_idle_resumes_one_preview_is_approved(self):
+        spec=importlib.util.spec_from_file_location('idle_pty',SCRIPTS/'rehearse_update_pty.py')
+        module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+        job,expected=self.fixture()
+        self.assertTrue(module.idle_review_matches(job,expected))
+        for change in ('working','wrong-chat','wrong-proof','extra-resume','stop','unproven','stopped-chat','keeps-running'):
+            with self.subTest(change=change):
+                job,expected=self.fixture()
+                daemon=job['confirmation']['preview']['daemon']
+                if change=='working': daemon['sessions'][0]['disposition']='waits_for_idle'
+                if change=='wrong-chat': daemon['sessions'][0]['id']='another-chat'
+                if change=='wrong-proof': expected['serving']={'host_session_id':'another-source'}
+                if change=='extra-resume': daemon['sessions'][1]['disposition']='resumes'
+                if change=='stop': job['confirmation']['stop']={'items':['console']}
+                if change=='unproven': expected['valid']=False
+                if change=='stopped-chat': job['confirmation']['preview']['stopped']=[{'pane':'chat'}]
+                if change=='keeps-running': job['confirmation']['preview']['review_details']={'panes':{'chat':{'outcome':'keeps_running','detail':'console keeps running'}}}
+                self.assertFalse(module.idle_review_matches(job,expected))
+
+
+class IdlePromptGuard(unittest.TestCase):
+    def exercise(self,*,working=False,wrong_chat=False):
+        with tempfile.TemporaryDirectory(prefix='ru-idle-prompt-',dir='/var/tmp') as temporary:
+            root=Path(temporary)
+            (root/'.rehearse-update').write_text(str(root)+'\n')
+            status=root/'home/.local/share/cagents-install/.update/status.json'
+            status.parent.mkdir(parents=True)
+            job,expected=IdleReview().fixture()
+            if wrong_chat:
+                job['confirmation']['preview']['daemon']['sessions'][0]['id']='another-chat'
+            job['confirmation']['nonce']='actual-private-review'
+            status.write_text(json.dumps(job));status.chmod(0o600)
+            (root/'natural-idle.json').write_text(json.dumps(expected))
+            prompt=('Enter: update when they finish   i: interrupt them now   n: cancel'
+                    if working else 'Update now? [Y/n] ')
+            answers=root/'answer'
+            program='import pathlib,sys;print(sys.argv[1],flush=True);pathlib.Path(sys.argv[2]).write_text(sys.stdin.readline().strip())'
+            result=subprocess.run([sys.executable,str(SCRIPTS/'rehearse_update_pty.py'),
+                '--require-idle','--answer','yes','--review-root',str(root),
+                '--review-output',str(root/'reviews/natural-idle'),'--timeout','5','--',
+                sys.executable,'-c',program,prompt,str(answers)],capture_output=True,text=True,timeout=10)
+            captured=json.loads((root/'reviews/natural-idle/prompt-1.status.json').read_text())
+            return result,answers.read_text(),captured
+
+    def test_real_first_review_is_captured_before_ordinary_consent(self):
+        result,answer,captured=self.exercise()
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        self.assertEqual(answer,'yes')
+        self.assertEqual(captured['confirmation']['nonce'],'actual-private-review')
+
+    def test_working_or_other_chat_is_declined_before_consent(self):
+        for option in ({'working':True},{'wrong_chat':True}):
+            with self.subTest(option=option):
+                result,answer,_=self.exercise(**option)
+                self.assertEqual(result.returncode,2,result.stdout+result.stderr)
+                self.assertEqual(answer,'n')
+                self.assertIn('case-invalid',result.stdout)
 
 
 class UpdateIntentClassification(unittest.TestCase):

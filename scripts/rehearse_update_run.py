@@ -212,6 +212,31 @@ def candidate_namespace_cli(root, archive_dir, version):
     return cli
 
 
+def seeded_codex(root):
+    items=json.loads((Path(root)/'seeds.json').read_text())['items']
+    targets=[row for row in items if row['state']=='codex-chat']
+    if len(targets)!=1:
+        raise RuntimeError('case-invalid: requires exactly one seeded Codex chat')
+    accepted=targets[0]['response']['data']
+    agent_id=accepted['agent']['id']
+    run=accepted['run']
+    verified=[row for row in targets[0]['verified_agents'] if row['agent']['id']==agent_id]
+    if (not run.get('id') or run.get('agent')!=agent_id or len(verified)!=1
+            or verified[0].get('run')!=run['id']):
+        raise RuntimeError('case-invalid: seed acceptance and verified Codex run differ')
+    return {'agent_id':agent_id,'run':run['id'],'chat':verified[0]['agent']['session']['Chat']}
+
+
+def require_seeded_codex(expected, row):
+    source=copy.deepcopy(row.get('agent',{}).get('session',{}).get('Chat',{}))
+    # The daemon may fill the provider-confirmed thread after seed verification.
+    if expected['chat'].get('launch',{}).get('session_id') is None and isinstance(source.get('launch'),dict):
+        source['launch']['session_id']=None
+    if (row.get('agent',{}).get('id')!=expected['agent_id'] or row.get('run')!=expected['run']
+            or source!=expected['chat']):
+        raise RuntimeError('case-invalid: original accepted Codex agent/run or source changed')
+
+
 def active_working_contract(before, agents, serving, events, agent_id):
     """Require the same still-running seeded parent, rather than an idle review."""
     old=before['agents'].get(agent_id,{})
@@ -726,25 +751,107 @@ class Rehearsal:
         with records.WindowCloseMonitor(self.root) as monitor:
             result=self.call('update',*args,timeout=300,check=False)
             monitor.command_exit=result[0]
-            if '--require-working' in args and (result[0]==2 or 'rehearse-update: case-invalid:' in result[1]):
-                raise RuntimeError('case-invalid: required working review failed; this is not an expected refusal')
+            if any(flag in args for flag in ('--require-working','--require-idle')) and (
+                    result[0]==2 or 'rehearse-update: case-invalid:' in result[1]):
+                raise RuntimeError('case-invalid: required review failed; this is not an expected refusal')
             return result
+
+    def wait_natural_idle(self, pause):
+        """Observe normal completion of the original private parent without interrupting it."""
+        evidence={'valid':False,'started_at':time.time()}
+        destination=self.root/'natural-idle.json'
+        try:
+            seed=seeded_codex(self.root)
+            agent_id=seed['agent_id']
+            _,listing=self.cli('--no-start','agent','list')
+            original=next(row for row in listing['data']['agents'] if row['agent']['id']==agent_id)
+            require_seeded_codex(seed,original)
+            source=original['agent']['session']['Chat']
+            socket=source['owned_codex_listener']['socket']
+            _,terminals=self.cli('--no-start','terminal','list','--all')
+            proof=terminals['data']['proof']
+            if (source['launch']['provider']!='Codex' or not proof or source['proof']!=proof
+                    or not original.get('run') or original.get('state') not in ('Running','Succeeded')):
+                raise RuntimeError('case-invalid: natural idle source is not the original owned Codex run')
+            evidence.update(agent_id=agent_id,chat_id=source['id'],run=original['run'],serving=proof,socket=socket)
+            deadline=time.monotonic()+pause+45
+            parent=None
+            while True:
+                events=[json.loads(line) for line in (self.root/'logs/codex-provider.jsonl').read_text().splitlines() if line]
+                starts=[row for row in events if row.get('event')=='notification' and row.get('method')=='turn/started'
+                        and row.get('socket')==socket and row.get('parent') is True]
+                if len(starts)!=1 or not starts[0].get('thread_id') or not starts[0].get('turn_id'):
+                    raise RuntimeError('case-invalid: natural idle requires exactly one original parent start')
+                if parent is None:
+                    parent=starts[0]
+                if starts[0]!=parent:
+                    raise RuntimeError('case-invalid: natural idle parent changed')
+                if source['launch'].get('session_id') not in (None,parent['thread_id']):
+                    raise RuntimeError('case-invalid: natural idle parent belongs to another confirmed thread')
+                matching=[row for row in events if row.get('socket')==socket and row.get('parent') is True
+                          and row.get('thread_id')==parent['thread_id'] and row.get('turn_id')==parent['turn_id']]
+                if any(row.get('method')=='turn/interrupt' for row in events if row.get('socket')==socket):
+                    raise RuntimeError('case-invalid: natural idle received an interrupt request')
+                completed=[row for row in matching if row.get('event')=='notification' and row.get('method')=='turn/completed']
+                if completed and (len(completed)!=1 or completed[0].get('status')!='completed'
+                                  or not isinstance(parent.get('time'),(int,float))
+                                  or not isinstance(completed[0].get('time'),(int,float))
+                                  or completed[0]['time']<parent['time']):
+                    raise RuntimeError('case-invalid: original parent did not complete normally')
+                _,listing=self.cli('--no-start','agent','list')
+                current=next(row for row in listing['data']['agents'] if row['agent']['id']==agent_id)
+                if current['agent']['session']!=original['agent']['session'] or current.get('run')!=original['run']:
+                    raise RuntimeError('case-invalid: natural idle changed the original agent/run')
+                evidence.update(parent=parent,fixture_events=events,agent=current)
+                if completed and current.get('state')=='Succeeded':
+                    evidence.update(valid=True,completed=completed[0],finished_at=time.time())
+                    return
+                if current.get('state') not in ('Running','Succeeded') or time.monotonic()>=deadline:
+                    raise RuntimeError('case-invalid: original Codex run did not settle normally before review')
+                time.sleep(.25)
+        except (RuntimeError,OSError,ValueError,KeyError,StopIteration) as exc:
+            evidence['error']=str(exc)
+            raise RuntimeError(f'natural-idle preflight failed: {exc}') from exc
+        finally:
+            with open(destination,'w',opener=lambda path,flags:os.open(path,flags,0o600)) as output:
+                output.write(json.dumps(evidence,indent=2,sort_keys=True)+'\n')
+
+    def failure_console_snapshot(self):
+        """Retain the original console's public output even if full after-recording failed."""
+        evidence={}
+        try:
+            path=self.root/'ui-console-before.json'
+            if path.exists():
+                terminal=json.loads(path.read_text())['terminal']
+            else:
+                seeds=json.loads((self.root/'seeds.json').read_text())['items']
+                seed=next(row for row in seeds if row['state']=='console')
+                consoles=[row['agent']['console']['id'] for row in seed['verified_agents']
+                          if row['agent']['id']==seed['response']['data']['agent']['id'] and row['agent'].get('console')]
+                if len(consoles)!=1:
+                    raise RuntimeError('original console identity is unavailable')
+                terminal=consoles[0]
+            evidence['terminal']=terminal
+            code,output=self.call('env','cagents','--no-start','--json','terminal','snapshot',terminal,
+                                  timeout=20,check=False)
+            evidence.update(exit=code,output=output)
+        except (OSError,RuntimeError,ValueError,KeyError,StopIteration) as exc:
+            evidence['error']=str(exc)
+        (self.root/'logs/failure-console-snapshot.json').write_text(json.dumps(evidence,indent=2,sort_keys=True)+'\n')
 
     def require_active_working(self):
         output=self.root/'logs/pre-update-working.json'
         evidence={}
         try:
             before=json.loads((self.root/'records/before/snapshot.json').read_text())
-            items=json.loads((self.root/'seeds.json').read_text())['items']
-            targets=[row['response']['data']['agent']['id'] for row in items if row['state']=='codex-chat']
-            if len(targets)!=1:
-                raise RuntimeError('case-invalid: working case requires exactly one seeded Codex chat')
+            seed=seeded_codex(self.root)
+            require_seeded_codex(seed,before['agents'][seed['agent_id']])
             _,agents=self.cli('--no-start','agent','list')
             _,terminals=self.cli('--no-start','terminal','list','--all')
             events=[json.loads(line) for line in (self.root/'logs/codex-provider.jsonl').read_text().splitlines() if line]
             evidence.update(agents=agents,terminals=terminals,fixture_events=events)
             evidence['active']=active_working_contract(before,agents['data']['agents'],
-                terminals['data'].get('proof'),events,targets[0])
+                terminals['data'].get('proof'),events,seed['agent_id'])
             evidence['valid']=True
         except (RuntimeError,OSError,ValueError,KeyError,TypeError) as exc:
             evidence.update(valid=False,error=str(exc))
@@ -1521,6 +1628,8 @@ class Rehearsal:
             code, _ = self.call('seed', *seed_flags(args), timeout=180, check=False)
             if code:
                 self.errors.append('seed verification failed; see seeds.json')
+            if args.natural_idle:
+                self.wait_natural_idle(args.codex_pause)
             if args.ceditor:
                 self.call('ceditor','start',args.ceditor,timeout=60)
                 self.wait_windows(['main','second','ceditor'])
@@ -1541,11 +1650,18 @@ class Rehearsal:
             if requires_working(args):
                 self.require_active_working()
                 update_args.append('--require-working')
+            if args.natural_idle:
+                update_args.append('--require-idle')
             (self.root/'rehearsal-target.json').write_text(json.dumps({
                 'version':args.new_version,'working':args.working,'started':time.time()})+'\n')
             self.watch_checkpoint()
             code, _ = self.observed_update(args.new_dir,args.new_version,args.new_installer,*update_args)
             self.finish_checkpoint_watch()
+            if args.natural_idle:
+                idle=json.loads((self.root/'natural-idle.json').read_text())
+                events=[json.loads(line) for line in (self.root/'logs/codex-provider.jsonl').read_text().splitlines() if line]
+                if any(row.get('method')=='turn/interrupt' and row.get('socket')==idle['socket'] for row in events):
+                    self.errors.append('natural-idle case sent a provider interrupt request')
             if args.require_prepared:
                 prepared = self.root/'logs/checkpoint-first-prepared.json'
                 baseline = json.loads((self.root/'records/before/snapshot.json').read_text())
@@ -1632,6 +1748,8 @@ class Rehearsal:
                 self.call('record','after',timeout=150,check=False)
         finally:
             self.finish_checkpoint_watch()
+            if (self.errors or failure) and (self.root/'logs').is_dir():
+                self.failure_console_snapshot()
             if ((self.root/'records/before/snapshot.json').exists()
                     and (self.root/'records/after/snapshot.json').exists()
                     and not any(step['command'][0]=='compare' for step in self.steps)):
@@ -1730,6 +1848,7 @@ def main():
     run.add_argument('--yes',action='store_true')
     run.add_argument('--working',default='',help='typed at the working-agents choice; empty waits for them')
     run.add_argument('--require-working',action='store_true',help='reject this case before updating unless the exact seeded Codex parent is still active; required for an intentional Enter/wait case')
+    run.add_argument('--natural-idle',action='store_true',help='wait for normal completion of the original Codex parent before the baseline review; require its exact idle Resumes (1) review')
     run.add_argument('--stop',default='',help='typed at the destructive stop list; empty cancels')
     run.add_argument('--upgrade-arg',action='append',default=[],help='use --upgrade-arg=--interrupt, for example')
     run.add_argument('--expect-console-refusal', action='store_true', help='with --fail-new-daemon, require console refusal before startup and preserve all work')
@@ -1759,6 +1878,11 @@ def main():
     staged.add_argument('installer')
     staged.add_argument('--record',metavar='STAGE_LOG')
     args=parser.parse_args()
+    if args.command=='run' and args.natural_idle and (requires_working(args) or args.no_codex
+            or args.working or args.yes or args.upgrade_arg or args.fail_new_daemon or args.expect_refusal
+            or any(getattr(args,flag) for flag in ('no_init','exit_mid_turn','ignore_term','uncarryable','unreachable'))
+            or args.answer.lower() not in ('yes','y')):
+        parser.error('--natural-idle requires ordinary yes, a seeded Codex chat, and no working/fault/override/refusal modes')
     if args.command == 'run' and requires_working(args) and (args.yes or any(
             flag=='--yes' or flag.startswith('--yes=') for flag in args.upgrade_arg)):
         parser.error('working cases forbid --yes because the actual working choice must be observed')

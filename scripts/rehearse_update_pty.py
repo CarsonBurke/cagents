@@ -27,11 +27,13 @@ def capture_review(root, output, index):
     """Retain the real private confirmation before answering its prompt."""
     root = Path(root).resolve()
     marker = root / '.rehearse-update'
-    destination = Path(output).resolve()
+    supplied = Path(output)
+    destination = supplied.resolve()
     if (marker.is_symlink() or marker.read_text().strip() != str(root)
-            or not destination.is_relative_to(root / 'retry') or destination.is_symlink()):
-        raise ValueError('review capture requires a marked root and its private retry directory')
-    destination.mkdir(mode=0o700, exist_ok=True)
+            or not any(destination.is_relative_to(root / name) for name in ('retry','reviews'))
+            or supplied.is_symlink()):
+        raise ValueError('review capture requires a marked root and its private retry/reviews directory')
+    destination.mkdir(mode=0o700, parents=True, exist_ok=True)
     descriptor = os.open(root / 'home/.local/share/cagents-install/.update/status.json', os.O_RDONLY | os.O_NOFOLLOW)
     with os.fdopen(descriptor, 'rb') as stream:
         metadata = os.fstat(stream.fileno())
@@ -42,6 +44,27 @@ def capture_review(root, output, index):
         raise ValueError('prompt has no bounded actual confirmation')
     with (destination / f'prompt-{index}.status.json').open('xb') as stream:
         stream.write(raw)
+    return json.loads(raw)
+
+
+def idle_review_matches(job, expected):
+    """An idle diagnostic may approve only the exact naturally settled chat."""
+    confirmation=job.get('confirmation') or {}
+    preview=confirmation.get('preview') or {}
+    daemon=preview.get('daemon') or {}
+    sessions=daemon.get('sessions',[])
+    resumes=[row for row in sessions if row.get('disposition')=='resumes']
+    additional=[key for key,row in preview.get('review_details',{}).get('panes',{}).items()
+                if row.get('outcome')=='resumes' and key!=expected.get('chat_id')]
+    saved=preview.get('review_details',{}).get('panes',{}).get(expected.get('chat_id'),{})
+    return (expected.get('valid') is True and job.get('phase')=='AwaitingConfirmation'
+            and not confirmation.get('stop') and daemon.get('policy')=='when_idle'
+            and not preview.get('stopped') and not preview.get('stopped_windows') and not daemon.get('blockers')
+            and daemon.get('capability',{}).get('proof')==expected.get('serving')
+            and len(resumes)==1 and resumes[0].get('id')==expected.get('chat_id')
+            and resumes[0].get('kind')=='native_chat' and not additional
+            and not (saved.get('outcome')=='keeps_running' and saved.get('detail'))
+            and not any(row.get('disposition') in ('waits_for_idle','interrupted','blocked','resume_picker') for row in sessions))
 
 
 def main():
@@ -54,6 +77,8 @@ def main():
                         help='typed at the destructive stop list; empty cancels')
     parser.add_argument('--require-working', action='store_true',
                         help='decline and fail if the first review is not the working-agents choice')
+    parser.add_argument('--require-idle', action='store_true',
+                        help='require the captured ordinary review to resume exactly the naturally completed seeded chat')
     parser.add_argument('--timeout', type=float, default=240)
     parser.add_argument('--review-root', type=Path)
     parser.add_argument('--review-output', type=Path)
@@ -64,8 +89,11 @@ def main():
         parser.error('a command and positive timeout are required')
     if bool(args.review_root) != bool(args.review_output):
         parser.error('--review-root and --review-output must be supplied together')
-    if args.require_working and any(arg=='--yes' or arg.startswith('--yes=') for arg in command):
-        parser.error('--require-working forbids --yes because it bypasses the actual working choice')
+    if args.require_idle and (args.require_working or not args.review_root):
+        parser.error('--require-idle requires review capture and cannot combine with --require-working')
+    if (args.require_working or args.require_idle) and any(arg=='--yes' or arg.startswith('--yes=') for arg in command):
+        parser.error('required review forbids --yes because it bypasses the actual choice')
+    expected_idle=json.loads((args.review_root/'natural-idle.json').read_text()) if args.require_idle else None
     pid, fd = pty.fork()
     if pid == 0:
         os.execvp(command[0], command)
@@ -102,13 +130,18 @@ def main():
             # arriving across separate PTY reads. Do not queue answers early.
             while match := PROMPTS.search(pending):
                 prompt_count += 1
+                review=None
                 if args.review_root:
-                    capture_review(args.review_root, args.review_output, prompt_count)
+                    review=capture_review(args.review_root, args.review_output, prompt_count)
                 answer = (args.answer if match.group('confirm') else
                           args.working if match.group('working') else args.stop)
                 if args.require_working and prompt_count == 1 and not match.group('working'):
                     case_invalid = True
                     print('\nrehearse-update: case-invalid: required working-agents choice was not offered; declining', flush=True)
+                if args.require_idle and (prompt_count!=1 or not match.group('confirm')
+                                          or not idle_review_matches(review,expected_idle)):
+                    case_invalid = True
+                    print('\nrehearse-update: case-invalid: required idle Resumes (1) review was not offered; declining', flush=True)
                 working_observed |= bool(match.group('working'))
                 if case_invalid:
                     answer = '' if match.group('stop') else 'n'
@@ -145,6 +178,9 @@ def main():
             signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
     if args.require_working and not working_observed:
         print('\nrehearse-update: case-invalid: no working-agents choice was observed', flush=True)
+        case_invalid = True
+    if args.require_idle and not prompt_count:
+        print('\nrehearse-update: case-invalid: no idle review was observed', flush=True)
         case_invalid = True
     return 124 if timed_out else 2 if case_invalid else os.waitstatus_to_exitcode(status)
 
