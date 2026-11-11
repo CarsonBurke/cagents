@@ -24437,8 +24437,27 @@ mod tests {
         app.account_ui.set_registry(registry);
         app.refresh_ui.focused = true;
         app.settings.show_status_bar = false;
+        drop(app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::Resized(1_600.0),
+        }));
         let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
         let runtime = chat_runtime(&app, card);
+        assert!(
+            runtime.presents(),
+            "fixture chat must follow the visible transcript path"
+        );
+        assert_eq!(
+            app.chat_account(
+                runtime.session.launch.provider,
+                &runtime.session.launch.recipe
+            ),
+            Some(crate::account::Account::system(Provider::Codex).id())
+        );
         let target = runtime.target;
         let handle = runtime.handle().unwrap().clone();
         let id = crate::account::Account::system(Provider::Codex).id();
@@ -24468,6 +24487,15 @@ mod tests {
         next.error = Some("Usage limit reached for this plan".into());
         handle.publish_snapshot_for_test(next);
         drop(app.update(Message::ChatUi(Action::Wake(target, Wake::Changed))));
+        assert!(app.refresh_ui.focused);
+        assert!(
+            chat_runtime(&app, card)
+                .failure_ui
+                .incidents
+                .iter()
+                .any(|incident| incident.kind == Some(chat::failure::FailureKind::AccountLimit)),
+            "fixture must classify the current provider rejection"
+        );
         let first = app
             .account_ui
             .pending_probe_for_test(&id)
@@ -24515,6 +24543,10 @@ mod tests {
             app.account_ui
                 .set_registry(crate::account::registry::Registry::default());
             app.refresh_ui.focused = true;
+            drop(app.update(Message::Viewport {
+                generation: app.workspace_view_generation,
+                event: WorkspaceViewportEvent::Resized(1_600.0),
+            }));
             let (card, target) = starting_chat(&mut app);
             let handle = fixture_handle(&app, card, Some("fixture-thread"));
             let mut snapshot = (*handle.snapshot()).clone();
@@ -24534,8 +24566,24 @@ mod tests {
             snapshot.error = active.then(|| raw.into());
             snapshot.generation += 1;
             handle.publish_snapshot_for_test(snapshot);
+            assert_eq!(
+                app.workspace.visibility(card),
+                Some(VisibilityClass::Visible)
+            );
             answer_start(&mut app, target, Ok(handle));
+            let runtime = chat_runtime(&app, card);
+            assert!(runtime.presents());
+            assert!(runtime.failure_ui.incidents.iter().any(|incident| incident.kind == Some(chat::failure::FailureKind::AccountLimit)));
+            assert_eq!(runtime.failure_ui.active_account_limit(), active);
+            assert!(app.refresh_ui.focused);
             let id = crate::account::Account::system(Provider::Codex).id();
+            assert_eq!(
+                app.chat_account(
+                    runtime.session.launch.provider,
+                    &runtime.session.launch.recipe
+                ),
+                Some(id.clone())
+            );
             assert_eq!(
                 app.account_ui.pending_probe_is_forced_for_test(&id),
                 active,
