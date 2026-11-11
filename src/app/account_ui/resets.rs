@@ -188,6 +188,7 @@ pub(in crate::app) struct Controls {
     enabled: bool,
     recovery_enabled: bool,
     checking: bool,
+    limit_context: bool,
     surface: String,
     identity: Option<Identity>,
 }
@@ -205,15 +206,6 @@ fn inventory(reset: &UsageReset, now: Millis) -> bool {
     reset.available_count > 0 && reset.expires_at.is_none_or(|at| at > unix_seconds(now))
 }
 
-struct InventoryGroup {
-    scopes: Vec<account::resets::ResetScope>,
-    label: String,
-    count: u64,
-    usable_now: bool,
-    next_expiry: Option<i64>,
-    unknown_expiry: bool,
-}
-
 fn normalized_scopes(reset: &UsageReset) -> Vec<account::resets::ResetScope> {
     let mut scopes = reset.scopes.clone();
     scopes.sort_by_key(account::resets::ResetScope::label);
@@ -221,48 +213,9 @@ fn normalized_scopes(reset: &UsageReset) -> Vec<account::resets::ResetScope> {
     scopes
 }
 
-fn grouped_inventory(snapshot: &UsageSnapshot, now: Millis) -> Vec<InventoryGroup> {
-    let mut groups: Vec<InventoryGroup> = Vec::new();
-    for reset in snapshot.resets.iter().filter(|reset| inventory(reset, now)) {
-        let scopes = normalized_scopes(reset);
-        let usable_now = reset.is_available(unix_seconds(now));
-        if let Some(group) = groups
-            .iter_mut()
-            .find(|group| group.scopes == scopes && group.usable_now == usable_now)
-        {
-            group.count = group.count.saturating_add(reset.available_count);
-            group.next_expiry = group.next_expiry.into_iter().chain(reset.expires_at).min();
-            group.unknown_expiry |= reset.expires_at.is_none();
-        } else {
-            groups.push(InventoryGroup {
-                label: if scopes.is_empty() {
-                    "Unknown scope".into()
-                } else {
-                    scopes
-                        .iter()
-                        .map(account::resets::ResetScope::label)
-                        .collect::<Vec<_>>()
-                        .join(" + ")
-                },
-                scopes,
-                count: reset.available_count,
-                usable_now,
-                next_expiry: reset.expires_at,
-                unknown_expiry: reset.expires_at.is_none(),
-            });
-        }
-    }
-    groups.sort_by(|left, right| {
-        left.label
-            .cmp(&right.label)
-            .then_with(|| right.usable_now.cmp(&left.usable_now))
-    });
-    groups
-}
-
 fn scope_count(snapshot: &UsageSnapshot, reset: &UsageReset, now: Millis) -> u64 {
     let scopes = normalized_scopes(reset);
-    grouped_inventory(snapshot, now)
+    account::resets::inventory_groups(&snapshot.resets, unix_seconds(now))
         .into_iter()
         .find(|group| group.scopes == scopes && group.usable_now)
         .map_or(0, |group| group.count)
@@ -484,6 +437,7 @@ impl Controls {
     pub(in crate::app) fn for_limit(&self, summary: &str) -> Option<Self> {
         let cleared = self.limit_cleared(summary);
         let mut controls = self.clone();
+        controls.limit_context = true;
         controls
             .snapshot
             .windows
@@ -547,34 +501,12 @@ impl Controls {
 
     pub(in crate::app) fn view(self) -> Element<'static, Message> {
         let mut rows: Vec<Element<'static, Message>> = Vec::new();
-        for group in grouped_inventory(&self.snapshot, self.now) {
-            let expiry = group
-                .next_expiry
-                .map(|at| {
-                    format!(
-                        " · {} {}",
-                        if group.unknown_expiry {
-                            "first known expiry"
-                        } else if group.count == 1 {
-                            "expires"
-                        } else {
-                            "first expires"
-                        },
-                        account::format_local_moment(at, unix_seconds(self.now))
-                    )
-                })
-                .unwrap_or_default();
+        for line in account::resets::inventory_lines(&self.snapshot.resets, unix_seconds(self.now))
+        {
             rows.push(
-                design::caption(format!(
-                    "{}{expiry}",
-                    account::resets::inventory_caption(
-                        &group.scopes,
-                        group.count,
-                        group.usable_now
-                    )
-                ))
-                .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
-                .into(),
+                design::caption(line)
+                    .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
+                    .into(),
             );
         }
         if self.checking && self.state.pending.is_none() {
@@ -627,10 +559,10 @@ impl Controls {
                 .into(),
             );
         } else if let Some(reset) = next_reset(&self.snapshot, &self.state, self.now) {
-            let label = if self.state.uncertain.is_empty() {
+            let label = if self.limit_context {
                 "Use a reset".into()
             } else {
-                format!("Use {}", reset.reset_phrase())
+                reset.action_label()
             };
             rows.push(
                 crate::ui_controls::button::secondary(label)
@@ -774,6 +706,7 @@ impl Cagents {
             state: reset_state,
             identity: state.identity.clone(),
             checking,
+            limit_context: false,
             surface: "accounts".into(),
             now: self.account_ui.now_ms,
             recovery_enabled: state.present
@@ -1297,6 +1230,7 @@ mod tests {
             enabled: true,
             recovery_enabled: true,
             checking: false,
+            limit_context: false,
             surface: "accounts".into(),
             identity: None,
         };
@@ -1315,10 +1249,10 @@ mod tests {
         let inventory: Vec<_> = texts
             .0
             .iter()
-            .filter(|text| text.starts_with("3 account resets available"))
+            .filter(|text| text.starts_with("3 account resets"))
             .collect();
         assert_eq!(inventory.len(), 1);
-        assert!(inventory[0].contains("3 account resets available · first expires"));
+        assert!(inventory[0].contains("3 account resets · first expires"));
     }
 
     #[test]
@@ -1410,7 +1344,7 @@ mod tests {
         let mut unknown = reset(ResetScope::Account);
         unknown.scopes.clear();
         snapshot.resets = vec![known, count_only, unknown];
-        let groups = grouped_inventory(&snapshot, now);
+        let groups = account::resets::inventory_groups(&snapshot.resets, unix_seconds(now));
         assert_eq!(groups.len(), 2);
         let account = groups
             .iter()
@@ -1547,6 +1481,7 @@ mod tests {
             enabled: true,
             recovery_enabled: true,
             checking: false,
+            limit_context: false,
             surface: "accounts".into(),
             identity: None,
         };
@@ -1863,6 +1798,7 @@ mod tests {
             enabled: true,
             recovery_enabled: true,
             checking: false,
+            limit_context: false,
             surface: "accounts".into(),
             identity: None,
         };
@@ -1983,6 +1919,7 @@ mod tests {
                 enabled: false,
                 recovery_enabled: false,
                 checking: false,
+                limit_context: false,
                 surface: "accounts".into(),
                 identity: None,
             };
@@ -2367,6 +2304,7 @@ mod tests {
             enabled: true,
             recovery_enabled: true,
             checking: false,
+            limit_context: false,
             surface: "accounts".into(),
             identity: None,
         };
@@ -2428,6 +2366,7 @@ mod tests {
             enabled: true,
             recovery_enabled: true,
             checking: false,
+            limit_context: false,
             surface: "accounts".into(),
             identity: None,
         };
@@ -2501,7 +2440,11 @@ mod tests {
                 let controls = controls.unwrap();
                 assert!(next_reset(&controls.snapshot, &controls.state, controls.now).is_some());
                 assert_eq!(
-                    grouped_inventory(&controls.snapshot, controls.now)[0].count,
+                    account::resets::inventory_groups(
+                        &controls.snapshot.resets,
+                        unix_seconds(controls.now)
+                    )[0]
+                    .count,
                     1
                 );
                 drop(app.account_limit_reported(Provider::Codex, &recipe));
@@ -2763,6 +2706,153 @@ mod tests {
         assert_eq!(entries[0].1.snapshot.resets[0].available_count, 1);
     }
     #[test]
+    fn account_buttons_name_the_selected_grant_while_limit_buttons_keep_the_generic_action() {
+        use iced::advanced::{
+            Layout, Shell, clipboard, layout,
+            widget::{Operation, Tree, operation},
+        };
+        use iced::{Event, Rectangle, Size, mouse};
+        #[derive(Default)]
+        struct Texts(Vec<String>);
+        impl Operation for Texts {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, _: Rectangle, text: &str) {
+                self.0.push(text.into());
+            }
+        }
+        let now = now_ms();
+        let mut combined = reset(ResetScope::AccountSession);
+        combined.scopes.push(ResetScope::AccountWeekly);
+        for (grant, window, summary, account_label) in [
+            (
+                reset(ResetScope::Model("Fable".into())),
+                window(account::WindowKind::Scoped, "weekly_scoped:Fable", 1.0),
+                "Claude Fable limit reached",
+                "Use Fable reset",
+            ),
+            (
+                combined,
+                window(account::WindowKind::Weekly, "weekly_all", 1.0),
+                "Claude weekly limit reached",
+                "Use Session + Weekly reset",
+            ),
+        ] {
+            let mut snapshot = UsageSnapshot::state(UsageStatus::Limited, "", now);
+            snapshot.windows.push(window);
+            snapshot.resets.push(grant.clone());
+            let controls = Controls {
+                id: Account::system(Provider::Claude).id(),
+                name: "Fixture".into(),
+                snapshot,
+                state: State::default(),
+                now,
+                enabled: true,
+                recovery_enabled: true,
+                checking: false,
+                limit_context: false,
+                surface: "accounts".into(),
+                identity: None,
+            };
+            // Surface identifiers affect focus routing, never the action copy.
+            for (controls, expected) in [
+                (controls.clone().on_surface("accounts"), account_label),
+                (controls.clone().on_surface("popover"), account_label),
+                (controls.clone().on_surface("chat/arbitrary"), account_label),
+                (
+                    controls.for_limit(summary).unwrap().on_surface("accounts"),
+                    "Use a reset",
+                ),
+            ] {
+                let renderer = crate::app::tests::headless_renderer();
+                let start = reset_control_id(&controls.id, &controls.surface, "start");
+                let expected_account = controls.id.clone();
+                let expected_surface = controls.surface.clone();
+                let mut element = controls.view();
+                let mut tree = Tree::new(element.as_widget());
+                let bounds = Rectangle::with_size(Size::new(420.0, 900.0));
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, bounds.size()),
+                );
+                let mut texts = Texts::default();
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut texts,
+                );
+                let actions: Vec<_> = texts
+                    .0
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|text| text.starts_with("Use "))
+                    .collect();
+                assert_eq!(
+                    actions,
+                    [expected],
+                    "the rendered primary button names its context"
+                );
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut operation::focusable::focus::<()>(start),
+                );
+                let key = keyboard::Key::Named(keyboard::key::Named::Enter);
+                let mut messages = Vec::new();
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &Event::Keyboard(keyboard::Event::KeyPressed {
+                        key: key.clone(),
+                        modified_key: key,
+                        physical_key: keyboard::key::Physical::Unidentified(
+                            keyboard::key::NativeCode::Unidentified,
+                        ),
+                        location: keyboard::Location::Standard,
+                        modifiers: keyboard::Modifiers::empty(),
+                        text: None,
+                        repeat: false,
+                    }),
+                    Layout::new(&node),
+                    mouse::Cursor::Unavailable,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &bounds,
+                );
+                assert!(
+                    matches!(messages.as_slice(), [Message::AccountUi(Action::ResetStart(account, reset_id, surface, false))]
+                    if account == &expected_account && reset_id == &grant.id && surface == &expected_surface)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn held_inventory_stays_scope_first_without_an_available_or_spend_action() {
+        let now = now_ms();
+        let mut held = reset(ResetScope::AccountSession);
+        held.scopes.push(ResetScope::AccountWeekly);
+        held.available_count = 1;
+        held.usable = false;
+        held.expires_at = Some(unix_seconds(now) + 86_400);
+        let mut snapshot = UsageSnapshot::state(UsageStatus::Limited, "", now);
+        snapshot
+            .windows
+            .push(window(account::WindowKind::Weekly, "weekly_all", 1.0));
+        snapshot.resets.push(held.clone());
+        let lines = account::resets::inventory_lines(&snapshot.resets, unix_seconds(now));
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with("1 Session + Weekly reset · not usable now · expires "));
+        assert!(!lines[0].contains("available"));
+        assert_eq!(scope_count(&snapshot, &held, now), 0);
+        assert!(next_reset(&snapshot, &State::default(), now).is_none());
+    }
+
+    #[test]
     fn reset_copy_counts_only_usable_grants_and_explains_the_effect_on_every_surface() {
         use iced::advanced::{
             Layout, layout,
@@ -2793,9 +2883,12 @@ mod tests {
             window(account::WindowKind::Scoped, "weekly_scoped:Fable", 1.0),
             window(account::WindowKind::Weekly, "weekly_all", 1.0),
         ];
-        snapshot.resets = vec![grant.clone(), paused, combined];
+        let mut held_combined = combined.clone();
+        held_combined.id = "held-combined".into();
+        held_combined.usable = false;
+        snapshot.resets = vec![grant.clone(), paused, combined, held_combined];
         assert_eq!(scope_count(&snapshot, &grant, now), 2);
-        let groups = grouped_inventory(&snapshot, now);
+        let groups = account::resets::inventory_groups(&snapshot.resets, unix_seconds(now));
         assert!(
             groups
                 .iter()
@@ -2817,6 +2910,7 @@ mod tests {
             enabled: true,
             recovery_enabled: true,
             checking: false,
+            limit_context: false,
             surface: "accounts".into(),
             identity: None,
         };
@@ -2834,9 +2928,10 @@ mod tests {
                 .as_widget_mut()
                 .operate(&mut tree, Layout::new(&node), &renderer, &mut texts);
             for expected in [
-                "2 Fable resets available",
-                "9 Fable resets not usable now",
-                "1 reset available for Session + Weekly",
+                "2 Fable resets",
+                "9 Fable resets · not usable now",
+                "1 Session + Weekly reset",
+                "1 Session + Weekly reset · not usable now",
                 "Use a Fable reset for fixture@example.test?",
                 "This clears the Fable weekly limit now. 2 available; this can’t be undone.",
             ] {
@@ -2869,6 +2964,7 @@ mod tests {
             enabled: true,
             recovery_enabled: true,
             checking: false,
+            limit_context: false,
             surface: "accounts".into(),
             identity: None,
         };

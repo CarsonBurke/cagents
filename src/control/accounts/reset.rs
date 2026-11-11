@@ -318,13 +318,12 @@ fn output(request: &ConsumeRequest, outcome: &ConsumeOutcome) -> CommandOutput {
                 window.left() * 100.0
             ));
         }
-        for reset in &snapshot.resets {
-            lines.push(format!(
-                "  {} resets: {} left",
-                reset.label(),
-                reset.available_count
-            ));
-        }
+        let now_secs = i64::try_from(snapshot.observed_at / 1000).unwrap_or(i64::MAX);
+        lines.extend(
+            crate::account::resets::inventory_lines(&snapshot.resets, now_secs)
+                .into_iter()
+                .map(|line| format!("  {line}")),
+        );
     } else {
         lines
             .push("Current usage could not be refreshed; do not assume a reset was unused.".into());
@@ -682,5 +681,114 @@ mod tests {
             "Use an account reset for codex/system? This clears the account usage limits now. 2 available; this can’t be undone."
         );
         assert!(!prompt.contains("codex/system (codex/system)"));
+    }
+    #[test]
+    fn info_and_reset_result_share_grouped_scope_first_inventory() {
+        use crate::account::{
+            UsageSnapshot, UsageStatus,
+            info::{AccountInfo, Report},
+            resets::ConsumeStatus,
+        };
+        let mut first = grant("fable-first", vec![ResetScope::Model("Fable".into())], 1);
+        first.expires_at = None;
+        let mut second = first.clone();
+        second.id = "fable-second".into();
+        let mut session = grant("session", vec![ResetScope::AccountSession], 1);
+        session.expires_at = None;
+        let mut held = grant(
+            "combined-held",
+            vec![ResetScope::AccountSession, ResetScope::AccountWeekly],
+            1,
+        );
+        held.expires_at = None;
+        held.usable = false;
+        let mut snapshot = UsageSnapshot::state(UsageStatus::Ok, "fixture", 100_000);
+        snapshot.resets = vec![first, second, session, held];
+        let request = ConsumeRequest {
+            account: "claude/system".parse().unwrap(),
+            reset_id: "fable-first".into(),
+            idempotency_key: "same-operation".into(),
+            expected_identity: None,
+        };
+        let mut account = AccountInfo {
+            id: request.account.clone(),
+            provider: crate::agent::Provider::Claude,
+            label: Some("Work".into()),
+            registered_identity: None,
+            observed_identity: None,
+            identity_conflict: false,
+            selected_by_caller: false,
+            default_for_new_chats: false,
+            archived: false,
+            usage: None,
+            remaining: vec![],
+            credits: None,
+            credits_remaining_fraction: None,
+            credits_remaining: None,
+            age_ms: None,
+            stale: false,
+            detail: None,
+        };
+        account.set_usage(snapshot.clone(), snapshot.observed_at);
+        let report = Report {
+            sampled_at: snapshot.observed_at,
+            caller: None,
+            accounts: vec![account],
+            diagnostics: vec![],
+        };
+        let info = super::super::human(&report);
+        let outcome = ConsumeOutcome {
+            status: ConsumeStatus::Reset,
+            message: None,
+            snapshot: Some(snapshot.clone()),
+        };
+        let result = output(&request, &outcome);
+        let inventory = crate::account::resets::inventory_lines(&snapshot.resets, 100);
+        assert_eq!(
+            inventory.len(),
+            3,
+            "equivalent Fable grants share one inventory line"
+        );
+        assert!(
+            inventory
+                .iter()
+                .any(|line| line.starts_with("2 Fable resets"))
+        );
+        assert!(
+            inventory
+                .iter()
+                .any(|line| line.starts_with("1 Session reset"))
+        );
+        assert!(
+            inventory
+                .iter()
+                .any(|line| line.contains("1 Session + Weekly reset · not usable now"))
+        );
+        for line in inventory {
+            assert!(info.lines().any(|rendered| rendered == format!("  {line}")));
+            assert!(
+                result
+                    .human
+                    .lines()
+                    .any(|rendered| rendered == format!("  {line}"))
+            );
+            assert!(!line.contains("available"));
+            assert!(!line.contains("left"));
+        }
+        assert_eq!(
+            result.data["result"]["snapshot"]["resets"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4,
+            "human grouping must not change JSON inventory"
+        );
+        assert_eq!(
+            serde_json::to_value(report).unwrap()["accounts"][0]["usage"]["resets"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
     }
 }

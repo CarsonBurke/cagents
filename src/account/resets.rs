@@ -86,6 +86,15 @@ impl UsageReset {
         }
     }
 
+    /// The account-level action names the grant selected for confirmation.
+    pub fn action_label(&self) -> String {
+        match ordered_scopes(&self.scopes).as_slice() {
+            [ResetScope::Account] => "Use account reset".into(),
+            [] => "Use a reset".into(),
+            _ => format!("Use {} reset", scope_label(&self.scopes)),
+        }
+    }
+
     pub fn confirmation_question(&self, account_name: &str) -> String {
         format!("Use {} for {account_name}?", self.reset_phrase())
     }
@@ -140,24 +149,97 @@ fn scope_label(scopes: &[ResetScope]) -> String {
         .join(" + ")
 }
 
-/// Inventory copy names grants, never a countdown until a limit resets.
-/// Paused/non-next grants must remain distinct from grants usable now.
+/// One scope/usability group, retaining the earliest reported expiry.
+/// This display model is shared by the UI and human CLI outputs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InventoryGroup {
+    pub scopes: Vec<ResetScope>,
+    pub label: String,
+    pub count: u64,
+    pub usable_now: bool,
+    pub next_expiry: Option<i64>,
+    pub unknown_expiry: bool,
+}
+
+/// Keep paused/non-next grants separate from grants usable now, without
+/// merging their counts into a misleading spendable total.
+pub fn inventory_groups(resets: &[UsageReset], now_secs: i64) -> Vec<InventoryGroup> {
+    let mut groups: Vec<InventoryGroup> = Vec::new();
+    for reset in resets.iter().filter(|reset| {
+        reset.available_count > 0 && reset.expires_at.is_none_or(|at| at > now_secs)
+    }) {
+        let scopes = ordered_scopes(&reset.scopes);
+        let usable_now = reset.is_available(now_secs);
+        if let Some(group) = groups
+            .iter_mut()
+            .find(|group| group.scopes == scopes && group.usable_now == usable_now)
+        {
+            group.count = group.count.saturating_add(reset.available_count);
+            group.next_expiry = group.next_expiry.into_iter().chain(reset.expires_at).min();
+            group.unknown_expiry |= reset.expires_at.is_none();
+        } else {
+            groups.push(InventoryGroup {
+                label: if scopes.is_empty() {
+                    "Unknown scope".into()
+                } else {
+                    scope_label(&scopes)
+                },
+                scopes,
+                count: reset.available_count,
+                usable_now,
+                next_expiry: reset.expires_at,
+                unknown_expiry: reset.expires_at.is_none(),
+            });
+        }
+    }
+    groups.sort_by(|left, right| {
+        left.label
+            .cmp(&right.label)
+            .then_with(|| right.usable_now.cmp(&left.usable_now))
+    });
+    groups
+}
+
+/// Scope-first inventory copy. Only non-spendable groups carry a qualifier;
+/// the chosen action, rather than repeated “available” labels, names a spend.
 pub fn inventory_caption(scopes: &[ResetScope], count: u64, usable_now: bool) -> String {
     let plural = if count == 1 { "" } else { "s" };
-    let availability = if usable_now {
-        "available"
-    } else {
-        "not usable now"
+    let scope = match ordered_scopes(scopes).as_slice() {
+        [ResetScope::Account] => "account".into(),
+        [] => "Unknown scope".into(),
+        _ => scope_label(scopes),
     };
-    match ordered_scopes(scopes).as_slice() {
-        [ResetScope::Account] => format!("{count} account reset{plural} {availability}"),
-        [scope] => format!("{count} {} reset{plural} {availability}", scope.label()),
-        [] => format!("{count} reset{plural} with an unknown scope · not usable now"),
-        _ => format!(
-            "{count} reset{plural} {availability} for {}",
-            scope_label(scopes)
-        ),
-    }
+    let availability = if usable_now && !scopes.is_empty() {
+        ""
+    } else {
+        " · not usable now"
+    };
+    format!("{count} {scope} reset{plural}{availability}")
+}
+
+/// Full grant lines, including expiry wording, identical across account UI
+/// surfaces, CLI usage, and the refreshed CLI reset result.
+pub fn inventory_lines(resets: &[UsageReset], now_secs: i64) -> Vec<String> {
+    inventory_groups(resets, now_secs)
+        .into_iter()
+        .map(|group| {
+            let mut line = inventory_caption(&group.scopes, group.count, group.usable_now);
+            if let Some(at) = group.next_expiry {
+                let expiry = if group.unknown_expiry {
+                    "first known expiry"
+                } else if group.count == 1 {
+                    "expires"
+                } else {
+                    "first expires"
+                };
+                line.push_str(&format!(
+                    " · {expiry} {}",
+                    super::format_local_moment(at, now_secs)
+                ));
+            }
+            line
+        })
+        .collect()
 }
 
 impl UsageSnapshot {
@@ -307,7 +389,7 @@ mod tests {
     fn inventory_copy_distinguishes_reset_grants_from_limit_windows_and_unusable_grants() {
         assert_eq!(
             inventory_caption(&[ResetScope::Model("Fable".into())], 2, true),
-            "2 Fable resets available"
+            "2 Fable resets"
         );
         assert_eq!(
             inventory_caption(
@@ -315,15 +397,15 @@ mod tests {
                 1,
                 true
             ),
-            "1 reset available for Session + Weekly"
+            "1 Session + Weekly reset"
         );
         assert_eq!(
             inventory_caption(&[ResetScope::Model("Fable".into())], 9, false),
-            "9 Fable resets not usable now"
+            "9 Fable resets · not usable now"
         );
         assert_eq!(
             inventory_caption(&[], 1, true),
-            "1 reset with an unknown scope · not usable now"
+            "1 Unknown scope reset · not usable now"
         );
     }
 }

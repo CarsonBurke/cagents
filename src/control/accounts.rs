@@ -235,22 +235,12 @@ fn human(report: &Report) -> String {
                     }
                 ));
             }
-            for reset in &usage.resets {
-                lines.push(format!(
-                    "  Resets: {} · {} left{}{}",
-                    reset.label(),
-                    reset.available_count,
-                    reset
-                        .expires_at
-                        .map(|at| format!(" · expires {at}"))
-                        .unwrap_or_default(),
-                    if reset.usable {
-                        ""
-                    } else {
-                        " · unavailable now"
-                    },
-                ));
-            }
+            let now_secs = i64::try_from(report.sampled_at / 1000).unwrap_or(i64::MAX);
+            lines.extend(
+                crate::account::resets::inventory_lines(&usage.resets, now_secs)
+                    .into_iter()
+                    .map(|line| format!("  {line}")),
+            );
             if let Some(credits) = &account.credits {
                 lines.push(format!("  Extra usage: {}", credits.summary()));
                 if let Some(remaining) = &account.credits_remaining {
