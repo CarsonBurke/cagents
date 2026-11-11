@@ -2625,7 +2625,14 @@ impl Cagents {
                     // A reported title waiting for its save is newer than the
                     // shared one, which it replaces when that save publishes it.
                     let reported = self.reported_title_save.cards.contains(&pane.id);
-                    if let Some(current) = self.card_state_mut(pane.id) {
+                    // Writing a card copies it while a save still holds it,
+                    // so only a card the view changes is written.
+                    let changed = self.card_state(pane.id).is_some_and(|current| {
+                        (!reported && current.title != pane.title)
+                            || current.width_fraction != pane.width_fraction
+                            || (!resuming && current.kind != kind)
+                    });
+                    if changed && let Some(current) = self.card_state_mut(pane.id) {
                         if !reported {
                             current.title = pane.title.clone();
                         }
@@ -2674,7 +2681,7 @@ impl Cagents {
                     let durable = Arc::make_mut(&mut self.durable);
                     if let Some(existing) = durable.cards.iter_mut().find(|card| card.id == pane.id)
                     {
-                        *existing = card;
+                        *existing = card.into();
                     } else {
                         durable.cards.push(card);
                     }
@@ -2720,22 +2727,9 @@ impl Cagents {
                 channel.focused = channel.cards.first().copied();
             }
         }
-        let members = visible.iter().copied().collect::<HashSet<_>>();
-        let states = self
-            .durable
+        Arc::make_mut(&mut self.durable)
             .cards
-            .iter()
-            .filter(|card| members.contains(&card.id))
-            .map(|card| (card.id, card.clone()))
-            .collect::<HashMap<_, _>>();
-        let mut ordered = visible.iter().filter_map(|id| states.get(id).cloned());
-        for card in &mut Arc::make_mut(&mut self.durable).cards {
-            if members.contains(&card.id) {
-                if let Some(next) = ordered.next() {
-                    *card = next;
-                }
-            }
-        }
+            .arrange_within(&visible);
         if active {
             tasks.push(self.project_shared_strip(&view.panes, &visible));
         }
