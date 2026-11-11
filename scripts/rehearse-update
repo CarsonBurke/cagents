@@ -30,10 +30,14 @@ DIR holds one private user. Its path must be short (sockets live below it).
                        --working TEXT, --stop TEXT,
                        --upgrade-arg=--interrupt, --untitled 0|1|2, --no-codex,
                        --no-child, --ignore-term, --no-init, --exit-mid-turn,
-                       --uncarryable, --unreachable. See run --help.
+                       --uncarryable, --unreachable, --reopen-existing-only,
+                       --new-terminal-after-restore,
+                       --expect-terminal-restart-failure (before example).
+                       See run --help.
   compare A B          Compare record names, directories or snapshot JSON.
   cleanup              Stop everything and remove this marked root.
-  launch [main|NAME]   Open a named installed UI window on the desktop.
+  launch [--restore-existing-only] [main|NAME]
+                       Open a named installed UI window on the desktop.
   wm ARGS...           Private compositor IPC (niri msg).
   ceditor start DIR    Launch DIR/ceditor with its matched companions.
   seed [OPTIONS]       Open two projects and create channels, agents (chat and
@@ -59,6 +63,7 @@ DIR holds one private user. Its path must be short (sockets live below it).
   record NAME          Write DIR/records/NAME/: daemon status, terminals,
                        sessions, channels, saved panes and their processes.
   stop                 End everything the private user runs, the daemon too.
+  stop-daemon          Stop only the private daemon with counted confirmation.
   status               Report the desktop, daemon and processes.
 USAGE
 }
@@ -161,6 +166,11 @@ cmd_init() {
     printf '%s\n' "$root" >"$root/.rehearse-update"
     mkdir -p -- "$bin" "$logs" "$root/records" "$root/shots" "$user_home"/{.claude,.codex,.config,.cache,.local/bin,.local/share,.local/state}
     mkdir -m 700 -p -- "$runtime"
+    # The fixture ignores probes in this counter; real chat starts append once.
+    [ ! -L "$user_home/.claude/fixture-launches" ] \
+        && { [ ! -e "$user_home/.claude/fixture-launches" ] || [ -f "$user_home/.claude/fixture-launches" ]; } \
+        || die 'fixture launch counter must be a regular private file' 2
+    (umask 077; touch -- "$user_home/.claude/fixture-launches")
     install -m 755 "$tool_root/tests/fixtures/chat-composer-claude.sh" "$bin/claude"
     install -m 755 "$tool_root/tests/fixtures/fixture-gh.sh" "$bin/gh"
     printf '#!/bin/sh\necho "curl: (7) the rehearsal has no network access" >&2\nexit 7\n' >"$bin/curl"
@@ -211,9 +221,10 @@ cmd_update() {
     require_init
     local archive_dir=${1:?update needs the archive directory} version=${2:?update needs a version} installer=${3:?update needs an install.sh}
     shift 3
-    local answer= working= stop= upgrade_args=()
+    local answer= working= stop= fail_new_daemon=0 upgrade_args=()
     while [ "$#" -gt 0 ]; do
         case $1 in
+            --fail-new-daemon) fail_new_daemon=1; shift ;;
             --answer) answer=${2?}; shift 2 ;;
             --working) working=${2?}; shift 2 ;;
             --stop) stop=${2?}; shift 2 ;;
@@ -223,6 +234,11 @@ cmd_update() {
     local started=$SECONDS status=0 transcript
     transcript=$logs/update-$(date +%H%M%S).log
     local prefix=$user_home/.local/share/cagents-install
+    if [ "$fail_new_daemon" -eq 1 ]; then
+        [ ! -e "$prefix/versions/$version" ] || die 'startup failure requires an unstaged private candidate' 2
+        archive_dir=$(user_env /usr/bin/python3 "$tool_root/scripts/rehearse_update_fault.py" \
+            "$root" "$version" --archive-dir "$archive_dir")
+    fi
     if [[ $prefix/current -ef $prefix/versions/$version ]]; then
         printf '%s is already current; skipping staging.\n' "$version"
     elif [ -e "$prefix/versions/$version" ]; then
@@ -313,9 +329,13 @@ run_desktop() {
     local limit=$1
     exec 9>"$native_lock"
     printf 'waiting for the native lock %s\n' "$native_lock"
-    while ! flock -w 1 9; do
-        [ ! -e "$desktop/stop" ] || return 0
-    done
+    local lock_status=0
+    setpriv --pdeathsig TERM /usr/bin/python3 "$tool_root/scripts/rehearse_update_run.py" \
+        "$root" "$self" wait-native-lock --fd 9 --parent-pid "$BASHPID" || lock_status=$?
+    if [ "$lock_status" -ne 0 ]; then
+        [ "$lock_status" -eq 75 ] && [ -e "$desktop/stop" ] && return 0
+        die "native lock waiter exited $lock_status" "$lock_status"
+    fi
     [ ! -e "$desktop/stop" ] || return 0
     printf 'holding the native lock\n'
     : >"$desktop/locked"
@@ -452,6 +472,24 @@ cmd_record() {
         esac
         user_env timeout -k 2 15 "$cli" --no-start --json "${args[@]}" >"$out/$noun.json" 2>"$out/$noun.stderr" || :
     done
+    # The issued receipt alone is historical evidence. Re-run its read-only
+    # verifier so paused panes are accepted only from the same Ready owner now.
+    local evidence_status=0
+    /usr/bin/python3 "$tool_root/scripts/rehearse_update_records.py" prepare-recovery "$root" "$out" \
+        >"$out/recovery-prepare.stdout" 2>"$out/recovery-prepare.stderr" || evidence_status=$?
+    if [ "$evidence_status" -eq 0 ]; then
+        local verifier
+        IFS= read -r verifier <"$out/recovery-prepare.stdout"
+        user_env timeout -k 2 30 "$verifier" --no-start daemon verify-update-census \
+            --census "$out/recovery-census.json" --outcome "$out/recovery-current.json" \
+            >"$out/recovery-verify.stdout" 2>"$out/recovery-verify.stderr" || {
+                printf '%s\n' 'Current daemon readiness and inventory verification failed; inspect recovery-verify.stderr' >"$out/recovery-error.txt"
+                status=1
+            }
+    elif [ "$evidence_status" -ne 1 ]; then
+        cp -- "$out/recovery-prepare.stderr" "$out/recovery-error.txt"
+        status=1
+    fi
     if desktop_live; then
         /usr/bin/python3 "$tool_root/scripts/rehearse_update_run.py" "$root" "$self" observe "$out/windows.json" || status=$?
     else
@@ -470,11 +508,19 @@ cmd_compare() {
 
 cmd_launch() {
     require_init
-    local slot=${1:-main} args=()
+    local existing_only=0
+    if [ "${1:-}" = --restore-existing-only ]; then existing_only=1; shift; fi
+    local slot=${1:-main} args=() program=$user_home/.local/bin/cagents
     [[ $slot =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]] || die 'invalid window name' 2
     [ "$slot" = main ] || args=(--window "$slot")
+    if [ "$existing_only" -eq 1 ]; then
+        program=$user_home/.local/share/cagents-install/current/bin/cagents-ui
+        args=(--restore-existing-only "${args[@]}")
+    else
+        args=(ui "${args[@]}")
+    fi
     # The display environment and private environment are retained by the UI.
-    (exec </dev/null; cmd_app "$user_home/.local/bin/cagents" ui "${args[@]}") >"$logs/ui-$slot.log" 2>&1 &
+    (exec </dev/null; cmd_app "$program" "${args[@]}") >"$logs/ui-$slot.log" 2>&1 &
     printf '%s\n' "$!" >"$root/ui-$slot.pid"
 }
 
@@ -592,6 +638,16 @@ cmd_stop() {
     return "$cleanup_status"
 }
 
+cmd_stop_daemon() {
+    require_init
+    local prefix=$user_home/.local/share/cagents-install cli capability
+    cli=$(readlink -f -- "$user_home/.local/bin/cagents")
+    [[ $cli == "$prefix"/versions/*/bin/cagents ]] || die 'private daemon stop requires its installed CLI' 2
+    [ "$cli" = "$(readlink -f -- "$prefix/current/bin/cagents")" ] || die 'private daemon stop requires the current build' 2
+    capability=$(user_env timeout -k 5 20 "$cli" --no-start daemon preflight) || return
+    user_env timeout -k 5 30 "$cli" --no-start --json daemon stop --confirm "$capability"
+}
+
 cmd_status() {
     if desktop_live; then printf 'desktop: running (pid %s)\n' "$(cat "$desktop/pid")"; else printf 'desktop: stopped\n'; fi
     printf 'installed: %s\n' "$(readlink -- "$user_home/.local/share/cagents-install/current" 2>/dev/null || echo none)"
@@ -618,6 +674,7 @@ case $command in
     shot) cmd_shot "$@" ;;
     record) cmd_record "$@" ;;
     stop) cmd_stop ;;
+    stop-daemon) cmd_stop_daemon ;;
     status) cmd_status ;;
     __desktop) run_desktop "$@" ;;
     __inner) run_inner ;;

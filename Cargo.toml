@@ -344,6 +344,11 @@ debug = "line-tables-only"
 [profile.test.package."*"]
 debug = 0
 
+# Lifecycle tests hash their actual executables within the startup budget.
+# Keep SHA-256 at production speed without changing ordinary dev builds.
+[profile.test.package.sha2]
+opt-level = 3
+
 [profile.test.package."libghostty-vt-sys"]
 debug = "line-tables-only"
 

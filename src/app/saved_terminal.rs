@@ -97,7 +97,7 @@ fn candidate(session: &TerminalSession) -> bool {
 
 /// Only the issued descriptor may select an existing attachment. No matching
 /// descriptor means disconnected saved data, not evidence that a process ended.
-fn attachment(
+pub(super) fn attachment(
     source: &TerminalSession,
     terminals: &[crate::terminal::ipc::TerminalDescriptor],
     proof: &HostSessionProof,
@@ -226,7 +226,7 @@ fn inspect_inventory(
 /// Keep the captured endpoint through the actual attachment, not just its
 /// inventory lookup. The normal constructor may resolve the selected device
 /// again; this saved-source operation must not follow a later device switch.
-fn attach_existing(
+pub(super) fn attach_existing(
     card: CardId,
     recovered: daemon_recovery::RecoveredTerminal,
     socket: PathBuf,

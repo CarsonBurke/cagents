@@ -3937,10 +3937,25 @@ impl Runtime {
     }
 
     fn is_saved_history_snapshot(&self, snapshot: &Snapshot) -> bool {
-        self.session.is_saved_claude_history()
+        // The attached reader has already passed the daemon's lineage check.
+        // Rendering uses its actual read-only snapshot, never an on-disk index
+        // which an update helper may change while this window is still open.
+        matches!(
+            self.session.native_continuity,
+            chat::NativeContinuity::ReconnectOnly
+        ) && self.session.terminal.is_none()
+            && self.session.owned_codex_listener.is_none()
+            && self
+                .session
+                .proof
+                .as_ref()
+                .is_some_and(HostSessionProof::is_complete)
             && snapshot.exited
             && snapshot.read_only_reason.is_some()
             && snapshot.session_id == self.session.launch.session_id
+            && self.handle().is_some_and(|handle| {
+                handle.attached_session_id() == snapshot.session_id.as_deref()
+            })
             && matches!(
                 snapshot.native_continuity,
                 crate::chat::NativeContinuity::ReconnectOnly
@@ -9212,6 +9227,13 @@ impl Cagents {
         terminate_source: bool,
         upgrade_admission: Option<chat::Session>,
     ) -> Task<Message> {
+        let initial_session = upgrade_admission
+            .as_ref()
+            .map_or(session.id, |canonical| canonical.id);
+        let intent = self
+            .startup_gate
+            .initial_panes
+            .chat_intent(card, initial_session, intent);
         if intent == chat::Intent::Start
             && source.is_none()
             && !terminate_source
@@ -9256,9 +9278,9 @@ impl Cagents {
                             let _ = sender.try_send((target, wake));
                         };
                         match upgrade_admission {
-                            Some(canonical) => {
-                                ClientHandle::connect_upgrade(session, canonical, wake)
-                            }
+                            Some(canonical) => ClientHandle::connect_upgrade_with_intent(
+                                session, canonical, intent, wake,
+                            ),
                             None => ClientHandle::connect(
                                 session,
                                 intent,
@@ -10960,6 +10982,13 @@ impl Cagents {
                     }
                     return Task::none();
                 }
+                self.startup_gate.initial_panes.settled(
+                    target.card,
+                    attempt
+                        .upgrade_admission
+                        .as_ref()
+                        .map_or(attempt.session.id, |canonical| canonical.id),
+                );
                 if result.is_err() && attempt.upgrade_admission.is_some() {
                     // Unproved lineage cannot bind the saved Content to the
                     // canonical actor. Keep it as an inert copy and leave
@@ -22546,6 +22575,55 @@ mod tests {
     }
 
     #[test]
+    fn non_floor_read_only_snapshot_renders_without_index_reads_or_writer_permission() {
+        for provider in [Provider::Claude, Provider::Codex] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat_for_provider(&mut app, provider, Some(KNOWN_THREAD));
+            let target = chat_runtime(&app, card).target;
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.session.reset_owned_codex_listener();
+            runtime.session.native_continuity = chat::NativeContinuity::ReconnectOnly;
+            let snapshot = Snapshot {
+                session_id: runtime.session.launch.session_id.clone(),
+                exited: true,
+                read_only_reason: Some("Saved history; no provider was started".into()),
+                ..Default::default()
+            };
+            // No floor record exists for this fixture's new allocation. The
+            // authenticated attached reader is sufficient for display only.
+            runtime.connection = Connection::Live(Arc::new(ClientHandle::fixture(
+                runtime.session.clone(),
+                snapshot.clone(),
+            )));
+            runtime.snapshot = Arc::new(snapshot);
+            runtime.replace_draft(text_editor::Content::with_text("Keep this unsent"));
+            let session = runtime.session.clone();
+            let capabilities = runtime.snapshot.capabilities.clone();
+            let reads = crate::upgrade::floor::index_reads_for_test();
+            for _ in 0..100 {
+                assert!(runtime.has_connected_saved_history(&runtime.snapshot));
+                assert!(matches!(
+                    runtime.inspector_runtime_status(),
+                    InspectorRuntimeStatus::Ready
+                ));
+                assert_eq!(
+                    runtime.composer_action_rows(false),
+                    vec![(ComposerRow::Attach, true)]
+                );
+                assert!(!runtime.composer_available(false));
+            }
+            assert_eq!(crate::upgrade::floor::index_reads_for_test(), reads);
+            assert_eq!(runtime.snapshot.capabilities, capabilities);
+            drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Send)));
+            let runtime = chat_runtime(&app, card);
+            assert_eq!(runtime.composer.text(), "Keep this unsent");
+            assert_eq!(runtime.session, session);
+            assert!(runtime.pending.is_none() && runtime.queued.is_none());
+            assert!(app.chat_ui.attempt(card).is_none());
+        }
+    }
+
+    #[test]
     fn saved_history_readiness_requires_exact_settled_read_only_attachment() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
@@ -22562,7 +22640,7 @@ mod tests {
             let mut observed = snapshot.clone();
             match mutation {
                 1 => observed.history_loading = true,
-                2 => observed.session_id = Some("different-conversation".into()),
+                2 => observed.session_id = Some(uuid::Uuid::new_v4().to_string()),
                 3 => observed.error = Some("History cannot be loaded".into()),
                 4 => observed.busy = true,
                 _ => {}
@@ -33114,3 +33192,7 @@ mod absence_tests;
 #[cfg(test)]
 #[path = "chat_ui/peer_draft_tests.rs"]
 mod peer_draft_tests;
+
+#[cfg(test)]
+#[path = "chat_ui/startup_restore_tests.rs"]
+mod startup_restore_tests;

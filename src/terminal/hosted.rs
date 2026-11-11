@@ -149,6 +149,8 @@ pub enum HostedTerminalStartError {
     HostReadyTimeout { path: PathBuf, timeout: Duration },
     #[error("could not complete cagents daemon startup: {0}")]
     HostStartup(String),
+    #[error("cagents is updating; try again shortly")]
+    UpdateInProgress(#[source] crate::instance::UpdateInProgress),
     #[error("could not verify the running cagents daemon: {0}")]
     HostProtocol(#[source] crate::control::ControlError),
     #[error(
@@ -1411,13 +1413,42 @@ pub fn ensure_daemon_ready() -> Result<PathBuf, HostedTerminalStartError> {
     ensure_daemon_ready_for(crate::notifications::Application::Cagents)
 }
 
+pub(crate) fn existing_daemon_socket_path() -> io::Result<PathBuf> {
+    match crate::device::existing_socket_path()? {
+        Some(socket) => Ok(socket),
+        None => daemon_socket_path(),
+    }
+}
+
 pub fn ensure_daemon_ready_for(
     application: crate::notifications::Application,
 ) -> Result<PathBuf, HostedTerminalStartError> {
     let socket = daemon_socket_path().map_err(HostedTerminalStartError::SocketPath)?;
+    if crate::instance::window_restore_policy()
+        == crate::instance::WindowRestorePolicy::ExistingOnly
+    {
+        // Background readers and model publishers share this boundary. A
+        // recovery window cannot turn an ordinary reconnect into a new daemon.
+        verify_daemon_protocol(crate::control::ControlClient::connect(&socket))?;
+        return Ok(socket);
+    }
     if !crate::device::is_remote() {
         ensure_daemon_ready_at(&socket, application)?;
     }
+    Ok(socket)
+}
+
+/// Provider activation requested by a person, after an attach-only recovery.
+/// Its transport is separate from the window's automatic read-only readers.
+pub(crate) fn ensure_daemon_ready_for_explicit_action() -> Result<PathBuf, HostedTerminalStartError>
+{
+    if let Some(socket) = crate::device::socket_path_for_explicit_action()
+        .map_err(HostedTerminalStartError::SocketPath)?
+    {
+        return Ok(socket);
+    }
+    let socket = daemon_socket_path().map_err(HostedTerminalStartError::SocketPath)?;
+    ensure_daemon_ready_at(&socket, crate::notifications::Application::Cagents)?;
     Ok(socket)
 }
 
@@ -1436,10 +1467,7 @@ fn ensure_daemon_ready_at(
             // stale damaged checkpoint must not reject a serving daemon.
             let timeout = crate::upgrade::handoff::startup_timeout()
                 .unwrap_or(crate::upgrade::handoff::STARTUP_BASE);
-            return verify_daemon_protocol(crate::control::ControlClient::from_stream_until(
-                stream,
-                Instant::now() + timeout,
-            ));
+            return verify_startup_stream(socket, stream, Instant::now() + timeout);
         }
         Err(error)
             if !matches!(
@@ -1455,6 +1483,8 @@ fn ensure_daemon_ready_at(
         Err(_) => {}
     }
 
+    refuse_update_launch(socket)?;
+
     let timeout = crate::upgrade::handoff::startup_timeout()
         .map_err(HostedTerminalStartError::HostStartup)?;
     let current_exe =
@@ -1466,9 +1496,13 @@ fn ensure_daemon_ready_at(
         return Err(HostedTerminalStartError::HostBinaryMissing(daemon_binary));
     }
 
-    let scoped = systemd_user_manager_available()
-        && !crate::instance::has_inherited_daemon_fence()
-            .map_err(|error| HostedTerminalStartError::HostStartup(error.to_string()))?;
+    // User scopes execute the command locally and preserve explicitly
+    // forwarded descriptors, including both update admission and inventory.
+    // Recovery authority belongs to the verified daemon itself. A scope
+    // launcher must never receive or relay its receipt and continuous fences.
+    let recovery = crate::upgrade::recovery::has_inherited_receipt()
+        .map_err(|error| HostedTerminalStartError::HostStartup(error.to_string()))?;
+    let scoped = systemd_user_manager_available() && !recovery;
     start_and_verify_daemon_at(socket, timeout, &daemon_binary, scoped, |scoped| {
         spawn_daemon(&daemon_binary, application, scoped)
     })
@@ -1495,9 +1529,37 @@ fn start_and_verify_daemon_at(
             path: socket.to_owned(),
             source,
         })?;
-    verify_daemon_protocol(crate::control::ControlClient::from_stream_until(
-        stream, deadline,
-    ))
+    verify_startup_stream(socket, stream, deadline)
+}
+
+fn launch_is_updating(socket: &Path) -> Result<bool, HostedTerminalStartError> {
+    crate::instance::daemon_launch_is_updating(socket)
+        .map_err(|error| HostedTerminalStartError::HostStartup(error.to_string()))
+}
+
+fn refuse_update_launch(socket: &Path) -> Result<(), HostedTerminalStartError> {
+    if launch_is_updating(socket)? {
+        return Err(HostedTerminalStartError::UpdateInProgress(
+            crate::instance::UpdateInProgress,
+        ));
+    }
+    Ok(())
+}
+
+fn verify_startup_stream(
+    socket: &Path,
+    stream: UnixStream,
+    deadline: Instant,
+) -> Result<(), HostedTerminalStartError> {
+    // A serving daemon remains usable during review. An ordinary reader of
+    // an update's bound-but-unready listener gets the normal handshake budget;
+    // only an admitted/inherited launch may need checkpoint restoration time.
+    let client = if launch_is_updating(socket)? {
+        crate::control::ControlClient::from_stream(stream)
+    } else {
+        crate::control::ControlClient::from_stream_until(stream, deadline)
+    };
+    verify_daemon_protocol(client)
 }
 
 fn verify_daemon_protocol(
@@ -1626,6 +1688,7 @@ fn spawn_daemon(
         command.pre_exec(crate::daemon::seal_inherited_descriptors);
     }
     crate::instance::inherit_daemon_fence(&mut command)?;
+    crate::daemon::lease_handoff::inherit_target_daemon_lease(&mut command)?;
     command.spawn()
 }
 
@@ -1649,11 +1712,14 @@ fn daemon_startup_ready(
             });
         }
     }
+    refuse_update_launch(socket)?;
     if let Some(status) = child_status {
         // A concurrent launch can win the lease while our child exits. Its
         // listener may not be bound yet; the lease proves its ownership.
-        if !crate::daemon::HostLease::is_held_at(socket)
+        if crate::daemon::lease_handoff::has_inherited_lease()
             .map_err(|error| HostedTerminalStartError::HostStartup(error.to_string()))?
+            || !crate::daemon::HostLease::is_held_at(socket)
+                .map_err(|error| HostedTerminalStartError::HostStartup(error.to_string()))?
         {
             return Err(HostedTerminalStartError::HostExited {
                 path: socket.to_owned(),
@@ -3151,6 +3217,118 @@ mod tests {
     }
 
     #[test]
+    fn update_fence_interrupts_ordinary_readiness_but_preserves_admission_and_serving_daemon() {
+        const CHILD: &str = "CAGENTS_TEST_UPDATE_READINESS";
+        if std::env::var_os(CHILD).is_some() {
+            use std::os::unix::process::ExitStatusExt;
+
+            let runtime = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap());
+            let socket = runtime
+                .join(crate::instance::runtime_subdirectory())
+                .join(crate::terminal_ipc::SOCKET_FILE_NAME);
+            std::fs::create_dir(socket.parent().unwrap()).unwrap();
+            let update = crate::instance::UiUpdateGuard::acquire().unwrap();
+            let _worker_lease = hold_startup_lease(&socket);
+            let started = Instant::now();
+            let error = ensure_daemon_ready_at(&socket, crate::notifications::Application::Cagents)
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                HostedTerminalStartError::UpdateInProgress(_)
+            ));
+            assert!(crate::instance::is_update_in_progress(&error));
+            // This is an already-dispatched launch: a failed child plus the
+            // update worker's lease must not look like a restoring daemon.
+            let result = start_daemon_at(
+                &socket,
+                Duration::from_secs(125),
+                Path::new("fixture-daemon"),
+                false,
+                |_| Command::new("/bin/false").spawn(),
+            );
+            assert!(matches!(
+                result,
+                Err(HostedTerminalStartError::UpdateInProgress(_))
+            ));
+            assert!(started.elapsed() < Duration::from_secs(2));
+
+            for compatible in [true, false] {
+                let listener = UnixListener::bind(&socket).unwrap();
+                let server = thread::spawn(move || {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let request: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+                    assert!(matches!(request.request, ClientRequest::Connect { .. }));
+                    let proof = proof("serving-during-review");
+                    write_frame(
+                        &mut stream,
+                        &ServerEnvelope {
+                            version: if compatible {
+                                PROTOCOL_VERSION
+                            } else {
+                                PROTOCOL_VERSION + 1
+                            },
+                            request_id: Some(request.request_id),
+                            proof: proof.clone(),
+                            message: ServerMessage::Response {
+                                response: ServerResponse::Connected {
+                                    proof,
+                                    resumed: vec![],
+                                },
+                            },
+                        },
+                    )
+                    .unwrap();
+                });
+                let result =
+                    ensure_daemon_ready_at(&socket, crate::notifications::Application::Cagents);
+                if compatible {
+                    result.unwrap();
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(HostedTerminalStartError::HostIncompatible { .. })
+                    ));
+                }
+                server.join().unwrap();
+                std::fs::remove_file(&socket).unwrap();
+            }
+            drop(update);
+            let _admission = crate::instance::AdmissionFence::acquire().unwrap();
+            assert!(
+                !daemon_startup_ready(
+                    &socket,
+                    Duration::from_secs(125),
+                    Duration::from_secs(60),
+                    Some(ExitStatus::from_raw(1 << 8)),
+                )
+                .unwrap(),
+                "a declared concurrent admission still owns its restoration allowance"
+            );
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let name = std::thread::current().name().unwrap().to_owned();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", &name, "--nocapture"])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", root.path())
+            .env("XDG_RUNTIME_DIR", root.path())
+            .env(CHILD, "1");
+        if let Some(authority) = std::env::var_os(crate::agent_execution::AUTHORITY_ENV) {
+            command.env(crate::agent_execution::AUTHORITY_ENV, authority);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn unavailable_scope_launcher_falls_back_once() {
         for spawn_error in [false, true] {
             let directory = tempfile::tempdir().unwrap();
@@ -3434,6 +3612,49 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 
+    fn scope_fixture_lease(root: &Path) -> crate::daemon::lease_handoff::LeaseHandoff {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let paths = crate::daemon::RuntimePaths {
+            directory: root.to_owned(),
+            socket: root.join("daemon.sock"),
+            lock: root.join("cagentsd.lock"),
+        };
+        let mut lock = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&paths.lock)
+            .unwrap();
+        write!(lock, "{{\"pid\":{}}}", std::process::id()).unwrap();
+        drop(lock);
+        crate::daemon::lease_handoff::LeaseHandoff::wait(&paths, std::process::id()).unwrap()
+    }
+
+    #[test]
+    fn scoped_launch_passes_reserved_lease_through_the_scope_launcher() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let launcher = root.path().join("systemd-run");
+        // The scope launcher executes locally and preserves inherited fds.
+        // This fake checks the selected mode and reproduces that exec contract.
+        std::fs::write(&launcher, "#!/bin/sh\n[ \"$1\" = --user ] && [ \"$2\" = --scope ] || exit 7\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n").unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let lease = scope_fixture_lease(root.path());
+        let mut command = daemon_launch_command(
+            Path::new("/bin/sh"),
+            crate::notifications::Application::Cagents,
+            true,
+        );
+        command.env("PATH", root.path()).args([
+            "-c",
+            "test \"$CAGENTS_DAEMON_LEASE_FD\" = 199 && test -e /proc/self/fd/199",
+        ]);
+        unsafe { command.pre_exec(crate::daemon::seal_inherited_descriptors) };
+        lease.inherit(&mut command).unwrap();
+        assert!(command.status().unwrap().success());
+    }
+
     #[test]
     fn systemd_scope_preserves_environment_arguments_and_isolates_cgroup() {
         use std::io::{Read, Seek};
@@ -3443,6 +3664,7 @@ mod tests {
         }
         let directory = tempfile::tempdir().unwrap();
         let output = directory.path().join("scope-evidence");
+        let lease = scope_fixture_lease(directory.path());
         // Regular files avoid waiting for the background holder to close a pipe.
         let mut stdout = tempfile::tempfile().unwrap();
         let mut stderr = tempfile::tempfile().unwrap();
@@ -3477,12 +3699,14 @@ mod tests {
         // manager-side variable expansion or replacement by manager state.
         command
             .env("CAGENTS_SCOPE_TEST", "caller-value")
-            .args(["-c", "sed -n 's/^0:://p' /proc/self/cgroup > \"$1\"; printf '%s\\n%s\\n' \"$2\" \"$CAGENTS_SCOPE_TEST\" >> \"$1\"; sleep 30 & echo $! >> \"$1\"", "fixture"])
+            .args(["-c", "test \"$CAGENTS_DAEMON_LEASE_FD\" = 199 && test -e /proc/self/fd/199 || exit 8; sed -n 's/^0:://p' /proc/self/cgroup > \"$1\"; printf '%s\\n%s\\n' \"$2\" \"$CAGENTS_SCOPE_TEST\" >> \"$1\"; sleep 30 & echo $! >> \"$1\"", "fixture"])
             .arg(&output)
             .arg("$HOME");
         command
             .stdout(stdout.try_clone().unwrap())
             .stderr(stderr.try_clone().unwrap());
+        unsafe { command.pre_exec(crate::daemon::seal_inherited_descriptors) };
+        lease.inherit(&mut command).unwrap();
         let status = command.status().unwrap();
         assert!(
             status.success(),

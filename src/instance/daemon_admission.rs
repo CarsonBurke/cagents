@@ -266,6 +266,30 @@ fn fence_holder(runtime: &Path) -> io::Result<FenceHolder> {
     }
 }
 
+/// Whether an ordinary launch at this instance's local socket would compete
+/// with an update. A daemon admission remains waitable; only authenticated
+/// inherited authority may start a daemon through an update's own fence.
+pub(crate) fn daemon_launch_is_updating(socket: &Path) -> io::Result<bool> {
+    let Some(runtime) = env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+    else {
+        return Ok(false);
+    };
+    if socket
+        != runtime
+            .join(runtime_subdirectory())
+            .join(crate::terminal_ipc::SOCKET_FILE_NAME)
+    {
+        return Ok(false);
+    }
+    let runtime = runtime_directory()?;
+    if inherited_fence()?.is_some() {
+        return Ok(false);
+    }
+    Ok(matches!(fence_holder(&runtime)?, FenceHolder::Update))
+}
+
 /// The daemon did not finish its admission within a starting window's wait.
 #[derive(Debug, Error)]
 pub struct DaemonStillStarting {
@@ -413,9 +437,6 @@ fn forward_fence(
     Ok(())
 }
 
-pub(crate) fn has_inherited_daemon_fence() -> io::Result<bool> {
-    Ok(inherited_fence()?.is_some())
-}
 pub(crate) fn inherit_daemon_fence(command: &mut process::Command) -> io::Result<()> {
     if let Some((file, descriptor)) = inherited_fence()? {
         forward_fence(command, file, Some(descriptor))?;
@@ -488,6 +509,83 @@ fn admit_windows(runtime: &Path) -> io::Result<OwnedLock> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_launch_probe_requires_selected_socket_and_authenticated_inherited_authority() {
+        const CHILD: &str = "CAGENTS_TEST_UPDATE_LAUNCH_AUTHORITY";
+        if let Ok(mode) = env::var(CHILD) {
+            let runtime = runtime_directory().unwrap();
+            let socket = runtime
+                .join(runtime_subdirectory())
+                .join(crate::terminal_ipc::SOCKET_FILE_NAME);
+            let update = UiUpdateGuard::acquire().unwrap();
+            assert!(
+                !daemon_launch_is_updating(
+                    &runtime
+                        .join("unrelated-instance")
+                        .join(crate::terminal_ipc::SOCKET_FILE_NAME)
+                )
+                .unwrap(),
+                "another endpoint must not borrow this runtime's update state"
+            );
+            if mode == "ordinary" {
+                assert!(daemon_launch_is_updating(&socket).unwrap());
+                return;
+            }
+            let descriptor = if mode == "197" { 197 } else { 198 };
+            if mode != "invalid" {
+                // SAFETY: this exact private subprocess owns its reserved FD.
+                // It borrows the update's held open-file description and only
+                // closes the duplicate; validation must not unlock the parent.
+                unsafe {
+                    assert_eq!(
+                        libc::dup2(update.lock.as_ref().unwrap().as_raw_fd(), descriptor),
+                        descriptor
+                    );
+                }
+                assert!(!daemon_launch_is_updating(&socket).unwrap());
+                unsafe { libc::close(descriptor) };
+                assert!(
+                    owned_lock(&fence_path_in(&runtime), libc::LOCK_SH | libc::LOCK_NB).is_err(),
+                    "validating inherited authority must preserve the parent's fence"
+                );
+            } else {
+                assert!(daemon_launch_is_updating(&socket).is_err());
+            }
+            return;
+        }
+        let name = std::thread::current().name().unwrap().to_owned();
+        for mode in ["ordinary", "197", "198", "invalid"] {
+            let runtime = tempfile::tempdir().unwrap();
+            let mut command = process::Command::new(env::current_exe().unwrap());
+            command
+                .args(["--exact", &name, "--nocapture"])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", runtime.path())
+                .env("XDG_RUNTIME_DIR", runtime.path())
+                .env(CHILD, mode);
+            match mode {
+                "197" => {
+                    command.env(INSTALL_GUARD_ENV, "197");
+                }
+                "198" | "invalid" => {
+                    command.env(DAEMON_FENCE_ENV, "198");
+                }
+                _ => {}
+            }
+            if let Some(authority) = env::var_os(crate::agent_execution::AUTHORITY_ENV) {
+                command.env(crate::agent_execution::AUTHORITY_ENV, authority);
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{mode}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
 
     fn fence_wait(runtime: &Path, timeout: Duration) -> (io::Result<OwnedLock>, usize) {
         let mut checks = 0;

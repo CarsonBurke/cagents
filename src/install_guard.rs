@@ -22,7 +22,8 @@ use std::{
 use crate::instance::UiUpdateGuard;
 
 mod companions;
-pub(crate) use companions::{preflight_editor_companions, trusted_executable_owner};
+pub use companions::EditorCompanion;
+pub(crate) use companions::{editor_companions, trusted_executable_owner};
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -136,7 +137,11 @@ pub(crate) fn sanitize_child_environment(command: &mut Command) {
     for name in [
         crate::instance::INSTALL_GUARD_ENV,
         crate::instance::DAEMON_FENCE_ENV,
+        crate::daemon::lease_handoff::DAEMON_LEASE_ENV,
+        crate::upgrade::recovery::RECOVERY_FD_ENV,
         RESULT_FD_ENV,
+        crate::update::recovery::CENSUS_ENV,
+        crate::update::recovery::OUTCOME_ENV,
         OWNER_CLI_ENV,
         "CAGENTS_ARCHIVE",
         "CAGENTS_CHECKSUMS",
@@ -227,12 +232,6 @@ pub(crate) fn run(
     let slots = if stage_only {
         Vec::new()
     } else {
-        if arguments
-            .iter()
-            .any(|argument| argument == "--restart-daemon")
-        {
-            preflight_editor_companions(None)?;
-        }
         guard.prepare_and_close_windows_with_preflight(Duration::from_secs(45), |guard| {
             preflight_source_panes(
                 guard,
@@ -431,6 +430,12 @@ pub(crate) fn staged_owner_bin(
     executable: &Path,
     recover: bool,
 ) -> io::Result<Option<std::path::PathBuf>> {
+    // This is the confirmed successor, holding the exact runtime lease. The
+    // old PID in its metadata is expected until HostLease adopts it; routing
+    // back through that stopped source would prevent the handoff itself.
+    if crate::daemon::lease_handoff::has_inherited_lease()? {
+        return Ok(None);
+    }
     use std::os::unix::fs::OpenOptionsExt;
     // Sealed update probes execute from anonymous FDs. Their kernel exe path
     // has no filesystem entry to canonicalize and carries no install routing.
@@ -781,6 +786,44 @@ fn running_owner_bin(prefix: &Path, executable: &Path) -> io::Result<std::path::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lease_handoff_ordinary_child_receives_no_recovery_authority() {
+        if !crate::daemon::isolated_handoff_coordinator() {
+            return;
+        }
+        let file = tempfile::tempfile().unwrap();
+        let descriptor = file.as_raw_fd();
+        let mut child = Command::new("/bin/sh");
+        child
+            .args([
+                "-c",
+                r#"
+            test -z "${CAGENTS_UPDATE_RECOVERY_FD+x}" || exit 91
+            for fd in 189 193 194 195 196; do
+                test ! -e "/proc/self/fd/$fd" || exit 92
+            done
+        "#,
+            ])
+            .env("CAGENTS_UPDATE_RECOVERY_FD", "193");
+        sanitize_child_environment(&mut child);
+        // Model authority slots before the ordinary-child sealing hook. No
+        // parent descriptor is remapped, and the isolated coordinator has no
+        // concurrent fork that could retain a copied description.
+        unsafe {
+            child.pre_exec(move || {
+                for target in [189, 193, 194, 195, 196] {
+                    if libc::dup2(descriptor, target) == -1
+                        || libc::fcntl(target, libc::F_SETFD, 0) == -1
+                    {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                crate::daemon::seal_inherited_descriptors()
+            });
+        }
+        assert!(child.status().unwrap().success());
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

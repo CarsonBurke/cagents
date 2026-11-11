@@ -5,12 +5,17 @@ mod account_isolation_tests;
 mod account_recovery_target_tests;
 pub(super) mod capacity;
 mod codex_owners;
+mod console_relaunch;
+#[cfg(test)]
+mod console_relaunch_tests;
+pub(super) mod floor_history;
 #[cfg(test)]
 mod lost_agent_close_tests;
 #[cfg(test)]
 mod lost_codex_owner_close_tests;
 mod native_cleanup;
 mod native_recovery;
+pub(super) use native_recovery::restore_ready_checkpoint;
 mod owned_listener;
 pub(super) use owned_listener::{
     Roots as CodexListenerRoots, keep_legacy_listeners_fresh as keep_legacy_codex_listeners_fresh,
@@ -58,6 +63,7 @@ use crate::{
 pub(super) use native_cleanup::{NativeClose, close_retained as close_retained_native};
 pub(super) use native_recovery::AdoptionFailures;
 pub(super) use native_recovery::restore_orphaned_native;
+pub(super) use native_recovery::restore_orphaned_native_preserving;
 use std::{
     collections::BTreeMap,
     sync::{Arc, Weak},
@@ -1873,6 +1879,14 @@ fn start_with_execution(
     execution: Option<Arc<chat::protocol::ExecutionContext>>,
     restart_launch: Option<&chat::Launch>,
 ) -> Result<ServerResponse, ProtocolError> {
+    if crate::upgrade::floor::load()
+        .map_err(unavailable)?
+        .blocks_id(session.id)
+    {
+        return Err(unavailable(
+            "This conversation was stopped for the update. Press Resume in its pane to continue the recorded conversation, or start a new conversation if none was recorded.",
+        ));
+    }
     // A helper may have committed installation before host publication failed.
     // Recover its durable outbox through authenticated adoption before asking
     // an unexposed startup guard to retire it without a semantic consumer.
@@ -3073,8 +3087,10 @@ fn codex_terminal_view(
         },
         Some(handle.execution_environment()),
         &TerminalViewReservation {
-            owners: &owners,
-            closing,
+            kind: TerminalViewKind::Codex {
+                owners: &owners,
+                closing,
+            },
         },
     );
     let (descriptor, paired_terminal) = match spawned {
@@ -3596,6 +3612,11 @@ fn process_inner(
             dry_run,
         }),
         ClientRequest::ChatPrepareResume { source } => {
+            if let Some(session) =
+                floor_history::prepare_resume(host, &source).map_err(unavailable)?
+            {
+                return Ok(ServerResponse::ChatResumePrepared { session });
+            }
             let proof = host
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -4323,20 +4344,46 @@ fn process_inner(
 /// Borrow the complete native transition only while its closing reservation is
 /// alive. Ordinary terminal spawns cannot bypass native admission with an ID.
 pub(super) struct TerminalViewReservation<'a> {
-    owners: &'a paired_close::Owners,
-    closing: &'a capacity::Reservation,
+    kind: TerminalViewKind<'a>,
+}
+
+enum TerminalViewKind<'a> {
+    Codex {
+        owners: &'a paired_close::Owners,
+        closing: &'a capacity::Reservation,
+    },
+    /// Only retained-actor recovery constructs this after authenticating the
+    /// helper and committing its exact console replacement intent.
+    RetainedConsole { requested: &'a Session },
 }
 
 impl TerminalViewReservation<'_> {
+    pub(super) fn retained_console(requested: &Session) -> TerminalViewReservation<'_> {
+        TerminalViewReservation {
+            kind: TerminalViewKind::RetainedConsole { requested },
+        }
+    }
+
     pub(super) fn authorizes(&self, state: &HostState, terminal_id: TerminalId) -> bool {
-        self.owners.target.source.id == terminal_id
-            && self.owners.require_locked(state, self.closing).is_ok()
-            && state.chats.get(&terminal_id).is_some_and(|record| {
-                record.returning_terminal
-                    && record.session.launch.provider == Provider::Codex
-                    && record.session.terminal.is_none()
-                    && record.paired_terminal.is_none()
-            })
+        match &self.kind {
+            TerminalViewKind::Codex { owners, closing } => {
+                owners.target.source.id == terminal_id
+                    && owners.require_locked(state, closing).is_ok()
+                    && state.chats.get(&terminal_id).is_some_and(|record| {
+                        record.returning_terminal
+                            && record.session.launch.provider == Provider::Codex
+                            && record.session.terminal.is_none()
+                            && record.paired_terminal.is_none()
+                    })
+            }
+            TerminalViewKind::RetainedConsole { requested } => {
+                requested.id == terminal_id
+                    && state.chat_spawning.get(&terminal_id) == Some(*requested)
+                    && !state.chats.contains_key(&terminal_id)
+                    && !state.native_closing.contains_key(&terminal_id)
+                    && !state.chat_handoffs.contains_key(&terminal_id)
+            }
+        }
     }
 }
 
@@ -4577,7 +4624,9 @@ pub(super) fn resolve_upgrade(
                 "The exact upgraded provider is unavailable. Its recovery evidence was retained; reopen this conversation from the provider's saved sessions."
             )))?;
         if !record.handle.owns_work()
-            && !(source.is_saved_claude_history() && record.handle.is_read_only_history())
+            && !((source.is_saved_claude_history()
+                || crate::upgrade::floor::load().is_ok_and(|ledger| ledger.blocks_chat(source)))
+                && record.handle.is_read_only_history())
         {
             return Err(unavailable(
                 "Restored native provider has closed; no writer was restarted",
@@ -4792,7 +4841,7 @@ pub(super) fn validate_upgrade_environment(
     )?;
     if !handle.recovery_environment_matches(&restored) {
         return Err(
-            "Native execution environment cannot survive daemon upgrade without losing selected credentials or account settings. Align the daemon configuration or finish and close this conversation before upgrading; no source was stopped."
+            "Native execution environment cannot survive daemon upgrade without losing selected credentials or account settings. The updater can restore this conversation stopped after confirmation; no source was stopped."
                 .into(),
         );
     }

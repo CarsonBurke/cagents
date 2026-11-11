@@ -71,6 +71,9 @@ pub(super) fn perform(
     state: &Path,
     job: &mut UpdateJob,
     root: &Path,
+    handoff: &mut Option<crate::daemon::lease_handoff::LeaseHandoff>,
+    survivors: &mut floor::Survivors,
+    terminal: bool,
 ) -> Result<(), UpdateError> {
     let layout = locate(&std::env::current_exe()?)?;
     let (source_protocol, _) = source::inspect_identity(None)?;
@@ -102,16 +105,17 @@ pub(super) fn perform(
         return Err(invalid("installed CLI exceeds update size limit"));
     }
     seal_file(&executable)?;
-    let cancellation = CancellationToken::new();
+    let cancellation = CancellationToken::for_job(state, &job.id)?;
     let staged =
         candidate::Staged::from_file(executable, job.version.clone(), identity, &cancellation)?;
-    let observe = |policy| {
+    let mut turns = source::TurnReview::default();
+    let mut observe = |policy| {
         if served_version_root(&layout)? != root || stamp(root)? != before {
             return Err(invalid(
                 "the installed application changed; review the new build before updating",
             ));
         }
-        observe_installed_source(&layout, root, &staged, policy)
+        turns.apply(observe_installed_source(&layout, root, &staged, policy)?)
     };
     if staged.identity.protocol == source_protocol {
         staged.verify_compatible_handshake(&cancellation)?;
@@ -126,6 +130,8 @@ pub(super) fn perform(
     let confirmed = confirmation::wait(state, job, |policy| {
         Ok(context.apply(observe(policy)?.with_inspection(&inspection)))
     })?;
+    let mut recovery = recovery::Context::default();
+    recovery.capture(state, job)?;
     set_phase(
         state,
         job,
@@ -133,45 +139,78 @@ pub(super) fn perform(
         "Saving and closing application windows",
     )?;
     let mut guard = crate::instance::UiUpdateGuard::acquire()?;
-    crate::install_guard::preflight_editor_companions(Some(staged.identity.protocol))?;
-    let windows = guard.prepare_and_close_windows_with_preflight(Duration::from_secs(45), |guard| {
-        let inspected = crate::install_guard::preflight_source_panes(guard,
-            confirmed.daemon.as_ref().map(|daemon| daemon.capability.proof.clone()), confirmed.replaces_daemon)?;
-        let latest = observe(confirmed.daemon.as_ref().map_or(impact::Policy::WhenIdle, |daemon| daemon.policy))
-            .map_err(io::Error::other)?.with_inspection(&inspected);
-        if !confirmed.preserves_consent(&context.apply(latest)) || digest(root).map_err(io::Error::other)? != staged.identity.digest {
-            return Err(io::Error::other("The installed build or session ownership changed during pane inspection; existing windows were kept open"));
-        }
-        Ok(())
-    })?;
-    let mut startup_attempted = false;
-    let mut startup_owned = false;
-    let result = (|| {
-        let current = observe(
+    confirmation::check_cancelled(state, job)?;
+    let windows = guard.prepare_windows(Duration::from_secs(45))?;
+    {
+        let inspected = crate::install_guard::preflight_source_panes(
+            &guard,
+            confirmed
+                .daemon
+                .as_ref()
+                .map(|daemon| daemon.capability.proof.clone()),
+            confirmed.replaces_daemon,
+        )?;
+        let latest = observe(
             confirmed
                 .daemon
                 .as_ref()
                 .map_or(impact::Policy::WhenIdle, |daemon| daemon.policy),
-        )?
-        .with_inspection(&confirmed.inspection());
-        let current = context.apply(current);
-        if !confirmed.preserves_consent(&current) || digest(root)? != staged.identity.digest {
+        )
+        .map_err(io::Error::other)?
+        .with_inspection(&inspected);
+        if !confirmed.preserves_consent(&context.apply(latest))
+            || digest(root).map_err(io::Error::other)? != staged.identity.digest
+        {
             return Err(invalid(
-                "the installed build or session ownership changed; review the update again",
+                "The installed build or session ownership changed during pane inspection; existing windows were kept open",
             ));
         }
-        // Prepare the capture while the source daemon still runs: failing to
-        // create it must not leave the runtime without a daemon.
-        let output = StartupOutput::create(state)?;
-        if let Some(daemon) = current.daemon {
-            let socket = crate::terminal_ipc::daemon_socket_path()?;
-            let mut client =
-                source::Client::connect(&socket).map_err(|error| invalid(error.to_string()))?;
-            client
-                .prepare_confirmed_upgrade(daemon, false)
+    }
+    confirmation::check_cancelled(state, job)?;
+    let output = StartupOutput::create(state)?;
+    let mut startup_attempted = false;
+    let mut startup_owned = false;
+    let mut previous = None;
+    let mut original_schema = None;
+    let mut result = (|| {
+        if let Some(daemon) = &confirmed.daemon {
+            let paths = crate::daemon::RuntimePaths::discover()
                 .map_err(|error| invalid(error.to_string()))?;
-            wait_daemon_stopped(&socket)?;
+            let source =
+                crate::daemon::lease_handoff::HandoffSource::pin(&paths, &daemon.capability.proof)
+                    .map_err(|error| invalid(error.to_string()))?;
+            let executable = fs::read_link(format!("/proc/{}/exe", source.pid))?;
+            let owner = locate(&executable)?;
+            if owner.prefix != installation.prefix
+                || source.exited()?
+                || recovery.census.as_ref().and_then(|c| c.source.as_ref())
+                    != Some(&daemon.capability.proof)
+            {
+                return Err(invalid(
+                    "The census belongs to a different source; shutdown was not requested",
+                ));
+            }
+            previous = (owner.version_root != root).then_some(owner.version_root);
         }
+        recovery.shutdown_requested = confirmed.replaces_daemon;
+        floor::quiesce(
+            state,
+            job,
+            &confirmed,
+            terminal,
+            |policy| Ok(context.apply(observe(policy)?.with_inspection(&inspection))),
+            handoff,
+            survivors,
+            &guard,
+        )?;
+        if previous.is_some()
+            && let Some(lease) = handoff.as_ref()
+        {
+            original_schema = Some(stopped_store_schema(root, &guard, lease)?);
+        }
+        survivors.authorize_successor(&root.join("bin/cagentsd"), None, handoff.as_ref())?;
+        confirmation::prepared(state, job)?;
+        guard.close_prepared_windows(&windows, Duration::from_secs(45))?;
         set_phase(
             state,
             job,
@@ -183,8 +222,14 @@ pub(super) fn perform(
                 .join(crate::companion::Product::Cli.file_name()),
         );
         command.args(["--json", "daemon", "start"]);
+        crate::install_guard::sanitize_child_environment(&mut command);
+        unsafe { command.pre_exec(crate::daemon::seal_inherited_descriptors) };
         output.attach(&mut command)?;
         guard.inherit_for_install(&mut command)?;
+        if let Some(handoff) = handoff.as_ref() {
+            handoff.inherit(&mut command)?;
+        }
+        survivors.inherit_recovery(&mut command)?;
         let timeout = crate::install_guard::daemon_start_timeout()?;
         startup_attempted = true;
         let started = wait_for_daemon_start(&mut command, timeout, state, job);
@@ -202,37 +247,258 @@ pub(super) fn perform(
                 successor_runs,
             ));
         }
-        if crate::daemon::running_executable().map_err(|error| invalid(error.to_string()))?
-            != Some(root.join("bin/cagentsd"))
-        {
-            return Err(invalid(
-                "The terminal service does not belong to the confirmed installation; its saved panes and recovery state were retained. Check cagents daemon status before retrying",
-            ));
-        }
-        Ok(())
+        // Wait through bounded restoration until the exact successor is
+        // Ready, then prove this job's recovery inventory against it.
+        confirm_daemon_ready(&root.join("bin/cagentsd"), timeout)?;
+        survivors.verify_successor(&root.join("bin/cagentsd"))
     })();
-    // Before startup, retain the previous matched executable on failure. Once
-    // the successor owns the runtime or an actual startup command was spawned,
-    // reopen that candidate's recovery UI instead of an incompatible old UI.
+    let mut restored_previous = false;
+    if result.is_err()
+        && recovery.shutdown_requested
+        && let Some(previous) = previous.as_ref()
+    {
+        match rollback_stopped_candidate(
+            &installation.prefix,
+            root,
+            previous,
+            original_schema,
+            startup_owned,
+            &guard,
+            handoff,
+        ) {
+            Ok(restored) => restored_previous = restored,
+            Err(error) => {
+                eprintln!("Installed candidate rollback failed: {error}");
+                result = Err(invalid(format!(
+                    "{} Recovery could not restore the previous installation: {error}",
+                    result.unwrap_err()
+                )));
+            }
+        }
+    }
+    // A failed command can have left a serving successor. Keep that writer's
+    // matched UI; a proven-dead candidate instead restores the old matched set.
     let successor_owns_runtime = startup_attempted
         && !startup_owned
         && result.is_err()
         && crate::daemon::running_executable()
-            .map_err(|error| invalid(error.to_string()))?
-            .is_some_and(|executable| executable == root.join("bin/cagentsd"));
-    let reopen = if result.is_ok() || successor_owns_runtime || startup_owned {
+            .is_ok_and(|executable| executable == Some(root.join("bin/cagentsd")));
+    let reopen = if restored_previous {
+        previous.as_ref().unwrap().clone()
+    } else if result.is_ok() || successor_owns_runtime || startup_owned {
         root.to_owned()
     } else {
-        installation
-            .prefix
-            .join("versions")
-            .join(&installation.version)
+        previous.unwrap_or_else(|| root.to_owned())
     };
+    let recovery_result = finish_handoff(
+        installation,
+        state,
+        job,
+        &result,
+        handoff,
+        &recovery,
+        survivors,
+        &guard,
+    );
+    recovery_result?;
     let reopened = guard
-        .relaunch_windows(&windows, &reopen.join("bin/cagents-ui"))
+        .relaunch_closed_windows(&reopen.join("bin/cagents-ui"))
         .map_err(UpdateError::from);
-    result?;
-    reopened
+    verify_reopened_service(&recovery, state, job)?;
+    if let Err(error) = reopened {
+        return report_recovery_failure(
+            state,
+            job,
+            invalid(format!(
+                "The daemon is ready and its original inventory was verified, but some saved windows did not reopen: {error}. Run `cagents ui` to reopen the saved workspace."
+            )),
+        );
+    }
+    result
+}
+
+/// Store maintenance receives the reservation intentionally; status probes
+/// never do. This keeps conversion and the following startup in one handoff.
+fn candidate_maintenance(
+    root: &Path,
+    arguments: &[&str],
+    guard: &crate::instance::UiUpdateGuard,
+    handoff: &crate::daemon::lease_handoff::LeaseHandoff,
+) -> Result<File, UpdateError> {
+    let mut command = Command::new(root.join("bin/cagents"));
+    command.args(arguments);
+    crate::install_guard::sanitize_child_environment(&mut command);
+    unsafe { command.pre_exec(crate::daemon::seal_inherited_descriptors) };
+    guard.inherit_for_install(&mut command)?;
+    handoff.inherit(&mut command)?;
+    bounded_command(
+        &mut command,
+        "Preparing terminal service recovery",
+        SMALL_ASSET_LIMIT,
+        Duration::from_secs(30),
+        &CancellationToken::new(),
+    )
+}
+
+fn stopped_store_schema(
+    root: &Path,
+    guard: &crate::instance::UiUpdateGuard,
+    handoff: &crate::daemon::lease_handoff::LeaseHandoff,
+) -> Result<u32, UpdateError> {
+    let mut output = candidate_maintenance(root, &["daemon", "store-schema"], guard, handoff)?;
+    let mut schema = String::new();
+    output.read_to_string(&mut schema)?;
+    let schema = schema.trim();
+    // Match installer rollback when the source had no shared-model store.
+    if schema.is_empty() {
+        Ok(22)
+    } else {
+        schema
+            .parse()
+            .map_err(|_| invalid("The stopped terminal store schema is unreadable"))
+    }
+}
+
+fn rollback_stopped_candidate(
+    prefix: &Path,
+    candidate: &Path,
+    previous: &Path,
+    schema: Option<u32>,
+    startup_spawned: bool,
+    guard: &crate::instance::UiUpdateGuard,
+    handoff: &mut Option<crate::daemon::lease_handoff::LeaseHandoff>,
+) -> Result<bool, UpdateError> {
+    selected_candidate(prefix, candidate)?;
+    let paths =
+        crate::daemon::RuntimePaths::discover().map_err(|error| invalid(error.to_string()))?;
+    if crate::daemon::daemon_process_alive_at(&paths).map_err(|error| invalid(error.to_string()))? {
+        return Ok(false);
+    }
+    if handoff.is_none() {
+        *handoff = crate::daemon::lease_handoff::LeaseHandoff::try_acquire(&paths)
+            .map_err(|error| invalid(error.to_string()))?;
+    }
+    let Some(lease) = handoff.as_ref() else {
+        return Ok(false);
+    };
+    if crate::daemon::daemon_process_alive_at(&paths).map_err(|error| invalid(error.to_string()))? {
+        return Ok(false);
+    }
+    if recovery::checkpoint_status()?
+        .is_some_and(|s| s.phase != crate::upgrade::handoff::Phase::Ready)
+    {
+        return Err(invalid(
+            "The checkpoint requires capable-target recovery; the candidate and current pointer were retained. No previous executable was restarted.",
+        ));
+    }
+    if startup_spawned {
+        let schema = schema.ok_or_else(|| invalid("The previous store schema was not captured"))?;
+        candidate_maintenance(
+            candidate,
+            &["daemon", "downgrade-store", &schema.to_string()],
+            guard,
+            lease,
+        )?;
+    }
+    restore_current(prefix, candidate, previous)?;
+    Ok(true)
+}
+
+fn selected_candidate(prefix: &Path, candidate: &Path) -> Result<(), UpdateError> {
+    let current = prefix.join("current");
+    if current.canonicalize()? != candidate
+        || !fs::symlink_metadata(&current)?.file_type().is_symlink()
+    {
+        return Err(invalid("The selected installation changed during recovery"));
+    }
+    Ok(())
+}
+
+fn restore_current(prefix: &Path, candidate: &Path, previous: &Path) -> Result<(), UpdateError> {
+    selected_candidate(prefix, candidate)?;
+    let current = prefix.join("current");
+    // Both roots came from the authenticated installation layout. Keep a new
+    // relative link beside current, then replace it atomically under the fence.
+    let previous = previous
+        .strip_prefix(prefix)
+        .map_err(|_| invalid("The previous version belongs to another installation"))?;
+    let temporary = prefix.join(format!(".rollback-{}", uuid::Uuid::new_v4()));
+    std::os::unix::fs::symlink(previous, &temporary)?;
+    let replaced = fs::rename(&temporary, &current);
+    if replaced.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    replaced?;
+    Ok(())
+}
+
+/// Listening is not proof that startup restored the reviewed panes. Recovery
+/// deliberately serves inspection while ordinary conversation requests fail.
+fn confirm_daemon_ready(expected: &Path, timeout: Duration) -> Result<(), UpdateError> {
+    let socket = crate::daemon::RuntimePaths::discover()
+        .map_err(|error| invalid(error.to_string()))?
+        .socket;
+    confirm_daemon_ready_at(&socket, expected, Instant::now() + timeout)
+}
+
+fn confirm_daemon_ready_at(
+    socket: &Path,
+    expected: &Path,
+    deadline: Instant,
+) -> Result<(), UpdateError> {
+    use crate::{control::ControlClient, terminal_ipc::StartupState};
+    let guidance =
+        "Existing work and recovery records were kept. Check cagents daemon status before retrying";
+    let communication = |error: &dyn std::fmt::Display| {
+        invalid(format!(
+            "Could not confirm restored panes: {error}. {guidance}"
+        ))
+    };
+    let stream = crate::control::connect_control_socket(
+        socket,
+        deadline.saturating_duration_since(Instant::now()),
+    )
+    .map_err(|error| communication(&error))?;
+    let peer = source::Peer::observe(&stream, socket).map_err(|error| communication(&error))?;
+    let mut client = ControlClient::from_stream_with_deadline(stream, deadline)
+        .map_err(|error| communication(&error))?;
+    let ownership = |proof: &crate::model::HostSessionProof| {
+        let unavailable = || invalid("the confirmed terminal service changed or is unavailable");
+        peer.verify(proof).map_err(|_| unavailable())?;
+        if peer.executable().map_err(|_| unavailable())? != expected {
+            return Err(invalid("the confirmed terminal service changed"));
+        }
+        Ok(())
+    };
+    loop {
+        if Instant::now() >= deadline {
+            return Err(invalid(format!(
+                "Timed out confirming restored panes. {guidance}"
+            )));
+        }
+        ownership(client.proof()).map_err(|error: UpdateError| communication(&error))?;
+        let state = client
+            .startup_state_with_deadline(deadline)
+            .map_err(|error| communication(&error))?;
+        ownership(client.proof()).map_err(|error: UpdateError| communication(&error))?;
+        match state {
+            StartupState::Ready => return Ok(()),
+            StartupState::Retained { detail } => {
+                return Err(invalid(format!(
+                    "The update could not restore all panes: {detail}. {guidance}"
+                )));
+            }
+            StartupState::Restoring { .. } => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(invalid(format!(
+                        "The terminal service is still restoring saved panes. {guidance}"
+                    )));
+                }
+                thread::sleep(remaining.min(Duration::from_millis(100)));
+            }
+        }
+    }
 }
 
 /// A compatible protocol is not proof that the daemon already runs the
@@ -296,6 +562,7 @@ fn observe_installed_source(
         stopped: Vec::new(),
         stopped_windows: Vec::new(),
         labels: Default::default(),
+        editors: crate::install_guard::editor_companions(),
         candidate: staged.identity.clone(),
         replaces_daemon: true,
         daemon: Some(daemon),
@@ -463,6 +730,344 @@ fn startup_failure(error: &io::Error, reason: Option<&str>, successor_runs: bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stopped_installed_candidate_rolls_back_only_without_a_live_writer() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        const ROOT: &str = "CAGENTS_INSTALLED_ROLLBACK_FIXTURE_ROOT";
+        let Some(root) = std::env::var_os(ROOT) else {
+            let root = tempfile::tempdir().unwrap();
+            for member in ["runtime", "home"] {
+                fs::create_dir(root.path().join(member)).unwrap();
+                fs::set_permissions(root.path().join(member), fs::Permissions::from_mode(0o700))
+                    .unwrap();
+            }
+            let selector = thread::current().name().unwrap().to_owned();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &selector, "--nocapture", "--test-threads=1"])
+                .env(ROOT, root.path())
+                .env("XDG_RUNTIME_DIR", root.path().join("runtime"))
+                .env("HOME", root.path().join("home"))
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        };
+        let root = PathBuf::from(root);
+        let old = root.join("versions/old");
+        let candidate = root.join("versions/candidate");
+        for version in [&old, &candidate] {
+            fs::create_dir_all(version.join("bin")).unwrap();
+        }
+        symlink("versions/candidate", root.join("current")).unwrap();
+        let cli = candidate.join("bin/cagents");
+        fs::write(
+            &cli,
+            r#"#!/usr/bin/python3
+import fcntl, os, pathlib, sys
+assert os.environ['CAGENTS_DAEMON_LEASE_FD'] == '199'
+assert 'FLOCK' in pathlib.Path('/proc/self/fdinfo/199').read_text()
+fcntl.flock(199, fcntl.LOCK_EX | fcntl.LOCK_NB)
+root=pathlib.Path(__file__).resolve().parents[3]
+if sys.argv[1:] == ['daemon', 'store-schema']:
+ print(23)
+elif sys.argv[1:] == ['daemon', 'downgrade-store', '23']:
+ if (root/'fail-conversion').exists(): sys.exit(1)
+ (root/'converted').write_text('23')
+else: raise AssertionError(sys.argv)
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = crate::daemon::RuntimePaths::discover().unwrap();
+        fs::create_dir_all(&paths.directory).unwrap();
+        fs::set_permissions(&paths.directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut stopped = Command::new("/bin/true").spawn().unwrap();
+        let stopped_pid = stopped.id();
+        stopped.wait().unwrap();
+        let proof = crate::model::HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("installed-rollback"),
+            boot_id: crate::daemon::read_boot_id().unwrap(),
+            host_incarnation: crate::model::HostIncarnation::new("installed-rollback"),
+        };
+        let metadata =
+            |pid| serde_json::to_vec(&serde_json::json!({"pid":pid,"proof":proof})).unwrap();
+        let mut lock = OpenOptions::new()
+            .write(true)
+            .read(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&paths.lock)
+            .unwrap();
+        lock.write_all(&metadata(stopped_pid)).unwrap();
+        let mut lease = crate::daemon::lease_handoff::LeaseHandoff::try_acquire(&paths).unwrap();
+        let guard = crate::instance::UiUpdateGuard::acquire().unwrap();
+        let schema = stopped_store_schema(&candidate, &guard, lease.as_ref().unwrap()).unwrap();
+        assert_eq!(schema, 23);
+        // Conversion failure must leave the only readable installation selected.
+        fs::write(root.join("fail-conversion"), "fail").unwrap();
+        assert!(
+            rollback_stopped_candidate(
+                &root,
+                &candidate,
+                &old,
+                Some(schema),
+                true,
+                &guard,
+                &mut lease
+            )
+            .is_err()
+        );
+        assert_eq!(root.join("current").canonicalize().unwrap(), candidate);
+        // A command that never spawned cannot have converted the store; old
+        // recovery must not depend on invoking that unavailable candidate.
+        assert!(
+            rollback_stopped_candidate(&root, &candidate, &old, None, false, &guard, &mut lease,)
+                .unwrap()
+        );
+        assert_eq!(root.join("current").canonicalize().unwrap(), old);
+        assert!(!root.join("converted").exists());
+        fs::remove_file(root.join("current")).unwrap();
+        symlink("versions/candidate", root.join("current")).unwrap();
+        fs::remove_file(root.join("fail-conversion")).unwrap();
+        // A live metadata owner keeps its matched installation and store.
+        lock.seek(SeekFrom::Start(0)).unwrap();
+        lock.set_len(0).unwrap();
+        lock.write_all(&metadata(std::process::id())).unwrap();
+        assert!(
+            !rollback_stopped_candidate(
+                &root,
+                &candidate,
+                &old,
+                Some(schema),
+                true,
+                &guard,
+                &mut lease
+            )
+            .unwrap()
+        );
+        assert!(!root.join("converted").exists());
+        // Once the new daemon is dead, retain the reservation through conversion
+        // and atomically restore the authenticated old source's matched set.
+        lock.seek(SeekFrom::Start(0)).unwrap();
+        lock.set_len(0).unwrap();
+        lock.write_all(&metadata(stopped_pid)).unwrap();
+        assert!(
+            rollback_stopped_candidate(
+                &root,
+                &candidate,
+                &old,
+                Some(schema),
+                true,
+                &guard,
+                &mut lease
+            )
+            .unwrap()
+        );
+        assert_eq!(root.join("current").canonicalize().unwrap(), old);
+        assert_eq!(fs::read_to_string(root.join("converted")).unwrap(), "23");
+        fs::remove_file(root.join("converted")).unwrap();
+        // An independently changed current is rejected before store conversion.
+        assert!(
+            rollback_stopped_candidate(
+                &root,
+                &candidate,
+                &old,
+                Some(schema),
+                true,
+                &guard,
+                &mut lease
+            )
+            .is_err()
+        );
+        assert!(!root.join("converted").exists());
+    }
+
+    #[derive(Clone, Copy)]
+    enum StartupPeer {
+        Matched,
+        OtherExecutable,
+        OtherProof,
+        ChangedLease,
+    }
+
+    fn startup_fixture(
+        states: Vec<crate::terminal_ipc::StartupState>,
+        peer: StartupPeer,
+        timeout: Duration,
+    ) -> (Result<(), UpdateError>, usize) {
+        use crate::{
+            model::{HostIncarnation, HostSessionId, HostSessionProof},
+            terminal_ipc::{
+                ClientEnvelope, ClientRequest, ServerEnvelope, ServerMessage, ServerResponse,
+                StartupState, read_frame, write_frame,
+            },
+        };
+        use std::{
+            collections::VecDeque,
+            os::unix::net::{UnixListener, UnixStream},
+        };
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("cagentsd.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let mut proof = HostSessionProof {
+            host_session_id: HostSessionId::new("startup-probe"),
+            boot_id: crate::daemon::read_boot_id().unwrap(),
+            host_incarnation: HostIncarnation::new("startup-probe"),
+        };
+        let mut lease = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(root.path().join("cagentsd.lock"))
+            .unwrap();
+        assert_eq!(unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX) }, 0);
+        serde_json::to_writer(
+            &mut lease,
+            &serde_json::json!({"pid":std::process::id(),"proof":proof}),
+        )
+        .unwrap();
+        if matches!(peer, StartupPeer::OtherProof) {
+            proof.host_incarnation = HostIncarnation::new("another-startup");
+        }
+        let lease_path = root.path().join("cagentsd.lock");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let reply = |stream: &mut UnixStream, id, response| {
+                write_frame(
+                    stream,
+                    &ServerEnvelope {
+                        version: crate::terminal_ipc::PROTOCOL_VERSION,
+                        request_id: Some(id),
+                        proof: proof.clone(),
+                        message: ServerMessage::Response { response },
+                    },
+                )
+                .unwrap();
+            };
+            let connect: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+            assert!(matches!(connect.request, ClientRequest::Connect { .. }));
+            reply(
+                &mut stream,
+                connect.request_id,
+                ServerResponse::Connected {
+                    proof: proof.clone(),
+                    resumed: Vec::new(),
+                },
+            );
+            let mut states = VecDeque::from(states);
+            let mut requests = 0;
+            while let Some(request) = read_frame::<ClientEnvelope>(&mut stream).unwrap() {
+                assert_eq!(request.request, ClientRequest::StartupState);
+                let state = states
+                    .pop_front()
+                    .unwrap_or(StartupState::Restoring { awaiting: 1 });
+                let finished = !matches!(state, StartupState::Restoring { .. });
+                if matches!(peer, StartupPeer::ChangedLease) {
+                    let mut changed = proof.clone();
+                    changed.host_incarnation = HostIncarnation::new("replacement-owner");
+                    fs::write(
+                        &lease_path,
+                        serde_json::to_vec(&serde_json::json!({
+                            "pid": std::process::id(), "proof": changed
+                        }))
+                        .unwrap(),
+                    )
+                    .unwrap();
+                }
+                reply(
+                    &mut stream,
+                    request.request_id,
+                    ServerResponse::StartupState(state),
+                );
+                requests += 1;
+                if finished {
+                    break;
+                }
+            }
+            requests
+        });
+        let executable = if matches!(peer, StartupPeer::OtherExecutable) {
+            PathBuf::from("/another-installation/bin/cagentsd")
+        } else {
+            std::env::current_exe().unwrap()
+        };
+        let result = confirm_daemon_ready_at(&socket, &executable, Instant::now() + timeout);
+        (result, server.join().unwrap())
+    }
+
+    #[test]
+    fn matched_service_must_finish_restoring_before_update_success() {
+        use crate::terminal_ipc::StartupState;
+        let (result, requests) = startup_fixture(
+            vec![StartupState::Restoring { awaiting: 1 }, StartupState::Ready],
+            StartupPeer::Matched,
+            Duration::from_secs(3),
+        );
+        result.unwrap();
+        assert_eq!(requests, 2);
+    }
+
+    #[test]
+    fn listening_service_with_retained_ownership_is_an_update_failure() {
+        use crate::terminal_ipc::StartupState;
+        let (result, requests) = startup_fixture(
+            vec![StartupState::Retained {
+                detail: "The console could not reconnect".into(),
+            }],
+            StartupPeer::Matched,
+            Duration::from_secs(3),
+        );
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("could not restore all panes"), "{error}");
+        assert!(error.contains("The console could not reconnect"), "{error}");
+        assert!(
+            error.contains("Existing work and recovery records were kept"),
+            "{error}"
+        );
+        assert_eq!(requests, 1);
+    }
+
+    #[test]
+    fn another_executable_or_daemon_proof_cannot_satisfy_restoration() {
+        for peer in [
+            StartupPeer::OtherExecutable,
+            StartupPeer::OtherProof,
+            StartupPeer::ChangedLease,
+        ] {
+            let (result, requests) = startup_fixture(
+                vec![crate::terminal_ipc::StartupState::Ready],
+                peer,
+                Duration::from_secs(3),
+            );
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("terminal service changed")
+            );
+            assert_eq!(
+                requests,
+                usize::from(matches!(peer, StartupPeer::ChangedLease))
+            );
+        }
+    }
+
+    #[test]
+    fn a_service_that_remains_restoring_has_a_bounded_failure() {
+        let (result, requests) =
+            startup_fixture(vec![], StartupPeer::Matched, Duration::from_millis(500));
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("Timed out confirming restored panes"),
+            "{error}"
+        );
+        assert!(requests > 0);
+    }
 
     fn run_captured(
         script: &str,

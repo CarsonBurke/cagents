@@ -71,7 +71,15 @@ impl SessionImpact {
                 SessionKind::NativeChat => "The conversation and its running work stay alive.".into(),
             },
             Disposition::Resumes => "Restarts on its recorded conversation.".into(),
-            Disposition::WaitsForIdle => "Finishing its turn; the update waits.".into(),
+            Disposition::WaitsForIdle => {
+                let tasks = self.interrupted_subagents.len();
+                if tasks == 0 {
+                    "Finishing its turn; the update waits.".into()
+                } else {
+                    let noun = if tasks == 1 { "task" } else { "tasks" };
+                    format!("Finishing its turn; interrupting now also stops {tasks} background {noun}; background work will not resume automatically.")
+                }
+            },
             Disposition::Interrupted => {
                 let tasks = self.interrupted_subagents.len();
                 if tasks == 0 {
@@ -83,6 +91,7 @@ impl SessionImpact {
             }
             Disposition::ResumePicker => "Its conversation cannot reopen automatically.".into(),
             Disposition::Blocked => match self.reason.as_str() {
+                "Its turn finished, but background agents are still running. Review stopping them to continue the update." => "Its turn finished, but background agents are still running. Review stopping them to continue the update.".into(),
                 STOPPED_WITH_UNSETTLED_WORK => "Its provider stopped with unfinished work. Close this conversation before updating.".into(),
                 "Finish the pending return to terminal or close this conversation." => "Finish returning to the terminal or close this conversation before updating.".into(),
                 "Its provider is not ready yet. This clears on its own once it finishes starting; close the conversation if it does not." => "Its provider is still starting. Wait for it to finish, then try the update again.".into(),
@@ -215,6 +224,9 @@ impl DaemonImpact {
                         && (previous.disposition == current.disposition
                             || (self.policy == Policy::WhenIdle
                                 && previous.disposition == Disposition::WaitsForIdle
+                                && current.disposition == Disposition::Resumes)
+                            || (self.policy == Policy::Interrupt
+                                && previous.disposition == Disposition::Interrupted
                                 && current.disposition == Disposition::Resumes))
                 })
             })
@@ -301,6 +313,146 @@ mod tests {
     }
 
     #[test]
+    fn interruption_consent_survives_settlement_only_for_the_same_conversation() {
+        let mut confirmed = waiting();
+        confirmed.policy = Policy::Interrupt;
+        confirmed.sessions[0].disposition = Disposition::Interrupted;
+        let mut settled = confirmed.clone();
+        settled.sessions[0].disposition = Disposition::Resumes;
+        assert!(confirmed.preserves_consent(&settled));
+        assert!(
+            !settled.preserves_consent(&confirmed),
+            "a new turn needs consent"
+        );
+        settled.sessions[0].identity.push_str(" replacement owner");
+        assert!(!confirmed.preserves_consent(&settled));
+    }
+
+    fn preview_with_daemon(daemon: DaemonImpact) -> Preview {
+        Preview {
+            candidate: Candidate {
+                version: "2".into(),
+                protocol: 166,
+                digest: "verified".into(),
+            },
+            replaces_daemon: true,
+            daemon: Some(daemon),
+            from_version: "1".into(),
+            windows: 1,
+            stopped: Vec::new(),
+            stopped_windows: Vec::new(),
+            labels: Default::default(),
+            editors: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn preview_consent_survives_approved_activity_and_background_task_settlement() {
+        for policy in [Policy::WhenIdle, Policy::Interrupt] {
+            let mut daemon = waiting();
+            daemon.policy = policy;
+            if policy == Policy::Interrupt {
+                daemon.sessions[0].disposition = Disposition::Interrupted;
+            }
+            daemon.sessions[0].interrupted_subagents = vec!["first".into(), "second".into()];
+            let approved = preview_with_daemon(daemon);
+            let mut reduced = approved.clone();
+            reduced.daemon.as_mut().unwrap().sessions[0]
+                .interrupted_subagents
+                .remove(0);
+            assert!(approved.preserves_consent(&reduced), "{policy:?}");
+            assert!(!reduced.preserves_consent(&approved), "{policy:?}");
+            let mut settled = reduced;
+            let daemon = settled.daemon.as_mut().unwrap();
+            daemon.capability.token = "renewed".into();
+            daemon.capability.expires_at_unix_ms += 100;
+            daemon.sessions[0].disposition = Disposition::Resumes;
+            daemon.sessions[0].interrupted_subagents.clear();
+            assert!(approved.preserves_consent(&settled), "{policy:?}");
+            assert!(!settled.preserves_consent(&approved), "{policy:?}");
+        }
+    }
+
+    #[test]
+    fn preview_activity_settlement_cannot_hide_changed_review_content_or_owners() {
+        let approved = preview_with_daemon(waiting());
+        let mut settled = approved.clone();
+        settled.daemon.as_mut().unwrap().sessions[0].disposition = Disposition::Resumes;
+        assert!(approved.preserves_consent(&settled));
+        for change in [
+            "title",
+            "owner",
+            "kind",
+            "notice",
+            "window",
+            "saved outcome",
+            "stop",
+        ] {
+            let mut changed = settled.clone();
+            match change {
+                "title" => changed.daemon.as_mut().unwrap().sessions[0]
+                    .title
+                    .push_str(" renamed"),
+                "owner" => changed.daemon.as_mut().unwrap().sessions[0]
+                    .identity
+                    .push_str(" replaced"),
+                "kind" => changed.daemon.as_mut().unwrap().sessions[0].kind = SessionKind::Terminal,
+                "notice" => changed
+                    .labels
+                    .details
+                    .notices
+                    .push("A pending return to terminal needs attention.".into()),
+                "window" => changed.windows += 1,
+                "saved outcome" => {
+                    let pane = changed.daemon.as_ref().unwrap().sessions[0].id;
+                    changed.labels.details.panes.insert(
+                        pane,
+                        super::super::source_inspection::InspectedPane {
+                            kind: SessionKind::NativeChat,
+                            outcome: super::super::source_inspection::SavedOutcome::Resumes,
+                            detail: "Its saved pane requires a new recovery step.".into(),
+                        },
+                    );
+                }
+                "stop" => {
+                    changed
+                        .stopped_windows
+                        .push(super::super::source_inspection::StoppedWindow {
+                            window: 1,
+                            reason: "A saved window could not be read".into(),
+                            recovery: "Its saved file stays as it is".into(),
+                        })
+                }
+                _ => unreachable!(),
+            }
+            assert!(!approved.preserves_consent(&changed), "{change}");
+        }
+    }
+
+    #[test]
+    fn editor_census_is_backwards_compatible_and_does_not_expand_consent() {
+        let before: Preview = serde_json::from_value(serde_json::json!({
+            "candidate": { "version": "1.0", "protocol": 160, "digest": "verified" },
+            "replaces_daemon": true,
+            "daemon": null
+        }))
+        .unwrap();
+        assert!(before.editors.is_empty());
+        let mut after = before.clone();
+        after.editors.push(crate::install_guard::EditorCompanion {
+            name: "Ceditor".into(),
+            version: Some("07e7efc5".into()),
+            protocol: Some(127),
+            pid: 42,
+        });
+        assert!(before.preserves_consent(&after));
+        assert!(after.preserves_consent(&before));
+        let roundtrip: Preview =
+            serde_json::from_slice(&serde_json::to_vec(&after).unwrap()).unwrap();
+        assert_eq!(after, roundtrip);
+    }
+
+    #[test]
     fn duplicate_inventory_and_changed_candidate_cannot_reuse_confirmation() {
         let mut previous = waiting();
         let mut additional = previous.sessions[0].clone();
@@ -316,6 +468,7 @@ mod tests {
             stopped: Vec::new(),
             stopped_windows: Vec::new(),
             labels: Default::default(),
+            editors: Vec::new(),
             candidate: Candidate {
                 version: "1.0.0".into(),
                 protocol: 31,
@@ -332,6 +485,7 @@ mod tests {
     fn stopped_outcomes_require_the_same_panes_windows_and_reasons() {
         use super::super::source_inspection::{StoppedKind, StoppedPane, StoppedWindow};
         let preview = Preview {
+            editors: Vec::new(),
             candidate: Candidate {
                 version: "2".into(),
                 protocol: 160,
@@ -404,6 +558,8 @@ pub struct Candidate {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Preview {
+    #[serde(default)]
+    pub editors: Vec<crate::install_guard::EditorCompanion>,
     pub candidate: Candidate,
     /// Compatible updates leave the daemon and its entire inventory in place.
     pub replaces_daemon: bool,
@@ -441,19 +597,60 @@ impl Preview {
         self
     }
 
+    /// Stop consent binds the candidate and exact listed owners. Activity is
+    /// display-only here; the ordinary review has already settled the wait.
+    pub(super) fn preserves_stop_consent(&self, observed: &Self) -> bool {
+        self.candidate == observed.candidate
+            && self.replaces_daemon == observed.replaces_daemon
+            && self.daemon.as_ref().map(|daemon| &daemon.capability.proof)
+                == observed
+                    .daemon
+                    .as_ref()
+                    .map(|daemon| &daemon.capability.proof)
+    }
+
     pub fn preserves_consent(&self, observed: &Self) -> bool {
-        super::source_inspection::SourceInspection::same_outcomes(
+        if !super::source_inspection::SourceInspection::same_outcomes(
             &self.stopped,
             &self.stopped_windows,
             &observed.stopped,
             &observed.stopped_windows,
-        ) && super::review::Review::from(self) == super::review::Review::from(observed)
-            && self.candidate == observed.candidate
-            && self.replaces_daemon == observed.replaces_daemon
-            && match (&self.daemon, &observed.daemon) {
+        ) || self.labels.details.console_capabilities
+            != observed.labels.details.console_capabilities
+            || self.candidate != observed.candidate
+            || self.replaces_daemon != observed.replaces_daemon
+            || !match (&self.daemon, &observed.daemon) {
                 (None, None) => true,
                 (Some(previous), Some(current)) => previous.preserves_consent(current),
                 _ => false,
             }
+        {
+            return false;
+        }
+
+        let mut settled = self.clone();
+        // Editor census entries describe independent companions; their protocol
+        // preflight remains separate from consent to this update's consequences.
+        settled.editors.clone_from(&observed.editors);
+        if let (Some(previous), Some(current)) = (&mut settled.daemon, &observed.daemon) {
+            for session in &mut previous.sessions {
+                let Some(now) = current
+                    .sessions
+                    .iter()
+                    .find(|now| now.id == session.id && now.kind == session.kind)
+                else {
+                    return false;
+                };
+                // The daemon comparison above proved these are the same owners
+                // and only permitted activity settlement or shrinking task sets.
+                // Keep all titles, source reasons, saved outcomes and notices so
+                // settling work cannot conceal any other change to the review.
+                session.disposition = now.disposition;
+                session
+                    .interrupted_subagents
+                    .clone_from(&now.interrupted_subagents);
+            }
+        }
+        super::review::Review::from(&settled) == super::review::Review::from(observed)
     }
 }

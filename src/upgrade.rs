@@ -1,9 +1,9 @@
 //! Shared exact-session recovery authority and durable daemon upgrade handoff.
+pub(crate) mod floor;
+pub(crate) mod recovery;
 #[cfg(any(feature = "host", feature = "ui"))]
 use crate::lineage_birth::LineageBirth;
-#[cfg(any(feature = "host", test))]
 use crate::model::HostSessionProof;
-#[cfg(any(feature = "host", feature = "ui", test))]
 use crate::model::{LaunchRecipe, TerminalSession};
 #[cfg(any(feature = "host", feature = "ui", test))]
 use std::{fs, io};
@@ -36,7 +36,6 @@ pub fn relaunch_agents_by_default(settings: &Path) -> Result<bool, String> {
 }
 
 /// How a terminal comes back after its daemon is gone, and why.
-#[cfg(any(feature = "host", feature = "ui", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RecoveryKind {
     /// The exact saved conversation resumes.
@@ -60,7 +59,6 @@ impl RecoveryKind {
 }
 
 /// Automatic recovery never replays arbitrary command recipes.
-#[cfg(any(feature = "host", test))]
 pub(crate) fn recovery_recipe(session: &TerminalSession) -> Result<LaunchRecipe, String> {
     recovery_plan(session).map(|(recipe, _)| recipe)
 }
@@ -70,7 +68,6 @@ pub(crate) fn recovery_recipe(session: &TerminalSession) -> Result<LaunchRecipe,
 /// An agent the terminal was known to run is never downgraded to the shell it
 /// ran in: a shell would leave its conversation findable only by someone who
 /// knows where the provider keeps it.
-#[cfg(any(feature = "host", feature = "ui", test))]
 pub(crate) fn recovery_plan(
     session: &TerminalSession,
 ) -> Result<(LaunchRecipe, RecoveryKind), String> {
@@ -92,13 +89,12 @@ pub(crate) fn recovery_plan(
     if recoverable_shell(&session.launch) {
         return Ok((session.launch.clone(), RecoveryKind::Shell));
     }
-    Err("This command has no agent identity and cannot safely be replayed; finish or close it before upgrading".into())
+    Err("This command cannot restart automatically; after you confirm, its pane reopens stopped with the saved screen".into())
 }
 
 /// A shell cagents made can carry the selected provider homes. Other
 /// environment overrides can change what the shell executes and are not
 /// enough evidence to replay a command during an upgrade.
-#[cfg(any(feature = "host", feature = "ui", test))]
 fn recoverable_shell(recipe: &LaunchRecipe) -> bool {
     let Ok(shell) = LaunchRecipe::shell(recipe.working_directory.clone()) else {
         return false;
@@ -113,7 +109,6 @@ fn recoverable_shell(recipe: &LaunchRecipe) -> bool {
 
 /// Setup recipes are retained for an explicit reviewed run, never automatic
 /// upgrade replay. The marker is classification, not execution authority.
-#[cfg(any(feature = "host", test))]
 pub(crate) fn is_worktree_setup_recipe(recipe: &LaunchRecipe) -> bool {
     recipe
         .environment
@@ -121,7 +116,6 @@ pub(crate) fn is_worktree_setup_recipe(recipe: &LaunchRecipe) -> bool {
         .is_some_and(|value| value == "1")
 }
 
-#[cfg(any(feature = "host", test))]
 pub(crate) fn checkpoint_recipe(
     session: &TerminalSession,
     relaunches: &[crate::terminal_ipc::UpgradeRelaunch],
@@ -147,7 +141,6 @@ pub(crate) fn checkpoint_recipe(
 /// Recipes passed here have already been normalized by agent_resume_recipe.
 /// Only the provider's resume selector identifies the writer, never UUID-shaped
 /// values of unrelated model, profile, or configuration flags.
-#[cfg(any(feature = "host", feature = "ui", test))]
 pub(crate) fn exact_conversation(
     recipe: &LaunchRecipe,
 ) -> Option<(crate::agent::Provider, uuid::Uuid)> {
@@ -957,12 +950,11 @@ pub(crate) fn process_error(error: io::Error) -> String {
 
 pub(crate) mod handoff {
     use super::*;
+    use crate::chat;
     use crate::fs_safety;
-    #[cfg(any(feature = "host", test))]
-    use crate::{chat, terminal_ipc::TerminalSpawnOptions};
-    use serde::Deserialize;
-    #[cfg(any(feature = "host", test))]
-    use serde::Serialize;
+    use crate::terminal_ipc::TerminalSpawnOptions;
+    use serde::{Deserialize, Serialize};
+    use sha2::{Digest, Sha256};
     #[cfg(any(feature = "host", test))]
     use std::io::Write;
     use std::{ffi::OsStr, path::PathBuf};
@@ -1005,7 +997,6 @@ pub(crate) mod handoff {
         Ok(output.bytes)
     }
 
-    #[cfg(any(feature = "host", test))]
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
     pub(crate) enum Phase {
         /// Persisted before any irreversible stop. Provider closure is unproven.
@@ -1016,7 +1007,15 @@ pub(crate) mod handoff {
         Restoring,
     }
 
-    #[cfg(any(feature = "host", test))]
+    /// A read-only observation of one exact private checkpoint. This grants
+    /// no authority to promote, consume, archive or replay the host payload.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct CheckpointStatus {
+        pub(crate) proof: HostSessionProof,
+        pub(crate) phase: Phase,
+        pub(crate) digest: String,
+    }
+
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub(crate) struct Terminal {
         pub source: TerminalSession,
@@ -1032,7 +1031,6 @@ pub(crate) mod handoff {
     /// A terminal left running under its holder for the next daemon to adopt,
     /// processes, screen and all. Its launch is unchanged, so its lineage
     /// records the carry as a source whose successor launched the same way.
-    #[cfg(any(feature = "host", test))]
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub(crate) struct Carried {
         pub source: TerminalSession,
@@ -1044,7 +1042,6 @@ pub(crate) mod handoff {
         pub options: TerminalSpawnOptions,
     }
 
-    #[cfg(any(feature = "host", test))]
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub(crate) struct Chat {
         /// Immutable issued launch and former daemon ownership, independent of
@@ -1056,7 +1053,6 @@ pub(crate) mod handoff {
         pub launch: chat::Launch,
     }
 
-    #[cfg(any(feature = "host", test))]
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub(crate) struct ChatSource {
         pub source: chat::Session,
@@ -1065,10 +1061,9 @@ pub(crate) mod handoff {
         pub launch: chat::Launch,
     }
 
-    #[cfg(any(feature = "host", test))]
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub(crate) struct Checkpoint {
-        /// Read, and checked, but written by [`Store::save`] from what the
+        /// Read and checked here; the host writer derives it from what the
         /// checkpoint holds.
         #[serde(skip_serializing)]
         version: u16,
@@ -1084,8 +1079,8 @@ pub(crate) mod handoff {
         pub chats: Vec<Chat>,
     }
 
-    #[cfg(any(feature = "host", test))]
     impl Checkpoint {
+        #[cfg(any(feature = "host", test))]
         pub fn new(
             proof: HostSessionProof,
             terminals: Vec<Terminal>,
@@ -1378,6 +1373,7 @@ pub(crate) mod handoff {
             Ok(())
         }
 
+        #[cfg(any(feature = "host", test))]
         pub fn require_ready(&self) -> Result<(), String> {
             self.validate()?;
             if self.phase != Phase::Ready {
@@ -1390,10 +1386,26 @@ pub(crate) mod handoff {
         }
     }
 
+    /// Validate the complete supported host payload without granting replay or
+    /// mutation authority. Recovery receipts must bind valid checkpoint bytes,
+    /// not a reduced status/index shape that omits recipes or spawn options.
+    pub(crate) fn validate_checkpoint_bytes(bytes: &[u8]) -> Result<(), String> {
+        decode_checkpoint(bytes).map(|_| ())
+    }
+
+    fn decode_checkpoint(bytes: &[u8]) -> Result<Checkpoint, String> {
+        if bytes.len() as u64 > MAX_BYTES {
+            return Err("Upgrade checkpoint exceeds the 8 MiB durable byte limit".into());
+        }
+        let checkpoint: Checkpoint =
+            serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+        checkpoint.validate()?;
+        Ok(checkpoint)
+    }
+
     /// A retained execution carries its console without replaying its recipe.
     /// Only the live/detached presentation may differ from the issued pair;
     /// every ownership and execution field must remain exactly the same.
-    #[cfg(any(feature = "host", test))]
     fn paired_carried_source(
         chat: &Chat,
         carried: &Carried,
@@ -1424,7 +1436,6 @@ pub(crate) mod handoff {
     /// Keep the descriptor already issued to the chat while validating the
     /// separate exact execution selected by its original daemon. Older writers
     /// stored the derived resume hint on the checkpoint's terminal copy.
-    #[cfg(any(feature = "host", test))]
     pub(crate) fn paired_terminal_source(
         chat: &Chat,
         terminal: &Terminal,
@@ -1459,7 +1470,6 @@ pub(crate) mod handoff {
         Ok(issued)
     }
 
-    #[cfg(any(feature = "host", test))]
     /// Check the immutable descriptor against the separate effective restart.
     /// Call while the old provider and windows are still usable, before handoff.
     pub(crate) fn validate_chat_source(
@@ -1627,13 +1637,71 @@ pub(crate) mod handoff {
     // issued aliases beside the authenticated replacement until panes have
     // attached or the conversation is explicitly closed.
     const RECOVERED_FILE: &str = "daemon-upgrade.recovered.json";
-    #[cfg(any(feature = "host", test))]
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub(crate) struct RecoveredChat {
         pub evidence: Chat,
         pub replacement: chat::Session,
         #[serde(default)]
         pub aliases: Vec<chat::Session>,
+    }
+
+    /// Completed checkpoint lineage is evidence about a listed replacement,
+    /// never authority to restore or attach a conversation.
+    #[derive(Debug, Default)]
+    pub(crate) struct RecoveredChats {
+        entries: Vec<RecoveredChat>,
+    }
+
+    impl RecoveredChat {
+        fn issued_sources(self) -> Vec<ChatSource> {
+            let mut sources = self.evidence.previous_sources;
+            sources.extend(self.aliases.into_iter().map(|source| ChatSource {
+                source,
+                launch: self.evidence.launch.clone(),
+            }));
+            sources.push(ChatSource {
+                source: self.evidence.source,
+                launch: self.evidence.launch.clone(),
+            });
+            sources.push(ChatSource {
+                source: self.replacement,
+                launch: self.evidence.launch,
+            });
+            sources
+        }
+    }
+
+    impl RecoveredChats {
+        pub(crate) fn proves(
+            &self,
+            source: &chat::Session,
+            current: &chat::Session,
+            serving: &HostSessionProof,
+        ) -> bool {
+            if !serving.is_complete()
+                || current.proof.as_ref() != Some(serving)
+                || !source
+                    .proof
+                    .as_ref()
+                    .is_some_and(HostSessionProof::is_complete)
+            {
+                return false;
+            }
+            self.entries.iter().any(|entry| {
+                // The live Resolve path may authenticate a later actor before
+                // adopting it. A read-only verifier cannot use that shape-only
+                // fallback: it needs the exact durably issued replacement.
+                entry.replacement == *current
+                    && entry.clone().issued_sources().iter().any(|issued| {
+                        if issued.source == *source {
+                            return true;
+                        }
+                        let mut confirmed = issued.source.clone();
+                        confirmed.launch.session_id = issued.launch.session_id.clone();
+                        confirmed == *source
+                    })
+            })
+        }
     }
 
     /// A restoring provider can take its full attachment timeout even when
@@ -1719,7 +1787,29 @@ pub(crate) mod handoff {
             })
         }
 
-        fn read_bytes(&self) -> Result<Option<Vec<u8>>, String> {
+        /// Predict the source prepare's refusal to overwrite another update.
+        /// This reads the existing checkpoint without granting replay authority.
+        pub(crate) fn conflicts_with_source(
+            &self,
+            proof: &crate::model::HostSessionProof,
+        ) -> Result<bool, String> {
+            #[derive(Deserialize)]
+            struct Header {
+                version: u16,
+                proof: crate::model::HostSessionProof,
+                phase: String,
+            }
+            let Some(bytes) = self.read_bytes()? else {
+                return Ok(false);
+            };
+            let header: Header =
+                serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+            Ok(!VERSIONS.contains(&header.version)
+                || header.proof != *proof
+                || header.phase != "Prepared")
+        }
+
+        pub(super) fn read_bytes(&self) -> Result<Option<Vec<u8>>, String> {
             self.read_named(FILE)
         }
 
@@ -1746,6 +1836,37 @@ pub(crate) mod handoff {
                 return Err("Upgrade evidence exceeds durable byte limit".into());
             }
             Ok(Some(bytes))
+        }
+
+        /// Inspect only the common envelope, retaining the exact private-byte
+        /// identity. Readers in every feature lane share the same phase and
+        /// version contract without deserializing any host session payload.
+        pub(crate) fn checkpoint_status(&self) -> Result<Option<CheckpointStatus>, String> {
+            let Some(bytes) = self.read_bytes()? else {
+                return Ok(None);
+            };
+            #[derive(Deserialize)]
+            struct Envelope {
+                version: u16,
+                proof: HostSessionProof,
+                phase: Phase,
+            }
+            let envelope: Envelope = serde_json::from_slice(&bytes)
+                .map_err(|error| format!("Cannot read upgrade checkpoint status: {error}"))?;
+            if !VERSIONS.contains(&envelope.version) {
+                return Err("Unsupported upgrade checkpoint; checkpoint retained".into());
+            }
+            if !envelope.proof.is_complete() {
+                return Err(
+                    "Upgrade checkpoint has incomplete source ownership; checkpoint retained"
+                        .into(),
+                );
+            }
+            Ok(Some(CheckpointStatus {
+                proof: envelope.proof,
+                phase: envelope.phase,
+                digest: format!("{:x}", Sha256::digest(&bytes)),
+            }))
         }
 
         fn startup_timeout(&self) -> Result<std::time::Duration, String> {
@@ -1775,10 +1896,7 @@ pub(crate) mod handoff {
             let Some(bytes) = self.read_bytes()? else {
                 return Ok(None);
             };
-            let checkpoint: Checkpoint =
-                serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
-            checkpoint.validate()?;
-            Ok(Some(checkpoint))
+            decode_checkpoint(&bytes).map(Some)
         }
 
         #[cfg(any(feature = "host", test))]
@@ -1803,7 +1921,7 @@ pub(crate) mod handoff {
 
         /// Atomically and durably replaces `name` with `bytes`.
         #[cfg(any(feature = "host", test))]
-        fn write_named(&self, name: &str, bytes: &[u8]) -> Result<(), String> {
+        pub(super) fn write_named(&self, name: &str, bytes: &[u8]) -> Result<(), String> {
             let (mut file, temporary) = fs_safety::create_temporary_in(&self.root, 0o600)
                 .map_err(|error| error.to_string())?;
             let result = (|| {
@@ -1819,7 +1937,6 @@ pub(crate) mod handoff {
             result
         }
 
-        #[cfg(any(feature = "host", test))]
         fn read_recovered(&self) -> Result<Vec<RecoveredChat>, String> {
             let Some(bytes) = self.read_named(RECOVERED_FILE)? else {
                 return Ok(Vec::new());
@@ -1830,6 +1947,24 @@ pub(crate) mod handoff {
                 return Err("Unsupported recovered conversation evidence; it was preserved".into());
             }
             Ok(report.conversations)
+        }
+
+        /// Read immutable issued lineage once for a fenced daemon inventory.
+        /// Missing evidence grants no continuity; unsafe or ambiguous evidence
+        /// is an error and remains untouched.
+        pub(crate) fn recovered_chats(&self) -> Result<RecoveredChats, String> {
+            let entries = self.read_recovered()?;
+            let mut ids = std::collections::BTreeSet::new();
+            if entries
+                .iter()
+                .any(|entry| !ids.insert(entry.replacement.id))
+            {
+                return Err(
+                    "Recovered conversation evidence has duplicate replacements; it was preserved"
+                        .into(),
+                );
+            }
+            Ok(RecoveredChats { entries })
         }
 
         /// Preserve aliases after the replay checkpoint is consumed. This file
@@ -1954,19 +2089,7 @@ pub(crate) mod handoff {
                 {
                     continue;
                 }
-                let mut aliases = entry.evidence.previous_sources;
-                aliases.extend(entry.aliases.into_iter().map(|source| ChatSource {
-                    source,
-                    launch: entry.evidence.launch.clone(),
-                }));
-                aliases.push(ChatSource {
-                    source: entry.evidence.source,
-                    launch: entry.evidence.launch.clone(),
-                });
-                aliases.push(ChatSource {
-                    source: entry.replacement,
-                    launch: entry.evidence.launch,
-                });
+                let aliases = entry.issued_sources();
                 if aliases
                     .iter()
                     .any(|alias| issued_chat_source_matches(alias, source))
@@ -2122,6 +2245,19 @@ pub(crate) mod handoff {
             self.write_named(UNATTACHED_FILE, &bytes)
         }
 
+        /// The confirmed stop floor must never replay an earlier checkpoint.
+        /// Preserve it under a unique name after the updater owns the lease.
+        pub(crate) fn archive_floor(&self) -> Result<Option<PathBuf>, String> {
+            if self.read_bytes()?.is_none() {
+                return Ok(None);
+            }
+            self.archive_as(&format!(
+                "daemon-upgrade.stopped.{}.json",
+                uuid::Uuid::new_v4()
+            ))
+            .map(Some)
+        }
+
         pub fn archive(&self) -> Result<PathBuf, String> {
             self.archive_as("daemon-upgrade.abandoned.json")
         }
@@ -2189,6 +2325,280 @@ pub(crate) mod handoff {
             }
             let error = encode_bounded(&Oversized, "evidence byte budget exceeded").unwrap_err();
             assert!(error.contains("evidence byte budget exceeded"), "{error}");
+        }
+
+        const STATUS_CHECKPOINT: &[u8] = br#"{"version":5,"proof":{"host_session_id":"host","boot_id":"boot","host_incarnation":"daemon"},"phase":"Prepared","payload":{"unknown":"read only"}}"#;
+
+        fn write_status_fixture(store: &Store, bytes: &[u8]) {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&store.path)
+                .unwrap();
+            file.write_all(bytes).unwrap();
+        }
+
+        #[test]
+        fn checkpoint_status_observes_typed_phases_and_exact_bytes_without_changing_evidence() {
+            let directory = tempfile::tempdir().unwrap();
+            let store = Store::open(directory.path()).unwrap();
+            assert_eq!(store.checkpoint_status().unwrap(), None);
+            assert!(!store.path.exists());
+            write_status_fixture(&store, STATUS_CHECKPOINT);
+            let original = store.checkpoint_status().unwrap().unwrap();
+            assert_eq!(original.phase, Phase::Prepared);
+            assert!(original.proof.is_complete());
+            assert_eq!(
+                original.digest,
+                "28832b59ca25b329709f14d502030bbac3292b883df6b68550e8779150148d97"
+            );
+            assert_eq!(std::fs::read(&store.path).unwrap(), STATUS_CHECKPOINT);
+            // The digest names exact bytes, not a normalized JSON document.
+            let mut spaced = STATUS_CHECKPOINT.to_vec();
+            spaced.push(b'\n');
+            write_status_fixture(&store, &spaced);
+            let changed = store.checkpoint_status().unwrap().unwrap();
+            assert_eq!(changed.proof, original.proof);
+            assert_eq!(changed.phase, original.phase);
+            assert_ne!(changed.digest, original.digest);
+            assert_eq!(std::fs::read(&store.path).unwrap(), spaced);
+            for phase in [Phase::Prepared, Phase::Ready, Phase::Restoring] {
+                let bytes = serde_json::to_vec(&serde_json::json!({
+                    "version": VERSION, "proof": original.proof, "phase": phase,
+                    // Deliberately not a host Checkpoint payload: status must
+                    // never turn inspection into host admission or replay.
+                    "terminals": {"opaque":"ignored"}, "chats": 42,
+                }))
+                .unwrap();
+                write_status_fixture(&store, &bytes);
+                let status = store.checkpoint_status().unwrap().unwrap();
+                assert_eq!(status.phase, phase);
+                assert_eq!(std::fs::read(&store.path).unwrap(), bytes);
+            }
+            for version in VERSIONS {
+                let mut envelope: serde_json::Value =
+                    serde_json::from_slice(STATUS_CHECKPOINT).unwrap();
+                envelope["version"] = version.into();
+                write_status_fixture(&store, &serde_json::to_vec(&envelope).unwrap());
+                assert!(store.checkpoint_status().unwrap().is_some());
+            }
+        }
+
+        #[test]
+        fn checkpoint_status_refuses_unknown_or_incomplete_envelopes_without_mutation() {
+            let directory = tempfile::tempdir().unwrap();
+            let store = Store::open(directory.path()).unwrap();
+            let valid: serde_json::Value = serde_json::from_slice(STATUS_CHECKPOINT).unwrap();
+            let mut cases = vec![b"not json".to_vec(), b"{}".to_vec()];
+            for version in [0, VERSION + 1] {
+                let mut envelope = valid.clone();
+                envelope["version"] = version.into();
+                cases.push(serde_json::to_vec(&envelope).unwrap());
+            }
+            for field in ["host_session_id", "boot_id", "host_incarnation"] {
+                let mut envelope = valid.clone();
+                envelope["proof"][field] = "".into();
+                cases.push(serde_json::to_vec(&envelope).unwrap());
+            }
+            for field in ["proof", "phase"] {
+                let mut envelope = valid.clone();
+                envelope[field] = "malformed".into();
+                cases.push(serde_json::to_vec(&envelope).unwrap());
+            }
+            for bytes in cases {
+                write_status_fixture(&store, &bytes);
+                assert!(store.checkpoint_status().is_err());
+                assert_eq!(std::fs::read(&store.path).unwrap(), bytes);
+            }
+        }
+
+        #[test]
+        fn checkpoint_status_reuses_private_file_and_byte_limit_checks() {
+            use std::os::unix::fs::{PermissionsExt, symlink};
+            let directory = tempfile::tempdir().unwrap();
+            let store = Store::open(directory.path()).unwrap();
+            write_status_fixture(&store, STATUS_CHECKPOINT);
+            // Exercise a foreign owner when this test user has CAP_CHOWN;
+            // unprivileged runs still exercise every readable-file safeguard.
+            let owned = std::fs::File::open(&store.path).unwrap();
+            let uid = crate::daemon::current_uid();
+            if unsafe { libc::fchown(std::os::fd::AsRawFd::as_raw_fd(&owned), uid + 1, u32::MAX) }
+                == 0
+            {
+                assert!(store.checkpoint_status().is_err());
+                assert_eq!(
+                    unsafe { libc::fchown(std::os::fd::AsRawFd::as_raw_fd(&owned), uid, u32::MAX) },
+                    0
+                );
+            }
+            std::fs::set_permissions(&store.path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(store.checkpoint_status().is_err());
+            assert_eq!(std::fs::read(&store.path).unwrap(), STATUS_CHECKPOINT);
+            std::fs::set_permissions(&store.path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let alias = directory.path().join("alias.json");
+            std::fs::hard_link(&store.path, &alias).unwrap();
+            assert!(store.checkpoint_status().is_err());
+            std::fs::remove_file(&alias).unwrap();
+            std::fs::rename(&store.path, &alias).unwrap();
+            symlink(&alias, &store.path).unwrap();
+            assert!(store.checkpoint_status().is_err());
+            assert_eq!(std::fs::read(&alias).unwrap(), STATUS_CHECKPOINT);
+            std::fs::remove_file(&store.path).unwrap();
+            std::fs::rename(&alias, &store.path).unwrap();
+            let mut oversized = STATUS_CHECKPOINT.to_vec();
+            oversized.resize(MAX_BYTES as usize + 1, b' ');
+            write_status_fixture(&store, &oversized);
+            assert!(store.checkpoint_status().is_err());
+            assert_eq!(std::fs::metadata(&store.path).unwrap().len(), MAX_BYTES + 1);
+            assert_eq!(std::fs::read(&store.path).unwrap(), oversized);
+        }
+
+        fn recovered_fixture(provider: crate::agent::Provider) -> RecoveredChat {
+            let source = chat::Session {
+                id: crate::model::TerminalId::new(),
+                launch: chat::Launch {
+                    provider,
+                    recipe: crate::model::LaunchRecipe {
+                        program: provider.executable().into(),
+                        arguments: vec![],
+                        working_directory: "/fixture".into(),
+                        environment: Default::default(),
+                        unset_environment: Default::default(),
+                    },
+                    session_id: Some(uuid::Uuid::new_v4().to_string()),
+                },
+                proof: Some(HostSessionProof {
+                    host_session_id: "host".into(),
+                    boot_id: "boot".into(),
+                    host_incarnation: "source".into(),
+                }),
+                terminal: None,
+                owned_codex_listener: None,
+                native_continuity: Default::default(),
+            };
+            let mut replacement = source.clone();
+            replacement.proof.as_mut().unwrap().host_incarnation = "replacement".into();
+            RecoveredChat {
+                evidence: Chat {
+                    launch: source.launch.clone(),
+                    source,
+                    previous_sources: vec![],
+                },
+                replacement,
+                aliases: vec![],
+            }
+        }
+
+        #[test]
+        fn recovered_chat_lineage_proves_claude_and_codex_only_for_exact_serving_replacement() {
+            for provider in [
+                crate::agent::Provider::Claude,
+                crate::agent::Provider::Codex,
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let store = Store::open(directory.path()).unwrap();
+                let entry = recovered_fixture(provider);
+                let source = &entry.evidence.source;
+                let current = &entry.replacement;
+                let serving = current.proof.as_ref().unwrap();
+                assert!(
+                    !store
+                        .recovered_chats()
+                        .unwrap()
+                        .proves(source, current, serving)
+                );
+                assert!(!store.path.with_file_name(RECOVERED_FILE).exists());
+                store.record_recovered(&[entry.clone()]).unwrap();
+                let path = store.path.with_file_name(RECOVERED_FILE);
+                let before = std::fs::read(&path).unwrap();
+                let evidence = store.recovered_chats().unwrap();
+                assert!(evidence.proves(source, current, serving), "{provider:?}");
+                assert!(!evidence.proves(source, current, source.proof.as_ref().unwrap()));
+                for mutation in 0..7 {
+                    let mut changed = current.clone();
+                    match mutation {
+                        0 => changed.proof.as_mut().unwrap().host_incarnation = "foreign".into(),
+                        1 => changed.launch.session_id = Some(uuid::Uuid::new_v4().to_string()),
+                        2 => changed.launch.recipe.arguments.push("--different".into()),
+                        3 => changed.id = crate::model::TerminalId::new(),
+                        4 => changed.proof = None,
+                        5 => {
+                            changed.native_continuity =
+                                chat::NativeContinuity::RetainedClaudeActor { protocol: 2 }
+                        }
+                        _ => {
+                            changed
+                                .launch
+                                .recipe
+                                .environment
+                                .insert("ACCOUNT".into(), "other".into());
+                        }
+                    }
+                    assert!(
+                        !evidence.proves(source, &changed, serving),
+                        "replacement mutation {mutation}"
+                    );
+                }
+                let mut unissued_successor = current.clone();
+                unissued_successor.proof.as_mut().unwrap().host_incarnation =
+                    "unissued-successor".into();
+                assert!(
+                    !evidence.proves(
+                        source,
+                        &unissued_successor,
+                        unissued_successor.proof.as_ref().unwrap()
+                    ),
+                    "matching a foreign serving proof is insufficient without its exact issued replacement"
+                );
+                let mut foreign_source = source.clone();
+                foreign_source.proof.as_mut().unwrap().host_incarnation = "foreign".into();
+                assert!(!evidence.proves(&foreign_source, current, serving));
+                assert_eq!(std::fs::read(path).unwrap(), before);
+                assert!(
+                    store.load().unwrap().is_none(),
+                    "reading lineage cannot mint a replay checkpoint"
+                );
+            }
+        }
+
+        #[test]
+        fn recovered_chat_lineage_reads_exact_recorded_aliases_and_rejects_ambiguous_reports() {
+            let directory = tempfile::tempdir().unwrap();
+            let store = Store::open(directory.path()).unwrap();
+            let mut entry = recovered_fixture(crate::agent::Provider::Claude);
+            let mut earlier = entry.evidence.source.clone();
+            earlier.proof.as_mut().unwrap().host_incarnation = "earlier".into();
+            entry.aliases.push(earlier.clone());
+            let mut early_unconfirmed = earlier.clone();
+            early_unconfirmed.launch.session_id = None;
+            entry.evidence.previous_sources.push(ChatSource {
+                source: early_unconfirmed.clone(),
+                launch: earlier.launch.clone(),
+            });
+            store.record_recovered(&[entry.clone()]).unwrap();
+            let evidence = store.recovered_chats().unwrap();
+            let serving = entry.replacement.proof.as_ref().unwrap();
+            assert!(evidence.proves(&earlier, &entry.replacement, serving));
+            assert!(evidence.proves(&early_unconfirmed, &entry.replacement, serving));
+            let path = store.path.with_file_name(RECOVERED_FILE);
+            for (version, conversations) in [
+                (1, vec![entry.clone(), entry.clone()]),
+                (2, vec![entry.clone()]),
+            ] {
+                let bytes = serde_json::to_vec(&UnattachedReport {
+                    version,
+                    conversations,
+                })
+                .unwrap();
+                std::fs::write(&path, &bytes).unwrap();
+                assert!(store.recovered_chats().is_err());
+                assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            }
+            std::fs::write(&path, b"malformed").unwrap();
+            assert!(store.recovered_chats().is_err());
+            assert_eq!(std::fs::read(path).unwrap(), b"malformed");
         }
 
         #[test]
@@ -2569,6 +2979,61 @@ mod tests {
             Vec::new(),
             Vec::new(),
         )
+    }
+
+    #[test]
+    fn full_checkpoint_byte_validation_requires_recipes_options_and_valid_ownership() {
+        let directory = tempfile::tempdir().unwrap();
+        let checkpoint = checkpoint(directory.path());
+        let mut full = serde_json::to_value(&checkpoint).unwrap();
+        full["version"] = serde_json::json!(5);
+        let validate = |value: &serde_json::Value| {
+            handoff::validate_checkpoint_bytes(&serde_json::to_vec(value).unwrap())
+        };
+        validate(&full).unwrap();
+        for field in ["recipe", "options"] {
+            let mut incomplete = full.clone();
+            incomplete["terminals"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert!(
+                validate(&incomplete).is_err(),
+                "missing {field} must refuse a receipt"
+            );
+        }
+        let mut carried = full.clone();
+        carried["terminals"] = serde_json::json!([]);
+        carried["carried"] = serde_json::json!([{
+            "source": full["terminals"][0]["source"],
+            "options": full["terminals"][0]["options"],
+        }]);
+        validate(&carried).unwrap();
+        carried["carried"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("options");
+        assert!(validate(&carried).is_err());
+        let mut foreign = full.clone();
+        foreign["proof"]["host_incarnation"] = serde_json::json!("foreign");
+        assert!(validate(&foreign).is_err());
+        let mut future = full.clone();
+        future["version"] = serde_json::json!(6);
+        assert!(validate(&future).is_err());
+        let mut unsafe_recipe = full;
+        unsafe_recipe["terminals"][0]["recipe"]["arguments"] = serde_json::json!(["-c", "replay"]);
+        assert!(validate(&unsafe_recipe).is_err());
+    }
+
+    #[test]
+    fn full_checkpoint_byte_validation_rejects_status_only_payload_and_byte_overflow() {
+        let status = br#"{"version":5,"proof":{"host_session_id":"host","boot_id":"boot","host_incarnation":"daemon"},"phase":"Prepared","payload":{"unknown":"read only"}}"#;
+        assert!(handoff::validate_checkpoint_bytes(status).is_err());
+        assert!(
+            handoff::validate_checkpoint_bytes(&vec![b' '; 8 * 1024 * 1024 + 1])
+                .unwrap_err()
+                .contains("8 MiB")
+        );
     }
 
     #[test]
@@ -4003,6 +4468,44 @@ mod tests {
         assert_eq!(
             store.load().unwrap().unwrap().terminals[0].source.id,
             second.terminals[0].source.id
+        );
+    }
+}
+
+#[cfg(test)]
+mod floor_archive_tests {
+    use super::handoff::Store;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn floor_archives_stale_bytes_without_replaying_or_replacing_prior_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        assert!(store.archive_floor().unwrap().is_none());
+        let write_checkpoint = |bytes: &[u8]| {
+            std::fs::write(&store.path, bytes).unwrap();
+            std::fs::set_permissions(&store.path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        };
+        // Even an unreadable historical payload must be kept as evidence,
+        // rather than deserialized by the destination's boot path.
+        write_checkpoint(b"historical checkpoint bytes");
+        let first = store.archive_floor().unwrap().unwrap();
+        assert!(!store.path.exists());
+        assert_eq!(
+            std::fs::read(&first).unwrap(),
+            b"historical checkpoint bytes"
+        );
+        write_checkpoint(b"another refused checkpoint");
+        let second = store.archive_floor().unwrap().unwrap();
+        assert_ne!(first, second);
+        assert!(!store.path.exists());
+        assert_eq!(
+            std::fs::read(first).unwrap(),
+            b"historical checkpoint bytes"
+        );
+        assert_eq!(
+            std::fs::read(second).unwrap(),
+            b"another refused checkpoint"
         );
     }
 }

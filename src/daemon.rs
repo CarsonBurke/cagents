@@ -4,6 +4,7 @@ pub(crate) mod adopted_orphans;
 pub(crate) mod child_reaper;
 pub(crate) mod holder_registry;
 pub(crate) mod hosting;
+pub(crate) mod lease_handoff;
 #[cfg(feature = "host")]
 pub(crate) mod lost_processes;
 #[cfg(feature = "host")]
@@ -341,6 +342,8 @@ impl Drop for RecoveryLease {
 pub(crate) struct HostLease {
     socket_path: PathBuf,
     lock: File,
+    shared_handoff: bool,
+    _store_maintenance: Option<crate::instance::OwnedLock>,
 }
 
 impl HostLease {
@@ -349,19 +352,41 @@ impl HostLease {
         paths: &RuntimePaths,
         proof: &HostSessionProof,
     ) -> Result<Self, PlatformError> {
-        prepare_runtime_directory(&paths.directory)?;
+        Self::acquire_with_handoff(paths, proof, None)
+    }
 
-        let mut lock = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            // Do not erase a live daemon's metadata before the lock is acquired.
-            // `write_lock_metadata` truncates after exclusive ownership is proven.
-            .truncate(false)
-            .mode(PRIVATE_FILE_MODE)
-            .custom_flags(LOCK_OPEN_FLAGS)
-            .open(&paths.lock)?;
+    #[cfg(feature = "host")]
+    pub(crate) fn acquire_with_handoff(
+        paths: &RuntimePaths,
+        proof: &HostSessionProof,
+        inherited: Option<File>,
+    ) -> Result<Self, PlatformError> {
+        prepare_runtime_directory(&paths.directory)?;
+        // Sharing the inventory description must not let startup publish its
+        // PID while the updater is reading or converting the stopped store.
+        let _maintenance = store_maintenance_guard(paths)?;
+        let shared_handoff = inherited.is_some();
+        let mut lock = if let Some(lock) = inherited {
+            lease_handoff::validate_inherited(&lock, paths)?;
+            lock
+        } else {
+            OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                // Do not erase a live daemon's metadata before the lock is acquired.
+                // `write_lock_metadata` truncates after exclusive ownership is proven.
+                .truncate(false)
+                .mode(PRIVATE_FILE_MODE)
+                .custom_flags(LOCK_OPEN_FLAGS)
+                .open(&paths.lock)?
+        };
         validate_lock_file(&paths.lock, &lock.metadata()?, current_uid())?;
+        // Adoption must not let the inventory lease escape into providers or
+        // terminals even when a caller supplies a descriptor without CLOEXEC.
+        if unsafe { libc::fcntl(lock.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+            return Err(io::Error::last_os_error().into());
+        }
         lock.set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
         // SAFETY: flock receives a live file descriptor and no pointer data.
         if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
@@ -375,6 +400,8 @@ impl HostLease {
         Ok(Self {
             socket_path: paths.socket.clone(),
             lock,
+            shared_handoff,
+            _store_maintenance: None,
         })
     }
 
@@ -435,6 +462,8 @@ impl HostLease {
         Ok(Self {
             socket_path: paths.socket.clone(),
             lock,
+            shared_handoff: false,
+            _store_maintenance: None,
         })
     }
 }
@@ -447,8 +476,27 @@ impl HostLease {
     /// a status check still sees no daemon.
     pub(crate) fn acquire_for_store_maintenance(
         paths: &RuntimePaths,
+        inherited: Option<File>,
     ) -> Result<Self, PlatformError> {
         prepare_runtime_directory(&paths.directory)?;
+        let maintenance = store_maintenance_guard(paths)?;
+        if let Some(mut lock) = inherited {
+            lease_handoff::validate_inherited(&lock, paths)?;
+            lock.seek(SeekFrom::Start(0))?;
+            let stored: StoredLockMetadata = serde_json::from_reader(&mut lock)?;
+            if !recorded_daemon_exited(stored.pid)? {
+                return Err(PlatformError::AlreadyRunning {
+                    path: paths.socket.clone(),
+                });
+            }
+            recover_stale_socket(&paths.socket)?;
+            return Ok(Self {
+                socket_path: paths.socket.clone(),
+                lock,
+                shared_handoff: true,
+                _store_maintenance: Some(maintenance),
+            });
+        }
         // flock belongs to an open file description, so closing this one
         // cannot release a lock another holds.
         drop(
@@ -460,8 +508,68 @@ impl HostLease {
                 .custom_flags(LOCK_OPEN_FLAGS)
                 .open(&paths.lock)?,
         );
-        Self::acquire_for_maintenance(paths)
+        let mut lease = Self::acquire_for_maintenance(paths)?;
+        lease._store_maintenance = Some(maintenance);
+        Ok(lease)
     }
+}
+
+/// Independent open descriptions serialize store work with inherited lease
+/// adoption. Startup holds this only until its live PID has been published;
+/// maintenance holds it until the store operation has finished.
+#[cfg(feature = "host")]
+fn store_maintenance_guard(
+    paths: &RuntimePaths,
+) -> Result<crate::instance::OwnedLock, PlatformError> {
+    let path = paths.directory.join("cagentsd.store-maintenance.lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .mode(PRIVATE_FILE_MODE)
+        .custom_flags(LOCK_OPEN_FLAGS | libc::O_CLOEXEC)
+        .open(&path)?;
+    validate_lock_file(&path, &lock.metadata()?, current_uid())?;
+    crate::instance::owned_file_lock(lock, libc::LOCK_EX | libc::LOCK_NB).map_err(|error| {
+        if error.kind() == io::ErrorKind::WouldBlock {
+            PlatformError::AlreadyRunning {
+                path: paths.socket.clone(),
+            }
+        } else {
+            error.into()
+        }
+    })
+}
+
+#[cfg(feature = "host")]
+fn recorded_daemon_exited(pid: u32) -> io::Result<bool> {
+    let pid = i32::try_from(pid)
+        .ok()
+        .filter(|pid| *pid > 1)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid daemon PID"))?;
+    // SAFETY: pidfd_open pins the recorded process before checking exit.
+    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if descriptor < 0 {
+        let error = io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(true)
+        } else {
+            Err(error)
+        };
+    }
+    // SAFETY: pidfd_open returned a new descriptor owned exactly once here.
+    let process = unsafe { File::from_raw_fd(descriptor as c_int) };
+    let mut poll = libc::pollfd {
+        fd: process.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: poll points to one initialized pollfd for the live pidfd.
+    if unsafe { libc::poll(&mut poll, 1, 0) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(poll.revents & libc::POLLIN != 0)
 }
 
 impl Drop for HostLease {
@@ -471,8 +579,12 @@ impl Drop for HostLease {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(_) => {}
         }
+        // An adopted description is also the worker's failure reservation;
+        // only closing our copy preserves it until failure has been recorded.
         // SAFETY: the file descriptor remains live for the duration of Drop.
-        let _ = unsafe { libc::flock(self.lock.as_raw_fd(), libc::LOCK_UN) };
+        if !self.shared_handoff {
+            let _ = unsafe { libc::flock(self.lock.as_raw_fd(), libc::LOCK_UN) };
+        }
     }
 }
 
@@ -504,10 +616,94 @@ struct StoredLockMetadata {
     pid: u32,
 }
 
+/// Distinguish a live daemon process from an updater's retained reservation.
+/// A successful handshake establishes serving readiness separately; a live
+/// process still holding the recorded descriptor can be starting or stopping.
+pub(crate) fn daemon_process_alive_at(paths: &RuntimePaths) -> Result<bool, PlatformError> {
+    if !HostLease::is_held(paths)? {
+        return Ok(false);
+    }
+    let lock = match OpenOptions::new()
+        .read(true)
+        .custom_flags(LOCK_OPEN_FLAGS | libc::O_CLOEXEC)
+        .open(&paths.lock)
+    {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    validate_lock_file(&paths.lock, &lock.metadata()?, current_uid())?;
+    let stored: StoredLockMetadata = serde_json::from_reader(&lock)?;
+    let pid = i32::try_from(stored.pid)
+        .ok()
+        .filter(|pid| *pid > 1)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid daemon PID"))?;
+    // Pin and check exit before inspecting descriptors: an exited zombie has
+    // no descriptors even though its /proc directory and pidfd still exist.
+    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if descriptor < 0 {
+        let error = io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(false)
+        } else {
+            Err(error.into())
+        };
+    }
+    // SAFETY: successful pidfd_open returned a fresh descriptor owned here.
+    let process = unsafe { File::from_raw_fd(descriptor as c_int) };
+    let exited = || -> io::Result<bool> {
+        let mut poll = libc::pollfd {
+            fd: process.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one initialized pollfd referring to the pinned process.
+        if unsafe { libc::poll(&mut poll, 1, 0) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(poll.revents != 0)
+    };
+    if exited()? {
+        return Ok(false);
+    }
+    let process_path = Path::new("/proc").join(stored.pid.to_string());
+    let ownership = (|| -> io::Result<bool> {
+        validate_owner(
+            &process_path,
+            &fs::symlink_metadata(&process_path)?,
+            current_uid(),
+        )
+        .map_err(io::Error::other)?;
+        let expected = lock.metadata()?;
+        for entry in fs::read_dir(process_path.join("fd"))? {
+            let entry = entry?;
+            let actual = match fs::metadata(entry.path()) {
+                Ok(actual) => actual,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            if actual.dev() == expected.dev() && actual.ino() == expected.ino() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    })();
+    // A process can finish while its descriptor ownership is being inspected.
+    if exited()? {
+        return Ok(false);
+    }
+    ownership.map_err(Into::into)
+}
+
 /// Locate the executable of this instance's live, kernel-verified lock owner.
 /// Update coordination uses its sibling CLI to speak the owner's own protocol.
 pub(crate) fn running_executable() -> Result<Option<PathBuf>, PlatformError> {
-    let paths = RuntimePaths::discover()?;
+    running_executable_at(&RuntimePaths::discover()?)
+}
+
+pub(crate) fn running_executable_at(
+    paths: &RuntimePaths,
+) -> Result<Option<PathBuf>, PlatformError> {
     let mut lock = match OpenOptions::new()
         .read(true)
         .custom_flags(LOCK_OPEN_FLAGS)
@@ -517,7 +713,7 @@ pub(crate) fn running_executable() -> Result<Option<PathBuf>, PlatformError> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    let Some(_pidfd) = daemon_pidfd_from_lock(&mut lock, &paths)? else {
+    let Some(_pidfd) = daemon_pidfd_from_lock(&mut lock, paths)? else {
         return Ok(None);
     };
     lock.seek(SeekFrom::Start(0))?;
@@ -1051,6 +1247,38 @@ pub(crate) fn shut_down_test_listener(listener: std::os::unix::net::UnixListener
     );
 }
 
+/// LeaseHandoff deliberately closes without LOCK_UN because a successor
+/// can share its description. An unrelated test's concurrent fork can
+/// retain even a CLOEXEC copy until exec; create the tested descriptors
+/// only inside a coordinator with no other tests running beside it.
+#[cfg(test)]
+pub(crate) fn isolated_handoff_coordinator() -> bool {
+    use std::os::unix::process::CommandExt;
+    use std::process::Command;
+
+    const COORDINATOR: &str = "CAGENTS_TEST_HANDOFF_COORDINATOR";
+    if env::var_os(COORDINATOR).is_some() {
+        return true;
+    }
+    let test = std::thread::current().name().unwrap().to_owned();
+    let mut command = Command::new(env::current_exe().unwrap());
+    command
+        .args(["--exact", &test, "--nocapture", "--test-threads=1"])
+        .env(COORDINATOR, "1");
+    // SAFETY: only descriptor syscalls after fork. The coordinator creates
+    // its own lease after exec and needs no inherited fixture descriptors.
+    unsafe { command.pre_exec(seal_inherited_descriptors) };
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+    false
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "host")]
@@ -1071,6 +1299,44 @@ mod tests {
         let expected = unsafe { libc::geteuid() };
         assert_eq!(peer_uid(&client).unwrap(), expected);
         assert_eq!(peer_uid(&server).unwrap(), expected);
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn lease_handoff_reservation_is_not_a_live_daemon_process() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = RuntimePaths {
+            directory: root.path().to_owned(),
+            socket: root.path().join("cagentsd.sock"),
+            lock: root.path().join("cagentsd.lock"),
+        };
+        let mut child = std::process::Command::new("/bin/true").spawn().unwrap();
+        let pid = child.id();
+        let lock = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(&paths.lock)
+            .unwrap();
+        fs::write(&paths.lock, format!("{{\"pid\":{pid}}}")).unwrap();
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+        // Wait for exit without reaping to exercise the zombie case too.
+        let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        assert!(descriptor >= 0);
+        let process = unsafe { File::from_raw_fd(descriptor as c_int) };
+        let mut poll = libc::pollfd {
+            fd: process.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut poll, 1, 5000) }, 1);
+        assert!(HostLease::is_held(&paths).unwrap());
+        assert!(!daemon_process_alive_at(&paths).unwrap());
+        assert!(child.wait().unwrap().success());
+        assert!(!daemon_process_alive_at(&paths).unwrap());
     }
 
     #[cfg(feature = "host")]
@@ -1891,5 +2157,303 @@ while True: time.sleep(1)
             .is_err()
         );
         assert_eq!(fs::read(&target).unwrap(), b"untouched");
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn store_maintenance_preserves_handoff_and_excludes_adoption() {
+        if !isolated_handoff_coordinator() {
+            return;
+        }
+        let root = tempdir().unwrap();
+        let paths = paths(root.path().join("runtime"));
+        let mut ended = std::process::Command::new("/bin/true").spawn().unwrap();
+        let ended_pid = ended.id();
+        ended.wait().unwrap();
+        let mut original = HostLease::acquire(&paths, &proof()).unwrap();
+        let reservation = original.lock.try_clone().unwrap();
+        original.shared_handoff = true;
+        drop(original);
+        fs::write(&paths.lock, format!("{{\"pid\":{ended_pid}}}")).unwrap();
+        let metadata = fs::read(&paths.lock).unwrap();
+
+        let maintenance = HostLease::acquire_for_store_maintenance(
+            &paths,
+            Some(reservation.try_clone().unwrap()),
+        )
+        .unwrap();
+        assert!(matches!(
+            HostLease::acquire_with_handoff(
+                &paths,
+                &proof(),
+                Some(reservation.try_clone().unwrap())
+            ),
+            Err(PlatformError::AlreadyRunning { .. })
+        ));
+        drop(maintenance);
+        assert!(HostLease::is_held(&paths).unwrap());
+        assert_eq!(fs::read(&paths.lock).unwrap(), metadata);
+
+        // Publication precedes the listener: a live successor must refuse
+        // maintenance even when it shares the worker's inventory description.
+        let successor = HostLease::acquire_with_handoff(
+            &paths,
+            &proof(),
+            Some(reservation.try_clone().unwrap()),
+        )
+        .unwrap();
+        assert!(!paths.socket.exists());
+        assert!(matches!(
+            HostLease::acquire_for_store_maintenance(
+                &paths,
+                Some(reservation.try_clone().unwrap())
+            ),
+            Err(PlatformError::AlreadyRunning { .. })
+        ));
+        drop(successor);
+        assert!(HostLease::is_held(&paths).unwrap());
+        fs::write(&paths.lock, b"unreadable").unwrap();
+        assert!(
+            HostLease::acquire_for_store_maintenance(
+                &paths,
+                Some(reservation.try_clone().unwrap())
+            )
+            .is_err()
+        );
+        assert!(HostLease::is_held(&paths).unwrap());
+        drop(reservation);
+        assert!(!HostLease::is_held(&paths).unwrap());
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn handoff_rejects_mismatched_inode_and_unheld_descriptors() {
+        let root = tempdir().unwrap();
+        let expected = paths(root.path().join("expected"));
+        let original = HostLease::acquire(&expected, &proof()).unwrap();
+        drop(original);
+        let unrelated = paths(root.path().join("unrelated"));
+        let unrelated_lease = HostLease::acquire(&unrelated, &proof()).unwrap();
+        let error = HostLease::acquire_with_handoff(
+            &expected,
+            &proof(),
+            Some(unrelated_lease.lock.try_clone().unwrap()),
+        )
+        .err()
+        .expect("a held lease for another inode cannot be adopted");
+        assert!(
+            error.to_string().contains("different lease inode"),
+            "{error}"
+        );
+        let unheld = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&expected.lock)
+            .unwrap();
+        let error = HostLease::acquire_with_handoff(&expected, &proof(), Some(unheld))
+            .err()
+            .expect("an unlocked descriptor is not a handoff");
+        assert!(error.to_string().contains("unheld lease"), "{error}");
+        assert!(HostLease::is_held(&unrelated).unwrap());
+        assert!(!HostLease::is_held(&expected).unwrap());
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn blocking_handoff_excludes_companion_autostart_until_worker_releases() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        if !isolated_handoff_coordinator() {
+            return;
+        }
+        let root = tempdir().unwrap();
+        let paths = paths(root.path().join("runtime"));
+        let original = HostLease::acquire(&paths, &proof()).unwrap();
+        let waiting_paths = paths.clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let waiter = std::thread::spawn(move || {
+            sender
+                .send(lease_handoff::LeaseHandoff::wait(
+                    &waiting_paths,
+                    std::process::id(),
+                ))
+                .unwrap();
+        });
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(30)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(matches!(
+            HostLease::acquire(&paths, &proof()),
+            Err(PlatformError::AlreadyRunning { .. })
+        ));
+        drop(original);
+        let handoff = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        waiter.join().unwrap();
+        // Model an older companion's nonblocking autostart during the interval
+        // after checkpointing and before the successor process is launched.
+        assert!(matches!(
+            HostLease::acquire(&paths, &proof()),
+            Err(PlatformError::AlreadyRunning { .. })
+        ));
+        drop(handoff);
+        let _manual_restart = HostLease::acquire(&paths, &proof()).unwrap();
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn handoff_survives_cli_forwarding_and_successor_exit_without_leaking_to_children() {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+        use std::process::{Child, Command, Stdio};
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        const TEST: &str = "daemon::tests::handoff_survives_cli_forwarding_and_successor_exit_without_leaking_to_children";
+        const MODE: &str = "CAGENTS_TEST_LEASE_HANDOFF_MODE";
+        const EXIT: &str = "CAGENTS_TEST_LEASE_HANDOFF_EXIT";
+        if let Ok(mode) = env::var(MODE) {
+            assert!(lease_handoff::has_inherited_lease().unwrap());
+            if mode == "cli" {
+                let mut command = Command::new(env::current_exe().unwrap());
+                command
+                    .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                    .env(MODE, "daemon")
+                    .stdin(Stdio::inherit());
+                crate::install_guard::sanitize_child_environment(&mut command);
+                // Follow the real CLI spawn order: seal everything, then
+                // explicitly restore only the daemon's inherited authority.
+                unsafe { command.pre_exec(seal_inherited_descriptors) };
+                lease_handoff::inherit_daemon_lease(&mut command).unwrap();
+                let status = command.status().unwrap();
+                std::process::exit(status.code().unwrap_or(99));
+            }
+            assert_eq!(mode, "daemon");
+            // Only this exact test runs in the fixture. No concurrent test or
+            // other fixture thread reads the environment while it is consumed.
+            let inherited = unsafe { lease_handoff::take_inherited_lease() }
+                .unwrap()
+                .unwrap();
+            assert!(env::var_os(lease_handoff::DAEMON_LEASE_ENV).is_none());
+            assert!(!lease_handoff::has_inherited_lease().unwrap());
+            assert_ne!(
+                unsafe { libc::fcntl(inherited.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+                0
+            );
+            let paths = RuntimePaths::discover().unwrap();
+            let successor =
+                HostLease::acquire_with_handoff(&paths, &proof(), Some(inherited)).unwrap();
+            let metadata: StoredLockMetadata =
+                serde_json::from_slice(&fs::read(&paths.lock).unwrap()).unwrap();
+            assert_eq!(metadata.pid, std::process::id());
+            let mut provider = Command::new("/bin/sh");
+            provider
+                .args([
+                    "-c",
+                    "test -z \"${CAGENTS_DAEMON_LEASE_FD+x}\" && test ! -e /proc/self/fd/199 && test ! -e \"/proc/self/fd/$1\"",
+                    "ordinary-child",
+                    &successor.lock.as_raw_fd().to_string(),
+                ])
+                .env(lease_handoff::DAEMON_LEASE_ENV, "199");
+            crate::install_guard::sanitize_child_environment(&mut provider);
+            unsafe { provider.pre_exec(seal_inherited_descriptors) };
+            assert!(provider.status().unwrap().success());
+            println!("lease-adopted-and-child-sealed");
+            io::stdout().flush().unwrap();
+            io::stdin().read_exact(&mut [0_u8]).unwrap();
+            let exit = env::var(EXIT).unwrap().parse().unwrap();
+            if exit != 0 {
+                drop(successor);
+            }
+            // On the serving-success path skip destructors, as a daemon crash
+            // would: the kernel must release its last copy of the descriptor.
+            std::process::exit(exit);
+        }
+        if !isolated_handoff_coordinator() {
+            return;
+        }
+
+        struct FixtureChild(Child);
+        impl Drop for FixtureChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        for exit in [0, 17] {
+            let runtime = tempdir().unwrap();
+            let paths = paths(runtime.path().join(instance::runtime_subdirectory()));
+            let original = HostLease::acquire(&paths, &proof()).unwrap();
+            drop(original);
+            let mut handoff =
+                Some(lease_handoff::LeaseHandoff::wait(&paths, std::process::id()).unwrap());
+            let mut command = Command::new(env::current_exe().unwrap());
+            command
+                .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                .env(MODE, "cli")
+                .env(EXIT, exit.to_string())
+                .env("XDG_RUNTIME_DIR", runtime.path())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit());
+            unsafe { command.pre_exec(seal_inherited_descriptors) };
+            handoff.as_ref().unwrap().inherit(&mut command).unwrap();
+            let mut child = FixtureChild(command.spawn().unwrap());
+            // A Command retains its forwarding hook and therefore a duplicate
+            // of the lease; release it before testing the worker guard's lifetime.
+            drop(command);
+            let stdout = child.0.stdout.take().unwrap();
+            let (sender, receiver) = mpsc::sync_channel(1);
+            let output = std::thread::spawn(move || {
+                for line in io::BufReader::new(stdout).lines() {
+                    if line.unwrap().contains("lease-adopted-and-child-sealed") {
+                        sender.send(()).unwrap();
+                        break;
+                    }
+                }
+            });
+            receiver
+                .recv_timeout(Duration::from_secs(10))
+                .expect("forwarded daemon never adopted the lease");
+            output.join().unwrap();
+            assert!(matches!(
+                HostLease::acquire(&paths, &proof()),
+                Err(PlatformError::AlreadyRunning { .. })
+            ));
+            if exit == 0 {
+                // The serving successor owns the lease independently once the
+                // worker closes its copy, before any client-window reopening.
+                drop(handoff.take());
+                assert!(HostLease::is_held(&paths).unwrap());
+            }
+            child.0.stdin.take().unwrap().write_all(b"x").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let status = loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    break status;
+                }
+                assert!(Instant::now() < deadline, "forwarded daemon did not exit");
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            assert_eq!(status.code(), Some(exit));
+            if exit == 17 {
+                // A failed startup retains the worker's recovery reservation
+                // until the failure is durably recorded and recovery can start.
+                assert!(matches!(
+                    HostLease::acquire(&paths, &proof()),
+                    Err(PlatformError::AlreadyRunning { .. })
+                ));
+            } else {
+                // A crash after readiness must permit another start even
+                // while the updater is still alive reopening its clients.
+                assert!(!HostLease::is_held(&paths).unwrap());
+            }
+            drop(handoff);
+            let _manual_restart = HostLease::acquire(&paths, &proof()).unwrap();
+        }
     }
 }
