@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 """Duplex stream contract for the offline Claude provider; no native app needed."""
 
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -11,7 +12,13 @@ import tempfile
 import time
 import unittest
 
-from chat_composer_provider import SCRIPT, prompt
+# Isolated Python (-I) leaves this directory off sys.path.
+_provider_spec = importlib.util.spec_from_file_location(
+    "chat_composer_provider", Path(__file__).resolve().parent / "chat_composer_provider.py")
+chat_composer_provider = importlib.util.module_from_spec(_provider_spec)
+_provider_spec.loader.exec_module(chat_composer_provider)
+SCRIPT = chat_composer_provider.SCRIPT
+prompt = chat_composer_provider.prompt
 
 
 def control(subtype, request_id=None, **fields):
