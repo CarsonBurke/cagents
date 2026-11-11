@@ -54,8 +54,34 @@ impl CardWorktrees {
 /// reconciliation; card membership and descriptors are projected afresh.
 struct ViewScopeTopology<'a> {
     roots: worktree_ui::WorktreeRoots<'a>,
-    repositories: HashMap<PathBuf, PathBuf>,
-    project_repositories: HashSet<PathBuf>,
+    authorities: ViewScopeAuthorities<'a>,
+}
+
+enum ViewScopeAuthorities<'a> {
+    Borrowed {
+        repositories: HashMap<&'a Path, &'a Path>,
+        projects: HashSet<&'a Path>,
+    },
+    Owned {
+        repositories: HashMap<PathBuf, PathBuf>,
+        projects: HashSet<PathBuf>,
+    },
+}
+
+impl ViewScopeAuthorities<'_> {
+    fn repository_for(&self, path: &Path) -> Option<&Path> {
+        match self {
+            Self::Borrowed { repositories, .. } => repositories.get(path).copied(),
+            Self::Owned { repositories, .. } => repositories.get(path).map(PathBuf::as_path),
+        }
+    }
+
+    fn contains_repository(&self, repository: &Path) -> bool {
+        match self {
+            Self::Borrowed { projects, .. } => projects.contains(repository),
+            Self::Owned { projects, .. } => projects.contains(repository),
+        }
+    }
 }
 
 struct ScopeDiscovery<'a> {
@@ -771,55 +797,90 @@ impl Cagents {
         self.discover_view_scopes().scopes
     }
 
-    /// Every scope this window shows, and the worktree each card outside a
-    /// channel resolves to. A large workspace holds thousands of cards and
-    /// historical worktrees, so each card and path is resolved by lookup
-    /// rather than by comparing it with every root or project worktree.
+    /// Preserve the first matching project's authority, just as
+    /// worktree_view_scope does, including its common Git directory's parent.
+    fn view_repository_paths(&self) -> impl Iterator<Item = (&Path, &Path)> {
+        self.sidebar_model.projects.iter().flat_map(|project| {
+            let repository = project.repository.as_path();
+            project
+                .worktrees
+                .iter()
+                .map(|worktree| worktree.path.as_path())
+                .chain(std::iter::once(repository))
+                .chain(
+                    repository
+                        .file_name()
+                        .is_some_and(|name| name == ".git")
+                        .then(|| repository.parent())
+                        .flatten(),
+                )
+                .map(move |path| (path, repository))
+        })
+    }
+
+    #[cfg(test)]
+    fn record_topology_build(&self) {
+        self.shared_views
+            .topology_build_count
+            .set(self.shared_views.topology_build_count.get() + 1);
+    }
+
+    /// Standalone immutable reads borrow path storage. In particular, repeated
+    /// startup readiness checks must not clone every saved repository path.
+    fn borrowed_view_scope_topology(&self) -> ViewScopeTopology<'_> {
+        #[cfg(test)]
+        self.record_topology_build();
+        let mut repositories = HashMap::new();
+        for (path, repository) in self.view_repository_paths() {
+            repositories.entry(path).or_insert(repository);
+        }
+        ViewScopeTopology {
+            roots: self.indexed_worktree_roots(),
+            authorities: ViewScopeAuthorities::Borrowed {
+                repositories,
+                projects: self
+                    .sidebar_model
+                    .projects
+                    .iter()
+                    .map(|project| project.repository.as_path())
+                    .collect(),
+            },
+        }
+    }
+
+    /// Reconciliation owns just its authority paths while it mutates cards.
+    /// Its root backing is independently owned by the caller, not borrowed
+    /// from mutable window state.
     fn view_scope_topology<'a>(
         &self,
         roots: worktree_ui::WorktreeRoots<'a>,
     ) -> ViewScopeTopology<'a> {
         #[cfg(test)]
-        self.shared_views
-            .topology_build_count
-            .set(self.shared_views.topology_build_count.get() + 1);
-        // Preserve the first matching project's authority, just as
-        // worktree_view_scope does, without searching every worktree per path.
+        self.record_topology_build();
         let mut repositories = HashMap::new();
-        for project in &self.sidebar_model.projects {
-            for path in project
-                .worktrees
-                .iter()
-                .map(|worktree| worktree.path.as_path())
-                .chain(std::iter::once(project.repository.as_path()))
-                .chain(
-                    project
-                        .repository
-                        .file_name()
-                        .is_some_and(|name| name == ".git")
-                        .then(|| project.repository.parent())
-                        .flatten(),
-                )
-            {
-                repositories
-                    .entry(path.to_owned())
-                    .or_insert_with(|| project.repository.clone());
-            }
+        for (path, repository) in self.view_repository_paths() {
+            repositories
+                .entry(path.to_owned())
+                .or_insert_with(|| repository.to_owned());
         }
         ViewScopeTopology {
             roots,
-            repositories,
-            project_repositories: self
-                .sidebar_model
-                .projects
-                .iter()
-                .map(|project| project.repository.clone())
-                .collect(),
+            authorities: ViewScopeAuthorities::Owned {
+                repositories,
+                projects: self
+                    .sidebar_model
+                    .projects
+                    .iter()
+                    .map(|project| project.repository.clone())
+                    .collect(),
+            },
         }
     }
 
+    /// Every scope this window shows, and each unchanneled card's worktree.
+    /// Membership remains fresh when a pass reuses immutable topology.
     fn discover_view_scopes(&self) -> ScopeDiscovery<'_> {
-        let topology = self.view_scope_topology(self.indexed_worktree_roots());
+        let topology = self.borrowed_view_scope_topology();
         self.discover_view_scopes_with(&topology)
     }
 
@@ -855,7 +916,7 @@ impl Cagents {
                 .iter()
                 .filter_map(|view| match &view.scope {
                     Scope::Worktree { repository, .. }
-                        if topology.project_repositories.contains(repository) =>
+                        if topology.authorities.contains_repository(repository) =>
                     {
                         Some(view.scope.clone())
                     }
@@ -869,9 +930,9 @@ impl Cagents {
             .chain(self.active_workspace.as_deref())
             .chain(worktree_cards.iter().map(|(_, path)| *path))
         {
-            if let Some(repository) = topology.repositories.get(path) {
+            if let Some(repository) = topology.authorities.repository_for(path) {
                 scopes.push(Scope::Worktree {
-                    repository: repository.clone(),
+                    repository: repository.to_owned(),
                     path: path.to_owned(),
                 });
             }
@@ -887,7 +948,7 @@ impl Cagents {
     /// The local views that list `card`, as `local_view_cards` would,
     /// without resolving every view's cards to find one.
     fn local_scopes_listing(&self, card: CardId) -> Vec<Scope> {
-        let topology = self.view_scope_topology(self.indexed_worktree_roots());
+        let topology = self.borrowed_view_scope_topology();
         self.local_scopes_listing_with_topology(card, &topology)
     }
 
@@ -1013,7 +1074,7 @@ impl Cagents {
     }
 
     fn local_views_in(&self, selected: Option<&HashSet<Scope>>) -> LocalViews {
-        let topology = self.view_scope_topology(self.indexed_worktree_roots());
+        let topology = self.borrowed_view_scope_topology();
         self.local_views_with_topology(selected, &topology)
     }
 
@@ -1932,7 +1993,7 @@ impl Cagents {
         repository: &Path,
         additional: &HashSet<Scope>,
     ) -> HashSet<Scope> {
-        let topology = self.view_scope_topology(self.indexed_worktree_roots());
+        let topology = self.borrowed_view_scope_topology();
         self.repository_view_scopes_with_topology(repository, additional, &topology)
     }
 
