@@ -228,6 +228,7 @@ jobs:
               ("memory limit", "scripts/memory-capped", "tests/memory_capped.py"),
               ("workload time limit", "scripts/bounded", "tests/bounded.py"),
               ("synthetic Claude provider", "tests/fixtures/chat-composer-claude.sh", "tests/chat_composer_provider.py"),
+              ("synthetic Claude streaming", "tests/fixtures/chat-composer-claude.sh", "tests/chat_composer_streaming.py"),
               ("Codex resume history", "tests/fixtures/codex-resume-history.py", "tests/codex_resume_history.py"),
               ("local install head check", "scripts/install-local", "tests/install_local.py"),
               ("GitHub status bootstrap", "scripts/gh-pr-status", "tests/gh-pr-status.py"),
