@@ -890,8 +890,97 @@ class NativeTerminalAfterRestore(unittest.TestCase):
             probe=scenario.terminal_probe_command({'launch':{'program':program}},'TOKEN','/var/tmp/private/output.txt')
             self.assertEqual(probe['pid_variable'],variable)
             self.assertIn(f'"{variable}"',probe['command'])
+            self.assertNotIn('\n',probe['command'])
         with self.assertRaisesRegex(RuntimeError,'unsupported'):
             scenario.terminal_probe_command({'launch':{'program':'/usr/bin/unknown-shell'}},'TOKEN','/var/tmp/private/output.txt')
+
+    def test_native_probe_submits_the_same_command_with_a_separate_return(self):
+        scenario=self.module()
+        with tempfile.TemporaryDirectory(prefix='ru-input-') as temporary:
+            root=Path(temporary)
+            rehearsal=scenario.Rehearsal(root,str(SCRIPT))
+            receipt=root/'typed-output.txt'
+            probe=scenario.terminal_probe_command({'launch':{'program':'/bin/fish'}},'TOKEN',receipt)
+            evidence={'events':[]}
+            saved=[]
+            actions=[]
+            def call(*args,**kwargs):
+                if args[0]=='drive':
+                    actions.append(args)
+                    self.assertEqual(saved[-1]['typed_command'],probe['command'])
+                    if args==('drive','key','Return'):
+                        receipt.write_text('TOKEN pid=123\n')
+                return 0,''
+            with patch.object(rehearsal,'call',side_effect=call), \
+                    patch.object(rehearsal,'cli',return_value=(0,{'data':{}})), \
+                    patch.object(rehearsal,'private_processes',return_value={'processes':[]}):
+                result=rehearsal.type_terminal_probe({'terminal_id':'issued'},probe,'TOKEN',receipt,
+                    evidence,lambda:saved.append(copy.deepcopy(evidence)))
+            self.assertEqual(actions,[('drive','type',probe['command']),('drive','key','Return')])
+            self.assertEqual(result,('TOKEN pid=123',123))
+            self.assertIn('before-type',saved[-1])
+            self.assertEqual([event['event'] for event in evidence['events']],
+                ['native_terminal_text_requested','native_terminal_text_completed',
+                 'native_terminal_return_requested','native_terminal_return_completed'])
+
+    def test_input_process_diagnostics_discard_fields_if_pid_is_reused(self):
+        scenario=self.module()
+        original='123 (fish) '+' '.join(['0']*19+['456'])
+        reused='123 (other) '+' '.join(['0']*19+['789'])
+        process={'pid':123,'start_ticks':456}
+        with patch.object(Path,'read_text',side_effect=[original,'wait_woken','read',original]):
+            self.assertEqual(scenario.terminal_process_input_state(process),
+                {'state':'same_process','wchan':'wait_woken','syscall':'read'})
+        with patch.object(Path,'read_text',side_effect=[original,'unrelated_wait','other_syscall',reused]):
+            self.assertEqual(scenario.terminal_process_input_state(process),{'state':'ended_or_reused'})
+        with patch.object(Path,'read_text',side_effect=FileNotFoundError('exited')):
+            self.assertEqual(scenario.terminal_process_input_state(process)['state'],'unavailable')
+
+    def test_native_probe_failure_preserves_command_and_exact_terminal_evidence(self):
+        scenario=self.module()
+        with tempfile.TemporaryDirectory(prefix='ru-input-failure-') as temporary:
+            root=Path(temporary)
+            rehearsal=scenario.Rehearsal(root,str(SCRIPT))
+            receipt=root/'typed-output.txt'
+            probe=scenario.terminal_probe_command({'launch':{'program':'/bin/fish'}},'TOKEN',receipt)
+            evidence={'events':[]}
+            saved=[]
+            def call(*args,**kwargs):
+                if args==('drive','key','Return'):
+                    raise RuntimeError('native Return failed')
+                return 0,''
+            with patch.object(rehearsal,'call',side_effect=call), \
+                    patch.object(rehearsal,'cli',return_value=(0,{'exact_terminal':'issued'})) as cli, \
+                    patch.object(rehearsal,'private_processes',return_value={'processes':[]}):
+                with self.assertRaisesRegex(RuntimeError,'native Return failed'):
+                    rehearsal.type_terminal_probe({'terminal_id':'issued'},probe,'TOKEN',receipt,
+                        evidence,lambda:saved.append(copy.deepcopy(evidence)))
+            failure=saved[-1]
+            self.assertEqual(failure['typed_command'],probe['command'])
+            self.assertIn('native Return failed',failure['input_failure'])
+            self.assertEqual(failure['input-failed']['show']['value'],{'exact_terminal':'issued'})
+            self.assertFalse(failure['input-failed']['receipt_exists'])
+            cli.assert_any_call('--no-start','terminal','snapshot','issued',check=False)
+            cli.assert_any_call('--no-start','terminal','show','issued',check=False)
+
+    def test_successful_native_input_without_shell_output_still_fails_with_evidence(self):
+        scenario=self.module()
+        with tempfile.TemporaryDirectory(prefix='ru-input-no-output-') as temporary:
+            root=Path(temporary)
+            rehearsal=scenario.Rehearsal(root,str(SCRIPT))
+            receipt=root/'typed-output.txt'
+            probe=scenario.terminal_probe_command({'launch':{'program':'/bin/fish'}},'TOKEN',receipt)
+            evidence={'events':[]}
+            saved=[]
+            with patch.object(rehearsal,'call',return_value=(0,'')), \
+                    patch.object(rehearsal,'cli',return_value=(0,{'data':{}})), \
+                    patch.object(rehearsal,'private_processes',return_value={'processes':[]}), \
+                    patch.object(scenario.time,'monotonic',side_effect=[0,1,2,3,4,20]):
+                with self.assertRaisesRegex(RuntimeError,'did not execute'):
+                    rehearsal.type_terminal_probe({'terminal_id':'issued'},probe,'TOKEN',receipt,
+                        evidence,lambda:saved.append(copy.deepcopy(evidence)))
+            self.assertFalse(saved[-1]['input-failed']['receipt_exists'])
+            self.assertIn('did not execute',saved[-1]['input_failure'])
 
     def test_terminal_card_is_bound_through_normalized_recipe_and_live_proof(self):
         scenario=self.module()

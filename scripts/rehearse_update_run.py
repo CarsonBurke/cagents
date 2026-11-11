@@ -227,7 +227,27 @@ def terminal_probe_command(session, token, receipt):
     else:
         raise RuntimeError(f'the issued terminal shell is unsupported by the output probe: {shell}')
     return {'program':session['launch']['program'],'pid_variable':variable,
-            'command':f"umask 077; printf '{token} pid=%s\\n' \"{variable}\" | tee {shlex.quote(str(receipt))}\n"}
+            'command':f"umask 077; printf '{token} pid=%s\\n' \"{variable}\" | tee {shlex.quote(str(receipt))}"}
+
+
+def terminal_process_input_state(process, proc=Path('/proc')):
+    path=proc/str(process['pid'])
+    def start_ticks():
+        return int((path/'stat').read_text().rsplit(')',1)[1].split()[19])
+    try:
+        if start_ticks()!=process['start_ticks']:
+            return {'state':'ended_or_reused'}
+        captured={}
+        for field in ('wchan','syscall'):
+            try:
+                captured[field]=(path/field).read_text().strip()
+            except OSError as error:
+                captured[field]=str(error)
+        if start_ticks()!=process['start_ticks']:
+            return {'state':'ended_or_reused'}
+        return {'state':'same_process',**captured}
+    except (OSError,ValueError,IndexError) as error:
+        return {'state':'unavailable','error':str(error)}
 
 
 def terminal_live_proof(continuity):
@@ -683,6 +703,62 @@ class Rehearsal:
                            'private-processes',self.root,*flags)
         return json.loads(output)
 
+    def type_terminal_probe(self, selected, probe, token, receipt, evidence, save):
+        """Submit native text and Return separately; retain evidence before cleanup."""
+        evidence.update(token=token,shell_probe=probe,typed_command=probe['command'])
+        save()
+        def capture(name):
+            captured={}
+            for noun,args in [('snapshot',('terminal','snapshot',selected['terminal_id'])),
+                              ('show',('terminal','show',selected['terminal_id'])),
+                              ('status',('daemon','status'))]:
+                try:
+                    code,value=self.cli('--no-start',*args,check=False)
+                    captured[noun]={'exit':code,'value':value}
+                except Exception as error:
+                    captured[noun]={'error':repr(error)}
+            try:
+                captured['processes']=self.private_processes(after_intentional_stop=True)
+                for process in captured['processes']['processes']:
+                    process['input_state']=terminal_process_input_state(process)
+            except Exception as error:
+                captured['processes']={'error':repr(error)}
+            captured['receipt_path']=str(receipt)
+            try:
+                captured['receipt_exists']=receipt.exists()
+                if captured['receipt_exists']:
+                    captured['receipt']=receipt.read_text()
+            except OSError as error:
+                captured['receipt_error']=str(error)
+            try:
+                code,output=self.call('shot','new-terminal-'+name,timeout=45,check=False)
+                captured['screenshot']={'exit':code,'output':output}
+            except Exception as error:
+                captured['screenshot']={'error':repr(error)}
+            evidence[name]=captured
+            save()
+        capture('before-type')
+        try:
+            for action,value,event in [('type',probe['command'],'native_terminal_text'),
+                                       ('key','Return','native_terminal_return')]:
+                evidence['events'].append({'event':event+'_requested','monotonic':time.monotonic()})
+                save()
+                self.call('drive',action,value,timeout=30)
+                evidence['events'].append({'event':event+'_completed','monotonic':time.monotonic()})
+                save()
+            deadline=time.monotonic()+15
+            while time.monotonic()<deadline:
+                line=receipt.read_text().strip() if receipt.exists() else ''
+                match=re.fullmatch(re.escape(token)+r' pid=([1-9][0-9]*)',line)
+                if match:
+                    return line,int(match[1])
+                time.sleep(.1)
+            raise RuntimeError('typing into the new native terminal did not execute the shell command')
+        except Exception as error:
+            evidence['input_failure']=repr(error)
+            capture('input-failed')
+            raise
+
     def new_terminal_after_restore(self, version, expect_failure=False):
         """Exercise a normal native action after the completed restore boundary."""
         destination=self.root/'new-terminal-after-restore'
@@ -821,21 +897,8 @@ class Rehearsal:
         token='REHEARSAL_TERMINAL_'+uuid.uuid4().hex
         receipt=destination/'typed-output.txt'
         probe=terminal_probe_command(shown['data']['terminal']['session'],token,receipt)
-        command=probe['command']
-        evidence['token']=token
-        evidence['shell_probe']=probe
-        evidence['typed_command']=command
-        self.call('drive','type',command,timeout=30)
-        deadline=time.monotonic()+15
-        while time.monotonic()<deadline:
-            line=receipt.read_text().strip() if receipt.exists() else ''
-            match=re.fullmatch(re.escape(token)+r' pid=([1-9][0-9]*)',line)
-            if match:
-                break
-            time.sleep(.1)
-        else:
-            raise RuntimeError('typing into the new native terminal did not execute the shell command')
-        evidence.update(output_line=line,shell_pid=int(match[1]))
+        line,shell_pid=self.type_terminal_probe(selected,probe,token,receipt,evidence,save)
+        evidence.update(output_line=line,shell_pid=shell_pid)
         _, evidence['terminal_snapshot']=self.cli('--no-start','terminal','snapshot',selected['terminal_id'])
         _, evidence['after_status']=self.cli('--no-start','daemon','status')
         evidence['after_processes']=self.private_processes(after_intentional_stop=True)
