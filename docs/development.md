@@ -1770,6 +1770,10 @@ harness, it provides:
   (override with `CAGENTS_EVIDENCE_NATIVE_LOCK`). Stop as soon as you have the
   evidence. A session gives the lock up after `--limit` seconds even if its
   owner has gone. `build` uses `/var/tmp/cagents-fw16-cargo.lock` the same way.
+- **Startup deadline.** `start SIDE --startup-timeout 900` allows a large seed
+  up to 900 seconds to show its app window. The default is 180 seconds; use a
+  whole number from 1 to 3600. Readiness still requires the mapped window.
+  This deadline does not extend the independent `--limit` session lifetime.
 - **File choosers.** `start SIDE --portal gtk` runs xdg-desktop-portal with
   the GTK backend on the session's private bus, so the app's Attach dialog
   opens inside the session, where `drive` can operate it: `drive key ctrl+l`,
