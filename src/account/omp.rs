@@ -197,6 +197,7 @@ fn snapshot(reading: &[&Row], observed_at: u64) -> UsageSnapshot {
     });
     UsageSnapshot {
         status: status_for(&windows, limited, warning),
+        resets: Vec::new(),
         ordinary_usage_allowed: None,
         windows,
         credits: None,

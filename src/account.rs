@@ -1,15 +1,15 @@
 //! Provider accounts and the usage limits each one is working against.
 //!
 //! An account is a provider plus the home directory its CLI keeps its login
-//! in. Everything cagents knows about one comes from that CLI: its identity
+//! in. Ordinary account metadata comes from that CLI: its identity
 //! from `claude auth status` or Codex's `account/read`, and its limits from
 //! Claude's `get_usage` control request or Codex's `account/rateLimits/read`.
 //! Omp keeps several logins of its own and picks between them itself; its
 //! accounts, and their limits, come from the usage record it keeps.
-//! cagents never opens a credential file and never talks to a provider's
-//! service itself - a subscription login belongs to the provider's own client,
-//! and the account model below holds only the non-secret metadata those
-//! clients chose to report.
+//! The reset transport is a narrow exception for Claude's private reset API:
+//! it reads the stored subscription bearer in memory and never copies or
+//! refreshes it. Login remains owned by the provider CLI. The account model
+//! contains only non-secret metadata.
 //!
 //! The model is shared by every lane. The parsers are pure functions over the
 //! JSON a CLI printed, so they are fixture-tested here. A running native chat
@@ -37,6 +37,8 @@ pub mod info;
 pub mod login;
 pub mod omp;
 pub mod preferences;
+pub mod resets;
+pub use resets::{ResetKind, ResetScope, UsageReset};
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod probe;
 #[cfg(any(feature = "ui", feature = "host"))]
@@ -1038,6 +1040,8 @@ pub enum UsageSource {
 /// Everything known about an account's limits at one moment.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UsageSnapshot {
+    #[serde(default)]
+    pub resets: Vec<UsageReset>,
     pub windows: Vec<UsageWindow>,
     pub credits: Option<Credits>,
     pub status: UsageStatus,
@@ -1063,6 +1067,7 @@ impl UsageSnapshot {
     pub fn state(status: UsageStatus, detail: impl Into<String>, observed_at: u64) -> Self {
         Self {
             windows: Vec::new(),
+            resets: Vec::new(),
             credits: None,
             status,
             ordinary_usage_allowed: None,
@@ -1509,6 +1514,7 @@ mod tests {
 
     fn snapshot(windows: Vec<UsageWindow>) -> UsageSnapshot {
         UsageSnapshot {
+            resets: Vec::new(),
             windows,
             credits: None,
             status: UsageStatus::Ok,
@@ -2164,6 +2170,7 @@ mod tests {
             })
         };
         let reading = |observed_at| UsageSnapshot {
+            resets: Vec::new(),
             windows: vec![window("five_hour", WindowKind::Session, 0.1, None)],
             credits: None,
             status: UsageStatus::Ok,
@@ -2204,11 +2211,9 @@ mod tests {
     }
 }
 
-/// The policy boundary this module is built on, held as a test: no source
-/// file may name a provider's credential store or token fields, or a
-/// provider's service endpoints. A subscription login belongs to the
-/// provider's own client; cagents learns about an account only by asking
-/// that client.
+/// Provider credentials and service endpoints stay inside the explicit
+/// Claude reset transport exception. Ordinary account metadata and all
+/// other provider operations continue to use the provider's own client.
 #[cfg(test)]
 mod credential_guard {
     //! A tripwire, not a proof: a determined change can spell a needle so it
@@ -2319,6 +2324,11 @@ mod credential_guard {
         let forbidden = forbidden();
         let mut violations = Vec::new();
         for file in files {
+            // Explicitly authorized private Claude reset adapter. Keep all
+            // credential discovery and provider HTTP in this one boundary.
+            if file.ends_with("src/account/probe/reset_transport.rs") {
+                continue;
+            }
             // This documented Codex setting selects storage; naming it does
             // not access Omp's similarly named credential table.
             let mut text = std::fs::read_to_string(&file)

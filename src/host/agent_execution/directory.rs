@@ -681,6 +681,7 @@ mod tests {
     ) -> SessionAccount {
         use crate::account::{UsageSnapshot, UsageSource, UsageWindow, info::RemainingWindow};
         let usage = UsageSnapshot {
+            resets: Vec::new(),
             windows: windows
                 .iter()
                 .map(|(label, kind, used, resets_at)| UsageWindow {

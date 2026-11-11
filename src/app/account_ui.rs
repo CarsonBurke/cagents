@@ -46,6 +46,7 @@ use crate::account::{
 };
 use crate::agent::Provider;
 
+pub(super) mod resets;
 mod table;
 
 fn remote_lifecycle<T: serde::de::DeserializeOwned>(
@@ -221,6 +222,13 @@ impl State {
     #[cfg(test)]
     pub(super) fn pending_probe_for_test(&self, id: &AccountId) -> Option<ProbeTicket> {
         self.account(id)?.pending_probe.clone()
+    }
+
+    #[cfg(test)]
+    pub(super) fn pending_probe_is_forced_for_test(&self, id: &AccountId) -> bool {
+        self.account(id)
+            .and_then(|state| state.pending_probe.as_ref())
+            .is_some_and(|ticket| ticket.force)
     }
 
     /// A pending explicit sign-in can finish without admitting unknown default
@@ -659,6 +667,7 @@ impl State {
                 let mut snapshot = entry.snapshot;
                 snapshot.source = UsageSource::Cache;
                 state.schedule.observe(snapshot.observed_at);
+                state.inventory_observed_at = Some(snapshot.observed_at);
                 state.identity = entry.identity;
                 state.snapshot = Some(snapshot);
             }
@@ -866,15 +875,23 @@ impl LoginConflict {
 /// allocation stays alive in every delayed or duplicate callback, so a later
 /// admission cannot reissue its identity. This never crosses a wire or cache.
 #[derive(Debug, Clone)]
-pub struct ProbeTicket(std::sync::Arc<()>);
+pub struct ProbeTicket {
+    identity: std::sync::Arc<()>,
+    force: bool,
+    limit_identity: Option<Option<Identity>>,
+}
 
 impl ProbeTicket {
-    fn new() -> Self {
-        Self(std::sync::Arc::new(()))
+    fn new(force: bool) -> Self {
+        Self {
+            identity: std::sync::Arc::new(()),
+            force,
+            limit_identity: None,
+        }
     }
 
-    fn same(&self, other: &Self) -> bool {
-        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    pub(super) fn same(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.identity, &other.identity)
     }
 }
 
@@ -894,6 +911,7 @@ struct AccountState {
     absent_since: Option<Millis>,
     identity: Option<Identity>,
     snapshot: Option<UsageSnapshot>,
+    inventory_observed_at: Option<Millis>,
     schedule: Schedule,
     pending_probe: Option<ProbeTicket>,
     /// Why the latest probe produced nothing, while the figures on screen
@@ -902,6 +920,10 @@ struct AccountState {
     /// A probe that came due while another account of the same provider was
     /// being probed, and starts once that one answers.
     queued: Option<Trigger>,
+    /// The login whose newly rejected request needs fresh inventory.
+    limit_refresh_identity: Option<Option<Identity>>,
+    limit_wake: Option<(u64, Millis)>,
+    next_limit_wake: u64,
     /// The login the account reported when the reader started signing it
     /// in, while that sign-in is watched for.
     signing_in_from: Option<Identity>,
@@ -913,6 +935,7 @@ struct AccountState {
     /// disagreement between two records of its login (see
     /// [`Identity::disputed_by`]).
     settle_records: bool,
+    reset: resets::State,
 }
 
 impl AccountState {
@@ -920,6 +943,11 @@ impl AccountState {
         // A result from before this login cannot confirm the new login intent.
         // Abandon that scheduling slot so a fresh verification can start.
         self.owner = NEXT_ACCOUNT_OWNER.fetch_add(1, Ordering::Relaxed);
+        self.reset = resets::State::default();
+        self.limit_refresh_identity = None;
+        self.inventory_observed_at = None;
+        self.limit_wake = None;
+        self.queued = None;
         self.pending_probe = None;
         self.schedule.abandon();
         self.schedule.await_login(now);
@@ -935,18 +963,34 @@ impl AccountState {
             absent_since: None,
             identity: None,
             snapshot: None,
+            inventory_observed_at: None,
             schedule: Schedule::default(),
             pending_probe: None,
             failure: None,
             queued: None,
+            limit_refresh_identity: None,
+            limit_wake: None,
+            next_limit_wake: 0,
             signing_in_from: None,
             sign_in_terminal: None,
             settle_records: false,
+            reset: resets::State::default(),
         }
     }
 
     fn start_probe(&mut self, trigger: Trigger, now: Millis) -> ProbeTicket {
-        let ticket = ProbeTicket::new();
+        self.start_probe_force(trigger, now, false)
+    }
+
+    fn start_probe_force(&mut self, trigger: Trigger, now: Millis, full_due: bool) -> ProbeTicket {
+        let mut ticket = ProbeTicket::new(
+            full_due
+                || matches!(trigger, Trigger::Manual | Trigger::Limit)
+                || self.schedule.awaiting_login(now),
+        );
+        if trigger == Trigger::Limit {
+            ticket.limit_identity = Some(self.identity.clone());
+        }
         self.pending_probe = Some(ticket.clone());
         self.schedule.start(trigger, now);
         ticket
@@ -962,6 +1006,14 @@ impl AccountState {
             return false;
         }
         self.pending_probe = None;
+        if ticket.limit_identity.as_ref().is_some_and(|expected| {
+            expected
+                .as_ref()
+                .is_some_and(|identity| Some(identity) != self.identity.as_ref())
+        }) {
+            self.schedule.abandon();
+            return false;
+        }
         true
     }
 
@@ -1104,9 +1156,24 @@ pub enum Action {
     /// Omp's usage record was read.
     OmpRead(History),
     Refresh(AccountId),
+    ResetStart(AccountId, String, String, bool),
+    ResetConfirm(AccountId),
+    ResetRecover(AccountId, String),
+    ResetCancel(AccountId),
+    ResetFinished {
+        id: AccountId,
+        owner: u64,
+        key: String,
+        result: Result<account::resets::ConsumeOutcome, String>,
+    },
     /// The debounce on a manual refresh lifted, so its control can offer
     /// another.
     ManualReady,
+    LimitReady {
+        id: AccountId,
+        owner: u64,
+        generation: u64,
+    },
     /// Live figures are due to be written to the cache.
     SaveLive,
     /// Opens the popover for an account, or closes it with `None` or by
@@ -1215,7 +1282,10 @@ impl Action {
     pub(super) fn blocked_while_modal(&self) -> bool {
         matches!(
             self,
-            Self::Refresh(_)
+            Self::ResetStart(_, _, _, _)
+                | Self::ResetConfirm(_)
+                | Self::ResetRecover(_, _)
+                | Self::Refresh(_)
                 | Self::Install(_)
                 | Self::Popover(Some(_))
                 | Self::ShowAccount(_)
@@ -1299,6 +1369,27 @@ fn provider_installations(search_path: Option<&std::ffi::OsStr>) -> BTreeMap<Pro
 
 /// Whether figures observed at `observed_at` still describe the account at
 /// `now`: they are recent, and no window has reset since they were read.
+fn merge_complete_inventory(current: &mut UsageSnapshot, full: &UsageSnapshot) {
+    current.resets.clone_from(&full.resets);
+    current.ordinary_usage_allowed = current
+        .ordinary_usage_allowed
+        .or(full.ordinary_usage_allowed);
+    if current.credits.is_none() {
+        current.credits.clone_from(&full.credits);
+    }
+    if current.plan.is_none() {
+        current.plan.clone_from(&full.plan);
+    }
+    if current.ordinary_usage_allowed == Some(false)
+        && matches!(
+            current.status,
+            UsageStatus::Ok | UsageStatus::Warning | UsageStatus::Limited
+        )
+    {
+        current.status = UsageStatus::Limited;
+    }
+}
+
 fn is_stale(snapshot: &UsageSnapshot, now: Millis) -> bool {
     if now.saturating_sub(snapshot.observed_at) > schedule::DISPLAY_STALE_AFTER {
         return true;
@@ -1484,7 +1575,7 @@ fn preview_chips(
                     .iter()
                     .find(|candidate| candidate.key == window.key)
             });
-            summary.text = if multiple {
+            summary.text = if multiple && snapshot.ordinary_usage_allowed != Some(false) {
                 format!("{}: {}% left", window.label, percent_left(window.used))
             } else {
                 format!("{}: {}", window.label, summary.text)
@@ -1569,6 +1660,21 @@ fn chip_with_window(
                 .clone()
                 .unwrap_or_else(|| format!("{name} reports no usage")),
         },
+        UsageStatus::Ok | UsageStatus::Warning | UsageStatus::Limited
+            if snapshot.ordinary_usage_allowed == Some(false) =>
+        {
+            Chip {
+                text: "Limited".into(),
+                gauge: None,
+                tone: if is_stale(snapshot, now) || account.failure.is_some() {
+                    ChipTone::Stale
+                } else {
+                    ChipTone::Attention
+                },
+                essential: true,
+                tooltip: format!("{name} reports usage is limited"),
+            }
+        }
         UsageStatus::Ok | UsageStatus::Warning | UsageStatus::Limited => {
             let Some(window) = window_of(snapshot) else {
                 return Chip {
@@ -2195,6 +2301,24 @@ impl Cagents {
     /// a dialog opening closes them, and Escape closes them before anything
     /// behind.
     pub(super) fn account_key_event(&mut self, event: &keyboard::Event) -> Option<Task<Message>> {
+        if self.modal_is_open() {
+            for state in &mut self.account_ui.accounts {
+                state.reset.confirmation = None;
+            }
+        }
+        if !self.modal_is_open()
+            && is_escape_press(event)
+            && self
+                .account_ui
+                .accounts
+                .iter()
+                .any(|state| state.reset.confirmation.is_some())
+        {
+            for state in &mut self.account_ui.accounts {
+                state.reset.confirmation = None;
+            }
+            return Some(Task::none());
+        }
         if self.account_ui.popover.is_none() && !self.account_ui.table.has_popup() {
             return None;
         }
@@ -2214,21 +2338,29 @@ impl Cagents {
     fn probe_accounts(&mut self, trigger: Trigger) -> Task<Message> {
         let now = now_ms();
         self.account_ui.now_ms = now;
-        if !self.accounts_surface_visible() {
-            return Task::none();
+        let newly_bound = self.refresh_chat_limit_accounts();
+        let visible = self.accounts_surface_visible();
+        let pending_limit = self
+            .account_ui
+            .accounts
+            .iter()
+            .any(|state| state.queued == Some(Trigger::Limit));
+        if !visible && !pending_limit {
+            return newly_bound;
         }
         let ids: Vec<AccountId> = self
             .account_ui
             .accounts
             .iter()
             .filter(|account| !account.account.is_brokered())
+            .filter(|account| visible || account.queued == Some(Trigger::Limit))
             .filter(|account| {
                 self.account_ui
                     .probe_policy_ready(&account.id, trigger, now)
             })
             .map(|account| account.id.clone())
             .collect();
-        let omp = if self.account_ui.registry_ready || trigger == Trigger::Manual {
+        let omp = if visible && (self.account_ui.registry_ready || trigger == Trigger::Manual) {
             self.read_omp(trigger, now)
         } else {
             None
@@ -2236,8 +2368,100 @@ impl Cagents {
         Task::batch(
             ids.iter()
                 .filter_map(|id| self.probe_account(id, trigger, now))
-                .chain(omp),
+                .chain(omp)
+                .chain(std::iter::once(newly_bound)),
         )
+    }
+
+    /// New classified rejections invalidate partial live reports as evidence
+    /// of reset inventory. One queued forced read survives an older probe.
+    pub(super) fn account_limit_reported(
+        &mut self,
+        provider: Provider,
+        recipe: &LaunchRecipe,
+    ) -> Task<Message> {
+        if !matches!(provider, Provider::Claude | Provider::Codex) {
+            return Task::none();
+        }
+        let Some(id) = self.chat_account(provider, recipe) else {
+            return Task::none();
+        };
+        let now = now_ms();
+        if let Some(state) = self.account_ui.account_mut(&id) {
+            state.limit_refresh_identity = Some(state.identity.clone());
+            if state.queued != Some(Trigger::Manual) {
+                state.queued = Some(Trigger::Limit);
+            }
+        }
+        self.probe_account(&id, Trigger::Limit, now)
+            .unwrap_or_else(Task::none)
+    }
+
+    /// Account discovery can bind a previously unknown launch home. Keep the
+    /// occurrence on its runtime until that exact recipe resolves; never guess
+    /// a default account for a rejection.
+    pub(super) fn refresh_chat_limit_accounts(&mut self) -> Task<Message> {
+        let requests = self
+            .workspace
+            .mounted_visibility()
+            .filter(|(_, visibility)| *visibility == VisibilityClass::Visible)
+            .filter_map(|(card, _)| {
+                let CardRuntime::Chat(runtime) = self.cards.get(&card)? else {
+                    return None;
+                };
+                (runtime.limit_refresh_pending
+                    && runtime.is_visible()
+                    && self
+                        .chat_account(
+                            runtime.session.launch.provider,
+                            &runtime.session.launch.recipe,
+                        )
+                        .is_some())
+                .then(|| (card, runtime.session.launch.clone()))
+            })
+            .collect::<Vec<_>>();
+        let mut tasks = Vec::new();
+        for (card, launch) in requests {
+            if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) {
+                runtime.limit_refresh_pending = false;
+            }
+            tasks.push(self.account_limit_reported(launch.provider, &launch.recipe));
+        }
+        Task::batch(tasks)
+    }
+
+    fn arm_limit_wake(&mut self, id: &AccountId, now: Millis) -> Option<Task<Message>> {
+        if !self.refresh_ui.focused || !self.account_ui.probe_policy_ready(id, Trigger::Limit, now)
+        {
+            return None;
+        }
+        let state = self.account_ui.account_mut(id)?;
+        if state.queued != Some(Trigger::Limit) || state.reset.in_flight() {
+            return None;
+        }
+        let deadline = state
+            .schedule
+            .limit_ready_at(now)
+            .filter(|deadline| *deadline > now)?;
+        if state
+            .limit_wake
+            .is_some_and(|(_, pending)| pending == deadline)
+        {
+            return None;
+        }
+        state.next_limit_wake = state.next_limit_wake.wrapping_add(1);
+        let generation = state.next_limit_wake;
+        state.limit_wake = Some((generation, deadline));
+        let owner = state.owner;
+        let id = id.clone();
+        Some(cosmic::task::future(async move {
+            tokio::time::sleep(Duration::from_millis(deadline.saturating_sub(now))).await;
+            Message::AccountUi(Action::LimitReady {
+                id,
+                owner,
+                generation,
+            })
+        }))
     }
 
     fn probe_account(
@@ -2246,10 +2470,37 @@ impl Cagents {
         trigger: Trigger,
         now: Millis,
     ) -> Option<Task<Message>> {
+        let trigger = if self.account_ui.account(id)?.queued == Some(Trigger::Limit)
+            && trigger != Trigger::Manual
+        {
+            Trigger::Limit
+        } else {
+            trigger
+        };
+        if trigger == Trigger::Limit {
+            let state = self.account_ui.account_mut(id)?;
+            if !state
+                .limit_refresh_identity
+                .as_ref()
+                .is_some_and(|expected| {
+                    expected
+                        .as_ref()
+                        .is_none_or(|identity| Some(identity) == state.identity.as_ref())
+                })
+            {
+                state.limit_refresh_identity = None;
+                state.limit_wake = None;
+                state.queued = None;
+                return None;
+            }
+        }
         // Focus can also arrive through a popover, a live login report or a
         // queued probe. All automatic paths wait for policy, except an
         // already explicit account-specific sign-in that needs verification.
         if !self.account_ui.probe_policy_ready(id, trigger, now) {
+            return None;
+        }
+        if self.account_ui.account(id)?.reset.in_flight() {
             return None;
         }
         self.refresh_login_watch(id, now);
@@ -2288,22 +2539,52 @@ impl Cagents {
             }
             trigger => trigger,
         };
-        if !state.schedule.should_probe(trigger, now, focused) {
-            return None;
+        let full_observed = matches!(provider, Provider::Claude | Provider::Codex)
+            .then_some(state.inventory_observed_at)
+            .flatten();
+        let periodic = matches!(trigger, Trigger::Tick | Trigger::Focus);
+        let admitted = if periodic && let Some(observed) = full_observed {
+            state
+                .schedule
+                .should_probe_full(trigger, now, focused, observed)
+        } else {
+            state.schedule.should_probe(trigger, now, focused)
+        };
+        if !admitted {
+            return if trigger == Trigger::Limit {
+                self.arm_limit_wake(id, now)
+            } else {
+                None
+            };
         }
         if busy {
             state.queued = Some(match (state.queued, trigger) {
                 (Some(Trigger::Manual), _) | (_, Trigger::Manual) => Trigger::Manual,
+                (Some(Trigger::Limit), _) | (_, Trigger::Limit) => Trigger::Limit,
                 (Some(Trigger::Focus), _) | (_, Trigger::Focus) => Trigger::Focus,
                 _ => Trigger::Tick,
             });
             return None;
         }
         state.queued = None;
+        state.limit_wake = None;
         // The cache is only as fresh as the last probe, which is exactly
         // what a reader asking again, or signing in, is trying to get past.
-        let force = trigger == Trigger::Manual || state.schedule.awaiting_login(now);
-        let ticket = state.start_probe(trigger, now);
+        let threshold = if trigger == Trigger::Focus {
+            schedule::STALE_AFTER
+        } else {
+            schedule::REFRESH_INTERVAL
+        };
+        let full_due = periodic
+            && full_observed.is_some_and(|at| {
+                at > now.saturating_add(schedule::CLOCK_SLACK)
+                    || now.saturating_sub(at) >= threshold
+            });
+        let ticket = state.start_probe_force(trigger, now, full_due);
+        let force = ticket.force;
+        if trigger == Trigger::Limit || trigger == Trigger::Manual {
+            state.limit_refresh_identity = None;
+        }
         let account = state.account.clone();
         let id = state.id.clone();
         let owner = state.owner;
@@ -2548,25 +2829,48 @@ impl Cagents {
         })
     }
 
-    /// Starts the probe that was waiting for another account of `provider`.
+    /// Attempt every waiting account: the provider gate admits at most one,
+    /// while a throttled or unavailable first row cannot strand its neighbors.
     fn probe_queued(&mut self, provider: Provider) -> Task<Message> {
         let now = now_ms();
-        let Some((id, trigger)) = self
+        let queued = self
             .account_ui
             .of(provider)
-            .find_map(|account| Some((account.id.clone(), account.queued?)))
-        else {
-            return Task::none();
-        };
-        if let Some(state) = self.account_ui.account_mut(&id) {
-            state.queued = None;
+            .filter_map(|account| Some((account.id.clone(), account.queued?)))
+            .collect::<Vec<_>>();
+        let mut tasks = Vec::new();
+        for (id, trigger) in queued {
+            if trigger != Trigger::Limit
+                && let Some(state) = self.account_ui.account_mut(&id)
+            {
+                state.queued = None;
+            }
+            if let Some(task) = self.probe_account(&id, trigger, now) {
+                tasks.push(task);
+            }
         }
-        self.probe_account(&id, trigger, now)
-            .unwrap_or_else(Task::none)
+        Task::batch(tasks)
     }
 
     pub(super) fn update_account_ui(&mut self, action: Action) -> Task<Message> {
         match action {
+            Action::ResetStart(id, reset, surface, choose_scope) => {
+                self.start_usage_reset(id, reset, surface, choose_scope)
+            }
+            Action::ResetConfirm(id) => self.confirm_usage_reset(id),
+            Action::ResetRecover(id, reset) => self.recover_usage_reset(id, reset),
+            Action::ResetCancel(id) => {
+                if let Some(state) = self.account_ui.account_mut(&id) {
+                    state.reset.confirmation = None;
+                }
+                Task::none()
+            }
+            Action::ResetFinished {
+                id,
+                owner,
+                key,
+                result,
+            } => self.finish_usage_reset(id, owner, key, result),
             Action::RemoteHomeReady(provider, result) => match result {
                 Ok(created) => {
                     let task = self.begin_account_login(
@@ -2804,6 +3108,28 @@ impl Cagents {
                     self.probe_account(&id, Trigger::Manual, now)
                         .unwrap_or_else(Task::none),
                 ])
+            }
+            Action::LimitReady {
+                id,
+                owner,
+                generation,
+            } => {
+                let current = self.account_ui.account_mut(&id).is_some_and(|state| {
+                    if state.owner != owner
+                        || state.limit_wake.map(|(pending, _)| pending) != Some(generation)
+                        || state.queued != Some(Trigger::Limit)
+                    {
+                        return false;
+                    }
+                    state.limit_wake = None;
+                    true
+                });
+                if current {
+                    self.probe_account(&id, Trigger::Limit, now_ms())
+                        .unwrap_or_else(Task::none)
+                } else {
+                    Task::none()
+                }
             }
             Action::ManualReady => {
                 self.account_ui.now_ms = now_ms();
@@ -3388,16 +3714,33 @@ impl Cagents {
         let provider = state.account.provider;
         let started = state.schedule.started();
         let mut learned = None;
+        let mut merged_inventory = false;
         match outcome {
             // A delayed probe or cached answer can predate live figures.
             // Keep the newer reading unless its future stamp indicates that
             // the clock was set back, as when accepting live reports.
-            Outcome::Answered { snapshot, .. }
-                if state.snapshot.as_ref().is_some_and(|current| {
-                    snapshot.observed_at < current.observed_at
-                        && current.observed_at <= now.saturating_add(schedule::CLOCK_SLACK)
-                }) =>
+            Outcome::Answered {
+                identity, snapshot, ..
+            } if state.snapshot.as_ref().is_some_and(|current| {
+                snapshot.observed_at < current.observed_at
+                    && current.observed_at <= now.saturating_add(schedule::CLOCK_SLACK)
+            }) =>
             {
+                if ticket.force
+                    && matches!(provider, Provider::Claude | Provider::Codex)
+                    && identity == state.identity
+                    && state.inventory_observed_at.is_none_or(|observed| {
+                        snapshot.observed_at >= observed
+                            || observed > now.saturating_add(schedule::CLOCK_SLACK)
+                    })
+                    && let Some(current) = state.snapshot.as_mut()
+                {
+                    // A later partial usage frame cannot erase fresh inventory
+                    // returned by this owner/login's forced complete reading.
+                    merge_complete_inventory(current, &snapshot);
+                    state.inventory_observed_at = Some(snapshot.observed_at);
+                    merged_inventory = true;
+                }
                 state.schedule.abandon();
             }
             Outcome::Answered {
@@ -3425,6 +3768,7 @@ impl Cagents {
                 let unchanged_by_login =
                     state.schedule.awaiting_login(now) && !signed_in_here && !was_signed_out;
                 state.schedule.succeed(snapshot.observed_at);
+                state.inventory_observed_at = Some(snapshot.observed_at);
                 if snapshot.status != UsageStatus::NeedsLogin && !unchanged_by_login {
                     state.schedule.login_settled();
                     state.signing_in_from = None;
@@ -3468,7 +3812,12 @@ impl Cagents {
         let remember = learned
             .map(|(key, identity)| self.remember_identity(&id, key, identity))
             .unwrap_or_else(Task::none);
-        Task::batch([remember, self.probe_queued(provider)])
+        let publish = if merged_inventory {
+            self.save_live(id.clone())
+        } else {
+            Task::none()
+        };
+        Task::batch([remember, publish, self.probe_queued(provider)])
     }
 
     /// Records who a registered account's home reported it is.
@@ -5349,6 +5698,9 @@ impl Cagents {
                     }
                 }
             },
+        }
+        if let Some(resets) = self.usage_reset_controls(account) {
+            rows.push(resets.on_surface("popover").view());
         }
         let mut footer: Vec<Element<'a, Message>> = Vec::new();
         if let Some(snapshot) = &account.snapshot {
@@ -9946,6 +10298,7 @@ mod app_tests {
         let cached = |used| Entry {
             identity: None,
             snapshot: UsageSnapshot {
+                resets: Vec::new(),
                 windows: vec![UsageWindow {
                     key: "five_hour".into(),
                     kind: WindowKind::Session,
@@ -12294,6 +12647,248 @@ mod app_tests {
         assert_eq!(
             std::fs::read(parked.join("old-history")).unwrap(),
             b"keep original removal evidence"
+        );
+    }
+    #[test]
+    fn limit_refresh_waits_for_an_older_probe_and_preserves_policy_owner_and_login_fences() {
+        let mut app = context_inspector_test_app(false);
+        let id = Account::system(Provider::Codex).id();
+        let recipe = recipe_on(&app, &id);
+        let now = now_ms();
+        let known_login = Identity {
+            email: Some("fixture-old@example.invalid".into()),
+            ..Identity::default()
+        };
+        app.refresh_ui.focused = true;
+        app.account_ui.registry_ready = false;
+        drop(app.account_limit_reported(Provider::Codex, &recipe));
+        assert!(app.account_ui.pending_probe_for_test(&id).is_none());
+        assert_eq!(
+            app.account_ui.account(&id).unwrap().queued,
+            Some(Trigger::Limit)
+        );
+        app.account_ui.registry_ready = true;
+        let (owner, old) = app.account_ui.begin_probe_for_test(&id, Trigger::Tick, now);
+        drop(app.account_limit_reported(Provider::Codex, &recipe));
+        drop(app.account_limit_reported(Provider::Codex, &recipe));
+        assert!(
+            app.account_ui
+                .pending_probe_for_test(&id)
+                .unwrap()
+                .same(&old)
+        );
+        assert_eq!(
+            app.account_ui.account(&id).unwrap().queued,
+            Some(Trigger::Limit)
+        );
+        drop(app.account_probed(
+            id.clone(),
+            owner,
+            old.clone(),
+            Outcome::Answered {
+                identity: Some(known_login.clone()),
+                catalog: None,
+                snapshot: UsageSnapshot::state(UsageStatus::Ok, "old cached answer", now),
+            },
+        ));
+        let fresh = app.account_ui.pending_probe_for_test(&id).unwrap();
+        assert!(!fresh.same(&old));
+        assert!(
+            fresh.force,
+            "an older cached result cannot satisfy the new rejection"
+        );
+        assert!(app.account_ui.account(&id).unwrap().queued.is_none());
+        let newer_owner = app.account_ui.account(&id).unwrap().owner + 1;
+        app.account_ui.account_mut(&id).unwrap().owner = newer_owner;
+        drop(app.account_probed(
+            id.clone(),
+            owner,
+            fresh.clone(),
+            Outcome::Answered {
+                identity: None,
+                catalog: None,
+                snapshot: UsageSnapshot::state(UsageStatus::Limited, "old owner", now + 1),
+            },
+        ));
+        assert!(
+            app.account_ui
+                .pending_probe_for_test(&id)
+                .unwrap()
+                .same(&fresh)
+        );
+        // A limit probe admitted under one login cannot replace another login's state.
+        let state = app.account_ui.account_mut(&id).unwrap();
+        state.owner = owner;
+        state.identity = Some(Identity {
+            organization: Some("fixture-login-changed-during-read".into()),
+            ..Identity::default()
+        });
+        drop(app.account_probed(
+            id.clone(),
+            owner,
+            fresh,
+            Outcome::Answered {
+                identity: None,
+                catalog: None,
+                snapshot: UsageSnapshot::state(
+                    UsageStatus::Limited,
+                    "changed login result",
+                    now + 1,
+                ),
+            },
+        ));
+        assert!(app.account_ui.pending_probe_for_test(&id).is_none());
+        assert_eq!(
+            app.account_ui
+                .account(&id)
+                .unwrap()
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .detail
+                .as_deref(),
+            Some("old cached answer")
+        );
+        // A queued event from one login cannot force a read for its replacement.
+        let state = app.account_ui.account_mut(&id).unwrap();
+        state.pending_probe = None;
+        state.schedule.abandon();
+        state.queued = Some(Trigger::Limit);
+        state.limit_refresh_identity = Some(Some(known_login));
+        state.identity = Some(Identity {
+            organization: Some("fixture-new-login".into()),
+            ..Identity::default()
+        });
+        drop(app.probe_queued(Provider::Codex));
+        assert!(app.account_ui.pending_probe_for_test(&id).is_none());
+        assert!(app.account_ui.account(&id).unwrap().queued.is_none());
+    }
+    #[test]
+    fn a_limit_intent_survives_unknown_policy_and_deadline_wakes_are_owned_and_coalesced() {
+        let mut app = context_inspector_test_app(false);
+        let id = Account::system(Provider::Codex).id();
+        let recipe = recipe_on(&app, &id);
+        let now = now_ms();
+        app.refresh_ui.focused = true;
+        app.settings.show_status_bar = false;
+        app.account_ui.registry_ready = false;
+        let state = app.account_ui.account_mut(&id).unwrap();
+        state.snapshot = Some(UsageSnapshot::state(
+            UsageStatus::Ok,
+            "recent cached zero",
+            now,
+        ));
+        state.schedule.observe(now);
+        drop(app.account_limit_reported(Provider::Codex, &recipe));
+        assert!(app.account_ui.pending_probe_for_test(&id).is_none());
+        assert_eq!(
+            app.account_ui.account(&id).unwrap().queued,
+            Some(Trigger::Limit)
+        );
+        app.account_ui.registry_ready = true;
+        drop(app.probe_accounts(Trigger::Focus));
+        assert!(app.account_ui.pending_probe_is_forced_for_test(&id));
+        let state = app.account_ui.account_mut(&id).unwrap();
+        state.pending_probe = None;
+        state.schedule.succeed(now);
+        drop(app.account_limit_reported(Provider::Codex, &recipe));
+        let wake = app
+            .account_ui
+            .account(&id)
+            .unwrap()
+            .limit_wake
+            .expect("throttle gets one exact deadline wake");
+        drop(app.account_limit_reported(Provider::Codex, &recipe));
+        assert_eq!(app.account_ui.account(&id).unwrap().limit_wake, Some(wake));
+        let owner = app.account_ui.account(&id).unwrap().owner;
+        drop(app.update_account_ui(Action::LimitReady {
+            id: id.clone(),
+            owner: owner + 1,
+            generation: wake.0,
+        }));
+        assert_eq!(app.account_ui.account(&id).unwrap().limit_wake, Some(wake));
+        // Move the scheduling clock past its throttle without sleeping or
+        // polling the returned network/timer futures.
+        let state = app.account_ui.account_mut(&id).unwrap();
+        state
+            .schedule
+            .start(Trigger::Limit, now - schedule::LIMIT_DEBOUNCE);
+        state.schedule.succeed(now);
+        drop(app.update_account_ui(Action::LimitReady {
+            id: id.clone(),
+            owner,
+            generation: wake.0,
+        }));
+        let ticket = app.account_ui.pending_probe_for_test(&id).unwrap();
+        assert!(ticket.force);
+        assert!(app.account_ui.account(&id).unwrap().limit_wake.is_none());
+        drop(app.update_account_ui(Action::LimitReady {
+            id: id.clone(),
+            owner,
+            generation: wake.0,
+        }));
+        assert!(
+            app.account_ui
+                .pending_probe_for_test(&id)
+                .unwrap()
+                .same(&ticket)
+        );
+    }
+    #[test]
+    fn a_blocked_queued_limit_does_not_starve_another_account_when_usage_views_are_closed() {
+        let mut app = context_inspector_test_app(false);
+        let blocked = Account::system(Provider::Codex).id();
+        let eligible = app.account_ui.add_managed_fixture(Provider::Codex, 881201);
+        let running = app.account_ui.add_managed_fixture(Provider::Codex, 881202);
+        app.refresh_ui.focused = true;
+        app.settings.show_status_bar = false;
+        for provider in Account::PROVIDERS {
+            app.account_ui
+                .registry
+                .set_default(&Account::system(provider));
+        }
+        assert!(!app.accounts_surface_visible());
+        let now = now_ms();
+        let state = app.account_ui.account_mut(&blocked).unwrap();
+        state.schedule.start(Trigger::Limit, now);
+        state.schedule.succeed(now);
+        state.queued = Some(Trigger::Limit);
+        state.limit_refresh_identity = Some(state.identity.clone());
+        let state = app.account_ui.account_mut(&eligible).unwrap();
+        state.queued = Some(Trigger::Limit);
+        state.limit_refresh_identity = Some(state.identity.clone());
+        let (owner, old) = app
+            .account_ui
+            .begin_probe_for_test(&running, Trigger::Tick, now);
+        drop(app.account_probed(
+            running,
+            owner,
+            old,
+            Outcome::Answered {
+                identity: None,
+                catalog: None,
+                snapshot: UsageSnapshot::state(UsageStatus::Ok, "finished", now),
+            },
+        ));
+        assert!(
+            app.account_ui
+                .account(&blocked)
+                .unwrap()
+                .limit_wake
+                .is_some(),
+            "first row owns its throttle deadline"
+        );
+        assert!(app.account_ui.pending_probe_for_test(&blocked).is_none());
+        assert!(
+            app.account_ui.pending_probe_is_forced_for_test(&eligible),
+            "eligible next row starts without any account-view tick"
+        );
+        assert_eq!(
+            app.account_ui
+                .of(Provider::Codex)
+                .filter(|state| state.schedule.in_flight(now_ms()))
+                .count(),
+            1
         );
     }
 }

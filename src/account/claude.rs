@@ -203,6 +203,7 @@ pub fn parse_usage(response: &Value, observed_at: u64) -> UsageSnapshot {
         (status_for(&windows, false, provider_warning), None)
     };
     UsageSnapshot {
+        resets: parse_resets(limits, observed_at / 1000),
         windows,
         credits,
         status,
@@ -212,6 +213,84 @@ pub fn parse_usage(response: &Value, observed_at: u64) -> UsageSnapshot {
         plan,
         detail,
     }
+}
+
+/// Inventory from the private usage endpoint. Only the provider's explicit
+/// `clears` list authorizes clearing a window; display labels never do.
+pub fn parse_resets(body: &Value, now_secs: u64) -> Vec<super::UsageReset> {
+    use super::{ResetKind, ResetScope, UsageReset};
+    let mut resets = Vec::new();
+    let program = &body["cedar_ember"];
+    for grant in program["grants"].as_array().into_iter().flatten().take(256) {
+        let Some(id) = grant["id"].as_str().filter(|id| valid_grant_id(id)) else {
+            continue;
+        };
+        let Some(available_count) = grant["resets_left"].as_u64() else {
+            continue;
+        };
+        let scopes = grant["clears"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|scope| {
+                Some(match scope.as_str()? {
+                    "five_hour" => ResetScope::AccountSession,
+                    "seven_day" => ResetScope::AccountWeekly,
+                    "seven_day_overage_included" => ResetScope::Model("Fable".into()),
+                    "seven_day_opus" => ResetScope::Model("Opus".into()),
+                    "seven_day_sonnet" => ResetScope::Model("Sonnet".into()),
+                    "seven_day_cowork" => ResetScope::Model("Cowork".into()),
+                    "seven_day_omelette" => ResetScope::Model("Omelette".into()),
+                    "seven_day_oauth_apps" => ResetScope::Model("OAuth apps".into()),
+                    _ => return None,
+                })
+            })
+            .collect();
+        let starts = grant["starts_at"].as_str().and_then(parse_rfc3339);
+        let expires_at = grant["ends_at"].as_str().and_then(parse_rfc3339);
+        let valid_times = ["starts_at", "ends_at"].iter().all(|key| {
+            grant.get(*key).is_none_or(|value| {
+                value.is_null() || value.as_str().and_then(parse_rfc3339).is_some()
+            })
+        });
+        let usable = valid_times
+            && program["eligible"].as_bool() == Some(true)
+            && program["next_grant_id"].as_str() == Some(id)
+            && grant["usable_now"].as_bool() == Some(true)
+            && grant["paused"].as_bool() != Some(true)
+            && starts.is_none_or(|start| start <= now_secs as i64)
+            && (!grant["use_requires_limit"].as_bool().unwrap_or(true)
+                || program["at_limit"].as_bool() == Some(true));
+        resets.push(UsageReset {
+            id: format!("cedar_ember/{id}"),
+            kind: ResetKind::Granted,
+            scopes,
+            available_count,
+            expires_at,
+            usable,
+        });
+    }
+    let session = &body["juniper_tide"];
+    if session.is_object() && session["arm"].as_str() == Some("reset") {
+        let available = session["available"].as_bool() == Some(true);
+        resets.push(UsageReset {
+            id: "juniper_tide".into(),
+            kind: ResetKind::WeeklySession,
+            scopes: vec![ResetScope::AccountSession],
+            available_count: u64::from(available),
+            expires_at: session["weekly_resets_at"].as_str().and_then(parse_rfc3339),
+            usable: available && session["eligible"].as_bool() == Some(true),
+        });
+    }
+    resets
+}
+
+pub(super) fn valid_grant_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 40
+        && id.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
 }
 
 /// A probe must distinguish a transient missing reading from the provider
@@ -1285,5 +1364,77 @@ mod tests {
         let future = parse_usage(&response, 1_002);
         assert_eq!(future.windows[0].key, "future_daily_burst");
         assert!(super::super::routing::available(&future, 1_002));
+    }
+}
+
+#[cfg(test)]
+mod reset_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn reset_inventory_keeps_counts_scope_expiry_and_next_grant() {
+        let resets = parse_resets(
+            &json!({"cedar_ember": {"eligible":true,"at_limit":true,
+            "next_grant_id":"fable", "grants":[
+                {"id":"fable","resets_left":2,"clears":["seven_day_overage_included"],"usable_now":true,"ends_at":"2030-01-01T00:00:00Z"},
+                {"id":"weekly","resets_left":1,"clears":["seven_day","five_hour"],"usable_now":true},
+                {"id":"bad/id","resets_left":99,"clears":["seven_day"],"usable_now":true}
+            ]},"juniper_tide":{"eligible":true,"arm":"reset","available":true,"resets_per_week":5}}),
+            1_000,
+        );
+        assert_eq!(resets.len(), 3);
+        assert_eq!(resets[0].available_count, 2);
+        assert_eq!(
+            resets[0].scopes,
+            [super::super::ResetScope::Model("Fable".into())]
+        );
+        assert_eq!(resets[0].expires_at, Some(1_893_456_000));
+        assert!(resets[0].is_available(1_000));
+        assert!(!resets[1].is_available(1_000));
+        assert_eq!(
+            resets[2].available_count, 1,
+            "weekly capacity is not current credit count"
+        );
+    }
+
+    #[test]
+    fn grant_labels_never_authorize_an_unknown_scope_or_paused_grant() {
+        let resets = parse_resets(
+            &json!({"cedar_ember":{"eligible":true,"at_limit":true,"next_grant_id":"grant",
+            "grants":[{"id":"grant","label":"Reset all limits","resets_left":2,"clears":["unknown"],"usable_now":true,"paused":true}]}}),
+            1,
+        );
+        assert_eq!(resets.len(), 1);
+        assert!(!resets[0].is_available(1));
+        assert!(resets[0].scopes.is_empty());
+        assert!(
+            parse_resets(
+                &json!({"cedar_ember":null,"juniper_tide":{"arm":"control","available":true}}),
+                1
+            )
+            .is_empty()
+        );
+    }
+}
+
+#[cfg(test)]
+mod reset_timestamp_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn malformed_grant_timestamps_never_authorize_spending() {
+        for field in ["starts_at", "ends_at"] {
+            for bad in [json!("tomorrow"), json!(12), json!({})] {
+                let mut grant = json!({"id":"grant","resets_left":1,"clears":["seven_day"],"usable_now":true,"use_requires_limit":false});
+                grant[field] = bad;
+                let resets = parse_resets(
+                    &json!({"cedar_ember":{"eligible":true,"next_grant_id":"grant","grants":[grant]}}),
+                    100,
+                );
+                assert_eq!(resets[0].available_count, 1);
+                assert!(!resets[0].is_available(100));
+            }
+        }
     }
 }

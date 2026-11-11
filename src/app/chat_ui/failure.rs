@@ -220,6 +220,7 @@ pub(super) struct Incident {
     pub guidance: &'static str,
     pub kind: Option<FailureKind>,
     sources: Vec<Source>,
+    reset_sources: std::collections::BTreeSet<u64>,
     /// The chronological first transcript source owns the visible notice.
     pub first_item: Option<String>,
     pub anchor: Option<String>,
@@ -235,11 +236,21 @@ struct Metadata {
     kind: Option<FailureKind>,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct LimitMarker {
+    carrier: Option<String>,
+    active: bool,
+}
+
+pub(super) type LimitEpisode = Vec<(String, Option<String>)>;
+
 #[derive(Default)]
 pub(super) struct State {
     pub incidents: Vec<Incident>,
     pub expanded: HashSet<String>,
     pub revision: u64,
+    pub(super) limit_occurrence: u64,
+    limit_markers: std::collections::BTreeMap<String, LimitMarker>,
     pub local_error: Option<Arc<str>>,
     pub find_expanded: HashSet<String>,
     previews: HashMap<String, Preview>,
@@ -487,6 +498,7 @@ impl State {
                 guidance: meta.guidance,
                 kind: meta.kind,
                 sources: vec![source],
+                reset_sources: Default::default(),
                 first_item,
                 anchor: None,
                 child_scope: None,
@@ -565,6 +577,48 @@ impl State {
             }
             self.push_metadata(meta.clone(), source.clone());
         }
+    }
+
+    pub(super) fn release_presentation(&mut self) {
+        let markers = std::mem::take(&mut self.limit_markers);
+        let occurrence = self.limit_occurrence;
+        let expanded = std::mem::take(&mut self.expanded);
+        let find_expanded = std::mem::take(&mut self.find_expanded);
+        *self = Self::default();
+        self.limit_markers = markers;
+        self.limit_occurrence = occurrence;
+        self.expanded = expanded;
+        self.find_expanded = find_expanded;
+    }
+
+    fn active_limit_episode(&self) -> Option<LimitEpisode> {
+        let episode = self
+            .limit_markers
+            .iter()
+            .filter(|(_, marker)| marker.active)
+            .map(|(key, marker)| (key.clone(), marker.carrier.clone()))
+            .collect::<Vec<_>>();
+        (!episode.is_empty()).then_some(episode)
+    }
+
+    pub(super) fn active_account_limit(&self) -> bool {
+        self.incidents.iter().any(|incident| {
+            incident.kind == Some(FailureKind::AccountLimit)
+                && incident
+                    .sources
+                    .iter()
+                    .any(|source| matches!(source, Source::Snapshot | Source::Local(_)))
+        })
+    }
+
+    fn limit_carrier(&self, provider: Provider, source: &Source) -> Option<String> {
+        let (item, _, _) = self.item_metadata.get(source)?;
+        let carrier = chat::failure::provider_error_carrier(provider, item).unwrap_or(&item.id);
+        Some(match source {
+            Source::Item(_) => format!("item:{carrier}"),
+            Source::ChildItem(child, _) => format!("child:{child}:{carrier}"),
+            _ => return None,
+        })
     }
 
     pub fn collect(runtime: &Runtime) -> Self {
@@ -877,6 +931,44 @@ impl State {
                         .unwrap_or_else(|| runtime.turns.last().map(|turn| turn.key.clone()))
                 });
         }
+        state.limit_markers = state
+            .incidents
+            .iter()
+            .filter(|incident| incident.kind == Some(FailureKind::AccountLimit))
+            .map(|incident| {
+                (
+                    incident.key.clone(),
+                    LimitMarker {
+                        carrier: incident
+                            .sources
+                            .iter()
+                            .rev()
+                            .find_map(|source| state.limit_carrier(provider, source)),
+                        active: incident
+                            .sources
+                            .iter()
+                            .any(|source| matches!(source, Source::Snapshot | Source::Local(_))),
+                    },
+                )
+            })
+            .collect();
+        state.limit_occurrence = runtime
+            .failure_ui
+            .limit_occurrence
+            .saturating_add(u64::from(state.limit_markers.iter().any(
+                |(key, marker)| {
+                    let Some(previous) = runtime.failure_ui.limit_markers.get(key) else {
+                        return true;
+                    };
+                    // Streamed Claude blocks share a carrier; a new rejected
+                    // request in the same prompt has a different carrier.
+                    (marker.carrier.is_some() && marker.carrier != previous.carrier)
+                        || (marker.carrier.is_none()
+                            && previous.carrier.is_none()
+                            && marker.active
+                            && !previous.active)
+                },
+            )));
         state.expanded = runtime
             .failure_ui
             .expanded
@@ -890,12 +982,41 @@ impl State {
             .intersection(&state.expanded)
             .cloned()
             .collect();
+        // Compute reset evidence once alongside classification. Rendering a
+        // collapsed limit must never rehash a potentially large diagnostic.
+        for incident in &mut state.incidents {
+            if incident.kind == Some(FailureKind::AccountLimit) {
+                incident.reset_sources = incident
+                    .sources
+                    .iter()
+                    .map(|source| {
+                        let mut hash = std::collections::hash_map::DefaultHasher::new();
+                        source.hash(&mut hash);
+                        if let Some((item, _, _)) = state.item_metadata.get(source) {
+                            Arc::as_ptr(item).hash(&mut hash);
+                        } else {
+                            runtime.failure_source(source).hash(&mut hash);
+                            // Live diagnostics can recur under the same textual
+                            // identity; require the exact published occurrence.
+                            if matches!(
+                                source,
+                                Source::Snapshot | Source::ChildDetail(_) | Source::Local(_)
+                            ) {
+                                runtime.snapshot.generation.hash(&mut hash);
+                            }
+                        }
+                        hash.finish()
+                    })
+                    .collect();
+            }
+        }
         let mut hash = std::hash::DefaultHasher::new();
         for incident in &state.incidents {
             (
                 &incident.key,
                 &incident.summary,
                 &incident.sources,
+                &incident.reset_sources,
                 &incident.first_item,
                 &incident.anchor,
                 &incident.active_recovery,
@@ -1080,7 +1201,24 @@ impl Runtime {
 
     pub(super) fn refresh_failure_ui(&mut self) {
         self.failure_ui = State::collect(self);
+        self.observe_visible_limit();
         self.refresh_failure_previews();
+    }
+
+    pub(super) fn observe_visible_limit(&mut self) {
+        if !self.visible.load(Ordering::Relaxed)
+            || !matches!(
+                self.session.launch.provider,
+                Provider::Claude | Provider::Codex
+            )
+        {
+            return;
+        }
+        let episode = self.failure_ui.active_limit_episode();
+        if episode.is_some() && episode != self.visible_limit_episode {
+            self.limit_refresh_pending = true;
+        }
+        self.visible_limit_episode = episode;
     }
 
     pub(super) fn refresh_failure_previews(&mut self) {
@@ -1276,21 +1414,85 @@ impl Runtime {
         Some(details.join("\n\n---\n\n"))
     }
 
+    #[cfg(test)]
     pub(super) fn failure_view(&self, incident: &Incident) -> Element<'static, Message> {
+        self.failure_view_with_reset(incident, None)
+    }
+
+    /// A source may disappear after a successful continuation; a new source or
+    /// chat lifetime is never evidence for an earlier reset.
+    fn reset_incident_evidence(
+        &self,
+        incident: &Incident,
+    ) -> crate::app::account_ui::resets::LimitIncidents {
+        crate::app::account_ui::resets::LimitIncidents(std::collections::BTreeMap::from([(
+            format!(
+                "{}/{}/{}",
+                self.target.card, self.target.generation, incident.key
+            ),
+            incident.reset_sources.clone(),
+        )]))
+    }
+
+    pub(in crate::app) fn reset_limit_incidents(
+        &self,
+    ) -> crate::app::account_ui::resets::LimitIncidents {
+        let mut evidence = crate::app::account_ui::resets::LimitIncidents::default();
+        for incident in &self.failure_ui.incidents {
+            if incident.kind == Some(FailureKind::AccountLimit) {
+                evidence.0.extend(self.reset_incident_evidence(incident).0);
+            }
+        }
+        evidence
+    }
+
+    pub(super) fn failure_view_with_reset(
+        &self,
+        incident: &Incident,
+        reset_controls: Option<&crate::app::account_ui::resets::Controls>,
+    ) -> Element<'static, Message> {
+        let reset_controls = reset_controls
+            .map(|controls| controls.for_incident(&self.reset_incident_evidence(incident)));
+        let cleared = incident.kind == Some(FailureKind::AccountLimit)
+            && reset_controls
+                .as_ref()
+                .is_some_and(|controls| controls.limit_cleared(&incident.summary));
+        let summary = if cleared {
+            let label = incident
+                .summary
+                .split_once(" limit reached")
+                .map_or("usage", |(label, _)| label);
+            format!("Earlier {label} limit · cleared")
+        } else {
+            incident.summary.clone()
+        };
         let mut rows = vec![
             widget::row::with_children(vec![
                 crate::ui_controls::passive_icon(Icon::Warning, design::COMPACT_ICON_SIZE),
-                design::body(incident.summary.clone())
-                    .width(Length::Fill)
-                    .into(),
+                design::body(summary).width(Length::Fill).into(),
             ])
             .spacing(space::S)
             .align_y(Alignment::Start)
             .into(),
-            design::caption(incident.guidance)
-                .width(Length::Fill)
-                .into(),
         ];
+        if !cleared {
+            rows.push(
+                design::caption(incident.guidance)
+                    .width(Length::Fill)
+                    .into(),
+            );
+        }
+        if incident.kind == Some(FailureKind::AccountLimit)
+            && let Some(controls) = reset_controls
+                .as_ref()
+                .and_then(|controls| controls.for_limit(&incident.summary))
+        {
+            rows.push(
+                controls
+                    .on_surface(format!("chat/{}/{}", self.target.card, incident.key))
+                    .view(),
+            );
+        }
         rows.push(self.failure_diagnostics(incident));
         widget::container(
             widget::column::with_children(rows)
@@ -1516,6 +1718,89 @@ mod tests {
             .0
             .text(diagnostic_preview_identity(key))
             .is_some()
+    }
+
+    #[test]
+    fn reset_evidence_rejects_a_new_rejection_without_any_usage_update() {
+        let raw = "You've hit your Fable limit · resets 9pm (UTC)";
+        let (mut runtime, handle) = live_fixture(
+            Provider::Claude,
+            vec![
+                text("prompt-1", chat::Role::User, "Fixture question"),
+                provider_error(Provider::Claude, "failure-1", raw),
+            ],
+        );
+        runtime.refresh_failure_ui();
+        assert_eq!(runtime.failure_ui.incidents.len(), 1);
+        assert_eq!(
+            runtime.failure_ui.incidents[0].kind,
+            Some(FailureKind::AccountLimit)
+        );
+        let original_summary = runtime.failure_ui.incidents[0].summary.clone();
+        let original = runtime.reset_limit_incidents();
+        assert!(
+            !original.0.is_empty(),
+            "fixture must classify a real limit incident"
+        );
+        assert!(original.contains(&runtime.reset_limit_incidents()));
+        publish(&mut runtime, &handle, |next| {
+            next.items
+                .push(Arc::new(text("prompt-2", chat::Role::User, "Continue")));
+            next.items
+                .push(Arc::new(provider_error(Provider::Claude, "failure-2", raw)));
+        });
+        assert_eq!(runtime.failure_ui.incidents.len(), 2);
+        assert!(runtime.failure_ui.incidents.iter().all(|incident| {
+            incident.kind == Some(FailureKind::AccountLimit) && incident.summary == original_summary
+        }));
+        let current = runtime.reset_limit_incidents();
+        assert!(current.0.keys().any(|key| !original.0.contains_key(key)));
+        assert!(
+            !original.contains(&current),
+            "same summary in a later turn is a new occurrence"
+        );
+    }
+
+    #[test]
+    fn one_limit_response_streams_once_but_a_new_request_in_the_same_prompt_is_observed() {
+        let raw = "You've hit your Fable limit · resets 9pm (UTC)";
+        let (mut runtime, handle) = live_fixture(
+            Provider::Claude,
+            vec![
+                text("prompt", chat::Role::User, "Fixture question"),
+                provider_error(Provider::Claude, "response-a:0", raw),
+            ],
+        );
+        runtime.refresh_failure_ui();
+        let first = runtime.failure_ui.limit_occurrence;
+        publish(&mut runtime, &handle, |next| {
+            next.items.push(Arc::new(provider_error(
+                Provider::Claude,
+                "response-a:1",
+                raw,
+            )));
+        });
+        assert_eq!(
+            runtime.failure_ui.limit_occurrence, first,
+            "streamed fragments share one request"
+        );
+        publish(&mut runtime, &handle, |next| {
+            next.items.push(Arc::new(provider_error(
+                Provider::Claude,
+                "response-b:0",
+                raw,
+            )));
+        });
+        assert_eq!(
+            runtime.failure_ui.incidents.len(),
+            1,
+            "same prompt keeps one historical card"
+        );
+        assert_eq!(
+            runtime.failure_ui.limit_occurrence,
+            first + 1,
+            "a new rejected request still refreshes inventory"
+        );
     }
 
     #[test]

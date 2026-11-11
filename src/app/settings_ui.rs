@@ -380,7 +380,7 @@ fn settings_category_controls<'a>(
             ));
             vec![settings_group(
                 "Default accounts",
-                "Each provider's CLI keeps every login in a home of its own. cagents never reads credentials.",
+                "Choose defaults for new conversations, or use Automatic to choose an account with available usage.",
                 settings,
             )]
         }

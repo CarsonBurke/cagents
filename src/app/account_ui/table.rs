@@ -477,11 +477,9 @@ fn toolbar<'a>(state: &'a State, layout: &Layout, browser_busy: bool) -> Element
     );
     let description = widget::column::with_children(vec![
         design::heading("Accounts").into(),
-        design::caption(
-            "Usage limits as each provider's own CLI reports them. Every login stays with its CLI; cagents never reads credentials.",
-        )
-        .wrapping(cosmic::iced::widget::text::Wrapping::Word)
-        .into(),
+        design::caption("Compare usage limits and available resets across your accounts.")
+            .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+            .into(),
     ])
     .spacing(space::XS)
     .width(Length::Fill);
@@ -795,6 +793,14 @@ fn row<'a>(
     // background check fails. The explanation can wrap below the fixed-height
     // row, including when the Status column has been dropped for space.
     let mut lines = vec![content];
+    if let Some(resets) = app.usage_reset_controls(account) {
+        lines.push(
+            widget::container(resets.on_surface("accounts").view())
+                .padding([space::XS, space::M])
+                .width(Length::Fill)
+                .into(),
+        );
+    }
     // The group explains a missing CLI once, with the way to install it.
     if let Some(reason) = failure_caption(account, now)
         .filter(|_| state.installed.get(&account.account.provider) != Some(&false))

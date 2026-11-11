@@ -2503,7 +2503,8 @@ where
             command:
                 AccountCommand::Link { .. }
                 | AccountCommand::Default { .. }
-                | AccountCommand::Remove { .. },
+                | AccountCommand::Remove { .. }
+                | AccountCommand::Reset { .. },
         } => Some("Account changes require your own terminal".into()),
         _ => None,
     };

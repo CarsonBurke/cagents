@@ -228,6 +228,58 @@ pub(super) fn read(
     })
 }
 
+/// Consume uses the same registry and lifecycle boundary as a usage refresh.
+/// The wire request carries only an ID, so remote clients cannot select a home.
+/// The caller holds shared control admission until the provider and refresh end.
+pub(in crate::host) fn consume(
+    host: &SharedHost,
+    request: crate::account::resets::ConsumeRequest,
+) -> Result<crate::account::resets::ConsumeOutcome, String> {
+    let registry = Store::installation()
+        .ok_or("Account registry is unavailable")?
+        .load()
+        .map_err(|error| error.to_string())?;
+    if registry.is_newer() {
+        return Err("Account registry needs a newer cagents version".into());
+    }
+    let homes = Homes::installation();
+    let account = registry
+        .accounts(homes.as_ref())
+        .into_iter()
+        .find(|account| account.id() == request.account)
+        .ok_or("This account is no longer configured; refresh accounts")?;
+    if let Some(registered) = account
+        .registry_key()
+        .and_then(|key| registry.registered().iter().find(|entry| entry.key == key))
+    {
+        let registered = registered.identity();
+        if registered.email.is_some()
+            && request
+                .expected_identity
+                .as_ref()
+                .is_some_and(|expected| !registered.claims_same_login(expected))
+        {
+            return Err(
+                "The confirmed login no longer matches the registered account; refresh accounts"
+                    .into(),
+            );
+        }
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())?;
+    with_refresh_admission(host, &account, || {
+        runtime.block_on(probe::consume(
+            account.clone(),
+            request.reset_id,
+            request.idempotency_key,
+            request.expected_identity,
+            Cache::installation(),
+        ))
+    })
+}
+
 /// The caller already holds shared control admission through the refresh.
 /// This is only a negative lifecycle check, not account selection/read authority.
 /// Keep it immediately before provider work; cached reads never invoke it.

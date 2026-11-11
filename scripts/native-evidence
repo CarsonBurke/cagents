@@ -39,7 +39,7 @@ both use the same fixture data and selected providers.
                   once no build or session has used them for 12 hours, or 1
                   hour while the disk is low.
   start SIDE [--width PX] [--height PX] [--keep-state] [--wait-lock SECONDS] [--limit SECONDS]
-        [--portal gtk|kde|gnome|cosmic] [--codex tool-rows|child-errors|terminal-escape]
+        [--portal gtk|kde|gnome|cosmic] [--codex tool-rows|child-errors|terminal-escape|usage-resets]
         [--instance NAME]
                   Take the native lock and start a headless session at the
                   requested logical width and height (default 1500x900). The lock is
@@ -538,7 +538,7 @@ install_codex() {
     [ -n "$peer" ] || return 0
     mkdir -p -- "$peers" "$fixture/home/.codex"
     # The peers load their transport from beside them.
-    install -m 644 -t "$peers" -- "$tool_root"/tests/fixtures/{terminal-escape-codex,codex-tool-rows,codex-child-errors}.py
+    install -m 644 -t "$peers" -- "$tool_root"/tests/fixtures/{terminal-escape-codex,codex-tool-rows,codex-child-errors,codex-usage-resets,usage-reset-fixture}.py
     printf '%s\n' "$peer" >"$peers/peer"
     install -m 755 "$tool_root/tests/fixtures/fixture-codex.sh" "$fixture/bin/codex"
 }
@@ -979,7 +979,7 @@ cmd_start() {
             --wait-lock) wait_lock=${2:?--wait-lock needs seconds}; shift 2 ;;
             --limit) limit=${2:?--limit needs seconds}; shift 2 ;;
             --portal) portal=${2:?--portal needs a backend: gtk, kde, gnome or cosmic}; shift 2 ;;
-            --codex) codex=${2:?--codex needs a peer: tool-rows, child-errors or terminal-escape}; shift 2 ;;
+            --codex) codex=${2:?--codex needs a peer: tool-rows, child-errors, terminal-escape or usage-resets}; shift 2 ;;
             --codex-executable) codex_executable=${2:?--codex-executable needs an absolute ELF path}; shift 2 ;;
             *) die "unknown start option: $1" 2 ;;
         esac
@@ -988,8 +988,8 @@ cmd_start() {
         die 'width and height must be positive pixels; lock wait and session limit must be whole numbers' 2
     [[ -z $portal || $portal =~ ^(gtk|kde|gnome|cosmic)$ ]] ||
         die "unknown portal backend: $portal; use gtk, kde, gnome or cosmic" 2
-    [[ -z $codex || $codex =~ ^(tool-rows|child-errors|terminal-escape)$ ]] ||
-        die "unknown Codex peer: $codex; use tool-rows, child-errors or terminal-escape" 2
+    [[ -z $codex || $codex =~ ^(tool-rows|child-errors|terminal-escape|usage-resets)$ ]] ||
+        die "unknown Codex peer: $codex; use tool-rows, child-errors, terminal-escape or usage-resets" 2
     [[ -z $codex || -z $codex_executable ]] ||
         die '--codex and --codex-executable are mutually exclusive' 2
     [[ $self =~ ^/[A-Za-z0-9._/-]+$ ]] || die "the tool's path has unsupported characters: $self" 2

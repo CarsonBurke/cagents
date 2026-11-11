@@ -1,10 +1,11 @@
 //! Asking a provider's own CLI how an account stands.
 //!
-//! Every question goes through the provider's official client, as that
-//! client's own documented protocol: Claude Code's stream-json control
-//! requests and `claude auth status`, Codex's app server. cagents never reads
-//! a credential file and never calls a provider's service itself, so a login
-//! stays the property of the client it belongs to.
+//! Ordinary usage goes through the provider's official client and its
+//! protocol: Claude Code's stream-json control
+//! requests and `claude auth status`, Codex's app server. Reset inventory and
+//! consumption are the narrow exception: Claude exposes no control route,
+//! so `reset_transport` reads its subscription bearer in memory for its fixed
+//! private endpoint. The provider CLI still owns login and credential refresh.
 //!
 //! A probe runs on the async runtime, never the interface thread. It is
 //! bounded in time ([`TIMEOUT`]) and in how much output it will read
@@ -34,6 +35,12 @@ use super::{
     schedule::STALE_AFTER,
 };
 use crate::{agent::Provider, chat::Model};
+
+mod reset_consume;
+#[cfg(test)]
+mod reset_contract_tests;
+mod reset_transport;
+pub use reset_consume::consume;
 
 /// How long a probe may take in total.
 pub const TIMEOUT: Duration = Duration::from_secs(30);
@@ -122,10 +129,44 @@ pub enum Outcome {
 /// Probes `account`, sharing the answer with other windows through `cache`.
 ///
 /// Unless `force`d, a cached answer another window observed within
-/// [`STALE_AFTER`] is returned instead of probing again.
+/// [`STALE_AFTER`] is returned instead of probing again. Explicit refreshes
+/// wait for an in-flight reader within [`TIMEOUT`], then take a fresh reading:
+/// a read that started before a reset cannot establish its resulting state.
 pub async fn run(account: Account, cache: Option<Cache>, force: bool) -> Outcome {
     let second_home = second_home(&account, &|name| std::env::var(name).ok());
-    run_reading(account, cache, force, second_home).await
+    if force {
+        run_forced(account, cache, second_home, TIMEOUT).await
+    } else {
+        run_reading(account, cache, false, second_home).await
+    }
+}
+
+async fn run_forced(
+    account: Account,
+    cache: Option<Cache>,
+    second_home: Option<PathBuf>,
+    timeout: Duration,
+) -> Outcome {
+    let reading = async {
+        loop {
+            let outcome =
+                run_reading(account.clone(), cache.clone(), true, second_home.clone()).await;
+            if !matches!(outcome, Outcome::Busy) {
+                return outcome;
+            }
+            // Only retry read admission. A consume is never part of this loop.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+    tokio::time::timeout(timeout, reading)
+        .await
+        .unwrap_or_else(|_| {
+            Outcome::Failed(format!(
+                "{} could not provide fresh usage within {} seconds",
+                cli_name(account.provider),
+                timeout.as_secs()
+            ))
+        })
 }
 
 /// [`run`], with `second_home` the home whose record of `account`'s login
@@ -183,6 +224,25 @@ async fn run_reading(
                 .ok()
                 .flatten();
     }
+    // Failed inventory is unknown, not zero. Retain disabled prior rows.
+    if let Outcome::Answered {
+        identity, snapshot, ..
+    } = &mut outcome
+        && snapshot.detail.as_deref() == Some("Reset availability could not be refreshed")
+        && let Some(previous) = cache.as_ref().and_then(|cache| {
+            key.as_ref()
+                .and_then(|key| cache.load(now_ms()).remove(key))
+        })
+        && identity
+            .as_ref()
+            .zip(previous.identity.as_ref())
+            .is_some_and(|(current, previous)| reset_consume::same_identity(current, previous))
+    {
+        snapshot.resets = previous.snapshot.resets;
+        for reset in &mut snapshot.resets {
+            reset.usable = false;
+        }
+    }
     if let (
         Outcome::Answered {
             identity,
@@ -199,18 +259,18 @@ async fn run_reading(
         };
         let catalog = catalog.clone();
         let provider = account.provider;
-        // Written in the background so the answer reaches the reader at
-        // once, with the probe lock held until the answer is in the cache:
-        // a window that takes the lock next finds it there instead of
-        // probing again. A cache that cannot be written only costs other
-        // windows a probe.
-        tokio::task::spawn_blocking(move || {
+        // Publish off the runtime thread, then release admission before the
+        // caller receives Answered. Returning earlier lets an immediate
+        // post-consume refresh collide with this probe's unfinished write.
+        // A cache write failure still leaves the observed answer usable.
+        let _ = tokio::task::spawn_blocking(move || {
             let _ = cache.store(&key, entry);
             if let Some(catalog) = catalog {
                 let _ = cache.store_catalog(provider, catalog);
             }
             drop(lock);
-        });
+        })
+        .await;
     }
     outcome
 }
@@ -921,7 +981,22 @@ async fn probe_claude_with_path(
         "",
         "--disable-slash-commands",
     ]);
-    join_claude(run_json(status), claude_usage(usage)).await
+    let mut probed = join_claude(run_json(status), claude_usage(usage)).await?;
+    if confirms_login(probed.identity.as_ref(), probed.snapshot.status) {
+        match reset_transport::Client::load(account, program, search_path).await {
+            Ok(client) => match client.inventory().await {
+                Ok(resets) => probed.snapshot.resets = resets,
+                Err(_) => {
+                    probed.snapshot.detail =
+                        Some("Reset availability could not be refreshed".into())
+                }
+            },
+            Err(_) => {
+                probed.snapshot.detail = Some("Reset availability could not be refreshed".into())
+            }
+        }
+    }
+    Ok(probed)
 }
 
 /// The home whose record of `account`'s login may disagree with the one its
