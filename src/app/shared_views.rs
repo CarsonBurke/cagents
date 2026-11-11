@@ -2734,8 +2734,25 @@ impl Cagents {
                 self.sidebar_state.transfer_card_update(alias, shared.id);
             }
             self.detach_shared_pane(alias);
-            for channel in &mut Arc::make_mut(&mut self.durable).channels {
-                channel.cards.retain(|id| *id != alias);
+            self.remove_shared_channel_member(alias);
+        }
+    }
+
+    /// Removing an alias or moving a pane to a worktree must leave a valid
+    /// saved channel even when its now-empty inactive view needs no projection.
+    fn remove_shared_channel_member(&mut self, id: CardId) {
+        if !self
+            .durable
+            .channels
+            .iter()
+            .any(|channel| channel.focused == Some(id) || channel.cards.contains(&id))
+        {
+            return;
+        }
+        for channel in &mut Arc::make_mut(&mut self.durable).channels {
+            channel.cards.retain(|card| *card != id);
+            if channel.focused == Some(id) {
+                channel.focused = channel.cards.first().copied();
             }
         }
     }
@@ -2911,9 +2928,7 @@ impl Cagents {
             if let Scope::Worktree { path, .. } = &view.scope {
                 projected.scope = Some(path.clone());
                 self.worktree_owners.insert(projected.id, path.clone());
-                for channel in &mut Arc::make_mut(&mut self.durable).channels {
-                    channel.cards.retain(|id| *id != projected.id);
-                }
+                self.remove_shared_channel_member(projected.id);
             }
 
             if let CardKind::Repository(repository) = &mut projected.kind {

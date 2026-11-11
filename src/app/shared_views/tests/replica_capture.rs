@@ -890,6 +890,14 @@ fn presentation_replica_capture_repository_alias_adoption_keeps_draft_and_ordere
     assert_eq!(app.replica_capture.captures, captures + 1);
     assert_eq!(app.replica_capture.offers, offers + 1);
     assert!(!app.card_state(alias).unwrap().existence.is_open());
+    let source_channel = app
+        .durable
+        .channels
+        .iter()
+        .find(|row| row.id == alias_scope)
+        .unwrap();
+    assert!(source_channel.cards.is_empty());
+    assert_eq!(source_channel.focused, None);
     assert!(app.card_state(canonical.id).unwrap().existence.is_open());
     assert_eq!(app.card_state(pane.id).unwrap().title, "Pending replica");
     assert!(
@@ -920,13 +928,194 @@ fn presentation_replica_capture_repository_alias_adoption_keeps_draft_and_ordere
         crate::model::BootId::new("replica-capture"),
     )
     .unwrap();
+    let restored = restored.unwrap();
+    let source_channel = restored
+        .channels
+        .iter()
+        .find(|row| row.id == alias_scope)
+        .unwrap();
+    assert!(source_channel.cards.is_empty());
+    assert_eq!(source_channel.focused, None);
     assert_eq!(
-        restored
-            .unwrap()
-            .chat_drafts
-            .get(&canonical.id)
-            .map(String::as_str),
+        restored.chat_drafts.get(&canonical.id).map(String::as_str),
         Some("cross-repository draft  ")
     );
     writer.shutdown();
+}
+
+#[test]
+fn presentation_replica_capture_worktree_move_preserves_valid_source_focus() {
+    for active_source in [false, true] {
+        for keep_other_cards in [false, true] {
+            for focus_moved in [false, true]
+                .into_iter()
+                .filter(|focus_moved| keep_other_cards || *focus_moved)
+            {
+                let directory = tempfile::tempdir().unwrap();
+                let (mut app, source, other, pane) = presentation_fixture();
+                let mut remaining = Vec::new();
+                if keep_other_cards {
+                    for title in ["First remaining", "Preserved focus"] {
+                        let mut sibling = app.card_state(pane.id).unwrap().clone();
+                        sibling.id = CardId::new();
+                        sibling.title = title.into();
+                        if let CardKind::Browser(browser) = &mut sibling.kind {
+                            browser.id = BrowserId::new();
+                        }
+                        let sibling_pane = Pane::from_card(&sibling, None).unwrap();
+                        remaining.push(sibling.id);
+                        Arc::make_mut(&mut app.durable).cards.push(sibling);
+                        Arc::make_mut(&mut app.durable)
+                            .channels
+                            .iter_mut()
+                            .find(|row| row.id == source)
+                            .unwrap()
+                            .cards
+                            .push(sibling_pane.id);
+                        app.workspace_model
+                            .views
+                            .iter_mut()
+                            .find(|view| view.scope == Scope::Channel(source))
+                            .unwrap()
+                            .panes
+                            .push(sibling_pane.clone());
+                        app.workspace
+                            .add_card(
+                                WorkspaceCard::new(
+                                    sibling_pane.id,
+                                    sibling_pane.title.clone(),
+                                    CardWidth::Fraction(sibling_pane.width_fraction),
+                                )
+                                .unwrap(),
+                                app.workspace.cards().len(),
+                                false,
+                            )
+                            .unwrap();
+                        app.shared_views
+                            .baseline
+                            .get_mut(&Scope::Channel(source))
+                            .unwrap()
+                            .push(sibling_pane);
+                        app.cards
+                            .insert(*remaining.last().unwrap(), CardRuntime::Completed);
+                    }
+                    Arc::make_mut(&mut app.durable)
+                        .channels
+                        .iter_mut()
+                        .find(|row| row.id == source)
+                        .unwrap()
+                        .focused = if !focus_moved {
+                        remaining.last().copied()
+                    } else {
+                        Some(pane.id)
+                    };
+                    if !focus_moved {
+                        let _ = app.workspace.focus(*remaining.last().unwrap()).unwrap();
+                    }
+                }
+                let expected_focus = if focus_moved {
+                    remaining.first().copied()
+                } else {
+                    remaining.last().copied()
+                };
+                // Exercise a real source strip, rather than letting the active
+                // snapshot replace durable membership with an older fixture strip.
+                drop(app.select_channel(other));
+                if active_source {
+                    drop(app.select_channel(source));
+                }
+                install_writer(&mut app, &directory);
+                let path = PathBuf::from("/repo/moved-worktree");
+                let scope = Scope::Worktree {
+                    repository: PathBuf::from("/repo/.git"),
+                    path: path.clone(),
+                };
+                app.known_worktree_roots.insert(path.clone());
+                let mut moved = pane.clone();
+                moved.scope = Some(path.clone());
+                app.workspace_model
+                    .views
+                    .iter_mut()
+                    .find(|view| view.scope == Scope::Channel(source))
+                    .unwrap()
+                    .panes
+                    .retain(|row| row.id != pane.id);
+                // Visit the destination first so its membership removal cannot
+                // rely on an earlier source projection repairing focus for it.
+                app.workspace_model.views.insert(
+                    0,
+                    View {
+                        scope: scope.clone(),
+                        revision: 22,
+                        panes: vec![moved],
+                        retired: vec![],
+                    },
+                );
+                app.shared_views.initialize(scope.clone(), vec![]);
+                drop(app.reconcile_shared_views_for_repository(
+                    Path::new("/repo/.git"),
+                    &HashSet::new(),
+                ));
+                let source_channel = app
+                    .durable
+                    .channels
+                    .iter()
+                    .find(|row| row.id == source)
+                    .unwrap();
+                assert_eq!(source_channel.cards, remaining);
+                assert_eq!(source_channel.focused, expected_focus);
+                assert_eq!(app.durable.card_scopes.get(&pane.id), Some(&path));
+                assert!(app.card_state(pane.id).unwrap().existence.is_open());
+                assert!(
+                    app.workspace.card(pane.id).is_none(),
+                    "the active snapshot must not put the moved pane back in its source channel"
+                );
+                // A second ordinary snapshot must retain the repaired membership
+                // and focus instead of reintroducing an active strip's old state.
+                app.save_workspace();
+                let source_channel = app
+                    .durable
+                    .channels
+                    .iter()
+                    .find(|row| row.id == source)
+                    .unwrap();
+                assert_eq!(source_channel.cards, remaining);
+                assert_eq!(source_channel.focused, expected_focus);
+                drop(app.select_channel(source));
+                assert!(
+                    app.workspace.card(pane.id).is_none(),
+                    "selecting the source must not resurrect the moved pane"
+                );
+                let source_channel = app
+                    .durable
+                    .channels
+                    .iter()
+                    .find(|row| row.id == source)
+                    .unwrap();
+                assert_eq!(source_channel.cards, remaining);
+                assert_eq!(source_channel.focused, expected_focus);
+                app.session
+                    .as_ref()
+                    .unwrap()
+                    .flush(Duration::from_secs(5))
+                    .unwrap();
+                drop(app);
+                let (mut writer, restored) = crate::session::SessionRuntime::open(
+                    directory.path().join("window.sqlite3"),
+                    crate::model::BootId::new("replica-capture"),
+                )
+                .unwrap();
+                let restored = restored.unwrap();
+                let source_channel = restored
+                    .channels
+                    .iter()
+                    .find(|row| row.id == source)
+                    .unwrap();
+                assert_eq!(source_channel.cards, remaining);
+                assert_eq!(source_channel.focused, expected_focus);
+                assert_eq!(restored.card_scopes.get(&pane.id), Some(&path));
+                writer.shutdown();
+            }
+        }
+    }
 }
