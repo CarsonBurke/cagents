@@ -2095,3 +2095,74 @@ fn private_census_validation_refuses_bad_input_and_never_claims_usability() {
     assert_eq!(reply["data"]["usable"], false);
     assert!(fs::read_dir(&runtime).unwrap().next().is_none());
 }
+
+#[test]
+fn absent_source_tolerance_requires_original_absence_and_no_pending_snapshot() {
+    let _serial = OS_FIXTURE.lock().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let runtime = root.path().join("runtime");
+    fs::create_dir(&runtime).unwrap();
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+    let proof = serde_json::json!({
+        "host_session_id":"previous-source", "boot_id":"previous-boot",
+        "host_incarnation":"previous-incarnation"
+    });
+    for (name, source, checkpoint, accepted) in [
+        (
+            "absent",
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            true,
+        ),
+        ("previously-serving", proof, serde_json::Value::Null, false),
+        (
+            "pending-snapshot",
+            serde_json::Value::Null,
+            serde_json::json!("0".repeat(64)),
+            false,
+        ),
+    ] {
+        let census = root.path().join(format!("{name}-census.json"));
+        let outcome = root.path().join(format!("{name}-outcome.json"));
+        fs::write(
+            &census,
+            serde_json::to_vec(&serde_json::json!({
+                "version":1,"transaction":"00000000-0000-4000-8000-000000000001",
+                "source":source,"terminals":[],"chats":[],"checkpoint_before":checkpoint
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(&census, fs::Permissions::from_mode(0o600)).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_cagents"))
+            .env_clear()
+            .env("HOME", root.path())
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .args([
+                "--json",
+                "--no-start",
+                "daemon",
+                "verify-update-census",
+                "--require-absent",
+                "--census",
+            ])
+            .arg(&census)
+            .arg("--outcome")
+            .arg(&outcome)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.success(), accepted, "{name}: {output:?}");
+        if accepted {
+            let receipt: serde_json::Value =
+                serde_json::from_slice(&fs::read(&outcome).unwrap()).unwrap();
+            assert_eq!(receipt["outcome"]["state"], "no_source");
+        } else if outcome.exists() {
+            let receipt: serde_json::Value =
+                serde_json::from_slice(&fs::read(&outcome).unwrap()).unwrap();
+            assert_ne!(receipt["outcome"]["state"], "usable");
+            assert_ne!(receipt["outcome"]["state"], "no_source");
+        }
+    }
+}

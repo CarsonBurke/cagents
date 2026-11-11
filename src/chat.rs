@@ -685,6 +685,11 @@ pub fn is_account_recovery(source: &Session, replacement: &Session) -> bool {
 /// This predicate is not provenance: callers must also have resolved the exact
 /// source through ResolveUpgradeChat and attached its confirmed replacement.
 pub fn is_upgrade_recovery(source: &Session, replacement: &Session) -> bool {
+    if crate::upgrade::floor::load()
+        .is_ok_and(|ledger| ledger.history_replacement(source, replacement))
+    {
+        return true;
+    }
     let Some((old, new)) = source.proof.as_ref().zip(replacement.proof.as_ref()) else {
         return false;
     };
@@ -737,6 +742,16 @@ pub fn is_upgrade_recovery(source: &Session, replacement: &Session) -> bool {
 /// no authority by itself; only an authenticated `ChatPrepareResume` answer on
 /// the same daemon stream may produce one.
 pub fn is_retained_resume_successor(source: &Session, successor: &Session) -> bool {
+    if crate::upgrade::floor::load().is_ok_and(|ledger| ledger.resume_source(source).is_some())
+        && source.launch.session_id.is_some()
+    {
+        let mut expected = source.clone();
+        expected.reset_owned_codex_listener();
+        expected.id = successor.id;
+        expected.proof = None;
+        expected.terminal = None;
+        return source.id != successor.id && expected == *successor;
+    }
     let valid = |id: &String| uuid::Uuid::parse_str(id).is_ok();
     // A pane whose actor never reported its conversation resumes the one the
     // daemon proved that actor confirmed, or, when it confirmed none, starts
@@ -982,7 +997,8 @@ impl Session {
     /// A saved transcript is eligible for the forced, read-only history API.
     /// This shape is never authority to launch, close or resume a provider.
     pub(crate) fn is_saved_claude_history(&self) -> bool {
-        self.launch.provider == Provider::Claude
+        (self.launch.provider == Provider::Claude
+            || crate::upgrade::floor::load().is_ok_and(|ledger| ledger.source(self.id).is_some()))
             && matches!(self.native_continuity, NativeContinuity::ReconnectOnly)
             && self.terminal.is_none()
             && self.owned_codex_listener.is_none()
@@ -990,11 +1006,16 @@ impl Session {
                 .proof
                 .as_ref()
                 .is_some_and(crate::model::HostSessionProof::is_complete)
-            && self
+            && (self
                 .launch
                 .session_id
                 .as_ref()
                 .is_some_and(|id| id.len() == 36 && uuid::Uuid::parse_str(id).is_ok())
+                || crate::upgrade::floor::load().is_ok_and(|ledger| {
+                    ledger
+                        .resume_source(self)
+                        .is_some_and(|source| source.launch.session_id == self.launch.session_id)
+                }))
     }
 
     /// Import an installed capability observed on this exact authenticated

@@ -32,6 +32,9 @@ pub struct TerminalConfig {
     pub execution_environment: Option<super::ipc::ChatExecutionEnvironment>,
     /// Daemon-issued identity for child-agent tools, never a durable recipe.
     pub agent_authority: crate::agent_execution::Authority,
+    /// Exact launching daemon, while its thin console waits for startup.
+    /// This transient proof is not part of the durable terminal recipe.
+    pub console_startup_owner: Option<crate::model::HostSessionProof>,
     /// Take over the terminal a previous daemon left to its holder, which
     /// waits on this socket, instead of starting the session's launch.
     pub adoption: Option<std::path::PathBuf>,
@@ -60,6 +63,7 @@ impl Default for TerminalConfig {
             transcript_max_bytes: DEFAULT_TRANSCRIPT_MAX_BYTES,
             execution_environment: None,
             agent_authority: Default::default(),
+            console_startup_owner: None,
             adoption: None,
             #[cfg(feature = "host")]
             holder_recovery: None,

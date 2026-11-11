@@ -186,6 +186,12 @@ pub(super) fn restore_with_admission(
     source: &Session,
     mut admission: Option<capacity::Reservation>,
 ) -> Result<ServerResponse, String> {
+    if crate::upgrade::floor::load()?.blocks_id(source.id) {
+        return Err(
+            "This conversation was stopped for the update; its earlier provider is not attached"
+                .into(),
+        );
+    }
     // Main's durable holder format has no immutable account-home proof.
     super::super::account_lifecycle::ensure_idle(host).map_err(|error| error.message)?;
     let proof = {
@@ -557,8 +563,9 @@ pub(in crate::host) fn restore_orphaned_native(
         .proof()
         .clone();
     let directory = registry::directory(Kind::Native)?;
+    let stopped = crate::upgrade::floor::load()?;
     for record in registry::recovery_candidates(&directory, &proof.boot_id, Kind::Native)? {
-        if refused.contains(&record.terminal) {
+        if stopped.blocks_id(record.terminal) || refused.contains(&record.terminal) {
             continue;
         }
         if host

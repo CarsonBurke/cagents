@@ -36,7 +36,9 @@ pub(super) mod channel_work;
 #[cfg(test)]
 mod channel_work_integration_tests;
 pub(super) use automations::Claimed;
+pub(super) mod console_relaunch;
 mod execution;
+pub(super) mod floor;
 pub(super) use execution::ResidentRelease;
 mod lineage;
 mod mailbox;
@@ -54,7 +56,7 @@ mod views;
 #[cfg(test)]
 mod workspace_snapshot_tests;
 
-const SCHEMA_VERSION: u32 = 23;
+const SCHEMA_VERSION: u32 = 24;
 
 /// A writer that loses a race waits rather than failing. Only the daemon writes
 /// this store, so contention is between its own client threads and is measured
@@ -743,6 +745,10 @@ fn migrate_through(
     if version < 23 && target >= 23 {
         views::store::migrate(tx)?;
         schema::migration_checkpoint(23)?;
+    }
+    if version < 24 && target >= 24 {
+        console_relaunch::migrate(tx)?;
+        schema::migration_checkpoint(24)?;
     }
     Ok(())
 }

@@ -1134,6 +1134,22 @@ pub struct UiUpdateGuard {
 }
 
 impl UiUpdateGuard {
+    /// Retain this exact exclusive fence through an authenticated recovery.
+    /// A plain File duplicate closes without explicitly unlocking its parent.
+    pub(crate) fn duplicate_for_recovery(&self) -> io::Result<(File, File)> {
+        let fence = self
+            .lock
+            .as_ref()
+            .ok_or_else(|| io::Error::other("update launch fence was released"))?
+            .try_clone()?;
+        Ok((fence, self._legacy_fence.try_clone()?))
+    }
+
+    /// Exact slots frozen by this update, for an explicitly authorized recovery.
+    pub(crate) fn prepared_window_slots(&self) -> &[String] {
+        &self.prepared
+    }
+
     /// The authenticated windows while this guard is held. Its shared legacy
     /// fence already excludes a legacy exclusive UI owner, so absence of
     /// window leases means no windows; probing legacy exclusivity again would
@@ -1218,10 +1234,18 @@ impl UiUpdateGuard {
         timeout: Duration,
         preflight: impl FnOnce(&Self) -> io::Result<()>,
     ) -> io::Result<Vec<String>> {
+        let slots = self.prepare_windows(timeout)?;
+        preflight(self)?;
+        self.close_prepared_windows(&slots, timeout)?;
+        Ok(slots)
+    }
+
+    /// Flush and freeze windows while a candidate asks for destructive consent.
+    /// Dropping the guard cancels preparation without closing a window.
+    pub(crate) fn prepare_windows(&mut self, timeout: Duration) -> io::Result<Vec<String>> {
         let deadline = std::time::Instant::now() + timeout;
         let slots = running_window_slots(&self.runtime)?;
         for slot in &slots {
-            // Include a possibly timed-out participant in cancellation.
             self.prepared.push(slot.clone());
             update_window(
                 &self.runtime,
@@ -1230,14 +1254,17 @@ impl UiUpdateGuard {
                 deadline.saturating_duration_since(std::time::Instant::now()),
             )?;
         }
-        preflight(self)?;
-        if std::time::Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "Source inspection exceeded the window preparation allowance; source windows remain usable",
-            ));
-        }
-        for slot in &slots {
+        Ok(slots)
+    }
+
+    /// Human review has no window-RPC deadline. Closing gets its own budget.
+    pub(crate) fn close_prepared_windows(
+        &mut self,
+        slots: &[String],
+        timeout: Duration,
+    ) -> io::Result<()> {
+        let deadline = std::time::Instant::now() + timeout;
+        for slot in slots {
             // A lost ACK cannot prove that the UI did not accept an irreversible close.
             self.closed.push(slot.clone());
             update_window(
@@ -1257,7 +1284,21 @@ impl UiUpdateGuard {
             std::thread::sleep(Duration::from_millis(25));
         }
         self.prepared.clear();
-        Ok(slots)
+        Ok(())
+    }
+
+    /// Finish a staged update without reopening windows that never closed.
+    /// On a partial close, Drop cancels the remaining prepared windows and waits
+    /// for committed windows to exit before reopening only those slots.
+    pub(crate) fn relaunch_closed_windows(mut self, executable: &Path) -> io::Result<()> {
+        if self.prepared.is_empty() {
+            let closed = self.closed.clone();
+            self.relaunch_windows(&closed, executable)
+        } else {
+            self.set_fallback_executable(executable.to_owned());
+            drop(self);
+            Ok(())
+        }
     }
 
     pub fn relaunch_windows(mut self, slots: &[String], executable: &Path) -> io::Result<()> {
@@ -1319,6 +1360,13 @@ pub(crate) fn relaunch_failure(windows: usize, errors: &[(&str, String)]) -> Str
 }
 
 pub(crate) const INSTALL_GUARD_ENV: &str = "CAGENTS_UI_UPDATE_GUARD_FD";
+pub(crate) fn update_recovery_fences() -> io::Result<(PathBuf, PathBuf)> {
+    let runtime = runtime_directory()?;
+    Ok((
+        runtime.join(format!("{APPLICATION_LOCK_FILE}.update")),
+        runtime.join(APPLICATION_LOCK_FILE),
+    ))
+}
 const INSTALL_GUARD_FD: i32 = 197;
 
 /// Verify the inherited open-file description owns the active exclusive fence.
@@ -3022,6 +3070,99 @@ mod tests {
             );
             worker.join().unwrap();
         }
+    }
+
+    #[test]
+    fn relaunch_closed_windows_cancels_open_prepared_windows_and_preserves_their_leases() {
+        let runtime = tempdir().unwrap();
+        let lock = owned_lock(
+            &runtime
+                .path()
+                .join(format!("{APPLICATION_LOCK_FILE}.update")),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+        .unwrap();
+        let legacy =
+            owned_lock(&runtime.path().join(APPLICATION_LOCK_FILE), libc::LOCK_SH).unwrap();
+        let mut leases = Vec::new();
+        let mut workers = Vec::new();
+        for slot in [PRIMARY_WINDOW, "window-2"] {
+            leases.push(
+                owned_lock(&runtime.path().join(slot_lock_name(slot)), libc::LOCK_EX).unwrap(),
+            );
+            let listener =
+                std::os::unix::net::UnixListener::bind(runtime.path().join(slot_socket_name(slot)))
+                    .unwrap();
+            listener.set_nonblocking(true).unwrap();
+            workers.push(std::thread::spawn(move || {
+                let mut actions = Vec::new();
+                for _ in 0..2 {
+                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    let stream = loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => break stream,
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                assert!(
+                                    std::time::Instant::now() < deadline,
+                                    "prepared window was not cancelled"
+                                );
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                            Err(error) => panic!("window accept: {error}"),
+                        }
+                    };
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(1)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(1)))
+                        .unwrap();
+                    actions.push(read_capped_line(&stream).unwrap());
+                    writeln!(&stream, "ok").unwrap();
+                }
+                actions
+            }));
+        }
+        let mut guard = UiUpdateGuard {
+            lock: Some(lock),
+            runtime: runtime.path().into(),
+            _legacy_fence: legacy,
+            prepared: Vec::new(),
+            closed: Vec::new(),
+            fallback_executable: None,
+        };
+        let slots = guard.prepare_windows(Duration::from_secs(5)).unwrap();
+        assert_eq!(slots.len(), 2);
+        // A cancelled stop prompt and a failure before commit both arrive here:
+        // the original windows are still running and must simply unfreeze.
+        guard
+            .relaunch_closed_windows(&runtime.path().join("must-not-launch"))
+            .unwrap();
+        for worker in workers {
+            assert_eq!(worker.join().unwrap(), ["update-prepare", "update-cancel"]);
+        }
+        assert_eq!(running_window_slots(runtime.path()).unwrap(), slots);
+        for slot in &slots {
+            assert!(
+                owned_lock(
+                    &runtime.path().join(slot_lock_name(slot)),
+                    libc::LOCK_EX | libc::LOCK_NB,
+                )
+                .is_err(),
+                "the original window lost its lease"
+            );
+        }
+        assert!(
+            owned_lock(
+                &runtime
+                    .path()
+                    .join(format!("{APPLICATION_LOCK_FILE}.update")),
+                libc::LOCK_EX | libc::LOCK_NB,
+            )
+            .is_ok(),
+            "the cancelled update retained the launch fence"
+        );
+        drop(leases);
     }
 
     #[test]

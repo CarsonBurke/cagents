@@ -392,6 +392,29 @@ fn coordinated_release_mode(
     let maintenance = restart == Some("handoff-maintenance-failure");
     let bootstrap = restart == Some("handoff-bootstrap");
     let direct_bash = restart == Some("handoff-bash");
+    let pending_standalone = matches!(
+        coordinator,
+        "pending-standalone" | "pending-standalone-supplied"
+    );
+    let ordinary_start_failure = matches!(
+        coordinator,
+        "first-start-failure"
+            | "absent-start-failure"
+            | "serving-start-failure"
+            | "first-start-checkpoint"
+            | "absent-start-checkpoint"
+    );
+    let first_start_checkpoint = matches!(
+        coordinator,
+        "first-start-checkpoint" | "absent-start-checkpoint"
+    );
+    let absent_source = matches!(
+        coordinator,
+        "first-start-failure"
+            | "absent-start-failure"
+            | "first-start-checkpoint"
+            | "absent-start-checkpoint"
+    );
     let home = tempfile::tempdir().unwrap();
     let coordinator_bin = home.path().join("coordinator-bin");
     fs::create_dir(&coordinator_bin).unwrap();
@@ -407,7 +430,10 @@ fn coordinated_release_mode(
         "cagents install root\n",
     )
     .unwrap();
-    if coordinator != "initial-independent" {
+    if !matches!(
+        coordinator,
+        "initial-independent" | "first-start-failure" | "first-start-checkpoint"
+    ) {
         std::os::unix::fs::symlink("versions/old", prefix.join("current")).unwrap();
     }
     let status = r#"#!/bin/sh
@@ -464,6 +490,17 @@ if [ "$FIXTURE_HANDOFF" = true ]; then
   esac
 fi
 case "$*" in
+  'daemon inspect-pending-update-recovery --candidate-cli '*)
+    [ "$CLI" = new ] && { [ "$#" -eq 4 ] || { [ "$#" -eq 6 ] && [ "$5" = --census ]; }; } || exit 98
+    [ "$4" = "$FIXTURE_PREFIX/versions/9.9.9/bin/cagents" ] || exit 98
+    printf 'pending-inspect\n' >> "$FIXTURE_CENSUS_LOG"
+    if [ -e "$FIXTURE_CHECKPOINT" ]; then
+      printf "Run '%s' --no-start daemon recover-update --checkpoint fixture-digest --yes" "$4" >&2
+      if [ "$#" -eq 6 ]; then printf " --census '%s'" "$6" >&2; fi
+      printf '\n' >&2
+      exit 1
+    fi
+    ;;
   'daemon capture-update-census --output '*)
     [ "$CLI" = new ] && [ "$#" -eq 4 ] || exit 98
     if [ "$FIXTURE_RESTART" = census-capture-failure ]; then
@@ -476,13 +513,21 @@ case "$*" in
   'daemon verify-update-census --census '*' --outcome '*)
     [ "$CLI" = new ] || exit 98
     case "$#:$7:$8" in
-      6::|7:--allow-absent:|7:--require-original:|7:--validate-only:|8:--require-original:--allow-absent) ;;
+      6::|7:--allow-absent:|7:--require-original:|7:--require-absent:|7:--validate-only:|8:--require-original:--allow-absent) ;;
       *) exit 98 ;;
     esac
     printf 'verify\n' >> "$FIXTURE_CENSUS_LOG"
     if [ ! -f "$4" ] || [ "$FIXTURE_RESTART" = provided-census-malformed ]; then
       fixture_recovery_receipt "$6" "unverified" "invalid_census"
       printf 'The supplied private census is invalid.\n' >&2
+      exit 1
+    fi
+    if [ "$#" -eq 7 ] && [ "$7" = --require-absent ]; then
+      if [ ! -e "$FIXTURE_RUNNING" ] && [ ! -s "$4" ] && [ ! -e "$FIXTURE_CHECKPOINT" ]; then
+        fixture_recovery_receipt "$6" "no_source" ""
+        exit 0
+      fi
+      fixture_recovery_receipt "$6" "unverified" "source_or_pending_recovery_exists"
       exit 1
     fi
     if [ "$#" -eq 7 ] && [ "$7" = --validate-only ]; then
@@ -512,11 +557,12 @@ case "$*" in
     fixture_recovery_receipt "$6" "usable" ""
     ;;
   'daemon inspect-update-recovery --census '*' --outcome '*)
-    [ "$CLI" = new ] && [ "$#" -eq 6 ] || exit 98
+    [ "$CLI" = new ] && [ "$#" -eq 8 ] && [ "$7" = --candidate-cli ] || exit 98
+    [ "$8" = "$FIXTURE_PREFIX/versions/9.9.9/bin/cagents" ] || exit 98
     printf 'inspect\n' >> "$FIXTURE_CENSUS_LOG"
     if [ -e "$FIXTURE_CHECKPOINT" ]; then
       fixture_recovery_receipt "$6" "needs_target_recovery" "Prepared"
-      printf 'Prepared sessions require target recovery. Inspect with --no-start daemon status and --no-start terminal list.\n' >&2
+      printf "Run '%s' --no-start daemon recover-update --checkpoint fixture-digest --yes --census '%s'\n" "$8" "$4" >&2
       exit 1
     fi
     fixture_recovery_receipt "$6" "restart_permitted" ""
@@ -611,6 +657,12 @@ case "$*" in
     [ "$FIXTURE_RESTART" != prepare-failure ] || exit 3
     [ "$(readlink "$FIXTURE_PREFIX/current")" = versions/old ] || exit 98
     printf '%s\n' exact-conversation-and-shells > "$FIXTURE_CHECKPOINT"
+    if [ "$FIXTURE_RESTART" = pre-switch-recovery ]; then
+      printf 'new\n' > "$FIXTURE_RUNNING"
+      cp "$FIXTURE_CHECKPOINT" "$FIXTURE_RESTORED"
+      printf 'external:ready\n' >> "$FIXTURE_ACTIONS"
+      exit 3
+    fi
     touch "$FIXTURE_PENDING"
     printf '{"ok":true,"command":"daemon.prepare_upgrade","data":{"terminals":%s,"chats":1}}\n' "$FIXTURE_TERMINALS"
     ;;
@@ -624,6 +676,12 @@ case "$*" in
   'daemon start')
     [ "$#" -eq 2 ] || exit 98
     printf '%s:start\n' "$CLI" >> "$FIXTURE_ACTIONS"
+    if [ "$CLI" = new ] && [ "$FIXTURE_ORDINARY_START_FAILURE" = true ]; then
+      if [ "$FIXTURE_FIRST_START_CHECKPOINT" = true ]; then
+        printf 'startup-created-checkpoint\n' > "$FIXTURE_CHECKPOINT"
+      fi
+      exit 4
+    fi
     if [ "$CLI" = new ] && { [ "$FIXTURE_RESTART" = start-failure ] || [ "$FIXTURE_RESTART" = empty-start-failure ] || [ "$FIXTURE_RESTART" = handoff-start-failure ] || [ "$FIXTURE_RESTART" = handoff-maintenance-failure ] || [ "$FIXTURE_RESTART" = empty-recovery-unready ]; }; then exit 4; fi
     if [ -e "$FIXTURE_CHECKPOINT" ]; then
       [ ! -e "$FIXTURE_RUNNING" ] && [ ! -e "$FIXTURE_PENDING" ] || exit 98
@@ -900,7 +958,9 @@ os.execv(target, [target, *sys.argv[1:]])
         // Prepare/checkpoint already completed in the worker; the installer
         // receives a held lock and no running service, just as after shutdown.
         fs::write(&checkpoint, "exact-conversation-and-shells\n").unwrap();
-    } else if !handoff && coordinator != "stage-no-source" {
+    } else if pending_standalone {
+        fs::write(&checkpoint, "exact-conversation-and-shells\n").unwrap();
+    } else if !handoff && !absent_source && coordinator != "stage-no-source" {
         fs::write(&running, "old\n").unwrap();
     }
     let runtime = home.path().join("runtime");
@@ -1099,7 +1159,10 @@ with open(os.environ['FIXTURE_LEASE_PATH'], 'r+') as contender:
     if restart == Some("handoff-orphan-ui") {
         command.env_remove("CAGENTS_UI_UPDATE_GUARD_FD");
     }
-    if handoff || restart.is_some_and(|mode| mode.starts_with("provided-census-")) {
+    if handoff
+        || restart.is_some_and(|mode| mode.starts_with("provided-census-"))
+        || coordinator == "pending-standalone-supplied"
+    {
         command.env("CAGENTS_INSTALL_CENSUS_PATH", &census);
     } else {
         command.env_remove("CAGENTS_INSTALL_CENSUS_PATH");
@@ -1114,6 +1177,14 @@ with open(os.environ['FIXTURE_LEASE_PATH'], 'r+') as contender:
         .env("XDG_CONFIG_HOME", home.path().join("config"))
         .env("XDG_RUNTIME_DIR", &runtime)
         .env("FIXTURE_HANDOFF", handoff.to_string())
+        .env(
+            "FIXTURE_ORDINARY_START_FAILURE",
+            ordinary_start_failure.to_string(),
+        )
+        .env(
+            "FIXTURE_FIRST_START_CHECKPOINT",
+            first_start_checkpoint.to_string(),
+        )
         .env("FIXTURE_MAINTENANCE", maintenance.to_string())
         .env("FIXTURE_BOOTSTRAP", bootstrap.to_string())
         .env("FIXTURE_BOOTSTRAP_POISON", &bootstrap_poison)
@@ -1472,6 +1543,129 @@ with open(os.environ['FIXTURE_LEASE_PATH'], 'r+') as contender:
                 .any(|probe| probe == "inspect"),
             "a verified live recovery writer must not enter stopped-source inspection"
         );
+        return;
+    }
+    if pending_standalone {
+        assert!(!output.status.success(), "{output:?}");
+        assert_eq!(
+            fs::read_link(prefix.join("current")).unwrap(),
+            Path::new("versions/old")
+        );
+        assert!(prefix.join("versions/9.9.9/bin/cagents").exists());
+        assert_eq!(
+            fs::read_to_string(&checkpoint).unwrap(),
+            "exact-conversation-and-shells\n"
+        );
+        assert_eq!(fs::read_to_string(&census).unwrap(), inventory);
+        assert_eq!(
+            fs::read_to_string(&census_log).unwrap(),
+            "pending-inspect\n"
+        );
+        assert!(fs::read_to_string(&actions).unwrap_or_default().is_empty());
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        let command = format!(
+            "'{}' --no-start daemon recover-update --checkpoint fixture-digest --yes",
+            prefix.join("versions/9.9.9/bin/cagents").display()
+        );
+        assert!(diagnostic.contains(&command), "{diagnostic}");
+        if coordinator == "pending-standalone-supplied" {
+            assert!(diagnostic.contains(&format!("--census '{}'", census.display())));
+        }
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("your sessions are ready"));
+        return;
+    }
+    if restart == Some("pre-switch-recovery") {
+        assert!(!output.status.success(), "{output:?}");
+        assert_eq!(
+            fs::read_link(prefix.join("current")).unwrap(),
+            Path::new("versions/old")
+        );
+        assert!(prefix.join("versions/9.9.9/bin/cagents").exists());
+        assert_eq!(fs::read_to_string(&running).unwrap(), "new\n");
+        assert_eq!(fs::read(&checkpoint).unwrap(), fs::read(&restored).unwrap());
+        assert_eq!(
+            fs::read_to_string(&actions).unwrap(),
+            "old:help\nold:prepare\nexternal:ready\n"
+        );
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&fs::read(&outcome).unwrap()).unwrap();
+        assert_eq!(receipt["outcome"]["state"], "usable");
+        assert!(
+            !fs::read_to_string(&census_log)
+                .unwrap()
+                .lines()
+                .any(|probe| probe == "inspect")
+        );
+        return;
+    }
+    if ordinary_start_failure {
+        assert_eq!(
+            output.status.success(),
+            absent_source && !first_start_checkpoint,
+            "{output:?}"
+        );
+        assert_eq!(
+            fs::read_link(prefix.join("current")).unwrap(),
+            Path::new(if absent_source {
+                "versions/9.9.9"
+            } else {
+                "versions/old"
+            })
+        );
+        assert_eq!(fs::read_to_string(&actions).unwrap(), "new:start\n");
+        assert_eq!(checkpoint.exists(), first_start_checkpoint);
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("your sessions are ready"));
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&fs::read(&outcome).unwrap()).unwrap();
+        if absent_source {
+            assert!(prefix.join("versions/9.9.9/bin/cagents").exists());
+            assert!(
+                home.path()
+                    .join("config/autostart/dev.cagents.Cagents.Daemon.desktop")
+                    .is_symlink()
+            );
+            assert!(!running.exists());
+            if first_start_checkpoint {
+                assert!(
+                    !String::from_utf8_lossy(&output.stdout)
+                        .contains("will start at graphical login")
+                );
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains("absence is no longer proven")
+                );
+                assert_eq!(
+                    fs::read_to_string(&checkpoint).unwrap(),
+                    "startup-created-checkpoint\n"
+                );
+                assert_eq!(receipt["outcome"]["state"], "unverified");
+            } else {
+                assert!(
+                    String::from_utf8_lossy(&output.stdout)
+                        .contains("will start at graphical login")
+                );
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains("daemon start command failed")
+                );
+                assert_eq!(
+                    receipt["outcome"]["state"], "no_source",
+                    "file publication cannot mint readiness"
+                );
+            }
+        } else {
+            assert_eq!(fs::read_to_string(&running).unwrap(), "old\n");
+            assert!(!prefix.join("versions/9.9.9").exists());
+            assert!(
+                !String::from_utf8_lossy(&output.stdout).contains("will start at graphical login")
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("replacement daemon startup failed")
+            );
+            assert_eq!(
+                receipt["outcome"]["state"], "usable",
+                "the original service remains verified after rollback"
+            );
+        }
         return;
     }
     if restart == Some("census-capture-failure")
@@ -2120,4 +2314,45 @@ fn recovery_bundle_direct_bash_enables_alias_isolation_before_any_utility() {
         "recovery_bundle_direct_bash_enables_alias_isolation_before_any_utility",
         &["handoff-bash"],
     );
+}
+
+#[test]
+fn ordinary_no_current_or_absent_source_installs_keep_files_when_first_start_fails() {
+    for coordinator in ["first-start-failure", "absent-start-failure"] {
+        coordinated_release_mode(true, 0, None, None, None, coordinator, false);
+    }
+}
+
+#[test]
+fn ordinary_serving_source_start_failure_still_fails_and_rolls_back() {
+    for terminals in [0, 7] {
+        coordinated_release_mode(
+            true,
+            terminals,
+            None,
+            None,
+            None,
+            "serving-start-failure",
+            false,
+        );
+    }
+}
+
+#[test]
+fn failed_first_start_cannot_hide_a_new_checkpoint_behind_earlier_absence() {
+    for coordinator in ["first-start-checkpoint", "absent-start-checkpoint"] {
+        coordinated_release_mode(true, 0, None, None, None, coordinator, false);
+    }
+}
+
+#[test]
+fn standalone_pending_retry_keeps_original_scope_and_prints_explicit_recovery_command() {
+    for coordinator in ["pending-standalone", "pending-standalone-supplied"] {
+        coordinated_release_mode(true, 7, None, None, None, coordinator, false);
+    }
+}
+
+#[test]
+fn serving_target_recovery_before_current_switch_is_retained_without_old_restart() {
+    upgrade_fixture(true, 7, None, Some("pre-switch-recovery"));
 }

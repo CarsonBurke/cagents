@@ -149,7 +149,7 @@ impl Staged {
     }
 }
 
-fn inherit(command: &mut Command, fd: i32) {
+pub(super) fn inherit(command: &mut Command, fd: i32) {
     // SAFETY: the caller keeps the File alive through spawn; only an
     // async-signal-safe descriptor operation executes in the child.
     unsafe {

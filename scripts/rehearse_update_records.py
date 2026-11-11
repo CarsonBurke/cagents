@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 from contextlib import closing
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import sys
 from typing import Any
@@ -160,6 +162,53 @@ def processes(root: Path, errors: list[str] | None = None) -> list[dict]:
     return sorted(result, key=lambda row: row["pid"])
 
 
+def prepare_recovery(root: Path, out: Path) -> bool:
+    """Copy this job's evidence verbatim; never choose a receipt by mtime."""
+    state = root / "home/.local/share/cagents-install/.update"
+    if not (state / "status.json").exists():
+        return False
+    status = read_json(state / "status.json")
+    job = status["id"]
+    if not isinstance(job, str) or not re.fullmatch(r"[0-9a-fA-F-]{36}", job):
+        raise ValueError("invalid update transaction identity")
+    paths = [state / f"{job}.{suffix}.json" for suffix in ("census", "recovery")]
+    if not all(path.is_file() for path in paths):
+        # An update refused before shutdown need not issue a recovery receipt.
+        # It must still pass the ordinary exact before/after preservation checks.
+        if status.get("phase") == "Complete":
+            raise ValueError(f"completed update {job} has no paired census and readiness evidence")
+        return False
+    version = status.get("version")
+    if not isinstance(version, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.+_-]{0,127}", version):
+        raise ValueError("invalid update target version")
+    for suffix, name in (("census", "recovery-census"), ("recovery", "recovery-issued")):
+        source = state / f"{job}.{suffix}.json"
+        (out / f"{name}.json").write_bytes(source.read_bytes())
+    # A restored old current may predate the verifier. The staged target owns
+    # the protocol bridge and receipt schema for this exact update job.
+    print(root / "home/.local/share/cagents-install/versions" / version / "bin/cagents")
+    return True
+
+
+def recovery_evidence(out: Path, errors: list[str]) -> dict | None:
+    census_file = out / "recovery-census.json"
+    error_file = out / "recovery-error.txt"
+    if error_file.exists():
+        errors.append(f"recovery evidence: {error_file.read_text().strip()}")
+        return None
+    if not census_file.exists():
+        return None
+    try:
+        raw = census_file.read_bytes()
+        evidence = {"census": json.loads(raw), "digest": hashlib.sha256(raw).hexdigest(),
+                    "issued": read_json(out / "recovery-issued.json"),
+                    "current": read_json(out / "recovery-current.json")}
+        return evidence
+    except (OSError, ValueError) as error:
+        errors.append(f"recovery evidence: {error}")
+        return None
+
+
 def record(root: Path, out: Path, windows: Path | None) -> dict:
     errors: list[str] = []
     snapshot = {"schema": 1, "root": str(root), "errors": errors}
@@ -169,6 +218,11 @@ def record(root: Path, out: Path, windows: Path | None) -> dict:
         if "" in indexed or len(indexed) != len(rows):
             errors.append(f"{name}: missing or duplicate stable identity")
         snapshot[name] = indexed
+    try:
+        snapshot["serving"] = read_json(out / "terminals.json").get("data", {}).get("proof")
+    except (OSError, ValueError, AttributeError):
+        snapshot["serving"] = None
+    snapshot["recovery"] = recovery_evidence(out, errors)
     snapshot["stores"] = stores(root / "home", errors)
     snapshot["processes"] = processes(root, errors)
     snapshot["windows"] = {}
@@ -244,8 +298,49 @@ def panes(snapshot: dict) -> dict:
     return result
 
 
+def verified_pauses(before: dict, after: dict) -> tuple[set[str], set[str]]:
+    """Receipts establish disposition; before records establish exact identity."""
+    evidence = after.get("recovery")
+    if not isinstance(evidence, dict):
+        return set(), set()
+    census, issued, current = (evidence.get(name, {}) for name in ("census", "issued", "current"))
+    source = census.get("source")
+    if (not isinstance(source, dict) or not source or source != before.get("serving")
+            or any(not isinstance(source.get(field), str) or not source[field]
+                   for field in ("host_session_id", "boot_id", "host_incarnation"))):
+        return set(), set()
+    for receipt in (issued, current):
+        if (receipt.get("version") != 1 or census.get("version") != 1
+                or receipt.get("transaction") != census.get("transaction")
+                or receipt.get("census_digest") != evidence.get("digest")
+                or receipt.get("checkpoint_before") != census.get("checkpoint_before")):
+            return set(), set()
+    outcome = current.get("outcome", {})
+    if (issued.get("outcome") != outcome or outcome.get("state") != "usable"
+            or not isinstance(outcome.get("serving"), dict)
+            or outcome.get("serving") != after.get("serving")):
+        return set(), set()
+    chat_proofs = {card["content"].get("id"): card["content"].get("proof")
+                   for card in panes(before).values()
+                   if card.get("kind_tag") == "chat" and isinstance(card.get("content"), dict)}
+    chat_ids = {row.get("id") for row in before["sessions"].values()}
+    expected_chats = {row["id"] for row in census.get("chats", [])
+                      if row.get("id") in chat_ids and row.get("proof") == source
+                      and chat_proofs.get(row.get("id")) == source}
+    expected_terminals = {row["id"] for row in census.get("terminals", [])
+                          if row.get("id") in before["terminals"]}
+    chats, terminals = outcome.get("paused_chats", []), outcome.get("paused_terminals", [])
+    if (not isinstance(chats, list) or not isinstance(terminals, list)
+            or not all(isinstance(item, str) for item in chats + terminals)
+            or len(set(chats)) != len(chats) or len(set(terminals)) != len(terminals)
+            or not set(chats) <= expected_chats or not set(terminals) <= expected_terminals):
+        return set(), set()
+    return set(chats), set(terminals)
+
+
 def compare(before: dict, after: dict) -> list[dict]:
     changes = []
+    paused_chats, paused_terminals = verified_pauses(before, after)
     for side, snapshot in (("before", before), ("after", after)):
         for error in snapshot["errors"]:
             changes.append({"kind": "evidence", "id": side, "change": str(error), "regression": True})
@@ -253,9 +348,21 @@ def compare(before: dict, after: dict) -> list[dict]:
         left = panes(before) if name == "panes" else before[name]
         right = panes(after) if name == "panes" else after[name]
         for key, original in sorted(left.items()):
+            session = original.get("agent", {}).get("session") if name == "agents" else None
+            chat = session.get("Chat") if isinstance(session, dict) else None
+            paused_agent = (isinstance(chat, dict) and chat.get("id") in paused_chats
+                            and chat.get("proof") == before.get("serving"))
+            paused = ((name == "sessions" and original.get("id") in paused_chats)
+                      or (name == "terminals" and key in paused_terminals))
             if key not in right:
-                changes.append({"kind": name, "id": key, "change": "disappeared", "regression": True})
+                changes.append({"kind": name, "id": key,
+                                "change": "verified paused by update" if paused else "disappeared",
+                                "regression": not paused})
                 continue
+            if (name == "panes" and original.get("session_id") in paused_chats
+                    and original.get("content") != right[key].get("content")):
+                changes.append({"kind": name, "id": key,
+                                "change": "paused chat descriptor changed", "regression": True})
             a, b = project(original, name), project(right[key], name)
             for field in sorted(a.keys() | b.keys()):
                 if a.get(field) != b.get(field):
@@ -267,9 +374,12 @@ def compare(before: dict, after: dict) -> list[dict]:
                     # provider-named thread, the focused pane in a window's
                     # title. Only a title that goes blank was lost.
                     retitled = field == "title" and (name == "windows" or bool(b.get(field)))
+                    verified_pause = ((paused and field in {"state", "failure", "exit", "attached"})
+                                      or (paused_agent and field == "state"))
                     changes.append({"kind": name, "id": key, "change": field,
                                     "before": a.get(field), "after": b.get(field),
-                                    "regression": not (healthy_state or resumed_id or retitled)})
+                                    "regression": not (healthy_state or resumed_id or retitled or verified_pause),
+                                    **({"disposition": "verified paused by update"} if verified_pause else {})})
         for key in sorted(right.keys() - left.keys()):
             changes.append({"kind": name, "id": key, "change": "added", "regression": False})
     current = {(row["pid"], row["start_ticks"]): row for row in after["processes"]}
@@ -294,12 +404,17 @@ def main() -> int:
     capture.add_argument("root", type=Path)
     capture.add_argument("out", type=Path)
     capture.add_argument("--windows", type=Path)
+    recovery = commands.add_parser("prepare-recovery")
+    recovery.add_argument("root", type=Path)
+    recovery.add_argument("out", type=Path)
     comparison = commands.add_parser("compare")
     comparison.add_argument("before", type=Path)
     comparison.add_argument("after", type=Path)
     comparison.add_argument("--json", action="store_true")
     args = parser.parse_args()
     try:
+        if args.command == "prepare-recovery":
+            return 0 if prepare_recovery(args.root.resolve(), args.out) else 1
         if args.command == "record":
             snapshot = record(args.root.resolve(), args.out, args.windows)
             print(args.out / "snapshot.json")
@@ -312,6 +427,8 @@ def main() -> int:
                 detail = ""
                 if "before" in change:
                     detail = f" {json.dumps(change['before'], sort_keys=True)} -> {json.dumps(change.get('after'), sort_keys=True)}"
+                if "disposition" in change:
+                    detail += f" ({change['disposition']})"
                 print(f"{'REGRESSION' if change['regression'] else 'CHANGE'} {change['kind']} {change['id']}: {change['change']}{detail}")
             if not changes:
                 print("No lost items or state changes.")

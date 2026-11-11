@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import importlib.util
+import copy
+import hashlib
 import json
 import fcntl
 from contextlib import closing
@@ -42,6 +44,27 @@ def snapshot() -> dict:
 
 
 class Comparison(unittest.TestCase):
+    def paused_replacement(self):
+        before, after = snapshot(), snapshot()
+        source = {"host_session_id": "source", "boot_id": "boot", "host_incarnation": "old"}
+        serving = {**source, "host_session_id": "target", "host_incarnation": "new"}
+        before["serving"], after["serving"] = source, serving
+        chat = {"id": "chat-old", "proof": source, "launch": {"session_id": "provider-issued-thread"}}
+        for value in (before, after):
+            value["stores"]["windows/main/sessions.sqlite3"]["rows"]["cards"].append({
+                "card_id": "chat-pane", "workspace_id": "workspace", "ordinal": 1,
+                "kind_tag": "chat", "existence": "open", "content": copy.deepcopy(chat)})
+        census = {"version": 1, "transaction": "12345678-1234-1234-1234-123456789abc",
+                  "source": source, "chats": [chat], "terminals": [], "checkpoint_before": None}
+        receipt = {"version": 1, "transaction": census["transaction"],
+                   "census_digest": hashlib.sha256(records.dump(census).encode()).hexdigest(),
+                   "checkpoint_before": None, "outcome": {"state": "usable", "serving": serving,
+                   "chats": 0, "terminals": 1, "paused_chats": ["chat-old"], "paused_terminals": []}}
+        after["recovery"] = {"census": census, "digest": receipt["census_digest"],
+                             "issued": receipt, "current": copy.deepcopy(receipt)}
+        del after["sessions"]["lineage"]
+        return before, after
+
     def test_same_record_does_not_lose_items(self):
         self.assertEqual(records.compare(snapshot(), snapshot()), [])
 
@@ -71,6 +94,91 @@ class Comparison(unittest.TestCase):
         self.assertFalse(any(row["regression"] for row in changes))
         after["sessions"]["lineage"]["state"] = "Stopped"
         self.assertTrue(any(row["regression"] for row in records.compare(before, after)))
+
+    def test_exact_receipt_accounted_chat_is_paused_not_lost_or_live(self):
+        before, after = self.paused_replacement()
+        changes = records.compare(before, after)
+        self.assertFalse(any(row["regression"] for row in changes), changes)
+        self.assertTrue(any(row["change"] == "verified paused by update" for row in changes))
+        after["sessions"]["lineage"] = {**before["sessions"]["lineage"], "state": "Stopped", "failure": "Update paused this chat"}
+        changes = records.compare(before, after)
+        self.assertFalse(any(row["regression"] for row in changes), changes)
+
+    def test_paused_acceptance_rejects_unbound_foreign_or_stale_receipt(self):
+        mutations = {
+            "transaction": lambda b, a: a["recovery"]["current"].update(transaction="foreign"),
+            "digest": lambda b, a: a["recovery"]["issued"].update(census_digest="foreign"),
+            "checkpoint": lambda b, a: a["recovery"]["current"].update(checkpoint_before="foreign"),
+            "not-ready": lambda b, a: a["recovery"]["current"]["outcome"].update(state="unverified"),
+            "other-serving-owner": lambda b, a: a.update(serving={**a["serving"], "host_incarnation": "foreign"}),
+            "other-source-owner": lambda b, a: b.update(serving={**b["serving"], "host_incarnation": "foreign"}),
+            "foreign-chat": lambda b, a: a["recovery"]["census"]["chats"][0].update(id="foreign"),
+            "foreign-pane-proof": lambda b, a: b["stores"]["windows/main/sessions.sqlite3"]["rows"]["cards"][1]["content"].update(proof={"host_session_id": "foreign"}),
+            "no-receipt": lambda b, a: a.pop("recovery"),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                before, after = self.paused_replacement()
+                mutate(before, after)
+                self.assertTrue(any(row["regression"] for row in records.compare(before, after)))
+
+    def test_verified_pause_still_requires_saved_pane_and_original_terminal_child(self):
+        before, after = self.paused_replacement()
+        after["stores"]["windows/main/sessions.sqlite3"]["rows"]["cards"].pop()
+        after["processes"] = []
+        regressions = [row for row in records.compare(before, after) if row["regression"]]
+        self.assertEqual({row["kind"] for row in regressions}, {"panes", "terminal-child"})
+
+    def test_verified_pause_does_not_accept_foreign_history_in_original_pane(self):
+        before, after = self.paused_replacement()
+        after["stores"]["windows/main/sessions.sqlite3"]["rows"]["cards"][1]["content"]["launch"]["session_id"] = "foreign-thread"
+        self.assertTrue(any(row["regression"] for row in records.compare(before, after)))
+
+    def test_paused_agent_state_requires_its_exact_source_chat_and_keeps_agent(self):
+        before, after = self.paused_replacement()
+        chat = before["stores"]["windows/main/sessions.sqlite3"]["rows"]["cards"][1]["content"]
+        before["agents"]["agent"]["agent"]["session"] = {"Chat": copy.deepcopy(chat)}
+        after["agents"]["agent"]["state"] = "Stopped"
+        self.assertFalse(any(row["regression"] for row in records.compare(before, after)))
+        before["agents"]["agent"]["agent"]["session"]["Chat"]["id"] = "foreign"
+        self.assertTrue(any(row["regression"] for row in records.compare(before, after)))
+        before["agents"]["agent"]["agent"]["session"]["Chat"]["id"] = "chat-old"
+        del after["agents"]["agent"]
+        self.assertTrue(any(row["regression"] for row in records.compare(before, after)))
+
+    def test_recovery_capture_keeps_raw_digest_and_requires_fresh_verifier(self):
+        before, after = self.paused_replacement()
+        evidence = after["recovery"]
+        with tempfile.TemporaryDirectory(prefix="rehearse-receipt-") as temporary:
+            root = Path(temporary)
+            state = root / "home/.local/share/cagents-install/.update"
+            out = root / "records/after"
+            state.mkdir(parents=True)
+            out.mkdir(parents=True)
+            job = evidence["census"]["transaction"]
+            (state / "status.json").write_text(records.dump({"id": job, "version": "candidate"}))
+            raw = records.dump(evidence["census"]).encode()
+            (state / f"{job}.census.json").write_bytes(raw)
+            (state / f"{job}.recovery.json").write_text(records.dump(evidence["issued"]))
+            self.assertTrue(records.prepare_recovery(root, out))
+            self.assertEqual((out / "recovery-census.json").read_bytes(), raw)
+            errors = []
+            self.assertIsNone(records.recovery_evidence(out, errors))
+            self.assertTrue(errors)
+            (out / "recovery-current.json").write_text(records.dump(evidence["current"]))
+            errors = []
+            captured = records.recovery_evidence(out, errors)
+            self.assertEqual(errors, [])
+            self.assertEqual(captured, evidence)
+            (state / "status.json").write_text(records.dump({"id": "../../foreign"}))
+            with self.assertRaises(ValueError):
+                records.prepare_recovery(root, out)
+            (state / f"{job}.recovery.json").unlink()
+            (state / "status.json").write_text(records.dump({"id": job, "phase": "Failed", "version": "candidate"}))
+            self.assertFalse(records.prepare_recovery(root, out))
+            (state / "status.json").write_text(records.dump({"id": job, "phase": "Complete", "version": "candidate"}))
+            with self.assertRaises(ValueError):
+                records.prepare_recovery(root, out)
 
     def test_titles_that_follow_content_are_changes_and_blank_titles_are_losses(self):
         before, after = snapshot(), snapshot()

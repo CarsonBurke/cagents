@@ -20,6 +20,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 VERSION = "9.9.9"
+JOB = "00000000-0000-4000-8000-000000000001"
 TOP = f"cagents-{VERSION}"
 ARCHIVE_NAME = f"{TOP}-x86_64-unknown-linux-gnu.tar.gz"
 
@@ -50,13 +51,23 @@ elif args[0] == 'coordinate-install':
     environment = dict(os.environ, CAGENTS_UI_UPDATE_GUARD_FD='fixture-only')
     sys.exit(subprocess.run(['/bin/sh', installer, *child_args], env=environment).returncode)
 elif args[0] == 'verify-install-guard':
+    assert args in (['verify-install-guard'], ['verify-install-guard', '--stage-only'])
     assert os.environ['CAGENTS_UI_UPDATE_GUARD_FD'] == 'fixture-only'
-    record('verify')
+    stage_only = args[1:] == ['--stage-only']
+    record('verify', stage_only=stage_only)
+    if os.environ.get('FIXTURE_WINDOWS_PREPARED') and not stage_only:
+        print('application windows have not finished closing', file=sys.stderr)
+        sys.exit(1)
 elif args[:2] == ['daemon', 'capture-update-census']:
     assert args[2] == '--output' and len(args) == 4
     record('census-capture')
     pathlib.Path(args[3]).write_text(json.dumps({'version': 1, 'transaction': '00000000-0000-4000-8000-000000000001',
                                                'source': None, 'terminals': [], 'chats': [], 'checkpoint_before': None}, separators=(',', ':')))
+elif args[:2] == ['daemon', 'inspect-pending-update-recovery']:
+    assert args[2] == '--candidate-cli' and len(args) in (4, 6)
+    if len(args) == 6:
+        assert args[4] == '--census'
+    record('pending-inspect')
 elif args[:2] in (['daemon', 'verify-update-census'], ['daemon', 'inspect-update-recovery']):
     import hashlib
     assert args[2] == '--census' and args[4] == '--outcome'
@@ -64,10 +75,16 @@ elif args[:2] in (['daemon', 'verify-update-census'], ['daemon', 'inspect-update
     census = json.loads(census_path.read_text())
     assert census == {'version': 1, 'transaction': '00000000-0000-4000-8000-000000000001', 'source': None, 'terminals': [], 'chats': [], 'checkpoint_before': None}
     assert not census_path.stat().st_mode & 0o077
-    flags = set(args[6:])
-    assert flags <= {'--allow-absent', '--require-original', '--validate-only'}
-    ready = pathlib.Path(os.environ['FIXTURE_DAEMON_STATE']).exists()
     if args[1] == 'inspect-update-recovery':
+        assert args[6] == '--candidate-cli' and len(args) == 8
+        flags = set()
+    else:
+        flags = set(args[6:])
+    assert flags <= {'--allow-absent', '--require-original', '--require-absent', '--validate-only'}
+    ready = pathlib.Path(os.environ['FIXTURE_DAEMON_STATE']).exists()
+    if '--require-absent' in flags:
+        state, accepted = ('no_source', True) if not ready and census['checkpoint_before'] is None else ('unverified', False)
+    elif args[1] == 'inspect-update-recovery':
         state, accepted = 'restart_permitted', True
     elif '--validate-only' in flags:
         state, accepted = 'unverified', True
@@ -185,8 +202,11 @@ class InstallerCoordinator(unittest.TestCase):
             "TMPDIR": str(self.downloads),
             "FIXTURE_CALLS": str(self.calls),
             "FIXTURE_DAEMON_STATE": str(self.directory / "daemon-ready"),
+            "FIXTURE_SYNC_CALL": str(self.directory / "sync-call"),
         }
         self.executable(self.tools / "getconf", '#!/bin/sh\nprintf "glibc 2.99\\n"\n')
+        self.executable(self.tools / "sync", '#!/bin/sh\nprintf "%s\\n" "$*" > "$FIXTURE_SYNC_CALL"\n'
+                        '[ -z "${FIXTURE_SYNC_FAIL:-}" ] || exit 7\nexec /usr/bin/sync "$@"\n')
         for name in ("curl", "wget", "gh"):
             self.executable(self.tools / name, '#!/bin/sh\nexit 97\n')
         self.executable(self.tools / "cagentsd", '#!/bin/sh\nexit 96\n')
@@ -516,6 +536,185 @@ os.execv({real_tar!r}, [{real_tar!r}, *args])
         self.assertEqual(copy.read_text(), "written during the installation\n")
         self.assert_no_backups(copy)
         self.assertEqual(os.readlink(self.prefix / "current"), "versions/old")
+
+    def assert_files_installed_for_login(self, result):
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(os.readlink(self.prefix / "current"), f"versions/{VERSION}")
+        self.assertTrue((self.prefix / "versions" / VERSION / "bin/cagents").exists())
+        self.assertTrue((self.home / "config/autostart/dev.cagents.Cagents.Daemon.desktop").is_symlink())
+        self.assertIn("will start at graphical login", result.stdout)
+        self.assertNotIn("your sessions are ready", result.stdout)
+        self.assertIn("daemon start command failed", result.stderr)
+        self.assertFalse(Path(self.environment["FIXTURE_DAEMON_STATE"]).exists())
+        proofs = [e['state'] for e in self.events() if e['event'] == 'census-verify']
+        self.assertIn('no_source', proofs)
+        self.assertNotIn('usable', proofs, 'failed first startup is not verified readiness')
+
+    def test_fresh_install_keeps_files_and_login_autostart_when_daemon_start_fails(self):
+        self.environment["FIXTURE_DAEMON_START_FAILS"] = "1"
+        self.assert_files_installed_for_login(self.install())
+
+    def test_absent_source_install_keeps_files_and_login_autostart_when_daemon_start_fails(self):
+        self.installed_cli(guarded=True)
+        self.environment["FIXTURE_DAEMON_START_FAILS"] = "1"
+        self.assert_files_installed_for_login(self.install())
+
+    def prepare_candidate(self, *, serving=False):
+        self.installed_cli(guarded=True)
+        self.environment['CAGENTS_UI_UPDATE_GUARD_FD'] = 'fixture-only'
+        self.environment['FIXTURE_WINDOWS_PREPARED'] = '1'
+        source_state = Path(self.environment['FIXTURE_DAEMON_STATE'])
+        if serving:
+            source_state.write_text('original service remains available\n')
+        result = self.install('--prepare-candidate', JOB)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('Prepared cagents', result.stdout)
+        self.assertEqual(os.readlink(self.prefix / 'current'), 'versions/old')
+        self.assertEqual([e['event'] for e in self.events()], ['verify'])
+        self.assertTrue(self.events()[0]['stage_only'], 'preparation must allow prepared live windows')
+        self.assertFalse((self.home / '.local/bin/cagents').exists())
+        self.assertFalse((self.home / 'config/autostart').exists())
+        if serving:
+            self.assertEqual(source_state.read_text(), 'original service remains available\n')
+        else:
+            self.assertFalse(source_state.exists())
+        self.assertEqual(list(self.downloads.iterdir()), [])
+        self.assertEqual(Path(self.environment['FIXTURE_SYNC_CALL']).read_text(),
+                         f'-f {self.prefix / "versions"}\n')
+        candidate = self.prefix / 'versions' / VERSION
+        marker = candidate / '.cagents-prepared-candidate-v1.json'
+        self.assertEqual(marker.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(json.loads(marker.read_text()), {
+            'version': 1, 'job': JOB,
+            'archive_sha256': hashlib.sha256(self.archive.read_bytes()).hexdigest(),
+        })
+        self.calls.unlink()
+        return candidate
+
+    def test_candidate_capability_probe_has_no_installation_side_effects(self):
+        result = subprocess.run(
+            ['/bin/sh', str(ROOT / 'install.sh'), '--supports-prepared-candidate'],
+            env=self.environment, capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(self.prefix.exists())
+        self.assertFalse(self.calls.exists())
+        self.assertEqual(list(self.downloads.iterdir()), [])
+
+    def test_prepared_candidate_is_reused_only_by_its_explicit_job(self):
+        candidate = self.prepare_candidate()
+        original_inode = (candidate / 'bin/cagents').stat().st_ino
+        refused = self.install('--prepared-candidate', JOB)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn('application windows have not finished closing', refused.stderr)
+        self.assertFalse(self.events()[0]['stage_only'], 'final commit still requires closed windows')
+        self.assertEqual(os.readlink(self.prefix / 'current'), 'versions/old')
+        self.assertTrue(candidate.exists())
+        self.calls.unlink()
+        self.environment.pop('FIXTURE_WINDOWS_PREPARED')
+        result = self.install('--prepared-candidate', JOB)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(os.readlink(self.prefix / 'current'), f'versions/{VERSION}')
+        self.assertEqual((candidate / 'bin/cagents').stat().st_ino, original_inode)
+        self.assertEqual(sum(e['event'] == 'daemon-start-fixture' for e in self.events()), 1)
+        self.assertTrue((candidate / '.cagents-prepared-candidate-v1.json').exists())
+
+    def test_prepared_candidate_rejects_wrong_job_and_tree_tampering_before_source_calls(self):
+        candidate = self.prepare_candidate()
+        self.environment.pop('FIXTURE_WINDOWS_PREPARED')
+        marker = candidate / '.cagents-prepared-candidate-v1.json'
+        original_marker = marker.read_bytes()
+        executable = candidate / 'bin/cagents'
+        original = executable.read_bytes()
+        for mutation in ('job', 'contents', 'permissions', 'extra', 'newline-extra', 'marker-mode', 'archive-marker'):
+            with self.subTest(mutation=mutation):
+                job = '00000000-0000-4000-8000-000000000002' if mutation == 'job' else JOB
+                if mutation == 'contents':
+                    executable.write_bytes(original + b'\n# changed\n')
+                elif mutation == 'permissions':
+                    executable.chmod(0o700)
+                elif mutation == 'extra':
+                    (candidate / 'unexpected').write_text('extra\n')
+                elif mutation == 'newline-extra':
+                    (candidate / 'bin\nshare').write_text('extra\n')
+                elif mutation == 'marker-mode':
+                    marker.chmod(0o644)
+                elif mutation == 'archive-marker':
+                    marker.write_text(json.dumps({'version': 1, 'job': JOB, 'archive_sha256': '0' * 64},
+                                                 separators=(',', ':')) + '\n')
+                result = self.install('--prepared-candidate', job)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(os.readlink(self.prefix / 'current'), 'versions/old')
+                self.assertTrue(candidate.exists(), 'a prepared target must survive failure')
+                self.assertEqual([e['event'] for e in self.events()], ['verify'])
+                self.calls.unlink()
+                executable.write_bytes(original)
+                executable.chmod(0o755)
+                marker.write_bytes(original_marker)
+                marker.chmod(0o600)
+                (candidate / 'unexpected').unlink(missing_ok=True)
+                (candidate / 'bin\nshare').unlink(missing_ok=True)
+
+    def test_prepared_candidate_cannot_be_claimed_by_an_ordinary_install(self):
+        candidate = self.prepare_candidate()
+        self.environment.pop('FIXTURE_WINDOWS_PREPARED')
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('already installed', result.stderr)
+        self.assertEqual(os.readlink(self.prefix / 'current'), 'versions/old')
+        self.assertTrue(candidate.exists())
+        (candidate / '.cagents-prepared-candidate-v1.json').unlink()
+        unmarked = self.install('--prepare-candidate', JOB)
+        self.assertNotEqual(unmarked.returncode, 0)
+        self.assertIn('does not match this private job', unmarked.stderr)
+        self.assertEqual(os.readlink(self.prefix / 'current'), 'versions/old')
+        self.assertTrue(candidate.exists(), 'an unmarked existing tree is never claimed or deleted')
+
+    def test_candidate_preparation_requires_the_worker_guard_before_installation(self):
+        result = self.install('--prepare-candidate', JOB)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('requires the worker application update fence', result.stderr)
+        self.assertFalse(self.prefix.exists())
+        self.assertFalse(self.calls.exists())
+
+    def test_candidate_preparation_keeps_a_serving_source_and_prepared_windows_untouched(self):
+        self.prepare_candidate(serving=True)
+
+    def test_candidate_publication_flush_failure_does_not_prepare_or_stop_the_source(self):
+        self.installed_cli(guarded=True)
+        self.environment.update(CAGENTS_UI_UPDATE_GUARD_FD='fixture-only',
+                                FIXTURE_WINDOWS_PREPARED='1', FIXTURE_SYNC_FAIL='1')
+        state = Path(self.environment['FIXTURE_DAEMON_STATE'])
+        state.write_text('original remains available\n')
+        result = self.install('--prepare-candidate', JOB)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('could not durably publish', result.stderr)
+        self.assertEqual(state.read_text(), 'original remains available\n')
+        self.assertEqual(os.readlink(self.prefix / 'current'), 'versions/old')
+        self.assertFalse((self.prefix / 'versions' / VERSION).exists())
+        self.assertEqual([e['event'] for e in self.events()], ['verify'])
+
+    def test_cancelled_preparation_can_be_adopted_by_a_new_guarded_job_for_the_same_release(self):
+        candidate = self.prepare_candidate()
+        original_inode = (candidate / 'bin/cagents').stat().st_ino
+        next_job = '00000000-0000-4000-8000-000000000002'
+        retried = self.install('--prepare-candidate', next_job)
+        self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
+        self.assertEqual(os.readlink(self.prefix / 'current'), 'versions/old')
+        self.assertEqual((candidate / 'bin/cagents').stat().st_ino, original_inode)
+        self.assertEqual([e['event'] for e in self.events()], ['verify'])
+        self.assertTrue(self.events()[0]['stage_only'])
+        self.assertEqual(json.loads((candidate / '.cagents-prepared-candidate-v1.json').read_text())['job'], next_job)
+        self.calls.unlink()
+        self.environment.pop('FIXTURE_WINDOWS_PREPARED')
+        refused = self.install('--prepared-candidate', JOB)
+        self.assertNotEqual(refused.returncode, 0, 'the previous job cannot claim the rebound marker')
+        self.assertEqual(os.readlink(self.prefix / 'current'), 'versions/old')
+        self.calls.unlink()
+        finished = self.install('--prepared-candidate', next_job)
+        self.assertEqual(finished.returncode, 0, finished.stdout + finished.stderr)
+        self.assertEqual(os.readlink(self.prefix / 'current'), f'versions/{VERSION}')
+        self.assertEqual((candidate / 'bin/cagents').stat().st_ino, original_inode)
 
 
 if __name__ == "__main__":

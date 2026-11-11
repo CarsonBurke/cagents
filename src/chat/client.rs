@@ -1189,6 +1189,15 @@ fn restore(
     if session.proof.as_ref() == Some(proof) && !retry_explicit_start {
         return Ok(ClientRequest::ChatAttach { session });
     }
+    if crate::upgrade::floor::load().is_ok_and(|ledger| {
+        ledger
+            .resume_source(&session)
+            .is_some_and(|original| original.launch.session_id.is_none())
+    }) {
+        return Err(StartFailure::retry(
+            "This conversation was stopped for the update before it recorded a conversation. Its saved pane is kept; start a fresh conversation from the pane.",
+        ));
+    }
     let mut refusal = None;
     if retry_explicit_start
         || !session
@@ -1344,6 +1353,11 @@ fn restore(
             // application update rather than a reason to give up.
             Err(message) => refusal = Some(message),
         }
+    }
+    if crate::upgrade::floor::load().is_ok_and(|ledger| ledger.resume_source(&session).is_some()) {
+        return Err(StartFailure::retry(
+            "This conversation was stopped for the update. Its saved files are kept; the transcript preview could not be attached. Nothing was restarted.",
+        ));
     }
     if matches!(
         session.native_continuity,
@@ -2156,6 +2170,42 @@ impl ClientHandle {
                     None,
                 )?
             }
+        } else if intent == Intent::Start
+            && let Ok(ledger) = crate::upgrade::floor::load()
+            && let Some(original) = ledger.resume_source(&session).cloned()
+        {
+            let request_id = attach_request;
+            attach_request += 1;
+            codec
+                .write(
+                    &mut stream,
+                    &ClientEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id,
+                        proof: Some(proof.clone()),
+                        request: ClientRequest::ChatPrepareResume { source: original },
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+            let prepared = match receive(&mut stream, &mut codec, request_id, Some(&proof))? {
+                ServerResponse::ChatResumePrepared { session: prepared }
+                    if super::is_retained_resume_successor(&session, &prepared) =>
+                {
+                    prepared
+                }
+                _ => return Err(
+                    "The stopped conversation did not receive its exact proof-checked successor"
+                        .into(),
+                ),
+            };
+            resumed_from = Some(session);
+            let execution_environment = native_environment(&prepared, true);
+            ClientRequest::ChatStart {
+                session: prepared,
+                source: None,
+                terminate_source: false,
+                execution_environment,
+            }
         } else if intent == Intent::Start {
             let execution_environment = native_environment(&session, source.is_none());
             ClientRequest::ChatStart {
@@ -2656,6 +2706,11 @@ impl ClientHandle {
         }
         session.learn_native_continuity(&snapshot.native_continuity);
         session
+    }
+    /// The identity negotiated by ChatAttached, before snapshot projection.
+    /// A read-only reader cannot move to another conversation after attachment.
+    pub(crate) fn attached_session_id(&self) -> Option<&str> {
+        self.inner.session.launch.session_id.as_deref()
     }
     pub(crate) fn upgrade_recovery(&self) -> Option<&(Session, Session)> {
         self.inner

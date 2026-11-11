@@ -69,7 +69,7 @@ if [ "${CAGENTS_DAEMON_LEASE_FD:-}" = 3 ] \
     # apply inside functions and command substitutions too.
     for installer_utility in awk cat chmod cp curl find getconf gh \
         gtk-update-icon-cache id ln mkdir mktemp mv readlink rm rmdir sed \
-        sha256sum shasum sleep tar uname update-desktop-database; do
+        sha256sum shasum sleep sync tar uname update-desktop-database; do
         if command -v "$installer_utility" >/dev/null 2>&1; then
             alias "$installer_utility=installer_tool $installer_utility"
         fi
@@ -120,6 +120,8 @@ RESTART_DAEMON=0
 STAGE_ONLY=0
 REQUIRE_EMPTY_DAEMON=0
 RELAUNCH_AGENTS=
+PREPARE_CANDIDATE=
+PREPARED_CANDIDATE=
 
 while [ "$#" -gt 0 ]; do
     case $1 in
@@ -136,6 +138,16 @@ while [ "$#" -gt 0 ]; do
         --stage-only)
             STAGE_ONLY=1
             shift
+            ;;
+        --prepare-candidate|--prepared-candidate)
+            [ "$#" -ge 2 ] || fail "$1 requires a job UUID"
+            [ -n "$2" ] || fail "$1 requires a job UUID"
+            if [ "$1" = --prepare-candidate ]; then PREPARE_CANDIDATE=$2; else PREPARED_CANDIDATE=$2; fi
+            shift 2
+            ;;
+        --supports-prepared-candidate)
+            [ "$#" -eq 1 ] || fail '--supports-prepared-candidate takes no arguments'
+            exit 0
             ;;
         --restart-daemon)
             RESTART_DAEMON=1
@@ -171,6 +183,24 @@ while [ "$#" -gt 0 ]; do
             ;;
     esac
 done
+
+valid_candidate_job() {
+    printf '%s\n' "$1" | LC_ALL=C awk -F- '
+        NR != 1 || NF != 5 || length($1) != 8 || length($2) != 4 || length($3) != 4 ||
+        length($4) != 4 || length($5) != 12 { exit 1 }
+        { for (i = 1; i <= NF; i++) if ($i !~ /^[0-9a-f]+$/) exit 1 }
+    '
+}
+if [ -n "$PREPARE_CANDIDATE$PREPARED_CANDIDATE" ]; then
+    [ -z "$PREPARE_CANDIDATE" ] || [ -z "$PREPARED_CANDIDATE" ] \
+        || fail 'candidate preparation and reuse cannot be combined'
+    [ "$STAGE_ONLY" -eq 0 ] && [ "$UNINSTALL" -eq 0 ] \
+        || fail 'private candidate preparation cannot be combined with staging or removal'
+    candidate_job=${PREPARE_CANDIDATE:-$PREPARED_CANDIDATE}
+    valid_candidate_job "$candidate_job" || fail 'candidate preparation requires a canonical job UUID'
+    [ -n "${CAGENTS_UI_UPDATE_GUARD_FD:-}" ] \
+        || fail 'private candidate preparation requires the worker application update fence'
+fi
 
 if [ "${CAGENTS_AGENT_AUTHORITY+x}" = x ]; then
     fail 'installation and removal require your own terminal; hosted sessions cannot change the installation. Cagents terminals are hosted sessions. A person must run this command from a system terminal outside cagents.'
@@ -445,6 +475,7 @@ need_command mktemp
 need_command sed
 need_command tar
 need_command readlink
+[ -z "$PREPARE_CANDIDATE" ] || need_command sync
 
 CURL_OPTIONS="--proto =https --tlsv1.2 --fail --location --silent --show-error"
 AUTHENTICATED_GH=0
@@ -488,6 +519,8 @@ esac
 DOWNLOAD_DIR=$(mktemp -d "$TEMP_ROOT/cagents-download.XXXXXX")
 INSTALL_STAGE=
 NEW_VERSION_DIR=
+NEW_VERSION_PREPARED=0
+PREPARED_MARKER_TEMP=
 CURRENT_TEMP=
 CURRENT_SWITCHED=0
 TRANSACTION_COMMITTED=0
@@ -505,6 +538,8 @@ INSTALL_OUTCOME_PATH=${CAGENTS_INSTALL_OUTCOME_PATH:-$DOWNLOAD_DIR/update-outcom
 DAEMON_CHECKPOINTED=0
 OLD_DAEMON_WAS_RUNNING=0
 DAEMON_STARTED=0
+DAEMON_START_FAILED=0
+PREUPDATE_NO_SOURCE=0
 DAEMON_DEFERRED=0
 DAEMON_START_ATTEMPTED=0
 # The shared-model store's schema before the replacement daemon starts, which
@@ -593,9 +628,15 @@ verify_original_census() {
         --census "$INSTALL_CENSUS_PATH" --outcome "$INSTALL_OUTCOME_PATH" \
         --require-original >/dev/null 2>&1
 }
+verify_absent_census() {
+    installer_tool "$CANDIDATE_COORDINATOR" daemon verify-update-census \
+        --census "$INSTALL_CENSUS_PATH" --outcome "$INSTALL_OUTCOME_PATH" \
+        --require-absent >/dev/null 2>&1
+}
 inspect_update_recovery() {
     installer_tool "$CANDIDATE_COORDINATOR" daemon inspect-update-recovery \
-        --census "$INSTALL_CENSUS_PATH" --outcome "$INSTALL_OUTCOME_PATH" >/dev/null
+        --census "$INSTALL_CENSUS_PATH" --outcome "$INSTALL_OUTCOME_PATH" \
+        --candidate-cli "$NEW_VERSION_DIR/bin/cagents" >/dev/null
 }
 retain_recovery_evidence() {
     RETAIN_RECOVERY=1
@@ -611,8 +652,12 @@ cleanup() {
     if [ -n "$CURRENT_TEMP" ]; then
         rm -f "$CURRENT_TEMP" || :
     fi
+    if [ -n "$PREPARED_MARKER_TEMP" ]; then
+        rm -f "$PREPARED_MARKER_TEMP" || :
+    fi
 
-    if [ "$TRANSACTION_COMMITTED" -eq 0 ] && [ "$CURRENT_SWITCHED" -eq 1 ]; then
+    if [ "$TRANSACTION_COMMITTED" -eq 0 ] && [ -n "$NEW_VERSION_DIR" ] \
+        && [ "$CENSUS_CAPTURED" -eq 1 ]; then
         read_daemon_status "$NEW_VERSION_DIR/bin/cagents"
         if [ "$DAEMON_STATUS" != stopped ]; then
             if verify_original_census; then
@@ -624,7 +669,7 @@ cleanup() {
                 RETAIN_RECOVERY=1
                 if ! verify_update_census; then retain_recovery_evidence; fi
                 RECOVERY_OUTCOME_SETTLED=1
-                printf '%s: the original terminal service could not be verified; retained the selected version and recovery evidence instead of rewinding its binaries\n' \
+                printf '%s: the original terminal service could not be verified; retained the candidate and recovery evidence instead of rewinding its binaries\n' \
                     "$PROGRAM" >&2
             fi
         fi
@@ -769,6 +814,7 @@ cleanup() {
 
     if [ "$TRANSACTION_COMMITTED" -eq 0 ] \
         && [ -n "$NEW_VERSION_DIR" ] && [ "$ROLLBACK_OK" -eq 1 ] \
+        && [ "$NEW_VERSION_PREPARED" -eq 0 ] \
         && [ "$RETAIN_RECOVERY" -eq 0 ]; then
         rm -rf "$NEW_VERSION_DIR" || :
     fi
@@ -934,7 +980,15 @@ supports_store_conversion() {
 supports_selected_guard() {
     if [ "$STAGE_ONLY" -eq 1 ]; then supports_stage_guard "$1"; else supports_install_guard "$1"; fi
 }
-if [ "$STAGE_ONLY" -eq 1 ]; then
+if [ -n "$PREPARE_CANDIDATE$PREPARED_CANDIDATE" ]; then
+    if [ -n "$PREPARE_CANDIDATE" ]; then
+        supports_stage_guard "$CANDIDATE_COORDINATOR"
+    else
+        supports_install_guard "$CANDIDATE_COORDINATOR"
+    fi \
+        || fail 'the candidate cannot validate the worker application update fence'
+    COORDINATOR=$CANDIDATE_COORDINATOR
+elif [ "$STAGE_ONLY" -eq 1 ]; then
     # Staged launch routing is interpreted by this exact candidate set. An old
     # candidate cannot borrow a newer installed coordinator's staging support.
     supports_stage_guard "$CANDIDATE_COORDINATOR" \
@@ -951,7 +1005,9 @@ else
 fi
 if [ -n "${CAGENTS_UI_UPDATE_GUARD_FD:-}" ]; then
     set -- verify-install-guard
-    [ "$STAGE_ONLY" -eq 0 ] || set -- "$@" --stage-only
+    if [ "$STAGE_ONLY" -eq 1 ] || [ -n "$PREPARE_CANDIDATE" ]; then
+        set -- "$@" --stage-only
+    fi
     installer_tool "$COORDINATOR" "$@" >/dev/null \
         || fail 'inherited application update fence is invalid; installation was not changed'
 else
@@ -1037,20 +1093,50 @@ if [ -L "$PREFIX/versions" ] || { [ -e "$PREFIX/versions" ] && [ ! -d "$PREFIX/v
     fail "unsafe versions path at $PREFIX"
 fi
 mkdir -p "$PREFIX/versions"
-[ ! -e "$PREFIX/versions/$VERSION" ] && [ ! -L "$PREFIX/versions/$VERSION" ] \
-    || fail "version $VERSION is already installed at $PREFIX"
-if [ -e "$PREFIX/current" ] && [ ! -L "$PREFIX/current" ]; then
-    fail "refusing to replace non-symlink $PREFIX/current"
+PREPARED_MARKER=.cagents-prepared-candidate-v1.json
+prepared_marker_contents() {
+    printf '{"version":1,"job":"%s","archive_sha256":"%s"}\n' "${1:-$candidate_job}" "$ACTUAL_HASH"
+}
+if [ -n "$PREPARED_CANDIDATE" ] \
+    || { [ -n "$PREPARE_CANDIDATE" ] && { [ -e "$PREFIX/versions/$VERSION" ] || [ -L "$PREFIX/versions/$VERSION" ]; }; }; then
+    prepared_root=$PREFIX/versions/$VERSION
+    [ -d "$prepared_root" ] && [ ! -L "$prepared_root" ] \
+        || fail 'the explicitly prepared candidate is missing or unsafe'
+    prepared_marker=$prepared_root/$PREPARED_MARKER
+    [ -f "$prepared_marker" ] && [ ! -L "$prepared_marker" ] \
+        && [ "$(find "$prepared_marker" -maxdepth 0 -type f -uid "$(id -u)" -perm 0600 -print)" = "$prepared_marker" ] \
+        || fail 'the prepared candidate does not match this private job and verified archive'
+    if [ -n "$PREPARE_CANDIDATE" ]; then
+        # A new guarded job can adopt an unchanged, privately marked candidate
+        # left by cancellation. This grants no source or recovery authority.
+        previous_candidate_job=$(sed -n 's/^{"version":1,"job":"\([0-9a-f-]*\)","archive_sha256":"[0-9a-f]*"}$/\1/p' "$prepared_marker")
+        valid_candidate_job "$previous_candidate_job" \
+            || fail 'the previous prepared candidate marker is invalid'
+    else
+        previous_candidate_job=$candidate_job
+    fi
+    [ "$(cat "$prepared_marker")" = "$(prepared_marker_contents "$previous_candidate_job")" ] \
+        || fail 'the prepared candidate does not match this private job and verified archive'
+    NEW_VERSION_DIR=$prepared_root
+    NEW_VERSION_PREPARED=1
+else
+    [ ! -e "$PREFIX/versions/$VERSION" ] && [ ! -L "$PREFIX/versions/$VERSION" ] \
+        || fail "version $VERSION is already installed at $PREFIX"
 fi
+if [ -z "$PREPARE_CANDIDATE" ]; then
+    if [ -e "$PREFIX/current" ] && [ ! -L "$PREFIX/current" ]; then
+        fail "refusing to replace non-symlink $PREFIX/current"
+    fi
 
-if [ -L "$PREFIX/current" ]; then
-    PREVIOUS_CURRENT_TARGET=$(readlink "$PREFIX/current") \
-        || fail "cannot inspect $PREFIX/current"
-    HAD_CURRENT=1
-    case $PREVIOUS_CURRENT_TARGET in
-        /*) PREVIOUS_VERSION_DIR=$PREVIOUS_CURRENT_TARGET ;;
-        *) PREVIOUS_VERSION_DIR=$PREFIX/$PREVIOUS_CURRENT_TARGET ;;
-    esac
+    if [ -L "$PREFIX/current" ]; then
+        PREVIOUS_CURRENT_TARGET=$(readlink "$PREFIX/current") \
+            || fail "cannot inspect $PREFIX/current"
+        HAD_CURRENT=1
+        case $PREVIOUS_CURRENT_TARGET in
+            /*) PREVIOUS_VERSION_DIR=$PREVIOUS_CURRENT_TARGET ;;
+            *) PREVIOUS_VERSION_DIR=$PREFIX/$PREVIOUS_CURRENT_TARGET ;;
+        esac
+    fi
 fi
 
 # Succeeds when COPY is a regular file with the same bytes as MEMBER in any of
@@ -1161,24 +1247,83 @@ chmod 0755 \
     "$INSTALL_STAGE/$TOP_LEVEL/bin/cagents-uninstall"
 find "$INSTALL_STAGE/$TOP_LEVEL/share" -type d -exec chmod 0755 {} +
 find "$INSTALL_STAGE/$TOP_LEVEL/share" -type f -exec chmod 0644 {} +
+
+if [ "$NEW_VERSION_PREPARED" -eq 1 ]; then
+    # Re-extract the authenticated archive and repeat desktop normalization.
+    # A private marker alone is not evidence that its executable tree survived.
+    find "$INSTALL_STAGE/$TOP_LEVEL" -printf '%P\n' > "$DOWNLOAD_DIR/expected-tree"
+    while IFS= read -r prepared_member; do
+        expected_member=$INSTALL_STAGE/$TOP_LEVEL/$prepared_member
+        actual_member=$NEW_VERSION_DIR/$prepared_member
+        expected_kind=$(find "$expected_member" -maxdepth 0 -printf '%y:%m')
+        actual_kind=$(find "$actual_member" -maxdepth 0 -printf '%y:%m') \
+            || fail 'the prepared candidate is incomplete'
+        [ "$expected_kind" = "$actual_kind" ] \
+            || fail 'the prepared candidate file types or permissions changed'
+        case $expected_kind in
+            f:*) expected_member_hash=$(file_sha256 "$expected_member")
+                [ -n "$expected_member_hash" ] \
+                && [ "$expected_member_hash" = "$(file_sha256 "$actual_member")" ] \
+                || fail 'the prepared candidate contents changed' ;;
+        esac
+    done < "$DOWNLOAD_DIR/expected-tree"
+    # Pass untrusted existing names as argv, not lines: a newline in an extra
+    # name must not split it into two apparently valid archive members.
+    find "$NEW_VERSION_DIR" -mindepth 1 -exec sh -c '
+        prepared_root=$1 expected_root=$2 marker=$3
+        shift 3
+        for actual do
+            member=${actual#"$prepared_root/"}
+            [ "$member" = "$marker" ] && continue
+            [ -e "$expected_root/$member" ] || exit 1
+        done
+    ' cagents-prepared-tree "$NEW_VERSION_DIR" "$INSTALL_STAGE/$TOP_LEVEL" "$PREPARED_MARKER" {} + \
+        || fail 'the prepared candidate contains unexpected entries'
+    rm -rf "$INSTALL_STAGE"
+else
+    if [ -n "$PREPARE_CANDIDATE" ]; then
+        prepared_marker_contents > "$INSTALL_STAGE/$TOP_LEVEL/$PREPARED_MARKER"
+        chmod 0600 "$INSTALL_STAGE/$TOP_LEVEL/$PREPARED_MARKER"
+    fi
+    NEW_VERSION_DIR=$PREFIX/versions/$VERSION
+    mv -T "$INSTALL_STAGE/$TOP_LEVEL" "$NEW_VERSION_DIR"
+    rmdir "$INSTALL_STAGE"
+fi
+INSTALL_STAGE=
+if [ -n "$PREPARE_CANDIDATE" ]; then
+    if [ "$NEW_VERSION_PREPARED" -eq 1 ]; then
+        PREPARED_MARKER_TEMP=$NEW_VERSION_DIR/.prepared-marker.$$
+        (set -C; prepared_marker_contents > "$PREPARED_MARKER_TEMP") \
+            || fail 'cannot prepare the new private candidate marker'
+        chmod 0600 "$PREPARED_MARKER_TEMP"
+        mv -Tf "$PREPARED_MARKER_TEMP" "$NEW_VERSION_DIR/$PREPARED_MARKER" \
+            || fail 'cannot publish the new private candidate marker'
+        PREPARED_MARKER_TEMP=
+    fi
+    # GNU sync -f performs syncfs: flush the full extracted tree, its private
+    # marker and the atomic publication's parent before shutdown is permitted.
+    sync -f "$PREFIX/versions" || fail 'could not durably publish the recovery candidate; the source service was not changed'
+    NEW_VERSION_PREPARED=1
+    TRANSACTION_COMMITTED=1
+    printf 'Prepared cagents %s candidate at %s; running services and launchers were preserved.\n' \
+        "$VERSION" "$NEW_VERSION_DIR"
+    exit 0
+fi
+
 # A copy at a link path is compared with the finished candidate files, so the
 # rewritten desktop and autostart entries count, and with the current version.
-check_link_destination "$BIN_LINK" "$BIN_MEMBER" "$INSTALL_STAGE/$TOP_LEVEL" "$PREVIOUS_VERSION_DIR"
-check_link_destination "$DESKTOP_LINK" "$DESKTOP_MEMBER" "$INSTALL_STAGE/$TOP_LEVEL" "$PREVIOUS_VERSION_DIR"
-check_link_destination "$ICON_LINK" "$ICON_MEMBER" "$INSTALL_STAGE/$TOP_LEVEL" "$PREVIOUS_VERSION_DIR"
-check_link_destination "$RASTER_ICON_LINK" "$RASTER_ICON_MEMBER" "$INSTALL_STAGE/$TOP_LEVEL" "$PREVIOUS_VERSION_DIR"
-check_link_destination "$METAINFO_LINK" "$METAINFO_MEMBER" "$INSTALL_STAGE/$TOP_LEVEL" "$PREVIOUS_VERSION_DIR"
-check_link_destination "$AUTOSTART_LINK" "$AUTOSTART_MEMBER" "$INSTALL_STAGE/$TOP_LEVEL" "$PREVIOUS_VERSION_DIR"
+check_link_destination "$BIN_LINK" "$BIN_MEMBER" "$NEW_VERSION_DIR" "$PREVIOUS_VERSION_DIR"
+check_link_destination "$DESKTOP_LINK" "$DESKTOP_MEMBER" "$NEW_VERSION_DIR" "$PREVIOUS_VERSION_DIR"
+check_link_destination "$ICON_LINK" "$ICON_MEMBER" "$NEW_VERSION_DIR" "$PREVIOUS_VERSION_DIR"
+check_link_destination "$RASTER_ICON_LINK" "$RASTER_ICON_MEMBER" "$NEW_VERSION_DIR" "$PREVIOUS_VERSION_DIR"
+check_link_destination "$METAINFO_LINK" "$METAINFO_MEMBER" "$NEW_VERSION_DIR" "$PREVIOUS_VERSION_DIR"
+check_link_destination "$AUTOSTART_LINK" "$AUTOSTART_MEMBER" "$NEW_VERSION_DIR" "$PREVIOUS_VERSION_DIR"
 prepare_link_parent "$BIN_LINK"
 prepare_link_parent "$DESKTOP_LINK"
 prepare_link_parent "$ICON_LINK"
 prepare_link_parent "$RASTER_ICON_LINK"
 prepare_link_parent "$METAINFO_LINK"
 prepare_link_parent "$AUTOSTART_LINK"
-NEW_VERSION_DIR=$PREFIX/versions/$VERSION
-mv "$INSTALL_STAGE/$TOP_LEVEL" "$NEW_VERSION_DIR"
-rmdir "$INSTALL_STAGE"
-INSTALL_STAGE=
 
 # Replaces a managed copy at LINK with the link. The copy moves aside before
 # it is compared, so the bytes compared are the bytes replaced, and a file that
@@ -1240,6 +1385,22 @@ ensure_link() {
 }
 
 
+# A standalone retry must discover retained Prepared recovery before a fresh
+# empty census can replace its original scope. The shared owner prints the
+# exact explicit recovery command; the shell does not interpret its payload.
+# A reviewed worker already owns its intentional Prepared transaction.
+if [ -z "${CAGENTS_DAEMON_LEASE_FD:-}" ]; then
+    set -- daemon inspect-pending-update-recovery \
+        --candidate-cli "$NEW_VERSION_DIR/bin/cagents"
+    if [ -n "${CAGENTS_INSTALL_CENSUS_PATH:-}" ]; then
+        set -- "$@" --census "$INSTALL_CENSUS_PATH"
+    fi
+    if ! installer_tool "$CANDIDATE_COORDINATOR" "$@" >/dev/null; then
+        RETAIN_RECOVERY=1
+        fail 'retained recovery requires the explicit command above; the candidate and original checkpoint were preserved'
+    fi
+fi
+
 # A reviewed worker supplies its pre-shutdown census. A standalone installer
 # captures the authenticated source before it can prepare or stop that source.
 if [ -n "${CAGENTS_INSTALL_CENSUS_PATH:-}" ]; then
@@ -1261,6 +1422,14 @@ else
         --output "$INSTALL_CENSUS_PATH" >/dev/null \
         || fail 'cannot capture the terminal inventory; the running service was not changed'
     CENSUS_CAPTURED=1
+fi
+# A fresh/absent-source file install may defer its first daemon start to login.
+# This discriminator is a private, authenticated absence proof, not a status
+# string or merely an empty inventory. Pending recovery cannot qualify.
+if [ "$RESTART_DAEMON" -eq 0 ] && [ "$STAGE_ONLY" -eq 0 ]; then
+    if verify_absent_census; then
+        PREUPDATE_NO_SOURCE=1
+    fi
 fi
 OWNER_CLI=${CAGENTS_INSTALL_OWNER_CLI:-$PREFIX/current/bin/cagents}
 if [ "$STAGE_ONLY" -eq 1 ]; then
@@ -1372,18 +1541,39 @@ ensure_link "$METAINFO_MEMBER" "$METAINFO_LINK" metainfo
 ensure_link "$AUTOSTART_MEMBER" "$AUTOSTART_LINK" autostart
 # Startup exit status alone says nothing about retained terminals. Commit only
 # after the candidate proves serving readiness and the captured census matches.
+# The sole file-only exception is a proven absent source on an ordinary install.
 if [ "$DAEMON_DEFERRED" -eq 1 ]; then
     : # The installed candidate must not try to start beside the older daemon.
 elif DAEMON_START_ATTEMPTED=1 && installer_start_candidate >/dev/null; then
     :
 else
-    fail 'replacement daemon startup failed; checking rollback safety while preserving durable recovery state'
+    if [ "$PREUPDATE_NO_SOURCE" -eq 1 ] && [ "$RESTART_DAEMON" -eq 0 ] \
+        && [ "$STAGE_ONLY" -eq 0 ]; then
+        if ! verify_absent_census; then
+            # Startup can create a checkpoint or another service can appear.
+            # Neither may be hidden by the earlier absence or pointer rollback.
+            verify_update_census >/dev/null 2>&1 || :
+            TRANSACTION_COMMITTED=1
+            RECOVERY_OUTCOME_SETTLED=1
+            retain_recovery_evidence
+            fail 'daemon startup failed and absence is no longer proven; retained the selected version and recovery state'
+        fi
+        DAEMON_START_FAILED=1
+        # Publish only file-install success, with authenticated NoSource rather
+        # than Ready or recovered sessions.
+        printf '%s: the daemon start command failed; graphical-login autostart remains enabled\n' \
+            "$PROGRAM" >&2
+    else
+        fail 'replacement daemon startup failed; checking rollback safety while preserving durable recovery state'
+    fi
 fi
-if ! verify_update_census; then
-    retain_recovery_evidence
-    fail 'the installation did not prove that the terminal service and its sessions are ready'
+if [ "$DAEMON_START_FAILED" -eq 0 ]; then
+    if ! verify_update_census; then
+        retain_recovery_evidence
+        fail 'the installation did not prove that the terminal service and its sessions are ready'
+    fi
+    if [ "$DAEMON_DEFERRED" -eq 0 ]; then DAEMON_STARTED=1; fi
 fi
-if [ "$DAEMON_DEFERRED" -eq 0 ]; then DAEMON_STARTED=1; fi
 TRANSACTION_COMMITTED=1
 if command -v gtk-update-icon-cache >/dev/null 2>&1; then
     gtk-update-icon-cache --force --ignore-theme-index "$DATA_HOME/icons/hicolor" >/dev/null 2>&1 || :

@@ -30,6 +30,10 @@ pub(crate) enum Outcome {
         serving: HostSessionProof,
         terminals: usize,
         chats: usize,
+        #[serde(default)]
+        paused_terminals: Vec<crate::model::TerminalId>,
+        #[serde(default)]
+        paused_chats: Vec<crate::model::TerminalId>,
     },
     /// A verified absence is useful for staging a fresh installation, but is
     /// deliberately not a usable daemon or a completed daemon replacement.
@@ -69,9 +73,17 @@ pub struct TargetRecoveryRequired {
     pub checkpoint_digest: String,
     pub source: HostSessionProof,
     pub checkpoint_before: Option<String>,
+    #[serde(default)]
+    pub recovery_command: Option<String>,
 }
 impl std::fmt::Display for TargetRecoveryRequired {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(command) = &self.recovery_command {
+            return write!(
+                f,
+                "The previous build cannot recover this Prepared checkpoint. Its saved panes and checkpoint are retained; daemon readiness is unverified. Run this exact command to recover through the retained target without starting providers: {command}"
+            );
+        }
         write!(
             f,
             "The previous build cannot recover this Prepared checkpoint. Its saved panes and checkpoint are retained; terminal readiness is unverified. Keep the checkpoint for the staged build's recovery owner (transaction {}). Run `cagents --no-start daemon status` and `cagents --no-start terminal list` to inspect what is serving. Do not restart the previous build or delete the checkpoint.",
@@ -82,6 +94,27 @@ impl std::fmt::Display for TargetRecoveryRequired {
 impl std::error::Error for TargetRecoveryRequired {}
 
 impl Census {
+    pub(super) fn from_pending(
+        transaction: String,
+        pending: &crate::upgrade::recovery::PendingRecovery,
+    ) -> Result<Self, UpdateError> {
+        if !pending.original_census_complete {
+            return Err(invalid(
+                "The complete pre-update census is unavailable; an empty or checkpoint-only source cannot establish recovery",
+            ));
+        }
+        let census = Self {
+            version: VERSION,
+            transaction,
+            source: Some(pending.source.clone()),
+            terminals: pending.census.terminals.clone(),
+            chats: pending.census.chats.clone(),
+            checkpoint_before: Some(pending.checkpoint_hash.clone()),
+        };
+        census.validate()?;
+        Ok(census)
+    }
+
     pub(crate) fn capture(transaction: String) -> Result<Self, UpdateError> {
         if crate::device::is_remote() {
             return Err(invalid("Update census requires the local service"));
@@ -89,6 +122,9 @@ impl Census {
         if uuid::Uuid::parse_str(&transaction).is_err() {
             return Err(invalid("Invalid update census transaction"));
         }
+        // A retained checkpoint is a source, even after its process exits.
+        // Never replace that inventory with an empty socket observation.
+        inspect_pending(&std::env::current_exe()?, None)?;
         match observe() {
             Ok((source, terminals, chats, readiness)) => {
                 if readiness != StartupState::Ready {
@@ -198,9 +234,40 @@ impl Census {
         })
     }
     pub(crate) fn verify(&self) -> Result<Receipt, UpdateError> {
-        match observe() {
-            Ok((proof, terminals, chats, readiness)) => {
-                let mut outcome = compare(self, &proof, &terminals, &chats);
+        match observe_with(|proof, terminals, chats, target| {
+            let lineage = crate::upgrade::handoff::Store::existing()
+                .and_then(|store| {
+                    store.map_or_else(|| Ok(Default::default()), |store| store.recovered_chats())
+                })
+                .map_err(invalid)?;
+            let prepared = if self.source.as_ref() == Some(proof) {
+                None
+            } else {
+                crate::upgrade::recovery::verified::VerifiedView::load(
+                    proof, target, terminals, chats,
+                )
+                .map_err(invalid)?
+            };
+            let paused_ready = if self.source.as_ref() != Some(proof) && prepared.is_none() {
+                crate::upgrade::recovery::verified::ready::ReadyView::load(
+                    proof, target, terminals, chats,
+                )
+                .map_err(invalid)?
+            } else {
+                None
+            };
+            Ok((lineage, prepared, paused_ready))
+        }) {
+            Ok(((proof, terminals, chats, readiness), (lineage, prepared, paused_ready))) => {
+                let mut outcome = compare_with_recovery(
+                    self,
+                    &proof,
+                    &terminals,
+                    &chats,
+                    &lineage,
+                    prepared.as_ref(),
+                    paused_ready.as_ref(),
+                );
                 if readiness != StartupState::Ready {
                     outcome=match outcome {
                         Outcome::Unverified {surviving_terminals,expected_terminals,missing,unexpected,changed,..}=>Outcome::Unverified {serving:Some(proof),readiness:Some(readiness),surviving_terminals,expected_terminals,missing,unexpected,changed,detail:"The daemon answered but is not Ready; retained or pending restoration is not usable recovery".into()},
@@ -354,6 +421,7 @@ impl Receipt {
                 checkpoint_digest: checkpoint_digest.clone(),
                 source: source.clone(),
                 checkpoint_before: self.checkpoint_before.clone(),
+                recovery_command: None,
             })
         } else {
             None
@@ -416,6 +484,7 @@ type Observation = (
 trait InventorySource {
     fn proof(&self) -> &HostSessionProof;
     fn inventory_generation(&mut self) -> Result<u64, UpdateError>;
+    fn executable(&self) -> Result<PathBuf, UpdateError>;
     fn startup_state(&mut self) -> Result<StartupState, UpdateError>;
     fn list_terminals(&mut self) -> Result<Vec<TerminalDescriptor>, UpdateError>;
     fn list_chats(&mut self) -> Result<Vec<crate::chat::Session>, UpdateError>;
@@ -424,6 +493,9 @@ trait InventorySource {
 impl InventorySource for source::Client {
     fn proof(&self) -> &HostSessionProof {
         source::Client::proof(self)
+    }
+    fn executable(&self) -> Result<PathBuf, UpdateError> {
+        self.serving_executable()
     }
     fn inventory_generation(&mut self) -> Result<u64, UpdateError> {
         source::Client::inventory_generation(self)
@@ -440,40 +512,98 @@ impl InventorySource for source::Client {
 }
 
 fn observe() -> Result<Observation, UpdateError> {
+    observe_with(|_, _, _, _| Ok(())).map(|(inventory, ())| inventory)
+}
+
+fn observe_with<E>(
+    read_evidence: impl FnOnce(
+        &HostSessionProof,
+        &[TerminalDescriptor],
+        &[crate::chat::Session],
+        &Path,
+    ) -> Result<E, UpdateError>,
+) -> Result<(Observation, E), UpdateError> {
     if crate::device::is_remote() {
         return Err(invalid("Update recovery requires the local daemon"));
     }
     let socket = crate::terminal_ipc::daemon_socket_path()?;
     let mut client =
         source::Client::connect(&socket).map_err(|error| invalid(error.to_string()))?;
-    read_inventory(&mut client)
+    read_inventory_with(&mut client, read_evidence)
 }
 
+#[cfg(test)]
 fn read_inventory(client: &mut impl InventorySource) -> Result<Observation, UpdateError> {
+    read_inventory_with(client, |_, _, _, _| Ok(())).map(|(inventory, ())| inventory)
+}
+
+fn read_inventory_with<E>(
+    client: &mut impl InventorySource,
+    read_evidence: impl FnOnce(
+        &HostSessionProof,
+        &[TerminalDescriptor],
+        &[crate::chat::Session],
+        &Path,
+    ) -> Result<E, UpdateError>,
+) -> Result<(Observation, E), UpdateError> {
     let proof = client.proof().clone();
     let generation = client.inventory_generation()?;
     let readiness = client.startup_state()?;
     let terminals = client.list_terminals()?;
     let chats = client.list_chats()?;
+    let executable = client.executable()?;
+    // Durable ancestry is read inside the same generation fence as its exact
+    // listed replacement. Loading it never resolves, adopts or starts a chat.
+    let evidence = read_evidence(&proof, &terminals, &chats, &executable)?;
     let after_readiness = client.startup_state()?;
     let after_generation = client.inventory_generation()?;
     // The source increments this generation for terminal/chat topology and
     // completion. Bracketing both lists rejects a hybrid roster even if counts
     // or readiness return to their original values between the separate RPCs.
-    if after_generation != generation || after_readiness != readiness || client.proof() != &proof {
+    if after_generation != generation
+        || after_readiness != readiness
+        || client.proof() != &proof
+        || client.executable()? != executable
+    {
         return Err(invalid(
             "Daemon ownership, readiness or inventory changed during census verification",
         ));
     }
-    Ok((proof, terminals, chats, readiness))
+    Ok(((proof, terminals, chats, readiness), evidence))
 }
 
+#[cfg(test)]
 fn compare(
     census: &Census,
     proof: &HostSessionProof,
     terminals: &[TerminalDescriptor],
     chats: &[crate::chat::Session],
 ) -> Outcome {
+    compare_with_lineage(census, proof, terminals, chats, &Default::default())
+}
+
+#[cfg(test)]
+fn compare_with_lineage(
+    census: &Census,
+    proof: &HostSessionProof,
+    terminals: &[TerminalDescriptor],
+    chats: &[crate::chat::Session],
+    lineage: &crate::upgrade::handoff::RecoveredChats,
+) -> Outcome {
+    compare_with_recovery(census, proof, terminals, chats, lineage, None, None)
+}
+
+fn compare_with_recovery(
+    census: &Census,
+    proof: &HostSessionProof,
+    terminals: &[TerminalDescriptor],
+    chats: &[crate::chat::Session],
+    lineage: &crate::upgrade::handoff::RecoveredChats,
+    prepared: Option<&crate::upgrade::recovery::verified::VerifiedView>,
+    paused_ready: Option<&crate::upgrade::recovery::verified::ready::ReadyView>,
+) -> Outcome {
+    let mut paused_terminals = vec![];
+    let mut paused_chats = vec![];
     let mut missing = vec![];
     let mut changed = vec![];
     let mut unexpected = vec![];
@@ -494,7 +624,13 @@ fn compare(
             })
             .collect();
         if matches.is_empty() {
-            missing.push(expected.id);
+            if prepared.is_some_and(|view| view.paused_terminal(expected))
+                || paused_ready.is_some_and(|view| view.paused_terminal(expected))
+            {
+                paused_terminals.push(expected.id);
+            } else {
+                missing.push(expected.id);
+            }
             continue;
         }
         if matches.len() != 1 {
@@ -535,8 +671,18 @@ fn compare(
     for expected in &census.chats {
         let same: Vec<_> = chats.iter().filter(|c| c.id == expected.id).collect();
         if same.is_empty() {
-            missing.push(expected.id);
-        } else if same.len() != 1 || !same_owner_chat_matches(expected, same[0], proof) {
+            if prepared.is_some_and(|view| view.paused_chat(expected))
+                || paused_ready.is_some_and(|view| view.paused_chat(expected))
+            {
+                paused_chats.push(expected.id);
+            } else {
+                missing.push(expected.id);
+            }
+        } else if same.len() != 1
+            || !(same_owner_chat_matches(expected, same[0], proof)
+                || lineage.proves(expected, same[0], proof)
+                || prepared.is_some_and(|view| view.proves_chat(expected, same[0])))
+        {
             changed.push(expected.id);
         } else {
             surviving_chats += 1;
@@ -557,27 +703,18 @@ fn compare(
             missing,
             unexpected,
             changed,
-            detail: if census
-                .chats
-                .iter()
-                .any(|chat| chat.proof.as_ref() != Some(proof))
-            {
-                format!(
-                    "The ready daemon's identity or inventory differs from the pre-update census; {surviving_chats} of {} original native chats were verified. This read-only protocol does not expose issued chat ancestry across daemon owners, so matching chat IDs and launch recipes cannot verify restored conversations.",
-                    census.chats.len()
-                )
-            } else {
-                format!(
-                    "The ready daemon's identity or inventory differs from the pre-update census; {surviving_chats} of {} original native chats were verified",
-                    census.chats.len()
-                )
-            },
+            detail: format!(
+                "The ready daemon's identity or inventory differs from the pre-update census; {surviving_chats} of {} original native chats have exact issued lineage to the serving owner",
+                census.chats.len()
+            ),
         }
     } else {
         Outcome::Usable {
             serving: proof.clone(),
             terminals: terminals.len(),
             chats: chats.len(),
+            paused_terminals,
+            paused_chats,
         }
     }
 }
@@ -586,10 +723,8 @@ fn same_owner_chat_matches(
     current: &crate::chat::Session,
     serving: &HostSessionProof,
 ) -> bool {
-    // ResolveUpgradeChat can adopt a missing retained owner, recover cleanup
-    // attachments, or register history aliases. It is not a read-only lineage
-    // probe, even after a list: a concurrent close can make that source missing.
-    // Until a read-only ancestry contract exists, changed owners stay unverified.
+    // With the original serving owner, the exact issued descriptor is enough.
+    // Changed owners additionally require the read-only durable lineage above.
     expected.proof.as_ref() == Some(serving)
         && current.proof.as_ref() == Some(serving)
         && current == expected
@@ -622,22 +757,169 @@ pub(crate) fn validate_file(path: &Path) -> Result<(), UpdateError> {
 pub(crate) fn capture_file(output: &Path) -> Result<(), UpdateError> {
     Census::capture(uuid::Uuid::new_v4().to_string())?.save(output)
 }
+
+pub(super) fn inspect_pending(
+    candidate_cli: &Path,
+    census: Option<&Path>,
+) -> Result<(), UpdateError> {
+    if crate::device::is_remote() {
+        return Err(invalid("Update recovery requires the local service"));
+    }
+    let mut pending = match census {
+        Some(path) => crate::upgrade::recovery::PendingRecovery::retain_installer_census(path),
+        None => crate::upgrade::recovery::PendingRecovery::inspect(),
+    }
+    .map_err(invalid)?;
+    if let Some(pending) = pending.as_mut() {
+        let recovered_path = if !pending.original_census_complete && census.is_none() {
+            let path = retained_job_census(candidate_cli, pending)?;
+            *pending = crate::upgrade::recovery::PendingRecovery::retain_installer_census(&path)
+                .map_err(invalid)?
+                .ok_or_else(|| invalid("The Prepared checkpoint disappeared during inspection"))?;
+            Some(path)
+        } else {
+            None
+        };
+        return Err(pending_required(
+            pending,
+            candidate_cli,
+            census.or(recovered_path.as_deref()),
+        )?);
+    }
+    Ok(())
+}
+
+/// Resolve one private, request-bound job, rather than searching by timestamps
+/// or borrowing another update's census. A retry cannot overwrite this scope.
+fn retained_job_census(
+    candidate_cli: &Path,
+    pending: &crate::upgrade::recovery::PendingRecovery,
+) -> Result<PathBuf, UpdateError> {
+    let missing = || {
+        invalid(
+            "A Prepared checkpoint is retained, but its complete original census is unavailable. Nothing was restarted or recaptured. Keep the checkpoint and the failed install's original private update-census.json; rerun the retained target's inspect-pending-update-recovery with --census pointing to that file before recovering",
+        )
+    };
+    let layout = locate(candidate_cli).map_err(|_| missing())?;
+    let state = layout.prefix.join(".update");
+    let directory = fs::symlink_metadata(&state).map_err(|_| missing())?;
+    if !directory.is_dir()
+        || directory.uid() != unsafe { libc::geteuid() }
+        || directory.mode() & 0o077 != 0
+    {
+        return Err(missing());
+    }
+    let status_path = state.join("status.json");
+    let status_bytes = read_private(&status_path, JOB_STATE_LIMIT).map_err(|_| missing())?;
+    let job: UpdateJob = serde_json::from_slice(&status_bytes).map_err(|_| missing())?;
+    if uuid::Uuid::parse_str(&job.id).is_err() || job.version != layout.version {
+        return Err(missing());
+    }
+    let request: UpdateRequest = serde_json::from_slice(
+        &read_private(&state.join(format!("{}.request", job.id)), JOB_STATE_LIMIT)
+            .map_err(|_| missing())?,
+    )
+    .map_err(|_| missing())?;
+    let target_matches = match request {
+        UpdateRequest::Installed { root } | UpdateRequest::InstalledFromTerminal { root } => root
+            .canonicalize()
+            .is_ok_and(|root| root == layout.version_root),
+        UpdateRequest::Release(release) | UpdateRequest::ReleaseFromTerminal(release) => {
+            release.version == job.version
+        }
+    };
+    let path = census_path(&state, &job.id);
+    let original = Census::load(&path).map_err(|_| missing())?;
+    if !target_matches
+        || original.transaction != job.id
+        || original.source.as_ref() != Some(&pending.source)
+        || original.checkpoint_before.as_ref() == Some(&pending.checkpoint_hash)
+        || read_private(&status_path, JOB_STATE_LIMIT)? != status_bytes
+    {
+        return Err(missing());
+    }
+    Ok(path)
+}
+
+fn pending_required(
+    pending: &crate::upgrade::recovery::PendingRecovery,
+    candidate_cli: &Path,
+    original_census: Option<&Path>,
+) -> Result<UpdateError, UpdateError> {
+    if !pending.original_census_complete {
+        return Err(invalid(
+            "The complete original census is unavailable; no recovery command was issued from a checkpoint-only inventory. Keep the checkpoint and the original installer census; no source inventory was recaptured",
+        ));
+    }
+    let census = Census {
+        version: VERSION,
+        transaction: uuid::Uuid::new_v4().to_string(),
+        source: Some(pending.source.clone()),
+        terminals: pending.census.terminals.clone(),
+        chats: pending.census.chats.clone(),
+        checkpoint_before: Some(pending.checkpoint_hash.clone()),
+    };
+    census.validate()?;
+    Ok(UpdateError::TargetRecoveryRequired(
+        TargetRecoveryRequired {
+            transaction: census.transaction.clone(),
+            census_digest: census.digest()?,
+            checkpoint_digest: pending.checkpoint_hash.clone(),
+            source: pending.source.clone(),
+            checkpoint_before: census.checkpoint_before.clone(),
+            recovery_command: Some(pending.command(candidate_cli, original_census)),
+        },
+    ))
+}
+
+/// Preserve the original installer census before reporting a target-only
+/// recovery. The command names the complete retained target, never a temporary
+/// coordinator or the old `current` executable.
+pub(crate) fn verify_file_with_candidate(
+    census: &Path,
+    outcome: &Path,
+    candidate_cli: Option<&Path>,
+) -> Result<Receipt, UpdateError> {
+    let original = Census::load(census)?;
+    let permission = original.inspect_restart()?;
+    if let Some(mut required) = permission.target_required() {
+        permission.save(outcome)?;
+        if let Some(candidate_cli) = candidate_cli {
+            let pending =
+                crate::upgrade::recovery::PendingRecovery::retain_installer_census(census)
+                    .map_err(invalid)?
+                    .ok_or_else(|| {
+                        invalid("The Prepared checkpoint disappeared during inspection")
+                    })?;
+            required.recovery_command = Some(pending.command(candidate_cli, Some(census)));
+        }
+        return Err(UpdateError::TargetRecoveryRequired(required));
+    }
+    verify_file(census, outcome, true, false, false, false)
+}
+
 pub(crate) fn verify_file(
     census: &Path,
     outcome: &Path,
     inspect: bool,
     allow_absent: bool,
     require_original: bool,
+    require_absent: bool,
 ) -> Result<Receipt, UpdateError> {
     if crate::device::is_remote() {
         return Err(invalid("Update recovery requires the local service"));
     }
     let census = Census::load(census)?;
-    let receipt = if allow_absent
-        && census.source.is_none()
-        && Census::capture(census.transaction.clone()).is_ok_and(|c| c.source.is_none())
-    {
-        census.receipt(Outcome::NoSource)?
+    let mut receipt = if require_absent {
+        match census.verify_absence() {
+            Ok(receipt) => receipt,
+            Err(error) => census.unverified(error.to_string())?,
+        }
+    } else if allow_absent && census.source.is_none() {
+        match census.verify_absence() {
+            Ok(receipt) => receipt,
+            Err(error) => census.unverified(error.to_string())?,
+        }
     } else if inspect {
         match census.inspect_restart() {
             Ok(r) => r,
@@ -648,21 +930,48 @@ pub(crate) fn verify_file(
     };
     if require_original {
         let unchanged = matches!(&receipt.outcome,Outcome::Usable{serving,..} if census.source.as_ref()==Some(serving));
-        if !unchanged && !(allow_absent && matches!(receipt.outcome, Outcome::NoSource)) {
-            return Err(invalid(
-                "The original service identity is no longer serving; retain the current recovery daemon and candidate installation.",
-            ));
+        if !unchanged
+            && !((allow_absent || require_absent) && matches!(receipt.outcome, Outcome::NoSource))
+        {
+            receipt = census.unverified(
+                "The original service identity is no longer serving; retain the current recovery daemon and candidate installation."
+                    .into(),
+            )?;
         }
     }
     receipt.save(outcome)?;
     if inspect && matches!(receipt.outcome, Outcome::RestartPermitted) {
         return Ok(receipt);
     }
-    if receipt.usable() || (allow_absent && matches!(receipt.outcome, Outcome::NoSource)) {
+    if (!require_absent && receipt.usable())
+        || ((allow_absent || require_absent) && matches!(receipt.outcome, Outcome::NoSource))
+    {
         Ok(receipt)
     } else {
         Err(receipt.failure())
     }
+}
+
+impl Census {
+    pub(super) fn verify_absence(&self) -> Result<Receipt, UpdateError> {
+        let fresh = Self::capture(self.transaction.clone())?;
+        if !proves_absent(self, &fresh) {
+            return Err(invalid(
+                "A daemon or pending recovery exists; a fresh installation without a source daemon was not proven",
+            ));
+        }
+        self.receipt(Outcome::NoSource)
+    }
+}
+
+fn proves_absent(census: &Census, fresh: &Census) -> bool {
+    census.transaction == fresh.transaction
+        && [census, fresh].iter().all(|observed| {
+            observed.source.is_none()
+                && observed.terminals.is_empty()
+                && observed.chats.is_empty()
+                && observed.checkpoint_before.is_none()
+        })
 }
 
 #[derive(Default)]
@@ -817,11 +1126,14 @@ mod tests {
         ));
     }
     fn chat() -> crate::chat::Session {
+        let mut recipe = terminal().session.launch;
+        recipe.program = "claude".into();
+        recipe.arguments.clear();
         crate::chat::Session {
             id: crate::model::TerminalId::new(),
             launch: crate::chat::Launch {
                 provider: crate::agent::Provider::Claude,
-                recipe: terminal().session.launch,
+                recipe,
                 session_id: Some(uuid::Uuid::new_v4().to_string()),
             },
             proof: Some(proof()),
@@ -871,6 +1183,155 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn update_recovery_chat_census_accepts_exact_durable_claude_and_codex_replacements() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::upgrade::handoff::Store::open(directory.path()).unwrap();
+        let mut expected = census(&terminal());
+        expected.terminals.clear();
+        let claude = chat();
+        let mut codex = chat();
+        codex.launch.provider = crate::agent::Provider::Codex;
+        codex.launch.recipe.program = "codex".into();
+        codex.native_continuity = Default::default();
+        expected.chats = vec![claude, codex];
+        let mut serving = proof();
+        serving.host_incarnation = "replacement".into();
+        let current: Vec<_> = expected
+            .chats
+            .iter()
+            .cloned()
+            .map(|mut chat| {
+                chat.proof = Some(serving.clone());
+                chat
+            })
+            .collect();
+        assert!(matches!(
+            compare(&expected, &serving, &[], &current),
+            Outcome::Unverified { .. }
+        ));
+        let entries: Vec<_> = expected
+            .chats
+            .iter()
+            .zip(&current)
+            .map(
+                |(source, replacement)| crate::upgrade::handoff::RecoveredChat {
+                    evidence: crate::upgrade::handoff::Chat {
+                        source: source.clone(),
+                        launch: source.launch.clone(),
+                        previous_sources: vec![],
+                    },
+                    replacement: replacement.clone(),
+                    aliases: vec![],
+                },
+            )
+            .collect();
+        store.record_recovered(&entries).unwrap();
+        let lineage = store.recovered_chats().unwrap();
+        assert!(matches!(
+            compare_with_lineage(&expected, &serving, &[], &current, &lineage),
+            Outcome::Usable { chats: 2, .. }
+        ));
+        for mutation in 0..4 {
+            let mut different = current.clone();
+            match mutation {
+                0 => different[0].proof.as_mut().unwrap().host_incarnation = "foreign".into(),
+                1 => different[1].launch.session_id = Some(uuid::Uuid::new_v4().to_string()),
+                2 => different[0]
+                    .launch
+                    .recipe
+                    .arguments
+                    .push("--different".into()),
+                _ => different.push(current[0].clone()),
+            }
+            assert!(
+                matches!(
+                    compare_with_lineage(&expected, &serving, &[], &different, &lineage),
+                    Outcome::Unverified { .. }
+                ),
+                "mutation {mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn update_recovery_require_absent_rejects_serving_inventory_and_pending_checkpoint() {
+        let mut empty = census(&terminal());
+        empty.source = None;
+        empty.terminals.clear();
+        assert!(proves_absent(&empty, &empty));
+        for mutation in 0..5 {
+            let mut changed = empty.clone();
+            match mutation {
+                0 => changed.source = Some(proof()),
+                1 => changed.terminals.push(terminal().session),
+                2 => changed.chats.push(chat()),
+                3 => changed.checkpoint_before = Some("pending-checkpoint".into()),
+                _ => changed.transaction = uuid::Uuid::new_v4().to_string(),
+            }
+            assert!(
+                !proves_absent(&empty, &changed),
+                "fresh mutation {mutation}"
+            );
+            assert!(
+                !proves_absent(&changed, &empty),
+                "original mutation {mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn update_recovery_allow_absent_cannot_hide_a_ready_checkpoint() {
+        const PRIVATE: &str = "CAGENTS_TEST_ALLOW_ABSENT_READY_CHECKPOINT";
+        if std::env::var_os(PRIVATE).is_none() {
+            let root = tempfile::tempdir().unwrap();
+            let runtime = root.path().join("runtime");
+            fs::create_dir(&runtime).unwrap();
+            fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    std::thread::current().name().unwrap(),
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(PRIVATE, root.path())
+                .env("XDG_RUNTIME_DIR", runtime)
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .env("XDG_STATE_HOME", root.path().join("state"))
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("XDG_CACHE_HOME", root.path().join("cache"))
+                .env("HOME", root.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
+        let root = PathBuf::from(std::env::var_os(PRIVATE).unwrap());
+        let store = crate::upgrade::handoff::Store::discover().unwrap();
+        let mut checkpoint =
+            crate::upgrade::handoff::Checkpoint::new(proof(), vec![], vec![], vec![]);
+        checkpoint.phase = crate::upgrade::handoff::Phase::Ready;
+        store.save(&checkpoint).unwrap();
+        let before = fs::read(&store.path).unwrap();
+        let mut original = census(&terminal());
+        original.source = None;
+        original.terminals.clear();
+        let path = root.join("original-census.json");
+        original.save(&path).unwrap();
+        let observed = Census::capture(original.transaction.clone()).unwrap();
+        assert!(observed.source.is_none());
+        assert!(observed.checkpoint_before.is_some());
+        let outcome = root.join("outcome.json");
+        for require_absent in [false, true] {
+            assert!(verify_file(&path, &outcome, false, true, false, require_absent).is_err());
+            let receipt: Receipt = serde_json::from_slice(&fs::read(&outcome).unwrap()).unwrap();
+            assert!(matches!(receipt.outcome, Outcome::Unverified { .. }));
+            assert!(!receipt.usable());
+        }
+        assert_eq!(fs::read(&store.path).unwrap(), before);
+    }
+
     struct InventoryFixture {
         proof: HostSessionProof,
         generation: u64,
@@ -880,6 +1341,9 @@ mod tests {
     impl InventorySource for InventoryFixture {
         fn proof(&self) -> &HostSessionProof {
             &self.proof
+        }
+        fn executable(&self) -> Result<PathBuf, UpdateError> {
+            Ok("/fixture/cagentsd".into())
         }
         fn inventory_generation(&mut self) -> Result<u64, UpdateError> {
             self.calls.push("fence");
@@ -928,6 +1392,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn update_recovery_observes_durable_evidence_inside_inventory_fence() {
+        let mut source = InventoryFixture {
+            proof: proof(),
+            generation: 7,
+            mutate_between_lists: false,
+            calls: vec![],
+        };
+        let (_, evidence) =
+            read_inventory_with(&mut source, |_, _, _, _| Ok("read-only evidence")).unwrap();
+        assert_eq!(evidence, "read-only evidence");
+        assert_eq!(
+            source.calls,
+            ["fence", "ready", "terminals", "chats", "ready", "fence"]
+        );
+        source.calls.clear();
+        assert!(
+            read_inventory_with(&mut source, |_, _, _, _| Err::<(), _>(invalid(
+                "unsafe evidence"
+            )))
+            .is_err()
+        );
+        assert_eq!(source.calls, ["fence", "ready", "terminals", "chats"]);
     }
 
     #[test]

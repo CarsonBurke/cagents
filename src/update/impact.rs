@@ -20,12 +20,6 @@ pub enum SessionKind {
     NativeChat,
 }
 
-/// A source refuses to carry a conversation whose provider stopped without
-/// confirming its work settled, and asks for it to be closed. Every source
-/// line since the candidate line (128) reports it in exactly these words, so
-/// the updater can recognize the one blocker that closing resolves.
-pub const STOPPED_WITH_UNSETTLED_WORK: &str = "Its provider stopped but may still hold unfinished work. Close this conversation to release it.";
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Disposition {
@@ -130,6 +124,9 @@ impl DaemonImpact {
                         && (previous.disposition == current.disposition
                             || (self.policy == Policy::WhenIdle
                                 && previous.disposition == Disposition::WaitsForIdle
+                                && current.disposition == Disposition::Resumes)
+                            || (self.policy == Policy::Interrupt
+                                && previous.disposition == Disposition::Interrupted
                                 && current.disposition == Disposition::Resumes))
                 })
             })
@@ -216,6 +213,22 @@ mod tests {
     }
 
     #[test]
+    fn interruption_consent_survives_settlement_only_for_the_same_conversation() {
+        let mut confirmed = waiting();
+        confirmed.policy = Policy::Interrupt;
+        confirmed.sessions[0].disposition = Disposition::Interrupted;
+        let mut settled = confirmed.clone();
+        settled.sessions[0].disposition = Disposition::Resumes;
+        assert!(confirmed.preserves_consent(&settled));
+        assert!(
+            !settled.preserves_consent(&confirmed),
+            "a new turn needs consent"
+        );
+        settled.sessions[0].identity.push_str(" replacement owner");
+        assert!(!confirmed.preserves_consent(&settled));
+    }
+
+    #[test]
     fn editor_census_is_backwards_compatible_and_does_not_expand_consent() {
         let before: Preview = serde_json::from_value(serde_json::json!({
             "candidate": { "version": "1.0", "protocol": 160, "digest": "verified" },
@@ -271,6 +284,7 @@ mod tests {
     fn stopped_outcomes_require_the_same_panes_windows_and_reasons() {
         use super::super::source_inspection::{StoppedKind, StoppedPane, StoppedWindow};
         let preview = Preview {
+            editors: Vec::new(),
             candidate: Candidate {
                 version: "2".into(),
                 protocol: 160,
@@ -279,7 +293,6 @@ mod tests {
             replaces_daemon: false,
             daemon: None,
             from_version: "1".into(),
-            editors: Vec::new(),
             windows: 2,
             stopped: vec![StoppedPane {
                 pane: TerminalId::new(),
@@ -381,6 +394,18 @@ impl Preview {
         self.stopped_windows = inspection.stopped_windows.clone();
         self.labels.names = inspection.labels.clone();
         self
+    }
+
+    /// Stop consent binds the candidate and exact listed owners. Activity is
+    /// display-only here; the ordinary review has already settled the wait.
+    pub(super) fn preserves_stop_consent(&self, observed: &Self) -> bool {
+        self.candidate == observed.candidate
+            && self.replaces_daemon == observed.replaces_daemon
+            && self.daemon.as_ref().map(|daemon| &daemon.capability.proof)
+                == observed
+                    .daemon
+                    .as_ref()
+                    .map(|daemon| &daemon.capability.proof)
     }
 
     pub fn preserves_consent(&self, observed: &Self) -> bool {

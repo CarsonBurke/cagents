@@ -3,8 +3,12 @@
 mod cancellation;
 mod candidate;
 mod confirmation;
+mod floor;
+mod floor_display;
+mod floor_prediction;
 mod handoff;
 mod installed;
+mod pending_recovery;
 pub(crate) mod recovery;
 pub use recovery::TargetRecoveryRequired;
 pub(crate) mod source;
@@ -52,6 +56,7 @@ const WORKER_LOCK_FD: i32 = 198;
 pub struct CancellationToken {
     requested: Arc<AtomicBool>,
     marker: Option<PathBuf>,
+    terminal_interrupts: bool,
 }
 impl CancellationToken {
     pub fn new() -> Self {
@@ -60,14 +65,22 @@ impl CancellationToken {
     pub fn cancel(&self) {
         self.requested.store(true, Ordering::Relaxed);
     }
+    fn for_terminal() -> Self {
+        Self {
+            terminal_interrupts: true,
+            ..Self::default()
+        }
+    }
     fn cancelled(&self) -> bool {
-        self.requested.load(Ordering::Relaxed)
+        (self.terminal_interrupts && cancellation::requested())
+            || self.requested.load(Ordering::Relaxed)
             || self.marker.as_ref().is_some_and(|marker| marker.exists())
     }
     fn for_job(state: &Path, job: &str) -> Result<Self, UpdateError> {
         Ok(Self {
             requested: Arc::default(),
             marker: confirmation::cancellation_path(state, job)?,
+            terminal_interrupts: false,
         })
     }
 }
@@ -415,10 +428,13 @@ fn applicable_release(release: GitHubRelease) -> Result<Release, UpdateError> {
 #[derive(Serialize, Deserialize)]
 enum UpdateRequest {
     Release(Release),
+    ReleaseFromTerminal(Release),
     Installed { root: PathBuf },
+    InstalledFromTerminal { root: PathBuf },
 }
 
 pub fn apply(release: &Release) -> Result<UpdateJob, UpdateError> {
+    inspect_pending_recovery(&std::env::current_exe()?, None)?;
     let installation = Installation::detect()?;
     if stable_version(&release.version)? <= installed_version(&installation.version)? {
         return Err(invalid(
@@ -433,6 +449,15 @@ pub fn apply(release: &Release) -> Result<UpdateJob, UpdateError> {
 }
 
 pub fn apply_installed(executable: &Path) -> Result<UpdateJob, UpdateError> {
+    apply_installed_from(executable, false)
+}
+
+fn apply_installed_from(executable: &Path, terminal: bool) -> Result<UpdateJob, UpdateError> {
+    let candidate_cli = executable
+        .parent()
+        .ok_or_else(unsupported_install)?
+        .join("cagents");
+    inspect_pending_recovery(&candidate_cli, None)?;
     let mut installation = running_installation()?;
     let layout = locate(&std::env::current_exe()?)?;
     let served = served_version_root(&layout)?;
@@ -452,7 +477,11 @@ pub fn apply_installed(executable: &Path) -> Result<UpdateJob, UpdateError> {
     start_job(
         &installation,
         &version,
-        &UpdateRequest::Installed { root: served },
+        &if terminal {
+            UpdateRequest::InstalledFromTerminal { root: served }
+        } else {
+            UpdateRequest::Installed { root: served }
+        },
     )
 }
 
@@ -518,131 +547,425 @@ fn installed_daemon_owner(layout: &InstallLayout) -> Result<Option<InstallLayout
 /// CLI entry point for the same leased worker, exact preview and window fence
 /// used by the application. The served candidate always supplies the worker.
 pub fn upgrade_installed(yes: bool, interrupt: bool) -> Result<UpdateJob, UpdateError> {
-    use std::io::IsTerminal;
-    if !yes && !io::stdin().is_terminal() {
-        return Err(invalid(
-            "Review the update in the app, or pass --yes to approve its displayed impact; --interrupt additionally permits active native turns and their background subagents to stop.",
-        ));
-    }
     let _interrupt = cancellation::Interrupt::install()?;
+    // An interrupted preparation has its own immutable source census. Do not
+    // route this retry through old `current` or construct a fresh empty source.
+    inspect_pending_recovery(&std::env::current_exe()?, None)?;
     let layout = locate(&std::env::current_exe()?)?;
     let candidate = served_version_root(&layout)?.join("bin/cagents-ui");
-    let initial = apply_installed(&candidate)?;
+    if cancellation::requested() {
+        return Err(UpdateError::Cancelled);
+    }
+    let initial = apply_installed_from(&candidate, true)?;
+    drive_terminal_review(initial, yes, interrupt)
+}
+
+pub fn upgrade_release(
+    version: &str,
+    yes: bool,
+    interrupt: bool,
+) -> Result<UpdateJob, UpdateError> {
+    let _interrupt = cancellation::Interrupt::install()?;
+    inspect_pending_recovery(&std::env::current_exe()?, None)?;
+    let installation = Installation::detect()?;
+    let parsed = stable_version(version)?;
+    let tag = format!("v{parsed}");
+    let selected = applicable_release(serde_json::from_slice(&metadata(
+        &format!("repos/{REPOSITORY}/releases/tags/{tag}"),
+        &CancellationToken::for_terminal(),
+    )?)?)?;
+    if stable_version(&selected.version)? != parsed
+        || parsed <= installed_version(&installation.version)?
+    {
+        return Err(invalid(
+            "selected release is not newer than the running installation",
+        ));
+    }
+    if cancellation::requested() {
+        return Err(UpdateError::Cancelled);
+    }
+    let initial = start_job(
+        &installation,
+        &selected.version,
+        &UpdateRequest::ReleaseFromTerminal(selected.clone()),
+    )?;
+    drive_terminal_review(initial, yes, interrupt)
+}
+
+/// Inspect retained preparation before constructing a new update census.
+pub fn inspect_pending_recovery(
+    candidate_cli: &Path,
+    census: Option<&Path>,
+) -> Result<(), UpdateError> {
+    recovery::inspect_pending(candidate_cli, census)
+}
+
+/// Explicit checkpoint-bound continuation through the shared recovery owner.
+pub fn recover_pending(
+    checkpoint: &str,
+    yes: bool,
+    census: Option<&Path>,
+) -> Result<String, UpdateError> {
+    pending_recovery::run(checkpoint, yes, census)
+}
+
+fn drive_terminal_review(
+    initial: UpdateJob,
+    yes: bool,
+    interrupt: bool,
+) -> Result<UpdateJob, UpdateError> {
+    drive_terminal_review_with(initial, yes, interrupt, &mut NativeTerminalReview)
+}
+
+trait TerminalReview: Write {
+    fn status(&mut self) -> Result<Option<UpdateJob>, UpdateError>;
+    fn decide(&mut self, job: &str, nonce: &str, choice: UpdateChoice) -> Result<(), UpdateError>;
+    fn cancel(&mut self, job: &str) -> Result<bool, UpdateError>;
+    fn read_line(&mut self, answer: &mut String) -> io::Result<usize>;
+    fn is_terminal(&self) -> bool;
+    fn interrupted(&self) -> bool;
+    fn worker_running(&mut self) -> Result<bool, UpdateError> {
+        Ok(false)
+    }
+    fn pause(&mut self) {
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+struct NativeTerminalReview;
+impl Write for NativeTerminalReview {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        io::stderr().lock().write(bytes)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        io::stderr().lock().flush()
+    }
+}
+impl TerminalReview for NativeTerminalReview {
+    fn status(&mut self) -> Result<Option<UpdateJob>, UpdateError> {
+        status()
+    }
+    fn decide(&mut self, job: &str, nonce: &str, choice: UpdateChoice) -> Result<(), UpdateError> {
+        decide(job, nonce, choice)
+    }
+    fn cancel(&mut self, job: &str) -> Result<bool, UpdateError> {
+        confirmation::cancel(job)
+    }
+    fn read_line(&mut self, answer: &mut String) -> io::Result<usize> {
+        cancellation::read_line(answer)
+    }
+    fn is_terminal(&self) -> bool {
+        use std::io::IsTerminal;
+        io::stdin().is_terminal()
+    }
+    fn interrupted(&self) -> bool {
+        cancellation::requested()
+    }
+    fn worker_running(&mut self) -> Result<bool, UpdateError> {
+        let state = running_installation()?.state_dir()?;
+        match acquire_lock(&state) {
+            Ok(_lease) => Ok(false),
+            Err(UpdateError::Busy) => Ok(true),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+fn drive_terminal_review_with(
+    initial: UpdateJob,
+    yes: bool,
+    interrupt: bool,
+    terminal: &mut impl TerminalReview,
+) -> Result<UpdateJob, UpdateError> {
     let mut policy = if interrupt {
         impact::Policy::Interrupt
     } else {
         impact::Policy::WhenIdle
     };
-    let mut submitted = None;
+    let mut submitted = std::collections::BTreeSet::new();
+    let mut waiting = None;
     let mut policy_requested = None;
+    let mut reviewed = None;
     let deadline = Instant::now() + Duration::from_secs(45 * 60);
     let mut finishing_message_shown = false;
     loop {
-        let job = status()?
+        if Instant::now() >= deadline {
+            return Err(invalid(
+                "The update is still running; inspect its progress in the app.",
+            ));
+        }
+        let job = terminal
+            .status()?
             .filter(|job| job.id == initial.id)
             .ok_or_else(|| {
                 invalid("The update job changed; inspect the current update in the app.")
             })?;
         if job.phase.is_terminal() {
+            if terminal.worker_running()? {
+                terminal.pause();
+                continue;
+            }
+            // Refresh after proving the worker has settled: the snapshot read
+            // before that lease probe may precede its final recovery report.
+            let job = terminal
+                .status()?
+                .filter(|current| current.id == initial.id)
+                .ok_or_else(|| {
+                    invalid("The update job changed; inspect the current update in the app.")
+                })?;
             return if job.phase == UpdatePhase::Complete {
                 Ok(job)
             } else {
                 Err(invalid(job.message))
             };
         }
-        if cancellation::requested() {
-            if confirmation::cancel(&job.id)? {
+        if terminal.interrupted() {
+            if terminal.cancel(&job.id)? {
                 return Err(UpdateError::Cancelled);
             }
             if !finishing_message_shown {
-                eprintln!("The update is already being applied; finishing it before returning.");
+                writeln!(
+                    terminal,
+                    "The update is already being applied; finishing it before returning."
+                )?;
                 finishing_message_shown = true;
             }
         } else if let Some(confirmation) = job.active_confirmation() {
-            if confirmation
-                .preview
-                .daemon
-                .as_ref()
-                .is_some_and(|daemon| daemon.policy != policy)
-            {
-                if policy_requested.as_ref() != Some(&confirmation.nonce) {
-                    decide(&job.id, &confirmation.nonce, UpdateChoice::Policy(policy))?;
-                    policy_requested = Some(confirmation.nonce.clone());
+            if job.phase == UpdatePhase::WaitingForIdle {
+                let labels: Vec<_> = confirmation
+                    .preview
+                    .daemon
+                    .iter()
+                    .flat_map(|daemon| &daemon.sessions)
+                    .filter(|item| item.disposition == impact::Disposition::WaitsForIdle)
+                    .map(|item| {
+                        confirmation
+                            .preview
+                            .labels
+                            .names
+                            .get(&item.id)
+                            .unwrap_or(&item.title)
+                            .clone()
+                    })
+                    .collect();
+                if !labels.is_empty() && waiting.as_ref() != Some(&labels) {
+                    writeln!(
+                        terminal,
+                        "Waiting for these conversations to finish their turns:\n  {}\nCtrl-C cancels the update; nothing has been ended or stopped.",
+                        labels.join("\n  ")
+                    )?;
+                    waiting = Some(labels);
                 }
-            } else if submitted.as_ref() != Some(&confirmation.nonce) {
-                // A changed preview is a new review, including after approval.
-                eprint!("{}", render_review(&confirmation.preview));
-                if submitted.is_some() {
-                    decide(&job.id, &confirmation.nonce, UpdateChoice::Cancel)?;
-                    return Err(invalid(
-                        "Update impact changed after approval; review and retry the update.",
-                    ));
-                }
-                if confirmation
+                // Approval belongs to this review, even if a worker republishes
+                // it with a fresh nonce during its cancellable idle wait.
+                submitted.insert(confirmation.nonce.clone());
+            }
+            if confirmation.stop.is_none()
+                && confirmation
                     .preview
                     .daemon
                     .as_ref()
-                    .is_some_and(impact::DaemonImpact::blocked)
-                {
-                    decide(&job.id, &confirmation.nonce, UpdateChoice::Cancel)?;
-                    return Err(invalid(
-                        "Resolve the items that need attention, then run the update again.",
-                    ));
+                    .is_some_and(|daemon| daemon.policy != policy)
+            {
+                if policy_requested.as_ref() != Some(&confirmation.nonce) {
+                    terminal.decide(&job.id, &confirmation.nonce, UpdateChoice::Policy(policy))?;
+                    policy_requested = Some(confirmation.nonce.clone());
                 }
-                let choice = if yes {
-                    UpdateChoice::Confirm
-                } else {
-                    match prompt_review(&confirmation.preview) {
+            } else if !submitted.contains(&confirmation.nonce) {
+                if let Some(list) = &confirmation.stop {
+                    write!(
+                        terminal,
+                        "{}",
+                        if terminal.is_terminal() {
+                            list.render()
+                        } else {
+                            list.render_preview()
+                        }
+                    )?;
+                    if !terminal.is_terminal() {
+                        writeln!(
+                            terminal,
+                            "Stopping live work needs a terminal. Rerun this command in a terminal."
+                        )?;
+                    }
+                    let is_terminal = terminal.is_terminal();
+                    let choice = match floor_display::read_stop_choice_from(
+                        |answer| terminal.read_line(answer),
+                        is_terminal,
+                        list,
+                    ) {
                         Ok(choice) => choice,
                         Err(error) => {
-                            if cancellation::requested() {
-                                if confirmation::cancel(&job.id)? {
+                            if terminal.interrupted() {
+                                if terminal.cancel(&job.id)? {
                                     return Err(UpdateError::Cancelled);
                                 }
                                 continue;
                             }
-                            let _ = decide(&job.id, &confirmation.nonce, UpdateChoice::Cancel);
+                            let _ = terminal.cancel(&job.id);
+                            return Err(error.into());
+                        }
+                    };
+                    if !submit_current_choice(
+                        terminal,
+                        &job.id,
+                        &confirmation.nonce,
+                        choice.clone(),
+                    )? {
+                        // Live work changed while the person was reading or
+                        // typing. Reload and display its new list in this CLI.
+                        continue;
+                    }
+                    if matches!(choice, UpdateChoice::Cancel) {
+                        return Err(UpdateError::Cancelled);
+                    }
+                    submitted.insert(confirmation.nonce.clone());
+                    continue;
+                }
+                write!(
+                    terminal,
+                    "{}",
+                    match &reviewed {
+                        Some(previous) =>
+                            review::render_review_changes(previous, &confirmation.preview),
+                        None => render_review(&confirmation.preview),
+                    }
+                )?;
+                let choice = if ordinary_approval(yes, terminal.is_terminal())
+                    == Some(OrdinaryChoice::Cancel)
+                {
+                    let stopped_preview = floor::preview_stop_list(&confirmation.preview);
+                    if let Err(error) = &stopped_preview {
+                        writeln!(terminal, "Stop preview unavailable: {error}")?;
+                    }
+                    if let Some(list) = stopped_preview.ok().flatten() {
+                        write!(terminal, "{}", list.render_preview())?;
+                    }
+                    writeln!(
+                        terminal,
+                        "Rerun this command in a terminal, or with --yes for the ordinary review. Stopping live work always needs a terminal."
+                    )?;
+                    OrdinaryChoice::Cancel
+                } else if let Some(choice) = ordinary_approval(yes, terminal.is_terminal()) {
+                    choice
+                } else {
+                    match prompt_review(terminal, &confirmation.preview) {
+                        Ok(choice) => choice,
+                        Err(error) => {
+                            if terminal.interrupted() {
+                                if terminal.cancel(&job.id)? {
+                                    return Err(UpdateError::Cancelled);
+                                }
+                                continue;
+                            }
+                            let _ =
+                                terminal.decide(&job.id, &confirmation.nonce, UpdateChoice::Cancel);
                             return Err(error.into());
                         }
                     }
                 };
                 match choice {
-                    UpdateChoice::Cancel => {
-                        decide(&job.id, &confirmation.nonce, choice)?;
+                    OrdinaryChoice::Cancel => {
+                        terminal.decide(&job.id, &confirmation.nonce, choice.into())?;
                         return Err(UpdateError::Cancelled);
                     }
-                    UpdateChoice::Policy(next) => {
-                        policy = next;
-                        decide(&job.id, &confirmation.nonce, choice)?;
+                    OrdinaryChoice::InterruptNow => {
+                        reviewed = Some(confirmation.preview.clone());
+                        if !submit_current_choice(
+                            terminal,
+                            &job.id,
+                            &confirmation.nonce,
+                            choice.into(),
+                        )? {
+                            continue;
+                        }
+                        reviewed = Some(review::interruption_review(&confirmation.preview));
+                        policy = impact::Policy::Interrupt;
                         policy_requested = Some(confirmation.nonce.clone());
-                        submitted = None;
+                        submitted.insert(confirmation.nonce.clone());
                     }
-                    UpdateChoice::Confirm => {
-                        decide(&job.id, &confirmation.nonce, choice)?;
-                        submitted = Some(confirmation.nonce.clone());
+                    OrdinaryChoice::Confirm => {
+                        reviewed = Some(confirmation.preview.clone());
+                        if submit_current_choice(
+                            terminal,
+                            &job.id,
+                            &confirmation.nonce,
+                            choice.into(),
+                        )? {
+                            submitted.insert(confirmation.nonce.clone());
+                        }
                     }
                 }
             }
         }
-        if Instant::now() >= deadline {
-            return Err(invalid(
-                "The update is still running; inspect its progress in the app.",
-            ));
-        }
-        thread::sleep(Duration::from_millis(250));
+        terminal.pause();
     }
 }
 
-fn review_answer(answer: &str, working: bool) -> Option<UpdateChoice> {
+/// A stale nonce means re-display, while a real failure must release prepared
+/// windows through cancellation of the current review.
+fn submit_current_choice(
+    terminal: &mut impl TerminalReview,
+    job: &str,
+    nonce: &str,
+    choice: UpdateChoice,
+) -> Result<bool, UpdateError> {
+    match terminal.decide(job, nonce, choice) {
+        Ok(()) => Ok(true),
+        Err(error) => {
+            if terminal
+                .status()?
+                .filter(|current| current.id == job)
+                .and_then(|current| current.active_confirmation().cloned())
+                .is_some_and(|confirmation| confirmation.nonce != nonce)
+            {
+                return Ok(false);
+            }
+            let _ = terminal.cancel(job);
+            Err(error)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OrdinaryChoice {
+    Confirm,
+    InterruptNow,
+    Cancel,
+}
+impl From<OrdinaryChoice> for UpdateChoice {
+    fn from(choice: OrdinaryChoice) -> Self {
+        match choice {
+            OrdinaryChoice::Confirm => Self::Confirm,
+            OrdinaryChoice::InterruptNow => Self::InterruptNow,
+            OrdinaryChoice::Cancel => Self::Cancel,
+        }
+    }
+}
+
+fn ordinary_approval(yes: bool, terminal: bool) -> Option<OrdinaryChoice> {
+    if yes {
+        Some(OrdinaryChoice::Confirm)
+    } else if !terminal {
+        Some(OrdinaryChoice::Cancel)
+    } else {
+        None
+    }
+}
+
+fn review_answer(answer: &str, working: bool) -> Option<OrdinaryChoice> {
     match answer.trim().to_ascii_lowercase().as_str() {
-        "" | "y" | "yes" => Some(UpdateChoice::Confirm),
-        "i" if working => Some(UpdateChoice::Policy(impact::Policy::Interrupt)),
-        "n" | "no" => Some(UpdateChoice::Cancel),
+        "" | "y" | "yes" => Some(OrdinaryChoice::Confirm),
+        "i" if working => Some(OrdinaryChoice::InterruptNow),
+        "n" | "no" => Some(OrdinaryChoice::Cancel),
         _ => None,
     }
 }
 
-fn prompt_review(preview: &impact::Preview) -> io::Result<UpdateChoice> {
+fn prompt_review(
+    terminal: &mut impl TerminalReview,
+    preview: &impact::Preview,
+) -> io::Result<OrdinaryChoice> {
     let working = preview.daemon.as_ref().is_some_and(|daemon| {
         daemon.policy == impact::Policy::WhenIdle
             && daemon
@@ -650,7 +973,19 @@ fn prompt_review(preview: &impact::Preview) -> io::Result<UpdateChoice> {
                 .iter()
                 .any(|session| session.disposition == impact::Disposition::WaitsForIdle)
     });
-    read_review_choice_from(cancellation::read_line, &mut io::stderr().lock(), working)
+    let stops = preview
+        .daemon
+        .as_ref()
+        .is_some_and(impact::DaemonImpact::blocked);
+    read_review_choice_from(
+        |prompt, answer| {
+            terminal.write_all(prompt.as_bytes())?;
+            terminal.flush()?;
+            terminal.read_line(answer)
+        },
+        working,
+        stops,
+    )
 }
 
 #[cfg(test)]
@@ -658,64 +993,41 @@ fn read_review_choice(
     input: &mut impl io::BufRead,
     output: &mut impl Write,
     working: bool,
-) -> io::Result<UpdateChoice> {
-    read_review_choice_from(|answer| input.read_line(answer), output, working)
+    stops: bool,
+) -> io::Result<OrdinaryChoice> {
+    read_review_choice_from(
+        |prompt, answer| {
+            output.write_all(prompt.as_bytes())?;
+            output.flush()?;
+            input.read_line(answer)
+        },
+        working,
+        stops,
+    )
 }
 
 fn read_review_choice_from(
-    mut read_line: impl FnMut(&mut String) -> io::Result<usize>,
-    output: &mut impl Write,
+    mut read_line: impl FnMut(&str, &mut String) -> io::Result<usize>,
     working: bool,
-) -> io::Result<UpdateChoice> {
+    stops: bool,
+) -> io::Result<OrdinaryChoice> {
     loop {
-        write!(
-            output,
-            "{}",
-            if working {
-                "Enter: update when they finish   i: interrupt them now   n: cancel\n"
-            } else {
-                "Update now? [Y/n] "
-            }
-        )?;
-        output.flush()?;
+        let prompt = if working && stops {
+            "Enter: review stops when they finish   i: interrupt them now   n: cancel\n"
+        } else if working {
+            "Enter: update when they finish   i: interrupt them now   n: cancel\n"
+        } else if stops {
+            "Enter: review what stops   n: cancel\n"
+        } else {
+            "Update now? [Y/n] "
+        };
         let mut answer = String::new();
-        if read_line(&mut answer)? == 0 {
-            return Ok(UpdateChoice::Cancel);
+        if read_line(prompt, &mut answer)? == 0 {
+            return Ok(OrdinaryChoice::Cancel);
         }
         if let Some(choice) = review_answer(&answer, working) {
             return Ok(choice);
         }
-    }
-}
-
-/// End only the exact source descriptors selected by a later destructive
-/// confirmation. Kept separate from the non-destructive update review.
-#[allow(dead_code)]
-fn end_source_chats(
-    daemon: &impact::DaemonImpact,
-    ending: Vec<crate::chat::Session>,
-) -> Result<(), UpdateError> {
-    let mut client = source_client_for(daemon)?;
-    // One the source cannot end does not keep the rest: each was approved
-    // on its own, and ending it releases what it held either way.
-    let mut failed = Vec::new();
-    for session in ending {
-        let title = session.launch.provider.label().to_owned();
-        match client.close_chat(session) {
-            Ok(()) => eprintln!("  Ended {title}"),
-            Err(error) => {
-                eprintln!("  Could not end {title}: {error}");
-                failed.push(title);
-            }
-        }
-    }
-    if failed.is_empty() {
-        Ok(())
-    } else {
-        Err(invalid(format!(
-            "The update still cannot carry {}; it was not started.",
-            failed.join(", ")
-        )))
     }
 }
 
@@ -748,6 +1060,15 @@ fn start_job(
     version: &str,
     request: &UpdateRequest,
 ) -> Result<UpdateJob, UpdateError> {
+    let candidate = match request {
+        UpdateRequest::Installed { root } | UpdateRequest::InstalledFromTerminal { root } => {
+            root.join("bin/cagents")
+        }
+        UpdateRequest::Release(_) | UpdateRequest::ReleaseFromTerminal(_) => {
+            std::env::current_exe()?
+        }
+    };
+    inspect_pending_recovery(&candidate, None)?;
     let state = installation.state_dir()?;
     let lock = acquire_lock(&state)?;
     let id = uuid::Uuid::new_v4().to_string();
@@ -1082,7 +1403,14 @@ pub fn run_worker(job_id: &str) -> Result<(), UpdateError> {
     // our copy before reopening windows; recovery closes it before restarting
     // the selected version. Neither close may unlock a serving successor.
     let mut handoff = None;
-    let result = perform_update(&installation, &state, &mut job, &mut handoff);
+    let mut survivors = floor::Survivors::default();
+    let result = perform_update(
+        &installation,
+        &state,
+        &mut job,
+        &mut handoff,
+        &mut survivors,
+    );
     let settled_failure = job.phase == UpdatePhase::Failed && result.is_err();
     job.phase = if matches!(result, Err(UpdateError::Cancelled)) {
         UpdatePhase::Cancelled
@@ -1097,6 +1425,23 @@ pub fn run_worker(job_id: &str) -> Result<(), UpdateError> {
         Err(_) if settled_failure => job.message.clone(),
         Err(error) => error.to_string(),
     };
+    if !job.message.contains("Ended or stopped:") {
+        job.message.push_str(&survivors.recovery_report());
+    }
+    if !job.message.contains("Current turns interrupted:") {
+        job.message.push_str(&survivors.prepared_report());
+    }
+    job.message.push_str(&survivors.paused_report());
+    let (remaining, unchecked) = survivors.report();
+    if !remaining.is_empty() {
+        job.message.push_str("\nStill running, not attached:\n");
+        job.message.push_str(&remaining.join("\n"));
+    }
+    if !unchecked.is_empty() {
+        job.message
+            .push_str("\nStill running; attachment could not be checked:\n");
+        job.message.push_str(&unchecked.join("\n"));
+    }
     if let Err(error) = write_job(&state, &job) {
         if result.is_ok() {
             return Err(error);
@@ -1113,18 +1458,23 @@ fn perform_update(
     state: &Path,
     job: &mut UpdateJob,
     handoff: &mut Option<crate::daemon::lease_handoff::LeaseHandoff>,
+    survivors: &mut floor::Survivors,
 ) -> Result<(), UpdateError> {
     let request: UpdateRequest = serde_json::from_slice(&read_private(
         &state.join(format!("{}.request", job.id)),
         SMALL_ASSET_LIMIT,
     )?)?;
+    let terminal = matches!(request, UpdateRequest::ReleaseFromTerminal(_));
     let selected = match request {
-        UpdateRequest::Release(release) => {
+        UpdateRequest::Release(release) | UpdateRequest::ReleaseFromTerminal(release) => {
             Installation::detect()?;
             release
         }
         UpdateRequest::Installed { root } => {
-            return installed::perform(installation, state, job, &root, handoff);
+            return installed::perform(installation, state, job, &root, handoff, survivors, false);
+        }
+        UpdateRequest::InstalledFromTerminal { root } => {
+            return installed::perform(installation, state, job, &root, handoff, survivors, true);
         }
     };
     let cancellation = CancellationToken::for_job(state, &job.id)?;
@@ -1161,6 +1511,7 @@ fn perform_update(
         "Verifying sealed release bytes",
     )?;
     verify_digest(&mut archive, &archive_hash)?;
+    let daemon_digest = archive_daemon_digest(&release, &archive, &cancellation)?;
     let staged = candidate::Staged::from_archive(&release, &archive, &archive_hash, &cancellation)?;
     let (source_protocol, _) = source::inspect_identity(None)?;
     if staged.identity.protocol == source_protocol {
@@ -1168,10 +1519,21 @@ fn perform_update(
     }
     let inspection = reconcile_saved_sources(staged.identity.protocol, false)?;
     let context = ReviewContext::capture(installation)?;
-    let confirmed = confirmation::wait(state, job, |policy| {
+    let mut turns = source::TurnReview::default();
+    let mut observe = |policy| {
         Installation::detect()?;
-        Ok(context.apply(observe_impact(&staged.identity, policy)?.with_inspection(&inspection)))
+        turns.apply(observe_impact(&staged.identity, policy)?)
+    };
+    let confirmed = confirmation::wait(state, job, |policy| {
+        Ok(context.apply(observe(policy)?.with_inspection(&inspection)))
     })?;
+    if confirmed.replaces_daemon {
+        // Recovery may need to carry high-numbered descriptors through the
+        // release installer. Establish its shell support before the source
+        // receives any shutdown request.
+        preflight_recovery_shell(Path::new("/bin/bash"))?;
+        preflight_candidate_preparation(&installer)?;
+    }
     let mut recovery = recovery::Context::default();
     recovery.capture(state, job)?;
     set_phase(
@@ -1181,59 +1543,78 @@ fn perform_update(
         "Saving and closing all application windows",
     )?;
     let mut guard = crate::instance::UiUpdateGuard::acquire()?;
-    let windows = guard.prepare_and_close_windows_with_preflight(Duration::from_secs(45), |guard| {
-        confirmation::check_cancelled(state, job).map_err(io::Error::other)?;
-        let inspected = crate::install_guard::preflight_source_panes(guard,
-            confirmed.daemon.as_ref().map(|daemon| daemon.capability.proof.clone()), confirmed.replaces_daemon)?;
-        let latest = observe_impact(&staged.identity, confirmed.daemon.as_ref().map_or(impact::Policy::WhenIdle, |daemon| daemon.policy))
-            .map_err(io::Error::other)?.with_inspection(&inspected);
-        if !confirmed.preserves_consent(&latest) {
-            return Err(io::Error::other("Session ownership changed during pane inspection; existing windows were kept open"));
-        }
-        Ok(())
-    }).map_err(|error| match confirmation::check_cancelled(state, job) {
-        Err(UpdateError::Cancelled) => UpdateError::Cancelled,
-        _ => UpdateError::from(error),
-    })?;
-    let install_result = (|| {
-        Installation::detect()?;
-        let current = observe_impact(
-            &staged.identity,
+    confirmation::check_cancelled(state, job)?;
+    let windows = guard.prepare_windows(Duration::from_secs(45))?;
+    {
+        let inspected = crate::install_guard::preflight_source_panes(
+            &guard,
+            confirmed
+                .daemon
+                .as_ref()
+                .map(|daemon| daemon.capability.proof.clone()),
+            confirmed.replaces_daemon,
+        )?;
+        let latest = observe(
             confirmed
                 .daemon
                 .as_ref()
                 .map_or(impact::Policy::WhenIdle, |daemon| daemon.policy),
-        )?
-        .with_inspection(&confirmed.inspection());
-        if !confirmed.preserves_consent(&current) {
+        )
+        .map_err(io::Error::other)?
+        .with_inspection(&inspected);
+        if !confirmed.preserves_consent(&latest) {
             return Err(invalid(
-                "Session ownership changed while saving windows; reopen and review the update again",
+                "Session ownership changed during pane inspection; existing windows were kept open",
             ));
         }
-        if let Some(daemon) = current.daemon {
-            let socket = crate::terminal_ipc::daemon_socket_path()?;
-            let mut client =
-                source::Client::connect(&socket).map_err(|error| invalid(error.to_string()))?;
-            let paths = crate::daemon::RuntimePaths::discover()
-                .map_err(|error| invalid(error.to_string()))?;
-            let source =
-                crate::daemon::lease_handoff::HandoffSource::pin(&paths, &daemon.capability.proof)
-                    .map_err(|error| invalid(error.to_string()))?;
-            if recovery.census.as_ref().and_then(|c| c.source.as_ref()) != Some(client.proof())
-                || source.exited()?
-            {
-                return Err(invalid(
-                    "The census belongs to a different source; shutdown was not requested",
-                ));
-            }
-            confirmation::prepared(state, job)?;
-            recovery.shutdown_requested = true;
-            client
-                .prepare_confirmed_upgrade(daemon, false)
-                .map_err(|error| invalid(error.to_string()))?;
-            *handoff = Some(wait_daemon_stopped(paths, source, state, job)?);
+    }
+    let install_result = (|| {
+        if confirmed.replaces_daemon {
+            // A failed prepare can strand an immutable Prepared checkpoint.
+            // Retain the complete verified recovery owner before asking the
+            // source to stop; this phase never changes current or clients.
+            run_installer(
+                installation,
+                &release,
+                &installer,
+                &archive,
+                &checksums,
+                true,
+                &guard,
+                None,
+                &job.id,
+                survivors,
+                true,
+            )?;
         }
+        recovery.shutdown_requested = confirmed.replaces_daemon;
+        if let Some(daemon) = &confirmed.daemon
+            && recovery.census.as_ref().and_then(|c| c.source.as_ref())
+                != Some(&daemon.capability.proof)
+        {
+            return Err(invalid(
+                "The census belongs to a different source; shutdown was not requested",
+            ));
+        }
+        floor::quiesce(
+            state,
+            job,
+            &confirmed,
+            terminal,
+            |policy| Ok(context.apply(observe(policy)?.with_inspection(&inspection))),
+            handoff,
+            survivors,
+            &guard,
+        )?;
+        let target_daemon = installation
+            .prefix
+            .join("versions")
+            .join(&release.version)
+            .join("bin/cagentsd");
+        survivors.authorize_successor(&target_daemon, Some(&daemon_digest), handoff.as_ref())?;
         confirmation::prepared(state, job)?;
+        guard.close_prepared_windows(&windows, Duration::from_secs(45))?;
+        Installation::detect()?;
         set_phase(
             state,
             job,
@@ -1246,11 +1627,17 @@ fn perform_update(
             &installer,
             &archive,
             &checksums,
-            current.replaces_daemon,
+            confirmed.replaces_daemon,
             &guard,
             handoff.as_ref(),
             &job.id,
-        )
+            survivors,
+            false,
+        )?;
+        if confirmed.replaces_daemon {
+            survivors.verify_successor(&target_daemon)?;
+        }
+        Ok(())
     })();
     let recovery_result = finish_handoff(
         installation,
@@ -1259,16 +1646,14 @@ fn perform_update(
         &install_result,
         handoff,
         &recovery,
+        survivors,
         &guard,
     );
     // Do not let a recovery UI autostart the frozen previous executable while
     // ownership or Prepared recovery is unresolved.
     recovery_result?;
     let reopen_result = guard
-        .relaunch_windows(
-            &windows,
-            &installation.prefix.join("current/bin/cagents-ui"),
-        )
+        .relaunch_closed_windows(&installation.prefix.join("current/bin/cagents-ui"))
         .map_err(UpdateError::from);
     verify_reopened_service(&recovery, state, job)?;
     if let Err(error) = reopen_result {
@@ -1292,17 +1677,24 @@ fn verify_reopened_service(
         .census
         .as_ref()
         .ok_or_else(|| invalid("No pre-update census exists; recovery readiness is unverified"))?;
-    let receipt = census.verify_with_target(
-        &state
-            .parent()
-            .ok_or_else(|| invalid("Update state has no installation root"))?
-            .join("versions")
-            .join(&job.version),
-        state,
-        &job.id,
-    )?;
+    let absence = (!recovery.shutdown_requested && census.source.is_none())
+        .then(|| census.verify_absence().ok())
+        .flatten();
+    let receipt = if let Some(absence) = absence {
+        absence
+    } else {
+        census.verify_with_target(
+            &state
+                .parent()
+                .ok_or_else(|| invalid("Update state has no installation root"))?
+                .join("versions")
+                .join(&job.version),
+            state,
+            &job.id,
+        )?
+    };
     receipt.save(&recovery::outcome_path(state, &job.id))?;
-    if receipt.usable() {
+    if receipt.usable() || matches!(receipt.outcome, recovery::Outcome::NoSource) {
         Ok(())
     } else {
         report_recovery_failure(state, job, receipt.failure())
@@ -1603,6 +1995,8 @@ fn record_handoff_failure(
     job: &mut UpdateJob,
     result: &Result<(), UpdateError>,
     handoff: &mut Option<crate::daemon::lease_handoff::LeaseHandoff>,
+    recovery_report: &str,
+    prepared_report: &str,
 ) -> Result<(), UpdateError> {
     if let Err(error) = result {
         eprintln!("{error}");
@@ -1613,10 +2007,74 @@ fn record_handoff_failure(
         };
         job.confirmation = None;
         job.message = error.to_string();
+        if !job.message.contains("Ended or stopped:") {
+            job.message.push_str(recovery_report);
+        }
+        if !job.message.contains("Current turns interrupted:") {
+            job.message.push_str(prepared_report);
+        }
         write_job(state, job)?;
         drop(handoff.take());
     }
     Ok(())
+}
+
+/// Socket evidence is separate from the lease metadata left by an old source.
+enum CleanupDaemon {
+    Ready,
+    Absent,
+    Unknown(String),
+}
+
+fn cleanup_daemon(paths: &crate::daemon::RuntimePaths, owns_handoff: bool) -> CleanupDaemon {
+    let source = match source::Client::connect(&paths.socket) {
+        Ok(source) => source,
+        Err(crate::control::ControlError::Connect(error))
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            // A handoff owns the old daemon's lease while its metadata can
+            // still name an unreaped, exited source. That is a reservation,
+            // not proof of a serving daemon. Other holders remain uncertain.
+            return if owns_handoff {
+                CleanupDaemon::Absent
+            } else {
+                match crate::daemon::HostLease::is_held(paths) {
+                    Ok(false) => CleanupDaemon::Absent,
+                    Ok(true) => CleanupDaemon::Unknown(
+                        "the daemon lease is held without an answering service".into(),
+                    ),
+                    Err(error) => CleanupDaemon::Unknown(error.to_string()),
+                }
+            };
+        }
+        Err(error) => return CleanupDaemon::Unknown(error.to_string()),
+    };
+    let source::Client::Current { mut client, peer } = source else {
+        return CleanupDaemon::Unknown("the answering service uses an older protocol".into());
+    };
+    if client.protocol() != crate::terminal_ipc::PROTOCOL_VERSION {
+        return CleanupDaemon::Unknown("the answering service uses a different protocol".into());
+    }
+    let verified = (|| {
+        peer.verify(client.proof())?;
+        let state = client
+            .startup_state()
+            .map_err(|error| invalid(error.to_string()))?;
+        peer.verify(client.proof())?;
+        if state != crate::terminal_ipc::StartupState::Ready {
+            return Err(invalid(
+                "the answering service has not finished restoring its panes",
+            ));
+        }
+        Ok(())
+    })();
+    match verified {
+        Ok(()) => CleanupDaemon::Ready,
+        Err(error) => CleanupDaemon::Unknown(error.to_string()),
+    }
 }
 
 /// Settle the reservation before reopening clients. The worker, including a
@@ -1628,9 +2086,11 @@ fn finish_handoff(
     result: &Result<(), UpdateError>,
     handoff: &mut Option<crate::daemon::lease_handoff::LeaseHandoff>,
     recovery: &recovery::Context,
+    survivors: &mut floor::Survivors,
     guard: &crate::instance::UiUpdateGuard,
 ) -> Result<(), UpdateError> {
-    let needed = recovery.shutdown_requested || handoff.is_some();
+    let needed =
+        recovery.shutdown_requested || handoff.is_some() || survivors.needs_daemon_recovery();
     let Some(census) = recovery.census.as_ref() else {
         if needed || result.is_ok() {
             return report_recovery_failure(
@@ -1641,7 +2101,14 @@ fn finish_handoff(
                 ),
             );
         }
-        record_handoff_failure(state, job, result, handoff)?;
+        record_handoff_failure(
+            state,
+            job,
+            result,
+            handoff,
+            &survivors.recovery_report(),
+            &survivors.prepared_report(),
+        )?;
         return Ok(());
     };
     let outcome_path = recovery::outcome_path(state, &job.id);
@@ -1651,10 +2118,40 @@ fn finish_handoff(
     // one permitted start after shutdown has already been requested.
     let mut recording_errors = Vec::new();
     let mut verified = probe_recovery(census, &target, state, &job.id, &mut recording_errors)?;
+    if !needed
+        && census.source.is_none()
+        && let Ok(absence) = census.verify_absence()
+    {
+        // A file-only installation did not remove a daemon. Verified absence
+        // is a separate outcome, never readiness or preservation of a service.
+        recording_errors.extend(absence.save(&outcome_path).err().map(|e| e.to_string()));
+        let recorded = record_handoff_failure(
+            state,
+            job,
+            result,
+            handoff,
+            &survivors.recovery_report(),
+            &survivors.prepared_report(),
+        );
+        recording_errors.extend(recorded.err().map(|e| e.to_string()));
+        if result.is_ok() {
+            job.message = "The application files are installed. No daemon was serving before the update, and none is running now; the daemon will start at graphical login.".into();
+            recording_errors.extend(write_job(state, job).err().map(|e| e.to_string()));
+        }
+        return finish_recording_recovery(state, job, recording_errors);
+    }
     if verified.usable() {
         let saved = verified.save(&outcome_path);
-        let recorded = record_handoff_failure(state, job, result, handoff);
+        let recorded = record_handoff_failure(
+            state,
+            job,
+            result,
+            handoff,
+            &survivors.recovery_report(),
+            &survivors.prepared_report(),
+        );
         drop(handoff.take());
+        survivors.release_recovery_reservation();
         recording_errors.extend(saved.err().map(|e| e.to_string()));
         recording_errors.extend(recorded.err().map(|e| e.to_string()));
         return finish_recording_recovery(state, job, recording_errors);
@@ -1670,9 +2167,40 @@ fn finish_handoff(
                 return report_recovery_failure(state, job, receipt.failure());
             }
         };
-        if let Some(required) = permission.target_required() {
+        if let Some(mut required) = permission.target_required() {
+            // This worker cannot consume Prepared. Hand custody back for the
+            // explicit target recovery command, closing only our duplicates;
+            // never LOCK_UN an open-file description shared with a daemon.
+            drop(handoff.take());
+            survivors.release_recovery_reservation();
             if let Err(error) = permission.save(&outcome_path) {
                 eprintln!("Could not save target recovery request: {error}");
+            }
+            let original = recovery::census_path(state, &job.id);
+            match crate::upgrade::recovery::PendingRecovery::retain_installer_census(&original) {
+                Ok(Some(pending)) => {
+                    required.recovery_command =
+                        Some(pending.command(&target.join("bin/cagents"), Some(&original)));
+                }
+                Ok(None) => {
+                    return report_recovery_failure(
+                        state,
+                        job,
+                        invalid(
+                            "The Prepared checkpoint disappeared before target recovery; inspect the retained update evidence before restarting",
+                        ),
+                    );
+                }
+                Err(error) => {
+                    return report_recovery_failure(
+                        state,
+                        job,
+                        invalid(format!(
+                            "The original recovery census could not be retained: {error}. Keep {} and the Prepared checkpoint; the previous build was not restarted",
+                            original.display()
+                        )),
+                    );
+                }
             }
             return report_recovery_failure(
                 state,
@@ -1693,8 +2221,19 @@ fn finish_handoff(
         return report_recovery_failure(state, job, verified.failure());
     }
     if needed {
-        let recorded = record_handoff_failure(state, job, result, handoff);
+        if let Err(error) = survivors.require_normal_restart() {
+            return report_recovery_failure(state, job, error);
+        }
+        let recorded = record_handoff_failure(
+            state,
+            job,
+            result,
+            handoff,
+            &survivors.recovery_report(),
+            &survivors.prepared_report(),
+        );
         drop(handoff.take());
+        survivors.release_recovery_reservation();
         let mut command = Command::new(installation.prefix.join("current/bin/cagents"));
         command.args(["daemon", "start"]);
         crate::install_guard::sanitize_child_environment(&mut command);
@@ -1784,6 +2323,89 @@ fn report_recovery_failure(
     Err(error)
 }
 
+fn archive_daemon_digest(
+    release: &Release,
+    archive: &File,
+    cancellation: &CancellationToken,
+) -> Result<String, UpdateError> {
+    let archive_fd = archive.as_raw_fd();
+    let mut extract = Command::new("tar");
+    extract
+        .args(["-xOz", "--file"])
+        .arg(format!("/proc/self/fd/{archive_fd}"))
+        .arg("--")
+        .arg(format!("cagents-{}/bin/cagentsd", release.version));
+    candidate::inherit(&mut extract, archive_fd);
+    let mut daemon = bounded_command(
+        &mut extract,
+        "candidate daemon extraction",
+        512 * 1024 * 1024,
+        Duration::from_secs(120),
+        cancellation,
+    )?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let count = daemon.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hash.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+fn preflight_recovery_shell(shell: &Path) -> Result<(), UpdateError> {
+    let mut command = Command::new(shell);
+    crate::install_guard::sanitize_child_environment(&mut command);
+    command
+        .args([
+            "--noprofile",
+            "--norc",
+            "-p",
+            "-c",
+            "[[ -n $BASH_VERSION ]] || exit 1; exec 189</dev/null 193</dev/null 194</dev/null 195</dev/null 196</dev/null; exec 189<&- 193<&- 194<&- 195<&- 196<&-",
+        ])
+        .env_remove("BASH_ENV")
+        .env_remove("ENV")
+        .stdin(Stdio::null());
+    unsafe { command.pre_exec(crate::daemon::seal_inherited_descriptors) };
+    bounded_command(
+        &mut command,
+        "Checking the recovery installer shell",
+        4096,
+        Duration::from_secs(5),
+        &CancellationToken::new(),
+    )
+    .map(|_| ())
+    .map_err(|error| {
+        invalid(format!(
+            "The update needs /bin/bash to preserve recovery ownership: {error}. The source daemon and panes are still running; nothing was changed in the installation"
+        ))
+    })
+}
+
+fn preflight_candidate_preparation(installer: &File) -> Result<(), UpdateError> {
+    let fd = installer.as_raw_fd();
+    let mut command = Command::new("/bin/bash");
+    crate::install_guard::sanitize_child_environment(&mut command);
+    command
+        .args(["--noprofile", "--norc", "-p"])
+        .arg(format!("/proc/self/fd/{fd}"))
+        .arg("--supports-prepared-candidate")
+        .env_remove("BASH_ENV")
+        .env_remove("ENV")
+        .stdin(Stdio::null());
+    unsafe { command.pre_exec(crate::daemon::seal_inherited_descriptors) };
+    candidate::inherit(&mut command, fd);
+    bounded_command(
+        &mut command, "Checking retained candidate support", 4096,
+        Duration::from_secs(10), &CancellationToken::new(),
+    ).map(|_| ()).map_err(|error| invalid(format!(
+        "This release installer cannot retain a recovery target before shutdown: {error}. The source daemon and panes are still running; choose a release with prepared-candidate support"
+    )))
+}
+
 fn run_installer(
     installation: &Installation,
     release: &Release,
@@ -1794,6 +2416,8 @@ fn run_installer(
     guard: &crate::instance::UiUpdateGuard,
     handoff: Option<&crate::daemon::lease_handoff::LeaseHandoff>,
     job_id: &str,
+    survivors: &floor::Survivors,
+    prepare_candidate: bool,
 ) -> Result<(), UpdateError> {
     // Keep sources above the destinations so remapping cannot overwrite a
     // still-needed input, even in a worker with many open descriptors.
@@ -1808,7 +2432,14 @@ fn run_installer(
         })
         .collect::<io::Result<_>>()?;
     let inherited_files = [190, 191, 192];
-    let mut command = Command::new("/bin/sh");
+    let mut command = Command::new(if restart_daemon {
+        "/bin/bash"
+    } else {
+        "/bin/sh"
+    });
+    if restart_daemon {
+        command.args(["--noprofile", "--norc", "-p"]);
+    }
     command
         .arg(format!("/proc/self/fd/{}", inherited_files[0]))
         .args(["--version", &release.version, "--prefix"])
@@ -1842,7 +2473,10 @@ fn run_installer(
         .env_remove("ENV")
         .env_remove("BASH_ENV")
         .stdin(Stdio::null());
-    if restart_daemon {
+    if prepare_candidate {
+        command.args(["--prepare-candidate", job_id]);
+    } else if restart_daemon {
+        command.args(["--prepared-candidate", job_id]);
         command.arg("--restart-daemon");
     }
     unsafe { command.pre_exec(crate::daemon::seal_inherited_descriptors) };
@@ -1864,6 +2498,7 @@ fn run_installer(
     if let Some(handoff) = handoff {
         handoff.inherit_for_installer(&mut command)?;
     }
+    survivors.inherit_recovery(&mut command)?;
     // Do not kill an installer mid-transaction. Its migration protocol owns
     // bounded shutdown/startup and rollback, and its log survives every UI.
     let result = command.status()?;
@@ -2381,54 +3016,163 @@ fn verify_digest(file: &mut File, expected: &[u8; 32]) -> Result<(), UpdateError
 #[cfg(test)]
 mod tests {
     #[test]
+    fn recovery_installer_shell_requires_high_descriptor_support_before_shutdown() {
+        preflight_recovery_shell(Path::new("/bin/bash")).unwrap();
+        for shell in ["/bin/false", "/missing-cagents-recovery-shell"] {
+            let error = preflight_recovery_shell(Path::new(shell)).unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains("source daemon and panes are still running"));
+            assert!(message.contains("nothing was changed in the installation"));
+        }
+    }
+
+    #[test]
+    fn replacement_requires_retained_candidate_support_before_shutdown() {
+        let root = tempfile::tempdir().unwrap();
+        let installer = root.path().join("install.sh");
+        fs::write(
+            &installer,
+            b"#!/bin/sh\n[ \"$1\" = --supports-prepared-candidate ]\n",
+        )
+        .unwrap();
+        preflight_candidate_preparation(&File::open(&installer).unwrap()).unwrap();
+        fs::write(&installer, b"#!/bin/sh\nexit 2\n").unwrap();
+        let error = preflight_candidate_preparation(&File::open(&installer).unwrap()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("source daemon and panes are still running")
+        );
+        assert!(error.to_string().contains("prepared-candidate support"));
+    }
+
+    #[test]
     fn review_prompt_defaults_to_update_but_eof_cancels() {
         let mut output = Vec::new();
         assert!(matches!(
-            read_review_choice(&mut &b"\n"[..], &mut output, false).unwrap(),
-            UpdateChoice::Confirm
+            read_review_choice(&mut &b"\n"[..], &mut output, false, false).unwrap(),
+            OrdinaryChoice::Confirm
         ));
         assert_eq!(String::from_utf8(output).unwrap(), "Update now? [Y/n] ");
         let mut output = Vec::new();
         assert!(matches!(
-            read_review_choice(&mut &b"i\n"[..], &mut output, true).unwrap(),
-            UpdateChoice::Policy(impact::Policy::Interrupt)
+            read_review_choice(&mut &b"i\n"[..], &mut output, true, false).unwrap(),
+            OrdinaryChoice::InterruptNow
         ));
         assert_eq!(
             String::from_utf8(output).unwrap(),
             "Enter: update when they finish   i: interrupt them now   n: cancel\n"
         );
         assert!(matches!(
-            read_review_choice(&mut &b""[..], &mut Vec::new(), false).unwrap(),
-            UpdateChoice::Cancel
+            read_review_choice(&mut &b""[..], &mut Vec::new(), false, false).unwrap(),
+            OrdinaryChoice::Cancel
         ));
         assert!(matches!(
-            read_review_choice(&mut &b"n\n"[..], &mut Vec::new(), true).unwrap(),
-            UpdateChoice::Cancel
+            read_review_choice(&mut &b"n\n"[..], &mut Vec::new(), true, false).unwrap(),
+            OrdinaryChoice::Cancel
         ));
         assert!(matches!(
-            read_review_choice(&mut &b"maybe\ny\n"[..], &mut Vec::new(), false).unwrap(),
-            UpdateChoice::Confirm
+            read_review_choice(&mut &b"maybe\ny\n"[..], &mut Vec::new(), false, false).unwrap(),
+            OrdinaryChoice::Confirm
         ));
+    }
+
+    #[test]
+    fn unattended_ordinary_review_cannot_approve_without_yes() {
+        assert_eq!(
+            ordinary_approval(false, false),
+            Some(OrdinaryChoice::Cancel)
+        );
+        assert_eq!(
+            ordinary_approval(true, false),
+            Some(OrdinaryChoice::Confirm)
+        );
+        assert_eq!(ordinary_approval(false, true), None);
+        assert_eq!(ordinary_approval(true, true), Some(OrdinaryChoice::Confirm));
+    }
+
+    #[test]
+    fn app_release_stop_instructions_select_the_same_release_without_staging() {
+        let directory = tempfile::tempdir().unwrap();
+        let release = applicable_release(release("9.8.7")).unwrap();
+        let job = UpdateJob {
+            id: uuid::Uuid::new_v4().to_string(),
+            version: release.version.clone(),
+            phase: UpdatePhase::AwaitingConfirmation,
+            message: String::new(),
+            log_path: directory.path().join("worker.log"),
+            confirmation: None,
+        };
+        let file = private_create(&directory.path().join(format!("{}.request", job.id))).unwrap();
+        serde_json::to_writer(file, &UpdateRequest::Release(release)).unwrap();
+        assert_eq!(
+            floor::terminal_confirmation(directory.path(), &job).unwrap(),
+            "Stopping live work needs confirmation in a terminal. Run `cagents daemon upgrade --version 9.8.7` from a system terminal outside cagents."
+        );
+    }
+
+    #[test]
+    fn recovery_daemon_digest_uses_the_exact_verified_archive_member() {
+        let directory = tempfile::tempdir().unwrap();
+        let release = applicable_release(release("9.8.7")).unwrap();
+        let package = format!("cagents-{}", release.version);
+        let bin = directory.path().join(&package).join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(bin.join("cagentsd"), b"verified candidate daemon").unwrap();
+        fs::write(bin.join("cagents"), b"different CLI bytes").unwrap();
+        let archive = directory.path().join("release.tar.gz");
+        assert!(
+            Command::new("tar")
+                .args(["-czf"])
+                .arg(&archive)
+                .arg("-C")
+                .arg(directory.path())
+                .arg(&package)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let archive = File::open(archive).unwrap();
+        assert_eq!(
+            archive_daemon_digest(&release, &archive, &CancellationToken::new()).unwrap(),
+            format!("{:x}", Sha256::digest(b"verified candidate daemon"))
+        );
+        let mut absent = release;
+        absent.version = "9.8.8".into();
+        assert!(archive_daemon_digest(&absent, &archive, &CancellationToken::new()).is_err());
+    }
+
+    #[test]
+    fn working_floor_review_waits_before_the_destructive_list() {
+        let mut output = Vec::new();
+        assert_eq!(
+            read_review_choice(&mut b"n\n".as_slice(), &mut output, true, true).unwrap(),
+            OrdinaryChoice::Cancel
+        );
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "Enter: review stops when they finish   i: interrupt them now   n: cancel\n"
+        );
     }
 
     #[test]
     fn review_enter_proceeds_and_interrupt_requires_working_review() {
         assert!(matches!(
             review_answer("\n", false),
-            Some(UpdateChoice::Confirm)
+            Some(OrdinaryChoice::Confirm)
         ));
         assert!(matches!(
             review_answer("", true),
-            Some(UpdateChoice::Confirm)
+            Some(OrdinaryChoice::Confirm)
         ));
         assert!(matches!(
             review_answer("i", true),
-            Some(UpdateChoice::Policy(impact::Policy::Interrupt))
+            Some(OrdinaryChoice::InterruptNow)
         ));
         assert!(review_answer("i", false).is_none());
         assert!(matches!(
             review_answer("n", true),
-            Some(UpdateChoice::Cancel)
+            Some(OrdinaryChoice::Cancel)
         ));
         assert!(review_answer("maybe", true).is_none());
     }
@@ -3899,13 +4643,15 @@ finally:
                 &root.path().join("missing"),
                 &mut job,
                 &result,
-                &mut handoff
+                &mut handoff,
+                "",
+                "",
             )
             .is_err()
         );
         assert!(handoff.is_some());
         assert!(HostLease::is_held(&paths).unwrap());
-        record_handoff_failure(root.path(), &mut job, &result, &mut handoff).unwrap();
+        record_handoff_failure(root.path(), &mut job, &result, &mut handoff, "", "").unwrap();
         let persisted: UpdateJob =
             serde_json::from_slice(&fs::read(root.path().join("status.json")).unwrap()).unwrap();
         assert_eq!(persisted.phase, UpdatePhase::Failed);
@@ -3930,6 +4676,8 @@ finally:
                 "prepared-target-handoff",
                 "recovery-recording-failure",
                 "start-nonzero-with-service",
+                "first-start-failed-without-source",
+                "absent-source-with-prepared-checkpoint",
             ] {
                 // A retained Prepared checkpoint belongs to this one case;
                 // later cases must not consume or remove another case's state.
@@ -4123,8 +4871,11 @@ if os.environ['CAGENTS_TEST_RECOVERY_FAILURE']=='start-nonzero-with-service': sy
             confirmation: None,
         };
         let census: recovery::Census=serde_json::from_value(serde_json::json!({"version":1,"transaction":job.id,"source":proof,"terminals":[],"chats":[]})).unwrap();
-        let census = if failure == "ready-missing-terminal" {
-            let missing = crate::terminal_ipc::TerminalDescriptor::relaunchable(
+        let census = if matches!(
+            failure.as_str(),
+            "ready-missing-terminal" | "prepared-target-handoff"
+        ) {
+            let mut missing = crate::terminal_ipc::TerminalDescriptor::relaunchable(
                 crate::model::TerminalId::new(),
                 crate::model::LaunchRecipe {
                     program: "/bin/sh".into(),
@@ -4135,15 +4886,37 @@ if os.environ['CAGENTS_TEST_RECOVERY_FAILURE']=='start-nonzero-with-service': sy
                 },
                 None,
             );
+            if failure == "prepared-target-handoff" {
+                missing.session.continuity = crate::model::TerminalContinuity::Live {
+                    host_session_id: proof.host_session_id.clone(),
+                    boot_id: proof.boot_id.clone(),
+                    host_incarnation: proof.host_incarnation.clone(),
+                };
+            }
             serde_json::from_value(serde_json::json!({"version":1,"transaction":job.id,"source":proof,"terminals":[missing.session],"chats":[]})).unwrap()
         } else {
             census
         };
+        let without_source = matches!(
+            failure.as_str(),
+            "first-start-failed-without-source" | "absent-source-with-prepared-checkpoint"
+        );
+        let census = if without_source {
+            serde_json::from_value(serde_json::json!({"version":1,"transaction":job.id,"source":null,"terminals":[],"chats":[]})).unwrap()
+        } else {
+            census
+        };
+        census
+            .save(&recovery::census_path(root.path(), &job.id))
+            .unwrap();
         let context = recovery::Context {
-            shutdown_requested: true,
+            shutdown_requested: !without_source,
             census: Some(census),
         };
-        let prepared = if failure == "prepared-target-handoff" {
+        let prepared = if matches!(
+            failure.as_str(),
+            "prepared-target-handoff" | "absent-source-with-prepared-checkpoint"
+        ) {
             let store = crate::upgrade::handoff::Store::discover().unwrap();
             store
                 .save(&crate::upgrade::handoff::Checkpoint::new(
@@ -4157,11 +4930,89 @@ if os.environ['CAGENTS_TEST_RECOVERY_FAILURE']=='start-nonzero-with-service': sy
         } else {
             None
         };
+        if failure == "prepared-target-handoff" {
+            // Model a retry after an older worker left only its private job
+            // census. Resolve it through exact request/source bindings, before
+            // any empty-source capture can replace the scope.
+            let bin = root.path().join("versions/new/bin");
+            fs::create_dir_all(&bin).unwrap();
+            for executable in ["cagents", "cagentsd", "cagents-ui"] {
+                fs::write(bin.join(executable), b"retained matched fixture").unwrap();
+            }
+            fs::write(
+                root.path().join(".cagents-install-root"),
+                b"cagents install root\n",
+            )
+            .unwrap();
+            let state = Installation {
+                prefix: root.path().into(),
+                version: "new".into(),
+            }
+            .state_dir()
+            .unwrap();
+            context
+                .census
+                .as_ref()
+                .unwrap()
+                .save(&recovery::census_path(&state, &job.id))
+                .unwrap();
+            let request = private_create(&state.join(format!("{}.request", job.id))).unwrap();
+            serde_json::to_writer(
+                &request,
+                &UpdateRequest::Installed {
+                    root: root.path().join("versions/old"),
+                },
+            )
+            .unwrap();
+            write_job(&state, &job).unwrap();
+            assert!(matches!(
+                inspect_pending_recovery(&bin.join("cagents"), None),
+                Err(UpdateError::Invalid(_))
+            ));
+            assert!(
+                !crate::upgrade::recovery::PendingRecovery::inspect()
+                    .unwrap()
+                    .unwrap()
+                    .original_census_complete
+            );
+            request.set_len(0).unwrap();
+            use std::io::Seek;
+            let mut request = request;
+            request.rewind().unwrap();
+            serde_json::to_writer(
+                request,
+                &UpdateRequest::Installed {
+                    root: root.path().join("versions/new"),
+                },
+            )
+            .unwrap();
+            write_job(&state, &job).unwrap();
+            let before = crate::upgrade::recovery::PendingRecovery::inspect()
+                .unwrap()
+                .unwrap();
+            assert!(!before.original_census_complete);
+            assert!(matches!(
+                inspect_pending_recovery(&bin.join("cagents"), None),
+                Err(UpdateError::TargetRecoveryRequired(_))
+            ));
+            let pending = crate::upgrade::recovery::PendingRecovery::inspect()
+                .unwrap()
+                .unwrap();
+            assert!(pending.original_census_complete);
+            let recovered =
+                recovery::Census::from_pending(uuid::Uuid::new_v4().to_string(), &pending).unwrap();
+            let value = serde_json::to_value(recovered).unwrap();
+            assert_eq!(value["source"], serde_json::to_value(&proof).unwrap());
+            assert_eq!(value["terminals"].as_array().unwrap().len(), 1);
+        }
         if failure == "recovery-recording-failure" {
             fs::create_dir(root.path().join("status.json")).unwrap();
             fs::create_dir(recovery::outcome_path(root.path(), &job.id)).unwrap();
         }
-        let installer_result = if failure == "installer-success-daemon-exited" {
+        let installer_result = if matches!(
+            failure.as_str(),
+            "installer-success-daemon-exited" | "first-start-failed-without-source"
+        ) {
             write_job(root.path(), &job).unwrap();
             Ok(())
         } else {
@@ -4174,19 +5025,92 @@ if os.environ['CAGENTS_TEST_RECOVERY_FAILURE']=='start-nonzero-with-service': sy
             &installer_result,
             &mut lease,
             &context,
+            &mut floor::Survivors::default(),
             &guard,
         );
+        if failure == "first-start-failed-without-source" {
+            assert!(settled.is_ok(), "{settled:?}");
+            assert!(job.message.contains("will start at graphical login"));
+            assert!(!root.path().join("start-attempts").exists());
+            let receipt: recovery::Receipt = serde_json::from_slice(
+                &fs::read(recovery::outcome_path(root.path(), &job.id)).unwrap(),
+            )
+            .unwrap();
+            assert!(matches!(receipt.outcome, recovery::Outcome::NoSource));
+            assert!(!receipt.usable());
+            verify_reopened_service(&context, root.path(), &mut job).unwrap();
+            return;
+        }
         if let Some((path, bytes)) = prepared {
-            assert!(matches!(
-                settled,
-                Err(UpdateError::TargetRecoveryRequired(_))
-            ));
+            if failure == "absent-source-with-prepared-checkpoint" {
+                assert!(settled.is_err());
+                assert!(!job.message.contains("will start at graphical login"));
+                assert!(!root.path().join("start-attempts").exists());
+                assert_eq!(fs::read(path).unwrap(), bytes);
+                return;
+            }
+            let Err(UpdateError::TargetRecoveryRequired(required)) = settled else {
+                panic!("Expected typed target recovery, got {settled:?}");
+            };
+            let command = required.recovery_command.unwrap();
+            assert!(
+                command.contains(
+                    &root
+                        .path()
+                        .join("versions/new/bin/cagents")
+                        .display()
+                        .to_string()
+                )
+            );
+            assert!(command.contains("daemon recover-update --checkpoint"));
+            assert!(command.contains("--yes --census"));
             assert_eq!(fs::read(path).unwrap(), bytes);
             assert!(
                 lease.is_some(),
                 "handoff custody must remain for the target owner"
             );
             assert!(!root.path().join("start-attempts").exists());
+            // A retry must retain the pending source scope before looking at
+            // the empty socket. No fresh empty census or worker is created.
+            let retry = root.path().join("retry-census.json");
+            assert!(matches!(
+                recovery::capture_file(&retry),
+                Err(UpdateError::TargetRecoveryRequired(_))
+            ));
+            assert!(!retry.exists());
+            assert!(matches!(
+                apply_installed_from(&root.path().join("versions/new/bin/cagents-ui"), true),
+                Err(UpdateError::TargetRecoveryRequired(_))
+            ));
+            let original = recovery::census_path(root.path(), &job.id);
+            assert!(matches!(
+                inspect_pending_recovery(
+                    &root.path().join("versions/new/bin/cagents"),
+                    Some(&original)
+                ),
+                Err(UpdateError::TargetRecoveryRequired(_))
+            ));
+            // Failed absence proof must invalidate an earlier NoSource
+            // receipt instead of leaving a stale successful discriminator.
+            let mut empty: serde_json::Value =
+                serde_json::from_slice(&fs::read(&original).unwrap()).unwrap();
+            empty["source"] = serde_json::Value::Null;
+            empty["terminals"] = serde_json::json!([]);
+            let empty_path = root.path().join("empty-census.json");
+            let empty_census: recovery::Census = serde_json::from_value(empty).unwrap();
+            empty_census.save(&empty_path).unwrap();
+            let proof_path = root.path().join("absence-proof.json");
+            fs::write(&proof_path, b"stale-no-source-receipt").unwrap();
+            fs::set_permissions(&proof_path, fs::Permissions::from_mode(0o600)).unwrap();
+            assert!(
+                recovery::verify_file(&empty_path, &proof_path, false, false, true, true).is_err()
+            );
+            let denied: recovery::Receipt =
+                serde_json::from_slice(&fs::read(proof_path).unwrap()).unwrap();
+            assert!(matches!(
+                denied.outcome,
+                recovery::Outcome::Unverified { .. }
+            ));
             return;
         }
         let expected_failure = matches!(
@@ -4320,5 +5244,135 @@ sys.stdin.buffer.read(1)
             .expect("a leaked lock is not a completed handoff")
             .to_string();
         assert_eq!(error, handoff::SERVICE_NOT_STOPPED);
+    }
+    #[test]
+    fn first_terminal_failure_preserves_the_exact_stop_report() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut job = UpdateJob {
+            id: uuid::Uuid::new_v4().to_string(),
+            version: "new".into(),
+            phase: UpdatePhase::Installing,
+            message: String::new(),
+            log_path: directory.path().join("worker.log"),
+            confirmation: None,
+        };
+        let report = concat!(
+            "\nThe terminal service accepted the stop.\n",
+            "Ended or stopped:\n",
+            "  build · alpha: screen and directory kept; press Restart in the pane\n",
+            "  review · beta: press Resume in the pane\n",
+        );
+        let mut handoff = None;
+        record_handoff_failure(
+            directory.path(),
+            &mut job,
+            &Err(invalid("The installer failed")),
+            &mut handoff,
+            report,
+            "",
+        )
+        .unwrap();
+
+        let first_failure: UpdateJob =
+            serde_json::from_slice(&fs::read(directory.path().join("status.json")).unwrap())
+                .unwrap();
+        assert_eq!(first_failure.phase, UpdatePhase::Failed);
+        assert!(first_failure.message.starts_with("The installer failed"));
+        for line in report.lines().filter(|line| !line.is_empty()) {
+            assert_eq!(
+                first_failure.message.matches(line).count(),
+                1,
+                "{}",
+                first_failure.message
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_driver_waits_for_worker_recovery_before_returning_failure() {
+        struct Terminal {
+            job: UpdateJob,
+            recovery_finished: bool,
+            pauses: usize,
+            worker_checks: usize,
+            output: Vec<u8>,
+        }
+        impl Write for Terminal {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.output.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl TerminalReview for Terminal {
+            fn status(&mut self) -> Result<Option<UpdateJob>, UpdateError> {
+                Ok(Some(self.job.clone()))
+            }
+            fn decide(&mut self, _: &str, _: &str, _: UpdateChoice) -> Result<(), UpdateError> {
+                panic!("recovery must not ask for another approval");
+            }
+            fn cancel(&mut self, _: &str) -> Result<bool, UpdateError> {
+                panic!("recovery must not submit a new cancellation");
+            }
+            fn read_line(&mut self, _: &mut String) -> io::Result<usize> {
+                panic!("recovery must not ask another question");
+            }
+            fn is_terminal(&self) -> bool {
+                true
+            }
+            fn interrupted(&self) -> bool {
+                false
+            }
+            fn worker_running(&mut self) -> Result<bool, UpdateError> {
+                self.worker_checks += 1;
+                Ok(!self.recovery_finished)
+            }
+            fn pause(&mut self) {
+                self.pauses += 1;
+                assert_eq!(self.pauses, 1, "the settled failure must return promptly");
+                self.recovery_finished = true;
+                self.job.message.push_str(
+                    "\nThe terminal service could not restart. Run `cagents daemon start` to recover your saved panes.",
+                );
+            }
+        }
+        let job = UpdateJob {
+            id: uuid::Uuid::new_v4().to_string(),
+            version: "new".into(),
+            phase: UpdatePhase::Failed,
+            message: concat!(
+                "The installer failed\nEnded or stopped:\n",
+                "  build · alpha: screen and directory kept; press Restart in the pane",
+            )
+            .into(),
+            log_path: "/fake/update-worker.log".into(),
+            confirmation: None,
+        };
+        let mut terminal = Terminal {
+            job: job.clone(),
+            recovery_finished: false,
+            pauses: 0,
+            worker_checks: 0,
+            output: Vec::new(),
+        };
+        let error = drive_terminal_review_with(job, false, false, &mut terminal)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(terminal.pauses, 1);
+        assert_eq!(terminal.worker_checks, 2);
+        assert!(
+            error.contains("The terminal service could not restart"),
+            "{error}"
+        );
+        assert!(
+            error.contains("build · alpha: screen and directory kept"),
+            "{error}"
+        );
+        assert!(
+            terminal.output.is_empty(),
+            "settled recovery needs no new prompts"
+        );
     }
 }

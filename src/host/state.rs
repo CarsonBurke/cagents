@@ -263,6 +263,9 @@ pub(crate) struct HostState {
     /// Actual parent-owned records installed before an adoption commit. They
     /// remain listed and explicitly closeable if confirmation is unavailable.
     startup_custody: BTreeSet<TerminalId>,
+    /// Missing original owners after an acknowledged incomplete update. Their
+    /// saved pane recipes are evidence, never automatic execution authority.
+    paused_update_terminals: BTreeSet<TerminalId>,
     startup_recovery: Option<String>,
     /// Immutable accepted inventory survives a failed final unlink/fsync as
     /// well as its Store handle. This is live custody, not a durable retry or
@@ -440,6 +443,7 @@ impl HostState {
             terminal_retirements: BTreeMap::new(),
             spawning: BTreeSet::new(),
             startup_custody: BTreeSet::new(),
+            paused_update_terminals: BTreeSet::new(),
             startup_recovery: None,
             retained_startup_checkpoint: None,
             #[cfg(test)]
@@ -1163,6 +1167,10 @@ impl HostState {
             host_incarnation: proof.host_incarnation.clone(),
         };
         Ok(current)
+    }
+
+    pub(super) fn terminal_options(&self, id: TerminalId) -> Option<TerminalSpawnOptions> {
+        self.terminals.get(&id).map(|record| record.options.clone())
     }
 
     /// The descriptor an observer with attachment state `attached` is owed.
@@ -2019,6 +2027,10 @@ impl HostState {
         })
     }
 
+    pub(in crate::host) fn pause_update_terminals(&mut self, ids: &[TerminalId]) {
+        self.paused_update_terminals.extend(ids.iter().copied());
+    }
+
     /// A retained failure outranks custody still awaiting its outcome: it is
     /// never cleared, so waiting on the remaining custody cannot finish startup.
     pub(super) fn startup_state(&self) -> StartupState {
@@ -2144,13 +2156,12 @@ fn upgrade_blockers_message(blockers: &[String], relaunch_agents: bool) -> Strin
     // session's process cannot be resumed after the daemon restarts, only
     // started again, and the upgrade will not make that choice for the user.
     let mut message = String::from(
-        "These active terminals cannot be resumed automatically. Finish or close their jobs before upgrading.",
+        "These active terminals cannot be checkpointed automatically. The updater can stop the terminal service after listing the affected work for confirmation.",
     );
-    // With relaunching accepted, whatever still blocks is no identified agent.
     message.push_str(if relaunch_agents {
-        " Each runs a job that is not an agent cagents can relaunch:"
+        " These jobs require the stopped-pane fallback:"
     } else {
-        " Identified agents can instead be relaunched into their resume picker: turn on Relaunch agents on upgrade in Settings, or pass --relaunch-agents. Unrelated shell jobs still block the upgrade:"
+        " These sessions require the stopped-pane fallback:"
     });
     for blocker in blockers {
         message.push_str("\n  ");
@@ -2209,7 +2220,7 @@ fn validate_terminal_upgrade_environment(
     recipe.remove_unset_environment(&mut restored);
     if execution.0 != restored {
         return Err(upgrade_error(
-            "Terminal execution environment cannot survive daemon upgrade without losing selected credentials or account settings. Align the daemon configuration or finish and close this terminal before upgrading; no source was stopped",
+            "Terminal execution environment cannot survive daemon upgrade without losing selected credentials or account settings. The updater can restore this terminal stopped after confirmation; no source was stopped",
         ));
     }
     Ok(())
@@ -2290,7 +2301,7 @@ fn prepare_upgrade_with_carry_policy(
             .any(|receipt| !receipt.unacknowledgeable(now))
         {
             return Err(upgrade_error(
-                "A native-to-terminal handoff is not durably acknowledged; save its replacement before upgrading",
+                "A native-to-terminal handoff is not durably acknowledged and cannot be checkpointed",
             ));
         }
         for (chat, receipt) in &state.chat_handoffs {
@@ -2302,7 +2313,7 @@ fn prepare_upgrade_with_carry_policy(
         }
         if state.chats.values().any(|record| record.returning_terminal) {
             return Err(upgrade_error(
-                "A native-to-terminal replacement is still pending; retry or explicitly close it before upgrading",
+                "A native-to-terminal replacement is still pending and cannot be checkpointed",
             ));
         }
         // A durable native holder also keeps its paired terminal alive. Its
@@ -2362,7 +2373,7 @@ fn prepare_upgrade_with_carry_policy(
             }
             if record.handle.is_completed() {
                 return Err(upgrade_error(
-                    "A native provider stopped but may still hold unconfirmed work; close its conversation before upgrading",
+                    "A native provider stopped but may still hold unconfirmed work and cannot be checkpointed",
                 ));
             }
             let mut source = record.session.clone();
@@ -2985,6 +2996,21 @@ pub(in crate::host) fn restore_upgrade_with_process_fixture(
     )
 }
 
+/// An acknowledged incomplete update authorizes attaching its original holder
+/// only. In particular, missing holders never fall back to a launch recipe.
+pub(in crate::host) fn adopt_prepared_terminal(
+    host: &SharedHost,
+    terminal: &crate::upgrade::handoff::Carried,
+) -> bool {
+    adopt_carried_terminal(
+        host,
+        terminal,
+        holder_directory().ok().as_deref(),
+        std::path::Path::new("/proc"),
+        false,
+    )
+}
+
 /// A holder's private record is discovery only. The live holder must return
 /// matching process evidence and the previous daemon's issued lineage before
 /// its PTY may be attached; a matching numeric terminal ID alone is insufficient.
@@ -3113,7 +3139,11 @@ pub(super) fn restore_orphaned_holders(host: &SharedHost) -> Result<(), String> 
         &proof.boot_id,
         crate::daemon::holder_registry::Kind::Terminal,
     )?;
+    let stopped = crate::upgrade::floor::load()?;
     for record in records {
+        if stopped.blocks_terminal(record.terminal) {
+            continue;
+        }
         if crate::daemon::termination_requested() {
             break;
         }
@@ -4131,6 +4161,59 @@ pub(super) fn spawn_codex_view_reserved(
     )
 }
 
+/// Restart only a thin console whose previous exact holder has proved closed.
+/// Keep the issued aliases and accepted launch in the new holder, so a crash
+/// before native re-pairing or a window save remains recoverable.
+pub(super) fn spawn_console_replacement(
+    shared: &SharedHost,
+    session: TerminalSession,
+    options: TerminalSpawnOptions,
+    aliases: &[TerminalSession],
+    requested: &crate::chat::Session,
+) -> Result<(TerminalDescriptor, TerminalHandle), ProtocolError> {
+    let (source, previous_sources) = aliases.split_last().ok_or_else(|| {
+        ProtocolError::new(
+            ProtocolErrorCode::InvalidRequest,
+            "Console replacement has no authenticated previous view",
+            false,
+        )
+    })?;
+    let relaunches: Vec<_> = aliases
+        .iter()
+        .cloned()
+        .map(|source| crate::terminal_ipc::UpgradeRelaunch {
+            source,
+            recipe: session.launch.clone(),
+        })
+        .collect();
+    let previous = crate::terminal::holder::Recovery {
+        source: source.clone(),
+        previous_sources: previous_sources.to_vec(),
+        relaunches: relaunches.clone(),
+        options: options.clone(),
+        execution_environment: None,
+        execution_recipe: None,
+    };
+    let (_, handle) = start_terminal_view_owned_reserved(
+        shared,
+        0,
+        session,
+        options,
+        None,
+        true,
+        None,
+        Some(previous),
+        None,
+        None,
+        Some(&super::chat::TerminalViewReservation::retained_console(
+            requested,
+        )),
+    )?;
+    let mut state = shared.lock().unwrap_or_else(|p| p.into_inner());
+    state.adopt_upgrade_lineage(source, previous_sources, &relaunches)?;
+    Ok((state.descriptor(0, source.id)?, handle))
+}
+
 fn start_terminal_view_owned_reserved(
     shared: &SharedHost,
     client_id: ClientId,
@@ -4144,6 +4227,18 @@ fn start_terminal_view_owned_reserved(
     execution_recipe: Option<crate::model::LaunchRecipe>,
     transition: Option<&super::chat::TerminalViewReservation<'_>>,
 ) -> Result<(TerminalDescriptor, TerminalHandle), ProtocolError> {
+    if shared
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .paused_update_terminals
+        .contains(&session.id)
+    {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::TerminalUnavailable,
+            "This terminal is paused after an incomplete update; its original process could not be authenticated. Open a new terminal to continue without replaying its saved command.",
+            false,
+        ));
+    }
     let recovery = shared
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -4403,6 +4498,15 @@ fn start_terminal_view_owned_reserved(
     });
     let config = TerminalConfig {
         agent_authority,
+        console_startup_owner: (paired
+            && crate::agent_execution::console_agent(&session.launch).is_some())
+        .then(|| {
+            shared
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .proof()
+                .clone()
+        }),
         columns: options.columns,
         rows: options.rows,
         cell_width_px: options.cell_width_px,

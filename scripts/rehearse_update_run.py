@@ -389,6 +389,9 @@ class Rehearsal:
             report += ['', 'Update transcript (includes every prompt and refusal):']
             for path in sorted((self.root/'logs').glob('update-*.log')):
                 report += [str(path),path.read_text(errors='replace')]
+            receipt = self.root/'records/after/recovery-current.json'
+            if receipt.exists():
+                report += ['', f'Fresh readiness and inventory verification: {receipt}', receipt.read_text()]
             seeds = self.root/'seeds.json'
             if seeds.exists():
                 report += ['', 'Seed verification (full inventories and diagnostics: seeds.json):']

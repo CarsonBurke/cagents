@@ -456,6 +456,24 @@ cmd_record() {
         esac
         user_env timeout -k 2 15 "$cli" --no-start --json "${args[@]}" >"$out/$noun.json" 2>"$out/$noun.stderr" || :
     done
+    # The issued receipt alone is historical evidence. Re-run its read-only
+    # verifier so paused panes are accepted only from the same Ready owner now.
+    local evidence_status=0
+    /usr/bin/python3 "$tool_root/scripts/rehearse_update_records.py" prepare-recovery "$root" "$out" \
+        >"$out/recovery-prepare.stdout" 2>"$out/recovery-prepare.stderr" || evidence_status=$?
+    if [ "$evidence_status" -eq 0 ]; then
+        local verifier
+        IFS= read -r verifier <"$out/recovery-prepare.stdout"
+        user_env timeout -k 2 30 "$verifier" --no-start daemon verify-update-census \
+            --census "$out/recovery-census.json" --outcome "$out/recovery-current.json" \
+            >"$out/recovery-verify.stdout" 2>"$out/recovery-verify.stderr" || {
+                printf '%s\n' 'Current daemon readiness and inventory verification failed; inspect recovery-verify.stderr' >"$out/recovery-error.txt"
+                status=1
+            }
+    elif [ "$evidence_status" -ne 1 ]; then
+        cp -- "$out/recovery-prepare.stderr" "$out/recovery-error.txt"
+        status=1
+    fi
     if desktop_live; then
         /usr/bin/python3 "$tool_root/scripts/rehearse_update_run.py" "$root" "$self" observe "$out/windows.json" || status=$?
     else

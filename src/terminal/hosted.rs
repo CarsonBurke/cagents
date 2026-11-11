@@ -1468,7 +1468,11 @@ fn ensure_daemon_ready_at(
 
     // User scopes execute the command locally and preserve explicitly
     // forwarded descriptors, including both update admission and inventory.
-    let scoped = systemd_user_manager_available();
+    // Recovery authority belongs to the verified daemon itself. A scope
+    // launcher must never receive or relay its receipt and continuous fences.
+    let recovery = crate::upgrade::recovery::has_inherited_receipt()
+        .map_err(|error| HostedTerminalStartError::HostStartup(error.to_string()))?;
+    let scoped = systemd_user_manager_available() && !recovery;
     start_and_verify_daemon_at(socket, timeout, &daemon_binary, scoped, |scoped| {
         spawn_daemon(&daemon_binary, application, scoped)
     })
@@ -1626,7 +1630,7 @@ fn spawn_daemon(
         command.pre_exec(crate::daemon::seal_inherited_descriptors);
     }
     crate::instance::inherit_daemon_fence(&mut command)?;
-    crate::daemon::lease_handoff::inherit_daemon_lease(&mut command)?;
+    crate::daemon::lease_handoff::inherit_target_daemon_lease(&mut command)?;
     command.spawn()
 }
 

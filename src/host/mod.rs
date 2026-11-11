@@ -22,6 +22,7 @@ mod service;
 #[cfg(all(test, target_os = "linux"))]
 mod shutdown_tests;
 mod state;
+mod update_recovery;
 mod work;
 mod workspace;
 mod worktree_removal;
@@ -420,10 +421,17 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     // can discard the holder's replay copy. It observes no process until the
     // same HostState publishes one; it initiates no execution.
     let _agent_activity = activity::Monitor::start(&host)?;
+    let mut recovered_prepared = false;
     let listener = listener_before_restore(&paths, || {
         let restored = (|| -> io::Result<()> {
+            if update_recovery::restore(&host).map_err(io::Error::other)? {
+                recovered_prepared = true;
+                return Ok(());
+            }
             chat::retained_actor::reconcile_previous_boot_history(&host)
                 .map_err(io::Error::other)?;
+            let ready_capture =
+                crate::upgrade::recovery::verified::ready::capture().map_err(io::Error::other)?;
             let unattached = state::restore_upgrade(&host).map_err(io::Error::other)?;
             state::restore_orphaned_holders(&host).map_err(io::Error::other)?;
             if let Some(detail) = host
@@ -434,8 +442,16 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
                 return Err(io::Error::other(detail.to_owned()));
             }
             chat::restore_orphaned_native(&host, &unattached).map_err(io::Error::other)?;
+            if let Some(detail) = host
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .startup_recovery()
+            {
+                return Err(io::Error::other(detail.to_owned()));
+            }
             chat::retained_actor::reconcile_retired_actors(&host).map_err(io::Error::other)?;
             chat::retained_actor::reconcile_startup_losses(&host).map_err(io::Error::other)?;
+            model::floor::restore_presentations().map_err(io::Error::other)?;
             let retained_runs = chat::retained_actor::retained_runs(&host);
             // A committed acceptance is not proof of provider delivery. Until a
             // restored actor supplies exact run evidence, never authorize a resend.
@@ -449,6 +465,29 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
                     )
                     .map_err(io::Error::other)?;
             }
+            let (proof, terminals, chats) = {
+                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                let chats = state
+                    .chats
+                    .values()
+                    .map(|record| {
+                        let mut session = record.session.clone();
+                        session.launch.session_id = record.handle.session_id();
+                        session.native_continuity = record.handle.native_continuity();
+                        session
+                    })
+                    .collect::<Vec<_>>();
+                (state.proof().clone(), state.list(0), chats)
+            };
+            let executable = std::env::current_exe()?;
+            crate::upgrade::recovery::verified::ready::publish(
+                ready_capture,
+                &proof,
+                &executable,
+                &terminals,
+                &chats,
+            )
+            .map_err(io::Error::other)?;
             Ok(())
         })();
         match restored {
@@ -486,11 +525,12 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
         Some(state.agent_tally())
     });
 
-    let recovery_only = host
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .startup_recovery()
-        .is_some();
+    let recovery_only = recovered_prepared
+        || host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .startup_recovery()
+            .is_some();
     if !recovery_only {
         let restore_host = Arc::downgrade(&host);
         if let Err(error) = std::thread::Builder::new()
