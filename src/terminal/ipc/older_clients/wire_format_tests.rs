@@ -537,7 +537,7 @@ fn readiness_proof_detects_startup_phase_variants_and_nested_payload_changes() {
                 _ => unreachable!(),
             }
             assert!(
-                !lifecycle_differences(&baseline, &changed).is_empty(),
+                !lifecycle_differences(&baseline, &changed, &[]).is_empty(),
                 "protocol {protocol}: readiness mutation {mutation} must be rejected"
             );
         }
