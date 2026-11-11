@@ -5066,8 +5066,13 @@ if os.environ['CAGENTS_TEST_RECOVERY_FAILURE']=='start-nonzero-with-service': sy
             assert!(command.contains("--yes --census"));
             assert_eq!(fs::read(path).unwrap(), bytes);
             assert!(
-                lease.is_some(),
-                "handoff custody must remain for the target owner"
+                lease.is_none(),
+                "the explicit recovery command needs a fresh lease"
+            );
+            drop(
+                LeaseHandoff::try_acquire(&paths).unwrap().expect(
+                    "the failed worker must release its reservation before target recovery",
+                ),
             );
             assert!(!root.path().join("start-attempts").exists());
             // A retry must retain the pending source scope before looking at
