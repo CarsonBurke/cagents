@@ -187,6 +187,7 @@ pub(in crate::app) struct Controls {
     now: Millis,
     enabled: bool,
     recovery_enabled: bool,
+    checking: bool,
     surface: String,
     identity: Option<Identity>,
 }
@@ -488,6 +489,7 @@ impl Controls {
             || !controls.state.uncertain.is_empty()
             || controls.state.pending.is_some()
             || controls.state.feedback.is_some()
+            || controls.checking
             || cleared)
             .then_some(controls)
     }
@@ -519,6 +521,9 @@ impl Controls {
                 .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
                 .into(),
             );
+        }
+        if self.checking && self.state.pending.is_none() {
+            rows.push(design::caption("Checking usage…").into());
         }
         if let Some(pending) = &self.state.pending {
             rows.push(design::caption(format!("Using a {} reset…", pending.reset.label())).into());
@@ -687,6 +692,11 @@ fn limit_matches(summary: &str, window: &UsageWindow) -> bool {
 impl Cagents {
     pub(super) fn usage_reset_controls(&self, state: &AccountState) -> Option<Controls> {
         let snapshot = state.snapshot.as_ref()?;
+        let checking = state.queued == Some(Trigger::Limit)
+            || state
+                .pending_probe
+                .as_ref()
+                .is_some_and(|ticket| ticket.limit_identity.is_some());
         let mut reset_state = state.reset.clone();
         reset_state.reconcile(snapshot, self.account_ui.now_ms);
         if snapshot
@@ -698,6 +708,7 @@ impl Cagents {
             && reset_state.feedback.is_none()
             && reset_state.uncertain.is_empty()
             && reset_state.confirmed.is_empty()
+            && !checking
         {
             return None;
         }
@@ -707,6 +718,7 @@ impl Cagents {
             snapshot: snapshot.clone(),
             state: reset_state,
             identity: state.identity.clone(),
+            checking,
             surface: "accounts".into(),
             now: self.account_ui.now_ms,
             recovery_enabled: state.present
@@ -714,6 +726,7 @@ impl Cagents {
                 && self.account_ui.login_conflict(state).is_none()
                 && !self.account_sign_in_running(&state.account),
             enabled: state.present
+                && !checking
                 && !state.reset.in_flight()
                 && state.failure.is_none()
                 && !is_stale(snapshot, self.account_ui.now_ms)
@@ -903,6 +916,7 @@ impl Cagents {
             return Task::none();
         }
         if let Some(snapshot) = snapshot {
+            let mut merged_inventory = false;
             if status == ConsumeStatus::Reset
                 && let Some(attempt) = submitted
             {
@@ -917,6 +931,18 @@ impl Cagents {
                 );
             }
             state.schedule.observe(snapshot.observed_at);
+            if state.inventory_observed_at.is_none_or(|known| {
+                snapshot.observed_at >= known
+                    || known > now_ms().saturating_add(schedule::CLOCK_SLACK)
+            }) {
+                state.inventory_observed_at = Some(snapshot.observed_at);
+                if let Some(current) = state.snapshot.as_mut()
+                    && current.observed_at > snapshot.observed_at
+                {
+                    merge_complete_inventory(current, &snapshot);
+                    merged_inventory = true;
+                }
+            }
             if state
                 .snapshot
                 .as_ref()
@@ -925,8 +951,14 @@ impl Cagents {
                 state.snapshot = Some(snapshot);
             }
             state.failure = None;
+            let provider = state.account.provider;
             self.account_ui.now_ms = now_ms();
-            Task::none()
+            let publish = if merged_inventory {
+                self.save_live(id)
+            } else {
+                Task::none()
+            };
+            Task::batch([publish, self.probe_queued(provider)])
         } else {
             state.schedule.invalidate();
             self.update_account_ui(Action::Refresh(id))
@@ -1209,6 +1241,7 @@ mod tests {
             now,
             enabled: true,
             recovery_enabled: true,
+            checking: false,
             surface: "accounts".into(),
             identity: None,
         };
@@ -1456,6 +1489,7 @@ mod tests {
             now,
             enabled: true,
             recovery_enabled: true,
+            checking: false,
             surface: "accounts".into(),
             identity: None,
         };
@@ -1771,6 +1805,7 @@ mod tests {
             now,
             enabled: true,
             recovery_enabled: true,
+            checking: false,
             surface: "accounts".into(),
             identity: None,
         };
@@ -1890,6 +1925,7 @@ mod tests {
                 now,
                 enabled: false,
                 recovery_enabled: false,
+                checking: false,
                 surface: "accounts".into(),
                 identity: None,
             };
@@ -2273,6 +2309,7 @@ mod tests {
             now,
             enabled: true,
             recovery_enabled: true,
+            checking: false,
             surface: "accounts".into(),
             identity: None,
         };
@@ -2333,6 +2370,7 @@ mod tests {
             now,
             enabled: true,
             recovery_enabled: true,
+            checking: false,
             surface: "accounts".into(),
             identity: None,
         };
@@ -2342,5 +2380,329 @@ mod tests {
         }
         controls.snapshot.ordinary_usage_allowed = Some(false);
         assert!(!controls.limit_cleared("Codex usage limit reached"));
+    }
+    #[test]
+    fn a_limit_event_forces_fresh_reset_inventory_instead_of_recent_cached_windows() {
+        let now = now_ms();
+        let id = Account::system(Provider::Codex).id();
+        let recipe = LaunchRecipe {
+            unset_environment: Default::default(),
+            program: "codex".into(),
+            arguments: vec![],
+            working_directory: "/fixture".into(),
+            environment: BTreeMap::new(),
+        };
+        for available in [1, 0] {
+            let mut app = context_inspector_test_app(false);
+            app.account_ui.registry_ready = true;
+            app.refresh_ui.focused = true;
+            let state = app.account_ui.account_mut(&id).unwrap();
+            state.present = true;
+            let mut snapshot = UsageSnapshot::state(UsageStatus::Ok, "cached", now);
+            snapshot.windows = vec![window(account::WindowKind::Session, "codex:primary", 0.0)];
+            state.snapshot = Some(snapshot.clone());
+            state.schedule.observe(now);
+            drop(app.account_limit_reported(Provider::Codex, &recipe));
+            let ticket = app.account_ui.pending_probe_for_test(&id).unwrap();
+            assert!(ticket.force);
+            let checking = app
+                .usage_reset_controls(app.account_ui.account(&id).unwrap())
+                .unwrap();
+            assert!(checking.checking);
+            assert!(
+                !checking.enabled,
+                "known stale inventory cannot start a new confirmation"
+            );
+            assert!(
+                checking
+                    .for_limit("Codex usage limit reached")
+                    .unwrap()
+                    .checking
+            );
+            snapshot.status = UsageStatus::Limited;
+            snapshot.ordinary_usage_allowed = Some(false);
+            snapshot.windows[0].used = 1.0;
+            let mut grant = reset(ResetScope::Account);
+            grant.available_count = available;
+            snapshot.resets = vec![grant];
+            snapshot.observed_at = now + 1;
+            let owner = app.account_ui.account(&id).unwrap().owner;
+            drop(app.account_probed(
+                id.clone(),
+                owner,
+                ticket,
+                Outcome::Answered {
+                    snapshot,
+                    identity: None,
+                    catalog: None,
+                },
+            ));
+            let state = app.account_ui.account(&id).unwrap();
+            assert_eq!(state.snapshot.as_ref().unwrap().windows[0].used, 1.0);
+            let controls = app.usage_reset_controls(state);
+            if available == 1 {
+                let controls = controls.unwrap();
+                assert!(next_reset(&controls.snapshot, &controls.state, controls.now).is_some());
+                assert_eq!(
+                    grouped_inventory(&controls.snapshot, controls.now)[0].count,
+                    1
+                );
+                drop(app.account_limit_reported(Provider::Codex, &recipe));
+                assert!(
+                    app.account_ui.pending_probe_for_test(&id).is_none(),
+                    "burst is coalesced until the existing tick"
+                );
+                let checking = app
+                    .usage_reset_controls(app.account_ui.account(&id).unwrap())
+                    .unwrap();
+                assert!(checking.checking);
+                assert!(!checking.enabled);
+                assert!(
+                    checking.recovery_enabled,
+                    "checking does not hide same-key recovery"
+                );
+                let renderer = crate::app::tests::headless_renderer();
+                let mut element = checking.view();
+                use iced::advanced::{
+                    Layout, layout,
+                    widget::{Operation, Tree},
+                };
+                #[derive(Default)]
+                struct Texts(Vec<String>);
+                impl Operation for Texts {
+                    fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                        visit(self);
+                    }
+                    fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, text: &str) {
+                        self.0.push(text.into());
+                    }
+                }
+                let mut tree = Tree::new(element.as_widget());
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(iced::Size::ZERO, iced::Size::new(320.0, 900.0)),
+                );
+                let mut texts = Texts::default();
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut texts,
+                );
+                assert!(texts.0.iter().any(|text| text == "Checking usage…"));
+            } else {
+                assert!(
+                    controls.is_none(),
+                    "fresh zero inventory hides the reset action"
+                );
+            }
+        }
+    }
+    #[test]
+    fn newer_partial_windows_keep_fresh_forced_inventory_and_cannot_renew_its_due_time() {
+        let now = now_ms();
+        let id = Account::system(Provider::Codex).id();
+        let recipe = LaunchRecipe {
+            unset_environment: Default::default(),
+            program: "codex".into(),
+            arguments: vec![],
+            working_directory: "/fixture".into(),
+            environment: BTreeMap::new(),
+        };
+        for count in [1, 0] {
+            let mut app = context_inspector_test_app(false);
+            let directory = tempfile::tempdir().unwrap();
+            app.account_ui.cache = Some(Cache::at(directory.path()));
+            app.account_ui.registry_ready = true;
+            app.refresh_ui.focused = true;
+            let state = app.account_ui.account_mut(&id).unwrap();
+            state.present = true;
+            let mut live =
+                UsageSnapshot::state(UsageStatus::Limited, "newer live windows", now + 2);
+            live.windows = vec![window(account::WindowKind::Session, "codex:primary", 1.0)];
+            live.ordinary_usage_allowed = Some(false);
+            live.resets = vec![reset(ResetScope::Account)];
+            state.snapshot = Some(live.clone());
+            state.schedule.observe(now + 2);
+            drop(app.account_limit_reported(Provider::Codex, &recipe));
+            let ticket = app.account_ui.pending_probe_for_test(&id).unwrap();
+            let owner = app.account_ui.account(&id).unwrap().owner;
+            let mut complete =
+                UsageSnapshot::state(UsageStatus::Ok, "full response before live frame", now + 1);
+            complete.windows = vec![window(account::WindowKind::Session, "codex:primary", 0.0)];
+            let mut grant = reset(ResetScope::Account);
+            grant.available_count = count;
+            complete.resets = vec![grant];
+            drop(app.account_probed(
+                id.clone(),
+                owner,
+                ticket,
+                Outcome::Answered {
+                    identity: None,
+                    snapshot: complete,
+                    catalog: None,
+                },
+            ));
+            let state = app.account_ui.account(&id).unwrap();
+            assert_eq!(state.snapshot.as_ref().unwrap().windows, live.windows);
+            assert_eq!(state.snapshot.as_ref().unwrap().observed_at, now + 2);
+            assert_eq!(
+                state.snapshot.as_ref().unwrap().ordinary_usage_allowed,
+                Some(false)
+            );
+            assert_eq!(
+                state.snapshot.as_ref().unwrap().resets[0].available_count,
+                count
+            );
+            assert_eq!(state.inventory_observed_at, Some(now + 1));
+            let entries = app.account_ui.take_live_entries();
+            assert_eq!(
+                entries.len(),
+                1,
+                "merged full inventory is republished through the coalesced writer"
+            );
+            assert_eq!(entries[0].1.snapshot.windows, live.windows);
+            assert_eq!(entries[0].1.snapshot.observed_at, now + 2);
+            assert_eq!(entries[0].1.snapshot.resets[0].available_count, count);
+            // A consume/recovery can publish even newer full inventory while
+            // another forced response is in transit. That inventory wins too.
+            let state = app.account_ui.account_mut(&id).unwrap();
+            state.inventory_observed_at = Some(now + 3);
+            state.snapshot.as_mut().unwrap().observed_at = now + 4;
+            state.snapshot.as_mut().unwrap().resets[0].available_count = 0;
+            let late = state.start_probe(Trigger::Limit, now);
+            let mut old = UsageSnapshot::state(UsageStatus::Ok, "older inventory", now + 1);
+            old.resets = vec![reset(ResetScope::Account)];
+            drop(app.account_probed(
+                id.clone(),
+                owner,
+                late,
+                Outcome::Answered {
+                    identity: None,
+                    snapshot: old,
+                    catalog: None,
+                },
+            ));
+            let state = app.account_ui.account(&id).unwrap();
+            assert_eq!(state.inventory_observed_at, Some(now + 3));
+            assert_eq!(
+                state.snapshot.as_ref().unwrap().resets[0].available_count,
+                0
+            );
+            // Continued live traffic updates quota age, not inventory age.
+            let state = app.account_ui.account_mut(&id).unwrap();
+            state.inventory_observed_at = Some(now - schedule::REFRESH_INTERVAL);
+            state.schedule.observe(now);
+            state
+                .schedule
+                .start(Trigger::Limit, now - schedule::LIMIT_DEBOUNCE);
+            state.schedule.succeed(now);
+            drop(app.probe_account(&id, Trigger::Tick, now));
+            assert!(app.account_ui.pending_probe_is_forced_for_test(&id));
+        }
+    }
+    #[test]
+    fn a_complete_read_keeps_explicit_permission_when_a_newer_partial_window_omits_it() {
+        let now = now_ms();
+        let id = Account::system(Provider::Codex).id();
+        for (partial_allowed, full_allowed, expected) in [
+            (None, false, false),
+            (Some(false), true, false),
+            (Some(true), false, true),
+        ] {
+            let mut app = context_inspector_test_app(false);
+            let state = app.account_ui.account_mut(&id).unwrap();
+            let mut partial = UsageSnapshot::state(UsageStatus::Ok, "newer partial", now + 2);
+            partial.ordinary_usage_allowed = partial_allowed;
+            partial.windows = vec![window(account::WindowKind::Session, "codex:primary", 0.0)];
+            state.snapshot = Some(partial);
+            let owner = state.owner;
+            let ticket = state.start_probe(Trigger::Limit, now);
+            let mut full = UsageSnapshot::state(UsageStatus::Limited, "complete", now + 1);
+            full.ordinary_usage_allowed = Some(full_allowed);
+            full.plan = Some("Fixture plan".into());
+            full.windows = vec![window(account::WindowKind::Session, "codex:primary", 1.0)];
+            drop(app.account_probed(
+                id.clone(),
+                owner,
+                ticket,
+                Outcome::Answered {
+                    identity: None,
+                    snapshot: full,
+                    catalog: None,
+                },
+            ));
+            let current = app
+                .account_ui
+                .account(&id)
+                .unwrap()
+                .snapshot
+                .as_ref()
+                .unwrap();
+            assert_eq!(current.ordinary_usage_allowed, Some(expected));
+            assert_eq!(
+                current.status,
+                if expected {
+                    UsageStatus::Ok
+                } else {
+                    UsageStatus::Limited
+                }
+            );
+            assert_eq!(
+                current.windows[0].used, 0.0,
+                "newer partial windows stay authoritative"
+            );
+            assert_eq!(current.plan.as_deref(), Some("Fixture plan"));
+            assert_eq!(current.observed_at, now + 2);
+            if !expected {
+                assert_eq!(
+                    chip(app.account_ui.account(&id).unwrap(), "Fixture", now + 2).text,
+                    "Limited",
+                    "an account denial must not advertise 100% available overall"
+                );
+            }
+        }
+    }
+    #[test]
+    fn a_consume_result_merged_with_newer_partial_usage_is_published_for_other_windows() {
+        let now = now_ms();
+        let mut app = context_inspector_test_app(false);
+        let directory = tempfile::tempdir().unwrap();
+        app.account_ui.cache = Some(Cache::at(directory.path()));
+        let id = Account::system(Provider::Codex).id();
+        let grant = reset(ResetScope::Account);
+        let state = app.account_ui.account_mut(&id).unwrap();
+        state.present = true;
+        let mut partial = UsageSnapshot::state(UsageStatus::Limited, "newer live usage", now + 2);
+        partial.windows = vec![window(account::WindowKind::Session, "codex:primary", 1.0)];
+        partial.resets = vec![grant.clone()];
+        state.snapshot = Some(partial.clone());
+        state.reset.prepare(grant.clone(), 2, None);
+        let attempt = state.reset.submit(&grant, 2, None).unwrap();
+        let owner = state.owner;
+        let mut complete = UsageSnapshot::state(
+            UsageStatus::Ok,
+            "consume response before live frame",
+            now + 1,
+        );
+        let mut remaining = grant;
+        remaining.available_count = 1;
+        complete.resets = vec![remaining];
+        drop(app.finish_usage_reset(
+            id,
+            owner,
+            attempt.key,
+            Ok(ConsumeOutcome {
+                status: ConsumeStatus::Reset,
+                message: None,
+                snapshot: Some(complete),
+            }),
+        ));
+        let entries = app.account_ui.take_live_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1.snapshot.windows, partial.windows);
+        assert_eq!(entries[0].1.snapshot.observed_at, now + 2);
+        assert_eq!(entries[0].1.snapshot.resets[0].available_count, 1);
     }
 }

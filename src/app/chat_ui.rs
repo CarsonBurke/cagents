@@ -2509,6 +2509,7 @@ pub(super) struct Runtime {
     closed_elsewhere: bool,
     /// The usage limit stopping the conversation, as the daemon judges it.
     usage_limit: Option<crate::agent_execution::directory::UsageLimit>,
+    pub(super) limit_refresh_pending: bool,
     /// The first message of a draft, while its conversation starts.
     queued: Option<Queued>,
     /// Messages held here for the next turn, oldest first.
@@ -3647,6 +3648,7 @@ impl Runtime {
             connection,
             closed_elsewhere: false,
             usage_limit: None,
+            limit_refresh_pending: false,
             queued: None,
             followups: Vec::new(),
             next_followup: 0,
@@ -11253,6 +11255,23 @@ impl Cagents {
                             self.publish_observed_channel_name(target, name, source);
                         }
                         self.observe_agent_activity_for_card(target.card, Some(activity));
+                        // A new request can reject before its first Changed
+                        // wake reaches this window. Historical reopen alone
+                        // does not manufacture a fresh limit occurrence.
+                        if matches!(
+                            attempt.intent,
+                            chat::Intent::Start | chat::Intent::RetryStart | chat::Intent::Resume
+                        ) && let Some(CardRuntime::Chat(runtime)) =
+                            self.cards.get_mut(&target.card)
+                            && matches!(
+                                runtime.session.launch.provider,
+                                Provider::Claude | Provider::Codex
+                            )
+                            && runtime.failure_ui.active_account_limit()
+                        {
+                            runtime.limit_refresh_pending = true;
+                        }
+                        let limits = self.refresh_chat_limit_accounts();
                         // Reports that raced the attachment woke nothing.
                         let usage = self.take_chat_account_usage(target);
                         let submitted = automatic_submit
@@ -11277,6 +11296,7 @@ impl Cagents {
                         return Task::batch([
                             submitted,
                             usage,
+                            limits,
                             self.list_chat_models(target.card),
                             self.dispatch_queued(target),
                         ]);
@@ -11602,7 +11622,14 @@ impl Cagents {
                 match wake {
                     Wake::Changed => {
                         let before = Arc::clone(&runtime.snapshot);
+                        let previous_limit = runtime.failure_ui.limit_occurrence;
                         runtime.refresh();
+                        let new_limit = runtime.failure_ui.limit_occurrence != previous_limit;
+                        runtime.limit_refresh_pending |= new_limit
+                            && matches!(
+                                runtime.session.launch.provider,
+                                Provider::Claude | Provider::Codex
+                            );
                         // What the provider holds is saved as it changes, so a
                         // queue outlives a provider that goes with the computer.
                         let queue_changed =
@@ -11650,7 +11677,9 @@ impl Cagents {
                         {
                             self.persist();
                         }
+                        let refresh_limits = self.refresh_chat_limit_accounts();
                         return Task::batch([
+                            refresh_limits,
                             self.list_chat_models(target.card),
                             self.resume_current_find(target, true),
                             self.dispatch_queued(target),
@@ -24395,6 +24424,163 @@ mod tests {
         assert!(
             handle.push_account_usage_for_test(report(95), now + 4),
             "the next report wakes the surface again"
+        );
+    }
+
+    #[test]
+    fn a_new_chat_limit_without_usage_frames_forces_one_read_with_usage_views_closed() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let mut registry = crate::account::registry::Registry::default();
+        for provider in crate::account::Account::PROVIDERS {
+            registry.set_default(&crate::account::Account::system(provider));
+        }
+        app.account_ui.set_registry(registry);
+        app.refresh_ui.focused = true;
+        app.settings.show_status_bar = false;
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let runtime = chat_runtime(&app, card);
+        let target = runtime.target;
+        let handle = runtime.handle().unwrap().clone();
+        let id = crate::account::Account::system(Provider::Codex).id();
+        let now = crate::chat::now_ms().unwrap();
+        let (owner, ticket) =
+            app.account_ui
+                .begin_probe_for_test(&id, crate::account::schedule::Trigger::Tick, now);
+        drop(
+            app.update(Message::AccountUi(crate::app::account_ui::Action::Probed {
+                id: id.clone(),
+                owner,
+                ticket,
+                outcome: crate::account::probe::Outcome::Answered {
+                    identity: None,
+                    catalog: None,
+                    snapshot: crate::account::UsageSnapshot::state(
+                        crate::account::UsageStatus::Ok,
+                        "cached",
+                        now,
+                    ),
+                },
+            })),
+        );
+        assert!(app.utility_card(&CardKind::Accounts).is_none());
+        let mut next = (*handle.snapshot()).clone();
+        next.generation += 1;
+        next.error = Some("Usage limit reached for this plan".into());
+        handle.publish_snapshot_for_test(next);
+        drop(app.update(Message::ChatUi(Action::Wake(target, Wake::Changed))));
+        let first = app
+            .account_ui
+            .pending_probe_for_test(&id)
+            .expect("a visible chat limit needs fresh account inventory");
+        assert!(app.account_ui.pending_probe_is_forced_for_test(&id));
+        // Repainting, account-limit signaling and identical transcript wakes
+        // are all the same classified occurrence, not another network read.
+        for wake in [Wake::Changed, Wake::Limit, Wake::Changed] {
+            drop(app.update(Message::ChatUi(Action::Wake(target, wake))));
+            assert!(
+                app.account_ui
+                    .pending_probe_for_test(&id)
+                    .unwrap()
+                    .same(&first)
+            );
+        }
+        drop(
+            app.update(Message::AccountUi(crate::app::account_ui::Action::Probed {
+                id: id.clone(),
+                owner,
+                ticket: first,
+                outcome: crate::account::probe::Outcome::Answered {
+                    identity: None,
+                    catalog: None,
+                    snapshot: crate::account::UsageSnapshot::state(
+                        crate::account::UsageStatus::Limited,
+                        "fresh",
+                        now + 1,
+                    ),
+                },
+            })),
+        );
+        assert!(
+            app.account_ui.pending_probe_for_test(&id).is_none(),
+            "duplicate wakes left no queued read"
+        );
+        drop(app.update(Message::ChatUi(Action::Wake(target, Wake::Changed))));
+        assert!(app.account_ui.pending_probe_for_test(&id).is_none());
+    }
+
+    #[test]
+    fn an_active_limit_before_initial_attachment_refreshes_inventory_without_a_changed_wake() {
+        for active in [true, false] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            app.account_ui
+                .set_registry(crate::account::registry::Registry::default());
+            app.refresh_ui.focused = true;
+            let (card, target) = starting_chat(&mut app);
+            let handle = fixture_handle(&app, card, Some("fixture-thread"));
+            let mut snapshot = (*handle.snapshot()).clone();
+            let raw = "Usage limit reached for this plan";
+            let mut old_failure = chat::Item {
+                id: "historical-request-error".into(),
+                role: chat::Role::System,
+                at: None,
+                started_at: None,
+                content: text(raw),
+            };
+            assert!(chat::failure::mark_provider_error(
+                Provider::Codex,
+                &mut old_failure
+            ));
+            snapshot.items.push(Arc::new(old_failure));
+            snapshot.error = active.then(|| raw.into());
+            snapshot.generation += 1;
+            handle.publish_snapshot_for_test(snapshot);
+            answer_start(&mut app, target, Ok(handle));
+            let id = crate::account::Account::system(Provider::Codex).id();
+            assert_eq!(
+                app.account_ui.pending_probe_is_forced_for_test(&id),
+                active,
+                "a current failed request needs inventory; reopening a historical notice alone does not"
+            );
+            assert!(!chat_runtime(&app, card).limit_refresh_pending);
+        }
+    }
+
+    #[test]
+    fn an_unresolved_limit_account_waits_for_its_actual_home_instead_of_guessing_a_default() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.account_ui
+            .set_registry(crate::account::registry::Registry::default());
+        app.refresh_ui.focused = true;
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let key = uuid::Uuid::from_u128(818191);
+        let home =
+            crate::account::home::Homes::at("/cagents-fixture/accounts").path(Provider::Codex, key);
+        if let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) {
+            runtime
+                .session
+                .launch
+                .recipe
+                .environment
+                .insert("CODEX_HOME".into(), home.display().to_string());
+            runtime.limit_refresh_pending = true;
+        }
+        drop(app.refresh_chat_limit_accounts());
+        assert!(chat_runtime(&app, card).limit_refresh_pending);
+        assert!(
+            app.account_ui
+                .pending_probe_for_test(&crate::account::Account::system(Provider::Codex).id())
+                .is_none()
+        );
+        let actual = app
+            .account_ui
+            .add_managed_fixture(Provider::Codex, key.as_u128());
+        drop(app.refresh_chat_limit_accounts());
+        assert!(!chat_runtime(&app, card).limit_refresh_pending);
+        assert!(app.account_ui.pending_probe_is_forced_for_test(&actual));
+        assert!(
+            app.account_ui
+                .pending_probe_for_test(&crate::account::Account::system(Provider::Codex).id())
+                .is_none()
         );
     }
 

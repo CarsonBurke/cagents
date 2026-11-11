@@ -241,6 +241,7 @@ pub(super) struct State {
     pub incidents: Vec<Incident>,
     pub expanded: HashSet<String>,
     pub revision: u64,
+    pub(super) limit_occurrence: u64,
     pub local_error: Option<Arc<str>>,
     pub find_expanded: HashSet<String>,
     previews: HashMap<String, Preview>,
@@ -569,6 +570,26 @@ impl State {
         }
     }
 
+    pub(super) fn active_account_limit(&self) -> bool {
+        self.incidents.iter().any(|incident| {
+            incident.kind == Some(FailureKind::AccountLimit)
+                && incident
+                    .sources
+                    .iter()
+                    .any(|source| matches!(source, Source::Snapshot | Source::Local(_)))
+        })
+    }
+
+    fn limit_carrier(&self, provider: Provider, source: &Source) -> Option<String> {
+        let (item, _, _) = self.item_metadata.get(source)?;
+        let carrier = chat::failure::provider_error_carrier(provider, item).unwrap_or(&item.id);
+        Some(match source {
+            Source::Item(_) => format!("item:{carrier}"),
+            Source::ChildItem(child, _) => format!("child:{child}:{carrier}"),
+            _ => return None,
+        })
+    }
+
     pub fn collect(runtime: &Runtime) -> Self {
         use std::hash::{Hash, Hasher};
         let mut state = Self::default();
@@ -879,6 +900,54 @@ impl State {
                         .unwrap_or_else(|| runtime.turns.last().map(|turn| turn.key.clone()))
                 });
         }
+        state.limit_occurrence = runtime
+            .failure_ui
+            .limit_occurrence
+            .saturating_add(u64::from(state.incidents.iter().any(|incident| {
+                if incident.kind != Some(FailureKind::AccountLimit) {
+                    return false;
+                }
+                let Some(previous) = runtime
+                    .failure_ui
+                    .incidents
+                    .iter()
+                    .find(|old| old.key == incident.key)
+                else {
+                    return true;
+                };
+                // New marked request carriers can recur within one prompt's
+                // incident. Claude's streamed blocks share one carrier, so
+                // extending that same response is never another refresh.
+                let carriers = incident
+                    .sources
+                    .iter()
+                    .filter_map(|source| state.limit_carrier(provider, source))
+                    .collect::<HashSet<_>>();
+                let old_carriers = previous
+                    .sources
+                    .iter()
+                    .filter_map(|source| runtime.failure_ui.limit_carrier(provider, source))
+                    .collect::<HashSet<_>>();
+                if carriers
+                    .iter()
+                    .any(|carrier| !old_carriers.contains(carrier))
+                {
+                    return true;
+                }
+                // For providers exposing only a live error, a fresh rejection
+                // after that live error cleared is a new occurrence. Retained
+                // notes alone are historical and do not trigger reads.
+                carriers.is_empty()
+                    && old_carriers.is_empty()
+                    && incident
+                        .sources
+                        .iter()
+                        .any(|source| matches!(source, Source::Snapshot | Source::Local(_)))
+                    && !previous
+                        .sources
+                        .iter()
+                        .any(|source| matches!(source, Source::Snapshot | Source::Local(_)))
+            })));
         state.expanded = runtime
             .failure_ui
             .expanded
@@ -1651,6 +1720,48 @@ mod tests {
         assert!(
             !original.contains(&current),
             "same summary in a later turn is a new occurrence"
+        );
+    }
+
+    #[test]
+    fn one_limit_response_streams_once_but_a_new_request_in_the_same_prompt_is_observed() {
+        let raw = "You've hit your Fable limit · resets 9pm (UTC)";
+        let (mut runtime, handle) = live_fixture(
+            Provider::Claude,
+            vec![
+                text("prompt", chat::Role::User, "Fixture question"),
+                provider_error(Provider::Claude, "response-a:0", raw),
+            ],
+        );
+        runtime.refresh_failure_ui();
+        let first = runtime.failure_ui.limit_occurrence;
+        publish(&mut runtime, &handle, |next| {
+            next.items.push(Arc::new(provider_error(
+                Provider::Claude,
+                "response-a:1",
+                raw,
+            )));
+        });
+        assert_eq!(
+            runtime.failure_ui.limit_occurrence, first,
+            "streamed fragments share one request"
+        );
+        publish(&mut runtime, &handle, |next| {
+            next.items.push(Arc::new(provider_error(
+                Provider::Claude,
+                "response-b:0",
+                raw,
+            )));
+        });
+        assert_eq!(
+            runtime.failure_ui.incidents.len(),
+            1,
+            "same prompt keeps one historical card"
+        );
+        assert_eq!(
+            runtime.failure_ui.limit_occurrence,
+            first + 1,
+            "a new rejected request still refreshes inventory"
         );
     }
 
