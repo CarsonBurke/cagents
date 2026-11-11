@@ -880,6 +880,7 @@ pub struct ProbeTicket {
     force: bool,
     limit_identity: Option<Option<Identity>>,
     plan_invalidated: Option<u64>,
+    usage_generation: u64,
 }
 
 impl ProbeTicket {
@@ -889,6 +890,7 @@ impl ProbeTicket {
             force,
             limit_identity: None,
             plan_invalidated: None,
+            usage_generation: 0,
         }
     }
 
@@ -914,6 +916,8 @@ struct AccountState {
     identity: Option<Identity>,
     snapshot: Option<UsageSnapshot>,
     inventory_observed_at: Option<Millis>,
+    usage_invalidated: bool,
+    usage_generation: u64,
     schedule: Schedule,
     pending_probe: Option<ProbeTicket>,
     /// Why the latest probe produced nothing, while the figures on screen
@@ -961,6 +965,13 @@ impl AccountState {
         self.invalidate_plan_profile();
     }
 
+    fn invalidate_usage(&mut self) {
+        self.inventory_observed_at = None;
+        self.usage_invalidated = true;
+        self.usage_generation = self.usage_generation.wrapping_add(1);
+        self.schedule.invalidate();
+    }
+
     fn invalidate_plan_profile(&mut self) {
         if self.account.provider != Provider::Claude {
             return;
@@ -987,6 +998,8 @@ impl AccountState {
             identity: None,
             snapshot: None,
             inventory_observed_at: None,
+            usage_invalidated: false,
+            usage_generation: 0,
             schedule: Schedule::default(),
             pending_probe: None,
             failure: None,
@@ -1013,6 +1026,7 @@ impl AccountState {
                 || matches!(trigger, Trigger::Manual | Trigger::Limit)
                 || self.schedule.awaiting_login(now),
         );
+        ticket.usage_generation = self.usage_generation;
         if trigger == Trigger::Limit {
             ticket.limit_identity = Some(self.identity.clone());
         }
@@ -2600,7 +2614,11 @@ impl Cagents {
             .then_some(state.inventory_observed_at)
             .flatten();
         let periodic = matches!(trigger, Trigger::Tick | Trigger::Focus);
-        let admitted = if periodic && let Some(observed) = full_observed {
+        let admitted = if periodic && state.usage_invalidated {
+            // Explicit invalidation is stronger than either observation clock;
+            // zero gives it no usable age while preserving focus/backoff gates.
+            state.schedule.should_probe_full(trigger, now, focused, 0)
+        } else if periodic && let Some(observed) = full_observed {
             state
                 .schedule
                 .should_probe_full(trigger, now, focused, observed)
@@ -2608,6 +2626,18 @@ impl Cagents {
             state.schedule.should_probe(trigger, now, focused)
         };
         if !admitted {
+            if periodic
+                && focused
+                && state.usage_invalidated
+                && state.schedule.in_flight(now)
+                && !matches!(state.queued, Some(Trigger::Manual | Trigger::Limit))
+            {
+                state.queued = Some(if state.queued == Some(Trigger::Focus) {
+                    Trigger::Focus
+                } else {
+                    trigger
+                });
+            }
             return if trigger == Trigger::Limit {
                 self.arm_limit_wake(id, now)
             } else {
@@ -2632,11 +2662,12 @@ impl Cagents {
         } else {
             schedule::REFRESH_INTERVAL
         };
-        let full_due = periodic
-            && full_observed.is_some_and(|at| {
-                at > now.saturating_add(schedule::CLOCK_SLACK)
-                    || now.saturating_sub(at) >= threshold
-            });
+        let full_due = state.usage_invalidated
+            || periodic
+                && full_observed.is_some_and(|at| {
+                    at > now.saturating_add(schedule::CLOCK_SLACK)
+                        || now.saturating_sub(at) >= threshold
+                });
         let ticket = state.start_probe_force(trigger, now, full_due);
         let force = ticket.force;
         if trigger == Trigger::Limit || trigger == Trigger::Manual {
@@ -2866,7 +2897,7 @@ impl Cagents {
             }
         }
         if login_changed {
-            state.schedule.invalidate();
+            state.invalidate_usage();
         }
         let save = if observed {
             self.save_live(id.clone())
@@ -3133,7 +3164,7 @@ impl Cagents {
                         continue;
                     };
                     if !state.present && restored.present {
-                        state.schedule.invalidate();
+                        state.invalidate_usage();
                     }
                     state.present = restored.present;
                     let absent = format!(
@@ -3844,6 +3875,7 @@ impl Cagents {
             }) =>
             {
                 if ticket.force
+                    && ticket.usage_generation == state.usage_generation
                     && matches!(provider, Provider::Claude | Provider::Codex)
                     && identity == state.identity
                     && state.inventory_observed_at.is_none_or(|observed| {
@@ -3856,6 +3888,7 @@ impl Cagents {
                     // returned by this owner/login's forced complete reading.
                     merge_complete_inventory(current, &snapshot);
                     state.inventory_observed_at = Some(snapshot.observed_at);
+                    state.usage_invalidated = false;
                     merged_inventory = true;
                 }
                 state.schedule.abandon();
@@ -3885,7 +3918,10 @@ impl Cagents {
                 let unchanged_by_login =
                     state.schedule.awaiting_login(now) && !signed_in_here && !was_signed_out;
                 state.schedule.succeed(snapshot.observed_at);
-                state.inventory_observed_at = Some(snapshot.observed_at);
+                if ticket.usage_generation == state.usage_generation {
+                    state.inventory_observed_at = Some(snapshot.observed_at);
+                    state.usage_invalidated = false;
+                }
                 if snapshot.status != UsageStatus::NeedsLogin
                     && !unchanged_by_login
                     && !state.refresh_plan
@@ -10600,6 +10636,10 @@ mod app_tests {
         let _ = app.account_reported(Provider::Codex, &recipe, vec![(login(true), now)]);
         let state = app.account_ui.account(&id).unwrap();
         assert!(state.schedule.in_flight(now_ms()));
+        assert!(
+            state.pending_probe.as_ref().unwrap().force,
+            "a changed login must bypass the recent cached identity and inventory"
+        );
         assert_eq!(
             state.snapshot.as_ref().unwrap().status,
             UsageStatus::NeedsLogin,
@@ -13164,5 +13204,105 @@ mod app_tests {
             assert!(!state.refresh_plan);
             assert_eq!(state.plan().as_deref(), Some("Current DISPLAY / Preview"));
         }
+    }
+    #[test]
+    fn restored_presence_invalidates_both_usage_ages_and_forces_a_fresh_queued_read() {
+        let mut app = context_inspector_test_app(false);
+        app.account_ui.set_registry(Registry::default());
+        app.refresh_ui.focused = true;
+        let id = Account::system(Provider::Codex).id();
+        let other = app.account_ui.add_managed_fixture(Provider::Codex, 929311);
+        let now = now_ms();
+        let state = app.account_ui.account_mut(&id).unwrap();
+        state.present = false;
+        state.snapshot = Some(UsageSnapshot::state(
+            UsageStatus::Ok,
+            "recent cached answer",
+            now,
+        ));
+        state.inventory_observed_at = Some(now);
+        state.schedule.observe(now);
+        let (owner, busy) = app
+            .account_ui
+            .begin_probe_for_test(&other, Trigger::Focus, now);
+        drop(app.update_account_ui(Action::Located {
+            generation: app.account_ui.discovery_generation,
+            owners: app.account_ui.discovery_owners(),
+            restored: vec![Restored {
+                id: id.clone(),
+                present: true,
+                entry: None,
+            }],
+            installed: BTreeMap::from([(Provider::Codex, true)]),
+        }));
+        let state = app.account_ui.account(&id).unwrap();
+        assert!(state.usage_invalidated);
+        assert!(state.inventory_observed_at.is_none());
+        assert_eq!(state.queued, Some(Trigger::Focus));
+        drop(app.account_probed(
+            other,
+            owner,
+            busy,
+            Outcome::Answered {
+                identity: None,
+                catalog: None,
+                snapshot: UsageSnapshot::state(UsageStatus::Ok, "finished", now),
+            },
+        ));
+        assert!(app.account_ui.pending_probe_for_test(&id).unwrap().force);
+    }
+    #[test]
+    fn usage_invalidation_survives_an_older_in_flight_reply_until_its_forced_successor_answers() {
+        let mut app = context_inspector_test_app(false);
+        app.account_ui.set_registry(Registry::default());
+        app.refresh_ui.focused = true;
+        let id = Account::system(Provider::Codex).id();
+        let now = now_ms();
+        let state = app.account_ui.account_mut(&id).unwrap();
+        state.present = true;
+        state.snapshot = Some(UsageSnapshot::state(UsageStatus::Ok, "original", now));
+        state.inventory_observed_at = Some(now);
+        let owner = state.owner;
+        let old = state.start_probe(Trigger::Focus, now);
+        state.invalidate_usage();
+        let generation = state.usage_generation;
+        drop(app.probe_account(&id, Trigger::Focus, now + 1));
+        assert_eq!(
+            app.account_ui.account(&id).unwrap().queued,
+            Some(Trigger::Focus)
+        );
+        drop(app.account_probed(
+            id.clone(),
+            owner,
+            old.clone(),
+            Outcome::Answered {
+                identity: None,
+                catalog: None,
+                snapshot: UsageSnapshot::state(UsageStatus::Ok, "older admitted read", now + 1),
+            },
+        ));
+        let state = app.account_ui.account(&id).unwrap();
+        assert!(state.usage_invalidated);
+        assert!(
+            state.inventory_observed_at.is_none(),
+            "an older read cannot renew the invalidated full-reading age"
+        );
+        let fresh = state.pending_probe.as_ref().unwrap().clone();
+        assert!(!fresh.same(&old));
+        assert!(fresh.force);
+        assert_eq!(fresh.usage_generation, generation);
+        drop(app.account_probed(
+            id.clone(),
+            owner,
+            fresh,
+            Outcome::Answered {
+                identity: None,
+                catalog: None,
+                snapshot: UsageSnapshot::state(UsageStatus::Ok, "fresh current read", now + 2),
+            },
+        ));
+        let state = app.account_ui.account(&id).unwrap();
+        assert!(!state.usage_invalidated);
+        assert_eq!(state.inventory_observed_at, Some(now + 2));
     }
 }
