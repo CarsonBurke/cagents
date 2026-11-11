@@ -528,7 +528,10 @@ fn installed_candidate_version(
     let replaces_daemon = source_proof.is_some()
         && (source_protocol != crate::terminal_ipc::PROTOCOL_VERSION
             || daemon.is_some_and(|owner| owner.version_root != candidate));
-    if candidate == window.version_root && served_version_root(window)? == candidate && !replaces_daemon {
+    if candidate == window.version_root
+        && served_version_root(window)? == candidate
+        && !replaces_daemon
+    {
         return Err(invalid("the installed application is already running"));
     }
     candidate
