@@ -464,20 +464,48 @@ class CandidateNamespace(unittest.TestCase):
         spec.loader.exec_module(scenario)
         return scenario
 
-    def test_candidate_must_observe_the_exact_serving_production_namespace(self):
-        scenario=self.module()
+    def evidence(self):
         source={'ok':True,'data':{'instance':'production','running':True,'daemon_version':'old',
                                   'socket':'/var/tmp/private/rt/cagents/cagentsd.sock','cli_version':'old'}}
         candidate=copy.deepcopy(source)
         candidate['data']['cli_version']='new'
-        scenario.candidate_namespace_contract(source,candidate,'old','new')
+        proof={'host_session_id':'source','boot_id':'boot','host_incarnation':'original'}
+        return {'source':source,'candidate_status':{'exit':0,'payload':candidate},'candidate_version':'cagents new\n',
+                'source_snapshot':{'root':'/var/tmp/private','errors':[],'serving':proof,'processes':[
+                    {'pid':100,'start_ticks':200,'executable':'/var/tmp/private/home/.local/share/cagents-install/versions/old/bin/cagentsd',
+                     'argv':['/var/tmp/private/home/.local/share/cagents-install/versions/old/bin/cagentsd']}]},
+                'census':{'transaction':'transaction','source':proof},'census_digest':'digest',
+                'receipt':{'transaction':'transaction','census_digest':'digest','outcome':{'state':'usable','serving':proof}}}
+
+    def test_candidate_must_observe_the_exact_serving_production_namespace(self):
+        scenario=self.module()
+        evidence=self.evidence()
+        scenario.candidate_namespace_contract(evidence,'old','new')
         for field,value in (('instance','development'),('running',False),('daemon_version','new'),
                             ('socket','/var/tmp/private/rt/cagents-development/cagentsd.sock'),('cli_version','wrong')):
             with self.subTest(field=field):
-                changed=copy.deepcopy(candidate)
-                changed['data'][field]=value
+                changed=copy.deepcopy(evidence)
+                changed['candidate_status']['payload']['data'][field]=value
+                with self.assertRaisesRegex(RuntimeError,'disagrees'):
+                    scenario.candidate_namespace_contract(changed,'old','new')
+
+    def test_protocol_rejected_status_requires_exact_ready_source_and_kernel_owner(self):
+        scenario=self.module()
+        evidence=self.evidence()
+        evidence['candidate_status']={'exit':1,'payload':{'ok':False,'error':{'kind':'protocol','message':'unsupported source protocol'}}}
+        scenario.candidate_namespace_contract(evidence,'old','new')
+        cases=[]
+        for value in (None,{},dict(evidence['census']['source'],host_incarnation='foreign')):
+            changed=copy.deepcopy(evidence);changed['census']['source']=value;cases.append(changed)
+        changed=copy.deepcopy(evidence);changed['receipt']['outcome']={'state':'no_source'};cases.append(changed)
+        changed=copy.deepcopy(evidence);changed['candidate_version']='cagents wrong';cases.append(changed)
+        changed=copy.deepcopy(evidence);changed['source_snapshot']['processes'][0]['executable']='/usr/bin/foreign';cases.append(changed)
+        changed=copy.deepcopy(evidence);changed['source']['data']['instance']='development';cases.append(changed)
+        changed=copy.deepcopy(evidence);changed['receipt']['census_digest']='foreign';cases.append(changed)
+        for changed in cases:
+            with self.subTest(evidence=changed):
                 with self.assertRaisesRegex(RuntimeError,'same namespace'):
-                    scenario.candidate_namespace_contract(source,changed,'old','new')
+                    scenario.candidate_namespace_contract(changed,'old','new')
 
     def test_probe_extracts_only_a_verified_regular_cli_inside_the_private_root(self):
         scenario=self.module()

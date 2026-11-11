@@ -51,16 +51,40 @@ def candidate_namespace_cli(root, archive_dir, version):
     return cli
 
 
-def candidate_namespace_contract(source, candidate, old_version, new_version):
+def candidate_namespace_contract(evidence, old_version, new_version):
+    source=evidence['source']
     expected=source.get('data',{})
-    actual=candidate.get('data',{})
-    if (source.get('ok') is not True or candidate.get('ok') is not True
-            or expected.get('running') is not True or actual.get('running') is not True
-            or expected.get('instance')!='production' or actual.get('instance')!='production'
-            or expected.get('daemon_version')!=old_version or actual.get('daemon_version')!=old_version
-            or not expected.get('socket') or actual.get('socket')!=expected['socket']
-            or actual.get('cli_version')!=new_version):
+    snapshot=evidence['source_snapshot']
+    root=Path(snapshot['root'])
+    version_root=root/'home/.local/share/cagents-install/versions'/old_version
+    owner=[row for row in snapshot['processes'] if row.get('executable')==str(version_root/'bin/cagentsd')
+           and row.get('argv')==[str(version_root/'bin/cagentsd')] and row.get('pid',0)>1
+           and row.get('start_ticks',0)>0]
+    census=evidence['census']
+    receipt=evidence['receipt']
+    proof=snapshot.get('serving')
+    outcome=receipt.get('outcome',{})
+    if (source.get('ok') is not True or expected.get('running') is not True
+            or expected.get('instance')!='production' or expected.get('daemon_version')!=old_version
+            or expected.get('socket')!=str(root/'rt/cagents/cagentsd.sock')
+            or evidence['candidate_version'].strip()!=f'cagents {new_version}'
+            or snapshot['errors'] or len(owner)!=1
+            or not isinstance(proof,dict) or any(not isinstance(proof.get(field),str) or not proof[field]
+                for field in ('host_session_id','boot_id','host_incarnation'))
+            or census.get('source')!=proof or outcome.get('state')!='usable' or outcome.get('serving')!=proof
+            or census.get('transaction')!=receipt.get('transaction')
+            or evidence['census_digest']!=receipt.get('census_digest')):
         raise RuntimeError('candidate does not observe the serving production baseline in the same namespace')
+    # A strict current-protocol status may reject a qualified frozen source.
+    # It proves neither absence nor presence; the successful read-only census
+    # and require-original verification above bind the actual Ready socket.
+    status=evidence['candidate_status']
+    if status['exit']==0:
+        actual=status['payload'].get('data',{})
+        if (status['payload'].get('ok') is not True or actual.get('running') is not True
+                or actual.get('instance')!='production' or actual.get('daemon_version')!=old_version
+                or actual.get('socket')!=expected['socket'] or actual.get('cli_version')!=new_version):
+            raise RuntimeError('candidate status disagrees with the serving production baseline')
 
 
 def provider_activity(root):
@@ -585,13 +609,29 @@ class Rehearsal:
             current=self.root/'home/.local/share/cagents-install/current'
             original_current=current.resolve()
             _, source=self.cli('--no-start','daemon','status')
-            _, output=self.call('env',candidate,'--no-start','--json','daemon','status')
-            observed=json.loads(output)
+            code, output=self.call('env',candidate,'--no-start','--json','daemon','status',check=False)
+            try:
+                observed=json.loads(output)
+            except ValueError:
+                observed={'raw':output}
+            _, version=self.call('env',candidate,'--version')
             probe=self.root/'candidate-namespace.json'
-            probe.write_text(json.dumps({'source':source,'candidate':observed,'current':str(original_current),
-                                        'archive':json.loads((candidate.parent/'archive.json').read_text())},indent=2,sort_keys=True)+'\n')
+            evidence={'source':source,'candidate_status':{'exit':code,'payload':observed},
+                      'candidate_version':version,'current':str(original_current),
+                      'archive':json.loads((candidate.parent/'archive.json').read_text())}
+            probe.write_text(json.dumps(evidence,indent=2,sort_keys=True)+'\n')
             probe.chmod(0o600)
-            candidate_namespace_contract(source,observed,args.old_version,args.new_version)
+            self.call('record','namespace',timeout=150)
+            evidence['source_snapshot']=json.loads((self.root/'records/namespace/snapshot.json').read_text())
+            census=candidate.parent/'census.json'
+            receipt=candidate.parent/'receipt.json'
+            self.call('env',candidate,'--no-start','--json','daemon','capture-update-census','--output',census)
+            self.call('env',candidate,'--no-start','--json','daemon','verify-update-census',
+                      '--require-original','--census',census,'--outcome',receipt)
+            evidence.update(census=json.loads(census.read_text()),receipt=json.loads(receipt.read_text()),
+                            census_digest=hashlib.sha256(census.read_bytes()).hexdigest())
+            probe.write_text(json.dumps(evidence,indent=2,sort_keys=True)+'\n')
+            candidate_namespace_contract(evidence,args.old_version,args.new_version)
             if current.resolve()!=original_current:
                 raise RuntimeError('read-only candidate namespace probe changed current')
             self.call('desktop','start','--limit','900', timeout=None)
