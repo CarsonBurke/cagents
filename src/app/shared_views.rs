@@ -868,10 +868,19 @@ impl Cagents {
     /// The local views that list `card`, as `local_view_cards` would,
     /// without resolving every view's cards to find one.
     fn local_scopes_listing(&self, card: CardId) -> Vec<Scope> {
+        let topology = self.view_scope_topology(self.indexed_worktree_roots());
+        self.local_scopes_listing_with_topology(card, &topology)
+    }
+
+    fn local_scopes_listing_with_topology(
+        &self,
+        card: CardId,
+        topology: &ViewScopeTopology<'_>,
+    ) -> Vec<Scope> {
         let ScopeDiscovery {
             scopes,
             worktree_cards,
-        } = self.discover_view_scopes();
+        } = self.discover_view_scopes_with(topology);
         let worktree = worktree_cards
             .iter()
             .find(|(state, _)| state.id == card)
@@ -2154,7 +2163,7 @@ impl Cagents {
             .iter()
             .flat_map(|view| view.panes.iter().map(|pane| pane.id))
             .collect::<HashSet<_>>();
-        self.prepare_shared_aliases_in(&views, &owned, selected);
+        self.prepare_shared_aliases_in(&views, &owned, selected, &topology);
         // Root discovery is immutable during this projection, so index it once
         // over owned paths that outlive each mutable view update. Keep only
         // owned card paths too, and refresh the panes each view changes before
@@ -2257,7 +2266,11 @@ impl Cagents {
     }
 
     fn prepare_shared_aliases(&mut self, views: &[View], owned: &HashSet<CardId>) {
-        self.prepare_shared_aliases_in(views, owned, None);
+        let root_paths = self.worktree_root_paths();
+        let topology = self.view_scope_topology(worktree_ui::WorktreeRoots::new(
+            root_paths.iter().map(PathBuf::as_path),
+        ));
+        self.prepare_shared_aliases_in(views, owned, None, &topology);
     }
 
     fn prepare_shared_aliases_in(
@@ -2265,6 +2278,7 @@ impl Cagents {
         views: &[View],
         owned: &HashSet<CardId>,
         selected: Option<&HashSet<Scope>>,
+        topology: &ViewScopeTopology<'_>,
     ) {
         let display_index = views::ManagedDisplayIndex::new(&self.workspace_model);
         self.shared_views.blocked =
@@ -2304,7 +2318,7 @@ impl Cagents {
                                 .any(|project| &project.repository == repository),
                         };
                     if !ready {
-                        for scope in self.local_scopes_listing(alias) {
+                        for scope in self.local_scopes_listing_with_topology(alias, topology) {
                             if scope != view.scope {
                                 self.shared_views.blocked.insert(scope);
                             }
@@ -2319,7 +2333,7 @@ impl Cagents {
                     };
                     if !can_adopt {
                         self.shared_views.blocked.insert(view.scope.clone());
-                        for scope in self.local_scopes_listing(alias) {
+                        for scope in self.local_scopes_listing_with_topology(alias, topology) {
                             self.shared_views.blocked.insert(scope);
                         }
                         self.status = Some(TransientNotice::warning(
@@ -4854,7 +4868,7 @@ mod tests {
             .flat_map(|view| view.panes.iter().map(|pane| pane.id))
             .collect::<HashSet<_>>();
 
-        app.prepare_shared_aliases_in(&overlay, &owned, Some(&selected));
+        app.prepare_shared_aliases(&overlay, &owned);
 
         assert!(app.card_state(alias.id).unwrap().existence.is_open());
         assert_eq!(app.durable.channels[0].cards, [alias.id]);
@@ -7279,7 +7293,9 @@ mod tests {
         let mut view = View::empty(destination);
         view.panes.push(canonical.clone());
         app.workspace_model.views = vec![View::empty(source), view];
+        app.shared_views.topology_build_count.set(0);
         drop(app.reconcile_shared_views_for_repository(&destination_repository, &HashSet::new()));
+        assert_eq!(app.shared_views.topology_build_count.get(), 1);
         assert!(!app.card_state(alias).unwrap().existence.is_open());
         assert!(app.card_state(canonical.id).unwrap().existence.is_open());
         assert!(
