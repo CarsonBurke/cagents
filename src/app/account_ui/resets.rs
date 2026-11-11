@@ -226,6 +226,19 @@ fn scope_count(snapshot: &UsageSnapshot, reset: &UsageReset, now: Millis) -> u64
         .map_or(0, |group| group.count)
 }
 
+fn reset_order(left: &UsageReset, right: &UsageReset) -> std::cmp::Ordering {
+    left.expires_at
+        .unwrap_or(i64::MAX)
+        .cmp(&right.expires_at.unwrap_or(i64::MAX))
+        .then_with(|| left.id.cmp(&right.id))
+}
+
+fn can_offer(snapshot: &UsageSnapshot, state: &State, reset: &UsageReset, now: Millis) -> bool {
+    actionable(snapshot, reset, now)
+        && !(reset.kind == account::resets::ResetKind::WeeklySession
+            && state.uncertain.contains_key(&reset.id))
+}
+
 fn next_reset<'a>(
     snapshot: &'a UsageSnapshot,
     state: &State,
@@ -234,17 +247,47 @@ fn next_reset<'a>(
     snapshot
         .resets
         .iter()
-        .filter(|reset| {
-            actionable(snapshot, reset, now)
-                && !(reset.kind == account::resets::ResetKind::WeeklySession
-                    && state.uncertain.contains_key(&reset.id))
-        })
-        .min_by(|left, right| {
-            left.expires_at
-                .unwrap_or(i64::MAX)
-                .cmp(&right.expires_at.unwrap_or(i64::MAX))
-                .then_with(|| left.id.cmp(&right.id))
-        })
+        .filter(|reset| can_offer(snapshot, state, reset, now))
+        .min_by(|left, right| reset_order(left, right))
+}
+
+struct ScopeChoice {
+    reset: UsageReset,
+    count: u64,
+}
+
+impl ScopeChoice {
+    fn label(&self) -> String {
+        format!("{} · {} left", self.reset.label(), self.count)
+    }
+}
+
+/// Offer one selection for each covered scope set, retaining the earliest
+/// expiry within a group so the picker never repeats individual credits.
+fn scope_choices(snapshot: &UsageSnapshot, state: &State, now: Millis) -> Vec<ScopeChoice> {
+    let mut choices: Vec<ScopeChoice> = Vec::new();
+    for reset in snapshot
+        .resets
+        .iter()
+        .filter(|reset| can_offer(snapshot, state, reset, now))
+    {
+        let scopes = normalized_scopes(reset);
+        if let Some(choice) = choices
+            .iter_mut()
+            .find(|choice| normalized_scopes(&choice.reset) == scopes)
+        {
+            if reset_order(reset, &choice.reset).is_lt() {
+                choice.reset = reset.clone();
+            }
+        } else {
+            choices.push(ScopeChoice {
+                reset: reset.clone(),
+                count: scope_count(snapshot, reset, now),
+            });
+        }
+    }
+    choices.sort_by_key(|choice| choice.reset.label());
+    choices
 }
 
 impl Controls {
@@ -318,6 +361,25 @@ impl Controls {
         if let Some(pending) = &self.state.pending {
             rows.push(design::caption(format!("Using a {} reset…", pending.reset.label())).into());
         } else if let Some(confirmation) = &self.state.confirmation {
+            let choices = scope_choices(&self.snapshot, &self.state, self.now);
+            if self.enabled && choices.len() > 1 {
+                let selected = choices
+                    .iter()
+                    .position(|choice| choice.reset.id == confirmation.reset.id);
+                let labels = choices.iter().map(ScopeChoice::label).collect::<Vec<_>>();
+                let id = self.id.clone();
+                rows.push(design::caption("Reset scope").into());
+                rows.push(
+                    crate::ui_controls::field::select(labels, selected, move |index| {
+                        Message::AccountUi(choices.get(index).map_or_else(
+                            || Action::ResetCancel(id.clone()),
+                            |choice| Action::ResetStart(id.clone(), choice.reset.id.clone()),
+                        ))
+                    })
+                    .width(Length::Fill)
+                    .into(),
+                );
+            }
             rows.push(
                 design::body(format!("Use a reset for {}?", self.name))
                     .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
@@ -1080,5 +1142,62 @@ mod tests {
         assert_eq!(state.confirmation.as_ref().unwrap().key, original.key);
         let next_retry = state.recover(&grant.id, None).unwrap();
         assert_eq!(next_retry.key, original.key);
+    }
+    #[test]
+    fn confirmation_can_choose_each_actionable_scope_and_cannot_change_a_submitted_attempt() {
+        let now = now_ms();
+        let mut snapshot = UsageSnapshot::state(UsageStatus::Limited, "", now);
+        snapshot.windows = vec![
+            window(account::WindowKind::Session, "session", 0.82),
+            window(account::WindowKind::Scoped, "weekly_scoped:Fable", 1.0),
+        ];
+        let mut session = reset(ResetScope::AccountSession);
+        session.id = "session-fixture".into();
+        session.available_count = 1;
+        let mut fable = reset(ResetScope::Model("Fable".into()));
+        fable.id = "fable-fixture".into();
+        snapshot.resets = vec![session.clone(), fable.clone()];
+        let mut state = State::default();
+        let choices = scope_choices(&snapshot, &state, now);
+        assert_eq!(choices.len(), 2);
+        assert!(choices.iter().any(|choice| choice.reset.id == session.id && choice.label() == "Session · 1 left"));
+        assert!(
+            choices
+                .iter()
+                .any(|choice| choice.reset.id == fable.id && choice.label() == "Fable · 2 left")
+        );
+        state.prepare(session, 1, None);
+        let selected = choices
+            .iter()
+            .find(|choice| choice.reset.id == fable.id)
+            .unwrap();
+        state.prepare(selected.reset.clone(), selected.count, None);
+        let confirmed = state.confirmation.as_ref().unwrap();
+        assert_eq!(confirmed.reset.id, fable.id);
+        assert_eq!(confirmed.total_count, 2);
+        let attempt = state.submit(&selected.reset, selected.count, None).unwrap();
+        let other = choices
+            .iter()
+            .find(|choice| choice.reset.id != fable.id)
+            .unwrap();
+        state.prepare(other.reset.clone(), other.count, None);
+        assert!(state.confirmation.is_none());
+        let pending = state.pending.as_ref().unwrap();
+        assert_eq!(pending.reset.id, fable.id);
+        assert_eq!(pending.key, attempt.key);
+        assert_eq!(pending.total_count, 2);
+        let controls = Controls {
+            id: Account::system(Provider::Claude).id(),
+            name: "Fixture".into(),
+            snapshot,
+            state: State::default(),
+            now,
+            enabled: true,
+            recovery_enabled: true,
+        };
+        let card = controls.for_limit("Claude Fable limit reached").unwrap();
+        let card_choices = scope_choices(&card.snapshot, &card.state, now);
+        assert_eq!(card_choices.len(), 1);
+        assert_eq!(card_choices[0].reset.id, fable.id);
     }
 }
