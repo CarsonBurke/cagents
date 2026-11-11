@@ -566,6 +566,25 @@ class ChatViews(unittest.TestCase):
             write(after,{**status,'phase':'Cancelled'})
             self.assertTrue(scenario.expected_refusal(root,'cancel','old'))
 
+    def test_restart_presentation_rejects_third_owner_and_zombie_provider(self):
+        spec = importlib.util.spec_from_file_location('rehearsal_restart',REPOSITORY/'scripts/rehearse_update_restart.py')
+        restart = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(restart)
+        root = Path('/var/tmp/cr/test')
+        executable = root/'home/.local/share/cagents-install/versions/new/bin/cagentsd'
+        proof = {'host_session_id':'new','boot_id':'boot','host_incarnation':'new-owner'}
+        with patch.object(restart,'owned_daemon',return_value=50):
+            restart.verify_same_daemon(root,executable,proof,50,proof)
+            with self.assertRaisesRegex(RuntimeError,'ownership changed'):
+                restart.verify_same_daemon(root,executable,proof,50,{**proof,'host_incarnation':'third-owner'})
+        with patch.object(restart,'owned_daemon',return_value=51):
+            with self.assertRaisesRegex(RuntimeError,'ownership changed'):
+                restart.verify_same_daemon(root,executable,proof,50,proof)
+        provider = {'pid':42,'start_ticks':123,'state':'S','argv':[str(root/'bin/claude')]}
+        self.assertEqual(restart.provider_identities({'processes':[provider]},root),{(42,123)})
+        for state in ('Z','X'):
+            self.assertEqual(restart.provider_identities({'processes':[{**provider,'state':state}]},root),set())
+
     def test_selection_requires_exact_card_channel_provider_and_thread(self):
         scenario = self.module()
         with tempfile.TemporaryDirectory(prefix='ru-selection-') as temporary:

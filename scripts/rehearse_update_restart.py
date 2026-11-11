@@ -48,6 +48,12 @@ def provider_identities(snapshot,root):
                 or str(root/'bin/claude') in row.get('argv',[]))}
 
 
+def verify_same_daemon(root,executable,proof,pid,observed):
+    if (observed != proof
+            or owned_daemon(root,executable,observed,no_recovery_environment=True) != pid):
+        raise RuntimeError('daemon ownership changed during post-restart native presentation')
+
+
 def restart(rehearsal, version):
     started = time.monotonic()
     root = rehearsal.root
@@ -94,9 +100,7 @@ def restart(rehearsal, version):
     after = records.read_json(root/'records/after/snapshot.json')
     if records.verified_recovery(baseline,after) is None or after['errors']:
         raise RuntimeError('post-restart native presentation lost verified readiness')
-    if (after['serving'] != successor_proof
-            or owned_daemon(root,executable,after['serving'],no_recovery_environment=True) != successor):
-        raise RuntimeError('daemon ownership changed during post-restart native presentation')
+    verify_same_daemon(root,executable,successor_proof,successor,after['serving'])
     if (root/'records/after/recovery-census.json').read_bytes()!=original_census:
         raise RuntimeError('ordinary restart replaced the original raw census')
     if immutable_evidence(root)!=immutable:
