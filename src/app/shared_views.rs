@@ -5138,7 +5138,7 @@ mod tests {
                 app.sidebar_model.projects[0]
                     .worktrees
                     .push(crate::sidebar::SidebarWorktree::new(
-                        WorktreeId::new(),
+                        crate::model::WorktreeId::new(),
                         path.clone(),
                         None,
                         false,
@@ -7399,7 +7399,9 @@ mod tests {
         let mut view = View::empty(a);
         view.panes = panes;
         app.workspace_model.views = vec![view];
+        app.shared_views.topology_build_count.set(0);
         drop(app.reconcile_shared_views());
+        assert_eq!(app.shared_views.topology_build_count.get(), 1);
         assert!(app.shared_views.blocked.contains(&Scope::Channel(a)));
         assert!(app.shared_views.adoptions.is_empty());
         for alias in &aliases {
