@@ -5310,6 +5310,20 @@ mod tests {
             cpu_ns() - cpu,
             wall.elapsed().as_nanos()
         );
+        // A restored workspace carries a registry identity; its readiness
+        // checks must discover scopes instead of taking the fresh-window guard.
+        Arc::make_mut(&mut app.durable).workspace_model_identity = Some(model.identity);
+        let wall = Instant::now();
+        let cpu = cpu_ns();
+        for _ in 0..64 {
+            assert!(std::hint::black_box(app.shared_views_startup_hold()).is_none());
+        }
+        println!(
+            "desktop_startup_readiness roots={} passes=64 cpu_ns={} wall_ns={}",
+            app.known_worktree_roots.len(),
+            cpu_ns() - cpu,
+            wall.elapsed().as_nanos()
+        );
         assert_eq!(app.durable.cards.len(), 555);
         assert_eq!(app.workspace_model.views, model.views);
     }
