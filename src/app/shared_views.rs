@@ -981,13 +981,31 @@ impl Cagents {
 
     fn local_view_cards(&self, scope: &Scope) -> Vec<CardId> {
         match scope {
-            Scope::Channel(id) => self
-                .durable
-                .channels
-                .iter()
-                .find(|channel| channel.id == *id)
-                .map(|channel| channel.cards.clone())
-                .unwrap_or_default(),
+            Scope::Channel(id) => {
+                let mounted = if self.active_workspace.is_some()
+                    && self.durable.active_channel == Some(*id)
+                {
+                    self.active_channel_order().map(|(_, order)| order)
+                } else {
+                    None
+                };
+                let members = mounted
+                    .or_else(|| {
+                        self.durable
+                            .channels
+                            .iter()
+                            .find(|channel| channel.id == *id)
+                            .map(|channel| channel.cards.clone())
+                    })
+                    .unwrap_or_default();
+                members
+                    .into_iter()
+                    .filter(|id| {
+                        self.card_state(*id)
+                            .is_some_and(|card| card.existence.is_open())
+                    })
+                    .collect()
+            }
             Scope::Worktree { path, .. } => {
                 let roots = self.indexed_worktree_roots();
                 let channel_cards = self
@@ -1110,7 +1128,15 @@ impl Cagents {
             .durable
             .channels
             .iter()
-            .map(|channel| (Scope::Channel(channel.id), channel.cards.clone()))
+            .map(|channel| {
+                let members = channel
+                    .cards
+                    .iter()
+                    .copied()
+                    .filter(|id| cards.get(id).is_some_and(|card| card.existence.is_open()))
+                    .collect::<Vec<_>>();
+                (Scope::Channel(channel.id), members)
+            })
             .collect::<HashMap<_, _>>();
         let pending = self
             .workspace_model
@@ -1904,10 +1930,12 @@ impl Cagents {
             && self.durable.active_channel.is_some_and(|id| {
                 selected.is_none_or(|selected| selected.contains(&Scope::Channel(id)))
             })
-            && let Some((id, order)) = self.active_channel_order()
+            && let Some((id, mut order)) = self.active_channel_order()
         {
             let scope = Scope::Channel(id);
             if let Some(members) = projected.cards.get_mut(&scope) {
+                let open = members.iter().copied().collect::<HashSet<_>>();
+                order.retain(|id| open.contains(id));
                 let positions = order
                     .iter()
                     .enumerate()
@@ -5631,10 +5659,20 @@ mod tests {
         assert_eq!(app.workspace.order().collect::<Vec<_>>(), [second.id]);
         assert_eq!(app.workspace.focused(), Some(second.id));
         assert!(app.card_state(first.id).unwrap().existence.is_open());
+        assert_eq!(app.local_view_cards(&scope), [second.id, first.id]);
+
+        drop(app.reconcile_shared_views());
+
+        assert_eq!(app.durable.channels[0].cards, [second.id, first.id]);
+        assert_eq!(
+            app.workspace.order().collect::<Vec<_>>(),
+            [second.id, first.id]
+        );
+        assert_eq!(app.workspace.focused(), Some(second.id));
     }
 
     #[test]
-    fn admission_leaves_closed_saved_members_for_ordinary_migration() {
+    fn admission_ignores_closed_saved_members_without_mutating_the_saved_membership() {
         let (mut app, source, _, first) = channel_move_fixture();
         app.active_workspace = Some("/repo".into());
         let scope = Scope::Channel(source);
@@ -5654,12 +5692,16 @@ mod tests {
 
         app.admit_existing_views_in(Some(&HashSet::from([scope.clone()])));
 
-        assert!(!app.shared_views.initialized.contains(&scope));
+        assert!(app.shared_views.initialized.contains(&scope));
         assert_eq!(app.durable.channels[0].cards, [first.id, closed]);
+        assert_eq!(
+            view_scope_hold(&app.shared_views, std::iter::once(&scope)),
+            None
+        );
         let (tx, rx) = async_channel::unbounded();
         app.workspace_model_tx = tx;
         drop(app.reconcile_shared_views());
-        assert!(std::iter::from_fn(|| rx.try_recv().ok()).any(
+        assert!(!std::iter::from_fn(|| rx.try_recv().ok()).any(
             |edit| matches!(edit, ModelEdit::SeedView { scope: seeded, .. } if seeded == scope)
         ));
         assert_eq!(app.durable.channels[0].cards, [first.id]);
