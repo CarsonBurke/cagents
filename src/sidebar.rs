@@ -12122,10 +12122,30 @@ mod row_interaction {
             Clipboard, Layout, Shell, Widget, layout, overlay, renderer,
             widget::{Id, Operation, Tree, operation, tree},
         },
+        event::{PlatformSpecific, wayland},
         keyboard, mouse, window,
     };
     use cosmic::{Element, Renderer, Theme};
     use std::{cell::Cell, rc::Rc};
+
+    /// Whether a row scrolled out of the list's view can let `event` pass it
+    /// by. These are what every widget in the window receives on each frame
+    /// or message: a redraw, the runtime's resize request, and pointer
+    /// motion. A row out of view can't be under the pointer and isn't drawn,
+    /// and whatever its widgets would note from them, such as their hover
+    /// status, they note from the redraw that precedes their next draw. Keys,
+    /// modifier changes, presses and releases still reach every row, since a
+    /// focused or pressed row may be scrolled away.
+    fn unseen_rows_may_skip(event: &Event) -> bool {
+        matches!(
+            event,
+            Event::Window(window::Event::RedrawRequested(_))
+                | Event::Mouse(mouse::Event::CursorMoved { .. })
+                | Event::PlatformSpecific(PlatformSpecific::Wayland(
+                    wayland::Event::RequestResize | wayland::Event::Frame(..)
+                ))
+        )
+    }
 
     /// One coordinate shared by the list and its groups, refreshed on each widget
     /// callback, including operations/accessibility before the next draw.
@@ -12246,6 +12266,9 @@ mod row_interaction {
         focused: bool,
         /// Whether the last layout narrowed the base row for its actions.
         revealed: bool,
+        /// Whether something in the row, such as a menu, was open the last
+        /// time the window collected overlays.
+        overlaid: Cell<bool>,
         header_node: Option<layout::Node>,
         scroll: Option<Box<FilterScrollState>>,
     }
@@ -12710,6 +12733,18 @@ mod row_interaction {
             shell: &mut Shell<'_, SidebarAction>,
             viewport: &Rectangle,
         ) {
+            // Without this, every frame and every message walks each of a
+            // long list's rows and their focus, however few are in view. A
+            // row that last saw the pointer, or that a drag started in, still
+            // hears the event that tells it the pointer has gone.
+            let state = tree.state.downcast_ref::<State>();
+            if !layout.bounds().intersects(viewport)
+                && !state.hovered
+                && state.origin.is_none()
+                && unseen_rows_may_skip(event)
+            {
+                return;
+            }
             self.focus(tree, layout, renderer);
             if let Kind::Reorder {
                 viewport: sticky, ..
@@ -13062,6 +13097,10 @@ mod row_interaction {
             if state.dragging {
                 return mouse::Interaction::Grabbing;
             }
+            // The pointer can't be over a row out of view.
+            if !layout.bounds().intersects(viewport) {
+                return mouse::Interaction::None;
+            }
             if cursor.is_over(*viewport)
                 && cursor
                     .position()
@@ -13244,6 +13283,17 @@ mod row_interaction {
                 sticky.0.set(viewport.y - translation.y);
             }
             let state = tree.state.downcast_ref::<State>();
+            // The window collects overlays twice a frame, so a long list
+            // must not ask each row it has scrolled away. Such a row has
+            // nothing to show unless something it had open, such as a menu,
+            // is still open as it leaves.
+            if !(layout.bounds() + translation).intersects(viewport)
+                && !state.overlaid.get()
+                && !state.hovered
+                && !state.focused
+            {
+                return None;
+            }
             let hide_actions =
                 matches!(self.kind, Kind::Actions { .. }) && !(state.hovered || state.focused);
             let overlays = self
@@ -13263,6 +13313,10 @@ mod row_interaction {
                         .overlay(tree, layout, renderer, viewport, translation)
                 })
                 .collect::<Vec<_>>();
+            tree.state
+                .downcast_ref::<State>()
+                .overlaid
+                .set(!overlays.is_empty());
             (!overlays.is_empty()).then(|| overlay::Group::with_children(overlays).overlay())
         }
 
@@ -20096,6 +20150,260 @@ pub(crate) mod tests {
             &layout::Limits::new(Size::ZERO, Size::new(320.0, 640.0)),
         ));
         assert_eq!(layouts() - start, 3, "a rebuilt list is laid out again");
+    }
+
+    /// Every frame and every message sends each widget in the window a
+    /// redraw or resize request, so a long list must not walk the rows it has
+    /// scrolled away. Input that can concern any row, such as keys for a
+    /// focused one, still reaches them all, and a row that was hovered hears
+    /// the redraw that tells it the pointer has gone.
+    #[test]
+    fn rows_out_of_view_let_frame_broadcasts_pass() {
+        use cosmic::iced::{
+            Event, Length, Point, Vector,
+            advanced::{Clipboard, Shell, Widget, clipboard, mouse, overlay, renderer},
+            event::{PlatformSpecific, wayland},
+            keyboard,
+            time::Instant,
+            window,
+        };
+        use cosmic::{Renderer, Theme};
+        use std::{
+            cell::{Cell, RefCell},
+            rc::Rc,
+        };
+
+        type Log = Rc<RefCell<Vec<usize>>>;
+        /// Notes each update, cursor query and overlay request that reaches
+        /// it, and has a menu open while `menu` says so.
+        struct Probe {
+            row: usize,
+            updates: Log,
+            queries: Log,
+            overlays: Log,
+            menu: Rc<Cell<Option<usize>>>,
+        }
+        struct Menu;
+        impl overlay::Overlay<SidebarAction, Theme, Renderer> for Menu {
+            fn layout(&mut self, _: &Renderer, bounds: Size) -> layout::Node {
+                layout::Node::new(bounds)
+            }
+            fn draw(
+                &self,
+                _: &mut Renderer,
+                _: &Theme,
+                _: &renderer::Style,
+                _: Layout<'_>,
+                _: mouse::Cursor,
+            ) {
+            }
+        }
+        impl Widget<SidebarAction, Theme, Renderer> for Probe {
+            fn size(&self) -> Size<Length> {
+                Size::new(Length::Fill, Length::Fixed(20.0))
+            }
+            fn layout(
+                &mut self,
+                _: &mut Tree,
+                _: &Renderer,
+                limits: &layout::Limits,
+            ) -> layout::Node {
+                layout::Node::new(limits.resolve(Length::Fill, Length::Fixed(20.0), Size::ZERO))
+            }
+            fn draw(
+                &self,
+                _: &Tree,
+                _: &mut Renderer,
+                _: &Theme,
+                _: &renderer::Style,
+                _: Layout<'_>,
+                _: mouse::Cursor,
+                _: &Rectangle,
+            ) {
+            }
+            fn update(
+                &mut self,
+                _: &mut Tree,
+                _: &Event,
+                _: Layout<'_>,
+                _: mouse::Cursor,
+                _: &Renderer,
+                _: &mut dyn Clipboard,
+                _: &mut Shell<'_, SidebarAction>,
+                _: &Rectangle,
+            ) {
+                self.updates.borrow_mut().push(self.row);
+            }
+            fn mouse_interaction(
+                &self,
+                _: &Tree,
+                _: Layout<'_>,
+                _: mouse::Cursor,
+                _: &Rectangle,
+                _: &Renderer,
+            ) -> mouse::Interaction {
+                self.queries.borrow_mut().push(self.row);
+                mouse::Interaction::None
+            }
+            fn overlay<'a>(
+                &'a mut self,
+                _: &'a mut Tree,
+                _: Layout<'a>,
+                _: &Renderer,
+                _: &Rectangle,
+                _: Vector,
+            ) -> Option<overlay::Element<'a, SidebarAction, Theme, Renderer>> {
+                self.overlays.borrow_mut().push(self.row);
+                (self.menu.get() == Some(self.row)).then(|| overlay::Element::new(Box::new(Menu)))
+            }
+        }
+
+        let (updates, queries, overlays) = (Log::default(), Log::default(), Log::default());
+        let menu = Rc::new(Cell::new(None));
+        let mut list: Element<'_, SidebarAction> = widget::column::with_children(
+            (0..100)
+                .map(|row| {
+                    let probe = || {
+                        Element::new(Probe {
+                            row,
+                            updates: updates.clone(),
+                            queries: queries.clone(),
+                            overlays: overlays.clone(),
+                            menu: menu.clone(),
+                        })
+                    };
+                    row_interaction::RowInteraction::actions(probe(), probe(), 0.0)
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into();
+        let renderer = headless_renderer();
+        let mut tree = Tree::new(&list);
+        let node = list.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(280.0, 2000.0)),
+        );
+        // Rows 0 to 9 fill the first 200 pixels; rows 50 to 59 the view
+        // scrolled to 1000.
+        let top = Rectangle::new(Point::ORIGIN, Size::new(280.0, 200.0));
+        let scrolled = Rectangle::new(Point::new(0.0, 1000.0), Size::new(280.0, 200.0));
+        let mut send = |event: Event, cursor: mouse::Cursor, viewport: &Rectangle| {
+            updates.borrow_mut().clear();
+            let mut messages = Vec::new();
+            let mut shell = Shell::new(&mut messages);
+            list.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                cursor,
+                &renderer,
+                &mut clipboard::Null,
+                &mut shell,
+                viewport,
+            );
+            let mut rows = updates.borrow().clone();
+            rows.dedup();
+            rows
+        };
+        let redraw = || Event::Window(window::Event::RedrawRequested(Instant::now()));
+        let away = mouse::Cursor::Unavailable;
+
+        assert_eq!(send(redraw(), away, &top), (0..10).collect::<Vec<_>>());
+        assert_eq!(
+            send(
+                Event::PlatformSpecific(PlatformSpecific::Wayland(wayland::Event::RequestResize)),
+                away,
+                &scrolled,
+            ),
+            (50..60).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            send(
+                Event::Keyboard(keyboard::Event::ModifiersChanged(
+                    keyboard::Modifiers::SHIFT
+                )),
+                away,
+                &scrolled,
+            ),
+            (0..100).collect::<Vec<_>>(),
+            "keys reach rows out of view"
+        );
+        let over_first = mouse::Cursor::Available(Point::new(10.0, 10.0));
+        assert_eq!(
+            send(
+                Event::Mouse(mouse::Event::CursorMoved {
+                    position: Point::new(10.0, 10.0)
+                }),
+                over_first,
+                &top,
+            ),
+            (0..10).collect::<Vec<_>>()
+        );
+        // Row 0 was hovered when the list scrolled away from it.
+        assert_eq!(
+            send(redraw(), away, &scrolled),
+            std::iter::once(0).chain(50..60).collect::<Vec<_>>(),
+            "the hovered row hears that the pointer has gone"
+        );
+        assert_eq!(
+            send(redraw(), away, &scrolled),
+            (50..60).collect::<Vec<_>>()
+        );
+
+        queries.borrow_mut().clear();
+        let over_scrolled = mouse::Cursor::Available(Point::new(10.0, 1010.0));
+        drop(list.as_widget().mouse_interaction(
+            &tree,
+            Layout::new(&node),
+            over_scrolled,
+            &scrolled,
+            &renderer,
+        ));
+        let mut asked = queries.borrow().clone();
+        asked.dedup();
+        assert_eq!(
+            asked,
+            (50..60).collect::<Vec<_>>(),
+            "only rows in view are asked for the cursor"
+        );
+
+        // Overlays take the window's viewport, and the scroll as translation.
+        let screen = Rectangle::new(Point::ORIGIN, Size::new(280.0, 200.0));
+        let mut collect = |scroll: f32| {
+            overlays.borrow_mut().clear();
+            let open = list
+                .as_widget_mut()
+                .overlay(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &screen,
+                    Vector::new(0.0, -scroll),
+                )
+                .is_some();
+            let mut asked = overlays.borrow().clone();
+            asked.dedup();
+            (asked, open)
+        };
+        assert_eq!(collect(1000.0), ((50..60).collect::<Vec<_>>(), false));
+        menu.set(Some(55));
+        assert_eq!(collect(1000.0), ((50..60).collect::<Vec<_>>(), true));
+        assert_eq!(
+            collect(0.0),
+            ((0..10).chain([55]).collect::<Vec<_>>(), true),
+            "a menu still open as its row leaves the view stays open"
+        );
+        menu.set(None);
+        assert_eq!(
+            collect(0.0),
+            ((0..10).chain([55]).collect::<Vec<_>>(), false)
+        );
+        assert_eq!(
+            collect(0.0),
+            ((0..10).collect::<Vec<_>>(), false),
+            "once closed, the row is left alone"
+        );
     }
 
     /// A row's overlay, such as its menu, handles events apart from the list's
