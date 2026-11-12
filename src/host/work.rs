@@ -236,9 +236,22 @@ impl Tracked {
         }
     }
 
-    fn read_recently(&self) -> bool {
-        self.read_at
-            .is_some_and(|read_at| read_at.elapsed() < READ_WINDOW)
+    /// Whether this project polls at the watched cadence: a window watches
+    /// the whole board, or a request or conversation read it lately.
+    fn being_read(&self, watching: bool) -> bool {
+        watching
+            || self
+                .read_at
+                .is_some_and(|read_at| read_at.elapsed() < READ_WINDOW)
+    }
+
+    /// How long after a poll the next one is due.
+    fn forge_interval(&self, watching: bool) -> Duration {
+        if self.forge == Forge::NotGitHub {
+            forge::NOT_GITHUB_INTERVAL
+        } else {
+            forge::interval(self.being_read(watching), self.failures)
+        }
     }
 
     /// Records a read of this project. The first in a while brings its forge
@@ -246,7 +259,7 @@ impl Tracked {
     /// that went stale while nobody read it, as a board request does. Returns
     /// whether the forge poller must reconsider its deadlines.
     fn read(&mut self, watching: bool) -> bool {
-        let was_read = watching || self.read_recently();
+        let was_read = self.being_read(watching);
         self.read_at = Some(Instant::now());
         if was_read || self.forge == Forge::NotGitHub {
             return false;
@@ -385,10 +398,14 @@ impl Shared {
                 .is_some_and(|read_at| read_at.elapsed() < READ_WINDOW)
     }
 
-    /// Whether `tracked` polls at the watched cadence: a window watches the
-    /// whole board, or a request or conversation read this project lately.
-    fn being_read(&self, tracked: &Tracked) -> bool {
-        self.watching || tracked.read_recently()
+    /// A board request reads the projects in its scope, and the board's
+    /// tickets. Only those projects poll faster.
+    fn read_board(&mut self, selected: &[(PathBuf, String)]) {
+        self.board_read_at = Some(Instant::now());
+        let watching = self.watching;
+        for (repository, name) in selected {
+            self.track(repository, name).read(watching);
+        }
     }
 
     /// A departing window stops the fast cadence immediately. Keep explicit
@@ -403,8 +420,7 @@ impl Shared {
             if tracked.forge != Forge::NotGitHub
                 && let Some(last) = tracked.last_poll
             {
-                let reading = watching || tracked.read_recently();
-                let deadline = last + forge::interval(reading, tracked.failures);
+                let deadline = last + tracked.forge_interval(watching);
                 tracked.next_poll = if tracked.failures > 0 {
                     tracked.next_poll.max(deadline)
                 } else {
@@ -779,16 +795,8 @@ impl Handle {
 
     fn board(&self, host: &SharedHost, scope: &Scope, fresh: bool) -> Result<Board, String> {
         let selected = self.resolve(host, scope)?;
-        {
-            let mut shared = self.shared();
-            shared.board_read_at = Some(Instant::now());
-            // Only the projects in scope poll faster; settling wakes the
-            // poller to reconsider them.
-            let watching = shared.watching;
-            for (repository, name) in &selected {
-                shared.track(repository, name).read(watching);
-            }
-        }
+        // Settling wakes the poller to reconsider the projects read.
+        self.shared().read_board(&selected);
         self.settle(&selected, fresh);
         Ok(self.assemble(host, &selected))
     }
@@ -1362,12 +1370,7 @@ impl Handle {
                     };
                 }
             }
-            tracked.next_poll = Instant::now()
-                + if tracked.forge == Forge::NotGitHub {
-                    forge::NOT_GITHUB_INTERVAL
-                } else {
-                    forge::interval(watching || tracked.read_recently(), tracked.failures)
-                };
+            tracked.next_poll = Instant::now() + tracked.forge_interval(watching);
             drop(shared);
             self.changed();
         }
@@ -1762,7 +1765,7 @@ mod tests {
         shared.set_watching(false);
         let tracked = &shared.projects[Path::new("/fixture/repo")];
         assert!(
-            shared.being_read(tracked),
+            tracked.being_read(shared.watching),
             "an explicit CLI read retains its own lease"
         );
         assert_eq!(tracked.next_poll, last + forge::interval(true, 2));
@@ -1777,7 +1780,7 @@ mod tests {
             .read_at = Some(last - READ_WINDOW);
         shared.set_watching(true);
         shared.set_watching(false);
-        assert!(!shared.being_read(&shared.projects[Path::new("/fixture/repo")]));
+        assert!(!shared.projects[Path::new("/fixture/repo")].being_read(shared.watching));
         assert_eq!(
             shared.projects[Path::new("/fixture/repo")].next_poll,
             last + forge::interval(false, 2)
@@ -1807,7 +1810,7 @@ mod tests {
         assert!(!read.read(watching), "a repeated read changes nothing");
         assert!(!shared.board_being_read());
         let other = &shared.projects[Path::new("/fixture/other")];
-        assert!(!shared.being_read(other));
+        assert!(!other.being_read(shared.watching));
         assert_eq!(other.next_poll, last + forge::interval(false, 0));
         assert!(!other.poll_requested);
 
@@ -1822,6 +1825,40 @@ mod tests {
         assert_eq!(
             shared.projects[Path::new("/fixture/other")].next_poll,
             last + forge::interval(false, 0)
+        );
+    }
+
+    /// A scoped board request reads its projects and the tickets; the next
+    /// poll of each is due at its own cadence.
+    #[test]
+    fn a_board_request_reads_only_the_projects_in_its_scope() {
+        let handle = polling_handle();
+        let mut shared = handle.shared();
+        for name in ["read", "other", "local"] {
+            let tracked = shared.track(&Path::new("/fixture").join(name), name);
+            tracked.forge = Forge::Pending;
+        }
+        shared
+            .projects
+            .get_mut(Path::new("/fixture/local"))
+            .unwrap()
+            .forge = Forge::NotGitHub;
+        shared.read_board(&[
+            (PathBuf::from("/fixture/read"), "read".into()),
+            (PathBuf::from("/fixture/local"), "local".into()),
+        ]);
+        assert!(shared.board_being_read());
+        let watching = shared.watching;
+        let interval = |name: &str| {
+            shared.projects[&Path::new("/fixture").join(name)].forge_interval(watching)
+        };
+        assert_eq!(interval("read"), forge::WATCHED_INTERVAL);
+        assert_eq!(interval("other"), forge::interval(false, 0));
+        assert_eq!(interval("local"), forge::NOT_GITHUB_INTERVAL);
+        // A window watching the board reads every project.
+        assert_eq!(
+            shared.projects[Path::new("/fixture/other")].forge_interval(true),
+            forge::WATCHED_INTERVAL
         );
     }
 
