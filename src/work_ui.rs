@@ -39,16 +39,19 @@ const ROW_ESTIMATE: f32 = 54.0;
 
 /// The keys a culled column keeps each card's widget state by.
 fn card_keys(items: &[&Item]) -> Vec<u64> {
-    use std::hash::{Hash, Hasher};
     items
         .iter()
-        .map(|item| {
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            item.project.hash(&mut hasher);
-            item.key.hash(&mut hasher);
-            hasher.finish()
-        })
+        .map(|item| card_key(&item.project, &item.key))
         .collect()
+}
+
+/// A card's key in a culled column, from what identifies it.
+fn card_key(project: &std::path::Path, key: &ItemKey) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    project.hash(&mut hasher);
+    key.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// One card on the board, by what identifies it to the daemon.
@@ -642,21 +645,23 @@ impl State {
             .width(Length::Fill)
             .into()
         } else {
-            widget::scrollable(
-                widget::container(
-                    crate::ui_controls::culled_column(card_keys(&items), move |index| {
-                        self.card(items[index])
-                    })
-                    .spacing(space::S)
-                    .estimate(CARD_ESTIMATE),
+            crate::ui_controls::keep_in_place(
+                widget::scrollable(
+                    widget::container(
+                        crate::ui_controls::culled_column(card_keys(&items), move |index| {
+                            self.card(items[index])
+                        })
+                        .spacing(space::S)
+                        .estimate(CARD_ESTIMATE)
+                        .keep_built(self.open_menu_key()),
+                    )
+                    .padding(design::with_vertical_rail(Padding::from([0.0, space::XS]))),
                 )
-                .padding(design::with_vertical_rail(Padding::from([0.0, space::XS]))),
+                .direction(iced::widget::scrollable::Direction::Vertical(
+                    design::scrollbar(),
+                ))
+                .height(Length::Fill),
             )
-            .direction(iced::widget::scrollable::Direction::Vertical(
-                design::scrollbar(),
-            ))
-            .height(Length::Fill)
-            .into()
         };
         widget::container(
             widget::column::with_children(vec![header.into(), body])
@@ -679,25 +684,35 @@ impl State {
         if items.is_empty() {
             return self.no_match();
         }
-        widget::scrollable(
-            widget::container(
-                crate::ui_controls::culled_column(card_keys(&items), move |index| {
-                    self.row(items[index])
-                })
-                .spacing(space::XS)
-                .estimate(ROW_ESTIMATE),
+        crate::ui_controls::keep_in_place(
+            widget::scrollable(
+                widget::container(
+                    crate::ui_controls::culled_column(card_keys(&items), move |index| {
+                        self.row(items[index])
+                    })
+                    .spacing(space::XS)
+                    .estimate(ROW_ESTIMATE)
+                    .keep_built(self.open_menu_key()),
+                )
+                .padding(design::with_vertical_rail(Padding::from([
+                    space::M,
+                    space::L,
+                ]))),
             )
-            .padding(design::with_vertical_rail(Padding::from([
-                space::M,
-                space::L,
-            ]))),
+            .direction(iced::widget::scrollable::Direction::Vertical(
+                design::scrollbar(),
+            ))
+            .width(Length::Fill)
+            .height(Length::Fill),
         )
-        .direction(iced::widget::scrollable::Direction::Vertical(
-            design::scrollbar(),
-        ))
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+    }
+
+    /// The card whose menu is open stays built while it scrolls away, so
+    /// its menu stays open and closes on a click elsewhere.
+    fn open_menu_key(&self) -> Option<u64> {
+        self.menu
+            .as_ref()
+            .map(|card| card_key(&card.project, &card.key))
     }
 
     fn no_match(&self) -> Element<'_, Action> {

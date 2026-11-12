@@ -2,36 +2,45 @@
 //!
 //! A long list inside a [`scrollable`](cosmic::iced::widget::scrollable) pays
 //! to build, lay out and diff every row on each rebuild, though only a
-//! screenful is ever seen. [`culled_column`] takes a key per row and a builder
-//! instead of the rows themselves. During layout it builds just the rows that
-//! lie within an overscan of the last viewport it was drawn in, plus the row
-//! holding keyboard focus, and stands in for the rest with their height.
+//! screenful is ever seen. [`culled_column`] takes a unique key per row and a
+//! builder instead of the rows themselves. During layout it builds just the
+//! rows that lie within an overscan of the last viewport it was drawn in, plus
+//! the row holding keyboard focus and any rows the caller keeps built, and
+//! stands in for the rest with their height.
 //!
-//! - Heights are measured as rows are laid out and kept per key, so content
-//!   above and below the mounted rows keeps its place while scrolling. A row
-//!   never measured at the current width counts as the mean height of the
-//!   first rows laid out at that width, or as `estimate` before then. The
-//!   assumption is fixed once made, so measuring more rows corrects only
-//!   their own heights: rows of similar height keep the column's height, and
-//!   its scrollbar, steady from the first layout, and content above the
-//!   viewport never moves because rows elsewhere were measured.
+//! - Heights are measured as rows are laid out and kept per key. A row not
+//!   yet measured at the current width counts as the mean of those that have
+//!   been, or as `estimate` before any has. The mean is taken again only once
+//!   it has drifted by more than [`DRIFT`], so rows of similar height keep the
+//!   column's height, and its scrollbar, steady from the first layout, while
+//!   rows that all grow, as when pull requests arrive, are soon accounted.
+//! - Measuring a row can still move every row below it. So that nothing on
+//!   screen moves, the column notes how far the row at the top of the
+//!   viewport moved, after a new window, a width change or rows added above,
+//!   and [`keep_in_place`] around the scrollable scrolls by as much before
+//!   the next frame is drawn. Wrap every scrollable that holds a culled column
+//!   with it.
 //! - Row widget state is kept per key, as in a keyed list, so hover, focus
 //!   and open tooltips stay with their row when the mounted window moves.
 //! - When the viewport moves past what is mounted, the column asks for a new
 //!   layout itself; no message reaches the application.
 //! - The row with keyboard focus stays mounted, and so do the rows beside it,
 //!   so moving focus row by row never runs off the end of what is built.
+//!   Keyboard traversal that enters the column from outside reaches the first
+//!   or last built row, not the first or last row.
+//! - Rows are laid out at the column's width with unbounded height, so a row
+//!   must not fill its height.
 //!
 //! Rows outside the window have no widgets, so they are absent from the
 //! accessibility tree and from pointer and keyboard operations until they come
 //! near the viewport.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use cosmic::iced::advanced::{
     Clipboard, Layout, Shell, Widget, layout, mouse, overlay, renderer,
-    widget::{Id, Operation, Tree, operation, tree},
+    widget::{Id, Operation, Tree, operation, operation::scrollable::AbsoluteOffset, tree},
 };
 use cosmic::iced::{Element, Event, Length, Rectangle, Size, Vector};
 use cosmic::{Renderer, Theme};
@@ -40,6 +49,9 @@ use cosmic::{Renderer, Theme};
 const OVERSCAN: f32 = 480.0;
 /// The viewport assumed before the column has been drawn once.
 const FIRST_VIEWPORT: f32 = 1200.0;
+/// How far the mean measured height may drift, as a fraction, before rows
+/// not yet measured are assumed to be the new mean.
+const DRIFT: f32 = 0.02;
 /// Rows kept built on each side of the focused row, so focus traversal always
 /// finds its next stop mounted.
 const FOCUS_NEIGHBOURS: usize = 2;
@@ -55,6 +67,7 @@ pub fn culled_column<'a, Message: 'a>(
         build: Box::new(build),
         spacing: 0.0,
         estimate: 48.0,
+        kept: Vec::new(),
         mounted: Vec::new(),
     }
 }
@@ -64,6 +77,8 @@ pub struct CulledColumn<'a, Message> {
     build: Box<dyn Fn(usize) -> Element<'a, Message, Theme, Renderer> + 'a>,
     spacing: f32,
     estimate: f32,
+    /// Keys whose rows stay built wherever the viewport is.
+    kept: Vec<u64>,
     /// The rows built in the last layout, by index, in order.
     mounted: Vec<(usize, Element<'a, Message, Theme, Renderer>)>,
 }
@@ -80,18 +95,31 @@ impl<Message> CulledColumn<'_, Message> {
         self.estimate = estimate;
         self
     }
+
+    /// Keeps the rows with these keys built wherever the viewport is, as for
+    /// a row whose menu is open, so its overlay and state outlive scrolling.
+    pub fn keep_built(mut self, keys: impl IntoIterator<Item = u64>) -> Self {
+        self.kept.extend(keys);
+        self
+    }
 }
 
 #[derive(Default)]
 struct State {
     /// Measured row heights, by key, at `width`.
     heights: HashMap<u64, f32>,
-    /// The height assumed for unmeasured rows at `width`, once any were laid
-    /// out at it.
+    /// The sum of `heights`, for their mean.
+    measured: f32,
+    /// The height assumed for rows not yet measured.
     assumed: Option<f32>,
     width: f32,
     /// The keys whose trees are `tree.children`, in order.
     mounted: Vec<u64>,
+    /// Where the last layout put each mounted row: its top and bottom.
+    placed: Vec<(f32, f32)>,
+    /// How far the row at the top of the viewport has moved in layouts since
+    /// [`keep_in_place`] last scrolled to follow it.
+    shift: f32,
     /// The span of content, from the column's top, that the mounted rows
     /// cover; a viewport inside it needs no new layout.
     covered: Range<f32>,
@@ -106,6 +134,46 @@ struct State {
 impl State {
     fn height(&self, key: u64, estimate: f32) -> f32 {
         self.heights.get(&key).copied().unwrap_or(estimate)
+    }
+
+    /// The height to assume for an unmeasured row.
+    fn unmeasured(&self, estimate: f32) -> f32 {
+        self.assumed.unwrap_or(estimate)
+    }
+
+    fn measure(&mut self, key: u64, height: f32) {
+        self.measured += height - self.heights.insert(key, height).unwrap_or(0.0);
+    }
+
+    /// Assumes the mean measured height for unmeasured rows, once it has
+    /// drifted far enough from what they are assumed to be.
+    fn reassume(&mut self) {
+        if self.heights.is_empty() {
+            return;
+        }
+        let mean = self.measured / self.heights.len() as f32;
+        if self
+            .assumed
+            .is_none_or(|assumed| (mean - assumed).abs() > DRIFT * assumed)
+        {
+            self.assumed = Some(mean);
+        }
+    }
+
+    fn forget_heights(&mut self) {
+        self.heights.clear();
+        self.measured = 0.0;
+        self.assumed = None;
+    }
+
+    /// Drops the heights of rows that are gone, once they outnumber the rows
+    /// there are, so a list whose rows keep changing doesn't grow forever.
+    fn prune(&mut self, keys: &[u64]) {
+        if self.heights.len() > 2 * keys.len() + 64 {
+            let live: HashSet<u64> = keys.iter().copied().collect();
+            self.heights.retain(|key, _| live.contains(key));
+            self.measured = self.heights.values().sum();
+        }
     }
 }
 
@@ -127,7 +195,7 @@ impl<Message> CulledColumn<'_, Message> {
     /// column's end last.
     fn tops(&self, state: &State) -> Vec<f32> {
         let mut tops = Vec::with_capacity(self.keys.len() + 1);
-        let unmeasured = state.assumed.unwrap_or(self.estimate);
+        let unmeasured = state.unmeasured(self.estimate);
         let mut y = 0.0;
         for key in &self.keys {
             tops.push(y);
@@ -138,13 +206,16 @@ impl<Message> CulledColumn<'_, Message> {
     }
 
     /// Which rows to build: the contiguous run within the overscanned
-    /// viewport, then the focused row and its neighbours, sorted.
-    fn window(&self, state: &State, tops: &[f32]) -> (Range<usize>, Vec<usize>) {
+    /// `viewport`, then the focused row and its neighbours and the kept rows,
+    /// sorted.
+    fn window(
+        &self,
+        state: &State,
+        tops: &[f32],
+        viewport: Option<(f32, f32)>,
+    ) -> (Range<usize>, Vec<usize>) {
         let rows = &tops[..self.keys.len()];
-        let span = wanted(
-            state.viewport.get().unwrap_or((0.0, FIRST_VIEWPORT)),
-            OVERSCAN,
-        );
+        let span = wanted(viewport.unwrap_or((0.0, FIRST_VIEWPORT)), OVERSCAN);
         // The row whose top is above the span may still reach into it.
         let first = rows
             .partition_point(|top| *top <= span.start)
@@ -158,9 +229,18 @@ impl<Message> CulledColumn<'_, Message> {
                 index.saturating_sub(FOCUS_NEIGHBOURS)
                     ..(index + FOCUS_NEIGHBOURS + 1).min(self.keys.len()),
             );
-            built.sort_unstable();
-            built.dedup();
         }
+        if !self.kept.is_empty() {
+            built.extend(
+                self.keys
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, key)| self.kept.contains(key))
+                    .map(|(index, _)| index),
+            );
+        }
+        built.sort_unstable();
+        built.dedup();
         (first..last, built)
     }
 
@@ -228,15 +308,43 @@ impl<Message> Widget<Message, Theme, Renderer> for CulledColumn<'_, Message> {
         renderer: &Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
+        debug_assert!(
+            self.keys.iter().collect::<HashSet<_>>().len() == self.keys.len(),
+            "culled_column keys must be unique"
+        );
         let width = limits.max().width;
         let state = tree.state.downcast_mut::<State>();
+        // The row at the top of the viewport, as the last layout placed it.
+        // Away from the top of the list, it is what the user is looking at,
+        // and it stays put however the rows above it change.
+        let anchor = state
+            .viewport
+            .get()
+            .filter(|(top, _)| *top > 0.0)
+            .and_then(|(top, _)| {
+                let (key, (placed, _)) = state
+                    .mounted
+                    .iter()
+                    .zip(&state.placed)
+                    .find(|(_, (_, bottom))| *bottom > top)?;
+                let index = self.keys.iter().position(|row| row == key)?;
+                Some((index, *placed))
+            });
+        let moved = |tops: &[f32]| anchor.map_or(0.0, |(index, placed)| tops[index] - placed);
         if (state.width - width).abs() > 0.5 {
-            state.heights.clear();
-            state.assumed = None;
+            state.forget_heights();
             state.width = width;
         }
+        state.prune(&self.keys);
         let tops = self.tops(state);
-        let (run, rows) = self.window(state, &tops);
+        // Choose the window around where the viewport will be once it has
+        // followed the anchor.
+        let ahead = moved(&tops);
+        let viewport = state
+            .viewport
+            .get()
+            .map(|(top, height)| (top + ahead, height));
+        let (run, rows) = self.window(state, &tops, viewport);
 
         // Match each row's retained tree by key, as a keyed list does.
         let mut retained: HashMap<u64, Tree> = std::mem::take(&mut state.mounted)
@@ -273,15 +381,27 @@ impl<Message> Widget<Message, Theme, Renderer> for CulledColumn<'_, Message> {
         state.mounted = rows.iter().map(|index| self.keys[*index]).collect();
         state.laid_out_focus = state.focused;
         for (index, node) in rows.iter().zip(&nodes) {
-            state.heights.insert(self.keys[*index], node.size().height);
+            state.measure(self.keys[*index], node.size().height);
         }
-        if state.assumed.is_none() && !nodes.is_empty() {
-            state.assumed =
-                Some(nodes.iter().map(|node| node.size().height).sum::<f32>() / nodes.len() as f32);
-        }
+        state.reassume();
         // Place rows by the measured heights, which may differ from the
         // estimates the window was chosen by.
         let tops = self.tops(state);
+        let shift = moved(&tops);
+        if shift != 0.0 {
+            state.shift += shift;
+            state.viewport.set(
+                state
+                    .viewport
+                    .get()
+                    .map(|(top, height)| (top + shift, height)),
+            );
+        }
+        state.placed = rows
+            .iter()
+            .zip(&nodes)
+            .map(|(index, node)| (tops[*index], tops[*index] + node.size().height))
+            .collect();
         let children = rows
             .iter()
             .zip(nodes)
@@ -403,6 +523,8 @@ impl<Message> Widget<Message, Theme, Renderer> for CulledColumn<'_, Message> {
         renderer: &Renderer,
         operation: &mut dyn Operation,
     ) {
+        // Lets [`keep_in_place`] find the column without visiting its rows.
+        operation.custom(None, layout.bounds(), tree.state.downcast_mut::<State>());
         let offset = layout.virtual_offset();
         // An operation may skip this column's rows, as a search that has
         // already found its widget does; then nothing was learnt of focus.
@@ -497,6 +619,255 @@ impl<'a, Message: 'a> From<CulledColumn<'a, Message>> for Element<'a, Message, T
     }
 }
 
+/// Wraps the scrollable around a [`culled_column`], and scrolls it to follow
+/// the row at the top of its viewport whenever a layout moves that row, so
+/// rows measured or added above it never move what is on screen.
+///
+/// While a mouse button is held, as when dragging the scrollbar's thumb, the
+/// pointer decides the position and the scrollable is left where it is.
+pub fn keep_in_place<'a, Message: 'a>(
+    scrollable: impl Into<Element<'a, Message, Theme, Renderer>>,
+) -> Element<'a, Message, Theme, Renderer> {
+    Element::new(KeepInPlace {
+        content: scrollable.into(),
+    })
+}
+
+struct KeepInPlace<'a, Message> {
+    content: Element<'a, Message, Theme, Renderer>,
+}
+
+/// Whether a mouse button went down over the scrollable and is still held.
+#[derive(Default)]
+struct Held(bool);
+
+/// Takes the shift the first culled column has noted, without visiting rows.
+#[derive(Default)]
+struct TakeShift(Option<f32>);
+impl Operation for TakeShift {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+        if self.0.is_none() {
+            operate(self);
+        }
+    }
+    fn custom(&mut self, _id: Option<&Id>, _bounds: Rectangle, state: &mut dyn std::any::Any) {
+        if self.0.is_none()
+            && let Some(state) = state.downcast_mut::<State>()
+        {
+            self.0 = Some(std::mem::take(&mut state.shift));
+        }
+    }
+}
+
+/// Scrolls the outermost scrollable by `0` vertically, and nothing inside it.
+struct ScrollBy(Option<f32>);
+impl Operation for ScrollBy {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+        if self.0.is_some() {
+            operate(self);
+        }
+    }
+    fn scrollable(
+        &mut self,
+        _id: Option<&Id>,
+        bounds: Rectangle,
+        content_bounds: Rectangle,
+        _translation: Vector,
+        state: &mut dyn operation::Scrollable,
+    ) {
+        if let Some(y) = self.0.take() {
+            state.scroll_by(AbsoluteOffset { x: 0.0, y }, bounds, content_bounds);
+        }
+    }
+}
+
+impl<Message> Widget<Message, Theme, Renderer> for KeepInPlace<'_, Message> {
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<Held>()
+    }
+
+    fn state(&self) -> tree::State {
+        tree::State::new(Held::default())
+    }
+
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content)]
+    }
+
+    fn diff(&mut self, tree: &mut Tree) {
+        tree.diff_children(std::slice::from_mut(&mut self.content));
+    }
+
+    fn size(&self) -> Size<Length> {
+        self.content.as_widget().size()
+    }
+
+    fn size_hint(&self) -> Size<Length> {
+        self.content.as_widget().size_hint()
+    }
+
+    fn id(&self) -> Option<Id> {
+        self.content.as_widget().id()
+    }
+
+    fn set_id(&mut self, id: Id) {
+        self.content.as_widget_mut().set_id(id);
+    }
+
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        self.content
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits)
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        let held = &mut tree.state.downcast_mut::<Held>().0;
+        match event {
+            Event::Mouse(mouse::Event::ButtonPressed(_)) if cursor.is_over(layout.bounds()) => {
+                *held = true;
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(_)) => {
+                *held = false;
+            }
+            _ => {}
+        }
+        let held = *held;
+        // Follow the anchor before the event, so the column under it judges
+        // the viewport where it will be drawn.
+        let mut take = TakeShift::default();
+        self.content
+            .as_widget_mut()
+            .operate(&mut tree.children[0], layout, renderer, &mut take);
+        if let Some(shift) = take.0.filter(|shift| *shift != 0.0 && !held) {
+            self.content.as_widget_mut().operate(
+                &mut tree.children[0],
+                layout,
+                renderer,
+                &mut ScrollBy(Some(shift)),
+            );
+            shell.request_redraw();
+        }
+        self.content.as_widget_mut().update(
+            &mut tree.children[0],
+            event,
+            layout,
+            cursor,
+            renderer,
+            clipboard,
+            shell,
+            viewport,
+        );
+    }
+
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        self.content.as_widget().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            style,
+            layout,
+            cursor,
+            viewport,
+        );
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &Renderer,
+    ) -> mouse::Interaction {
+        self.content.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout,
+            cursor,
+            viewport,
+            renderer,
+        )
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        self.content
+            .as_widget_mut()
+            .operate(&mut tree.children[0], layout, renderer, operation);
+    }
+
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut Tree,
+        layout: Layout<'b>,
+        renderer: &Renderer,
+        viewport: &Rectangle,
+        translation: Vector,
+    ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
+        self.content.as_widget_mut().overlay(
+            &mut tree.children[0],
+            layout,
+            renderer,
+            viewport,
+            translation,
+        )
+    }
+
+    fn a11y_nodes(
+        &self,
+        layout: Layout<'_>,
+        tree: &Tree,
+        cursor: mouse::Cursor,
+    ) -> iced_accessibility::A11yTree {
+        self.content
+            .as_widget()
+            .a11y_nodes(layout, &tree.children[0], cursor)
+    }
+
+    fn drag_destinations(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        destinations: &mut cosmic::iced::advanced::clipboard::DndDestinationRectangles,
+    ) {
+        self.content.as_widget().drag_destinations(
+            &tree.children[0],
+            layout,
+            renderer,
+            destinations,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -526,20 +897,39 @@ mod tests {
         built: Rc<RefCell<Vec<usize>>>,
         height: fn(usize) -> f32,
     ) -> cosmic::Element<'a, ()> {
-        culled_column((0..rows as u64).collect(), move |index| {
+        keyed(
+            (0..rows as u64).collect(),
+            built,
+            height,
+            std::iter::empty(),
+        )
+    }
+
+    /// A column whose rows have `keys`, named and sized by their key, with
+    /// the `kept` keys kept built.
+    fn keyed<'a>(
+        keys: Vec<u64>,
+        built: Rc<RefCell<Vec<usize>>>,
+        height: fn(usize) -> f32,
+        kept: impl IntoIterator<Item = u64>,
+    ) -> cosmic::Element<'a, ()> {
+        let names = keys.clone();
+        culled_column(keys, move |index| {
             built.borrow_mut().push(index);
+            let key = names[index] as usize;
             cosmic_widget::button::custom(
                 cosmic_widget::Space::new()
                     .width(Length::Fill)
-                    .height(height(index)),
+                    .height(height(key)),
             )
-            .id(widget::Id::new(format!("row-{index}")))
+            .id(widget::Id::new(format!("row-{key}")))
             .on_press(())
             .padding(0)
             .into()
         })
         .spacing(SPACING)
         .estimate(ROW)
+        .keep_built(kept)
         .into()
     }
 
@@ -565,6 +955,55 @@ mod tests {
 
         fn relayout(&mut self) {
             self.node = layout_of(&mut self.element, &mut self.tree, &self.renderer);
+        }
+
+        /// Lays out at `width` instead of the screen's.
+        fn relayout_at(&mut self, width: f32) {
+            self.node = self.element.as_widget_mut().layout(
+                &mut self.tree,
+                &self.renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(width, f32::INFINITY)),
+            );
+        }
+
+        /// Takes the shift the column has noted for [`keep_in_place`].
+        fn take_shift(&mut self) -> f32 {
+            let mut take = TakeShift::default();
+            self.element.as_widget_mut().operate(
+                &mut self.tree,
+                Layout::new(&self.node),
+                &self.renderer,
+                &mut take,
+            );
+            take.0.unwrap_or_default()
+        }
+
+        /// Where the row with `key` was placed, from the column's top.
+        fn top_of(&self, key: u64) -> Option<f32> {
+            let state = self.tree.state.downcast_ref::<State>();
+            let index = state.mounted.iter().position(|row| *row == key)?;
+            Some(state.placed[index].0)
+        }
+
+        /// The first mounted row whose bottom is below `top`.
+        fn row_at(&self, top: f32) -> u64 {
+            let state = self.tree.state.downcast_ref::<State>();
+            state
+                .mounted
+                .iter()
+                .zip(&state.placed)
+                .find(|(_, (_, bottom))| *bottom > top)
+                .map(|(key, _)| *key)
+                .unwrap()
+        }
+
+        /// Scrolls to `top`, lays out if the column asks to, and follows the
+        /// shift as [`keep_in_place`] would; returns the new top.
+        fn follow(&mut self, top: f32) -> f32 {
+            if self.scroll_to(top) {
+                self.relayout();
+            }
+            top + self.take_shift()
         }
 
         /// Delivers a redraw with the column scrolled to `top`; returns
@@ -764,5 +1203,197 @@ mod tests {
             top += SCREEN.height;
         }
         assert_eq!(harness.node.size().height, exact);
+    }
+
+    /// Rows of uneven height, none the estimated `ROW`.
+    fn uneven(index: usize) -> f32 {
+        [70.0, 55.0, 55.0, 90.0, 48.0][index % 5]
+    }
+
+    #[test]
+    fn scrolling_up_through_rows_never_measured_leaves_what_is_on_screen_in_place() {
+        let built = Rc::new(RefCell::new(Vec::new()));
+        let mut harness = Harness::new(column_of(3000, built, uneven));
+        // Jump to the middle, as a dragged thumb does, past every row measured.
+        let mut top = harness.follow(1500.0 * (ROW + SPACING));
+        // Then wheel up through rows never measured, a little at a time.
+        for _ in 0..60 {
+            let key = harness.row_at(top);
+            let on_screen = harness.top_of(key).unwrap() - top;
+            top = harness.follow(top - 100.0);
+            let now = harness.top_of(key).unwrap() - top;
+            assert!(
+                (now - (on_screen + 100.0)).abs() < 0.01,
+                "row {key} was {on_screen} px into the view and is now {now}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_width_change_keeps_the_row_at_the_top_of_the_view() {
+        let built = Rc::new(RefCell::new(Vec::new()));
+        let mut harness = Harness::new(column_of(3000, built, uneven));
+        let mut top = 0.0;
+        while top < 20_000.0 {
+            top = harness.follow(top + SCREEN.height);
+        }
+        let key = harness.row_at(top);
+        let on_screen = harness.top_of(key).unwrap() - top;
+        // Every measured height is forgotten at a new width.
+        harness.relayout_at(SCREEN.width - 20.0);
+        let top = top + harness.take_shift();
+        assert_eq!(harness.top_of(key).unwrap() - top, on_screen);
+    }
+
+    #[test]
+    fn rows_added_above_the_view_leave_what_is_on_screen_in_place() {
+        let built = Rc::new(RefCell::new(Vec::new()));
+        let keys: Vec<u64> = (100..3100).collect();
+        let mut harness = Harness::new(keyed(keys.clone(), built.clone(), uneven, []));
+        let top = harness.follow(0.0);
+        let top = harness.follow(top + 2000.0);
+        let key = harness.row_at(top);
+        let on_screen = harness.top_of(key).unwrap() - top;
+        // Ten new rows arrive at the head of the list.
+        let more = (0..10).chain(keys).collect();
+        harness.element = keyed(more, built, uneven, []);
+        harness.tree.diff(harness.element.as_widget_mut());
+        harness.relayout();
+        let top = top + harness.take_shift();
+        assert_eq!(harness.top_of(key).unwrap() - top, on_screen);
+        // At the very top, the new rows show instead.
+        let mut harness = Harness::new(keyed((100..3100).collect(), Rc::default(), uneven, []));
+        harness.follow(0.0);
+        harness.element = keyed((0..3100).collect(), Rc::default(), uneven, []);
+        harness.relayout();
+        assert_eq!(harness.take_shift(), 0.0);
+        assert_eq!(harness.mounted().first(), Some(&0));
+    }
+
+    #[test]
+    fn a_kept_row_stays_built_wherever_the_view_is() {
+        let built = Rc::new(RefCell::new(Vec::new()));
+        let mut harness = Harness::new(keyed((0..3000).collect(), built, |_| ROW, [5]));
+        harness.follow(2500.0 * (ROW + SPACING));
+        harness.relayout();
+        let mounted = harness.mounted();
+        assert!(
+            mounted.contains(&5) && mounted.contains(&2500),
+            "{mounted:?}"
+        );
+    }
+
+    #[test]
+    fn keep_in_place_scrolls_to_follow_the_row_on_screen_through_the_runtime() {
+        use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+        /// The vertical translation of the scrollable, and the content-space
+        /// top of each named row.
+        #[derive(Default)]
+        struct Positions(f32, HashMap<String, f32>);
+        impl Operation for Positions {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+            fn scrollable(
+                &mut self,
+                _id: Option<&Id>,
+                _bounds: Rectangle,
+                _content_bounds: Rectangle,
+                translation: Vector,
+                _state: &mut dyn operation::Scrollable,
+            ) {
+                self.0 = translation.y;
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&Id>,
+                bounds: Rectangle,
+                _state: &mut dyn operation::Focusable,
+            ) {
+                if let Some(id) = id {
+                    self.1.insert(format!("{id:?}"), bounds.y);
+                }
+            }
+        }
+        let mut renderer = super::super::accessibility_probe::headless_renderer();
+        let id = Id::new("lane");
+        let view = || -> cosmic::Element<'static, ()> {
+            keep_in_place(
+                cosmic_widget::scrollable(column_of(3000, Rc::default(), uneven))
+                    .id(Id::new("lane"))
+                    .height(Length::Fill),
+            )
+        };
+        let redraw = Event::Window(window::Event::RedrawRequested(
+            cosmic::iced::time::Instant::now(),
+        ));
+        let mut ui = UserInterface::build(view(), SCREEN, Cache::new(), &mut renderer);
+        // Redraw as the runtime does, again while layout keeps changing.
+        let settle =
+            |ui: &mut UserInterface<'_, (), Theme, Renderer>, renderer: &mut Renderer, cursor| {
+                for _ in 0..3 {
+                    let (state, _) = ui.update(
+                        std::slice::from_ref(&redraw),
+                        cursor,
+                        renderer,
+                        &mut clipboard::Null,
+                        &mut Vec::new(),
+                    );
+                    if !state.has_layout_changed() {
+                        break;
+                    }
+                }
+            };
+        settle(&mut ui, &mut renderer, mouse::Cursor::Unavailable);
+        ui.operate(
+            &renderer,
+            &mut operation::scrollable::scroll_to(
+                id,
+                AbsoluteOffset {
+                    x: None,
+                    y: Some(1500.0 * (ROW + SPACING)),
+                },
+            ),
+        );
+        settle(&mut ui, &mut renderer, mouse::Cursor::Unavailable);
+        let pointer = Point::new(150.0, 200.0);
+        let cursor = mouse::Cursor::Available(pointer);
+        let mut followed = 0;
+        for _ in 0..30 {
+            let mut before = Positions::default();
+            ui.operate(&renderer, &mut before);
+            let _ = ui.update(
+                &[
+                    Event::Mouse(mouse::Event::CursorMoved { position: pointer }),
+                    Event::Mouse(mouse::Event::WheelScrolled {
+                        delta: mouse::ScrollDelta::Pixels { x: 0.0, y: 100.0 },
+                    }),
+                ],
+                cursor,
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut Vec::new(),
+            );
+            settle(&mut ui, &mut renderer, cursor);
+            let mut after = Positions::default();
+            ui.operate(&renderer, &mut after);
+            // Every row on screen before and after moved down by the wheel's
+            // 100 px, though rows above it were measured in between.
+            let moved = ((before.0 - after.0) - 100.0).abs() > 0.5;
+            for (name, top) in &before.1 {
+                let Some(now) = after.1.get(name) else {
+                    continue;
+                };
+                let (was, is) = (top - before.0, now - after.0);
+                if (0.0..SCREEN.height).contains(&was) {
+                    assert!(
+                        (is - (was + 100.0)).abs() < 0.01,
+                        "{name} was at {was}, is at {is}"
+                    );
+                }
+            }
+            followed += usize::from(moved);
+        }
+        assert!(followed > 0, "no layout moved the rows on screen");
     }
 }

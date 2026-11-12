@@ -5,7 +5,7 @@ pub(crate) mod accessibility_probe;
 pub(crate) mod accessible_bounds;
 pub mod button;
 mod culled_column;
-pub use culled_column::{CulledColumn, culled_column};
+pub use culled_column::{CulledColumn, culled_column, keep_in_place};
 mod display;
 mod editable;
 pub mod field;
