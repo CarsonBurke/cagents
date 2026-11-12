@@ -39,6 +39,9 @@ const PROBE_UNAVAILABLE_FOR: Duration = Duration::from_secs(10 * 60);
 /// How long GitHub's search, which the listing reads, may take to show a
 /// change its REST API, which the probe reads, already does.
 const SEARCH_LAG: Duration = Duration::from_secs(60);
+/// How many of the viewer's latest changes the probe names. Unchanged, a
+/// larger answer is as free; changed, it costs the same one request.
+const PROBE_PAGE: usize = 20;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Snapshot {
@@ -139,46 +142,72 @@ struct Listing {
 }
 
 impl Listing {
-    /// Whether this listing already shows the newest change the probe saw.
-    /// The probe's REST answer can be ahead of the search the listing reads.
-    fn reflects(&self, newest: &Newest) -> bool {
-        match newest {
-            Newest::Nothing => self.pull_requests.is_empty(),
-            Newest::PullRequest(number, updated) => self.pull_requests.iter().any(|pull_request| {
-                pull_request.number == *number
-                    && pull_request.updated_at.parse::<jiff::Timestamp>().ok() == Some(*updated)
-            }),
-            // An issue isn't listed, but nothing of the viewer's changed
-            // after it, so a listing read well after it shows everything.
-            Newest::Issue(updated) => jiff::SignedDuration::try_from(SEARCH_LAG)
-                .ok()
-                .and_then(|lag| updated.checked_add(lag).ok())
-                .is_some_and(|settled| self.read_at >= settled),
+    /// Whether this listing already shows the changes the probe saw. The
+    /// probe's REST answer can be ahead of the search the listing reads,
+    /// which fills in the fields of the pull requests it returns live but can
+    /// be slow to return a new one at all. So every pull request the probe
+    /// names must be listed as it is now, unless it changed so long before
+    /// this listing was read that search has had time to show it, and an
+    /// answer of only such recent changes may have more beyond it.
+    fn reflects(&self, recent: &Recent) -> bool {
+        let Some(settled) = jiff::SignedDuration::try_from(SEARCH_LAG)
+            .ok()
+            .and_then(|lag| self.read_at.checked_sub(lag).ok())
+        else {
+            return false;
+        };
+        if recent.0.is_empty() {
+            return self.pull_requests.is_empty();
         }
+        let full = recent.0.len() >= PROBE_PAGE;
+        if full && recent.0.iter().all(|row| row.updated >= settled) {
+            return false;
+        }
+        recent.0.iter().all(|row| {
+            let Some(number) = row.pull_request else {
+                return true;
+            };
+            match self
+                .pull_requests
+                .iter()
+                .find(|pull_request| pull_request.number == number)
+            {
+                Some(listed) => {
+                    listed.updated_at.parse::<jiff::Timestamp>().ok() == Some(row.updated)
+                }
+                None => row.updated < settled,
+            }
+        })
     }
 }
 
-/// The viewer's most recently updated issue or pull request in the
-/// repository, as the probe's answer names it.
+/// The viewer's most recently updated issues and pull requests in the
+/// repository, newest first, as the probe's answer names them.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Newest {
-    Nothing,
-    Issue(jiff::Timestamp),
-    PullRequest(u64, jiff::Timestamp),
+struct Recent(Vec<Row>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Row {
+    /// The pull request's number; an issue has none.
+    pull_request: Option<u64>,
+    updated: jiff::Timestamp,
 }
 
-impl Newest {
+impl Recent {
     fn of(body: &[u8]) -> Option<Self> {
         let rows: Vec<serde_json::Value> = serde_json::from_slice(body).ok()?;
-        let Some(row) = rows.first() else {
-            return Some(Self::Nothing);
-        };
-        let updated = row.get("updated_at")?.as_str()?.parse().ok()?;
-        Some(if row.get("pull_request").is_some() {
-            Self::PullRequest(row.get("number")?.as_u64()?, updated)
-        } else {
-            Self::Issue(updated)
-        })
+        rows.iter()
+            .map(|row| {
+                Some(Row {
+                    pull_request: match row.get("pull_request") {
+                        Some(_) => Some(row.get("number")?.as_u64()?),
+                        None => None,
+                    },
+                    updated: row.get("updated_at")?.as_str()?.parse().ok()?,
+                })
+            })
+            .collect::<Option<_>>()
+            .map(Self)
     }
 }
 
@@ -189,10 +218,11 @@ enum Answer {
     /// It may not be: read it again, and keep this validator.
     Unknown(Probe),
     /// Something changed: read it again, and keep `etag` only if that read
-    /// shows `newest`, so search lag can't hide behind a new validator.
+    /// shows what the probe saw, so search lag can't hide behind a new
+    /// validator.
     Changed {
         etag: Option<String>,
-        newest: Newest,
+        recent: Recent,
     },
 }
 
@@ -345,9 +375,17 @@ fn listing<E: crate::repository::ProcessExecutor>(
         .take()
         .filter(|listing| listing.repository == *repository && listing.credential == credential)
     else {
-        let read = read_listing(gh, repository, credential, Probe::Unknown, cancellation)?;
+        let read = read_listing(
+            gh,
+            repository,
+            credential.clone(),
+            Probe::Unknown,
+            cancellation,
+        )?;
         let pull_requests = read.pull_requests.clone();
-        memory.listing = Some(read);
+        if crate::github_status::credential_fingerprint().ok() == credential {
+            memory.listing = Some(read);
+        }
         return Ok(pull_requests);
     };
     // Asked before the listing is read, so a change landing between the two
@@ -363,18 +401,27 @@ fn listing<E: crate::repository::ProcessExecutor>(
         memory.listing = Some(previous);
         return Ok(pull_requests);
     }
-    let (probe, newest) = match answer {
-        Answer::Current(probe) | Answer::Unknown(probe) => (probe, None),
-        Answer::Changed { etag, newest } => {
-            (etag.map_or(Probe::Unknown, Probe::Validator), Some(newest))
+    let (probe, recent) = match answer {
+        Answer::Current(probe) | Answer::Unknown(probe) => {
+            // What the probe learned holds for the last listing too, such as
+            // that GitHub refuses it, should this read fail.
+            previous.probe = probe.clone();
+            (probe, None)
+        }
+        Answer::Changed { etag, recent } => {
+            (etag.map_or(Probe::Unknown, Probe::Validator), Some(recent))
         }
     };
-    match read_listing(gh, repository, credential, probe, cancellation) {
+    match read_listing(gh, repository, credential.clone(), probe, cancellation) {
+        // Read as another account than it would be kept for.
+        Ok(read) if crate::github_status::credential_fingerprint().ok() != credential => {
+            Ok(read.pull_requests)
+        }
         Ok(mut read) => {
             // A validator is for one viewer's pull requests, and one read
             // that shows what the probe saw.
             if read.viewer != previous.viewer
-                || newest.is_some_and(|newest| !read.reflects(&newest))
+                || recent.is_some_and(|recent| !read.reflects(&recent))
             {
                 read.probe = Probe::Unknown;
             }
@@ -410,12 +457,12 @@ fn ask<E: crate::repository::ProcessExecutor>(
         cancellation,
     ) {
         Ok(Revalidation::NotModified) => Answer::Current(listing.probe.clone()),
-        Ok(Revalidation::Modified { etag, body }) => match Newest::of(&body) {
+        Ok(Revalidation::Modified { etag, body }) => match Recent::of(&body) {
             // Unchanged in effect, such as the first validator after a read.
-            Some(newest) if listing.reflects(&newest) => {
+            Some(recent) if listing.reflects(&recent) => {
                 Answer::Current(etag.map_or(Probe::Unknown, Probe::Validator))
             }
-            Some(newest) => Answer::Changed { etag, newest },
+            Some(recent) => Answer::Changed { etag, recent },
             None => Answer::Unknown(Probe::Unknown),
         },
         Ok(Revalidation::Refused) => Answer::Unknown(Probe::Unavailable(Instant::now())),
@@ -453,7 +500,7 @@ fn read_listing<E: crate::repository::ProcessExecutor>(
 /// with the issue or pull request itself.
 fn probe_path(repository: &GitHubRepoKey, viewer: &str) -> String {
     format!(
-        "repos/{}/{}/issues?creator={viewer}&state=all&sort=updated&direction=desc&per_page=1",
+        "repos/{}/{}/issues?creator={viewer}&state=all&sort=updated&direction=desc&per_page={PROBE_PAGE}",
         repository.owner, repository.name
     )
 }
@@ -834,12 +881,14 @@ mod tests {
         assert_eq!(poll(&mut memory, Freshness::Watched), (true, vec!["probe"]));
 
         // A repository GitHub refuses to probe is listed every poll, and
-        // asked again only after a while.
+        // asked again only after a while, even when that listing failed.
         *forge.probe_fails.lock().unwrap() = Some("410 Gone");
+        forge.listing_fails.store(true, Ordering::SeqCst);
         assert_eq!(
             poll(&mut memory, Freshness::Watched),
-            (true, vec!["probe", "listing"])
+            (false, vec!["probe", "listing"])
         );
+        forge.listing_fails.store(false, Ordering::SeqCst);
         assert_eq!(
             poll(&mut memory, Freshness::Watched),
             (true, vec!["listing"])
@@ -873,28 +922,45 @@ mod tests {
     }
 
     #[test]
-    fn the_newest_change_shows_in_a_listing_that_has_it() {
-        let listing = |updated: &str, read_at: &str| Listing {
+    fn a_listing_reflects_the_changes_search_has_had_time_to_show() {
+        let listing = |listed: &[(u64, &str)], read_at: &str| Listing {
             repository: key("me"),
             credential: None,
             at: Instant::now(),
             read_at: read_at.parse().unwrap(),
-            pull_requests: vec![pull_request(1, "a", "a", "OPEN", updated)],
+            pull_requests: listed
+                .iter()
+                .map(|&(number, updated)| pull_request(number, "a", "a", "OPEN", updated))
+                .collect(),
             viewer: "me".into(),
             probe: Probe::Unknown,
         };
-        let newest = |body: serde_json::Value| Newest::of(body.to_string().as_bytes()).unwrap();
-        let pull =
-            newest(serde_json::json!([{"number": 1, "updated_at": SECOND, "pull_request": {}}]));
-        assert_eq!(pull, Newest::PullRequest(1, SECOND.parse().unwrap()));
-        assert!(listing(SECOND, FIRST).reflects(&pull));
-        assert!(!listing(FIRST, THIRD).reflects(&pull));
-        // An issue isn't listed: a listing read once search caught up is.
-        let issue = newest(serde_json::json!([{"number": 2, "updated_at": SECOND}]));
-        assert!(!listing(FIRST, "2026-01-02T00:00:30Z").reflects(&issue));
-        assert!(listing(FIRST, "2026-01-02T00:01:00Z").reflects(&issue));
-        assert!(!listing(FIRST, THIRD).reflects(&newest(serde_json::json!([]))));
-        assert_eq!(Newest::of(b"{\"message\":\"no\"}"), None);
+        let recent = |body: serde_json::Value| Recent::of(body.to_string().as_bytes()).unwrap();
+        let pull = |number: u64, updated: &str| serde_json::json!({"number": number, "updated_at": updated, "pull_request": {}});
+        let issue = |updated: &str| serde_json::json!({"number": 99, "updated_at": updated});
+        let late = "2026-01-02T00:00:30Z";
+
+        // The newest change, listed as it is now or not.
+        let changed = recent(serde_json::json!([pull(1, SECOND)]));
+        assert!(listing(&[(1, SECOND)], THIRD).reflects(&changed));
+        assert!(!listing(&[(1, FIRST)], THIRD).reflects(&changed));
+        // An older new pull request search hadn't returned yet, though it
+        // returned a newer one.
+        let both = recent(serde_json::json!([pull(2, late), pull(1, SECOND)]));
+        assert!(!listing(&[(2, late)], "2026-01-02T00:01:00Z").reflects(&both));
+        // One search has had a while to return and never did isn't waited for.
+        assert!(listing(&[(2, late)], THIRD).reflects(&both));
+        // Issues aren't listed.
+        let issues = recent(serde_json::json!([issue(THIRD), pull(1, SECOND)]));
+        assert!(listing(&[(1, SECOND)], FIRST).reflects(&issues));
+        // A whole answer of recent changes may hide more beyond it.
+        let busy = recent(serde_json::Value::Array(
+            (0..PROBE_PAGE).map(|_| issue(THIRD)).collect(),
+        ));
+        assert!(!listing(&[], THIRD).reflects(&busy));
+        assert!(!listing(&[(1, SECOND)], THIRD).reflects(&recent(serde_json::json!([]))));
+        assert!(listing(&[], THIRD).reflects(&recent(serde_json::json!([]))));
+        assert_eq!(Recent::of(b"{\"message\":\"no\"}"), None);
     }
 
     #[test]

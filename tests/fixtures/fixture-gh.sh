@@ -416,15 +416,17 @@ api() {
     trace "api $method ${endpoint%%\?*}"
     case $method:$endpoint in
         GET:repos/*/issues\?*)
-            # The viewer's most recently updated issue or pull request, whose
-            # validator changes with the seeded pull requests it covers.
+            # The most recently updated issues and pull requests, the
+            # viewer's with creator=, whose validator changes with the seeded
+            # pull requests it covers.
             slug=${endpoint#repos/}
             slug=${slug%%/issues*}
             creator=$(printf '%s\n' "$endpoint" | sed -nE 's#.*[?&]creator=([^&]+).*#\1#p')
+            per_page=$(printf '%s\n' "$endpoint" | sed -nE 's#.*[?&]per_page=([0-9]+).*#\1#p')
             check_seed
-            page=$(seeded "$slug" | jq -c --arg creator "$creator" '
+            page=$(seeded "$slug" | jq -c --arg creator "$creator" --argjson limit "${per_page:-30}" '
                 map(select($creator == "" or .author.login == $creator))
-                | sort_by(.updatedAt) | reverse | .[:1]
+                | sort_by(.updatedAt) | reverse | .[:$limit]
                 | map({number, title, state: (if .state == "OPEN" then "open" else "closed" end),
                     updated_at: .updatedAt, html_url: .url, pull_request: {html_url: .url}})')
             etag="W/\"$(printf '%s' "$page" | cksum | cut -d' ' -f1)\""

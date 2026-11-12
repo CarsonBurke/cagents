@@ -100,7 +100,8 @@ so daemon Work polling can be counted separately from sidebar and branch
 lookups. No query bodies or variables are recorded.
 
 Like GitHub, the issues probe moves only with a pull request's `updatedAt` and
-the fields of the row it returns: to make the Work board notice a seeded
+the fields of the rows it returns (`per_page` of them, newest first): to make
+the Work board or sidebar notice a seeded
 change, such as new checks, change that seed's `updatedAt` too, or wait for the
 board's five-minute reread.
 
