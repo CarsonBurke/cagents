@@ -4542,6 +4542,9 @@ impl Runtime {
                 )
                     .hash(&mut hasher);
             }
+            // The client replaces its map whenever it learns an address, and a
+            // new handle brings its own.
+            std::sync::Arc::as_ptr(&self.agent_addresses).hash(&mut hasher);
         }
         hasher.finish()
     }
@@ -13295,6 +13298,47 @@ mod tests {
             .iter()
             .map(|turn| runtime.turn_fingerprint(turn, dark))
             .collect()
+    }
+
+    /// A lone step that stopped an agent names it on its collapsed strip as
+    /// its open row does, once the daemon says how Claude addresses it, and
+    /// the drawn turn is redrawn when it learns that.
+    #[test]
+    fn a_stopped_agent_is_named_on_its_strip_once_its_address_is_known() {
+        let items = vec![chat::Item {
+            id: "toolu_stop".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Tool {
+                name: "TaskStop".into(),
+                input: r#"{"task_id":"a1892b93e88999a7d"}"#.into(),
+                output: String::new(),
+                status: chat::ToolStatus::Succeeded,
+            },
+            started_at: Some(1000),
+            at: Some(1000),
+        }];
+        let (mut runtime, _handle) = frame_cost::live_runtime(&items);
+        Arc::make_mut(&mut runtime.snapshot)
+            .subagents
+            .push(chat::Subagent {
+                id: "toolu_relocate".into(),
+                kind: "general-purpose".into(),
+                description: "Relocate the repo".into(),
+                status: chat::ToolStatus::Stopped,
+                model: None,
+                waiting: false,
+                detail: String::new(),
+                background: true,
+                items: Vec::new(),
+            });
+        let turn = runtime.turns[0].clone();
+        assert_eq!(runtime.strip_summary(&turn), "Stopped a background task");
+        let before = runtime.turn_fingerprint(&turn, true);
+        runtime.agent_addresses =
+            Arc::new([("a1892b93e88999a7d".to_owned(), "toolu_relocate".to_owned())].into());
+        assert_ne!(before, runtime.turn_fingerprint(&turn, true));
+        let name = runtime.listed_agent_name("toolu_relocate").unwrap();
+        assert_eq!(runtime.strip_summary(&turn), format!("Stopped {name}"));
     }
 
     #[test]

@@ -303,6 +303,27 @@ impl Runtime {
         )
     }
 
+    /// A collapsed strip's line. A lone step that worked with other agents
+    /// names them as its open row does, by what this conversation calls them,
+    /// which grouping, formed only when the transcript's structure changes,
+    /// cannot know.
+    pub(super) fn strip_summary(&self, turn: &turn::Turn) -> String {
+        let [only] = turn.steps.as_slice() else {
+            return turn.summary.clone();
+        };
+        let Some(coordinated) = self
+            .snapshot
+            .items
+            .get(only.index)
+            .and_then(|item| self.cache.get(&item.id))
+            .and_then(|cached| cached.coordination.as_deref())
+        else {
+            return turn.summary.clone();
+        };
+        let line = coordinated.summary_naming(&|id| self.listed_agent_name(id));
+        format!("{}{}", turn::headline(line), turn.state_suffix())
+    }
+
     /// One group's activity: a summary line and how long the work took,
     /// disclosing the individual steps.
     ///
@@ -353,7 +374,8 @@ impl Runtime {
         // command would otherwise wrap it across the pane. The duration is
         // measured first and the summary cut to what it leaves, so the
         // duration stays in view. Opening the group shows the whole command.
-        let summary = one_line(design::heading(turn.summary.clone()));
+        let text = self.strip_summary(turn);
+        let summary = one_line(design::heading(text.clone()));
         line.push(match &elapsed {
             Some(elapsed) => trailing::trailing(summary, design::caption(elapsed.clone()), GAP_S),
             None => summary,
@@ -362,8 +384,8 @@ impl Runtime {
         // name as well: a reader on a screen reader is the one who cannot see
         // the caption beside it.
         let name = match &elapsed {
-            Some(elapsed) => format!("{} · {elapsed}", turn.summary),
-            None => turn.summary.clone(),
+            Some(elapsed) => format!("{text} · {elapsed}"),
+            None => text,
         };
         let header = widget::button::custom(
             widget::row::with_children(line)
