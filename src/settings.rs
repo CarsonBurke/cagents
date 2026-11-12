@@ -1138,6 +1138,11 @@ pub struct AppSettings {
     /// source-control data and agent activity indicators intact.
     #[serde(default = "default_show_worktree_changes_icons")]
     pub show_worktree_changes_icons: bool,
+    /// Whether the inspector lists the pull requests a channel only
+    /// mentioned, below those it worked on. Off, because a mention says
+    /// little about what the channel did.
+    #[serde(default)]
+    pub show_mentioned_pull_requests: bool,
     /// Whether a daemon upgrade relaunches an agent whose conversation cannot
     /// be resumed exactly - into its provider's resume picker, or a fresh
     /// conversation when it had none yet - rather than refusing to upgrade
@@ -1244,6 +1249,7 @@ impl Default for AppSettings {
             show_status_bar: default_show_status_bar(),
             usage_preview_rows: HashMap::new(),
             show_worktree_changes_icons: default_show_worktree_changes_icons(),
+            show_mentioned_pull_requests: false,
             relaunch_agents_on_upgrade: default_relaunch_agents_on_upgrade(),
             check_for_updates: default_check_for_updates(),
             work_stale_after_days: default_work_stale_after_days(),

@@ -98,7 +98,7 @@ use crate::{
     design::{self, InspectorLayout, space},
     github::{
         CreatePullRequestRequest, GitHubAvailability, GitHubRepoKey, GitHubService,
-        ListPullRequestsRequest, PullRequestCreationOutcome, PullRequestStateFilter,
+        PullRequestCreationOutcome,
     },
     inspector::{self, InspectorAction},
     instance,
@@ -2878,7 +2878,7 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
             | Message::PreviewLocalFile(_)
             | Message::ChatUi(chat_ui::Action::OpenUrl(_))
             | Message::PullRequestUi(
-                pull_request_ui::Action::OpenUrl(_) | pull_request_ui::Action::OpenMarkdownLink(_)
+                pull_request_ui::Action::Open { .. } | pull_request_ui::Action::OpenCheck(_)
             )
             | Message::ChromeUi(chrome_ui::Action::Launch(_))
             | Message::MovePaneToChannel { .. }
@@ -3004,6 +3004,7 @@ pub enum SettingsField {
     DefaultNativePaneFraction,
     ShowStatusBar,
     ShowWorktreeChangesIcons,
+    ShowMentionedPullRequests,
     RelaunchAgentsOnUpgrade,
     CheckForUpdates,
     EditorSyntaxTheme,
@@ -3161,6 +3162,7 @@ impl SettingsField {
             Self::ChatEnterSends => "Chat send key",
             Self::ShowStatusBar => "Status bar",
             Self::ShowWorktreeChangesIcons => "Worktree changes icons",
+            Self::ShowMentionedPullRequests => "Mentioned pull requests",
             Self::AutoDeleteMergedWorktrees => "Notify about merged worktrees",
             Self::RelaunchAgentsOnUpgrade => "Unresumable agents",
             Self::CheckForUpdates => "Automatic checks",
@@ -3197,6 +3199,7 @@ impl SettingsField {
             | Self::UiScale
             | Self::ShowStatusBar
             | Self::ShowWorktreeChangesIcons
+            | Self::ShowMentionedPullRequests
             | Self::AutoDeleteMergedWorktrees
             | Self::DefaultColumnFraction => SettingsCategory::Appearance,
             Self::TerminalLineHeight
@@ -3419,6 +3422,7 @@ struct SettingsDraft {
     default_native_pane_fraction: String,
     show_status_bar: bool,
     show_worktree_changes_icons: bool,
+    show_mentioned_pull_requests: bool,
     relaunch_agents_on_upgrade: bool,
     check_for_updates: bool,
     focus_follows_mouse: bool,
@@ -3482,6 +3486,7 @@ impl SettingsDraft {
             default_native_pane_fraction: settings.default_native_pane_fraction.to_string(),
             show_status_bar: settings.show_status_bar,
             show_worktree_changes_icons: settings.show_worktree_changes_icons,
+            show_mentioned_pull_requests: settings.show_mentioned_pull_requests,
             relaunch_agents_on_upgrade: settings.relaunch_agents_on_upgrade,
             check_for_updates: settings.check_for_updates,
             editor_syntax_theme: settings.editor_syntax_theme,
@@ -3546,6 +3551,9 @@ impl SettingsDraft {
             SettingsField::ShowStatusBar => self.show_status_bar = value == "true",
             SettingsField::ShowWorktreeChangesIcons => {
                 self.show_worktree_changes_icons = value == "true"
+            }
+            SettingsField::ShowMentionedPullRequests => {
+                self.show_mentioned_pull_requests = value == "true"
             }
             SettingsField::RelaunchAgentsOnUpgrade => {
                 self.relaunch_agents_on_upgrade = value == "true"
@@ -3798,6 +3806,10 @@ fn settings_update(
             .parse::<bool>()
             .map(|enabled| next.show_worktree_changes_icons = enabled)
             .map_err(|_| "Choose whether worktree changes icons are shown.".to_owned()),
+        SettingsField::ShowMentionedPullRequests => value
+            .parse::<bool>()
+            .map(|enabled| next.show_mentioned_pull_requests = enabled)
+            .map_err(|_| "Choose whether mentioned pull requests are listed.".to_owned()),
         SettingsField::AutoDeleteMergedWorktrees => value
             .parse::<bool>()
             .map(|enabled| next.auto_delete_merged_worktrees = enabled)
@@ -17922,6 +17934,10 @@ impl Application for Cagents {
                         }
                         return cosmic::task::message(Message::CancelRepositoryClose);
                     }
+                    // A popup is the innermost thing the user is looking at.
+                    if self.checks_popup_open() {
+                        return self.handle_pull_request_ui(pull_request_ui::Action::ShowChecks(None));
+                    }
                     // Ahead of the inspector and the sidebar because the find
                     // bar is the innermost thing the user is looking at, and
                     // behind the confirmations above because those are modal.
@@ -18590,7 +18606,7 @@ impl Application for Cagents {
                 });
             self.sidebar_state.select_file(&source.key, selected);
         }
-        let pull_request = self.sync_pull_request_inspector();
+        self.sync_pull_request_inspector();
         // `view` cannot rebuild the chrome cache itself, so refresh it here.
         let chrome = self.sync_chrome();
         let deferred = self.release_deferred_navigation_if_unblocked();
@@ -18600,7 +18616,6 @@ impl Application for Cagents {
             binding,
             chrome,
             deferred,
-            pull_request,
             notices,
             terminal_probes,
         ])
@@ -23879,11 +23894,13 @@ mod tests {
                 crate::settings::LinkOpenGesture::ControlShiftClick,
             ),
             Message::ChatUi(chat_ui::Action::OpenUrl("https://example.com".into())),
-            Message::PullRequestUi(pull_request_ui::Action::OpenUrl(
+            Message::PullRequestUi(pull_request_ui::Action::Open {
+                repository: GitHubRepoKey::new("github.com", None, "o", "r").unwrap(),
+                number: 1,
+                url: Url::parse("https://github.com/o/r/pull/1").unwrap(),
+            }),
+            Message::PullRequestUi(pull_request_ui::Action::OpenCheck(
                 Url::parse("https://example.com").unwrap(),
-            )),
-            Message::PullRequestUi(pull_request_ui::Action::OpenMarkdownLink(
-                "https://example.com".into(),
             )),
             Message::FocusCard(CardId::new()),
             Message::FocusAdjacent(crate::workspace::FocusDirection::Right),
@@ -25406,7 +25423,12 @@ mod tests {
                 SectionAction::Show(WorkspaceView::Files),
                 Some(WorkspaceView::Files),
             ),
-            (SectionAction::Toggle(Section::Workspace), None),
+            // With no conversation sections above it, the workspace section
+            // stays shown.
+            (
+                SectionAction::Toggle(Section::Workspace),
+                Some(WorkspaceView::Files),
+            ),
         ] {
             let _ = app.update(Message::ContextSection(action));
             assert_eq!(app.workspace_view_shown(), shown);
@@ -25416,9 +25438,9 @@ mod tests {
         }
         app.settings_reset_confirm = true;
         let _ = app.update(Message::ContextSection(SectionAction::Show(
-            WorkspaceView::Files,
+            WorkspaceView::SourceControl,
         )));
-        assert_eq!(app.workspace_view_shown(), None);
+        assert_eq!(app.workspace_view_shown(), Some(WorkspaceView::Files));
         app.settings_reset_confirm = false;
         let _ = app.update(Message::ContextInspector(InspectorAction::Close));
 

@@ -1199,14 +1199,7 @@ pub(crate) fn pull_request_glyph<'a, Message: 'a>(
 pub(crate) fn pull_request_badges<'a, Message: 'a>(
     pull_request: &crate::work::PullRequest,
 ) -> Vec<Element<'a, Message>> {
-    let mut badges = Vec::new();
-    let (label, tone): (&str, Toned) = match (pull_request.state, pull_request.draft) {
-        (PullRequestState::Open, true) => ("Draft", design::muted_color),
-        (PullRequestState::Open, false) => ("Open", design::success_color),
-        (PullRequestState::Merged, _) => ("Merged", design::accent_color),
-        (PullRequestState::Closed, _) => ("Closed", design::destructive_color),
-    };
-    badges.push(badge(label, Tone::Themed(tone)));
+    let mut badges = vec![pull_request_state_badge(pull_request)];
     if pull_request.state != PullRequestState::Open {
         return badges;
     }
@@ -1227,15 +1220,36 @@ pub(crate) fn pull_request_badges<'a, Message: 'a>(
     }) {
         badges.push(badge(label, Tone::Themed(tone)));
     }
-    if let Some(review) = pull_request.review {
-        let (label, tone): (&str, Toned) = match review {
-            Review::Approved => ("Approved", design::success_color),
-            Review::ChangesRequested => ("Changes requested", design::destructive_color),
-            Review::Required => ("Review required", design::muted_color),
-        };
-        badges.push(badge(label, Tone::Themed(tone)));
-    }
+    badges.extend(pull_request_review_badge(pull_request));
     badges
+}
+
+/// Open, draft, merged or closed, as a pill.
+pub(crate) fn pull_request_state_badge<'a, Message: 'a>(
+    pull_request: &crate::work::PullRequest,
+) -> Element<'a, Message> {
+    let (label, tone): (&str, Toned) = match (pull_request.state, pull_request.draft) {
+        (PullRequestState::Open, true) => ("Draft", design::muted_color),
+        (PullRequestState::Open, false) => ("Open", design::success_color),
+        (PullRequestState::Merged, _) => ("Merged", design::accent_color),
+        (PullRequestState::Closed, _) => ("Closed", design::destructive_color),
+    };
+    badge(label, Tone::Themed(tone))
+}
+
+/// The review decision of an open pull request, as a pill.
+pub(crate) fn pull_request_review_badge<'a, Message: 'a>(
+    pull_request: &crate::work::PullRequest,
+) -> Option<Element<'a, Message>> {
+    if pull_request.state != PullRequestState::Open {
+        return None;
+    }
+    let (label, tone): (&str, Toned) = match pull_request.review? {
+        Review::Approved => ("Approved", design::success_color),
+        Review::ChangesRequested => ("Changes requested", design::destructive_color),
+        Review::Required => ("Review required", design::muted_color),
+    };
+    Some(badge(label, Tone::Themed(tone)))
 }
 
 fn glyph<'a, Message: 'a>(icon: Icon, tone: Toned) -> Element<'a, Message> {

@@ -649,6 +649,18 @@ fn settings_category_controls<'a>(
                             },
                         ),
                     ),
+                    setting_field(
+                        "Mentioned pull requests",
+                        "In a channel's Pull requests section, also list pull requests it only mentioned, below the ones it worked on.",
+                        crate::settings_widgets::toggle(
+                            "Show mentioned pull requests",
+                            draft.show_mentioned_pull_requests,
+                            |enabled| Message::SettingsChanged {
+                                field: SettingsField::ShowMentionedPullRequests,
+                                value: enabled.to_string(),
+                            },
+                        ),
+                    ),
                 ],
             ),
             settings_group(

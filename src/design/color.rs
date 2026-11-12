@@ -244,6 +244,11 @@ pub fn destructive_text(theme: &Theme) -> text::Style {
     ink(destructive_color(theme))
 }
 
+/// Text that reports something finished well, such as passing checks.
+pub fn success_text(theme: &Theme) -> text::Style {
+    ink(success_color(theme))
+}
+
 /// The gutter marker on an added or removed patch line.
 ///
 /// The marker is tinted rather than the whole line, so the line keeps the

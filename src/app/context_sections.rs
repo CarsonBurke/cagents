@@ -1,16 +1,16 @@
 //! The context inspector as vertical, collapsible sections.
 //!
 //! A channel's conversation is the inspector's subject, so its sections lead
-//! with what that conversation produced: the pull requests it worked on or
-//! mentioned, then the worktrees it edited. The active worktree's changes and
-//! files follow behind one switch, collapsed until asked for, and a focused
-//! editor adds what its language server found. Each section says how much it
-//! holds in its header, so a collapsed one still reads at a glance.
+//! with what that conversation produced: the pull requests it worked on, then
+//! the worktrees it edited. The active worktree's changes and files follow
+//! behind one switch, collapsed until asked for unless nothing else is shown,
+//! and a focused editor adds what its language server found. Each section
+//! says how much it holds in its header, so a collapsed one still reads at a
+//! glance.
 //!
 //! Expanded sections share the panel's height the way a stack of panes does:
-//! a list that scrolls on its own takes a share of what is left, and the
-//! short worktree list takes only the rows it has. Nothing loads or polls for
-//! a section that is collapsed.
+//! the worktree's tree takes what is left, and the short lists take only the
+//! rows they have. Nothing loads or polls for a section that is collapsed.
 
 use super::*;
 
@@ -112,16 +112,18 @@ pub enum Action {
 }
 
 /// How an expanded section's body takes the panel's height.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq)]
 enum Height {
     /// A share of the height the other sections leave; the body scrolls.
     Share,
-    /// Its own content's height, up to a bound past which it scrolls.
-    Content,
+    /// Its own content's height, up to this many two-line rows, past which
+    /// it scrolls.
+    Content { rows: f32 },
 }
 
-/// The rows of the worktree list before it scrolls instead of growing.
-const WORKTREE_ROWS_SHOWN: f32 = 5.5;
+/// The rows of a short list before it scrolls instead of growing. The half
+/// row shows there is more.
+const LIST_ROWS_SHOWN: f32 = 5.5;
 
 /// A header's count and the text style that says what kind of count it is.
 type Count = (String, fn(&cosmic::Theme) -> iced::widget::text::Style);
@@ -138,20 +140,21 @@ struct Pane<'a> {
 }
 
 impl Cagents {
-    /// Whether the Pull requests section is expanded and has pull requests to
-    /// show, which is when the shown pull request is read and refreshed.
-    pub(super) fn pull_request_section_open(&self) -> bool {
-        self.context_inspector_open
-            && self.context_sections.is_open(Section::PullRequests)
-            && self.pull_requests_listed()
+    /// Whether the workspace section is all the inspector has: no
+    /// conversation's pull requests or worktrees lead it. It is then shown
+    /// rather than left as a lone collapsed header over an empty panel.
+    fn workspace_alone(&self) -> bool {
+        !self.pull_requests_listed() && self.edited_worktrees().is_empty()
+    }
+
+    fn workspace_open(&self) -> bool {
+        self.workspace_alone() || self.context_sections.is_open(Section::Workspace)
     }
 
     /// The workspace section's view while it is expanded. A folder that is
     /// not a Git worktree has only its files.
     pub(super) fn workspace_view_shown(&self) -> Option<WorkspaceView> {
-        self.context_sections
-            .is_open(Section::Workspace)
-            .then(|| self.workspace_view())
+        self.workspace_open().then(|| self.workspace_view())
     }
 
     pub(super) fn workspace_view(&self) -> WorkspaceView {
@@ -165,6 +168,8 @@ impl Cagents {
     pub(super) fn handle_context_section(&mut self, action: Action) -> Task<Message> {
         let before = self.workspace_view_shown();
         match action {
+            // Shown because it is alone, it has nothing to collapse into.
+            Action::Toggle(Section::Workspace) if self.workspace_alone() => return Task::none(),
             Action::Toggle(section) => {
                 let open = !self.context_sections.is_open(section);
                 self.context_sections.set_open(section, open);
@@ -231,9 +236,9 @@ impl Cagents {
                         .width(Length::Fill)
                         .height(Length::Fill)
                         .into(),
-                    Height::Content => widget::container(body)
+                    Height::Content { rows } => widget::container(body)
                         .width(Length::Fill)
-                        .max_height(design::DENSE_ROW_HEIGHT * 2.0 * WORKTREE_ROWS_SHOWN)
+                        .max_height(design::DENSE_ROW_HEIGHT * 2.0 * rows)
                         .into(),
                 });
             }
@@ -259,20 +264,30 @@ impl Cagents {
         controls: Vec<Element<'a, Message>>,
         open: bool,
     ) -> Element<'a, Message> {
-        let mut name = format!(
-            "{title} section, {}",
-            if open { "expanded" } else { "collapsed" }
-        );
-        let mut label: Vec<Element<'a, Message>> = vec![
-            crate::ui_controls::passive_icon(
+        // The workspace section shown because it is alone has nothing to
+        // collapse into, so it draws no disclosure.
+        let collapsible = !(section == Section::Workspace && self.workspace_alone());
+        let mut name = if collapsible {
+            format!(
+                "{title} section, {}",
+                if open { "expanded" } else { "collapsed" }
+            )
+        } else {
+            format!("{title} section")
+        };
+        let mut label: Vec<Element<'a, Message>> = Vec::with_capacity(3);
+        if collapsible {
+            label.push(crate::ui_controls::passive_icon(
                 if open { Icon::PanDown } else { Icon::PanEnd }.handle(),
                 design::COMPACT_ICON_SIZE,
-            ),
+            ));
+        }
+        label.push(
             design::caption(title)
                 .font(design::heading_font())
                 .wrapping(iced::widget::text::Wrapping::None)
                 .into(),
-        ];
+        );
         if let Some((count, style)) = count {
             name.push_str(", ");
             name.push_str(description.as_deref().unwrap_or(&count));
@@ -299,7 +314,8 @@ impl Cagents {
             .height(design::DENSE_ROW_HEIGHT)
             .width(Length::Fill)
             .on_press_maybe(
-                (!self.modal_is_open()).then_some(Message::ContextSection(Action::Toggle(section))),
+                (collapsible && !self.modal_is_open())
+                    .then_some(Message::ContextSection(Action::Toggle(section))),
             ),
         );
         let mut row = vec![toggle];
@@ -323,12 +339,10 @@ impl Cagents {
             title: "Pull requests".into(),
             count: (count > 0).then(|| (count.to_string(), design::muted_text as _)),
             description: None,
-            controls: if open {
-                self.pull_request_controls()
-            } else {
-                Vec::new()
+            controls: Vec::new(),
+            height: Height::Content {
+                rows: LIST_ROWS_SHOWN,
             },
-            height: Height::Share,
             body: open.then(|| self.pull_request_section()),
         }
     }
@@ -349,7 +363,9 @@ impl Cagents {
                 format!("{} edited", edited.len())
             }),
             controls: Vec::new(),
-            height: Height::Content,
+            height: Height::Content {
+                rows: LIST_ROWS_SHOWN,
+            },
             body: open.then(|| self.edited_worktrees_view(edited)),
         })
     }
@@ -403,18 +419,36 @@ impl Cagents {
                     design::ROW_ICON_SIZE,
                 ),
             };
-            let mut facts: Vec<Element<'a, Message>> = Vec::with_capacity(4);
+            let mut facts: Vec<Element<'a, Message>> = Vec::with_capacity(6);
             if let Some(pull_request) = indicators.pull_request {
                 facts.push(design::caption(format!("#{}", pull_request.number)).into());
             }
-            match indicators.dirty {
-                Some(dirty) => facts.push(
-                    design::caption(dirty.to_owned())
-                        .class(cosmic::theme::Text::Custom(design::warning_text))
-                        .into(),
+            // The daemon's count includes untracked files, which a worktree
+            // row in Projects may leave out.
+            match edited.changed_paths {
+                Some(0) => facts.push(design::caption("Clean").into()),
+                Some(count) => facts.push(
+                    design::caption(if count == 1 {
+                        "1 change".to_owned()
+                    } else {
+                        format!("{count} changes")
+                    })
+                    .class(cosmic::theme::Text::Custom(design::warning_text))
+                    .into(),
                 ),
-                None if found.is_some() => facts.push(design::caption("Clean").into()),
-                None => facts.push(design::caption("Not open in Projects").into()),
+                None => {}
+            }
+            if let Some(diff) = edited.diff {
+                let counts = crate::repository::line_change_counts(
+                    Some(diff.additions),
+                    Some(diff.deletions),
+                );
+                if !counts.is_empty() {
+                    facts.push(crate::ui_controls::change_counts(&counts));
+                }
+            }
+            if found.is_none() {
+                facts.push(design::caption("Not open in Projects").into());
             }
             if current {
                 facts.push(design::caption(current_fact).into());
@@ -492,7 +526,7 @@ impl Cagents {
     }
 
     fn workspace_pane(&self, width: f32) -> Pane<'_> {
-        let open = self.context_sections.is_open(Section::Workspace);
+        let open = self.workspace_open();
         let view = self.workspace_view();
         let git = !self.active_folder_scope();
         let indicators = git.then(|| self.context_rail_indicators());
@@ -735,19 +769,23 @@ mod tests {
     }
 
     #[test]
-    fn a_collapsed_section_reads_and_polls_nothing() {
+    fn a_workspace_section_with_nothing_above_it_is_shown_and_stays_shown() {
         let mut app = crate::app::tests::context_inspector_test_app(true);
         app.context_inspector_open = true;
         app.context_sections.set_open(Section::Workspace, false);
-        assert_eq!(app.workspace_view_shown(), None);
+        // Left collapsed, it would be one header over an empty panel.
+        assert_eq!(
+            app.workspace_view_shown(),
+            Some(WorkspaceView::SourceControl)
+        );
+        let _ = app.update(Message::ContextSection(Action::Toggle(Section::Workspace)));
+        assert_eq!(
+            app.workspace_view_shown(),
+            Some(WorkspaceView::SourceControl)
+        );
+        assert!(!app.context_sections.is_open(Section::Workspace));
         let _ = app.update(Message::ContextSection(Action::Show(WorkspaceView::Files)));
         assert_eq!(app.workspace_view_shown(), Some(WorkspaceView::Files));
-        let _ = app.update(Message::ContextSection(Action::Toggle(Section::Workspace)));
-        assert_eq!(app.workspace_view_shown(), None);
-        assert!(
-            !app.pull_request_section_open(),
-            "a section with no pull requests to show reads none"
-        );
     }
 
     #[test]
