@@ -321,3 +321,170 @@ fn disabled_switches_keep_their_checked_color_while_dimming() {
     assert_eq!(disabled_on.background, on.background.scale_alpha(0.5));
     assert_ne!(disabled_on.background, disabled_off.background);
 }
+
+#[test]
+fn switches_require_an_owned_press_before_pointer_or_touch_release() {
+    use cosmic::iced::{Point, touch, window};
+
+    let renderer = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(Renderer::new(
+            Font::DEFAULT,
+            Pixels::from(16),
+            Some("tiny-skia"),
+        ))
+        .expect("create a headless renderer");
+    let inside = Point::new(10.0, 10.0);
+    let outside = Point::new(500.0, 100.0);
+    let mouse_press = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+    let mouse_release = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
+    let touch_press = |id, position| Event::Touch(touch::Event::FingerPressed { id, position });
+    let touch_release = |id, position| Event::Touch(touch::Event::FingerLifted { id, position });
+    let finger = touch::Finger(1);
+    let other_finger = touch::Finger(2);
+    let cases = [
+        (
+            "release without press",
+            vec![(mouse_release.clone(), inside)],
+            false,
+        ),
+        (
+            "complete mouse click",
+            vec![
+                (mouse_press.clone(), inside),
+                (mouse_release.clone(), inside),
+            ],
+            true,
+        ),
+        (
+            "mouse press outside",
+            vec![
+                (mouse_press.clone(), outside),
+                (mouse_release.clone(), inside),
+            ],
+            false,
+        ),
+        (
+            "mouse release outside",
+            vec![
+                (mouse_press.clone(), inside),
+                (mouse_release.clone(), outside),
+            ],
+            false,
+        ),
+        (
+            "mouse release consumed once",
+            vec![
+                (mouse_press.clone(), inside),
+                (mouse_release.clone(), inside),
+                (mouse_release.clone(), inside),
+            ],
+            true,
+        ),
+        (
+            "window loses focus",
+            vec![
+                (mouse_press.clone(), inside),
+                (Event::Window(window::Event::Unfocused), inside),
+                (mouse_release.clone(), inside),
+            ],
+            false,
+        ),
+        (
+            "pointer leaves window",
+            vec![
+                (mouse_press, inside),
+                (Event::Mouse(mouse::Event::CursorLeft), outside),
+                (mouse_release, inside),
+            ],
+            false,
+        ),
+        (
+            "touch release without press",
+            vec![(touch_release(finger, inside), outside)],
+            false,
+        ),
+        (
+            "complete touch tap uses touch coordinates",
+            vec![
+                (touch_press(finger, inside), outside),
+                (touch_release(finger, inside), outside),
+            ],
+            true,
+        ),
+        (
+            "touch starts outside",
+            vec![
+                (touch_press(finger, outside), inside),
+                (touch_release(finger, inside), inside),
+            ],
+            false,
+        ),
+        (
+            "touch ends outside",
+            vec![
+                (touch_press(finger, inside), inside),
+                (touch_release(finger, outside), inside),
+            ],
+            false,
+        ),
+        (
+            "unrelated finger cannot release tap",
+            vec![
+                (touch_press(finger, inside), inside),
+                (touch_release(other_finger, inside), inside),
+            ],
+            false,
+        ),
+        (
+            "touch cancellation clears press",
+            vec![
+                (touch_press(finger, inside), inside),
+                (
+                    Event::Touch(touch::Event::FingerLost {
+                        id: finger,
+                        position: inside,
+                    }),
+                    inside,
+                ),
+                (touch_release(finger, inside), inside),
+            ],
+            false,
+        ),
+    ];
+    for enabled in [true, false] {
+        for (name, events, activates) in &cases {
+            let mut element: Element<'_, bool> = field::toggle(false)
+                .label("Show the status bar".to_owned())
+                .on_toggle_maybe(enabled.then_some(|value| value))
+                .into();
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(400.0, 100.0)),
+            );
+            let layout = Layout::new(&node);
+            let mut messages = Vec::new();
+            for (event, pointer) in events {
+                element.as_widget_mut().update(
+                    &mut tree,
+                    event,
+                    layout,
+                    mouse::Cursor::Available(*pointer),
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &layout.bounds(),
+                );
+            }
+            let expected: Vec<bool> = (enabled && *activates)
+                .then_some(true)
+                .into_iter()
+                .collect();
+            assert_eq!(messages, expected, "{name}, enabled={enabled}");
+        }
+    }
+}

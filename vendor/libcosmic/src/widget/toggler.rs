@@ -237,6 +237,7 @@ impl<'a, Message> Widget<Message, crate::Theme, crate::Renderer> for Toggler<'a,
             operation.focusable(Some(&self.id), layout.bounds(), state);
         } else {
             state.unfocus();
+            state.pressed = None;
         }
     }
 
@@ -254,6 +255,7 @@ impl<'a, Message> Widget<Message, crate::Theme, crate::Renderer> for Toggler<'a,
         let state = tree.state.downcast_mut::<State>();
         let Some(on_toggle) = self.on_toggle.as_ref() else {
             state.unfocus();
+            state.pressed = None;
             return;
         };
 
@@ -265,8 +267,23 @@ impl<'a, Message> Widget<Message, crate::Theme, crate::Renderer> for Toggler<'a,
         }
 
         match event {
-            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
-            | Event::Touch(touch::Event::FingerPressed { .. }) => {
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                state.pressed = cursor_position
+                    .is_over(layout.bounds())
+                    .then_some(Press::Mouse);
+                if state.pressed.is_some() {
+                    shell.capture_event();
+                }
+                if state.is_focused {
+                    state.unfocus();
+                    shell.request_redraw();
+                }
+            }
+            Event::Touch(touch::Event::FingerPressed { id, position }) => {
+                if state.pressed.is_none() && layout.bounds().contains(*position) {
+                    state.pressed = Some(Press::Touch(*id));
+                    shell.capture_event();
+                }
                 if state.is_focused {
                     state.unfocus();
                     shell.request_redraw();
@@ -309,14 +326,43 @@ impl<'a, Message> Widget<Message, crate::Theme, crate::Renderer> for Toggler<'a,
                 shell.capture_event();
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
-            | Event::Touch(touch::Event::FingerLifted { .. }) => {
-                let mouse_over = cursor_position.is_over(layout.bounds());
-
-                if mouse_over {
+                if state.pressed == Some(Press::Mouse) =>
+            {
+                state.pressed = None;
+                if cursor_position.is_over(layout.bounds()) {
                     shell.publish((on_toggle)(!self.is_toggled));
                     state.anim.changed(self.duration);
                     state.prev_toggled = !self.is_toggled;
-                    shell.capture_event();
+                }
+                shell.capture_event();
+            }
+            Event::Touch(touch::Event::FingerLifted { id, position })
+                if state.pressed == Some(Press::Touch(*id)) =>
+            {
+                state.pressed = None;
+                if layout.bounds().contains(*position) {
+                    shell.publish((on_toggle)(!self.is_toggled));
+                    state.anim.changed(self.duration);
+                    state.prev_toggled = !self.is_toggled;
+                }
+                shell.capture_event();
+            }
+            Event::Touch(touch::Event::FingerLost { id, .. })
+                if state.pressed == Some(Press::Touch(*id)) =>
+            {
+                state.pressed = None;
+                shell.capture_event();
+            }
+            Event::Mouse(mouse::Event::CursorLeft) => {
+                if state.pressed == Some(Press::Mouse) {
+                    state.pressed = None;
+                }
+            }
+            Event::Window(window::Event::Unfocused) => {
+                state.pressed = None;
+                if state.is_focused {
+                    state.unfocus();
+                    shell.request_redraw();
                 }
             }
             Event::Window(window::Event::RedrawRequested(now)) => {
@@ -564,6 +610,12 @@ pub fn next_to_each_other(
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Press {
+    Mouse,
+    Touch(touch::Finger),
+}
+
 #[derive(Debug, Default)]
 pub struct State {
     text: widget::text::State<<crate::Renderer as iced_core::text::Renderer>::Paragraph>,
@@ -571,6 +623,7 @@ pub struct State {
     prev_toggled: bool,
     hovered: bool,
     is_focused: bool,
+    pressed: Option<Press>,
 }
 
 impl Focusable for State {
