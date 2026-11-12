@@ -1215,17 +1215,46 @@ fn assemble(
     ConversationPullRequests {
         generated_at_unix_ms: now_unix_ms(),
         repository,
-        pull_requests: pull_requests.into_iter().map(|(_, row)| row).collect(),
         transcript: watched.coverage.clone(),
         forge_error,
-        worktrees: project.map_or_else(Vec::new, |project| edited_worktrees(watched, project)),
+        worktrees: facts
+            .zip(project)
+            .map_or_else(Vec::new, |(facts, project)| {
+                edited_worktrees(watched, project, |branch| {
+                    let Resolved::Key(key) = resolve(
+                        &Reference::Branch {
+                            repository: None,
+                            name: branch.to_owned(),
+                        },
+                        facts,
+                        branches,
+                    ) else {
+                        return None;
+                    };
+                    pull_requests
+                        .iter()
+                        .any(|(_, row)| {
+                            row.relation != Relation::Mentioned
+                                && row.number == key.number
+                                && RepoKeyOrd::from(&row.repository) == key.repository
+                        })
+                        .then_some(key.number)
+                })
+            }),
+        pull_requests: pull_requests.into_iter().map(|(_, row)| row).collect(),
     }
 }
 
 /// The project's worktrees holding the directories `watched` edited, most
 /// recently edited first. A directory outside every worktree, such as another
 /// project's, names none.
-fn edited_worktrees(watched: &Watched, project: &ProjectFacts) -> Vec<ConversationWorktree> {
+///
+/// `listed` names the worked-on pull request a branch heads, if any.
+fn edited_worktrees(
+    watched: &Watched,
+    project: &ProjectFacts,
+    listed: impl Fn(&str) -> Option<u64>,
+) -> Vec<ConversationWorktree> {
     edited(watched, project)
         .into_iter()
         .map(|(worktree, edit)| ConversationWorktree {
@@ -1235,6 +1264,7 @@ fn edited_worktrees(watched: &Watched, project: &ProjectFacts) -> Vec<Conversati
             changed_paths: worktree.dirty.as_ref().map(|dirty| dirty.paths),
             // Filled in from what was measured, which the scan does not hold.
             diff: None,
+            pull_request: worktree.branch.as_deref().and_then(&listed),
         })
         .collect()
 }

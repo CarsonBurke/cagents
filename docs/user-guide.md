@@ -180,9 +180,10 @@ still reads at a glance, and the inspector remembers which are expanded.
 - **Pull requests** lists the PRs the focused conversation worked on (see
   [A conversation's pull requests](#a-conversations-pull-requests)). It appears
   once there is one.
-- **Worktrees** lists the worktrees the conversation edited, most recently
-  edited first. Each row shows its branch, uncommitted changes (untracked
-  files included) and their line counts, and its PR. The row for the current
+- **Worktrees** lists the other worktrees the conversation edited, most
+  recently edited first: those whose branch heads no PR it worked on, such as
+  the default branch. Each row shows its branch, uncommitted changes
+  (untracked files included) and their line counts. The row for the current
   worktree says so; choosing another opens it, which moves the workspace to
   that worktree.
 - **Changes** and **Files** share one section, behind a switch in its header,
@@ -448,6 +449,11 @@ its page. Choosing the row opens the PR where **Settings → Open pull requests
 in** says: the review pane, or GitHub. A PR in another repository shows as
 `owner/repo#123`. When GitHub can't be reached, rows keep their last known
 state and say when it was read.
+
+A branch the conversation edited in a worktree is listed once. When the
+branch heads a PR it worked on, the PR's row adds a line for the worktree:
+its branch, uncommitted changes and their line counts. Choose that line to
+open the worktree; the rest of the row opens the PR.
 
 PRs the conversation only mentioned are left out unless **Settings →
 Appearance → Mentioned pull requests** is on. They then follow under

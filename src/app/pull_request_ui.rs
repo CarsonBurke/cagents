@@ -8,6 +8,8 @@ use super::*;
 
 mod conversation;
 
+pub(super) use conversation::{Placement, separated, worktree_facts};
+
 #[derive(Debug, Clone)]
 pub enum Action {
     /// The focused conversation's pull requests changed.
@@ -23,6 +25,9 @@ pub enum Action {
     ShowChecks(Option<(GitHubRepoKey, u64)>),
     /// Open one check's details page.
     OpenCheck(Url),
+    /// Open the worktree at this path, where the conversation edited a
+    /// listed pull request's branch.
+    OpenWorktree(PathBuf),
     /// Show every mentioned pull request, or again only the first few.
     ToggleAllMentions,
 }
@@ -58,6 +63,10 @@ impl Cagents {
                 conversation.show_checks(None);
                 self.open_clicked_link(url)
             }
+            Action::OpenWorktree(path) => match self.open_worktree_message(&path) {
+                Some(open) => self.update(open),
+                None => Task::none(),
+            },
             Action::Open {
                 repository,
                 number,
@@ -144,16 +153,20 @@ impl Cagents {
             .count()
     }
 
-    /// The worktrees the inspected conversation edited, most recently
-    /// edited first.
-    pub(super) fn edited_worktrees(&self) -> &[crate::work::ConversationWorktree] {
-        self.pull_request_inspector.conversation.worktrees()
+    /// The worktrees the inspected conversation edited that no pull
+    /// request row shows, most recently edited first.
+    pub(super) fn edited_worktrees(&self) -> Vec<&crate::work::ConversationWorktree> {
+        self.pull_request_inspector
+            .conversation
+            .worktrees_alone()
+            .collect()
     }
 
     pub(super) fn pull_request_section(&self) -> Element<'_, Message> {
         let list = conversation::view(
             &self.pull_request_inspector.conversation,
             self.settings.show_mentioned_pull_requests,
+            &|worktree| self.worktree_placement(&worktree.path),
         )
         .unwrap_or_else(|| widget::Space::new().height(0).into());
         let content: Element<'_, Action> = widget::scrollable(
@@ -321,6 +334,7 @@ mod tests {
                     additions: 3,
                     deletions: 1,
                 }),
+                pull_request: None,
             }],
             true,
         )));
@@ -355,5 +369,44 @@ mod tests {
         }));
         assert!(!app.checks_popup_open());
         assert!(app.context_inspector_open);
+    }
+
+    #[test]
+    fn a_worktree_shows_once_on_the_row_of_the_pull_request_its_branch_heads() {
+        let (mut app, conversation, _) = conversation_app();
+        app.sync_pull_request_inspector();
+        let worktree = |path: &str, pull_request| crate::work::ConversationWorktree {
+            path: PathBuf::from(path),
+            branch: Some(path.trim_start_matches('/').into()),
+            by_subagent: false,
+            changed_paths: Some(1),
+            diff: None,
+            pull_request,
+        };
+        drop(app.handle_pull_request_ui(listed_with(
+            conversation,
+            1,
+            &[(4, Relation::Created), (5, Relation::Mentioned)],
+            vec![
+                worktree("/on-the-row", Some(4)),
+                worktree("/no-pull-request", None),
+                // Only a worked-on row takes its worktree.
+                worktree("/mentioned", Some(5)),
+            ],
+            true,
+        )));
+        assert_eq!(
+            app.edited_worktrees()
+                .iter()
+                .map(|worktree| worktree.path.to_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["/no-pull-request", "/mentioned"]
+        );
+        // The row's worktree line opens nothing Projects does not list.
+        assert!(
+            !app.worktree_placement(std::path::Path::new("/on-the-row"))
+                .openable
+        );
+        drop(app.handle_pull_request_ui(Action::OpenWorktree(PathBuf::from("/on-the-row"))));
     }
 }

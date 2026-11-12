@@ -370,29 +370,60 @@ impl Cagents {
         })
     }
 
-    /// The worktrees the conversation edited, each with its branch, its
-    /// uncommitted changes and its pull request. Opening one goes to it.
+    /// The project and worktree Projects lists at `path`.
+    fn project_worktree(
+        &self,
+        path: &std::path::Path,
+    ) -> Option<(&sidebar::SidebarProject, &sidebar::SidebarWorktree)> {
+        self.sidebar_model.projects.iter().find_map(|project| {
+            project
+                .worktrees
+                .iter()
+                .find(|worktree| worktree.path == path)
+                .map(|worktree| (project, worktree))
+        })
+    }
+
+    /// Where the edited worktree at `path` stands in this window.
+    pub(super) fn worktree_placement(&self, path: &std::path::Path) -> pull_request_ui::Placement {
+        let current = self
+            .sidebar_state
+            .active_worktree()
+            .is_some_and(|key| key.canonical_path == path);
+        pull_request_ui::Placement {
+            openable: self.project_worktree(path).is_some(),
+            // Point at the workspace section only while it shows the current
+            // worktree; collapsed, the row just marks which one is current.
+            current: current.then(|| {
+                if self.workspace_view_shown().is_some() {
+                    "Shown below"
+                } else {
+                    "Current"
+                }
+            }),
+        }
+    }
+
+    /// Opens the worktree Projects lists at `path`.
+    pub(super) fn open_worktree_message(&self, path: &std::path::Path) -> Option<Message> {
+        let (project, worktree) = self.project_worktree(path)?;
+        Some(Message::Sidebar(SidebarAction::OpenWorktree {
+            project_id: project.id,
+            worktree_id: worktree.id,
+            path: worktree.path.clone(),
+        }))
+    }
+
+    /// The edited worktrees no pull request row shows, each with its branch,
+    /// its uncommitted changes and any pull request Projects knows for it.
+    /// Opening one goes to it.
     fn edited_worktrees_view<'a>(
         &'a self,
-        edited: &'a [crate::work::ConversationWorktree],
+        edited: Vec<&'a crate::work::ConversationWorktree>,
     ) -> Element<'a, Message> {
-        let active = self.sidebar_state.active_worktree();
-        // Point at the workspace section only while it shows the current
-        // worktree; collapsed, the row just marks which one is current.
-        let current_fact = if self.workspace_view_shown().is_some() {
-            "Shown below"
-        } else {
-            "Current"
-        };
-        let rows = edited.iter().map(|edited| {
-            let found = self.sidebar_model.projects.iter().find_map(|project| {
-                project
-                    .worktrees
-                    .iter()
-                    .find(|worktree| worktree.path == edited.path)
-                    .map(|worktree| (project, worktree))
-            });
-            let current = active.is_some_and(|key| key.canonical_path == edited.path);
+        let rows = edited.into_iter().map(|edited| {
+            let found = self.project_worktree(&edited.path);
+            let placement = self.worktree_placement(&edited.path);
             let indicators = found
                 .map(|(_, worktree)| sidebar::worktree_indicators(worktree))
                 .unwrap_or_default();
@@ -419,51 +450,13 @@ impl Cagents {
                     design::ROW_ICON_SIZE,
                 ),
             };
+            // A pull request the conversation did not work on, such as one
+            // merged before it began, is still worth naming.
             let mut facts: Vec<Element<'a, Message>> = Vec::with_capacity(6);
             if let Some(pull_request) = indicators.pull_request {
                 facts.push(design::caption(format!("#{}", pull_request.number)).into());
             }
-            // The daemon's count includes untracked files, which a worktree
-            // row in Projects may leave out.
-            match edited.changed_paths {
-                Some(0) => facts.push(design::caption("Clean").into()),
-                Some(count) => facts.push(
-                    design::caption(if count == 1 {
-                        "1 change".to_owned()
-                    } else {
-                        format!("{count} changes")
-                    })
-                    .class(cosmic::theme::Text::Custom(design::warning_text))
-                    .into(),
-                ),
-                None => {}
-            }
-            if let Some(diff) = edited.diff {
-                let counts = crate::repository::line_change_counts(
-                    Some(diff.additions),
-                    Some(diff.deletions),
-                );
-                if !counts.is_empty() {
-                    facts.push(crate::ui_controls::change_counts(&counts));
-                }
-            }
-            if found.is_none() {
-                facts.push(design::caption("Not open in Projects").into());
-            }
-            if current {
-                facts.push(design::caption(current_fact).into());
-            }
-            if edited.by_subagent {
-                facts.push(design::caption("by a subagent").into());
-            }
-            let separated = facts
-                .into_iter()
-                .enumerate()
-                .flat_map(|(index, fact)| {
-                    let dot = (index > 0).then(|| design::caption("·").into());
-                    dot.into_iter().chain(std::iter::once(fact))
-                })
-                .collect::<Vec<_>>();
+            facts.extend(pull_request_ui::worktree_facts(edited, placement));
             let lines = widget::column::with_children(vec![
                 widget::row::with_children(vec![
                     glyph,
@@ -479,7 +472,7 @@ impl Cagents {
                 .align_y(Alignment::Center)
                 .into(),
                 widget::container(
-                    widget::row::with_children(separated)
+                    widget::row::with_children(pull_request_ui::separated(facts))
                         .spacing(space::XS)
                         .align_y(Alignment::Center)
                         .wrap(),
@@ -491,19 +484,18 @@ impl Cagents {
                 .into(),
             ])
             .spacing(space::XXS);
-            let open = found.map(|(project, worktree)| {
-                Message::Sidebar(SidebarAction::OpenWorktree {
-                    project_id: project.id,
-                    worktree_id: worktree.id,
-                    path: worktree.path.clone(),
-                })
-            });
             let button = widget::button::custom(lines)
                 .name(format!("Open worktree {label}"))
-                .class(crate::ui_controls::control_style(current, None))
+                .class(crate::ui_controls::control_style(
+                    placement.current.is_some(),
+                    None,
+                ))
                 .padding([space::XS, space::S])
                 .width(Length::Fill)
-                .on_press_maybe(open.filter(|_| !self.modal_is_open()));
+                .on_press_maybe(
+                    self.open_worktree_message(&edited.path)
+                        .filter(|_| !self.modal_is_open()),
+                );
             crate::interaction::tooltip(
                 crate::interaction::hover(button),
                 edited.path.display().to_string(),

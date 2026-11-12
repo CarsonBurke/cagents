@@ -11965,6 +11965,12 @@
               "Container": "cagents::work::DiffStat"
             }
           }
+        ],
+        [
+          "pull_request",
+          {
+            "Option": "U64"
+          }
         ]
       ]
     },

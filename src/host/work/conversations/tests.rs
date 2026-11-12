@@ -722,6 +722,20 @@ fn edited_worktrees_are_listed_most_recent_first_and_outside_ones_dropped() {
             ("/w/app", Some("main"), false),
         ]
     );
+    // The feat branch heads #1, which editing it worked on, so the row shows
+    // the worktree; main heads nothing.
+    assert!(
+        list.pull_requests
+            .iter()
+            .any(|row| row.number == 1 && row.relation == Relation::Edited)
+    );
+    assert_eq!(
+        list.worktrees
+            .iter()
+            .map(|worktree| worktree.pull_request)
+            .collect::<Vec<_>>(),
+        vec![Some(1), None]
+    );
     // Editing a directory again is the newest edit, by the conversation
     // itself this time.
     watched.apply(

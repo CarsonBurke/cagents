@@ -576,6 +576,11 @@ pub struct ConversationWorktree {
     /// Lines its uncommitted changes to tracked files add and remove.
     #[serde(default)]
     pub diff: Option<DiffStat>,
+    /// The number of the listed pull request, in the list's repository, that
+    /// its branch heads and the conversation worked on: the same work, which
+    /// the list shows once.
+    #[serde(default)]
+    pub pull_request: Option<u64>,
 }
 
 /// Lines a change adds and removes.

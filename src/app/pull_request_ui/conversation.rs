@@ -115,11 +115,11 @@ impl State {
             .filter(move |row| show_mentions || row.relation.worked_on())
     }
 
-    /// Opens the checks popup of this pull request, or with `None` closes it.
     pub(super) fn checks_popup_open(&self) -> bool {
         self.checks_shown.is_some()
     }
 
+    /// Opens the checks popup of this pull request, or with `None` closes it.
     pub(super) fn show_checks(&mut self, shown: Option<(GitHubRepoKey, u64)>) {
         self.checks_shown = shown;
     }
@@ -135,6 +135,36 @@ impl State {
         self.list
             .as_deref()
             .map_or(&[], |list| list.worktrees.as_slice())
+    }
+
+    /// The edited worktree whose branch `row` heads, shown on the row.
+    fn worktree_of(&self, row: &ConversationPullRequest) -> Option<&ConversationWorktree> {
+        let list = self.list.as_deref()?;
+        if !row.relation.worked_on()
+            || !list
+                .repository
+                .as_ref()
+                .is_some_and(|repository| repository.same_repository(&row.repository))
+        {
+            return None;
+        }
+        list.worktrees
+            .iter()
+            .find(|worktree| worktree.pull_request == Some(row.number))
+    }
+
+    /// The edited worktrees no listed row shows: those whose branch heads
+    /// no pull request the conversation worked on.
+    pub(super) fn worktrees_alone(&self) -> impl Iterator<Item = &ConversationWorktree> + '_ {
+        let shown = self
+            .rows()
+            .iter()
+            .filter_map(|row| self.worktree_of(row))
+            .map(|worktree| worktree.path.as_path())
+            .collect::<Vec<_>>();
+        self.worktrees()
+            .iter()
+            .filter(move |worktree| !shown.contains(&worktree.path.as_path()))
     }
 
     /// Whether the section lists any pull request, or the previous
@@ -255,7 +285,11 @@ impl Drop for HangUpOnDrop {
 }
 
 /// The list, or `None` while the section lists no pull request.
-pub(super) fn view<'a>(state: &'a State, show_mentions: bool) -> Option<Element<'a, Action>> {
+pub(super) fn view<'a>(
+    state: &'a State,
+    show_mentions: bool,
+    place: &dyn Fn(&ConversationWorktree) -> Placement,
+) -> Option<Element<'a, Action>> {
     let list = state.list.as_deref()?;
     let (worked_on, mentioned): (Vec<_>, Vec<_>) = state
         .listed(show_mentions)
@@ -284,7 +318,10 @@ pub(super) fn view<'a>(state: &'a State, show_mentions: bool) -> Option<Element<
             children.push(heading("Worked on", worked_on.len()));
         }
         for row in &worked_on {
-            children.push(worked_on_row(state, list, row));
+            let worktree = state
+                .worktree_of(row)
+                .map(|worktree| (worktree, place(worktree)));
+            children.push(worked_on_row(state, list, row, worktree));
         }
     }
     if !mentioned.is_empty() {
@@ -574,10 +611,116 @@ fn checks_popup<'a>(row: &ConversationPullRequest) -> Element<'a, Action> {
         .into()
 }
 
+/// Where an edited worktree stands in the window.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Placement {
+    /// Open in Projects, so choosing it can go there.
+    pub(crate) openable: bool,
+    /// What its row says when it is the current worktree.
+    pub(crate) current: Option<&'static str>,
+}
+
+/// What a row says about an edited worktree: its uncommitted changes, the
+/// lines they change, and where it stands.
+pub(crate) fn worktree_facts<'a, M: 'a>(
+    worktree: &ConversationWorktree,
+    placement: Placement,
+) -> Vec<Element<'a, M>> {
+    let mut facts: Vec<Element<'a, M>> = Vec::with_capacity(5);
+    // The daemon's count includes untracked files, which a worktree row in
+    // Projects may leave out.
+    match worktree.changed_paths {
+        Some(0) => facts.push(design::caption("Clean").into()),
+        Some(count) => facts.push(
+            design::caption(if count == 1 {
+                "1 change".to_owned()
+            } else {
+                format!("{count} changes")
+            })
+            .class(cosmic::theme::Text::Custom(design::warning_text))
+            .into(),
+        ),
+        None => {}
+    }
+    if let Some(diff) = worktree.diff {
+        let counts =
+            crate::repository::line_change_counts(Some(diff.additions), Some(diff.deletions));
+        if !counts.is_empty() {
+            facts.push(crate::ui_controls::change_counts(&counts));
+        }
+    }
+    if !placement.openable {
+        facts.push(design::caption("Not open in Projects").into());
+    }
+    if let Some(current) = placement.current {
+        facts.push(design::caption(current).into());
+    }
+    if worktree.by_subagent {
+        facts.push(design::caption("by a subagent").into());
+    }
+    facts
+}
+
+/// Facts with a dot between each.
+pub(crate) fn separated<'a, M: 'a>(facts: Vec<Element<'a, M>>) -> Vec<Element<'a, M>> {
+    facts
+        .into_iter()
+        .enumerate()
+        .flat_map(|(index, fact)| {
+            let dot = (index > 0).then(|| design::caption("·").into());
+            dot.into_iter().chain(std::iter::once(fact))
+        })
+        .collect()
+}
+
+/// The line of a pull request's row naming the worktree where the
+/// conversation edited its branch; choosing it opens the worktree.
+fn worktree_line<'a>(worktree: &ConversationWorktree, placement: Placement) -> Element<'a, Action> {
+    let branch = worktree.branch.clone().unwrap_or_else(|| {
+        worktree
+            .path
+            .file_name()
+            .map_or_else(String::new, |name| name.to_string_lossy().into_owned())
+    });
+    let mut parts = vec![
+        crate::ui_controls::passive_icon(
+            crate::sidebar::worktree_icon(),
+            design::COMPACT_ICON_SIZE,
+        ),
+        design::caption(branch.clone())
+            .wrapping(iced::widget::text::Wrapping::None)
+            .into(),
+    ];
+    let facts = worktree_facts(worktree, placement);
+    if !facts.is_empty() {
+        parts.push(design::caption("·").into());
+        parts.extend(separated(facts));
+    }
+    let line = widget::button::custom(
+        widget::row::with_children(parts)
+            .spacing(space::XS)
+            .align_y(Alignment::Center)
+            .wrap(),
+    )
+    .name(format!("Open worktree {branch}"))
+    .class(crate::ui_controls::control_style(false, None))
+    .padding([space::XXS, space::XS])
+    .on_press_maybe(
+        placement
+            .openable
+            .then(|| Action::OpenWorktree(worktree.path.clone())),
+    );
+    crate::interaction::tooltip(
+        crate::interaction::hover(line),
+        worktree.path.display().to_string(),
+    )
+}
+
 fn worked_on_row<'a>(
     state: &State,
     list: &ConversationPullRequests,
     row: &ConversationPullRequest,
+    worktree: Option<(&ConversationWorktree, Placement)>,
 ) -> Element<'a, Action> {
     let name = name(list, row);
     let title = widget::row::with_children(vec![
@@ -624,21 +767,30 @@ fn worked_on_row<'a>(
         }
         None => facts.push(design::caption("State unknown").into()),
     }
-    let lines = widget::column::with_children(vec![
+    let indent = |line: Element<'a, Action>, inset: f32| -> Element<'a, Action> {
+        widget::container(line)
+            .padding(Padding {
+                left: f32::from(design::ROW_ICON_SIZE) + space::S - inset,
+                ..Padding::ZERO
+            })
+            .into()
+    };
+    let mut lines = vec![
         title.into(),
-        widget::container(
+        indent(
             widget::row::with_children(facts)
                 .spacing(space::XS)
                 .align_y(Alignment::Center)
-                .wrap(),
-        )
-        .padding(Padding {
-            left: f32::from(design::ROW_ICON_SIZE) + space::S,
-            ..Padding::ZERO
-        })
-        .into(),
-    ])
-    .spacing(space::XXS);
+                .wrap()
+                .into(),
+            0.0,
+        ),
+    ];
+    if let Some((worktree, placement)) = worktree {
+        // Inset by its own padding, so its text lines up with the facts.
+        lines.push(indent(worktree_line(worktree, placement), space::XS));
+    }
+    let lines = widget::column::with_children(lines).spacing(space::XXS);
     crate::interaction::hover(
         widget::button::custom(lines)
             .name(format!("Open {name}"))
