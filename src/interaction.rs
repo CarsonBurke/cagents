@@ -2274,6 +2274,86 @@ mod tests {
         );
     }
 
+    /// A Work list row is a `button::custom` holding tooltip-bearing
+    /// controls; the tooltip must open at the control, with the camera
+    /// translation of an enclosing workspace card applied once.
+    #[test]
+    fn tooltips_inside_an_offset_button_anchor_to_their_control() {
+        use cosmic::iced::advanced::clipboard;
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let screen = Size::new(600.0, 400.0);
+        let control = Size::new(24.0, 24.0);
+        let mut element: Element<'_, u8> = widget::container(
+            widget::button::custom(
+                widget::row::with_children(vec![
+                    cosmic::iced::widget::Space::new()
+                        .width(100)
+                        .height(24)
+                        .into(),
+                    tooltip(
+                        cosmic::iced::widget::Space::new()
+                            .width(control.width)
+                            .height(control.height),
+                        "Card actions",
+                    ),
+                ])
+                .spacing(8),
+            )
+            .padding(10)
+            .on_press(1),
+        )
+        .padding(cosmic::iced::Padding {
+            left: 140.0,
+            top: 90.0,
+            ..cosmic::iced::Padding::ZERO
+        })
+        .into();
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, screen),
+        );
+        let anchor = Rectangle::new(Point::new(140.0 + 10.0 + 100.0 + 8.0, 90.0 + 10.0), control);
+        let start = Instant::now();
+        let viewport = Rectangle::with_size(screen);
+        for event in [
+            Event::Mouse(mouse::Event::CursorMoved {
+                position: anchor.center(),
+            }),
+            Event::Window(window::Event::RedrawRequested(start + TOOLTIP_DELAY * 2)),
+        ] {
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Available(anchor.center()),
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut Vec::new()),
+                &viewport,
+            );
+        }
+        for camera in [Vector::ZERO, Vector::new(-60.0, 35.0)] {
+            let mut overlay = element
+                .as_widget_mut()
+                .overlay(&mut tree, Layout::new(&node), &renderer, &viewport, camera)
+                .expect("hovering past the delay opens the tooltip");
+            // An overlay group spans the screen; the surface is its child.
+            let tip = overlay
+                .as_overlay_mut()
+                .layout(&renderer, screen)
+                .children()[0]
+                .bounds();
+            let anchor = anchor + camera;
+            assert!(
+                (tip.center_x() - anchor.center_x()).abs() < 0.5
+                    && (tip.y - (anchor.y + anchor.height + TIP_GAP)).abs() < 0.5,
+                "tooltip {tip:?} is not beneath its control {anchor:?}"
+            );
+        }
+    }
+
     use super::*;
     #[test]
     fn an_exclusive_chooser_narrower_than_its_base_hides_the_base_from_the_pointer() {
