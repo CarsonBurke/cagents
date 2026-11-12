@@ -1036,6 +1036,58 @@ impl VerifiedWindow {
         // SAFETY: poll points to one initialized descriptor and does not block.
         unsafe { libc::poll(&mut poll, 1, 0) == 0 }
     }
+
+    /// Signal exactly the pinned process; a reused PID is never addressed.
+    /// False means it had already exited.
+    fn signal(&self, signal: libc::c_int) -> io::Result<bool> {
+        // SAFETY: the pidfd is owned by self, the signal is valid, and a null
+        // siginfo with zero flags is the documented kill(2)-equivalent form.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.pidfd.as_raw_fd(),
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        if result == -1 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error);
+            }
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// Whether the pinned process exited within `timeout`. The kernel closes
+    /// its descriptors, and so releases its slot flock, before the pidfd
+    /// reports the exit.
+    fn wait_exit(&self, timeout: Duration) -> io::Result<bool> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let mut poll = libc::pollfd {
+                fd: self.pidfd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let milliseconds = libc::c_int::try_from(remaining.as_millis()).unwrap_or(i32::MAX);
+            // SAFETY: poll points to one initialized descriptor.
+            match unsafe { libc::poll(&mut poll, 1, milliseconds) } {
+                -1 => {
+                    let error = io::Error::last_os_error();
+                    if error.kind() != io::ErrorKind::Interrupted {
+                        return Err(error);
+                    }
+                }
+                0 if remaining.is_zero() => return Ok(false),
+                0 => {}
+                _ => return Ok(true),
+            }
+        }
+    }
 }
 
 /// Contention alone is not ownership: require the exact exclusive flock in the
@@ -1191,8 +1243,110 @@ pub struct UiUpdateGuard {
     _legacy_fence: OwnedLock,
     prepared: Vec<String>,
     closed: Vec<String>,
+    close: CloseEvidence,
     fallback_executable: Option<PathBuf>,
     restore_policy: WindowRestorePolicy,
+}
+
+/// A committed window is already closing. After this long its update gives
+/// up waiting: Drop reopens without it, and recovery restarts the daemon.
+const COMMITTED_WINDOW_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a saved window that ignored its close deadline has after SIGTERM.
+const SAVED_WINDOW_TERMINATE_GRACE: Duration = Duration::from_secs(5);
+/// SIGKILL cannot be refused; this only bounds the kernel's teardown.
+const SAVED_WINDOW_KILL_REAP: Duration = Duration::from_secs(5);
+
+/// What the update can prove about each window it is closing.
+#[derive(Default)]
+struct CloseEvidence {
+    /// Window processes pinned when the update prepared them, by slot. A
+    /// forced close signals exactly that process, never a reused PID.
+    pinned: Vec<(String, VerifiedWindow)>,
+    /// Slots whose window acknowledged update-commit, with the wall-clock
+    /// millisecond at which the commit was requested. Final-flush evidence
+    /// recorded before that instant belongs to an earlier save.
+    committed: Vec<(String, u64)>,
+}
+
+fn unix_millis_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+fn close_deadline_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        "windows did not finish saving and closing; update cancelled",
+    )
+}
+
+/// End windows that saved their workspace and acknowledged closing but are
+/// still running: SIGTERM to all, one shared grace period, then SIGKILL to
+/// any that remain. Every step is logged to the update job.
+fn end_saved_windows(
+    windows: &[(&str, &VerifiedWindow)],
+    waited: Duration,
+    grace: Duration,
+) -> io::Result<()> {
+    let signal = |slot: &str, window: &VerifiedWindow, signal, name| {
+        window.signal(signal).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "could not send {name} to window {slot} (pid {}): {error}",
+                    window.pid
+                ),
+            )
+        })
+    };
+    let mut running = Vec::with_capacity(windows.len());
+    for &(slot, window) in windows {
+        let pid = window.pid;
+        if signal(slot, window, libc::SIGTERM, "SIGTERM")? {
+            eprintln!(
+                "Window {slot} (pid {pid}) saved its workspace and acknowledged closing, but is still running after {}s; sent SIGTERM.",
+                waited.as_secs()
+            );
+            running.push((slot, window));
+        } else {
+            eprintln!(
+                "Window {slot} (pid {pid}) exited on its own after {}s.",
+                waited.as_secs()
+            );
+        }
+    }
+    let deadline = std::time::Instant::now() + grace;
+    let mut killed = Vec::new();
+    for (slot, window) in running {
+        let pid = window.pid;
+        if window.wait_exit(deadline.saturating_duration_since(std::time::Instant::now()))? {
+            eprintln!("Window {slot} (pid {pid}) exited after SIGTERM.");
+            continue;
+        }
+        if signal(slot, window, libc::SIGKILL, "SIGKILL")? {
+            eprintln!(
+                "Window {slot} (pid {pid}) did not exit within {}s of SIGTERM; sent SIGKILL.",
+                grace.as_secs()
+            );
+            killed.push((slot, window));
+        } else {
+            eprintln!("Window {slot} (pid {pid}) exited after SIGTERM.");
+        }
+    }
+    let deadline = std::time::Instant::now() + SAVED_WINDOW_KILL_REAP;
+    for (slot, window) in killed {
+        let pid = window.pid;
+        if !window.wait_exit(deadline.saturating_duration_since(std::time::Instant::now()))? {
+            return Err(io::Error::other(format!(
+                "window {slot} (pid {pid}) did not exit after SIGKILL"
+            )));
+        }
+        eprintln!("Window {slot} (pid {pid}) exited after SIGKILL.");
+    }
+    Ok(())
 }
 
 impl UiUpdateGuard {
@@ -1287,6 +1441,7 @@ impl UiUpdateGuard {
             runtime,
             prepared: Vec::new(),
             closed: Vec::new(),
+            close: CloseEvidence::default(),
             fallback_executable: None,
             restore_policy: WindowRestorePolicy::Ordinary,
         })
@@ -1322,6 +1477,24 @@ impl UiUpdateGuard {
                 deadline.saturating_duration_since(std::time::Instant::now()),
             )?;
         }
+        // Pin each prepared process now, while its identity is reviewed. A
+        // window that cannot be pinned is never forced closed later.
+        match verified_window_lease_owners_in(&self.runtime, Path::new("/proc")) {
+            Ok(windows) => {
+                self.close.pinned = windows
+                    .into_iter()
+                    .filter_map(|window| {
+                        let slot = slots.iter().find(|slot| {
+                            window.lease_path == self.runtime.join(slot_lock_name(slot))
+                        })?;
+                        Some((slot.clone(), window))
+                    })
+                    .collect();
+            }
+            Err(error) => eprintln!(
+                "Could not identify the prepared window processes: {error}. A window that does not close in time cancels the update."
+            ),
+        }
         Ok(slots)
     }
 
@@ -1331,28 +1504,195 @@ impl UiUpdateGuard {
         slots: &[String],
         timeout: Duration,
     ) -> io::Result<()> {
+        self.close_prepared_windows_with(
+            slots,
+            timeout,
+            crate::diagnostics::ui_final_flush_complete,
+            SAVED_WINDOW_TERMINATE_GRACE,
+        )
+    }
+
+    fn close_prepared_windows_with(
+        &mut self,
+        slots: &[String],
+        timeout: Duration,
+        flushed: impl Fn(u32, u64) -> io::Result<bool>,
+        grace: Duration,
+    ) -> io::Result<()> {
         let deadline = std::time::Instant::now() + timeout;
         for slot in slots {
             // A lost ACK cannot prove that the UI did not accept an irreversible close.
             self.closed.push(slot.clone());
+            let requested = unix_millis_now();
             update_window(
                 &self.runtime,
                 slot,
                 "update-commit",
                 deadline.saturating_duration_since(std::time::Instant::now()),
             )?;
+            self.close.committed.push((slot.clone(), requested));
         }
         while !running_window_slots(&self.runtime)?.is_empty() {
             if std::time::Instant::now() >= deadline {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "windows did not finish saving and closing; update cancelled",
-                ));
+                self.terminate_saved_windows(timeout, &flushed, grace)?;
+                break;
             }
             std::thread::sleep(Duration::from_millis(25));
         }
         self.prepared.clear();
         Ok(())
+    }
+
+    /// At the close deadline, end windows that already saved but did not
+    /// exit. Each must have acknowledged update-commit and then recorded a
+    /// complete final flush; nothing it owns remains unsaved. Any other
+    /// lingering window cancels the update, and every window keeps running.
+    fn terminate_saved_windows(
+        &self,
+        waited: Duration,
+        flushed: &impl Fn(u32, u64) -> io::Result<bool>,
+        grace: Duration,
+    ) -> io::Result<()> {
+        let lingering = running_window_slots(&self.runtime)?;
+        let mut saved = Vec::with_capacity(lingering.len());
+        for slot in &lingering {
+            match self.saved_window(slot, flushed) {
+                Ok(Some(window)) => saved.push((slot.as_str(), window)),
+                Ok(None) => eprintln!("Window {slot} exited at the close deadline."),
+                Err(reason) => {
+                    eprintln!(
+                        "Window {slot} is still open after {}s and {reason}; it keeps running.",
+                        waited.as_secs()
+                    );
+                    return Err(close_deadline_error());
+                }
+            }
+        }
+        end_saved_windows(&saved, waited, grace)?;
+        let remaining = running_window_slots(&self.runtime)?;
+        if !remaining.is_empty() {
+            eprintln!(
+                "Window {} still holds a slot after the saved windows exited.",
+                remaining.join(", ")
+            );
+            return Err(close_deadline_error());
+        }
+        eprintln!("Every window closed; continuing the update.");
+        Ok(())
+    }
+
+    /// The pinned window for `slot` if it is proven to have nothing unsaved,
+    /// or None if that process has already exited and released its slot.
+    fn saved_window(
+        &self,
+        slot: &str,
+        flushed: &impl Fn(u32, u64) -> io::Result<bool>,
+    ) -> Result<Option<&VerifiedWindow>, String> {
+        let Some((_, window)) = self.close.pinned.iter().find(|(s, _)| s == slot) else {
+            return Err("its process was not identified when the update prepared it".into());
+        };
+        // An exit between listing slots and verifying the process is success,
+        // not an unverifiable window: its procfs entries are already gone.
+        let exited = |window: &VerifiedWindow| !window.is_alive();
+        if exited(window) {
+            return Ok(None);
+        }
+        let Some((_, requested)) = self.close.committed.iter().find(|(s, _)| s == slot) else {
+            return Err("did not acknowledge closing".into());
+        };
+        match window.still_owns_lease() {
+            Ok(true) => {}
+            _ if exited(window) => return Ok(None),
+            Ok(false) => return Err("its slot now belongs to a different process".into()),
+            Err(error) => return Err(format!("its process could not be verified: {error}")),
+        }
+        match flushed(window.pid, *requested) {
+            Ok(true) => Ok(Some(window)),
+            Ok(false) => Err("has not reported that its workspace was saved".into()),
+            Err(error) => Err(format!("its save report could not be read: {error}")),
+        }
+    }
+
+    /// Before a daemon restarts after rollback, ensure no committed window
+    /// still holds its slot. A daemon admits only authenticated live windows,
+    /// and a half-exited one fails that check: a daemon restarted beside it
+    /// exits instead of serving. Wait for committed windows, then end those
+    /// that already saved. Windows that never committed are healthy live
+    /// windows of the source and are left alone.
+    pub(crate) fn settle_committed_windows(&self) -> io::Result<()> {
+        self.settle_committed_windows_with(
+            COMMITTED_WINDOW_EXIT_TIMEOUT,
+            crate::diagnostics::ui_final_flush_complete,
+            SAVED_WINDOW_TERMINATE_GRACE,
+        )
+    }
+
+    fn settle_committed_windows_with(
+        &self,
+        timeout: Duration,
+        flushed: impl Fn(u32, u64) -> io::Result<bool>,
+        grace: Duration,
+    ) -> io::Result<()> {
+        match self.wait_for_committed_windows_within(timeout) {
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => {}
+            settled => return settled,
+        }
+        let live = running_window_slots(&self.runtime)?;
+        let mut unsaved = Vec::new();
+        let mut saved = Vec::new();
+        for slot in self.closed.iter().filter(|slot| live.contains(slot)) {
+            match self.saved_window(slot, &flushed) {
+                Ok(Some(window)) => saved.push((slot.as_str(), window)),
+                Ok(None) => {}
+                Err(reason) => {
+                    eprintln!(
+                        "Window {slot} is still closing after {}s and {reason}; it keeps running.",
+                        timeout.as_secs()
+                    );
+                    unsaved.push(slot.as_str());
+                }
+            }
+        }
+        end_saved_windows(&saved, timeout, grace)?;
+        if unsaved.is_empty() {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "window {} is still closing after {}s",
+                    unsaved.join(", "),
+                    timeout.as_secs()
+                ),
+            ))
+        }
+    }
+
+    fn wait_for_committed_windows_within(&self, timeout: Duration) -> io::Result<()> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let live = running_window_slots(&self.runtime)?;
+            let lingering: Vec<_> = self
+                .closed
+                .iter()
+                .filter(|slot| live.contains(slot))
+                .map(String::as_str)
+                .collect();
+            if lingering.is_empty() {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "window {} is still closing after {}s",
+                        lingering.join(", "),
+                        timeout.as_secs()
+                    ),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
     }
 
     /// Finish a staged update without reopening windows that never closed.
@@ -1509,7 +1849,7 @@ impl Drop for UiUpdateGuard {
         // A committed close is already on its bounded LSP teardown path.
         // Wait for that lease before reopening, rather than racing a still-live
         // process and silently losing its relaunch.
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + COMMITTED_WINDOW_EXIT_TIMEOUT;
         while !self.closed.is_empty()
             && running_window_slots(&self.runtime)
                 .is_ok_and(|live| self.closed.iter().any(|slot| live.contains(slot)))
@@ -2780,6 +3120,361 @@ mod tests {
         assert!(verified_editors_in(runtime.path(), processes.path()).is_err());
     }
 
+    fn guard_in(runtime: &Path) -> UiUpdateGuard {
+        UiUpdateGuard {
+            lock: Some(
+                owned_lock(
+                    &runtime.join(format!("{APPLICATION_LOCK_FILE}.update")),
+                    libc::LOCK_EX | libc::LOCK_NB,
+                )
+                .unwrap(),
+            ),
+            runtime: runtime.into(),
+            _legacy_fence: owned_lock(
+                &runtime.join(APPLICATION_LOCK_FILE),
+                libc::LOCK_SH | libc::LOCK_NB,
+            )
+            .unwrap(),
+            prepared: Vec::new(),
+            closed: Vec::new(),
+            close: CloseEvidence::default(),
+            // Drop's reopen of committed slots must never start a real UI.
+            fallback_executable: Some(runtime.join("no-ui-in-tests")),
+            restore_policy: WindowRestorePolicy::Ordinary,
+        }
+    }
+
+    /// A process that holds a window slot lease the way a closing window
+    /// does, optionally ignoring SIGTERM like a window stuck in teardown.
+    struct LingeringWindow(process::Child);
+
+    const LINGERING_LEASE: &str = "CAGENTS_TEST_LINGERING_WINDOW_LEASE";
+    const LINGERING_IGNORES_TERM: &str = "CAGENTS_TEST_LINGERING_WINDOW_IGNORES_TERM";
+    const LINGERING_SOCKET: &str = "CAGENTS_TEST_LINGERING_WINDOW_SOCKET";
+
+    impl LingeringWindow {
+        fn spawn(runtime: &Path, slot: &str, ignores_term: bool) -> Self {
+            Self::spawn_with(runtime, slot, ignores_term, false)
+        }
+
+        /// One that also answers update-prepare and update-commit, as a
+        /// window does before it stalls in teardown.
+        fn spawn_answering(runtime: &Path, slot: &str) -> Self {
+            Self::spawn_with(runtime, slot, false, true)
+        }
+
+        fn spawn_with(runtime: &Path, slot: &str, ignores_term: bool, answers: bool) -> Self {
+            let mut command = process::Command::new(env::current_exe().unwrap());
+            if answers {
+                command.env(LINGERING_SOCKET, runtime.join(slot_socket_name(slot)));
+            }
+            command
+                .args([
+                    "--exact",
+                    "instance::tests::lingering_window_child",
+                    "--include-ignored",
+                ])
+                .env(LINGERING_LEASE, runtime.join(slot_lock_name(slot)))
+                .stdout(process::Stdio::null())
+                .stderr(process::Stdio::null());
+            if ignores_term {
+                command.env(LINGERING_IGNORES_TERM, "1");
+            }
+            let child = Self(command.spawn().unwrap());
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while !running_window_slots(runtime)
+                .unwrap()
+                .iter()
+                .any(|live| live == slot)
+                || (answers && !runtime.join(slot_socket_name(slot)).exists())
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the window never took its slot"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            child
+        }
+
+        fn exit_signal(&mut self) -> Option<i32> {
+            use std::os::unix::process::ExitStatusExt;
+            self.0
+                .try_wait()
+                .unwrap()
+                .and_then(|status| status.signal())
+        }
+    }
+
+    impl Drop for LingeringWindow {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    #[ignore = "child process for saved-window termination tests"]
+    fn lingering_window_child() {
+        let Some(lease) = env::var_os(LINGERING_LEASE) else {
+            return;
+        };
+        if env::var_os(LINGERING_IGNORES_TERM).is_some() {
+            // SAFETY: ignoring a signal installs no handler code.
+            unsafe { libc::signal(libc::SIGTERM, libc::SIG_IGN) };
+        }
+        let _lease = owned_lock(Path::new(&lease), libc::LOCK_EX).unwrap();
+        if let Some(socket) = env::var_os(LINGERING_SOCKET) {
+            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let stream = stream.unwrap();
+                    let _request = read_capped_line(&stream).unwrap();
+                    writeln!(&stream, "ok").unwrap();
+                }
+            });
+        }
+        std::thread::sleep(Duration::from_secs(60));
+    }
+
+    fn pin_committed(guard: &mut UiUpdateGuard, slot: &str) {
+        let window = verified_window_lease_owners_in(&guard.runtime, Path::new("/proc"))
+            .unwrap()
+            .pop()
+            .unwrap();
+        guard.close.pinned.push((slot.into(), window));
+        guard.close.committed.push((slot.into(), 0));
+        guard.closed.push(slot.into());
+    }
+
+    #[test]
+    fn a_window_without_save_evidence_keeps_running_and_cancels_the_update() {
+        let runtime = tempdir().unwrap();
+        let mut guard = guard_in(runtime.path());
+        let mut window = LingeringWindow::spawn(runtime.path(), "second", false);
+        pin_committed(&mut guard, "second");
+        let error = guard
+            .terminate_saved_windows(Duration::from_secs(45), &|_, _| Ok(false), Duration::ZERO)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            window.exit_signal(),
+            None,
+            "an unsaved window is never signalled"
+        );
+        // Unacknowledged commit is equally no proof, even with a flush.
+        guard.close.committed.clear();
+        assert!(
+            guard
+                .terminate_saved_windows(Duration::from_secs(45), &|_, _| Ok(true), Duration::ZERO)
+                .is_err()
+        );
+        assert_eq!(window.exit_signal(), None);
+        // Recovery reports a committed window that never exits, bounded.
+        let error = guard
+            .wait_for_committed_windows_within(Duration::from_millis(100))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("second"), "{error}");
+    }
+
+    #[test]
+    fn a_window_that_exits_while_being_verified_counts_as_closed() {
+        let runtime = tempdir().unwrap();
+        let mut guard = guard_in(runtime.path());
+        let mut window = LingeringWindow::spawn(runtime.path(), "second", false);
+        pin_committed(&mut guard, "second");
+        // It exits after its slot was listed but before it was verified:
+        // its procfs entries vanish, which must not read as unverifiable.
+        window.0.kill().unwrap();
+        window.0.wait().unwrap();
+        let unreadable = |_, _| Err(io::Error::other("no save report"));
+        assert!(matches!(
+            guard.saved_window("second", &unreadable),
+            Ok(None)
+        ));
+        guard.close.committed.clear();
+        assert!(
+            matches!(guard.saved_window("second", &unreadable), Ok(None)),
+            "an exited window needs no commit acknowledgement either"
+        );
+    }
+
+    #[test]
+    fn a_saved_window_that_lingers_is_terminated_and_the_candidate_starts() {
+        let runtime = tempdir().unwrap();
+        let mut guard = guard_in(runtime.path());
+        let mut window = LingeringWindow::spawn(runtime.path(), "second", false);
+        pin_committed(&mut guard, "second");
+        let checked = std::cell::Cell::new(None);
+        guard
+            .terminate_saved_windows(
+                Duration::from_secs(45),
+                &|pid, since| {
+                    checked.set(Some((pid, since)));
+                    Ok(true)
+                },
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        assert_eq!(checked.get(), Some((window.0.id(), 0)));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while window.exit_signal().is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(window.exit_signal(), Some(libc::SIGTERM));
+        assert!(running_window_slots(runtime.path()).unwrap().is_empty());
+        guard
+            .wait_for_committed_windows_within(Duration::from_secs(1))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_window_that_saves_after_commit_but_lingers_is_ended_at_the_close_deadline() {
+        let runtime = tempdir().unwrap();
+        let mut guard = guard_in(runtime.path());
+        let mut window = LingeringWindow::spawn_answering(runtime.path(), "second");
+        let slots = guard.prepare_windows(Duration::from_secs(5)).unwrap();
+        assert_eq!(slots, ["second"]);
+        assert_eq!(
+            guard.close.pinned.len(),
+            1,
+            "prepare pins the window process"
+        );
+        let before_commit = unix_millis_now();
+        let checked = std::cell::Cell::new(None);
+        guard
+            .close_prepared_windows_with(
+                &slots,
+                Duration::from_millis(300),
+                |pid, since| {
+                    checked.set(Some((pid, since)));
+                    // A save recorded before the commit request is no proof;
+                    // this one is recorded after it.
+                    Ok(since >= before_commit)
+                },
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        let (pid, since) = checked
+            .get()
+            .expect("the deadline consults the save report");
+        assert_eq!(pid, window.0.id());
+        assert!(since >= before_commit && since <= unix_millis_now());
+        assert!(guard.prepared.is_empty(), "closing completed");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while window.exit_signal().is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(window.exit_signal(), Some(libc::SIGTERM));
+    }
+
+    #[test]
+    fn a_window_whose_only_save_predates_the_commit_cancels_the_update() {
+        let runtime = tempdir().unwrap();
+        let mut guard = guard_in(runtime.path());
+        let mut window = LingeringWindow::spawn_answering(runtime.path(), "second");
+        let slots = guard.prepare_windows(Duration::from_secs(5)).unwrap();
+        let before_commit = unix_millis_now();
+        let error = guard
+            .close_prepared_windows_with(
+                &slots,
+                Duration::from_millis(300),
+                // The only complete flush was recorded before the commit.
+                |_, since| Ok(since < before_commit),
+                Duration::ZERO,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(window.exit_signal(), None);
+        assert!(
+            !guard.prepared.is_empty(),
+            "the update still owns a prepared window"
+        );
+        // Drop must not wait out a window this test keeps alive.
+        guard.prepared.clear();
+        guard.closed.clear();
+    }
+
+    #[test]
+    fn rollback_ends_a_saved_committed_window_before_the_daemon_restarts() {
+        let runtime = tempdir().unwrap();
+        let mut guard = guard_in(runtime.path());
+        let mut window = LingeringWindow::spawn(runtime.path(), "second", true);
+        pin_committed(&mut guard, "second");
+        guard
+            .settle_committed_windows_with(
+                Duration::from_millis(100),
+                |_, _| Ok(true),
+                Duration::from_millis(200),
+            )
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while window.exit_signal().is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(window.exit_signal(), Some(libc::SIGKILL));
+        assert!(running_window_slots(runtime.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn rollback_leaves_unsaved_and_uncommitted_windows_running() {
+        let runtime = tempdir().unwrap();
+        let mut guard = guard_in(runtime.path());
+        let mut window = LingeringWindow::spawn(runtime.path(), "second", false);
+        pin_committed(&mut guard, "second");
+        let error = guard
+            .settle_committed_windows_with(
+                Duration::from_millis(100),
+                |_, _| Ok(false),
+                Duration::ZERO,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("second"), "{error}");
+        assert_eq!(window.exit_signal(), None);
+        // A commit the window never acknowledged leaves a healthy source
+        // window, even when an older save report exists.
+        guard.close.committed.clear();
+        assert!(
+            guard
+                .settle_committed_windows_with(
+                    Duration::from_millis(100),
+                    |_, _| Ok(true),
+                    Duration::ZERO,
+                )
+                .is_err()
+        );
+        assert_eq!(window.exit_signal(), None);
+        // A window that never received a commit is not awaited at all.
+        guard.closed.clear();
+        guard
+            .settle_committed_windows_with(Duration::from_secs(30), |_, _| Ok(true), Duration::ZERO)
+            .unwrap();
+        assert_eq!(window.exit_signal(), None);
+    }
+
+    #[test]
+    fn a_saved_window_that_ignores_sigterm_is_killed_after_its_grace() {
+        let runtime = tempdir().unwrap();
+        let mut guard = guard_in(runtime.path());
+        let mut window = LingeringWindow::spawn(runtime.path(), "second", true);
+        pin_committed(&mut guard, "second");
+        guard
+            .terminate_saved_windows(
+                Duration::from_secs(45),
+                &|_, _| Ok(true),
+                Duration::from_millis(200),
+            )
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while window.exit_signal().is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(window.exit_signal(), Some(libc::SIGKILL));
+        assert!(running_window_slots(runtime.path()).unwrap().is_empty());
+    }
+
     #[test]
     fn update_guard_sees_no_windows_without_mistaking_its_own_fence_for_a_legacy_ui() {
         let runtime = tempfile::tempdir().unwrap();
@@ -2801,6 +3496,7 @@ mod tests {
             _legacy_fence: legacy,
             prepared: Vec::new(),
             closed: Vec::new(),
+            close: CloseEvidence::default(),
             fallback_executable: None,
             restore_policy: WindowRestorePolicy::Ordinary,
         };
@@ -3094,6 +3790,7 @@ mod tests {
             _legacy_fence: legacy,
             prepared: Vec::new(),
             closed: Vec::new(),
+            close: CloseEvidence::default(),
             fallback_executable: None,
             restore_policy: WindowRestorePolicy::Ordinary,
         };
@@ -3147,6 +3844,7 @@ mod tests {
             runtime: runtime.path().into(),
             prepared: Vec::new(),
             closed: Vec::new(),
+            close: CloseEvidence::default(),
             fallback_executable: None,
             restore_policy: WindowRestorePolicy::Ordinary,
         };
@@ -3221,6 +3919,7 @@ mod tests {
             runtime: runtime.path().into(),
             prepared: vec![],
             closed: vec![],
+            close: CloseEvidence::default(),
             fallback_executable: None,
             restore_policy: WindowRestorePolicy::Ordinary,
         };
@@ -3300,6 +3999,7 @@ mod tests {
             _legacy_fence: legacy,
             prepared: Vec::new(),
             closed: Vec::new(),
+            close: CloseEvidence::default(),
             fallback_executable: None,
             restore_policy: WindowRestorePolicy::Ordinary,
         };

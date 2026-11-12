@@ -829,7 +829,8 @@ listener.bind(sys.argv[2]);listener.listen()
     let saved: UpdateJob =
         serde_json::from_slice(&fs::read(state.join("status.json")).unwrap()).unwrap();
     assert_eq!(saved.phase, UpdatePhase::Failed);
-    assert_eq!(saved.message, error);
+    // The original failure leads; the recovery instruction follows it.
+    assert_eq!(saved.message, format!("{original} {error}"));
     assert!(
         !marker.exists(),
         "Prepared must never reach ordinary daemon start"

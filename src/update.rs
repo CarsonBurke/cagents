@@ -1635,6 +1635,7 @@ fn perform_update(
         }
         Ok(())
     })();
+    announce_primary_failure(&install_result);
     let recovery_result = finish_handoff(
         installation,
         state,
@@ -1995,24 +1996,42 @@ fn record_handoff_failure(
     prepared_report: &str,
 ) -> Result<(), UpdateError> {
     if let Err(error) = result {
-        eprintln!("{error}");
-        job.phase = if matches!(error, UpdateError::Cancelled) {
-            UpdatePhase::Cancelled
-        } else {
-            UpdatePhase::Failed
-        };
-        job.confirmation = None;
-        job.message = error.to_string();
-        if !job.message.contains("Ended or stopped:") {
-            job.message.push_str(recovery_report);
-        }
-        if !job.message.contains("Current turns interrupted:") {
-            job.message.push_str(prepared_report);
-        }
+        record_primary_failure(job, error, recovery_report, prepared_report);
         write_job(state, job)?;
         drop(handoff.take());
     }
     Ok(())
+}
+
+/// Print why the update failed, before any rollback or recovery text, so the
+/// log always leads with the cause. Call once, where the result is settled.
+fn announce_primary_failure(result: &Result<(), UpdateError>) {
+    if let Err(error) = result {
+        eprintln!("{error}");
+    }
+}
+
+/// Lead the job's message with the failure that stopped the update. Recovery
+/// reports are appended to it and never replace it.
+fn record_primary_failure(
+    job: &mut UpdateJob,
+    error: &UpdateError,
+    recovery_report: &str,
+    prepared_report: &str,
+) {
+    job.phase = if matches!(error, UpdateError::Cancelled) {
+        UpdatePhase::Cancelled
+    } else {
+        UpdatePhase::Failed
+    };
+    job.confirmation = None;
+    job.message = error.to_string();
+    if !job.message.contains("Ended or stopped:") {
+        job.message.push_str(recovery_report);
+    }
+    if !job.message.contains("Current turns interrupted:") {
+        job.message.push_str(prepared_report);
+    }
 }
 
 /// Socket evidence is separate from the lease metadata left by an old source.
@@ -2087,6 +2106,14 @@ fn finish_handoff(
 ) -> Result<(), UpdateError> {
     let needed =
         recovery.shutdown_requested || handoff.is_some() || survivors.needs_daemon_recovery();
+    if let Err(error) = result {
+        record_primary_failure(
+            job,
+            error,
+            &survivors.recovery_report(),
+            &survivors.prepared_report(),
+        );
+    }
     let Some(census) = recovery.census.as_ref() else {
         if needed || result.is_ok() {
             return report_recovery_failure(
@@ -2233,6 +2260,13 @@ fn finish_handoff(
     if needed {
         if let Err(error) = survivors.require_normal_restart() {
             return report_recovery_failure(state, job, error);
+        }
+        // The restarted daemon refuses to serve beside a half-exited window.
+        // Settle windows while this job still holds the startup reservation.
+        if let Err(error) = guard.settle_committed_windows() {
+            eprintln!(
+                "Restarting the terminal service while {error}; it may refuse to start until that window exits."
+            );
         }
         let recorded = record_handoff_failure(
             state,
@@ -5074,6 +5108,11 @@ if os.environ['CAGENTS_TEST_RECOVERY_FAILURE']=='start-nonzero-with-service': sy
             );
             assert!(command.contains("daemon recover-update --checkpoint"));
             assert!(command.contains("--yes"));
+            assert!(
+                job.message.starts_with(failure.as_str()),
+                "the cause must lead the target-recovery report: {}",
+                job.message
+            );
             assert_eq!(fs::read(path).unwrap(), bytes);
             assert!(
                 lease.is_none(),
@@ -5203,6 +5242,12 @@ if os.environ['CAGENTS_TEST_RECOVERY_FAILURE']=='start-nonzero-with-service': sy
             "attempt\n"
         );
         if expected_failure {
+            // The cause leads; recovery text follows it rather than replacing it.
+            assert!(
+                job.message.starts_with(failure.as_str()),
+                "{failure}: {}",
+                job.message
+            );
             if failure == "recovery-recording-failure" {
                 assert!(root.path().join("daemon-ready").exists());
                 assert!(HostLease::is_held(&paths).unwrap());
