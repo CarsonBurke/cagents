@@ -4723,15 +4723,36 @@ impl NavigationCache {
 /// The pinned generic Lazy widget does not forward accessibility nodes. Keep
 /// this list's actual element and child Tree together, including named native
 /// state, and use that same child for every widget operation.
+///
+/// An unchanged list costs a frame almost nothing, though it holds every
+/// project, channel and worktree row:
+///
+/// - Its child Tree lives in this widget's own state rather than among its
+///   tree children. The runtime's per-frame sweep of named widget states walks
+///   every tree child, so it never enters the list; the list reconciles its own
+///   named states, among its own widgets, only when it is rebuilt.
+/// - Its layout is kept while the dependency and the limits are unchanged and
+///   nothing inside has asked for a new one. The window's layout holds only the
+///   list's size; every call reaches the rows through the kept layout, placed
+///   where the window put the list.
+///
+/// A named state therefore cannot move between the list and the rest of the
+/// window. None needs to: only the list's scrollable is named on both sides,
+/// when the last project goes, and an empty list has nothing to scroll.
 mod cached_projects {
     use super::SidebarAction;
     use cosmic::{Element, Renderer, Theme, iced};
     use iced::advanced::widget::{Operation, Tree, tree};
     use iced::advanced::{Clipboard, Layout, Shell, Widget, layout, mouse, overlay, renderer};
     use iced::{Event, Length, Rectangle, Size, Vector};
-    use std::cell::RefCell;
 
     type Dependency = (u64, bool, bool);
+
+    #[cfg(test)]
+    thread_local! {
+        /// How many times a list was actually laid out, rather than reused.
+        pub(super) static LAYOUTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
 
     pub(super) fn view<'a>(
         dependency: Dependency,
@@ -4740,21 +4761,91 @@ mod cached_projects {
         Element::new(CachedProjects {
             dependency,
             build: Box::new(build),
-            initial_child: RefCell::new(None),
         })
+    }
+
+    /// The rows' own layout, which the window's layout leaves out.
+    #[cfg(test)]
+    pub(super) fn content_layout(tree: &Tree) -> &layout::Node {
+        &tree
+            .state
+            .downcast_ref::<State>()
+            .layout
+            .as_ref()
+            .unwrap()
+            .node
     }
 
     struct CachedProjects<'a> {
         dependency: Dependency,
         build: Box<dyn Fn() -> Element<'static, SidebarAction> + 'a>,
-        // Tree::new calls state before children. Construct the child from the
-        // exact element just installed in state, without rebuilding its view.
-        initial_child: RefCell<Option<Tree>>,
     }
 
     struct State {
         dependency: Dependency,
         element: Element<'static, SidebarAction>,
+        /// The element's Tree. Kept out of the tree children; see the module.
+        tree: Tree,
+        /// The rows' layout, until they are rebuilt; the window lays the new
+        /// rows out before anything else reaches them.
+        layout: Option<Kept>,
+        /// The rows asked for a new layout. Until the window lays out again,
+        /// they keep using the kept one, as the window keeps using its own.
+        stale: bool,
+    }
+
+    struct Kept {
+        limits: layout::Limits,
+        node: layout::Node,
+    }
+
+    impl Kept {
+        /// The rows' layout, placed where the window laid out the list.
+        fn place<'a>(&'a self, list: Layout<'_>) -> Layout<'a> {
+            Layout::with_offset(list.position() - self.node.bounds().position(), &self.node)
+                .with_virtual_offset(list.virtual_offset())
+        }
+    }
+
+    impl State {
+        /// Reconciles a rebuilt element with the retained Tree, moving named
+        /// states by name as the runtime does for the whole window, but only
+        /// among this list's own widgets. States of rows that are gone are
+        /// dropped with the scope; the window's own extracted states, which
+        /// the runtime is still reconciling around this widget, are put back
+        /// untouched. The old rows' layout goes with them, before the new rows
+        /// are laid out, so the new layout can reuse its memory.
+        fn rebuild(
+            &mut self,
+            dependency: Dependency,
+            mut element: Element<'static, SidebarAction>,
+        ) {
+            use iced::advanced::widget::tree::NAMED;
+            let named = self.tree.take_all_named();
+            let window = NAMED.with(|cell| std::mem::replace(&mut *cell.borrow_mut(), named));
+            self.tree.diff(element.as_widget_mut());
+            iced::runtime::user_interface::restore_cached_named_states(&mut self.tree);
+            NAMED.with(|cell| *cell.borrow_mut() = window);
+            self.element = element;
+            self.dependency = dependency;
+            self.layout = None;
+        }
+    }
+
+    /// Runs `update` and says whether it asked for a new layout, apart from any
+    /// request made before it, which is left as it was.
+    fn requests_layout(
+        shell: &mut Shell<'_, SidebarAction>,
+        update: impl FnOnce(&mut Shell<'_, SidebarAction>),
+    ) -> bool {
+        let mut earlier = false;
+        shell.revalidate_layout(|| earlier = true);
+        update(shell);
+        let requested = shell.is_layout_invalid();
+        if earlier {
+            shell.invalidate_layout();
+        }
+        requested
     }
 
     impl Widget<SidebarAction, Theme, Renderer> for CachedProjects<'_> {
@@ -4764,30 +4855,25 @@ mod cached_projects {
 
         fn state(&self) -> tree::State {
             let element = (self.build)();
-            *self.initial_child.borrow_mut() = Some(Tree::new(&element));
             tree::State::new(State {
                 dependency: self.dependency,
+                tree: Tree::new(&element),
                 element,
+                layout: None,
+                stale: false,
             })
         }
 
         fn children(&self) -> Vec<Tree> {
-            vec![
-                self.initial_child
-                    .borrow_mut()
-                    .take()
-                    .expect("cached project child"),
-            ]
+            Vec::new()
         }
 
         fn diff(&mut self, tree: &mut Tree) {
             let state = tree.state.downcast_mut::<State>();
             if state.dependency != self.dependency {
-                let mut element = (self.build)();
-                tree.children[0].diff(element.as_widget_mut());
-                state.element = element;
-                state.dependency = self.dependency;
+                state.rebuild(self.dependency, (self.build)());
             }
+            crate::reorder::diff_retained(&mut state.tree);
         }
 
         // project_scroll is Fill/Fill in empty, filtered and populated states.
@@ -4805,11 +4891,28 @@ mod cached_projects {
             renderer: &Renderer,
             limits: &layout::Limits,
         ) -> layout::Node {
-            tree.state
-                .downcast_mut::<State>()
-                .element
-                .as_widget_mut()
-                .layout(&mut tree.children[0], renderer, limits)
+            let state = tree.state.downcast_mut::<State>();
+            let kept = match &state.layout {
+                Some(kept) if !state.stale && kept.limits == *limits => kept,
+                _ => {
+                    #[cfg(test)]
+                    LAYOUTS.with(|layouts| layouts.set(layouts.get() + 1));
+                    // Free the stale layout first, as the window frees its own
+                    // before laying out again, so the new one reuses it.
+                    state.layout = None;
+                    let node =
+                        state
+                            .element
+                            .as_widget_mut()
+                            .layout(&mut state.tree, renderer, limits);
+                    state.stale = false;
+                    state.layout.insert(Kept {
+                        limits: *limits,
+                        node,
+                    })
+                }
+            };
+            layout::Node::new(kept.node.size())
         }
 
         fn operate(
@@ -4819,11 +4922,16 @@ mod cached_projects {
             renderer: &Renderer,
             operation: &mut dyn Operation,
         ) {
-            tree.state
-                .downcast_mut::<State>()
-                .element
-                .as_widget_mut()
-                .operate(&mut tree.children[0], layout, renderer, operation);
+            let state = tree.state.downcast_mut::<State>();
+            let Some(kept) = &state.layout else {
+                return;
+            };
+            state.element.as_widget_mut().operate(
+                &mut state.tree,
+                kept.place(layout),
+                renderer,
+                operation,
+            );
         }
 
         fn update(
@@ -4837,20 +4945,30 @@ mod cached_projects {
             shell: &mut Shell<'_, SidebarAction>,
             viewport: &Rectangle,
         ) {
-            tree.state
-                .downcast_mut::<State>()
-                .element
-                .as_widget_mut()
-                .update(
-                    &mut tree.children[0],
+            let State {
+                element,
+                tree: child,
+                layout: Some(kept),
+                stale,
+                ..
+            } = tree.state.downcast_mut::<State>()
+            else {
+                return;
+            };
+            // A row may ask for a new layout, such as a hovered row making
+            // room for its actions.
+            *stale |= requests_layout(shell, |shell| {
+                element.as_widget_mut().update(
+                    child,
                     event,
-                    layout,
+                    kept.place(layout),
                     cursor,
                     renderer,
                     clipboard,
                     shell,
                     viewport,
                 );
+            });
         }
 
         fn mouse_interaction(
@@ -4861,11 +4979,17 @@ mod cached_projects {
             viewport: &Rectangle,
             renderer: &Renderer,
         ) -> mouse::Interaction {
-            tree.state
-                .downcast_ref::<State>()
-                .element
-                .as_widget()
-                .mouse_interaction(&tree.children[0], layout, cursor, viewport, renderer)
+            let state = tree.state.downcast_ref::<State>();
+            let Some(kept) = &state.layout else {
+                return mouse::Interaction::None;
+            };
+            state.element.as_widget().mouse_interaction(
+                &state.tree,
+                kept.place(layout),
+                cursor,
+                viewport,
+                renderer,
+            )
         }
 
         fn draw(
@@ -4878,12 +5002,16 @@ mod cached_projects {
             cursor: mouse::Cursor,
             viewport: &Rectangle,
         ) {
-            tree.state.downcast_ref::<State>().element.as_widget().draw(
-                &tree.children[0],
+            let state = tree.state.downcast_ref::<State>();
+            let Some(kept) = &state.layout else {
+                return;
+            };
+            state.element.as_widget().draw(
+                &state.tree,
                 renderer,
                 theme,
                 style,
-                layout,
+                kept.place(layout),
                 cursor,
                 viewport,
             );
@@ -4895,11 +5023,14 @@ mod cached_projects {
             tree: &Tree,
             cursor: mouse::Cursor,
         ) -> iced_accessibility::A11yTree {
-            tree.state
-                .downcast_ref::<State>()
+            let state = tree.state.downcast_ref::<State>();
+            let Some(kept) = &state.layout else {
+                return iced_accessibility::A11yTree::default();
+            };
+            state
                 .element
                 .as_widget()
-                .a11y_nodes(layout, &tree.children[0], cursor)
+                .a11y_nodes(kept.place(layout), &state.tree, cursor)
         }
 
         fn drag_destinations(
@@ -4909,11 +5040,16 @@ mod cached_projects {
             renderer: &Renderer,
             destinations: &mut iced::advanced::clipboard::DndDestinationRectangles,
         ) {
-            tree.state
-                .downcast_ref::<State>()
-                .element
-                .as_widget()
-                .drag_destinations(&tree.children[0], layout, renderer, destinations);
+            let state = tree.state.downcast_ref::<State>();
+            let Some(kept) = &state.layout else {
+                return;
+            };
+            state.element.as_widget().drag_destinations(
+                &state.tree,
+                kept.place(layout),
+                renderer,
+                destinations,
+            );
         }
 
         fn overlay<'a>(
@@ -4924,17 +5060,111 @@ mod cached_projects {
             viewport: &Rectangle,
             translation: Vector,
         ) -> Option<overlay::Element<'a, SidebarAction, Theme, Renderer>> {
-            tree.state
-                .downcast_mut::<State>()
-                .element
+            let State {
+                element,
+                tree: child,
+                layout: Some(kept),
+                stale,
+                ..
+            } = tree.state.downcast_mut::<State>()
+            else {
+                return None;
+            };
+            element
                 .as_widget_mut()
-                .overlay(
-                    &mut tree.children[0],
-                    layout,
-                    renderer,
-                    viewport,
-                    translation,
-                )
+                .overlay(child, kept.place(layout), renderer, viewport, translation)
+                .map(|content| Watched::element(content, stale))
+        }
+    }
+
+    /// A row's overlay, such as its menu or tooltip, handles events apart from
+    /// the list's `update`. When it asks for a new layout, the rows may have
+    /// changed with it, so the list's kept layout is stale too.
+    struct Watched<'a> {
+        content: overlay::Element<'a, SidebarAction, Theme, Renderer>,
+        stale: &'a mut bool,
+    }
+
+    impl<'a> Watched<'a> {
+        fn element(
+            content: overlay::Element<'a, SidebarAction, Theme, Renderer>,
+            stale: &'a mut bool,
+        ) -> overlay::Element<'a, SidebarAction, Theme, Renderer> {
+            overlay::Element::new(Box::new(Self { content, stale }))
+        }
+    }
+
+    impl overlay::Overlay<SidebarAction, Theme, Renderer> for Watched<'_> {
+        fn layout(&mut self, renderer: &Renderer, bounds: Size) -> layout::Node {
+            self.content.as_overlay_mut().layout(renderer, bounds)
+        }
+
+        fn draw(
+            &self,
+            renderer: &mut Renderer,
+            theme: &Theme,
+            style: &renderer::Style,
+            layout: Layout<'_>,
+            cursor: mouse::Cursor,
+        ) {
+            self.content
+                .as_overlay()
+                .draw(renderer, theme, style, layout, cursor);
+        }
+
+        fn operate(
+            &mut self,
+            layout: Layout<'_>,
+            renderer: &Renderer,
+            operation: &mut dyn Operation,
+        ) {
+            self.content
+                .as_overlay_mut()
+                .operate(layout, renderer, operation);
+        }
+
+        fn update(
+            &mut self,
+            event: &Event,
+            layout: Layout<'_>,
+            cursor: mouse::Cursor,
+            renderer: &Renderer,
+            clipboard: &mut dyn Clipboard,
+            shell: &mut Shell<'_, SidebarAction>,
+        ) {
+            let content = &mut self.content;
+            *self.stale |= requests_layout(shell, |shell| {
+                content
+                    .as_overlay_mut()
+                    .update(event, layout, cursor, renderer, clipboard, shell);
+            });
+        }
+
+        fn mouse_interaction(
+            &self,
+            layout: Layout<'_>,
+            cursor: mouse::Cursor,
+            renderer: &Renderer,
+        ) -> mouse::Interaction {
+            self.content
+                .as_overlay()
+                .mouse_interaction(layout, cursor, renderer)
+        }
+
+        fn overlay<'b>(
+            &'b mut self,
+            layout: Layout<'b>,
+            renderer: &Renderer,
+        ) -> Option<overlay::Element<'b, SidebarAction, Theme, Renderer>> {
+            let stale = &mut *self.stale;
+            self.content
+                .as_overlay_mut()
+                .overlay(layout, renderer)
+                .map(|content| Watched::element(content, stale))
+        }
+
+        fn index(&self) -> f32 {
+            self.content.as_overlay().index()
         }
     }
 }
@@ -12014,6 +12244,8 @@ mod row_interaction {
         drop: Option<(Option<super::SelectionRow>, f32)>,
         hovered: bool,
         focused: bool,
+        /// Whether the last layout narrowed the base row for its actions.
+        revealed: bool,
         header_node: Option<layout::Node>,
         scroll: Option<Box<FilterScrollState>>,
     }
@@ -12363,12 +12595,9 @@ mod row_interaction {
             // row, which is what keeps a reservation out of the resting state.
             let reserve = match self.kind {
                 Kind::Actions { reserve } if reserve > 0.0 => {
-                    let state = tree.state.downcast_ref::<State>();
-                    if state.hovered || state.focused {
-                        reserve
-                    } else {
-                        0.0
-                    }
+                    let state = tree.state.downcast_mut::<State>();
+                    state.revealed = state.hovered || state.focused;
+                    if state.revealed { reserve } else { 0.0 }
                 }
                 _ => 0.0,
             };
@@ -12490,6 +12719,12 @@ mod row_interaction {
             }
             let reserves = matches!(self.kind, Kind::Actions { reserve } if reserve > 0.0);
             let state = tree.state.downcast_mut::<State>();
+            // A focus operation moves focus without a shell to ask for the
+            // relayout that reveals the actions, so lay out what the last
+            // layout did not show on the next event.
+            if reserves && (state.hovered || state.focused) != state.revealed {
+                shell.invalidate_layout();
+            }
             match event {
                 Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
                     state.modifiers = *modifiers
@@ -19620,6 +19855,487 @@ pub(crate) mod tests {
             .collect()
     }
 
+    /// Every bound in a layout, in tree order, to compare two layouts whole.
+    fn layout_bounds(node: &layout::Node, origin: cosmic::iced::Vector, out: &mut Vec<Rectangle>) {
+        let bounds = node.bounds() + origin;
+        out.push(bounds);
+        for child in node.children() {
+            layout_bounds(child, cosmic::iced::Vector::new(bounds.x, bounds.y), out);
+        }
+    }
+
+    /// A kept list layout must be the layout the list would compute afresh.
+    /// Hovering or focusing a row with a quick action narrows its title, so
+    /// the list is driven through pointer moves over every row, and keyboard
+    /// focus onto one, beside an uncached copy fed the same events.
+    #[test]
+    fn cached_project_list_layout_matches_a_fresh_layout_through_hover_and_focus() {
+        use cosmic::iced::{
+            Event, Point, Vector,
+            advanced::{Shell, clipboard, mouse, widget::operation},
+            time::Instant,
+            window,
+        };
+        let renderer = headless_renderer();
+        let model = SidebarModel::ready(SidebarMode::Expanded, vec![display_project()]);
+        let state = expanded_worktree_state();
+        let mut cached = cached_projects::view((1, false, false), || {
+            project_list(&model, &state, false, false)
+        });
+        let mut fresh = project_list(&model, &state, false, false);
+        let mut cached_tree = Tree::new(&cached);
+        let mut fresh_tree = Tree::new(&fresh);
+        let viewport = Rectangle::with_size(Size::new(280.0, 640.0));
+        let limits = layout::Limits::new(Size::ZERO, viewport.size());
+        let bounds = |node: &layout::Node| {
+            let mut out = Vec::new();
+            layout_bounds(node, Vector::ZERO, &mut out);
+            out
+        };
+        let mut cached_node = cached
+            .as_widget_mut()
+            .layout(&mut cached_tree, &renderer, &limits);
+        let mut fresh_node = fresh
+            .as_widget_mut()
+            .layout(&mut fresh_tree, &renderer, &limits);
+        assert_eq!(
+            bounds(cached_projects::content_layout(&cached_tree)),
+            bounds(&fresh_node)
+        );
+        let rows: Vec<Point> = {
+            let nodes = cached.as_widget().a11y_nodes(
+                Layout::new(&cached_node),
+                &cached_tree,
+                mouse::Cursor::Unavailable,
+            );
+            nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .filter_map(|node| node.node().bounds())
+                .map(|rect| Point::new((rect.x1 - 4.0) as f32, ((rect.y0 + rect.y1) / 2.0) as f32))
+                .collect()
+        };
+        assert!(rows.len() > 4, "the fixture lists several rows");
+        let mut relaid = 0;
+        let mut messages = Vec::new();
+        for (step, at) in rows
+            .into_iter()
+            .chain([Point::new(-10.0, -10.0)])
+            .enumerate()
+        {
+            let event = Event::Mouse(mouse::Event::CursorMoved { position: at });
+            let before = bounds(cached_projects::content_layout(&cached_tree));
+            let mut invalid = [false; 2];
+            for (index, (element, tree, node)) in [
+                (&mut cached, &mut cached_tree, &cached_node),
+                (&mut fresh, &mut fresh_tree, &fresh_node),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let mut shell = Shell::new(&mut messages);
+                element.as_widget_mut().update(
+                    tree,
+                    &event,
+                    Layout::new(node),
+                    mouse::Cursor::Available(at),
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut shell,
+                    &viewport,
+                );
+                invalid[index] = shell.is_layout_invalid();
+            }
+            assert_eq!(
+                invalid[0], invalid[1],
+                "step {step} reports the same relayout"
+            );
+            cached_node = cached
+                .as_widget_mut()
+                .layout(&mut cached_tree, &renderer, &limits);
+            fresh_node = fresh
+                .as_widget_mut()
+                .layout(&mut fresh_tree, &renderer, &limits);
+            assert_eq!(
+                bounds(cached_projects::content_layout(&cached_tree)),
+                bounds(&fresh_node),
+                "step {step}"
+            );
+            relaid += usize::from(bounds(cached_projects::content_layout(&cached_tree)) != before);
+        }
+        assert!(
+            relaid > 0,
+            "hovering a row with a quick action relays the list"
+        );
+
+        // Keyboard focus onto a channel row reveals its quick action too. The
+        // window moves focus with an operation, which has no shell, and then
+        // redraws: that redraw must ask for the layout that reveals it.
+        let channel = ChannelId::from_uuid(Uuid::from_u128(91));
+        let focus = selection_row_focus_id(SelectionRow::Channel(channel));
+        for (element, tree, node) in [
+            (&mut cached, &mut cached_tree, &cached_node),
+            (&mut fresh, &mut fresh_tree, &fresh_node),
+        ] {
+            element.as_widget_mut().operate(
+                tree,
+                Layout::new(node),
+                &renderer,
+                &mut operation::focusable::focus::<()>(focus.clone()),
+            );
+            let mut shell = Shell::new(&mut messages);
+            element.as_widget_mut().update(
+                tree,
+                &Event::Window(window::Event::RedrawRequested(Instant::now())),
+                Layout::new(node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut shell,
+                &viewport,
+            );
+            assert!(shell.is_layout_invalid(), "the redraw after focus relays");
+        }
+        let before = bounds(cached_projects::content_layout(&cached_tree));
+        cached_node = cached
+            .as_widget_mut()
+            .layout(&mut cached_tree, &renderer, &limits);
+        fresh_node = fresh
+            .as_widget_mut()
+            .layout(&mut fresh_tree, &renderer, &limits);
+        assert_eq!(
+            bounds(cached_projects::content_layout(&cached_tree)),
+            bounds(&fresh_node)
+        );
+        assert_ne!(
+            bounds(cached_projects::content_layout(&cached_tree)),
+            before,
+            "focus reveals the channel's action"
+        );
+    }
+
+    /// An unchanged list is neither swept for named states nor laid out
+    /// again, while a widget before it may still ask the window to relayout.
+    #[test]
+    fn unchanged_cached_project_list_skips_the_named_sweep_and_layout() {
+        use cosmic::iced::{
+            Event, Point,
+            advanced::{Shell, clipboard, mouse},
+        };
+        let renderer = headless_renderer();
+        let model = SidebarModel::ready(SidebarMode::Expanded, vec![display_project()]);
+        let state = expanded_worktree_state();
+        let make = |generation| {
+            cached_projects::view((generation, false, false), || {
+                project_list(&model, &state, false, false)
+            })
+        };
+        let mut element = make(1);
+        let mut tree = Tree::new(&element);
+        let limits = layout::Limits::new(Size::ZERO, Size::new(280.0, 640.0));
+        let layouts = || cached_projects::LAYOUTS.with(std::cell::Cell::get);
+        let start = layouts();
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        assert!(
+            tree.take_all_named().is_empty(),
+            "the runtime's sweep does not enter the list"
+        );
+        for _ in 0..3 {
+            element = make(1);
+            tree.diff(element.as_widget_mut());
+            drop(
+                element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits),
+            );
+        }
+        assert_eq!(layouts() - start, 1, "an unchanged list keeps its layout");
+
+        // An event the rows ignore leaves a pending window relayout pending.
+        let mut messages = Vec::new();
+        let mut shell = Shell::new(&mut messages);
+        shell.invalidate_layout();
+        element.as_widget_mut().update(
+            &mut tree,
+            &Event::Mouse(mouse::Event::CursorMoved {
+                position: Point::new(-10.0, -10.0),
+            }),
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut shell,
+            &Rectangle::with_size(Size::new(280.0, 640.0)),
+        );
+        assert!(shell.is_layout_invalid());
+        drop(
+            element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits),
+        );
+        assert_eq!(
+            layouts() - start,
+            1,
+            "another widget's relayout keeps the list's"
+        );
+
+        drop(element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(320.0, 640.0)),
+        ));
+        assert_eq!(layouts() - start, 2, "new limits lay the list out again");
+        element = make(2);
+        tree.diff(element.as_widget_mut());
+        drop(element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(320.0, 640.0)),
+        ));
+        assert_eq!(layouts() - start, 3, "a rebuilt list is laid out again");
+    }
+
+    /// A row's overlay, such as its menu, handles events apart from the list's
+    /// own update. When it asks for a new layout, the list lays its rows out
+    /// again too, and still reports the request to the window.
+    #[test]
+    fn cached_project_list_relays_when_a_row_overlay_asks() {
+        use cosmic::iced::{
+            Event, Length, Point, Vector,
+            advanced::{Clipboard, Shell, Widget, clipboard, mouse, overlay, renderer},
+        };
+        use cosmic::{Renderer, Theme};
+
+        /// A row whose overlay asks for a new layout on every event.
+        struct Row;
+        struct Menu;
+        impl Widget<SidebarAction, Theme, Renderer> for Row {
+            fn size(&self) -> Size<Length> {
+                Size::new(Length::Fill, Length::Fixed(20.0))
+            }
+            fn layout(
+                &mut self,
+                _: &mut Tree,
+                _: &Renderer,
+                limits: &layout::Limits,
+            ) -> layout::Node {
+                layout::Node::new(limits.resolve(Length::Fill, Length::Fixed(20.0), Size::ZERO))
+            }
+            fn draw(
+                &self,
+                _: &Tree,
+                _: &mut Renderer,
+                _: &Theme,
+                _: &renderer::Style,
+                _: Layout<'_>,
+                _: mouse::Cursor,
+                _: &Rectangle,
+            ) {
+            }
+            fn overlay<'a>(
+                &'a mut self,
+                _: &'a mut Tree,
+                _: Layout<'a>,
+                _: &Renderer,
+                _: &Rectangle,
+                _: Vector,
+            ) -> Option<overlay::Element<'a, SidebarAction, Theme, Renderer>> {
+                Some(overlay::Element::new(Box::new(Menu)))
+            }
+        }
+        impl overlay::Overlay<SidebarAction, Theme, Renderer> for Menu {
+            fn layout(&mut self, _: &Renderer, bounds: Size) -> layout::Node {
+                layout::Node::new(bounds)
+            }
+            fn draw(
+                &self,
+                _: &mut Renderer,
+                _: &Theme,
+                _: &renderer::Style,
+                _: Layout<'_>,
+                _: mouse::Cursor,
+            ) {
+            }
+            fn update(
+                &mut self,
+                _: &Event,
+                _: Layout<'_>,
+                _: mouse::Cursor,
+                _: &Renderer,
+                _: &mut dyn Clipboard,
+                shell: &mut Shell<'_, SidebarAction>,
+            ) {
+                shell.invalidate_layout();
+            }
+        }
+
+        let renderer = headless_renderer();
+        let viewport = Rectangle::with_size(Size::new(280.0, 640.0));
+        let limits = layout::Limits::new(Size::ZERO, viewport.size());
+        let mut element = cached_projects::view((1, false, false), || Element::new(Row));
+        let mut tree = Tree::new(&element);
+        let layouts = || cached_projects::LAYOUTS.with(std::cell::Cell::get);
+        let start = layouts();
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        drop(
+            element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits),
+        );
+        assert_eq!(layouts() - start, 1);
+
+        let mut messages = Vec::new();
+        let mut shell = Shell::new(&mut messages);
+        {
+            let mut menu = element
+                .as_widget_mut()
+                .overlay(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &viewport,
+                    Vector::ZERO,
+                )
+                .expect("the row's overlay is forwarded");
+            let menu_node = menu.as_overlay_mut().layout(&renderer, viewport.size());
+            menu.as_overlay_mut().update(
+                &Event::Mouse(mouse::Event::CursorMoved {
+                    position: Point::new(4.0, 4.0),
+                }),
+                Layout::new(&menu_node),
+                mouse::Cursor::Available(Point::new(4.0, 4.0)),
+                &renderer,
+                &mut clipboard::Null,
+                &mut shell,
+            );
+        }
+        assert!(shell.is_layout_invalid(), "the window lays out again");
+        drop(
+            element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits),
+        );
+        assert_eq!(layouts() - start, 2, "and so does the list");
+    }
+
+    /// A pane drag that is cancelled while it highlights a channel, as when a
+    /// modal opens, clears the highlight from the cached list's rows too.
+    #[test]
+    fn cancelled_channel_drag_clears_highlights_in_the_cached_list() {
+        use crate::reorder::channel_gesture_tests::{Highlighted, cancelling, highlight};
+        let renderer = headless_renderer();
+        let model = SidebarModel::ready(SidebarMode::Expanded, vec![display_project()]);
+        let state = expanded_worktree_state();
+        let make = || {
+            cached_projects::view((1, false, false), || {
+                project_list(&model, &state, false, false)
+            })
+        };
+        let mut element = make();
+        let mut tree = Tree::new(&element);
+        let limits = layout::Limits::new(Size::ZERO, Size::new(280.0, 640.0));
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        let highlighted = |element: &mut Element<'_, SidebarAction>, tree: &mut Tree| {
+            let mut count = Highlighted::default();
+            element
+                .as_widget_mut()
+                .operate(tree, Layout::new(&node), &renderer, &mut count);
+            count.0
+        };
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut highlight(ChannelId::from_uuid(Uuid::from_u128(91))),
+        );
+        assert_eq!(highlighted(&mut element, &mut tree), 1);
+        element = make();
+        tree.diff(element.as_widget_mut());
+        assert_eq!(
+            highlighted(&mut element, &mut tree),
+            1,
+            "an ordinary frame keeps the highlight"
+        );
+        element = make();
+        cancelling(|| tree.diff(element.as_widget_mut()));
+        assert_eq!(highlighted(&mut element, &mut tree), 0);
+    }
+
+    /// The list reconciles its own named states when it is rebuilt, so a
+    /// focused row stays focused when it moves, as it does when a project
+    /// before it is added.
+    #[test]
+    fn rebuilt_cached_project_list_keeps_a_moved_row_focused() {
+        use cosmic::iced::advanced::widget::operation;
+        #[derive(Default)]
+        struct Focused(Option<Id>);
+        impl operation::Operation for Focused {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn operation::Operation)) {
+                operate(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&Id>,
+                _bounds: Rectangle,
+                state: &mut dyn operation::Focusable,
+            ) {
+                if state.is_focused() {
+                    self.0 = id.cloned();
+                }
+            }
+        }
+        let renderer = headless_renderer();
+        let state = expanded_worktree_state();
+        let mut other = project();
+        other.id = project_id(7);
+        other.name = "Another".into();
+        other.repository = "/repo/another".into();
+        for worktree in &mut other.worktrees {
+            worktree.id = WorktreeId::new();
+            worktree.path = PathBuf::from("/repo/another").join(worktree.path.file_name().unwrap());
+        }
+        other.channels.clear();
+        other.pull_requests.clear();
+        let before = SidebarModel::ready(SidebarMode::Expanded, vec![display_project()]);
+        let after = SidebarModel::ready(SidebarMode::Expanded, vec![other, display_project()]);
+        let limits = layout::Limits::new(Size::ZERO, Size::new(280.0, 900.0));
+        let mut element = cached_projects::view((1, false, false), || {
+            project_list(&before, &state, false, false)
+        });
+        let mut tree = Tree::new(&element);
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        let focus = selection_row_focus_id(SelectionRow::Channel(ChannelId::from_uuid(
+            Uuid::from_u128(91),
+        )));
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::focusable::focus::<()>(focus.clone()),
+        );
+        let mut element = cached_projects::view((2, false, false), || {
+            project_list(&after, &state, false, false)
+        });
+        tree.diff(element.as_widget_mut());
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        let mut focused = Focused::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut focused);
+        assert_eq!(focused.0, Some(focus));
+    }
+
     #[test]
     fn cached_project_list_preserves_actual_accessibility_press_focus_and_overlay_state() {
         use cosmic::iced::{
@@ -19642,6 +20358,22 @@ pub(crate) mod tests {
                 if state.is_focused() {
                     self.0 = id.cloned();
                 }
+            }
+        }
+        /// Whether an operation, which is how native focus, scrolling and
+        /// accessibility find a widget, reaches the given focusable ID.
+        struct Reaches(Id, bool);
+        impl operation::Operation for Reaches {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn operation::Operation)) {
+                operate(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&Id>,
+                _bounds: Rectangle,
+                _state: &mut dyn operation::Focusable,
+            ) {
+                self.1 |= id == Some(&self.0);
             }
         }
         let renderer = headless_renderer();
@@ -19677,8 +20409,12 @@ pub(crate) mod tests {
             .as_widget_mut()
             .layout(&mut tree, &renderer, &limits);
         assert_eq!(builds.get(), 1);
+        let mut reaches = Reaches(id.clone(), false);
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut reaches);
         assert!(
-            tree.find(&id).is_some(),
+            reaches.1,
             "native ID traversal reaches the actual cached child"
         );
         let nodes =
@@ -19774,7 +20510,11 @@ pub(crate) mod tests {
             .find(|n| n.node().label() == Some(name.as_str()))
             .unwrap();
         assert_eq!(retained.id(), &ax_id);
-        assert!(tree.find(&id).is_some());
+        let mut reaches = Reaches(id.clone(), false);
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut reaches);
+        assert!(reaches.1);
         let mut focus = Focus::default();
         element
             .as_widget_mut()
