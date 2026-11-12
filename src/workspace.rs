@@ -211,6 +211,13 @@ impl StripGeometry {
             .map(|card| card.width.resolve(viewport_width, config.width_limits))
             .sum::<f32>();
         let expand = cards.len() > 1 && preferred_total > 0.0 && preferred_total < available;
+        // Panes that overflow the viewport scroll, and a pane too narrow to be
+        // readable there fills the viewport instead: the strip then pages one
+        // pane at a time rather than resting with a pane half on screen, laid
+        // out wider than the part of it that shows. Stored preferences are
+        // untouched, so the narrow width returns once everything fits again.
+        let overflow = cards.len() > 1 && preferred_total > available;
+        let readable = config.width_limits.minimum.min(available);
 
         for (index, card) in cards.iter().enumerate() {
             let start = cursor;
@@ -222,7 +229,12 @@ impl StripGeometry {
                 card.width.resolve(viewport_width, config.width_limits) / preferred_total
                     * available
             } else {
-                card.width.resolve(viewport_width, config.width_limits)
+                let width = card.width.resolve(viewport_width, config.width_limits);
+                if overflow && width < readable {
+                    available
+                } else {
+                    width
+                }
             };
             let end = if expand && index + 1 == cards.len() {
                 // Absorb rounding at the outer edge, avoiding a fractional
@@ -756,6 +768,25 @@ impl Workspace {
             visible_width
         }
     }
+    /// The next width preset for `id` that changes how wide it is drawn.
+    ///
+    /// Presets narrower than a readable pane are skipped: beside panes that
+    /// overflow the viewport they would fill it, so a press would visibly do
+    /// nothing or jump to full width.
+    pub fn next_width_preset(&self, id: CardId) -> Option<CardWidth> {
+        let current = self.card(id)?.width;
+        let limits = self.config.width_limits;
+        let readable = limits.minimum.min(self.viewport_width);
+        let mut next = current.next_preset();
+        for _ in 0..4 {
+            if next.resolve(self.viewport_width, limits) >= readable {
+                return Some(next);
+            }
+            next = next.next_preset();
+        }
+        Some(current.next_preset())
+    }
+
     pub fn fractional_width_limits(&self) -> WidthLimits {
         let available = self.viewport_width;
         let maximum = if available > 0.0 {
@@ -2281,7 +2312,7 @@ mod tests {
 
     #[test]
     fn the_card_at_the_viewport_edge_follows_the_camera() {
-        let mut filled = workspace_with_widths(&[CardWidth::Fraction(0.5); 4], 800.0);
+        let mut filled = workspace_with_widths(&[CardWidth::Fraction(0.5); 4], 1_000.0);
         let cards: Vec<_> = filled
             .geometry()
             .cards()
@@ -2290,9 +2321,9 @@ mod tests {
             .collect();
         // Unscrolled, the second of four half-width cards meets the edge.
         assert_eq!(filled.card_at_viewport_edge(), Some(cards[1]));
-        filled.camera.jump_to(200.0);
+        filled.camera.jump_to(250.0);
         assert_eq!(filled.card_at_viewport_edge(), None);
-        filled.camera.jump_to(400.0);
+        filled.camera.jump_to(500.0);
         assert_eq!(filled.card_at_viewport_edge(), Some(cards[2]));
 
         let underfilled = workspace_with_widths(&[CardWidth::Fraction(0.3); 2], 800.0);
@@ -2610,7 +2641,7 @@ mod tests {
     }
 
     #[test]
-    fn cycled_fractional_columns_use_the_actual_viewport_without_peek_or_width_clamps() {
+    fn cycled_fractional_columns_use_the_actual_viewport_and_fill_it_when_unreadable() {
         let mut workspace = workspace_with_widths(&[CardWidth::Fraction(0.61)], 320.0);
         let id = workspace.focused().unwrap();
         workspace
@@ -2624,13 +2655,68 @@ mod tests {
             for fraction in [2.0 / 3.0, 1.0, 1.0 / 3.0, 0.5, 2.0 / 3.0] {
                 let next = workspace.card(id).unwrap().width.next_preset();
                 workspace.set_card_width(id, next).unwrap();
-                assert!(
-                    (workspace.geometry().card(id).unwrap().width() - viewport * fraction).abs()
-                        < 0.001
-                );
+                // Beside the full-width pane the strip overflows, so a preset
+                // too narrow to read fills it rather than resting half shown.
+                let expected = if viewport * fraction < 480.0_f32.min(viewport) {
+                    viewport
+                } else {
+                    viewport * fraction
+                };
+                assert!((workspace.geometry().card(id).unwrap().width() - expected).abs() < 0.001);
                 assert_eq!(workspace.focused(), Some(id));
             }
         }
+    }
+
+    #[test]
+    fn a_narrow_strip_pages_whole_panes_instead_of_resting_on_half_of_one() {
+        // A 1500px window with the sidebar and the inspector docked leaves an
+        // 850px strip. A chat kept at half width and a pane opened at full
+        // width used to rest as 425px of chat beside the first 425px of an
+        // 850px pane, its text and switches cut off at the strip's edge.
+        let mut workspace =
+            workspace_with_widths(&[CardWidth::Fraction(0.5), CardWidth::Fraction(1.0)], 850.0);
+        let [chat, settings] = [workspace.cards()[0].id, workspace.cards()[1].id];
+        for focused in [chat, settings, chat] {
+            workspace.focus(focused).unwrap();
+            workspace.tick(Duration::from_secs(2));
+            let offset = workspace.camera().offset();
+            for card in workspace.geometry().cards() {
+                let shown = (card.end.min(offset + 850.0) - card.start.max(offset)).max(0.0);
+                assert!(
+                    shown == 0.0 || (shown - card.width()).abs() < 0.5,
+                    "{:?} rests {shown}px of {}px on screen",
+                    card.id,
+                    card.width()
+                );
+            }
+            assert_eq!(workspace.geometry().card(focused).unwrap().width(), 850.0);
+        }
+        // Wide enough for both, each returns to its own width.
+        workspace.resize_viewport(1_700.0);
+        assert_eq!(workspace.geometry().card(chat).unwrap().width(), 850.0);
+        assert_eq!(workspace.cards()[0].width, CardWidth::Fraction(0.5));
+    }
+
+    #[test]
+    fn cycling_skips_presets_too_narrow_to_read() {
+        let mut workspace =
+            workspace_with_widths(&[CardWidth::Fraction(1.0), CardWidth::Fraction(1.0)], 850.0);
+        let id = workspace.cards()[0].id;
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            let next = workspace.next_width_preset(id).unwrap();
+            workspace.set_card_width(id, next).unwrap();
+            seen.push(workspace.card(id).unwrap().width);
+        }
+        assert_eq!(
+            seen,
+            [
+                CardWidth::Fraction(2.0 / 3.0),
+                CardWidth::Fraction(1.0),
+                CardWidth::Fraction(2.0 / 3.0),
+            ]
+        );
     }
 
     #[test]
@@ -2662,7 +2748,11 @@ mod tests {
         workspace
             .add_card(card(CardWidth::Fraction(1.0)), 3, false)
             .unwrap();
-        assert_eq!(workspace.geometry().cards()[0].width(), 240.0);
+        // Beside a full-width pane the strip overflows, and a 240px pane is
+        // too narrow to rest half on screen beside it: it fills the strip,
+        // keeping its stored fraction for when everything fits again.
+        assert_eq!(workspace.geometry().cards()[0].width(), 1_152.0);
+        assert_eq!(workspace.cards()[0].width, CardWidth::Fraction(0.2));
         assert!(workspace.geometry().max_offset(1_200.0) > 0.0);
         workspace.resize_viewport(0.0);
         assert!(
@@ -2873,7 +2963,7 @@ mod tests {
 
     #[test]
     fn focus_navigation_stops_at_edges_and_close_keeps_focus_valid() {
-        let mut workspace = workspace_with_widths(&[CardWidth::Fraction(0.6); 3], 700.0);
+        let mut workspace = workspace_with_widths(&[CardWidth::Fraction(0.6); 3], 900.0);
         let ids: Vec<_> = workspace.order().collect();
         workspace.focus_adjacent(FocusDirection::Left).unwrap();
         assert_eq!(workspace.focused(), Some(ids[0]));

@@ -4952,7 +4952,12 @@ impl Cagents {
         )
         .width(Length::Fill)
         .height(STATUS_BAR_HEIGHT - design::BORDER_WIDTH)
-        .padding(Padding::from([0.0, space::S]))
+        // The rule above runs to the window edge; the trailing control stays
+        // out of the resize border.
+        .padding(Padding {
+            right: space::S + self.trailing_edge_inset(),
+            ..Padding::from([0.0, space::S])
+        })
         .align_y(Alignment::Center);
         Some(
             widget::column::with_children(vec![design::horizontal_rule(), bar.into()])
