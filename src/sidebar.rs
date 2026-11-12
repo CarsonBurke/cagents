@@ -12265,6 +12265,9 @@ mod row_interaction {
         drop: Option<(Option<super::SelectionRow>, f32)>,
         hovered: bool,
         focused: bool,
+        /// Whether any control in the row has focus, such as its delete
+        /// button, not only the row's own target.
+        focus_within: bool,
         /// Whether the last layout narrowed the base row for its actions.
         revealed: bool,
         /// Whether something in the row, such as a menu, was open the last
@@ -12295,7 +12298,7 @@ mod row_interaction {
     }
 
     #[derive(Default)]
-    struct FocusWithin(bool, Option<Id>, Option<Rectangle>);
+    struct FocusWithin(bool, Option<Id>, Option<Rectangle>, bool);
 
     impl Operation for FocusWithin {
         fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
@@ -12308,6 +12311,7 @@ mod row_interaction {
             bounds: Rectangle,
             state: &mut dyn operation::Focusable,
         ) {
+            self.3 |= state.is_focused();
             if self.1.as_ref().is_none_or(|target| Some(target) == id) {
                 self.0 |= state.is_focused();
                 self.2 = Some(bounds);
@@ -12458,6 +12462,7 @@ mod row_interaction {
             let state = tree.state.downcast_mut::<State>();
             state.focused = focus.0;
             state.selection_bounds = focus.2;
+            state.focus_within = focus.3;
         }
 
         fn header_at(&self, layout: Layout<'_>, point: Point) -> Option<super::SelectionRow> {
@@ -12737,17 +12742,21 @@ mod row_interaction {
             // Without this, every frame and every message walks each of a
             // long list's rows and their focus, however few are in view. A
             // row that last saw the pointer, or that a drag started in, still
-            // hears the event that tells it the pointer has gone. A focused
-            // row keeps every frame: its focused control may need redraws,
-            // such as an input placing its input method, and a focus moved
-            // here by an operation reveals the row's actions on the next one.
+            // hears the event that tells it the pointer has gone. A row with
+            // focus anywhere in it keeps every frame: its focused control may
+            // need redraws, such as an input placing its input method, and a
+            // focus moved here by an operation reveals the row's actions on
+            // the next one. Containers such as a group don't track focus, which
+            // would walk their members on each event; a focused member of a
+            // group out of view hears the redraw that brings it back into view
+            // before it is drawn.
             // So does a row whose tooltip or menu is still on screen: a
             // tooltip fades out over the frames after the pointer leaves, and
             // would stay frozen there without them.
             let state = tree.state.downcast_ref::<State>();
             if !layout.bounds().intersects(viewport)
                 && !state.hovered
-                && !state.focused
+                && !state.focus_within
                 && !state.overlaid.get()
                 && state.origin.is_none()
                 && unseen_rows_may_skip(event)
@@ -20209,6 +20218,28 @@ pub(crate) mod tests {
                 .into()
             }
 
+            /// `count` selectable rows of probes, in a column. A probe's focus
+            /// is not the row's own target, as a row's delete button isn't.
+            pub(super) fn selectable_rows(&self, count: usize) -> Element<'static, SidebarAction> {
+                let state = SidebarState::default();
+                widget::column::with_children(
+                    (0..count)
+                        .map(|row| {
+                            row_interaction::RowInteraction::selectable(
+                                Element::new(Probe {
+                                    row,
+                                    logs: self.clone(),
+                                }),
+                                SelectionRow::Channel(ChannelId::new()),
+                                &state,
+                                true,
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .into()
+            }
+
             /// The rows each log names since it was last taken, in order and
             /// without repeats.
             pub(super) fn take(log: &Log) -> Vec<usize> {
@@ -20520,6 +20551,53 @@ pub(crate) mod tests {
             send(list, tree, redraw(), away, &top),
             rows(&[0..10], &[]),
             "and its frames stop"
+        );
+    }
+
+    /// A control focused inside a row, such as its delete button, keeps the
+    /// row's frames out of view even though the row's own target isn't
+    /// focused.
+    #[test]
+    fn rows_out_of_view_keep_frames_for_a_control_focused_within() {
+        use cosmic::iced::{
+            Event, Point,
+            advanced::{Shell, clipboard, mouse},
+            time::Instant,
+            window,
+        };
+        use row_probe::Logs;
+
+        let logs = Logs::default();
+        let mut list = logs.selectable_rows(30);
+        let renderer = headless_renderer();
+        let mut tree = Tree::new(&list);
+        let node = list.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(280.0, 600.0)),
+        );
+        let top = Rectangle::new(Point::ORIGIN, Size::new(280.0, 200.0));
+        let mut redraw = |list: &mut Element<'_, SidebarAction>, tree: &mut Tree| {
+            let mut messages = Vec::new();
+            list.as_widget_mut().update(
+                tree,
+                &Event::Window(window::Event::RedrawRequested(Instant::now())),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &top,
+            );
+            Logs::take(&logs.updates)
+        };
+        assert_eq!(redraw(&mut list, &mut tree), (0..10).collect::<Vec<_>>());
+        logs.focus.set(Some(20));
+        list.as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut VisitAll);
+        assert_eq!(
+            redraw(&mut list, &mut tree),
+            (0..10).chain([20]).collect::<Vec<_>>()
         );
     }
 
