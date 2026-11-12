@@ -113,9 +113,9 @@ pub enum Action {
 enum Height {
     /// A share of the height the other sections leave; the body scrolls.
     Share,
-    /// Its own content's height, up to this many two-line rows, past which
-    /// it scrolls.
-    Content { rows: f32 },
+    /// Its own content's height, up to this many pixels, past which it
+    /// scrolls.
+    Content { height: f32 },
 }
 
 /// The rows of a short list before it scrolls instead of growing. The half
@@ -125,9 +125,9 @@ const LIST_ROWS_SHOWN: f32 = 5.5;
 /// A section header's height: a dense row and its padding.
 const SECTION_HEADER_HEIGHT: f32 = design::DENSE_ROW_HEIGHT + 2.0 * space::XXS;
 
-/// The height a short list takes before it scrolls.
+/// The height a short list of two-line rows takes before it scrolls.
 fn list_height(rows: f32) -> f32 {
-    design::DENSE_ROW_HEIGHT * 2.0 * rows
+    rows * (design::list::TWO_LINE_HEIGHT + space::XXS)
 }
 
 /// The height the first open list may take when no section shares the
@@ -243,7 +243,7 @@ impl Cagents {
         let lists: Vec<f32> = panes
             .iter()
             .filter_map(|pane| match (&pane.body, pane.height) {
-                (Some(_), Height::Content { rows }) => Some(list_height(rows)),
+                (Some(_), Height::Content { height }) => Some(height),
                 _ => None,
             })
             .collect();
@@ -290,9 +290,9 @@ impl Cagents {
                         .width(Length::Fill)
                         .height(Length::Fill)
                         .into(),
-                    Height::Content { rows } => widget::container(body)
+                    Height::Content { height } => widget::container(body)
                         .width(Length::Fill)
-                        .max_height(lead.take().unwrap_or_else(|| list_height(rows)))
+                        .max_height(lead.take().unwrap_or(height))
                         .into(),
                 });
             }
@@ -336,12 +336,6 @@ impl Cagents {
             format!("{title} section")
         };
         let mut label: Vec<Element<'a, Message>> = Vec::with_capacity(4);
-        if collapsible {
-            label.push(crate::ui_controls::passive_icon(
-                if open { Icon::PanDown } else { Icon::PanEnd }.handle(),
-                design::COMPACT_ICON_SIZE,
-            ));
-        }
         label.push(
             design::caption(title)
                 .font(design::heading_font())
@@ -377,19 +371,39 @@ impl Cagents {
                 .into(),
             );
         }
+        // The disclosure sits in the list grid's icon column and the title
+        // on its label column, so a section's name lines up with the names
+        // of the rows beneath it.
+        let disclosure: Element<'a, Message> = if collapsible {
+            crate::ui_controls::passive_icon(
+                if open { Icon::PanDown } else { Icon::PanEnd }.handle(),
+                design::COMPACT_ICON_SIZE,
+            )
+        } else {
+            iced::widget::Space::new().into()
+        };
         let toggle = crate::interaction::hover(
             widget::button::custom(
-                widget::container(
-                    widget::row::with_children(label)
-                        .spacing(space::XS)
-                        .align_y(Alignment::Center)
-                        .width(Length::Fill),
-                )
-                .center_y(Length::Fill),
+                widget::row::with_children(vec![
+                    widget::container(disclosure)
+                        .center_x(Length::Fixed(design::list::ICON))
+                        .center_y(Length::Fill)
+                        .into(),
+                    widget::container(
+                        widget::row::with_children(label)
+                            .spacing(space::XS)
+                            .align_y(Alignment::Center)
+                            .width(Length::Fill),
+                    )
+                    .center_y(Length::Fill)
+                    .into(),
+                ])
+                .spacing(design::list::GAP)
+                .height(Length::Fill),
             )
             .name(name)
             .class(crate::ui_controls::control_style(false, None))
-            .padding([0.0, space::S])
+            .padding([0.0, design::list::INSET])
             .height(design::DENSE_ROW_HEIGHT)
             .width(Length::Fill)
             .on_press_maybe(
@@ -405,7 +419,7 @@ impl Cagents {
                 .align_y(Alignment::Center)
                 .width(Length::Fill),
         )
-        .padding([space::XXS, space::XS])
+        .padding([space::XXS, design::list::GUTTER])
         .width(Length::Fill)
         .into()
     }
@@ -420,13 +434,16 @@ impl Cagents {
             scope: None,
             description: None,
             controls: Vec::new(),
-            // Each row is about two lines, so its count bounds the list's
-            // height and the leading list need not leave room for rows not
-            // there. The quarter row covers the list's padding. Expanding
-            // the shown work makes room for itself rather than pushing the
-            // rows after it out of view.
+            // The list's own height bounds it, so the leading list need not
+            // leave room for rows not there. Expanding the shown work makes
+            // room for itself rather than pushing the rows after it out of
+            // view.
             height: Height::Content {
-                rows: (work.rows + 0.25).min(LIST_ROWS_SHOWN + work.expanded),
+                height: work
+                    .height
+                    .content
+                    .min(list_height(LIST_ROWS_SHOWN) + work.height.expanded)
+                    + 2.0 * pull_request_ui::WORK_LIST_PADDING,
             },
             body: open.then(|| self.work_section(work)),
         }

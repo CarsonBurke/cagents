@@ -69,15 +69,16 @@ impl WorkScope {
     }
 }
 
+/// Above and below the Work section's list.
+pub(super) const WORK_LIST_PADDING: f32 = space::XS;
+
 /// The inspected conversation's work, as its sections need it.
 #[derive(Debug, Default)]
 pub(super) struct WorkSummary {
     /// The pieces of work listed, for the header.
     pub count: usize,
-    /// The rows the list draws, in two-line rows, which bounds its height.
-    pub rows: f32,
-    /// The part of `rows` the shown work's expansion adds.
-    pub expanded: f32,
+    /// How tall the list draws, which bounds its section's height.
+    pub height: conversation::Height,
     shown: Option<WorkKey>,
     pub scope: WorkScope,
 }
@@ -215,23 +216,12 @@ impl Cagents {
         let openable = |path: &std::path::Path| self.sidebar_model.worktree_at(path).is_some();
         let work = conversation.work(here.as_deref());
         let shown = conversation.shown(&work, here.as_deref(), &openable);
-        let mut rows = work.len() as f32 + shown.map_or(0.0, conversation::expanded_rows);
-        if self.settings.show_mentioned_pull_requests {
-            let mentioned = conversation
-                .rows()
-                .iter()
-                .filter(|row| !row.relation.worked_on())
-                .count();
-            if mentioned > 0 {
-                // The fold, and each one-line row beneath it while open.
-                rows += 0.5
-                    + if conversation.mentions_open {
-                        0.5 * mentioned as f32
-                    } else {
-                        0.0
-                    };
-            }
-        }
+        let height = conversation::height(
+            conversation,
+            &work,
+            shown,
+            self.settings.show_mentioned_pull_requests,
+        );
         let scope = match shown {
             None => WorkScope::Focus,
             Some(shown) => match (shown.worktree(), shown.pull_request()) {
@@ -256,8 +246,7 @@ impl Cagents {
                 .iter()
                 .filter(|work| !matches!(work, conversation::Work::Here(_)))
                 .count(),
-            rows,
-            expanded: shown.map_or(0.0, conversation::expanded_rows),
+            height,
             shown: shown.map(|work| work.key()),
             scope,
         }
@@ -292,10 +281,7 @@ impl Cagents {
         );
         let content: Element<'_, Action> = widget::scrollable(
             widget::container(list)
-                .padding(design::with_vertical_rail(Padding::from([
-                    space::XS,
-                    space::S,
-                ])))
+                .padding(design::list::scroll_padding(WORK_LIST_PADDING))
                 .width(Length::Fill),
         )
         .direction(iced::widget::scrollable::Direction::Vertical(
@@ -417,16 +403,22 @@ mod tests {
         assert!(!app.settings.show_mentioned_pull_requests);
         assert!(app.work_listed());
         let unexpanded = |app: &Cagents| {
-            let summary = app.work_summary();
-            summary.rows - summary.expanded
+            let height = app.work_summary().height;
+            height.content - height.expanded
         };
+        let row = design::list::TWO_LINE_HEIGHT;
+        let fold = design::DENSE_ROW_HEIGHT + space::XXS;
         assert_eq!(app.work_summary().count, 1);
-        assert_eq!(unexpanded(&app), 1.0);
+        assert_eq!(unexpanded(&app), row);
         app.settings.show_mentioned_pull_requests = true;
         assert_eq!(app.work_summary().count, 1);
-        assert_eq!(unexpanded(&app), 1.5, "the folded mentions take half a row");
+        assert_eq!(
+            unexpanded(&app),
+            row + fold,
+            "the folded mentions take a dense row"
+        );
         drop(app.handle_pull_request_ui(Action::ToggleMentions));
-        assert_eq!(unexpanded(&app), 2.0);
+        assert_eq!(unexpanded(&app), row + 2.0 * fold);
         app.settings.show_mentioned_pull_requests = false;
 
         // A conversation that only mentioned pull requests lists no work.

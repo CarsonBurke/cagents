@@ -7,6 +7,7 @@
 //! piece of work rather than to whichever card happens to be focused.
 
 use super::*;
+use crate::design::list;
 use crate::work::{
     Check, CheckState, ConversationPullRequest, ConversationPullRequests, ConversationWorktree,
     Relation, TranscriptCoverage,
@@ -47,7 +48,7 @@ pub(crate) enum Work<'a> {
     Here(&'a Path),
 }
 
-impl Work<'_> {
+impl<'a> Work<'a> {
     pub(crate) fn key(&self) -> WorkKey {
         match self {
             Self::PullRequest { row, .. } => WorkKey::PullRequest {
@@ -72,7 +73,7 @@ impl Work<'_> {
     }
 
     /// The local worktree its changes and files are read from.
-    pub(crate) fn worktree(&self) -> Option<&Path> {
+    pub(crate) fn worktree(self) -> Option<&'a Path> {
         match self {
             Self::PullRequest { worktree, .. } => worktree.map(|worktree| worktree.path.as_path()),
             Self::Worktree(worktree) => Some(&worktree.path),
@@ -81,7 +82,7 @@ impl Work<'_> {
     }
 
     /// The pull request it is, when it is one.
-    pub(crate) fn pull_request(&self) -> Option<&ConversationPullRequest> {
+    pub(crate) fn pull_request(self) -> Option<&'a ConversationPullRequest> {
         match self {
             Self::PullRequest { row, .. } => Some(row),
             Self::Worktree(_) | Self::Here(_) => None,
@@ -416,11 +417,19 @@ impl Drop for HangUpOnDrop {
     }
 }
 
+/// Between the list's rows.
+const ROW_SPACING: f32 = space::XXS;
+/// Above and below the list's notes.
+const NOTE_PADDING: f32 = space::XS;
+
 /// The Work section's rows, with the `shown` one expanded, and marked while
 /// `shown_open` says its changes or files are open beneath, then the
 /// mentioned pull requests folded beneath them when the settings ask for
 /// them. `openable` says whether Projects lists a worktree, so it can be
 /// shown.
+///
+/// Every row is a [`list_row`](crate::ui_controls::list_row) on the shared
+/// list grid, so [`height`] can say exactly how tall the list is.
 pub(super) fn view<'a>(
     state: &State,
     work: &[Work<'_>],
@@ -433,17 +442,12 @@ pub(super) fn view<'a>(
     let list = state.list.as_deref();
     for item in work {
         let chosen = shown.is_some_and(|key| item.is(key));
-        children.push(work_row(list, *item, chosen, shown_open, openable));
+        children.push(work_row(list, *item, chosen && shown_open, openable));
+        if chosen && let Some(row) = item.pull_request() {
+            children.push(chosen_details(row));
+        }
     }
-    let mentioned: Vec<&ConversationPullRequest> = if show_mentions {
-        state
-            .rows()
-            .iter()
-            .filter(|row| !row.relation.worked_on())
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let mentioned = mentioned(state, show_mentions);
     if !mentioned.is_empty() {
         children.push(mentions_toggle(state.mentions_open, mentioned.len()));
         if state.mentions_open {
@@ -456,52 +460,484 @@ pub(super) fn view<'a>(
         children.push(note);
     }
     widget::column::with_children(children)
-        .spacing(space::XXS)
+        .spacing(ROW_SPACING)
         .width(Length::Fill)
         .into()
 }
 
+/// The pull requests the conversation only mentioned, when the settings
+/// list them.
+fn mentioned(state: &State, show_mentions: bool) -> Vec<&ConversationPullRequest> {
+    if !show_mentions {
+        return Vec::new();
+    }
+    state
+        .rows()
+        .iter()
+        .filter(|row| !row.relation.worked_on())
+        .collect()
+}
+
+/// How tall [`view`] draws the list, and how much of that the shown work's
+/// expansion adds.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub(crate) struct Height {
+    pub content: f32,
+    pub expanded: f32,
+}
+
+/// The height [`view`] gives the same arguments, from the row heights it
+/// draws. Each note line is counted once; a note that wraps scrolls.
+pub(super) fn height(
+    state: &State,
+    work: &[Work<'_>],
+    shown: Option<Work<'_>>,
+    show_mentions: bool,
+) -> Height {
+    let expanded = shown
+        .and_then(|shown| shown.pull_request())
+        .map_or(0.0, |row| {
+            ROW_SPACING + detail_rows(row) as f32 * design::DENSE_ROW_HEIGHT
+        });
+    let mut heights: Vec<f32> = vec![list::TWO_LINE_HEIGHT; work.len()];
+    let mentioned = mentioned(state, show_mentions).len();
+    if mentioned > 0 {
+        heights.push(design::DENSE_ROW_HEIGHT);
+        if state.mentions_open {
+            heights.extend(std::iter::repeat_n(design::DENSE_ROW_HEIGHT, mentioned));
+        }
+    }
+    let notes = state.list.as_deref().map_or(0, note_lines);
+    if notes > 0 {
+        heights.push(notes as f32 * list::CAPTION_LINE + 2.0 * NOTE_PADDING);
+    }
+    let rows: f32 = heights.iter().sum();
+    let between = heights.len().saturating_sub(1) as f32 * ROW_SPACING;
+    Height {
+        content: rows + between + expanded,
+        expanded,
+    }
+}
+
 /// Why the list may be incomplete or out of date, when it may be.
 fn note<'a>(list: &ConversationPullRequests) -> Option<Element<'a, Action>> {
+    let line = |text: String| {
+        design::caption(text)
+            .line_height(iced::widget::text::LineHeight::Absolute(
+                list::CAPTION_LINE.into(),
+            ))
+            .wrapping(iced::widget::text::Wrapping::Word)
+            .width(Length::Fill)
+    };
     let mut lines = Vec::new();
     if let Some(error) = &list.forge_error {
         lines.push(crate::interaction::tooltip(
-            design::caption("GitHub could not be reached; states may be out of date.")
-                .wrapping(iced::widget::text::Wrapping::Word)
-                .width(Length::Fill),
+            line("GitHub could not be reached; states may be out of date.".to_owned()),
             error.clone(),
         ));
     }
-    match &list.transcript {
-        TranscriptCoverage::Partial => lines.push(
-            design::caption("Read from the latest part of this long conversation.")
-                .wrapping(iced::widget::text::Wrapping::Word)
-                .width(Length::Fill)
-                .into(),
-        ),
-        TranscriptCoverage::Unavailable { reason } => lines.push(
-            design::caption(reason.clone())
-                .wrapping(iced::widget::text::Wrapping::Word)
-                .width(Length::Fill)
-                .into(),
-        ),
-        TranscriptCoverage::Complete
-        | TranscriptCoverage::Pending
-        | TranscriptCoverage::Unsupported => {}
+    if let Some(coverage) = coverage_note(&list.transcript) {
+        lines.push(line(coverage).into());
     }
     (!lines.is_empty()).then(|| {
-        widget::container(
-            widget::column::with_children(lines)
-                .spacing(space::XXS)
-                .width(Length::Fill),
-        )
-        .padding([space::XS, space::S])
-        .into()
+        widget::container(widget::column::with_children(lines).width(Length::Fill))
+            .padding([NOTE_PADDING, list::INSET])
+            .into()
     })
 }
 
-/// The number a row's pull request goes by: `#12`, after its repository
-/// when that is not the conversation's.
+/// How many lines [`note`] draws, unwrapped.
+fn note_lines(list: &ConversationPullRequests) -> usize {
+    usize::from(list.forge_error.is_some()) + usize::from(coverage_note(&list.transcript).is_some())
+}
+
+/// What the list says about how much of the conversation it was read from,
+/// when not all of it.
+fn coverage_note(coverage: &TranscriptCoverage) -> Option<String> {
+    match coverage {
+        TranscriptCoverage::Partial => {
+            Some("Read from the latest part of this long conversation.".to_owned())
+        }
+        TranscriptCoverage::Unavailable { reason } => Some(reason.clone()),
+        TranscriptCoverage::Complete
+        | TranscriptCoverage::Pending
+        | TranscriptCoverage::Unsupported => None,
+    }
+}
+
+/// A theme's style for one fact on a row's second line.
+type Tone = fn(&cosmic::Theme) -> iced::widget::text::Style;
+
+/// One fact on a row's second line: a few words, each part in its own tone
+/// when it has one.
+struct Fact(Vec<(String, Option<Tone>)>);
+
+impl Fact {
+    fn plain(text: impl Into<String>) -> Self {
+        Self(vec![(text.into(), None)])
+    }
+
+    fn toned(text: impl Into<String>, tone: Tone) -> Self {
+        Self(vec![(text.into(), Some(tone))])
+    }
+
+    /// Lines added and removed, each in its tone.
+    fn change_counts(additions: u64, deletions: u64) -> Option<Self> {
+        let counts = crate::repository::line_change_counts(Some(additions), Some(deletions));
+        let parts: Vec<(String, Option<Tone>)> = counts
+            .split(' ')
+            .filter(|part| !part.is_empty())
+            .map(|part| {
+                let tone: Tone = if part.starts_with('+') {
+                    design::added_text
+                } else {
+                    design::removed_text
+                };
+                (part.to_owned(), Some(tone))
+            })
+            .collect();
+        (!parts.is_empty()).then_some(Self(parts))
+    }
+
+    fn text(&self) -> String {
+        self.0
+            .iter()
+            .map(|(text, _)| text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+/// A row's facts on its second line with a dot between each, cut short
+/// with an ellipsis when the row is too narrow, so the facts that matter
+/// most go first.
+fn facts_line<'a>(facts: &[Fact]) -> Element<'a, Action> {
+    let theme = cosmic::theme::active();
+    let mut spans: Vec<iced::widget::text::Span<'static, ()>> = Vec::with_capacity(facts.len() * 3);
+    for (index, fact) in facts.iter().enumerate() {
+        if index > 0 {
+            spans.push(iced::widget::span(" · "));
+        }
+        for (part, (text, tone)) in fact.0.iter().enumerate() {
+            if part > 0 {
+                spans.push(iced::widget::span(" "));
+            }
+            spans.push(
+                iced::widget::span(text.clone())
+                    .color_maybe(tone.and_then(|tone| tone(&theme).color)),
+            );
+        }
+    }
+    iced::widget::rich_text(spans)
+        .size(design::TEXT_CAPTION)
+        .line_height(iced::widget::text::LineHeight::Absolute(
+            list::CAPTION_LINE.into(),
+        ))
+        .wrapping(iced::widget::text::Wrapping::None)
+        .ellipsize(iced::widget::text::Ellipsize::End(
+            iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+        ))
+        .class(cosmic::theme::Text::Custom(design::muted_text))
+        .width(Length::Fill)
+        .into()
+}
+
+/// What a worktree's row says about it: its uncommitted changes and the
+/// lines they change.
+fn worktree_facts(worktree: &ConversationWorktree, facts: &mut Vec<Fact>) {
+    // The daemon's count includes untracked files, which a worktree row in
+    // Projects may leave out.
+    match worktree.changed_paths {
+        Some(0) => facts.push(Fact::plain("No uncommitted changes")),
+        Some(count) => facts.push(Fact::toned(
+            format!("{count} uncommitted"),
+            design::warning_text,
+        )),
+        None => {}
+    }
+    if let Some(diff) = worktree.diff {
+        facts.extend(Fact::change_counts(diff.additions, diff.deletions));
+    }
+}
+
+/// What a pull request's row says about it, the facts most in need of
+/// attention first: whose it is when not this repository's, how current
+/// it is, its checks and review, its size, and why it is listed.
+fn pull_request_facts(
+    list: Option<&ConversationPullRequests>,
+    row: &ConversationPullRequest,
+) -> Vec<Fact> {
+    let mut facts = Vec::with_capacity(6);
+    // Another repository's number would crowd the title, so it goes
+    // beneath it.
+    if !own_repository(list, row) {
+        facts.push(Fact::plain(repository_label(&row.repository)));
+    }
+    let Some(pull_request) = &row.pull_request else {
+        facts.push(Fact::plain("State unknown"));
+        facts.push(Fact::plain(reason(row)));
+        return facts;
+    };
+    if let Some(list) = list
+        && list.forge_error.is_some()
+        && let Some(at) = row.observed_at_unix_ms
+        && list.generated_at_unix_ms.saturating_sub(at) > STALE_AFTER_MS
+    {
+        facts.push(Fact::plain(format!(
+            "as of {}",
+            crate::work_ui::age(list.generated_at_unix_ms, at, true)
+        )));
+    }
+    if pull_request.state == crate::work::PullRequestState::Open
+        && let Some((overall, label)) = checks_summary(&row.checks)
+    {
+        facts.push(Fact::toned(label, state_text(overall)));
+    }
+    if let Some((label, tone)) = review_fact(pull_request) {
+        facts.push(Fact::toned(label, tone));
+    }
+    if let Some(diff) = row.diff {
+        facts.extend(Fact::change_counts(diff.additions, diff.deletions));
+    }
+    facts.push(Fact::plain(reason(row)));
+    facts
+}
+
+fn work_row<'a>(
+    list: Option<&ConversationPullRequests>,
+    work: Work<'_>,
+    marked: bool,
+    openable: &dyn Fn(&Path) -> bool,
+) -> Element<'a, Action> {
+    let mut facts: Vec<Fact> = Vec::with_capacity(6);
+    // Work this window cannot show says so before anything else, since it
+    // is why choosing it shows no changes.
+    if let Some(path) = work.worktree()
+        && !openable(path)
+    {
+        facts.push(Fact::plain("Not in Projects"));
+    }
+    let (glyph, name, trailing): (Element<'a, Action>, String, Option<String>) = match work {
+        Work::PullRequest { row, .. } => {
+            let state = row
+                .pull_request
+                .as_ref()
+                .map(crate::sidebar::WorktreePullRequestState::from_work);
+            facts.extend(pull_request_facts(list, row));
+            (
+                crate::ui_controls::pull_request_state_glyph(state, design::ROW_ICON_SIZE),
+                row.pull_request.as_ref().map_or_else(
+                    || number_label(list, row),
+                    |pull_request| pull_request.title.clone(),
+                ),
+                Some(format!("#{}", row.number)),
+            )
+        }
+        Work::Worktree(worktree) => {
+            worktree_facts(worktree, &mut facts);
+            facts.push(Fact::plain(if worktree.by_subagent {
+                "Edited by a subagent"
+            } else {
+                "Edited"
+            }));
+            (
+                crate::ui_controls::passive_icon(
+                    crate::sidebar::worktree_icon(),
+                    design::ROW_ICON_SIZE,
+                ),
+                worktree_branch(worktree),
+                None,
+            )
+        }
+        Work::Here(_) => {
+            facts.push(Fact::plain("Where this conversation runs"));
+            (
+                crate::ui_controls::passive_icon(
+                    crate::sidebar::worktree_icon(),
+                    design::ROW_ICON_SIZE,
+                ),
+                work.scope_label(),
+                None,
+            )
+        }
+    };
+    // The facts line may be cut short, so the name read out says them all.
+    let described = std::iter::once(if marked {
+        format!("{name}, shown below")
+    } else {
+        format!("Show {name}")
+    })
+    .chain(facts.iter().map(Fact::text))
+    .collect::<Vec<_>>()
+    .join(", ");
+    let mut row = crate::ui_controls::list_row(None, name)
+        .icon_element(glyph)
+        .caption_element(facts_line(&facts))
+        .name(described)
+        .selected(marked)
+        .on_press(Action::Choose(work.key()));
+    if let Some(trailing) = trailing {
+        row = row.trailing(design::caption(trailing).wrapping(iced::widget::text::Wrapping::None));
+    }
+    let row: Element<'a, Action> = row.into();
+    // A worktree's row names its folder; a pull request's would cover the
+    // checks beneath it.
+    match work {
+        Work::Worktree(worktree) => {
+            crate::interaction::tooltip(row, worktree.path.display().to_string())
+        }
+        Work::Here(path) => crate::interaction::tooltip(row, path.display().to_string()),
+        Work::PullRequest { .. } => row,
+    }
+}
+
+/// How many dense rows a chosen pull request adds beneath its row: its
+/// checks, a row for the rest when there are more, and its Open row.
+fn detail_rows(row: &ConversationPullRequest) -> usize {
+    let checks = if lists_checks(row) {
+        row.checks.len().min(CHECKS_SHOWN) + usize::from(row.checks.len() > CHECKS_SHOWN)
+    } else {
+        0
+    };
+    checks + 1
+}
+
+/// Whether a chosen pull request lists its checks: only an open one's
+/// still matter.
+fn lists_checks(row: &ConversationPullRequest) -> bool {
+    !row.checks.is_empty()
+        && row
+            .pull_request
+            .as_ref()
+            .is_some_and(|pull_request| pull_request.state == crate::work::PullRequestState::Open)
+}
+
+fn check_state_label(state: CheckState) -> &'static str {
+    match state {
+        CheckState::Failed => "failing",
+        CheckState::Pending => "running",
+        CheckState::Passed => "passed",
+        CheckState::Cancelled => "cancelled",
+        CheckState::Skipped => "skipped",
+    }
+}
+
+/// What a chosen pull request adds beneath its row: its checks, the ones
+/// most in need of attention first, and a way to open it. Its rows hang
+/// from the row's label column, so they read as belonging to it.
+fn chosen_details<'a>(row: &ConversationPullRequest) -> Element<'a, Action> {
+    let mut rows: Vec<Element<'a, Action>> = Vec::with_capacity(detail_rows(row));
+    if lists_checks(row) {
+        let mut checks: Vec<&Check> = row.checks.iter().collect();
+        checks.sort_by_key(|check| check.state);
+        for check in checks.iter().take(CHECKS_SHOWN) {
+            rows.push(
+                crate::ui_controls::list_row(None, check.name.clone())
+                    .icon_element(tinted_icon(
+                        state_icon(check.state),
+                        state_tone(check.state),
+                    ))
+                    .name(format!(
+                        "Open the {} check, {}",
+                        check.name,
+                        check_state_label(check.state)
+                    ))
+                    .dense()
+                    .on_press_maybe(Url::parse(&check.url).ok().map(Action::OpenCheck))
+                    .into(),
+            );
+        }
+        if checks.len() > CHECKS_SHOWN {
+            let more = checks.len() - CHECKS_SHOWN;
+            rows.push(
+                crate::ui_controls::list_row(Some(Icon::PopOut), format!("{more} more on GitHub"))
+                    .name(format!("Open all {} checks on GitHub", checks.len()))
+                    .dense()
+                    .on_press_maybe(
+                        Url::parse(&format!("{}/checks", row.url()))
+                            .ok()
+                            .map(Action::OpenCheck),
+                    )
+                    .into(),
+            );
+        }
+    }
+    rows.push(
+        crate::ui_controls::list_row(Some(Icon::PopOut), "Open pull request")
+            .name(format!("Open #{}", row.number))
+            .dense()
+            .on_press_maybe(open(row))
+            .into(),
+    );
+    widget::container(widget::column::with_children(rows).width(Length::Fill))
+        .padding(Padding {
+            left: list::ICON + list::GAP,
+            ..Padding::ZERO
+        })
+        .width(Length::Fill)
+        .into()
+}
+
+/// The fold over the mentioned pull requests, which says how many there are.
+fn mentions_toggle<'a>(open: bool, count: usize) -> Element<'a, Action> {
+    crate::ui_controls::list_row(None, "Mentioned")
+        .icon_element(crate::ui_controls::passive_icon(
+            if open { Icon::PanDown } else { Icon::PanEnd }.handle(),
+            design::COMPACT_ICON_SIZE,
+        ))
+        .trailing(design::caption(count.to_string()))
+        .name(format!(
+            "{count} mentioned pull requests, {}",
+            if open { "expanded" } else { "collapsed" }
+        ))
+        .dense()
+        .on_press(Action::ToggleMentions)
+        .into()
+}
+
+fn mentioned_row<'a>(
+    list: Option<&ConversationPullRequests>,
+    row: &ConversationPullRequest,
+) -> Element<'a, Action> {
+    let number = number_label(list, row);
+    let name = row
+        .pull_request
+        .as_ref()
+        .map_or_else(|| number.clone(), |pull_request| pull_request.title.clone());
+    let state = row
+        .pull_request
+        .as_ref()
+        .map(crate::sidebar::WorktreePullRequestState::from_work);
+    let described = format!(
+        "Open {number} {name}{}",
+        state.map_or(String::new(), |state| format!(
+            ", {}",
+            state.label().to_lowercase()
+        ))
+    );
+    crate::ui_controls::list_row(None, name.clone())
+        .icon_element(crate::ui_controls::pull_request_state_glyph(
+            state,
+            design::ROW_ICON_SIZE,
+        ))
+        // Mentions are the long tail, so they read quieter than the work.
+        .label(
+            design::body(name)
+                .class(cosmic::theme::Text::Custom(design::muted_text))
+                .wrapping(iced::widget::text::Wrapping::None)
+                .ellipsize(iced::widget::text::Ellipsize::End(
+                    iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+                ))
+                .width(Length::Fill),
+        )
+        .trailing(design::caption(number).wrapping(iced::widget::text::Wrapping::None))
+        .name(described)
+        .dense()
+        .on_press_maybe(open(row))
+        .into()
+}
+
+/// Whether the row's pull request is in the conversation's own repository.
 fn own_repository(list: Option<&ConversationPullRequests>, row: &ConversationPullRequest) -> bool {
     list.and_then(|list| list.repository.as_ref())
         .is_some_and(|own| own.same_repository(&row.repository))
@@ -524,6 +960,8 @@ fn review_fact(
     })
 }
 
+/// The number a row's pull request goes by: `#12`, after its repository
+/// when that is not the conversation's.
 fn number_label(list: Option<&ConversationPullRequests>, row: &ConversationPullRequest) -> String {
     if own_repository(list, row) {
         format!("#{}", row.number)
@@ -619,403 +1057,6 @@ fn checks_summary(checks: &[Check]) -> Option<(CheckState, String)> {
         CheckState::Skipped => format!("{count} skipped"),
     };
     Some((worst, label))
-}
-
-/// What a worktree's row says about it: its uncommitted changes and the
-/// lines they change.
-fn worktree_facts<'a>(worktree: &ConversationWorktree) -> Vec<Element<'a, Action>> {
-    let mut facts: Vec<Element<'a, Action>> = Vec::with_capacity(2);
-    // The daemon's count includes untracked files, which a worktree row in
-    // Projects may leave out.
-    match worktree.changed_paths {
-        Some(0) => facts.push(design::caption("No uncommitted changes").into()),
-        Some(count) => facts.push(
-            design::caption(format!("{count} uncommitted"))
-                .class(cosmic::theme::Text::Custom(design::warning_text))
-                .into(),
-        ),
-        None => {}
-    }
-    if let Some(diff) = worktree.diff {
-        let counts =
-            crate::repository::line_change_counts(Some(diff.additions), Some(diff.deletions));
-        if !counts.is_empty() {
-            facts.push(crate::ui_controls::change_counts(&counts));
-        }
-    }
-    facts
-}
-
-/// Facts with a dot between each.
-fn separated<'a>(facts: Vec<Element<'a, Action>>) -> Vec<Element<'a, Action>> {
-    facts
-        .into_iter()
-        .enumerate()
-        .flat_map(|(index, fact)| {
-            let dot = (index > 0).then(|| design::caption("·").into());
-            dot.into_iter().chain(std::iter::once(fact))
-        })
-        .collect()
-}
-
-fn one_line<'a>(text: impl Into<Cow<'a, str>> + 'a) -> iced::widget::Text<'a, cosmic::Theme> {
-    design::body(text)
-        .wrapping(iced::widget::text::Wrapping::None)
-        .ellipsize(iced::widget::text::Ellipsize::End(
-            iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-        ))
-}
-
-/// A row's two lines: its glyph, name and trailing number, then its facts
-/// under the name.
-fn lines<'a>(
-    glyph: Element<'a, Action>,
-    name: String,
-    trailing: Option<String>,
-    facts: Vec<Element<'a, Action>>,
-) -> Element<'a, Action> {
-    let mut first = vec![glyph, one_line(name).width(Length::Fill).into()];
-    if let Some(trailing) = trailing {
-        first.push(
-            design::caption(trailing)
-                .wrapping(iced::widget::text::Wrapping::None)
-                .into(),
-        );
-    }
-    let mut column = vec![
-        widget::row::with_children(first)
-            .spacing(space::S)
-            .align_y(Alignment::Center)
-            .into(),
-    ];
-    if !facts.is_empty() {
-        column.push(
-            widget::container(
-                widget::row::with_children(separated(facts))
-                    .spacing(space::XS)
-                    .align_y(Alignment::Center)
-                    .wrap(),
-            )
-            .padding(Padding {
-                left: f32::from(design::ROW_ICON_SIZE) + space::S,
-                ..Padding::ZERO
-            })
-            .into(),
-        );
-    }
-    widget::column::with_children(column)
-        .spacing(space::XXS)
-        .into()
-}
-
-fn work_row<'a>(
-    list: Option<&ConversationPullRequests>,
-    work: Work<'_>,
-    chosen: bool,
-    shown_open: bool,
-    openable: &dyn Fn(&Path) -> bool,
-) -> Element<'a, Action> {
-    let (glyph, name, trailing, mut facts): (Element<'a, Action>, String, Option<String>, _) =
-        match work {
-            Work::PullRequest { row, .. } => {
-                let state = row
-                    .pull_request
-                    .as_ref()
-                    .map(crate::sidebar::WorktreePullRequestState::from_work);
-                let number = format!("#{}", row.number);
-                let name = row.pull_request.as_ref().map_or_else(
-                    || number_label(list, row),
-                    |pull_request| pull_request.title.clone(),
-                );
-                let mut facts: Vec<Element<'a, Action>> = vec![design::caption(reason(row)).into()];
-                // Another repository's number would crowd the title, so it
-                // goes beneath it.
-                if !own_repository(list, row) {
-                    facts.push(design::caption(repository_label(&row.repository)).into());
-                }
-                match (state, &row.pull_request) {
-                    (Some(_), Some(pull_request)) => {
-                        if let Some((label, tone)) = review_fact(pull_request) {
-                            facts.push(
-                                design::caption(label)
-                                    .class(cosmic::theme::Text::Custom(tone))
-                                    .into(),
-                            );
-                        }
-                        if pull_request.state == crate::work::PullRequestState::Open
-                            && let Some((overall, label)) = checks_summary(&row.checks)
-                        {
-                            facts.push(
-                                design::caption(label)
-                                    .class(cosmic::theme::Text::Custom(state_text(overall)))
-                                    .into(),
-                            );
-                        }
-                        if let Some(diff) = row.diff {
-                            let counts = crate::repository::line_change_counts(
-                                Some(diff.additions),
-                                Some(diff.deletions),
-                            );
-                            if !counts.is_empty() {
-                                facts.push(crate::ui_controls::change_counts(&counts));
-                            }
-                        }
-                        if let Some(list) = list
-                            && list.forge_error.is_some()
-                            && let Some(at) = row.observed_at_unix_ms
-                            && list.generated_at_unix_ms.saturating_sub(at) > STALE_AFTER_MS
-                        {
-                            facts.push(
-                                design::caption(format!(
-                                    "as of {}",
-                                    crate::work_ui::age(list.generated_at_unix_ms, at, true)
-                                ))
-                                .into(),
-                            );
-                        }
-                    }
-                    _ => facts.push(design::caption("State unknown").into()),
-                }
-                (
-                    crate::ui_controls::pull_request_state_glyph(state, design::ROW_ICON_SIZE),
-                    name,
-                    Some(number),
-                    facts,
-                )
-            }
-            Work::Worktree(worktree) => {
-                let mut facts: Vec<Element<'a, Action>> = vec![
-                    design::caption(if worktree.by_subagent {
-                        "Edited by a subagent"
-                    } else {
-                        "Edited"
-                    })
-                    .into(),
-                ];
-                facts.extend(worktree_facts(worktree));
-                (
-                    crate::ui_controls::passive_icon(
-                        crate::sidebar::worktree_icon(),
-                        design::ROW_ICON_SIZE,
-                    ),
-                    worktree_branch(worktree),
-                    None,
-                    facts,
-                )
-            }
-            Work::Here(_) => (
-                crate::ui_controls::passive_icon(
-                    crate::sidebar::worktree_icon(),
-                    design::ROW_ICON_SIZE,
-                ),
-                work.scope_label(),
-                None,
-                vec![design::caption("Where this conversation runs").into()],
-            ),
-        };
-    if let Some(path) = work.worktree()
-        && !openable(path)
-    {
-        facts.push(design::caption("Not in Projects").into());
-    }
-    let mut body = vec![lines(glyph, name.clone(), trailing, facts)];
-    if chosen && let Some(row) = work.pull_request() {
-        body.extend(chosen_details(row));
-    }
-    let button = widget::button::custom(
-        widget::column::with_children(body)
-            .spacing(space::XS)
-            .width(Length::Fill),
-    )
-    .name(if chosen && shown_open {
-        format!("{name}, shown below")
-    } else {
-        format!("Show {name}")
-    })
-    .class(crate::ui_controls::control_style(
-        chosen && shown_open,
-        None,
-    ))
-    .padding([space::XS, space::S])
-    .width(Length::Fill)
-    .on_press(Action::Choose(work.key()));
-    // A worktree's row names its folder; a pull request's would cover its
-    // checks.
-    let tooltip = match work {
-        Work::Worktree(worktree) => worktree.path.display().to_string(),
-        Work::Here(path) => path.display().to_string(),
-        Work::PullRequest { .. } => String::new(),
-    };
-    let row = crate::interaction::hover(button);
-    if tooltip.is_empty() {
-        row
-    } else {
-        crate::interaction::tooltip(row, tooltip)
-    }
-}
-
-/// How many two-line rows of height `work` adds once shown: a pull
-/// request's checks, each about half a row, and its Open button.
-pub(super) fn expanded_rows(work: Work<'_>) -> f32 {
-    let Some(row) = work.pull_request() else {
-        return 0.0;
-    };
-    let open = row
-        .pull_request
-        .as_ref()
-        .is_some_and(|pull_request| pull_request.state == crate::work::PullRequestState::Open);
-    let checks = if open && !row.checks.is_empty() {
-        row.checks.len().min(CHECKS_SHOWN) + usize::from(row.checks.len() > CHECKS_SHOWN)
-    } else {
-        0
-    };
-    0.45 * checks as f32 + 0.75
-}
-
-/// What a chosen pull request adds beneath its row: its checks, the ones
-/// most in need of attention first, and a way to open it.
-fn chosen_details<'a>(row: &ConversationPullRequest) -> Vec<Element<'a, Action>> {
-    let mut details: Vec<Element<'a, Action>> = Vec::new();
-    let inset = Padding {
-        left: f32::from(design::ROW_ICON_SIZE) + space::S,
-        ..Padding::ZERO
-    };
-    let open_state = row
-        .pull_request
-        .as_ref()
-        .is_some_and(|pull_request| pull_request.state == crate::work::PullRequestState::Open);
-    if open_state && !row.checks.is_empty() {
-        let mut checks: Vec<&Check> = row.checks.iter().collect();
-        checks.sort_by_key(|check| check.state);
-        let mut lines: Vec<Element<'a, Action>> = Vec::with_capacity(CHECKS_SHOWN + 1);
-        for check in checks.iter().take(CHECKS_SHOWN) {
-            lines.push(crate::interaction::hover(
-                widget::button::custom(
-                    widget::row::with_children(vec![
-                        tinted_icon(state_icon(check.state), state_tone(check.state)),
-                        design::caption(check.name.clone())
-                            .wrapping(iced::widget::text::Wrapping::None)
-                            .ellipsize(iced::widget::text::Ellipsize::End(
-                                iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                            ))
-                            .width(Length::Fill)
-                            .into(),
-                    ])
-                    .spacing(space::XS)
-                    .align_y(Alignment::Center),
-                )
-                .name(format!("Open the {} check", check.name))
-                .class(crate::ui_controls::control_style(false, None))
-                .padding([space::XXS, space::XS])
-                .width(Length::Fill)
-                .on_press_maybe(Url::parse(&check.url).ok().map(Action::OpenCheck)),
-            ));
-        }
-        if checks.len() > CHECKS_SHOWN {
-            lines.push(
-                widget::container(design::caption(format!(
-                    "{} more on GitHub",
-                    checks.len() - CHECKS_SHOWN
-                )))
-                .padding([space::XXS, space::XS])
-                .into(),
-            );
-        }
-        details.push(
-            widget::container(widget::column::with_children(lines).width(Length::Fill))
-                .padding(Padding {
-                    left: inset.left - space::XS,
-                    ..Padding::ZERO
-                })
-                .into(),
-        );
-    }
-    details.push(
-        widget::container(
-            crate::ui_controls::button::quiet("Open pull request")
-                .icon(Icon::PopOut.handle())
-                .name(format!("Open #{}", row.number))
-                .on_press_maybe(open(row)),
-        )
-        .padding(Padding {
-            left: inset.left - space::S,
-            ..Padding::ZERO
-        })
-        .into(),
-    );
-    details
-}
-
-/// The fold over the mentioned pull requests, which says how many there are.
-fn mentions_toggle<'a>(open: bool, count: usize) -> Element<'a, Action> {
-    crate::interaction::hover(
-        widget::button::custom(
-            widget::row::with_children(vec![
-                crate::ui_controls::passive_icon(
-                    if open { Icon::PanDown } else { Icon::PanEnd }.handle(),
-                    design::COMPACT_ICON_SIZE,
-                ),
-                design::caption("Mentioned")
-                    .wrapping(iced::widget::text::Wrapping::None)
-                    .into(),
-                design::caption(count.to_string()).into(),
-            ])
-            .spacing(space::XS)
-            .align_y(Alignment::Center),
-        )
-        .name(format!(
-            "{count} mentioned pull requests, {}",
-            if open { "expanded" } else { "collapsed" }
-        ))
-        .class(crate::ui_controls::control_style(false, None))
-        .padding([space::XS, space::S])
-        .width(Length::Fill)
-        .on_press(Action::ToggleMentions),
-    )
-}
-
-fn mentioned_row<'a>(
-    list: Option<&ConversationPullRequests>,
-    row: &ConversationPullRequest,
-) -> Element<'a, Action> {
-    let number = number_label(list, row);
-    let name = row
-        .pull_request
-        .as_ref()
-        .map_or_else(|| number.clone(), |pull_request| pull_request.title.clone());
-    let state = row
-        .pull_request
-        .as_ref()
-        .map(crate::sidebar::WorktreePullRequestState::from_work);
-    let glyph = crate::ui_controls::pull_request_state_glyph(state, design::ROW_ICON_SIZE);
-    let described = format!(
-        "Open {number} {name}{}",
-        state.map_or(String::new(), |state| format!(
-            ", {}",
-            state.label().to_lowercase()
-        ))
-    );
-    crate::interaction::hover(
-        widget::button::custom(
-            widget::row::with_children(vec![
-                glyph,
-                one_line(name)
-                    .class(cosmic::theme::Text::Custom(design::muted_text))
-                    .width(Length::Fill)
-                    .into(),
-                design::caption(number)
-                    .wrapping(iced::widget::text::Wrapping::None)
-                    .into(),
-            ])
-            .spacing(space::S)
-            .align_y(Alignment::Center),
-        )
-        .name(described)
-        .class(crate::ui_controls::control_style(false, None))
-        .padding([space::XXS, space::S])
-        .width(Length::Fill)
-        .on_press_maybe(open(row)),
-    )
 }
 
 #[cfg(test)]
@@ -1130,6 +1171,61 @@ mod tests {
             changed_paths: Some(1),
             diff: None,
             pull_request,
+        }
+    }
+
+    /// The height the list reports is the height it lays out at, so its
+    /// section neither clips a row nor leaves a gap below the last.
+    #[test]
+    fn the_reported_height_is_the_laid_out_height() {
+        use cosmic::iced::advanced::{layout, widget::Tree};
+
+        let mut state = State::default();
+        let conversation = TerminalId::new();
+        state.retarget(Some((CardId::new(), conversation)));
+        let mut created = row(1, Relation::Created);
+        created.checks = (0..CHECKS_SHOWN + 2)
+            .map(|index| check(&format!("check {index}"), CheckState::Passed))
+            .chain([check("lint", CheckState::Failed)])
+            .collect();
+        state.update(listed(
+            conversation,
+            1,
+            vec![
+                created,
+                row(2, Relation::Pushed),
+                row(3, Relation::Mentioned),
+                row(4, Relation::Mentioned),
+            ],
+            true,
+        ));
+        state.mentions_open = true;
+        let work = state.work(None);
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        for (shown, show_mentions) in [
+            (None, false),
+            (Some(0), false),
+            (Some(0), true),
+            (Some(1), true),
+        ] {
+            let shown = shown.map(|index: usize| work[index]);
+            let key = shown.map(|shown| shown.key());
+            let mut element = view(&state, &work, key.as_ref(), true, show_mentions, &|_| true);
+            let mut tree = Tree::new(&element);
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(
+                    cosmic::iced::Size::ZERO,
+                    cosmic::iced::Size::new(280.0, 2000.0),
+                ),
+            );
+            let height = height(&state, &work, shown, show_mentions);
+            assert!(
+                (node.size().height - height.content).abs() < 0.5,
+                "{shown:?} with mentions {show_mentions}: laid out {} but reported {height:?}",
+                node.size().height,
+            );
         }
     }
 
