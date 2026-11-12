@@ -140,26 +140,49 @@ pub struct ChecksSummary {
 }
 
 impl ChecksSummary {
+    /// The states in the order a summary names them, worst first, with
+    /// their words.
+    const ORDER: [(CheckState, &'static str); 5] = [
+        (CheckState::Failed, "failing"),
+        (CheckState::Pending, "running"),
+        (CheckState::Cancelled, "cancelled"),
+        (CheckState::Passed, "passed"),
+        (CheckState::Skipped, "skipped"),
+    ];
+
     /// Summarises the states of a pull request's checks; `None` when it has
     /// none.
     pub fn of(states: impl IntoIterator<Item = CheckState>) -> Option<Self> {
-        const ORDER: [(CheckState, &str); 5] = [
-            (CheckState::Failed, "failing"),
-            (CheckState::Pending, "running"),
-            (CheckState::Cancelled, "cancelled"),
-            (CheckState::Passed, "passed"),
-            (CheckState::Skipped, "skipped"),
-        ];
-        let mut counts = [0_usize; ORDER.len()];
+        let mut counts = [0_usize; Self::ORDER.len()];
         for state in states {
-            let index = ORDER
-                .iter()
-                .position(|(each, _)| *each == state)
-                .expect("every check state has a word");
+            let index = match state {
+                CheckState::Failed => 0,
+                CheckState::Pending => 1,
+                CheckState::Cancelled => 2,
+                CheckState::Passed => 3,
+                CheckState::Skipped => 4,
+            };
             counts[index] += 1;
         }
-        let worst = ORDER[counts.iter().position(|count| *count > 0)?].0;
-        let label = ORDER
+        Self::of_each(counts)
+    }
+
+    /// Summarises the counts a work item keeps of its pull request's checks,
+    /// in constant time however many checks there are.
+    pub fn of_counts(checks: crate::work::Checks) -> Option<Self> {
+        let count = |n: u32| usize::try_from(n).unwrap_or(usize::MAX);
+        Self::of_each([
+            count(checks.failed),
+            count(checks.pending),
+            0,
+            count(checks.passed),
+            0,
+        ])
+    }
+
+    fn of_each(counts: [usize; Self::ORDER.len()]) -> Option<Self> {
+        let worst = Self::ORDER[counts.iter().position(|count| *count > 0)?].0;
+        let label = Self::ORDER
             .iter()
             .zip(counts)
             .filter(|(_, count)| *count > 0)
@@ -167,22 +190,6 @@ impl ChecksSummary {
             .collect::<Vec<_>>()
             .join(", ");
         Some(Self { worst, label })
-    }
-
-    /// Summarises the counts a work item keeps of its pull request's checks.
-    pub fn of_counts(checks: crate::work::Checks) -> Option<Self> {
-        let count = |n: u32| usize::try_from(n).unwrap_or(usize::MAX);
-        Self::of(
-            std::iter::repeat_n(CheckState::Failed, count(checks.failed))
-                .chain(std::iter::repeat_n(
-                    CheckState::Pending,
-                    count(checks.pending),
-                ))
-                .chain(std::iter::repeat_n(
-                    CheckState::Passed,
-                    count(checks.passed),
-                )),
-        )
     }
 
     /// The checks' name on hover and to assistive technology:
