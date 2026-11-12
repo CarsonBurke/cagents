@@ -2178,18 +2178,9 @@ impl State {
         let state = WorktreePullRequestState::from_github(pull_request);
         let shown = state.unwrap_or(WorktreePullRequestState::Open);
         let (icon, state_label) = (shown.icon(), shown.label());
-        let tone = match state {
-            Some(WorktreePullRequestState::Merged) => {
-                design::Tone::Themed(merged_pull_request_color)
-            }
-            Some(WorktreePullRequestState::Closed) => {
-                design::Tone::Themed(design::destructive_color)
-            }
-            Some(WorktreePullRequestState::Draft) | None => {
-                design::Tone::Themed(design::muted_icon_color)
-            }
-            Some(WorktreePullRequestState::Open) => design::Tone::Themed(design::success_color),
-        };
+        let tone = design::Tone::Themed(
+            state.map_or(design::muted_icon_color, WorktreePullRequestState::tone),
+        );
         let identity = crate::interaction::tooltip(
             widget::row::with_children(vec![
                 widget::icon::icon(icon.handle())
@@ -3150,16 +3141,12 @@ pub fn browser_row<'a>(
     let icon = state
         .map_or(Icon::PullRequest, WorktreePullRequestState::icon)
         .handle();
-    let tone: fn(&cosmic::Theme) -> iced::Color = match (state, checks) {
-        (Some(WorktreePullRequestState::Merged), _) => merged_pull_request_color,
-        (Some(WorktreePullRequestState::Closed), _) | (_, CheckStatus::Failing) => {
-            design::destructive_color
-        }
-        (_, CheckStatus::Pending) => design::warning_color,
-        (Some(WorktreePullRequestState::Draft), _) => design::muted_icon_color,
-        (_, CheckStatus::Passing) => design::success_color,
-        (_, CheckStatus::Unknown) => design::muted_icon_color,
-    };
+    // The glyph says the state alone, as it does in every list; the checks
+    // have their own words beneath.
+    let tone = state.map_or(
+        design::muted_icon_color as fn(&cosmic::Theme) -> iced::Color,
+        WorktreePullRequestState::tone,
+    );
     let mut detail = vec![format!("#{}", pull_request.number)];
     if let Some(author) = &pull_request.author {
         detail.push(author.login.clone());
@@ -3170,12 +3157,13 @@ pub fn browser_row<'a>(
     if let Some(label) = review_request {
         detail.push(label.into());
     }
-    match checks {
-        CheckStatus::Passing => detail.push("Checks passing".into()),
-        CheckStatus::Pending => detail.push("Checks pending".into()),
-        CheckStatus::Failing => detail.push("Checks failing".into()),
-        CheckStatus::Unknown => {}
-    }
+    // The checks keep their tone on their words, now the glyph has the state.
+    let checks: Option<(&str, fn(&cosmic::Theme) -> iced::widget::text::Style)> = match checks {
+        CheckStatus::Passing => Some(("Checks passing", design::success_text)),
+        CheckStatus::Pending => Some(("Checks pending", design::warning_text)),
+        CheckStatus::Failing => Some(("Checks failing", design::destructive_text)),
+        CheckStatus::Unknown => None,
+    };
     let one_line = |text: widget::text::Text<'a, cosmic::Theme, cosmic::Renderer>| {
         text.wrapping(iced::widget::text::Wrapping::None)
             .ellipsize(iced::widget::text::Ellipsize::End(
@@ -3195,7 +3183,26 @@ pub fn browser_row<'a>(
         .into(),
         widget::column::with_children(vec![
             one_line(design::body(pull_request.title.as_str())).into(),
-            one_line(design::caption(detail.join(" · "))).into(),
+            {
+                let mut facts = vec![
+                    design::caption(detail.join(" · "))
+                        .wrapping(iced::widget::text::Wrapping::None)
+                        .ellipsize(iced::widget::text::Ellipsize::End(
+                            EllipsizeHeightLimit::Lines(1),
+                        ))
+                        .into(),
+                ];
+                if let Some((label, tone)) = checks {
+                    facts.push(
+                        one_line(
+                            design::caption(format!(" · {label}"))
+                                .class(cosmic::theme::Text::Custom(tone)),
+                        )
+                        .into(),
+                    );
+                }
+                widget::row::with_children(facts).into()
+            },
         ])
         .width(Length::Fill)
         .into(),
@@ -5740,9 +5747,4 @@ mod browser_window_tests {
         assert_eq!(browser_row_window(10_000, f32::MAX, 480.0).end, 10_000);
         assert!(browser_row_window(0, 10.0, 480.0).is_empty());
     }
-}
-
-/// Merged pull requests take the one tone every list gives them.
-fn merged_pull_request_color(theme: &cosmic::Theme) -> iced::Color {
-    WorktreePullRequestState::Merged.color(theme)
 }

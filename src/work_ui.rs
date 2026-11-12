@@ -1118,7 +1118,6 @@ fn column_tone(column: Column) -> Toned {
     }
 }
 
-/// Merged work reads as done, apart from work under review.
 /// Landed work takes the tone merged pull requests have everywhere.
 fn merged_color(theme: &Theme) -> iced::Color {
     crate::sidebar::WorktreePullRequestState::Merged.color(theme)
@@ -1223,13 +1222,8 @@ pub(crate) fn pull_request_badges<'a, Message: 'a>(
 pub(crate) fn pull_request_state_badge<'a, Message: 'a>(
     pull_request: &crate::work::PullRequest,
 ) -> Element<'a, Message> {
-    let (label, tone): (&str, Toned) = match (pull_request.state, pull_request.draft) {
-        (PullRequestState::Open, true) => ("Draft", design::muted_color),
-        (PullRequestState::Open, false) => ("Open", design::success_color),
-        (PullRequestState::Merged, _) => ("Merged", design::accent_color),
-        (PullRequestState::Closed, _) => ("Closed", design::destructive_color),
-    };
-    badge(label, Tone::Themed(tone))
+    let state = crate::sidebar::WorktreePullRequestState::from_work(pull_request);
+    badge(state.label(), Tone::Themed(state.tone()))
 }
 
 /// The review decision of an open pull request, as a pill.

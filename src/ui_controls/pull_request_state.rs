@@ -11,7 +11,16 @@ use cosmic::widget;
 
 use super::Icon;
 use crate::design;
-use crate::sidebar::WorktreePullRequestState;
+
+/// Where a pull request stands, as people read it: a draft is its own state
+/// rather than an open pull request with a flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorktreePullRequestState {
+    Open,
+    Draft,
+    Closed,
+    Merged,
+}
 
 /// Merged has no COSMIC role, so it takes GitHub's purple, darker on a light
 /// surface so it keeps its contrast there.
@@ -51,15 +60,20 @@ impl WorktreePullRequestState {
         }
     }
 
-    /// The state's tone. Resolved from the theme a widget is drawn with, so a
-    /// row never reaches for the process-wide theme.
-    pub fn color(self, theme: &cosmic::Theme) -> Color {
+    /// The state's tone, as the function a style resolves from the theme a
+    /// widget is drawn with, so a row never reaches for the process-wide
+    /// theme.
+    pub const fn tone(self) -> fn(&cosmic::Theme) -> Color {
         match self {
-            Self::Open => design::success_color(theme),
-            Self::Draft => design::muted_icon_color(theme),
-            Self::Merged => merged_color(theme),
-            Self::Closed => design::destructive_color(theme),
+            Self::Open => design::success_color,
+            Self::Draft => design::muted_icon_color,
+            Self::Merged => merged_color,
+            Self::Closed => design::destructive_color,
         }
+    }
+
+    pub fn color(self, theme: &cosmic::Theme) -> Color {
+        self.tone()(theme)
     }
 }
 

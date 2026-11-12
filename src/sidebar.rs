@@ -1129,13 +1129,7 @@ impl CheckStatus {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WorktreePullRequestState {
-    Open,
-    Draft,
-    Closed,
-    Merged,
-}
+pub use crate::ui_controls::WorktreePullRequestState;
 
 impl WorktreePullRequestState {
     pub fn from_github(pull_request: &PullRequest) -> Option<Self> {
