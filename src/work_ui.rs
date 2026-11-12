@@ -1796,11 +1796,39 @@ mod tests {
                     "the {name} scrolled only {} px",
                     scrolled.0
                 );
+                // The first wheel of a gesture, which on a board that scrolls
+                // sideways decides where the gesture goes: a pointer motion
+                // this long after the last wheel ends the gesture before.
+                const GESTURES: usize = 8;
+                let mut started = Duration::ZERO;
+                for _ in 0..GESTURES {
+                    std::thread::sleep(Duration::from_millis(120));
+                    let moved =
+                        iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: pointer });
+                    let _ = ui.update(
+                        &[moved],
+                        cursor,
+                        &mut renderer,
+                        &mut iced::advanced::clipboard::Null,
+                        &mut Vec::new(),
+                    );
+                    let clock = Instant::now();
+                    let _ = ui.update(
+                        &[wheel.clone()],
+                        cursor,
+                        &mut renderer,
+                        &mut iced::advanced::clipboard::Null,
+                        &mut Vec::new(),
+                    );
+                    started += clock.elapsed();
+                }
                 eprintln!(
                     "work {name}, {cards} cards: rebuilt frame {build:.3} ms view, build and \
-                     layout + {draw:.3} ms draw; scrolled frame {:.3} ms mean, {:.3} ms worst",
+                     layout + {draw:.3} ms draw; scrolled frame {:.3} ms mean, {:.3} ms worst; \
+                     a gesture's first wheel {:.3} ms",
                     millis(total) / FRAMES as f64,
                     millis(worst),
+                    millis(started) / GESTURES as f64,
                 );
             }
         }
