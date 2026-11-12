@@ -807,7 +807,7 @@ impl SidebarWorktree {
             dirty_badge: dirty
                 .as_ref()
                 .filter(|dirty| dirty.is_dirty())
-                .map(|dirty| format!("{} changes", dirty_count(dirty)).into_boxed_str()),
+                .map(|dirty| dirty_label(dirty, false).into_boxed_str()),
             label: label.into_boxed_str(),
             pull_request: None,
         };
@@ -968,22 +968,11 @@ impl SidebarWorktree {
             self.chrome.delete_name = format!("Delete merged worktree {label}").into_boxed_str();
             self.chrome.label = label.into();
         }
-        self.chrome.dirty_badge =
-            self.dirty
-                .as_ref()
-                .filter(|dirty| dirty.is_dirty())
-                .map(|dirty| {
-                    format!(
-                        "{} {}changes",
-                        dirty_count(dirty),
-                        if self.untracked_omitted {
-                            "tracked "
-                        } else {
-                            ""
-                        }
-                    )
-                    .into_boxed_str()
-                });
+        self.chrome.dirty_badge = self
+            .dirty
+            .as_ref()
+            .filter(|dirty| dirty.is_dirty())
+            .map(|dirty| dirty_label(dirty, self.untracked_omitted).into_boxed_str());
         let mut status = status_summary(
             self.detached,
             self.locked,
@@ -11083,11 +11072,7 @@ fn status_summary(
 ) -> String {
     let mut parts = Vec::with_capacity(4);
     match dirty {
-        Some(dirty) if dirty.is_dirty() => parts.push(format!(
-            "{} {}changes",
-            dirty_count(dirty),
-            if untracked_omitted { "tracked " } else { "" }
-        )),
+        Some(dirty) if dirty.is_dirty() => parts.push(dirty_label(dirty, untracked_omitted)),
         Some(_) if untracked_omitted => parts.push("no tracked changes".to_owned()),
         Some(_) => parts.push("clean".to_owned()),
         None => parts.push("status unavailable".to_owned()),
@@ -11105,6 +11090,17 @@ fn status_summary(
         parts.push("locked".to_owned());
     }
     parts.join(", ")
+}
+
+/// `1 change`, `3 tracked changes`: how much a worktree has uncommitted,
+/// saying when untracked files were not counted.
+fn dirty_label(dirty: &DirtyState, untracked_omitted: bool) -> String {
+    let count = dirty_count(dirty);
+    format!(
+        "{count} {}{}",
+        if untracked_omitted { "tracked " } else { "" },
+        if count == 1 { "change" } else { "changes" }
+    )
 }
 
 fn dirty_count(dirty: &DirtyState) -> u64 {
@@ -21814,11 +21810,11 @@ pub(crate) mod tests {
         worktree.apply_status(&status);
         assert_eq!(
             worktree.chrome.dirty_badge.as_deref(),
-            Some("1 tracked changes")
+            Some("1 tracked change")
         );
         status.untracked_omitted = false;
         worktree.apply_status(&status);
-        assert_eq!(worktree.chrome.dirty_badge.as_deref(), Some("1 changes"));
+        assert_eq!(worktree.chrome.dirty_badge.as_deref(), Some("1 change"));
     }
 
     #[test]
