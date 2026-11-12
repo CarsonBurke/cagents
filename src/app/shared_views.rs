@@ -948,6 +948,12 @@ impl Cagents {
     /// The local views that list `card`, as `local_view_cards` would,
     /// without resolving every view's cards to find one.
     fn local_scopes_listing(&self, card: CardId) -> Vec<Scope> {
+        if self
+            .card_state(card)
+            .is_none_or(|card| !card.existence.is_open())
+        {
+            return Vec::new();
+        }
         let topology = self.borrowed_view_scope_topology();
         self.local_scopes_listing_with_topology(card, &topology)
     }
@@ -957,6 +963,12 @@ impl Cagents {
         card: CardId,
         topology: &ViewScopeTopology<'_>,
     ) -> Vec<Scope> {
+        if self
+            .card_state(card)
+            .is_none_or(|card| !card.existence.is_open())
+        {
+            return Vec::new();
+        }
         let ScopeDiscovery {
             scopes,
             worktree_cards,
