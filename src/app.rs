@@ -5317,6 +5317,7 @@ pub struct Cagents {
     channel_offsets: HashMap<crate::model::ChannelId, f32>,
     worktree_owners: HashMap<CardId, PathBuf>,
     known_worktree_roots: HashSet<PathBuf>,
+    worktree_paths: worktree_ui::WorktreePathIndex,
     workspace_view_generation: u64,
     workspace_scroll_id: widget::Id,
     github_availability: HashMap<ProjectId, GitHubAvailability>,
@@ -14701,6 +14702,7 @@ impl Application for Cagents {
                 .iter()
                 .map(|worktree| worktree.path.clone())
                 .collect(),
+            worktree_paths: worktree_ui::WorktreePathIndex::default(),
             workspace_view_generation: 0,
             workspace_scroll_id: widget::Id::new("workspace-strip-0"),
             github_availability: HashMap::new(),
@@ -14901,6 +14903,7 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        let _trace = crate::performance::ui_trace::update(&message);
         if let Some(settled) = self.settle_chat_close_confirm() {
             // An answer to the question that just ended must not answer the
             // next one, which the reader has not seen.
@@ -18647,6 +18650,8 @@ impl Application for Cagents {
     }
 
     fn subscription(&self) -> Subscription<Message> {
+        let _trace =
+            crate::performance::ui_trace::scope(crate::performance::ui_trace::Phase::Subscription);
         let operation_subscriptions = self.worktree_progress_subscriptions();
         let mut subscriptions = vec![
             self.chat_subscription(),
@@ -19152,6 +19157,7 @@ impl Application for Cagents {
     }
 
     fn view(&self) -> Element<'_, Message> {
+        let _trace = crate::performance::ui_trace::scope(crate::performance::ui_trace::Phase::View);
         let content_width = self.content_width();
         let sidebar_mode = self.projects_sidebar_mode();
         let sidebar = sidebar::view_cached(
@@ -19165,6 +19171,7 @@ impl Application for Cagents {
             !self.core.window.sharp_corners,
         )
         .map(Message::Sidebar);
+        let sidebar = crate::performance::ui_trace::region("sidebar", sidebar);
 
         // The focused card's own name and path are the card header's job, and
         // the window's header bar already carries the name; see
@@ -19355,6 +19362,7 @@ impl Application for Cagents {
             )
         };
 
+        let workspace = crate::performance::ui_trace::region("workspace", workspace);
         let main_content = self.workspace_chrome(workspace);
 
         let surface: Element<'_, Message> = if self.context_inspector_visible() {
@@ -19517,6 +19525,7 @@ impl Application for Cagents {
                 channel,
             },
         );
+        let surface = crate::performance::ui_trace::root(surface);
         #[cfg(feature = "latency-harness")]
         return latency_ui::instrument(
             surface,
@@ -30707,6 +30716,7 @@ mod tests {
             worktree_offsets: HashMap::new(),
             worktree_owners: HashMap::new(),
             known_worktree_roots: HashSet::new(),
+            worktree_paths: worktree_ui::WorktreePathIndex::default(),
             workspace_view_generation: 0,
             workspace_scroll_id: widget::Id::new("workspace-strip-0"),
             github_availability: HashMap::new(),

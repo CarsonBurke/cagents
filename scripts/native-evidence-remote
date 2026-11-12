@@ -385,7 +385,7 @@ cmd_pair() {
                 options+=("$1" "$2")
                 shift 2
                 ;;
-            --keep-state) options+=("$1"); shift ;;
+            --keep-state | --ui-trace) options+=("$1"); shift ;;
             --codex-executable)
                 [ "$#" -ge 2 ] || die "$1 needs a value" 2
                 options+=("$1" "$2")

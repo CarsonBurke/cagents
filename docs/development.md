@@ -1758,7 +1758,9 @@ harness, it provides:
   finish with `stop`. This preserves the daemon and live providers, whereas
   `stop` ends them. Add `--chat-stages` to record UI-thread chat stage timings
   under `logs/` on normal close; these measure synchronous work rather than
-  compositor presentation. Recreate the same workload on each revision when comparing
+  compositor presentation. Add `--ui-trace` to `start` for a live log of
+  UI-thread work by phase and message; see "UI thread trace" in
+  `docs/performance.md`. Recreate the same workload on each revision when comparing
   startup; a saved descriptor whose provider was killed is not a live chat.
 - **Matching evidence.** `start` refuses a checkout that changed since its build.
   `shots/manifest.tsv` records each image's revision, source state, requested
