@@ -601,8 +601,9 @@ pub struct Check {
     pub url: String,
 }
 
-/// Ordered from what most needs attention: a cancelled check leaves its
-/// pull request as unproven as a failing one is broken.
+/// Ordered from what most needs attention: a failure, then a check still
+/// running, then a cancelled one, which leaves its pull request unproven
+/// though nothing failed, then passes and skips.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckState {
