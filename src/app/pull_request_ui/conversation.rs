@@ -718,8 +718,8 @@ fn pull_request_facts(
 ) -> Vec<Fact> {
     let mut facts = Vec::with_capacity(6);
     // Another repository's number would crowd the title, so it goes
-    // beneath it.
-    if !own_repository(list, row) {
+    // beneath it. Not yet known, the row is named by that number already.
+    if !own_repository(list, row) && row.pull_request.is_some() {
         facts.push(Fact::plain(repository_label(&row.repository)));
     }
     if row.pull_request.is_none() {
@@ -1634,6 +1634,15 @@ mod tests {
         assert_eq!(
             row_parts(list, work, &|_| true).described(work, false, false),
             "Show Change 4, open, #4, upstream/repo, Reviewed"
+        );
+        upstream.pull_request = None;
+        let work = Work::PullRequest {
+            row: &upstream,
+            worktree: None,
+        };
+        assert_eq!(
+            row_parts(list, work, &|_| true).described(work, false, false),
+            "Show upstream/repo#4, State unknown, Reviewed"
         );
 
         let edited = worktree("/repo/notes", None);
