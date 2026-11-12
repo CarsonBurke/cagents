@@ -105,6 +105,15 @@ Each later turn answers with that file's contents instead of the default
 sentence, so replacing the file changes the next answer. A few turns with a
 long file give a transcript long enough to scroll.
 
+Create `fixture-stream-reply` to send that answer in 16,384-character text
+deltas before its final record. The file may hold the delay between deltas in
+seconds (default `0.25`). While streaming, control requests still take effect
+and additional prompts receive the usual queued lifecycle. Interrupt stops
+the stream and settles the turn without recording an answer that was never
+fully sent. Closing stdin finishes the finite reply. The fixture requires
+Bash for timed input reads; `python3 tests/chat_composer_streaming.py` checks
+this duplex protocol without the app or a live provider.
+
 For provider failure checks, write a diagnostic such as `Failed to
 authenticate: OAuth session expired and could not be refreshed` to
 `fixture-image-prompt-error`. Any prompt containing an image then settles with

@@ -377,7 +377,7 @@ fn tile_style<const SELECTED: bool>() -> theme::Button {
         let wash = if selected { 0.12 } else { 0.0 } + lift;
         button::Style {
             background: (wash > 0.0).then(|| Background::Color(ink.scale_alpha(wash))),
-            border_radius: design::RADIUS_S.into(),
+            border_radius: theme.cosmic().corner_radii.radius_s.into(),
             outline_width: if focused { design::BORDER_WIDTH } else { 0.0 },
             outline_color: if focused {
                 design::accent_color(theme)
