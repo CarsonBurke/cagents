@@ -164,7 +164,8 @@ impl Cagents {
         !self.pull_requests_listed() && self.edited_worktrees().is_empty()
     }
 
-    /// The inspector's height beneath its header, above the status bar.
+    /// An estimate of the sections' height until they have been laid out:
+    /// the window beneath the inspector's header, above the status bar.
     fn inspector_body_height(&self) -> f32 {
         let status = if self.settings.show_status_bar {
             super::account_ui::STATUS_BAR_HEIGHT
@@ -256,7 +257,8 @@ impl Cagents {
         // within a few rows above an empty panel.
         let mut lead = (!shared).then(|| {
             lead_list_height(
-                self.inspector_body_height(),
+                self.context_sections_height
+                    .unwrap_or_else(|| self.inspector_body_height()),
                 panes.len(),
                 lists.first().copied().unwrap_or_default(),
                 lists.iter().skip(1).sum(),
@@ -297,10 +299,15 @@ impl Cagents {
             children.push(design::horizontal_rule().into());
             children.push(iced::widget::Space::new().height(Length::Fill).into());
         }
-        widget::column::with_children(children)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
+        // The banners beneath the workspace come and go, so the height the
+        // sections have is measured rather than derived from the window.
+        iced::widget::sensor(
+            widget::column::with_children(children)
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_resize(|size| Message::ContextSectionsMeasured(size.height))
+        .into()
     }
 
     fn section_header<'a>(
@@ -411,8 +418,11 @@ impl Cagents {
                 format!("{} edited", edited.len())
             }),
             controls: Vec::new(),
+            // Each row is two lines, so its count bounds the list's height
+            // and the leading list need not leave room for rows not there.
+            // The quarter row covers the list's padding.
             height: Height::Content {
-                rows: LIST_ROWS_SHOWN,
+                rows: (edited.len() as f32 + 0.25).min(LIST_ROWS_SHOWN),
             },
             body: open.then(|| self.edited_worktrees_view(edited)),
         })

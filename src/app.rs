@@ -4620,6 +4620,8 @@ pub enum Message {
     },
     ToggleContextInspector,
     ContextSection(context_sections::Action),
+    /// The inspector sections were laid out at this height.
+    ContextSectionsMeasured(f32),
     ContextInspector(InspectorAction),
     SelectSettingsCategory(SettingsCategory),
     SettingsSearchChanged(String),
@@ -5271,6 +5273,8 @@ pub struct Cagents {
     /// it has been mapped. The native Opened and Resized events replace it.
     window_width: f32,
     window_height: f32,
+    /// The inspector sections' laid-out height, once they have been shown.
+    context_sections_height: Option<f32>,
     /// Whether the main window is maximized or fullscreen, so the shell offers
     /// no resize border. Tracked here rather than read from `core`, which only
     /// learns it from Wayland window states.
@@ -14648,6 +14652,7 @@ impl Application for Cagents {
             window_scale_factor,
             window_width: 1_600.0,
             window_height: 900.0,
+            context_sections_height: None,
             window_filled: false,
             window_state_observed: false,
             right_edge_tiled: false,
@@ -18144,6 +18149,12 @@ impl Application for Cagents {
             }
             Message::ContextSection(_) if self.modal_is_open() => Task::none(),
             Message::ContextSection(action) => self.handle_context_section(action),
+            // Reported on the first layout and whenever the size changes,
+            // including the width while the inspector slides open.
+            Message::ContextSectionsMeasured(height) => {
+                self.context_sections_height = Some(height);
+                Task::none()
+            }
             Message::ContextInspector(_) if self.modal_is_open() => Task::none(),
             Message::ContextInspector(action) => self.handle_context_inspector_action(action),
             Message::SelectSettingsCategory(category) => {
@@ -30655,6 +30666,7 @@ mod tests {
             window_scale_factor: 1.0,
             window_width: 1_600.0,
             window_height: 900.0,
+            context_sections_height: None,
             window_filled: false,
             window_state_observed: false,
             right_edge_tiled: false,
