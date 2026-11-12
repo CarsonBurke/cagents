@@ -900,6 +900,9 @@ enum WheelRoute {
 #[derive(Default)]
 struct WheelGesture {
     current: Option<(bool, Instant)>,
+    /// Shift asks iced's scrollables for sideways motion, so a wheel with it
+    /// held never keeps its vertical motion.
+    shift: bool,
 }
 
 impl WheelGesture {
@@ -911,6 +914,11 @@ impl WheelGesture {
 
     fn observe(&mut self, event: &Event) {
         let ended = match event {
+            Event::Keyboard(cosmic::iced::keyboard::Event::ModifiersChanged(modifiers)) => {
+                let changed = modifiers.shift() != self.shift;
+                self.shift = modifiers.shift();
+                changed
+            }
             Event::Mouse(
                 mouse::Event::ButtonPressed(_)
                 | mouse::Event::ButtonReleased(_)
@@ -927,27 +935,42 @@ impl WheelGesture {
     }
 
     /// Whether this wheel keeps its vertical motion: as the gesture decided
-    /// if one is in progress, otherwise as `decide` says.
+    /// if one is in progress, otherwise as `decide` says. Only the first
+    /// wheel of a gesture pays for deciding.
     fn keeps_vertical(&mut self, decide: impl FnOnce() -> bool) -> bool {
         let keep = match self.current {
             Some((keep, at)) if at.elapsed() <= Self::REST => keep,
-            _ => decide(),
+            _ => !self.shift && decide(),
         };
         self.current = Some((keep, Instant::now()));
         keep
     }
 }
 
-/// Finds whether a scrollable that moves vertically lies under a point given
-/// in the operated layout's coordinates.
+/// Finds whether a scrollable taller than its bounds - one that moves
+/// vertically - lies under a point given in the operated layout's
+/// coordinates.
+///
+/// Only the content of a scrollable under the point is visited, so a
+/// scrollable scrolled out of its parent's sight is never found, and the
+/// search costs about one visit per scrollable on the way to the point
+/// rather than one per widget: on a board, the lanes, not their cards.
 struct VerticalScrollableAt {
     point: Point,
     /// Scrolled distance of the content being visited.
     offset: Vector,
-    /// Scrolled distance of the scrollable just visited, which its next
-    /// traversal enters.
-    entering: Vector,
+    /// What the next traversal, a just visited scrollable's content, does.
+    next: Enter,
     found: bool,
+}
+
+enum Enter {
+    /// Not a scrollable's content: visited as it is.
+    Plain,
+    /// The content of a scrollable under the point, scrolled this far.
+    Scrolled(Vector),
+    /// The content of a scrollable away from the point.
+    Skip,
 }
 
 impl VerticalScrollableAt {
@@ -955,7 +978,7 @@ impl VerticalScrollableAt {
         Self {
             point,
             offset: Vector::ZERO,
-            entering: Vector::ZERO,
+            next: Enter::Plain,
             found: false,
         }
     }
@@ -963,13 +986,19 @@ impl VerticalScrollableAt {
 
 impl Operation for VerticalScrollableAt {
     fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
-        if self.found {
-            return;
-        }
         let outer = self.offset;
-        self.offset = outer + std::mem::replace(&mut self.entering, Vector::ZERO);
+        match std::mem::replace(&mut self.next, Enter::Plain) {
+            _ if self.found => return,
+            Enter::Skip => return,
+            Enter::Scrolled(translation) => self.offset = outer + translation,
+            Enter::Plain => {}
+        }
         operate(self);
         self.offset = outer;
+    }
+
+    fn container(&mut self, _id: Option<&Id>, _bounds: Rectangle) {
+        self.next = Enter::Plain;
     }
 
     fn scrollable(
@@ -980,10 +1009,15 @@ impl Operation for VerticalScrollableAt {
         translation: Vector,
         _state: &mut dyn operation::Scrollable,
     ) {
-        if content_bounds.height > bounds.height && bounds.contains(self.point + self.offset) {
-            self.found = true;
+        if self.found {
+            return;
         }
-        self.entering = translation;
+        if bounds.contains(self.point + self.offset) {
+            self.found = content_bounds.height > bounds.height;
+            self.next = Enter::Scrolled(translation);
+        } else {
+            self.next = Enter::Skip;
+        }
     }
 }
 
@@ -2977,6 +3011,30 @@ mod tests {
             wheel(&mut swiped, 100.0, 200.0, pixels(-40.0, -10.0)),
             (40.0, 0.0, 0.0)
         );
+
+        // Shift asks for sideways motion, as it does of iced's scrollables,
+        // even over a lane.
+        let mut shifted = ui();
+        let shift = |ui: &mut UserInterface<'_, (), Theme, Renderer>, held: bool| {
+            let modifiers = if held {
+                cosmic::iced::keyboard::Modifiers::SHIFT
+            } else {
+                cosmic::iced::keyboard::Modifiers::empty()
+            };
+            let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+            let _ = ui.update(
+                &[Event::Keyboard(
+                    cosmic::iced::keyboard::Event::ModifiersChanged(modifiers),
+                )],
+                mouse::Cursor::Available(Point::new(100.0, 200.0)),
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut Vec::new(),
+            );
+        };
+        shift(&mut shifted, true);
+        assert_eq!(wheel(&mut shifted, 100.0, 200.0, notch), (60.0, 0.0, 0.0));
+        assert_eq!(wheel(&mut shifted, 100.0, 200.0, notch), (120.0, 0.0, 0.0));
 
         // Over a heading the wheel moves the row sideways, and goes on doing
         // so when that brings a lane under the pointer mid-gesture.
