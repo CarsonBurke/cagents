@@ -361,6 +361,13 @@ impl Cagents {
         edited: &'a [crate::work::ConversationWorktree],
     ) -> Element<'a, Message> {
         let active = self.sidebar_state.active_worktree();
+        // Point at the workspace section only while it shows the current
+        // worktree; collapsed, the row just marks which one is current.
+        let current_fact = if self.workspace_view_shown().is_some() {
+            "Shown below"
+        } else {
+            "Current"
+        };
         let rows = edited.iter().map(|edited| {
             let found = self.sidebar_model.projects.iter().find_map(|project| {
                 project
@@ -410,7 +417,7 @@ impl Cagents {
                 None => facts.push(design::caption("Not open in Projects").into()),
             }
             if current {
-                facts.push(design::caption("Shown below").into());
+                facts.push(design::caption(current_fact).into());
             }
             if edited.by_subagent {
                 facts.push(design::caption("by a subagent").into());
