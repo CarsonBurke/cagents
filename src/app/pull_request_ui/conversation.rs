@@ -481,11 +481,15 @@ pub(super) fn view<'a>(
     let list = state.list.as_deref();
     for item in work {
         let chosen = shown.is_some_and(|key| item.is(key));
-        children.push(work_row(list, *item, chosen && shown_open, openable));
-        if chosen
-            && state.details_open(*item)
-            && let Some(row) = item.pull_request()
-        {
+        let details = chosen && state.details_open(*item);
+        children.push(work_row(
+            list,
+            *item,
+            chosen && shown_open,
+            details,
+            openable,
+        ));
+        if details && let Some(row) = item.pull_request() {
             children.push(chosen_details(row));
         }
     }
@@ -771,6 +775,7 @@ fn work_row<'a>(
     list: Option<&ConversationPullRequests>,
     work: Work<'_>,
     marked: bool,
+    details: bool,
     openable: &dyn Fn(&Path) -> bool,
 ) -> Element<'a, Action> {
     let mut facts: Vec<Fact> = Vec::with_capacity(6);
@@ -828,10 +833,13 @@ fn work_row<'a>(
         }
     };
     // The facts line may be cut short, so the name read out says them all.
-    let described = std::iter::once(if marked {
-        format!("{name}, shown below")
-    } else {
-        format!("Show {name}")
+    // Pressing a shown pull request again folds or unfolds its checks, which
+    // nothing on the row draws, so its name says which it will do.
+    let described = std::iter::once(match (marked, work.pull_request()) {
+        (true, Some(_)) if details => format!("{name}, shown below, press to hide its checks"),
+        (true, Some(_)) => format!("{name}, shown below, press to list its checks"),
+        (true, None) => format!("{name}, shown below"),
+        (false, _) => format!("Show {name}"),
     })
     .chain(marks.iter().map(|(_, said)| said.clone()))
     .chain(facts.iter().map(Fact::text))

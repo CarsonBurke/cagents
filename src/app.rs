@@ -13168,7 +13168,10 @@ impl Cagents {
         {
             self.context_inspector_transition = None;
             let sync = self.sync_context_overlay_state();
-            return Task::batch([sync, self.focus_context_overlay_if_exposed()]);
+            // A frame skips the rebind, and a closed inspector no longer pins
+            // the panels to the work it showed.
+            let binding = self.rebind_source_control();
+            return Task::batch([sync, binding, self.focus_context_overlay_if_exposed()]);
         }
         Task::none()
     }

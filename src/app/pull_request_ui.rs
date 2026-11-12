@@ -559,10 +559,23 @@ mod tests {
             )))),
         );
         assert!(app.inspector_panel_pin().is_some());
+        drop(app.rebind_source_control());
+        let pinned = Some(PathBuf::from("/repo/fix-sidebar"));
+        let active = |app: &Cagents| {
+            app.sidebar_state
+                .active_worktree()
+                .map(|key| key.canonical_path.clone())
+        };
+        assert_eq!(active(&app), pinned);
         drop(app.set_context_inspector_open(false));
-        app.context_inspector_transition = None;
+        // The close finishes on an animation frame, which rebinds nothing
+        // else; the panels must still let go of the work.
+        drop(app.update(Message::Frame(
+            std::time::Instant::now() + super::super::DIALOG_TRANSITION_DURATION * 2,
+        )));
         assert!(!app.context_inspector_visible());
         assert_eq!(app.inspector_panel_pin(), None);
+        assert_ne!(active(&app), pinned);
     }
 }
 
