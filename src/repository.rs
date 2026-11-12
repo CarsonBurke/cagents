@@ -6662,7 +6662,7 @@ const LOG_STDERR_EXCERPT: usize = 512;
 ///
 /// Every caller that reads a non-zero exit as a real failure goes through here
 /// so that the argv behind it is recorded exactly once. Without that record,
-/// `git: process exited with status Some(128)` on a banner is unattributable:
+/// `git: process exited with status 128` on a banner is unattributable:
 /// identifying which command of a repository load returned it needed a shim on
 /// `PATH`.
 fn git_failure(command: &CommandSpec, output: ProcessOutput) -> ProcessFailure {
@@ -12015,7 +12015,7 @@ mod tests {
     }
 
     /// A whole run under `RUST_LOG=cagents=trace` produced no `cagents::` line
-    /// at all, so the `git: process exited with status Some(128)` banner named
+    /// at all, so the `git: process exited with status 128` banner named
     /// neither the command that failed nor Git's own reason for failing.
     /// Attributing it needed a shim on `PATH`. Every failure now carries its
     /// argv, its status and Git's message.

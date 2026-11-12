@@ -1332,6 +1332,15 @@ pub enum GitHubError {
 }
 
 impl GitHubError {
+    /// What a surface reports about this failure: for a `gh` that exited
+    /// non-zero, the line it wrote about why, rather than its exit status.
+    pub fn reported_detail(&self) -> String {
+        match self {
+            Self::Process(failure) => failure.reported_detail(),
+            other => other.to_string(),
+        }
+    }
+
     pub fn rate_limit(&self) -> Option<polling::RateLimit> {
         match self {
             Self::RateLimited { limit } => Some(limit.clone()),
@@ -2022,7 +2031,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
                 scope.spawn(|| self.cached_checks(repository, &pull_request, cancellation));
             let conversation = self
                 .conversation(&key, cancellation)
-                .map_err(|error| error.to_string());
+                .map_err(|error| error.reported_detail());
             (
                 checks
                     .join()
@@ -2334,7 +2343,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
         let (checks, ttl) = match self.checks(&key.pull_request, cancellation) {
             Ok(checks) => (checks, CHECKS_CACHE_TTL),
             Err(GitHubError::ChecksPending { checks, .. }) => (checks, Duration::from_secs(2)),
-            Err(error) => return Err(error.to_string()),
+            Err(error) => return Err(error.reported_detail()),
         };
         if !cancellation.is_cancelled() {
             lock_checks_cache().insert(
