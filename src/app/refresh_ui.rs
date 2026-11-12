@@ -291,7 +291,7 @@ impl Cagents {
             }
         }
         if self.context_inspector_open
-            && matches!(self.context_tab, ContextTab::Files | ContextTab::Changes)
+            && self.workspace_view_shown().is_some()
             && self.refresh_ui.source_cancel.is_none()
             && let Some(key) = self
                 .sidebar_model

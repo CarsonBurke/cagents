@@ -1,10 +1,12 @@
-//! The pull requests the inspected conversation worked on or mentioned, as
-//! the daemon infers them from its transcript. They list above the pull
-//! request detail; choosing one shows it there.
+//! The pull requests the inspected conversation worked on or mentioned, and
+//! the worktrees it edited, as the daemon infers them from its transcript.
+//! The pull requests list above the pull request detail; choosing one shows
+//! it there.
 
 use super::*;
 use crate::work::{
-    ConversationPullRequest, ConversationPullRequests, Relation, TranscriptCoverage,
+    ConversationPullRequest, ConversationPullRequests, ConversationWorktree, Relation,
+    TranscriptCoverage,
 };
 use cosmic::iced::futures::SinkExt;
 
@@ -94,6 +96,13 @@ impl State {
         self.list
             .as_deref()
             .map_or(&[], |list| list.pull_requests.as_slice())
+    }
+
+    /// The worktrees the conversation edited, most recently edited first.
+    pub(super) fn worktrees(&self) -> &[ConversationWorktree] {
+        self.list
+            .as_deref()
+            .map_or(&[], |list| list.worktrees.as_slice())
     }
 
     pub(super) fn lists(&self, key: &PullRequestKey) -> bool {
@@ -255,7 +264,6 @@ impl Drop for HangUpOnDrop {
 /// `selected` is the pull request the detail shows.
 pub(super) fn view<'a>(
     state: &'a State,
-    title: Option<&'a str>,
     selected: Option<&PullRequestKey>,
 ) -> Option<Element<'a, Action>> {
     let list = state.list.as_deref()?;
@@ -267,30 +275,20 @@ pub(super) fn view<'a>(
         .iter()
         .partition(|row| row.relation.worked_on());
     let mut children: Vec<Element<'a, Action>> = Vec::new();
+    // The inspector stands beside the conversation it describes, so the
+    // groups need no name but their own.
     let heading = |label: &'static str, count: usize| -> Element<'a, Action> {
-        let mut parts = vec![
+        widget::row::with_children(vec![
             design::caption(label)
                 .font(design::heading_font())
                 .wrapping(iced::widget::text::Wrapping::None)
                 .into(),
             design::caption(count.to_string()).into(),
-        ];
-        if let Some(title) = title.filter(|_| label == "Worked on" || worked_on_empty(list)) {
-            parts.push(
-                design::caption(format!("· {title}"))
-                    .wrapping(iced::widget::text::Wrapping::None)
-                    .ellipsize(iced::widget::text::Ellipsize::End(
-                        iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                    ))
-                    .width(Length::Fill)
-                    .into(),
-            );
-        }
-        widget::row::with_children(parts)
-            .spacing(space::XS)
-            .align_y(Alignment::Center)
-            .width(Length::Fill)
-            .into()
+        ])
+        .spacing(space::XS)
+        .align_y(Alignment::Center)
+        .width(Length::Fill)
+        .into()
     };
     if !worked_on.is_empty() {
         children.push(heading("Worked on", worked_on.len()));
@@ -337,13 +335,6 @@ pub(super) fn view<'a>(
             .width(Length::Fill)
             .into(),
     )
-}
-
-fn worked_on_empty(list: &ConversationPullRequests) -> bool {
-    !list
-        .pull_requests
-        .iter()
-        .any(|row| row.relation.worked_on())
 }
 
 /// Why the list may be incomplete or out of date, when it may be.

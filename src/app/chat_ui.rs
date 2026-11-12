@@ -4384,77 +4384,6 @@ impl Runtime {
                 None => self.scroll,
             })
     }
-    pub(super) fn memory_diagnostics(&self) -> crate::inspector::ChatMemory {
-        fn payload(item: &chat::Item) -> usize {
-            match &item.content {
-                ItemContent::Text { text, .. } => text.len(),
-                ItemContent::Command { output, .. } => output.len(),
-                ItemContent::Tool { input, output, .. } => input.len() + output.len(),
-                ItemContent::Changes { changes, .. } => {
-                    changes.iter().map(|change| change.diff.len()).sum()
-                }
-                ItemContent::Delivery { body, .. } => body.len(),
-                _ => 0,
-            }
-        }
-        crate::inspector::ChatMemory {
-            source_bytes: self
-                .snapshot
-                .items
-                .iter()
-                .chain(
-                    self.snapshot
-                        .subagents
-                        .iter()
-                        .flat_map(|agent| &agent.items),
-                )
-                .map(|item| payload(item))
-                .sum::<usize>()
-                .saturating_add(
-                    self.queued
-                        .as_ref()
-                        .map_or(0, |queued| queued.source.allocation()),
-                )
-                .saturating_add(
-                    self.snapshot
-                        .queued_messages
-                        .iter()
-                        .map(|message| message.text.len())
-                        .sum::<usize>(),
-                )
-                .saturating_add(
-                    self.followups
-                        .iter()
-                        .map(|message| message.text.capacity())
-                        .sum::<usize>(),
-                ),
-            presentation_bytes: self
-                .cache
-                .values()
-                .chain(self.child_cache.values())
-                .map(CachedItem::retained_bytes)
-                .sum::<usize>()
-                .saturating_add(
-                    self.queued
-                        .as_ref()
-                        .and_then(|queued| queued.presentation.prepared.as_ref())
-                        .map_or(0, |prepared| prepared.retained_bytes()),
-                )
-                .saturating_add(self.provider_queue.borrow().retained_bytes())
-                .saturating_add(
-                    self.followups
-                        .iter()
-                        .map(|message| message.preview.capacity())
-                        .sum::<usize>(),
-                ),
-            selection_bytes: self
-                .selection_document
-                .borrow()
-                .as_ref()
-                .map_or(0, |(_, catalog)| catalog.retained_plain_bytes()),
-            prepared_items: self.cache.len() + self.child_cache.len(),
-        }
-    }
 
     fn prepare_transcript_cache(&mut self, snapshot: &Snapshot) -> preparation::MetadataRetirement {
         self.preparation.take_deferred();
@@ -5779,23 +5708,6 @@ impl Runtime {
                 .pending
                 .as_ref()
                 .is_some_and(|pending| pending.sent.is_some())
-    }
-    pub(super) fn inspector_runtime_status(&self) -> InspectorRuntimeStatus {
-        if self.disconnected {
-            InspectorRuntimeStatus::Attention
-        } else if self.has_connected_saved_history(&self.snapshot) {
-            if self.snapshot.history_loading {
-                InspectorRuntimeStatus::Loading
-            } else {
-                InspectorRuntimeStatus::Ready
-            }
-        } else if self.snapshot.exited {
-            InspectorRuntimeStatus::Attention
-        } else if self.is_draft() || self.snapshot.ready {
-            InspectorRuntimeStatus::Ready
-        } else {
-            InspectorRuntimeStatus::Starting
-        }
     }
     /// Ownership can become durable after the initial attachment, including
     /// while the pane is hidden. Preserve that confirmed capability before
@@ -18145,50 +18057,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn inspector_does_not_report_an_exited_attached_provider_as_ready() {
-        let mut app = crate::app::tests::context_inspector_test_app(false);
-        let draft = draft_chat_for_provider(&mut app, Provider::Claude);
-        assert_eq!(
-            app.inspector_runtime_status(draft),
-            InspectorRuntimeStatus::Ready
-        );
-        let card = live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
-        for (ready, exited, expected) in [
-            (false, false, InspectorRuntimeStatus::Starting),
-            (true, false, InspectorRuntimeStatus::Ready),
-            (false, true, InspectorRuntimeStatus::Attention),
-            (true, true, InspectorRuntimeStatus::Attention),
-        ] {
-            show_chat_snapshot_for_test(
-                &mut app,
-                card,
-                Snapshot {
-                    session_id: Some(KNOWN_THREAD.into()),
-                    ready,
-                    exited,
-                    ..Snapshot::default()
-                },
-            );
-            assert_eq!(app.inspector_runtime_status(card), expected);
-        }
-        show_chat_snapshot_for_test(
-            &mut app,
-            card,
-            Snapshot {
-                session_id: Some(KNOWN_THREAD.into()),
-                exited: true,
-                read_only_reason: Some("Saved history has no executing provider".into()),
-                native_continuity: chat::NativeContinuity::ReconnectOnly,
-                ..Snapshot::default()
-            },
-        );
-        assert_eq!(
-            app.inspector_runtime_status(card),
-            InspectorRuntimeStatus::Ready
-        );
-    }
-
     fn presentation_child(id: &str, item: Arc<chat::Item>) -> chat::Subagent {
         chat::Subagent {
             id: id.into(),
@@ -22602,10 +22470,6 @@ mod tests {
             let reads = crate::upgrade::floor::index_reads_for_test();
             for _ in 0..100 {
                 assert!(runtime.has_connected_saved_history(&runtime.snapshot));
-                assert!(matches!(
-                    runtime.inspector_runtime_status(),
-                    InspectorRuntimeStatus::Ready
-                ));
                 assert_eq!(
                     runtime.composer_action_rows(false),
                     vec![(ComposerRow::Attach, true)]
@@ -22942,10 +22806,6 @@ mod tests {
             assert!(
                 !runtime.has_connected_saved_history(&runtime.snapshot),
                 "show Reconnect rather than Resume"
-            );
-            assert_eq!(
-                runtime.inspector_runtime_status(),
-                InspectorRuntimeStatus::Attention
             );
             assert!(!app.chat_ui.explicit_starts.contains_key(&card));
             drop(app.handle_chat_ui(if stale_resume_click {

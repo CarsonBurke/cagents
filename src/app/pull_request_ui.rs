@@ -681,53 +681,28 @@ fn comment_matches(comment: &PullRequestComment, filter: &str) -> bool {
             .is_some_and(|actor| actor.login.to_lowercase().contains(filter))
 }
 
-pub fn view(state: &State) -> Element<'_, Action> {
-    let visual = state.preview.as_ref().map(sidebar::pull_request_visual);
-    let header = widget::row::with_children(vec![
-        widget::icon(
-            visual
-                .as_ref()
-                .map_or_else(|| Icon::PullRequest.handle(), |(icon, _)| icon.clone()),
-        )
-        .size(design::ROW_ICON_SIZE)
-        .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(move |theme| {
-            cosmic::iced::widget::svg::Style {
-                color: Some(visual.as_ref().map_or_else(
-                    || theme.current_container().component.on.into(),
-                    |(_, color)| *color,
-                )),
-            }
-        })))
-        .into(),
-        design::heading(state.pull_request.as_ref().map_or_else(
-            || {
-                state
-                    .preview
-                    .as_ref()
-                    .map_or_else(|| "Pull request".to_owned(), |pr| format!("#{}", pr.number))
-            },
-            |pr| format!("#{} · {}", pr.number, readable_state(&pr.state.0)),
-        ))
-        .width(Length::Fill)
-        .into(),
-        widget::container(if state.loading {
-            crate::ui_controls::activity_spinner(
-                f32::from(design::ROW_ICON_SIZE),
-                design::warning_color,
-            )
-        } else {
-            iced::widget::Space::new().into()
-        })
-        .width(design::ROW_ICON_SIZE)
-        .height(design::ROW_ICON_SIZE)
-        .into(),
+/// The section header's controls for the shown pull request: whether a read
+/// is in flight, and a refresh.
+pub(super) fn activity(state: &State) -> Vec<Element<'_, Action>> {
+    let mut controls = Vec::with_capacity(2);
+    if state.loading {
+        controls.push(crate::ui_controls::activity_spinner(
+            f32::from(design::COMPACT_ICON_SIZE),
+            design::warning_color,
+        ));
+    }
+    controls.push(
         crate::ui_controls::icon_button(Icon::Refresh, "Refresh pull request")
+            .compact()
             .on_press_maybe((state.target.is_some() && !state.loading).then_some(Action::Refresh))
             .into(),
-    ])
-    .spacing(space::XS)
-    .align_y(Alignment::Center)
-    .height(design::HEADER_CONTENT_HEIGHT);
+    );
+    controls
+}
+
+/// The shown pull request: its identity, review state, checks and
+/// discussion, as rows for the section that scrolls them.
+pub(super) fn detail(state: &State) -> Vec<Element<'_, Action>> {
     let mut children: Vec<Element<'_, Action>> = Vec::new();
     // While a pull request is loaded its metadata grid carries the repository
     // and branch; this line only orients the reader before that arrives.
@@ -1198,31 +1173,7 @@ pub fn view(state: &State) -> Element<'_, Action> {
             }
         }
     }
-    let body = widget::scrollable(
-        widget::column::with_children(children)
-            .spacing(space::S)
-            .padding(design::with_vertical_rail(cosmic::iced::Padding::from([
-                space::XS,
-                space::S,
-            ])))
-            .width(Length::Fill),
-    )
-    .direction(cosmic::iced::widget::scrollable::Direction::Vertical(
-        crate::design::scrollbar(),
-    ))
-    .height(Length::Fill)
-    .width(Length::Fill);
-    widget::column::with_children(vec![
-        widget::container(header)
-            .padding([0.0, space::S])
-            .width(Length::Fill)
-            .into(),
-        crate::design::horizontal_rule().into(),
-        body.into(),
-    ])
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .into()
+    children
 }
 
 impl Cagents {
@@ -1455,7 +1406,7 @@ impl Cagents {
         } else {
             inspector.conversation.settled(inspector.default.as_ref())
         };
-        if !self.context_inspector_open || self.context_tab != ContextTab::PullRequest {
+        if !self.pull_request_section_open() {
             self.pull_request_inspector.source_key = None;
             return self
                 .pull_request_inspector
@@ -1579,12 +1530,10 @@ impl Cagents {
     fn pull_request_binding_is_current(&self) -> bool {
         let state = &self.pull_request_inspector;
         if let Some(key) = &self.shown_pull_request() {
-            return self.context_inspector_open
-                && self.context_tab == ContextTab::PullRequest
+            return self.pull_request_section_open()
                 && matches!(&state.source_target, Some(Target::PullRequest(bound)) if bound == key);
         }
-        self.context_inspector_open
-            && self.context_tab == ContextTab::PullRequest
+        self.pull_request_section_open()
             && state.source_key.as_ref() == self.sidebar_state.active_worktree()
             && self
                 .sidebar_model
@@ -1619,8 +1568,7 @@ impl Cagents {
         git: RepositoryService<E>,
         github: GitHubService<G>,
     ) -> Task<Message> {
-        if !self.context_inspector_open
-            || self.context_tab != ContextTab::PullRequest
+        if !self.pull_request_section_open()
             || !self.pull_request_binding_is_current()
             || self.pull_request_inspector.loading
             || self
@@ -1639,7 +1587,42 @@ impl Cagents {
             .map(cosmic::Action::App)
     }
 
-    pub(super) fn pull_request_panel(&self, width: f32) -> Element<'_, Message> {
+    /// Whether the Pull requests section has anything to show: a pull request
+    /// the inspected conversation worked on or mentioned, or the active
+    /// branch's own. Neither is a section that would only say so.
+    pub(super) fn pull_requests_listed(&self) -> bool {
+        self.conversation_lists_pull_requests() || self.active_branch_pull_request().is_some()
+    }
+
+    /// How many pull requests the section lists, for its header.
+    pub(super) fn pull_request_count(&self) -> usize {
+        let listed = self.pull_request_inspector.conversation.rows();
+        let branch = self.active_branch_pull_request().filter(|key| {
+            !listed
+                .iter()
+                .filter_map(conversation::row_key)
+                .any(|row| conversation::same_pull_request(&row, key))
+        });
+        listed.len() + usize::from(branch.is_some())
+    }
+
+    /// The worktrees the inspected conversation edited, most recently
+    /// edited first.
+    pub(super) fn edited_worktrees(&self) -> &[crate::work::ConversationWorktree] {
+        self.pull_request_inspector.conversation.worktrees()
+    }
+
+    /// The Pull requests section's header controls.
+    pub(super) fn pull_request_controls(&self) -> Vec<Element<'_, Message>> {
+        activity(&self.pull_request_inspector)
+            .into_iter()
+            .map(|control| control.map(Message::PullRequestUi))
+            .collect()
+    }
+
+    /// The conversation's pull requests, then the one shown in detail, in one
+    /// scroll so a long discussion never squeezes the list out of view.
+    pub(super) fn pull_request_section(&self) -> Element<'_, Message> {
         let state = &self.pull_request_inspector;
         let selected = match &state.target {
             Some(Target::PullRequest(key)) => Some(key.clone()),
@@ -1649,15 +1632,9 @@ impl Cagents {
                 .and_then(|pr| PullRequestKey::new(target.repository.clone(), pr.number).ok()),
             None => None,
         };
-        let title = state
-            .conversation
-            .card
-            .and_then(|card| self.card_state(card))
-            .map(|card| card.title.as_str())
-            .filter(|title| !title.is_empty());
-        let list = conversation::view(&state.conversation, title, selected.as_ref());
+        let list = conversation::view(&state.conversation, selected.as_ref());
         // Without a branch or a choice, or on a branch with no pull request,
-        // the list is the panel's content.
+        // the list is the section's content.
         let prompt = match &state.target {
             None => Some("Choose a pull request to see its checks and discussion.".to_owned()),
             Some(Target::Branch(target))
@@ -1673,44 +1650,40 @@ impl Cagents {
             }
             Some(_) => None,
         };
-        let detail: Element<'_, Action> = match (&list, prompt) {
-            (Some(_), Some(prompt)) => widget::container(
-                design::caption(prompt)
-                    .wrapping(iced::widget::text::Wrapping::Word)
-                    .width(Length::Fill),
-            )
-            .padding([space::S, space::S])
-            .width(Length::Fill)
-            .into(),
-            _ => view(state),
-        };
-        let content: Element<'_, Action> = match list {
-            Some(list) => widget::column::with_children(vec![
-                widget::container(
-                    widget::scrollable(widget::container(list).padding(
-                        design::with_vertical_rail(Padding::from([space::S, space::S])),
-                    ))
-                    .direction(iced::widget::scrollable::Direction::Vertical(
-                        design::scrollbar(),
-                    ))
-                    .width(Length::Fill),
-                )
-                // The list keeps room for the detail below it.
-                .max_height((self.window_height * 0.4).max(160.0))
-                .width(Length::Fill)
-                .into(),
-                design::horizontal_rule().into(),
-                detail,
-            ])
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into(),
-            None => detail,
-        };
-        widget::container(content.map(Message::PullRequestUi))
-            .width(Length::Fixed(width))
-            .height(Length::Fill)
-            .into()
+        let mut children: Vec<Element<'_, Action>> = Vec::new();
+        match (list, prompt) {
+            (Some(list), Some(prompt)) => {
+                children.push(list);
+                children.push(
+                    design::caption(prompt)
+                        .wrapping(iced::widget::text::Wrapping::Word)
+                        .width(Length::Fill)
+                        .into(),
+                );
+            }
+            (Some(list), None) => {
+                children.push(list);
+                children.push(design::horizontal_rule().into());
+                children.extend(detail(state));
+            }
+            (None, _) => children.extend(detail(state)),
+        }
+        let content: Element<'_, Action> = widget::scrollable(
+            widget::column::with_children(children)
+                .spacing(space::S)
+                .padding(design::with_vertical_rail(Padding::from([
+                    space::XS,
+                    space::S,
+                ])))
+                .width(Length::Fill),
+        )
+        .direction(iced::widget::scrollable::Direction::Vertical(
+            design::scrollbar(),
+        ))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into();
+        content.map(Message::PullRequestUi)
     }
 }
 
@@ -1772,7 +1745,7 @@ mod tests {
         let worktree = PathBuf::from("/repo/feature");
         let project = ProjectId::new();
         app.context_inspector_open = true;
-        app.context_tab = ContextTab::PullRequest;
+        app.context_sections = context_sections::Sections::default();
         app.github_availability.insert(
             project,
             GitHubAvailability::Ready {
@@ -1798,6 +1771,20 @@ mod tests {
             )],
             Vec::new(),
         ));
+        // The branch's known pull request is what lists the section; the
+        // inspector still looks the branch up to follow its live head.
+        app.sidebar_model.projects[0].worktrees[0].set_pull_request(
+            crate::sidebar::SidebarPullRequest::new(
+                project,
+                7,
+                "Feature".into(),
+                Url::parse(&format!("https://{host}/owner/repo/pull/7")).unwrap(),
+                "feature".into(),
+                None,
+                false,
+                crate::sidebar::CheckStatus::Unknown,
+            ),
+        );
         app.sidebar_state
             .sync_active_worktree(&app.sidebar_model, &SidebarFocus::Repository { worktree });
         let key = app.sidebar_state.active_worktree().unwrap().clone();
@@ -2328,7 +2315,7 @@ mod tests {
             &crate::github::GitHubError::Inspection("offline".into()),
         );
         app.context_inspector_open = true;
-        app.context_tab = ContextTab::PullRequest;
+        app.context_sections = context_sections::Sections::default();
         app.pull_request_inspector = State::default();
         app.pull_request_inspector.target = Some(target);
         app.pull_request_inspector.generation = 5;
@@ -2415,7 +2402,7 @@ mod tests {
         app.workspace = Cagents::rebuild_workspace(&app.durable);
         app.index_cards();
         app.context_inspector_open = true;
-        app.context_tab = ContextTab::PullRequest;
+        app.context_sections = context_sections::Sections::default();
         (app, conversation, terminal_id)
     }
 

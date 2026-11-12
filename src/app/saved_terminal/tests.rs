@@ -219,10 +219,6 @@ fn pending_then_exact_absence_keeps_the_original_descriptor_and_clears_start_sta
     assert!(app.saved_terminal_ready(card));
     assert_eq!(app.saved_terminal_status(card), None);
     assert_eq!(
-        app.inspector_runtime_status(card),
-        InspectorRuntimeStatus::Unavailable
-    );
-    assert_eq!(
         app.card_state(card).unwrap().kind,
         CardKind::Terminal(source.clone())
     );
