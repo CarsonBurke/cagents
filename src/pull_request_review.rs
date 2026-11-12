@@ -2176,22 +2176,11 @@ impl State {
         };
         let pull_request = &target.pull_request;
         let state = WorktreePullRequestState::from_github(pull_request);
-        let (icon, state_label) = match state {
-            Some(WorktreePullRequestState::Merged) => (Icon::MergedPullRequest, "Merged"),
-            Some(WorktreePullRequestState::Closed) => (Icon::ClosedPullRequest, "Closed"),
-            Some(WorktreePullRequestState::Draft) => (Icon::PullRequest, "Draft"),
-            Some(WorktreePullRequestState::Open) | None => (Icon::PullRequest, "Open"),
-        };
-        let tone = match state {
-            Some(WorktreePullRequestState::Merged) => design::Tone::Themed(design::accent_color),
-            Some(WorktreePullRequestState::Closed) => {
-                design::Tone::Themed(design::destructive_color)
-            }
-            Some(WorktreePullRequestState::Draft) | None => {
-                design::Tone::Themed(design::muted_icon_color)
-            }
-            Some(WorktreePullRequestState::Open) => design::Tone::Themed(design::success_color),
-        };
+        let shown = state.unwrap_or(WorktreePullRequestState::Open);
+        let (icon, state_label) = (shown.icon(), shown.label());
+        let tone = design::Tone::Themed(
+            state.map_or(design::muted_icon_color, WorktreePullRequestState::tone),
+        );
         let identity = crate::interaction::tooltip(
             widget::row::with_children(vec![
                 widget::icon::icon(icon.handle())
@@ -3149,37 +3138,29 @@ pub fn browser_row<'a>(
 ) -> Element<'a, Action> {
     let state = WorktreePullRequestState::from_github(pull_request);
     let checks = CheckStatus::from_checks(&pull_request.check_summaries());
-    let icon = Icon::handle(match state {
-        Some(WorktreePullRequestState::Merged) => Icon::MergedPullRequest,
-        Some(WorktreePullRequestState::Closed) => Icon::ClosedPullRequest,
-        _ => Icon::PullRequest,
-    });
-    let tone: fn(&cosmic::Theme) -> iced::Color = match (state, checks) {
-        (Some(WorktreePullRequestState::Merged), _) => design::accent_color,
-        (Some(WorktreePullRequestState::Closed), _) | (_, CheckStatus::Failing) => {
-            design::destructive_color
-        }
-        (_, CheckStatus::Pending) => design::warning_color,
-        (Some(WorktreePullRequestState::Draft), _) => design::muted_icon_color,
-        (_, CheckStatus::Passing) => design::success_color,
-        (_, CheckStatus::Unknown) => design::muted_icon_color,
-    };
+    let icon = state
+        .map_or(Icon::PullRequest, WorktreePullRequestState::icon)
+        .handle();
+    // The glyph says the state alone, as it does in every list; the checks
+    // have their own words beneath.
+    let tone = state.map_or(
+        design::muted_icon_color as fn(&cosmic::Theme) -> iced::Color,
+        WorktreePullRequestState::tone,
+    );
     let mut detail = vec![format!("#{}", pull_request.number)];
     if let Some(author) = &pull_request.author {
         detail.push(author.login.clone());
     }
-    if pull_request.is_draft {
-        detail.push("Draft".into());
-    }
     if let Some(label) = review_request {
         detail.push(label.into());
     }
-    match checks {
-        CheckStatus::Passing => detail.push("Checks passing".into()),
-        CheckStatus::Pending => detail.push("Checks pending".into()),
-        CheckStatus::Failing => detail.push("Checks failing".into()),
-        CheckStatus::Unknown => {}
-    }
+    // The checks keep their tone on their words, now the glyph has the state.
+    let checks: Option<(&str, fn(&cosmic::Theme) -> iced::widget::text::Style)> = match checks {
+        CheckStatus::Passing => Some(("Checks passing", design::success_text)),
+        CheckStatus::Pending => Some(("Checks pending", design::warning_text)),
+        CheckStatus::Failing => Some(("Checks failing", design::destructive_text)),
+        CheckStatus::Unknown => None,
+    };
     let one_line = |text: widget::text::Text<'a, cosmic::Theme, cosmic::Renderer>| {
         text.wrapping(iced::widget::text::Wrapping::None)
             .ellipsize(iced::widget::text::Ellipsize::End(
@@ -3199,7 +3180,26 @@ pub fn browser_row<'a>(
         .into(),
         widget::column::with_children(vec![
             one_line(design::body(pull_request.title.as_str())).into(),
-            one_line(design::caption(detail.join(" · "))).into(),
+            {
+                let mut facts = vec![
+                    design::caption(detail.join(" · "))
+                        .wrapping(iced::widget::text::Wrapping::None)
+                        .ellipsize(iced::widget::text::Ellipsize::End(
+                            EllipsizeHeightLimit::Lines(1),
+                        ))
+                        .into(),
+                ];
+                if let Some((label, tone)) = checks {
+                    facts.push(
+                        one_line(
+                            design::caption(format!(" · {label}"))
+                                .class(cosmic::theme::Text::Custom(tone)),
+                        )
+                        .into(),
+                    );
+                }
+                widget::row::with_children(facts).into()
+            },
         ])
         .width(Length::Fill)
         .into(),
@@ -3214,8 +3214,13 @@ pub fn browser_row<'a>(
             button::custom(content)
                 .class(sidebar_button_style(selected))
                 .name(format!(
-                    "Review pull request #{} {}",
-                    pull_request.number, pull_request.title
+                    "Review {} pull request #{} {}",
+                    state
+                        .unwrap_or(WorktreePullRequestState::Open)
+                        .label()
+                        .to_lowercase(),
+                    pull_request.number,
+                    pull_request.title
                 ))
                 .selected(selected)
                 .padding([space::XS, space::S])
