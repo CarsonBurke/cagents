@@ -1083,6 +1083,7 @@ fn settings_layout<'a>(
         vec![category]
     };
     let mut results = Vec::new();
+    let mut page_description = None;
     for category in categories {
         let filter = if context.pressed_key.is_some()
             || crate::settings_widgets::matches(category.label(), query)
@@ -1093,10 +1094,13 @@ fn settings_layout<'a>(
         };
         let mut groups = settings_category_controls(category, draft, context);
         // A page with one group of its own name would say it twice, once as
-        // the page title and again, larger, as the section title.
-        if !searching && groups.len() == 1 && groups[0].title() == category.label() {
-            let group = groups.remove(0).untitled();
-            groups.push(group);
+        // the page title and again, larger, as the section title. Its
+        // description then introduces the page, under the page title.
+        if !searching
+            && let [group] = groups.as_mut_slice()
+            && group.title() == category.label()
+        {
+            page_description = Some(group.untitled()).filter(|detail| !detail.is_empty());
         }
         results.extend(
             groups
@@ -1133,17 +1137,27 @@ fn settings_layout<'a>(
         .into(),
     ];
     header.extend(save_status(feedback, invalid.len()));
+    let mut header = vec![
+        widget::row::with_children(header)
+            .align_y(Alignment::Center)
+            .spacing(space::S)
+            .width(Length::Fill)
+            // The height of the search field beside it, so the page title
+            // and the field share one centre line.
+            .height(design::DENSE_ROW_HEIGHT)
+            .into(),
+    ];
+    if let Some(description) = page_description {
+        header.push(
+            iced::widget::Space::new()
+                .height(design::rhythm::TITLE_TO_DESCRIPTION)
+                .into(),
+        );
+        header.push(design::description(description).into());
+    }
     let header = widget::container(
-        widget::container(
-            widget::row::with_children(header)
-                .align_y(Alignment::Center)
-                .spacing(space::S)
-                .width(Length::Fill)
-                // The height of the search field beside it, so the page title
-                // and the field share one centre line.
-                .height(design::DENSE_ROW_HEIGHT),
-        )
-        .max_width(content_max_width),
+        widget::container(widget::column::with_children(header).width(Length::Fill))
+            .max_width(content_max_width),
     )
     .padding(iced::Padding {
         top: space::M,

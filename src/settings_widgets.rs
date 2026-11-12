@@ -203,15 +203,22 @@ impl<'a, Message: Clone + 'a> Group<'a, Message> {
         self
     }
 
+    /// Where a search result sits: the category, then the group unless the
+    /// group is named after it, which would read "Editor > Editor".
     pub fn breadcrumb(&self, category: &str) -> String {
-        format!("{category} > {}", self.title)
+        if self.title == category {
+            category.to_owned()
+        } else {
+            format!("{category} > {}", self.title)
+        }
     }
 
-    /// Leaves the title out, for a page whose own title already names this,
-    /// its only group. The description still introduces the settings.
-    pub fn untitled(mut self) -> Self {
+    /// Leaves the title and description to the page, for a page whose own
+    /// title already names this, its only group. Returns the description,
+    /// which the page sets under its title.
+    pub fn untitled(&mut self) -> &'static str {
         self.untitled = true;
-        self
+        self.detail
     }
 
     pub fn title(&self) -> &'static str {
@@ -244,7 +251,7 @@ impl<'a, Message: Clone + 'a> Group<'a, Message> {
         } else if !self.untitled {
             heading.push(design::title(self.title).width(Length::Fill).into());
         }
-        if !self.detail.is_empty() {
+        if !self.detail.is_empty() && (searching || !self.untitled) {
             if !heading.is_empty() {
                 heading.push(
                     iced::widget::Space::new()
@@ -546,8 +553,11 @@ mod tests {
 
     #[test]
     fn results_carry_category_and_group() {
-        let group = group::<()>("Font", "", vec![]);
-        assert_eq!(group.breadcrumb("Editor"), "Editor > Font");
+        let font = group::<()>("Font", "", vec![]);
+        assert_eq!(font.breadcrumb("Editor"), "Editor > Font");
+        // A group named after its category is not named twice.
+        let named_after = group::<()>("Editor", "", vec![]);
+        assert_eq!(named_after.breadcrumb("Editor"), "Editor");
     }
 
     #[test]
