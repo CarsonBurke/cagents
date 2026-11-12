@@ -215,7 +215,7 @@ impl StripGeometry {
         cards: &[WorkspaceCard],
         viewport_width: f32,
         config: WorkspaceConfig,
-        held: Option<&[CardId]>,
+        held: Option<&HashSet<CardId>>,
     ) -> Self {
         let viewport_width = finite_nonnegative(viewport_width);
         let mut cursor = config.leading_padding;
@@ -737,7 +737,7 @@ pub struct Workspace {
     resize_limits: Option<(CardId, WidthLimits)>,
     /// The panes a resize gesture keeps filled until it ends; see
     /// [`StripGeometry::build_holding`].
-    held_fill: Option<Vec<CardId>>,
+    held_fill: Option<HashSet<CardId>>,
     config: WorkspaceConfig,
 }
 
@@ -947,7 +947,10 @@ impl Workspace {
         }
         self.resize_limits = None;
         let held = self.held_fill.take();
-        if held.as_deref() == Some(self.build_geometry(self.viewport_width).filled.as_slice()) {
+        if held.is_some_and(|held| {
+            let filled = self.build_geometry(self.viewport_width).filled;
+            filled.len() == held.len() && filled.iter().all(|card| held.contains(card))
+        }) {
             return ViewportUpdate::unchanged();
         }
         self.rebuild_geometry();
@@ -1550,7 +1553,7 @@ impl Workspace {
             &self.cards,
             viewport_width,
             self.config,
-            self.held_fill.as_deref(),
+            self.held_fill.as_ref(),
         )
     }
 
@@ -1559,7 +1562,7 @@ impl Workspace {
             cards,
             self.viewport_width,
             self.config,
-            self.held_fill.as_deref(),
+            self.held_fill.as_ref(),
         )
     }
 
@@ -2573,6 +2576,70 @@ mod tests {
         assert_eq!(
             Some(rest),
             workspace.geometry().rest_offset(middle, 800.0, during)
+        );
+    }
+
+    /// The strip's work on the UI path at a long session's scale: 60 open
+    /// panes of mixed widths in an 850px strip. Each figure is the mean cost
+    /// of one call. Run it optimized:
+    ///
+    /// ```sh
+    /// scripts/cargo-gate test --locked --profile local --no-default-features --features ui \
+    ///     --lib -- --ignored --nocapture workspace::tests::strip_workload
+    /// ```
+    #[test]
+    #[ignore = "timing workload; run optimized with --ignored --nocapture"]
+    fn strip_workload() {
+        use std::time::Instant;
+        const PANES: usize = 60;
+        const ROUNDS: usize = 50;
+        let widths: Vec<_> = (0..PANES)
+            .map(|index| CardWidth::Fraction([1.0, 0.5, 0.5, 1.0 / 3.0, 2.0 / 3.0][index % 5]))
+            .collect();
+        let mut workspace = workspace_with_widths(&widths, 850.0);
+        let ids: Vec<_> = workspace.order().collect();
+        let mean =
+            |start: Instant, calls: usize| start.elapsed().as_secs_f64() * 1e6 / calls as f64;
+
+        let start = Instant::now();
+        for _ in 0..ROUNDS {
+            for id in &ids {
+                workspace.focus(*id).unwrap();
+            }
+        }
+        let focus = mean(start, ROUNDS * PANES);
+
+        let start = Instant::now();
+        let mut presets = 0;
+        for _ in 0..ROUNDS {
+            for id in &ids {
+                presets += usize::from(workspace.next_width_preset(*id).is_some());
+            }
+        }
+        let cycle = mean(start, ROUNDS * PANES);
+        assert_eq!(presets, ROUNDS * PANES);
+
+        let dragged = ids[PANES / 2];
+        workspace.focus(dragged).unwrap();
+        workspace.begin_card_resize(dragged);
+        let start = Instant::now();
+        for step in 0..ROUNDS * 20 {
+            let width = 300.0 + (step % 500) as f32;
+            workspace
+                .set_card_width(dragged, CardWidth::Fixed(width))
+                .unwrap();
+        }
+        let drag = mean(start, ROUNDS * 20);
+
+        let start = Instant::now();
+        for step in 0..ROUNDS * 20 {
+            workspace.resize_viewport(850.0 + (step % 850) as f32);
+        }
+        let reflow = mean(start, ROUNDS * 20);
+
+        eprintln!(
+            "strip workload, {PANES} panes: focus {focus:.2} us, Alt+R preset {cycle:.2} us, \
+             drag step {drag:.2} us, viewport reflow {reflow:.2} us"
         );
     }
 
