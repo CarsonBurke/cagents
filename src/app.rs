@@ -18605,6 +18605,10 @@ impl Application for Cagents {
             self.prune_sidebar_row_selection();
         }
         self.refresh_sidebar_worktree_panes();
+        // Ahead of the rebind, which pins what the inspected conversation
+        // chose: a newly focused conversation must not inherit the last
+        // one's choice for a frame.
+        self.sync_pull_request_inspector();
         let binding = self.rebind_source_control();
         if let Some(source) = self.sidebar_model.source_control.as_ref() {
             let selected = self
@@ -18620,7 +18624,6 @@ impl Application for Cagents {
                 });
             self.sidebar_state.select_file(&source.key, selected);
         }
-        self.sync_pull_request_inspector();
         // `view` cannot rebuild the chrome cache itself, so refresh it here.
         let chrome = self.sync_chrome();
         let deferred = self.release_deferred_navigation_if_unblocked();

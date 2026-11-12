@@ -229,15 +229,25 @@ impl State {
     }
 
     /// The work the inspector shows: the one chosen while it is listed, else
-    /// the one where the conversation runs, else the first checked out here.
-    pub(crate) fn shown<'w>(&self, work: &'w [Work<'w>], here: Option<&Path>) -> Option<Work<'w>> {
+    /// the one where the conversation runs, else the first checked out in a
+    /// worktree Projects lists, which `openable` says, so the panel has
+    /// something to show.
+    pub(crate) fn shown<'w>(
+        &self,
+        work: &'w [Work<'w>],
+        here: Option<&Path>,
+        openable: &dyn Fn(&Path) -> bool,
+    ) -> Option<Work<'w>> {
         self.chosen
             .as_ref()
             .and_then(|key| work.iter().find(|work| work.is(key)))
             .or_else(|| {
                 here.and_then(|here| work.iter().find(|work| work.worktree() == Some(here)))
             })
-            .or_else(|| work.iter().find(|work| work.worktree().is_some()))
+            .or_else(|| {
+                work.iter()
+                    .find(|work| work.worktree().is_some_and(openable))
+            })
             .or_else(|| work.first())
             .copied()
     }
@@ -406,13 +416,16 @@ impl Drop for HangUpOnDrop {
     }
 }
 
-/// The Work section's rows, with the `shown` one marked, then the mentioned
-/// pull requests folded beneath them when the settings ask for them.
-/// `openable` says whether Projects lists a worktree, so it can be shown.
+/// The Work section's rows, with the `shown` one expanded, and marked while
+/// `shown_open` says its changes or files are open beneath, then the
+/// mentioned pull requests folded beneath them when the settings ask for
+/// them. `openable` says whether Projects lists a worktree, so it can be
+/// shown.
 pub(super) fn view<'a>(
     state: &State,
     work: &[Work<'_>],
     shown: Option<&WorkKey>,
+    shown_open: bool,
     show_mentions: bool,
     openable: &dyn Fn(&Path) -> bool,
 ) -> Element<'a, Action> {
@@ -420,7 +433,7 @@ pub(super) fn view<'a>(
     let list = state.list.as_deref();
     for item in work {
         let chosen = shown.is_some_and(|key| item.is(key));
-        children.push(work_row(list, *item, chosen, openable));
+        children.push(work_row(list, *item, chosen, shown_open, openable));
     }
     let mentioned: Vec<&ConversationPullRequest> = if show_mentions {
         state
@@ -489,11 +502,30 @@ fn note<'a>(list: &ConversationPullRequests) -> Option<Element<'a, Action>> {
 
 /// The number a row's pull request goes by: `#12`, after its repository
 /// when that is not the conversation's.
-fn number_label(list: Option<&ConversationPullRequests>, row: &ConversationPullRequest) -> String {
-    if list
-        .and_then(|list| list.repository.as_ref())
+fn own_repository(list: Option<&ConversationPullRequests>, row: &ConversationPullRequest) -> bool {
+    list.and_then(|list| list.repository.as_ref())
         .is_some_and(|own| own.same_repository(&row.repository))
-    {
+}
+
+/// An open pull request's review decision, in its tone.
+fn review_fact(
+    pull_request: &crate::work::PullRequest,
+) -> Option<(
+    &'static str,
+    fn(&cosmic::Theme) -> iced::widget::text::Style,
+)> {
+    if pull_request.state != crate::work::PullRequestState::Open {
+        return None;
+    }
+    Some(match pull_request.review? {
+        crate::work::Review::Approved => ("Approved", design::success_text),
+        crate::work::Review::ChangesRequested => ("Changes requested", design::destructive_text),
+        crate::work::Review::Required => ("Review required", design::muted_text),
+    })
+}
+
+fn number_label(list: Option<&ConversationPullRequests>, row: &ConversationPullRequest) -> String {
+    if own_repository(list, row) {
         format!("#{}", row.number)
     } else {
         format!("{}#{}", repository_label(&row.repository), row.number)
@@ -680,6 +712,7 @@ fn work_row<'a>(
     list: Option<&ConversationPullRequests>,
     work: Work<'_>,
     chosen: bool,
+    shown_open: bool,
     openable: &dyn Fn(&Path) -> bool,
 ) -> Element<'a, Action> {
     let (glyph, name, trailing, mut facts): (Element<'a, Action>, String, Option<String>, _) =
@@ -689,14 +722,26 @@ fn work_row<'a>(
                     .pull_request
                     .as_ref()
                     .map(crate::sidebar::WorktreePullRequestState::from_work);
-                let number = number_label(list, row);
-                let name = row
-                    .pull_request
-                    .as_ref()
-                    .map_or_else(|| number.clone(), |pull_request| pull_request.title.clone());
+                let number = format!("#{}", row.number);
+                let name = row.pull_request.as_ref().map_or_else(
+                    || number_label(list, row),
+                    |pull_request| pull_request.title.clone(),
+                );
                 let mut facts: Vec<Element<'a, Action>> = vec![design::caption(reason(row)).into()];
+                // Another repository's number would crowd the title, so it
+                // goes beneath it.
+                if !own_repository(list, row) {
+                    facts.push(design::caption(repository_label(&row.repository)).into());
+                }
                 match (state, &row.pull_request) {
                     (Some(_), Some(pull_request)) => {
+                        if let Some((label, tone)) = review_fact(pull_request) {
+                            facts.push(
+                                design::caption(label)
+                                    .class(cosmic::theme::Text::Custom(tone))
+                                    .into(),
+                            );
+                        }
                         if pull_request.state == crate::work::PullRequestState::Open
                             && let Some((overall, label)) = checks_summary(&row.checks)
                         {
@@ -782,25 +827,49 @@ fn work_row<'a>(
             .spacing(space::XS)
             .width(Length::Fill),
     )
-    .name(if chosen {
+    .name(if chosen && shown_open {
         format!("{name}, shown below")
     } else {
         format!("Show {name}")
     })
-    .class(crate::ui_controls::control_style(chosen, None))
+    .class(crate::ui_controls::control_style(
+        chosen && shown_open,
+        None,
+    ))
     .padding([space::XS, space::S])
     .width(Length::Fill)
     .on_press(Action::Choose(work.key()));
-    let tooltip = work
-        .worktree()
-        .map(|path| path.display().to_string())
-        .unwrap_or_default();
+    // A worktree's row names its folder; a pull request's would cover its
+    // checks.
+    let tooltip = match work {
+        Work::Worktree(worktree) => worktree.path.display().to_string(),
+        Work::Here(path) => path.display().to_string(),
+        Work::PullRequest { .. } => String::new(),
+    };
     let row = crate::interaction::hover(button);
     if tooltip.is_empty() {
         row
     } else {
         crate::interaction::tooltip(row, tooltip)
     }
+}
+
+/// How many two-line rows of height `work` adds once shown: a pull
+/// request's checks, each about half a row, and its Open button.
+pub(super) fn expanded_rows(work: Work<'_>) -> f32 {
+    let Some(row) = work.pull_request() else {
+        return 0.0;
+    };
+    let open = row
+        .pull_request
+        .as_ref()
+        .is_some_and(|pull_request| pull_request.state == crate::work::PullRequestState::Open);
+    let checks = if open && !row.checks.is_empty() {
+        row.checks.len().min(CHECKS_SHOWN) + usize::from(row.checks.len() > CHECKS_SHOWN)
+    } else {
+        0
+    };
+    0.45 * checks as f32 + 0.75
 }
 
 /// What a chosen pull request adds beneath its row: its checks, the ones
@@ -1110,26 +1179,40 @@ mod tests {
         assert_eq!(work[1].worktree(), Some(Path::new("/feature")));
         // Until one is chosen, the work where the chat runs is shown.
         assert_eq!(
-            state.shown(&work, Some(here)).map(|work| work.key()),
+            state
+                .shown(&work, Some(here), &|_| true)
+                .map(|work| work.key()),
             Some(WorkKey::Worktree(PathBuf::from("/scratch")))
         );
         // Else the first checked out here, not a pull request with nothing
         // local to show.
         assert_eq!(
-            state.shown(&work, None).map(|work| work.key()),
+            state.shown(&work, None, &|_| true).map(|work| work.key()),
             Some(keys[1].clone())
+        );
+        // A worktree Projects does not list has nothing for the panel to
+        // show, so the default passes over it.
+        assert_eq!(
+            state
+                .shown(&work, None, &|path| path != Path::new("/feature"))
+                .map(|work| work.key()),
+            Some(keys[2].clone())
         );
         state.choose(keys[0].clone());
         let work = state.work(Some(here));
         assert_eq!(
-            state.shown(&work, Some(here)).map(|work| work.key()),
+            state
+                .shown(&work, Some(here), &|_| true)
+                .map(|work| work.key()),
             Some(keys[0].clone())
         );
         // A choice no longer listed gives way rather than showing nothing.
         state.choose(WorkKey::Worktree(PathBuf::from("/gone")));
         let work = state.work(Some(here));
         assert_eq!(
-            state.shown(&work, Some(here)).map(|work| work.key()),
+            state
+                .shown(&work, Some(here), &|_| true)
+                .map(|work| work.key()),
             Some(WorkKey::Worktree(PathBuf::from("/scratch")))
         );
         // Another conversation starts with nothing chosen.
@@ -1155,7 +1238,9 @@ mod tests {
         assert!(matches!(work[1], Work::Here(path) if path == here));
         assert_eq!(work[1].scope_label(), "main");
         assert_eq!(
-            state.shown(&work, Some(here)).map(|work| work.key()),
+            state
+                .shown(&work, Some(here), &|_| true)
+                .map(|work| work.key()),
             Some(WorkKey::Worktree(PathBuf::from("/main")))
         );
         // A conversation that worked on nothing has no Work at all.

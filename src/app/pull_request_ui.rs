@@ -42,6 +42,9 @@ pub(super) enum WorkScope {
     Focus,
     /// The worktree of the work shown, named by its branch.
     Worktree { path: PathBuf, label: String },
+    /// A worktree Projects does not list, whose changes this window cannot
+    /// read.
+    Unlisted { label: String },
     /// A pull request with no worktree here, which has no local changes or
     /// files to show.
     Elsewhere {
@@ -50,6 +53,39 @@ pub(super) enum WorkScope {
         number: u64,
         url: Option<Url>,
     },
+}
+
+impl WorkScope {
+    /// What the section beneath the Work list names as its subject, and the
+    /// glyph beside the name.
+    pub(super) fn header(&self) -> Option<(widget::icon::Handle, &str)> {
+        match self {
+            Self::Focus => None,
+            Self::Worktree { label, .. } | Self::Unlisted { label } => {
+                Some((crate::sidebar::worktree_icon(), label))
+            }
+            Self::Elsewhere { label, .. } => Some((Icon::PullRequest.handle(), label)),
+        }
+    }
+}
+
+/// The inspected conversation's work, as its sections need it.
+#[derive(Debug, Default)]
+pub(super) struct WorkSummary {
+    /// The pieces of work listed, for the header.
+    pub count: usize,
+    /// The rows the list draws, in two-line rows, which bounds its height.
+    pub rows: f32,
+    /// The part of `rows` the shown work's expansion adds.
+    pub expanded: f32,
+    shown: Option<WorkKey>,
+    pub scope: WorkScope,
+}
+
+impl Default for WorkScope {
+    fn default() -> Self {
+        Self::Focus
+    }
 }
 
 #[derive(Debug, Default)]
@@ -72,6 +108,12 @@ impl Cagents {
             Action::Choose(key) => {
                 conversation.choose(key);
                 // Choosing work is asking to see it.
+                if self
+                    .context_sections
+                    .is_open(context_sections::Section::Workspace)
+                {
+                    return Task::none();
+                }
                 self.context_sections
                     .set_open(context_sections::Section::Workspace, true);
                 self.save_settings_task(false)
@@ -162,52 +204,42 @@ impl Cagents {
             .lists_any(self.settings.show_mentioned_pull_requests)
     }
 
-    /// How many pieces of work the section lists, for its header.
-    pub(super) fn work_count(&self) -> usize {
-        let here = self.inspected_here();
-        self.pull_request_inspector
-            .conversation
-            .work(here.as_deref())
-            .iter()
-            .filter(|work| !matches!(work, conversation::Work::Here(_)))
-            .count()
-    }
-
-    /// How many rows the Work section draws, which bounds its height.
-    pub(super) fn work_rows(&self) -> usize {
-        let here = self.inspected_here();
+    /// What the Work section and the section beneath it need of the
+    /// inspected conversation's work, worked out once per use.
+    pub(super) fn work_summary(&self) -> WorkSummary {
         let conversation = &self.pull_request_inspector.conversation;
-        let mentions = if self.settings.show_mentioned_pull_requests {
+        if !self.work_listed() {
+            return WorkSummary::default();
+        }
+        let here = self.inspected_here();
+        let openable = |path: &std::path::Path| self.sidebar_model.worktree_at(path).is_some();
+        let work = conversation.work(here.as_deref());
+        let shown = conversation.shown(&work, here.as_deref(), &openable);
+        let mut rows = work.len() as f32 + shown.map_or(0.0, conversation::expanded_rows);
+        if self.settings.show_mentioned_pull_requests {
             let mentioned = conversation
                 .rows()
                 .iter()
                 .filter(|row| !row.relation.worked_on())
                 .count();
-            match mentioned {
-                0 => 0,
-                _ if conversation.mentions_open => mentioned + 1,
-                _ => 1,
+            if mentioned > 0 {
+                // The fold, and each one-line row beneath it while open.
+                rows += 0.5
+                    + if conversation.mentions_open {
+                        0.5 * mentioned as f32
+                    } else {
+                        0.0
+                    };
             }
-        } else {
-            0
-        };
-        conversation.work(here.as_deref()).len() + mentions
-    }
-
-    /// What the inspector's changes and files show while the Work section
-    /// leads it: the shown work's worktree, else focus.
-    pub(super) fn work_scope(&self) -> WorkScope {
-        if !self.work_listed() {
-            return WorkScope::Focus;
         }
-        let here = self.inspected_here();
-        let conversation = &self.pull_request_inspector.conversation;
-        let work = conversation.work(here.as_deref());
-        match conversation.shown(&work, here.as_deref()) {
+        let scope = match shown {
             None => WorkScope::Focus,
             Some(shown) => match (shown.worktree(), shown.pull_request()) {
-                (Some(path), _) => WorkScope::Worktree {
+                (Some(path), _) if openable(path) => WorkScope::Worktree {
                     path: path.to_path_buf(),
+                    label: shown.scope_label(),
+                },
+                (Some(_), _) => WorkScope::Unlisted {
                     label: shown.scope_label(),
                 },
                 (None, Some(row)) => WorkScope::Elsewhere {
@@ -218,33 +250,43 @@ impl Cagents {
                 },
                 (None, None) => WorkScope::Focus,
             },
+        };
+        WorkSummary {
+            count: work
+                .iter()
+                .filter(|work| !matches!(work, conversation::Work::Here(_)))
+                .count(),
+            rows,
+            expanded: shown.map_or(0.0, conversation::expanded_rows),
+            shown: shown.map(|work| work.key()),
+            scope,
         }
     }
 
     /// The worktree the source-control and file panels are pinned to, in
     /// place of the focused card's, while the inspector shows a
-    /// conversation's work.
+    /// conversation's work. Only a worktree Projects lists is pinned, so the
+    /// panels never show one thing under another's name.
     pub(super) fn inspector_panel_pin(&self) -> Option<PathBuf> {
         if !self.context_inspector_visible() {
             return None;
         }
-        match self.work_scope() {
+        match self.work_summary().scope {
             WorkScope::Worktree { path, .. } => Some(path),
-            WorkScope::Focus | WorkScope::Elsewhere { .. } => None,
+            WorkScope::Focus | WorkScope::Unlisted { .. } | WorkScope::Elsewhere { .. } => None,
         }
     }
 
-    pub(super) fn work_section(&self) -> Element<'_, Message> {
+    pub(super) fn work_section(&self, summary: &WorkSummary) -> Element<'_, Message> {
         let here = self.inspected_here();
         let conversation = &self.pull_request_inspector.conversation;
         let work = conversation.work(here.as_deref());
-        let shown = conversation
-            .shown(&work, here.as_deref())
-            .map(|work| work.key());
         let list = conversation::view(
             conversation,
             &work,
-            shown.as_ref(),
+            summary.shown.as_ref(),
+            self.context_sections
+                .is_open(context_sections::Section::Workspace),
             self.settings.show_mentioned_pull_requests,
             &|path| self.sidebar_model.worktree_at(path).is_some(),
         );
@@ -374,13 +416,17 @@ mod tests {
         // then are folded beneath the work rather than counted with it.
         assert!(!app.settings.show_mentioned_pull_requests);
         assert!(app.work_listed());
-        assert_eq!(app.work_count(), 1);
-        assert_eq!(app.work_rows(), 1);
+        let unexpanded = |app: &Cagents| {
+            let summary = app.work_summary();
+            summary.rows - summary.expanded
+        };
+        assert_eq!(app.work_summary().count, 1);
+        assert_eq!(unexpanded(&app), 1.0);
         app.settings.show_mentioned_pull_requests = true;
-        assert_eq!(app.work_count(), 1);
-        assert_eq!(app.work_rows(), 2, "the folded mentions take one row");
+        assert_eq!(app.work_summary().count, 1);
+        assert_eq!(unexpanded(&app), 1.5, "the folded mentions take half a row");
         drop(app.handle_pull_request_ui(Action::ToggleMentions));
-        assert_eq!(app.work_rows(), 3);
+        assert_eq!(unexpanded(&app), 2.0);
         app.settings.show_mentioned_pull_requests = false;
 
         // A conversation that only mentioned pull requests lists no work.
@@ -396,7 +442,7 @@ mod tests {
         drop(app.workspace.focus(terminal));
         app.sync_pull_request_inspector();
         drop(app.handle_pull_request_ui(listed(conversation, 3, &[(6, Relation::Pushed)], false)));
-        assert_eq!(app.work_count(), 1);
+        assert_eq!(app.work_summary().count, 1);
     }
 
     #[test]
@@ -412,7 +458,7 @@ mod tests {
             vec![edited("/tmp/edited", None)],
             true,
         )));
-        assert_eq!(app.work_count(), 1);
+        assert_eq!(app.work_summary().count, 1);
         assert_eq!(app.workspace_view_shown(), None);
         let _ = app.update(Message::ContextSection(context_sections::Action::Toggle(
             context_sections::Section::Workspace,
@@ -435,8 +481,10 @@ mod tests {
     }
 
     #[test]
-    fn choosing_work_scopes_the_changes_to_it_and_a_pull_request_not_here_says_so() {
+    fn choosing_work_scopes_the_changes_to_it_and_work_not_here_says_so() {
         let (mut app, conversation, _) = conversation_app();
+        // Projects lists /repo/main and /repo/fix-sidebar.
+        app.sidebar_model = crate::sidebar::tests::panel_model();
         app.sync_pull_request_inspector();
         app.context_sections
             .set_open(context_sections::Section::Workspace, false);
@@ -444,31 +492,49 @@ mod tests {
             conversation,
             1,
             &[(4, Relation::Created), (7, Relation::Pushed)],
-            vec![edited("/on-four", Some(4)), edited("/alone", None)],
+            vec![
+                edited("/elsewhere/on-four", Some(4)),
+                edited("/repo/fix-sidebar", None),
+                edited("/elsewhere/alone", None),
+            ],
             true,
         )));
-        // Two pull requests and the worktree no pull request heads.
-        assert_eq!(app.work_count(), 3);
+        // Two pull requests and the worktrees no pull request heads.
+        assert_eq!(app.work_summary().count, 4);
         // Nothing chosen and the chat runs in none of them: the first one
-        // checked out is shown.
+        // Projects lists is shown, not #4's worktree it does not.
         assert_eq!(
-            app.work_scope(),
+            app.work_summary().scope,
             WorkScope::Worktree {
-                path: PathBuf::from("/on-four"),
-                label: "on-four".into()
+                path: PathBuf::from("/repo/fix-sidebar"),
+                label: "fix-sidebar".into()
             }
         );
-        assert_eq!(app.inspector_panel_pin(), Some(PathBuf::from("/on-four")));
+        assert_eq!(
+            app.inspector_panel_pin(),
+            Some(PathBuf::from("/repo/fix-sidebar"))
+        );
 
+        // Chosen, a worktree Projects does not list is named for what it
+        // is, and the panels pin nothing rather than show another's changes
+        // under its name.
         drop(
-            app.handle_pull_request_ui(Action::Choose(WorkKey::Worktree(PathBuf::from("/alone")))),
+            app.handle_pull_request_ui(Action::Choose(WorkKey::Worktree(PathBuf::from(
+                "/elsewhere/alone",
+            )))),
         );
         assert!(
             app.context_sections
                 .is_open(context_sections::Section::Workspace),
             "choosing work opens what it shows"
         );
-        assert_eq!(app.inspector_panel_pin(), Some(PathBuf::from("/alone")));
+        assert_eq!(
+            app.work_summary().scope,
+            WorkScope::Unlisted {
+                label: "alone".into()
+            }
+        );
+        assert_eq!(app.inspector_panel_pin(), None);
 
         let repository = GitHubRepoKey::new("listed-inspector.invalid", None, "o", "r").unwrap();
         drop(
@@ -478,18 +544,20 @@ mod tests {
             })),
         );
         assert!(matches!(
-            app.work_scope(),
+            app.work_summary().scope,
             WorkScope::Elsewhere { number: 7, .. }
         ));
-        // The panels fall back to focus rather than keep another worktree's.
         assert_eq!(app.inspector_panel_pin(), None);
 
         // A hidden inspector pins nothing, so the rail follows focus again.
+        drop(
+            app.handle_pull_request_ui(Action::Choose(WorkKey::Worktree(PathBuf::from(
+                "/repo/fix-sidebar",
+            )))),
+        );
+        assert!(app.inspector_panel_pin().is_some());
         drop(app.set_context_inspector_open(false));
         app.context_inspector_transition = None;
-        drop(
-            app.handle_pull_request_ui(Action::Choose(WorkKey::Worktree(PathBuf::from("/alone")))),
-        );
         assert!(!app.context_inspector_visible());
         assert_eq!(app.inspector_panel_pin(), None);
     }

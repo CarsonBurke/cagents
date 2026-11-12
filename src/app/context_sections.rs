@@ -147,8 +147,8 @@ struct Pane<'a> {
     title: Cow<'a, str>,
     count: Option<Count>,
     /// What the section is about, after its title: the work whose changes
-    /// or files it shows.
-    scope: Option<String>,
+    /// or files it shows, and its glyph.
+    scope: Option<(widget::icon::Handle, String)>,
     /// Spoken after the title, for what the count and its tone mean.
     description: Option<String>,
     controls: Vec<Element<'a, Message>>,
@@ -231,10 +231,11 @@ impl Cagents {
     /// The inspector's sections beneath its header.
     pub(super) fn context_sections_view(&self, width: f32) -> Element<'_, Message> {
         let mut panes = Vec::with_capacity(5);
+        let work = self.work_summary();
         if self.work_listed() {
-            panes.push(self.work_pane());
+            panes.push(self.work_pane(&work));
         }
-        panes.push(self.workspace_pane(width));
+        panes.push(self.workspace_pane(width, work.scope.clone()));
         panes.extend(self.language_server_panes());
         let shared = panes
             .iter()
@@ -318,7 +319,7 @@ impl Cagents {
         section: Section,
         title: Cow<'a, str>,
         count: Option<Count>,
-        scope: Option<String>,
+        scope: Option<(widget::icon::Handle, String)>,
         description: Option<String>,
         controls: Vec<Element<'a, Message>>,
         open: bool,
@@ -357,15 +358,12 @@ impl Cagents {
                     .into(),
             );
         }
-        if let Some(scope) = scope {
+        if let Some((icon, scope)) = scope {
             name.push_str(", for ");
             name.push_str(&scope);
             label.push(
                 widget::row::with_children(vec![
-                    crate::ui_controls::passive_icon(
-                        sidebar::worktree_icon(),
-                        design::COMPACT_ICON_SIZE,
-                    ),
+                    crate::ui_controls::passive_icon(icon, design::COMPACT_ICON_SIZE),
                     design::caption(scope)
                         .wrapping(iced::widget::text::Wrapping::None)
                         .ellipsize(iced::widget::text::Ellipsize::End(
@@ -412,9 +410,9 @@ impl Cagents {
         .into()
     }
 
-    fn work_pane(&self) -> Pane<'_> {
+    fn work_pane(&self, work: &pull_request_ui::WorkSummary) -> Pane<'_> {
         let open = self.context_sections.is_open(Section::Work);
-        let count = self.work_count();
+        let count = work.count;
         Pane {
             section: Section::Work,
             title: "Work".into(),
@@ -424,19 +422,27 @@ impl Cagents {
             controls: Vec::new(),
             // Each row is about two lines, so its count bounds the list's
             // height and the leading list need not leave room for rows not
-            // there. The quarter row covers the list's padding.
+            // there. The quarter row covers the list's padding. Expanding
+            // the shown work makes room for itself rather than pushing the
+            // rows after it out of view.
             height: Height::Content {
-                rows: (self.work_rows() as f32 + 0.25).min(LIST_ROWS_SHOWN),
+                rows: (work.rows + 0.25).min(LIST_ROWS_SHOWN + work.expanded),
             },
-            body: open.then(|| self.work_section()),
+            body: open.then(|| self.work_section(work)),
         }
     }
 
-    fn workspace_pane(&self, width: f32) -> Pane<'_> {
+    fn workspace_pane(&self, width: f32, scope: pull_request_ui::WorkScope) -> Pane<'_> {
         let open = self.workspace_open();
         let view = self.workspace_view();
         let git = !self.active_folder_scope();
-        let indicators = git.then(|| self.context_rail_indicators());
+        // Work this window cannot read has no changes to count; the panels'
+        // figures would be the focused worktree's.
+        let readable = matches!(
+            scope,
+            pull_request_ui::WorkScope::Focus | pull_request_ui::WorkScope::Worktree { .. }
+        );
+        let indicators = (git && readable).then(|| self.context_rail_indicators());
         // Uncommitted changes are what source control lists; beside Files the
         // same figure would read as a number of files.
         let (count, description) = match indicators {
@@ -473,16 +479,18 @@ impl Cagents {
         } else {
             Vec::new()
         };
-        let scope = self.work_scope();
+        // Open source control names its branch in its own first row, so the
+        // header names the work only where nothing beneath does. A remote
+        // device's panels show the device, not this work.
+        let named_beneath = open && readable && view == WorkspaceView::SourceControl;
+        let header = (!named_beneath && !crate::device::is_remote())
+            .then(|| scope.header().map(|(icon, label)| (icon, label.to_owned())))
+            .flatten();
         Pane {
             section: Section::Workspace,
             title: view.label().into(),
             count,
-            scope: match &scope {
-                pull_request_ui::WorkScope::Focus => None,
-                pull_request_ui::WorkScope::Worktree { label, .. }
-                | pull_request_ui::WorkScope::Elsewhere { label, .. } => Some(label.clone()),
-            },
+            scope: header,
             description,
             controls,
             height: Height::Share,
@@ -493,6 +501,7 @@ impl Cagents {
                     url,
                     ..
                 } => self.elsewhere_body(repository, number, url),
+                pull_request_ui::WorkScope::Unlisted { label } => self.unlisted_body(label),
                 _ => self.workspace_body(view, width),
             }),
         }
@@ -537,6 +546,28 @@ impl Cagents {
             widget::column::with_children(lines)
                 .spacing(space::S)
                 .width(Length::Fill),
+        )
+        .padding(space::L)
+        .width(Length::Fill)
+        .into()
+    }
+
+    /// A worktree Projects does not list: this window reads only those, so
+    /// it says so rather than showing another worktree's changes.
+    fn unlisted_body(&self, label: String) -> Element<'_, Message> {
+        widget::container(
+            widget::column::with_children(vec![
+                design::heading(format!("{label} isn't in Projects"))
+                    .wrapping(iced::widget::text::Wrapping::Word)
+                    .width(Length::Fill)
+                    .into(),
+                design::caption("Its changes show once its project is open in Projects.")
+                    .wrapping(iced::widget::text::Wrapping::Word)
+                    .width(Length::Fill)
+                    .into(),
+            ])
+            .spacing(space::S)
+            .width(Length::Fill),
         )
         .padding(space::L)
         .width(Length::Fill)
