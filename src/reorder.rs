@@ -285,6 +285,69 @@ fn before(items: &[Item], source: CardId, x: f32) -> Option<CardId> {
         .map(|item| item.id)
 }
 
+thread_local! {
+    /// Set while a channel scope that is cancelling its gesture diffs its
+    /// content; see [`diff_retained`].
+    static CANCELLING_CHANNEL_GESTURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `diff` with the channel gesture cancelled if `cancel` is set or an
+/// enclosing scope already cancelled it, restoring the enclosing value after,
+/// even when `diff` unwinds.
+fn cancelling_channel_gesture<T>(cancel: bool, diff: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CANCELLING_CHANNEL_GESTURE.set(self.0);
+        }
+    }
+    let outer = CANCELLING_CHANNEL_GESTURE.get();
+    let _restore = Restore(outer);
+    CANCELLING_CHANNEL_GESTURE.set(outer || cancel);
+    diff()
+}
+
+/// A cancelled channel gesture is cleared from every tree under its scope,
+/// during the scope's diff, since a modal may keep the base from seeing
+/// another event. A widget that keeps a child Tree out of its tree children,
+/// where that walk cannot reach it, calls this from its own `diff` for that
+/// Tree, whether or not it rebuilds it.
+pub(crate) fn diff_retained(tree: &mut Tree) {
+    if CANCELLING_CHANNEL_GESTURE.get() {
+        clear_channel_gesture(tree);
+    }
+}
+
+/// Hooks for tests of widgets that hold channel targets.
+#[cfg(test)]
+pub(crate) mod channel_gesture_tests {
+    use super::*;
+
+    /// Highlights a channel's targets, as a settled drag does.
+    pub(crate) fn highlight(channel: ChannelId) -> impl Operation {
+        HighlightChannel(Some(channel))
+    }
+
+    /// Counts the highlighted channel targets it reaches.
+    #[derive(Default)]
+    pub(crate) struct Highlighted(pub(crate) usize);
+    impl Operation for Highlighted {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+        fn custom(&mut self, _: Option<&Id>, _: Rectangle, state: &mut dyn std::any::Any) {
+            if let Some(target) = state.downcast_ref::<ChannelTarget>() {
+                self.0 += usize::from(target.highlighted);
+            }
+        }
+    }
+
+    /// Runs `diff` as a channel scope cancelling its gesture runs it.
+    pub(crate) fn cancelling<T>(diff: impl FnOnce() -> T) -> T {
+        super::cancelling_channel_gesture(true, diff)
+    }
+}
+
 fn clear_channel_gesture(tree: &mut Tree) {
     if tree.tag == tree::Tag::of::<State>() {
         let state = tree.state.downcast_mut::<State>();
@@ -324,7 +387,9 @@ impl<Message> Widget<Message, Theme, Renderer> for Reorder<'_, Message> {
         }
         let cancel_channel = matches!(&self.kind, Kind::ChannelScope { generation, enabled, .. }
             if !enabled || state.channel_drag.as_ref().is_some_and(|drag| drag.generation != *generation));
-        tree.diff_children(std::slice::from_mut(&mut self.content));
+        cancelling_channel_gesture(cancel_channel, || {
+            tree.diff_children(std::slice::from_mut(&mut self.content));
+        });
         if cancel_channel {
             // A modal overlay can consume release without updating the base tree.
             clear_channel_gesture(tree);
@@ -875,6 +940,81 @@ mod tests {
         Drop(CardId, Option<CardId>),
         Scroll(f32),
         Move(CardId, ChannelId),
+    }
+
+    /// Keeps its child's Tree in its own state, out of the tree children, as
+    /// the sidebar's cached project list does.
+    struct Retained<'a>(Element<'a, Action>);
+    impl Widget<Action, Theme, Renderer> for Retained<'_> {
+        fn tag(&self) -> tree::Tag {
+            tree::Tag::of::<Tree>()
+        }
+        fn state(&self) -> tree::State {
+            tree::State::new(Tree::new(&self.0))
+        }
+        fn children(&self) -> Vec<Tree> {
+            Vec::new()
+        }
+        fn diff(&mut self, tree: &mut Tree) {
+            let child = tree.state.downcast_mut::<Tree>();
+            child.diff(self.0.as_widget_mut());
+            diff_retained(child);
+        }
+        fn size(&self) -> Size<Length> {
+            self.0.as_widget().size()
+        }
+        fn layout(
+            &mut self,
+            tree: &mut Tree,
+            renderer: &Renderer,
+            limits: &layout::Limits,
+        ) -> layout::Node {
+            let child = tree.state.downcast_mut::<Tree>();
+            self.0.as_widget_mut().layout(child, renderer, limits)
+        }
+        fn operate(
+            &mut self,
+            tree: &mut Tree,
+            layout: Layout<'_>,
+            renderer: &Renderer,
+            operation: &mut dyn Operation,
+        ) {
+            let child = tree.state.downcast_mut::<Tree>();
+            self.0
+                .as_widget_mut()
+                .operate(child, layout, renderer, operation);
+        }
+        fn update(
+            &mut self,
+            tree: &mut Tree,
+            event: &Event,
+            layout: Layout<'_>,
+            cursor: mouse::Cursor,
+            renderer: &Renderer,
+            clipboard: &mut dyn Clipboard,
+            shell: &mut Shell<'_, Action>,
+            viewport: &Rectangle,
+        ) {
+            let child = tree.state.downcast_mut::<Tree>();
+            self.0.as_widget_mut().update(
+                child, event, layout, cursor, renderer, clipboard, shell, viewport,
+            );
+        }
+        fn draw(
+            &self,
+            tree: &Tree,
+            renderer: &mut Renderer,
+            theme: &Theme,
+            style: &renderer::Style,
+            layout: Layout<'_>,
+            cursor: mouse::Cursor,
+            viewport: &Rectangle,
+        ) {
+            let child = tree.state.downcast_ref::<Tree>();
+            self.0
+                .as_widget()
+                .draw(child, renderer, theme, style, layout, cursor, viewport);
+        }
     }
 
     fn tabs(ids: &[CardId], alt: bool) -> Element<'static, Action> {
@@ -1446,7 +1586,7 @@ mod tests {
         }
         let ids = [CardId::new(), CardId::new()];
         let channel = ChannelId::new();
-        let make = |generation, modal: bool| {
+        let make = |generation, modal: bool, retained: bool| {
             let target = channel_target(
                 widget::button::custom(widget::Space::new())
                     .width(120)
@@ -1455,6 +1595,11 @@ mod tests {
                 channel,
                 true,
             );
+            let target = if retained {
+                Element::new(Retained(target))
+            } else {
+                target
+            };
             let base = channel_scope(
                 widget::row::with_children(vec![target, tabs(&ids, false)]),
                 Id::new("reorder.test"),
@@ -1481,9 +1626,9 @@ mod tests {
         let press = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
         let release = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
         let mut renderer = Surface::new(&ids, false).renderer;
-        for modal in [true, false] {
+        for (modal, retained) in [(true, false), (false, false), (true, true), (false, true)] {
             let mut ui = UserInterface::build(
-                make(1, false),
+                make(1, false, retained),
                 Size::new(280.0, 30.0),
                 Cache::new(),
                 &mut renderer,
@@ -1520,7 +1665,7 @@ mod tests {
             );
             let generation = if modal { 1 } else { 2 };
             ui = UserInterface::build(
-                make(generation, modal),
+                make(generation, modal, retained),
                 Size::new(280.0, 30.0),
                 ui.into_cache(),
                 &mut renderer,
@@ -1543,7 +1688,7 @@ mod tests {
             }
             assert!(messages.is_empty());
             ui = UserInterface::build(
-                make(generation, false),
+                make(generation, false, retained),
                 Size::new(280.0, 30.0),
                 ui.into_cache(),
                 &mut renderer,
