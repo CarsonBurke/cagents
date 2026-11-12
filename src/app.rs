@@ -21860,7 +21860,7 @@ mod tests {
         use context_sections::{Action, Section, WorkspaceView};
         let steps = [
             Action::Show(WorkspaceView::Files),
-            Action::Show(WorkspaceView::Changes),
+            Action::Show(WorkspaceView::SourceControl),
             Action::Toggle(Section::PullRequests),
             Action::Toggle(Section::Workspace),
             Action::Show(WorkspaceView::Files),
@@ -25399,8 +25399,8 @@ mod tests {
         use context_sections::{Action as SectionAction, Section, WorkspaceView};
         for (action, shown) in [
             (
-                SectionAction::Show(WorkspaceView::Changes),
-                Some(WorkspaceView::Changes),
+                SectionAction::Show(WorkspaceView::SourceControl),
+                Some(WorkspaceView::SourceControl),
             ),
             (
                 SectionAction::Show(WorkspaceView::Files),
@@ -31515,7 +31515,7 @@ mod tests {
         );
         drop(
             app.update(Message::ContextSection(context_sections::Action::Show(
-                context_sections::WorkspaceView::Changes,
+                context_sections::WorkspaceView::SourceControl,
             ))),
         );
         assert_eq!(app.workspace_view(), context_sections::WorkspaceView::Files);

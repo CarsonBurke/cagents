@@ -34,21 +34,21 @@ pub enum WorkspaceView {
     /// Source control: what is uncommitted, what the branch changes, and its
     /// history.
     #[default]
-    Changes,
+    SourceControl,
     Files,
 }
 
 impl WorkspaceView {
     const fn label(self) -> &'static str {
         match self {
-            Self::Changes => "Changes",
+            Self::SourceControl => "Source control",
             Self::Files => "Files",
         }
     }
 
     const fn icon(self) -> Icon {
         match self {
-            Self::Changes => Icon::Changes,
+            Self::SourceControl => Icon::Changes,
             Self::Files => Icon::Folder,
         }
     }
@@ -170,7 +170,7 @@ impl Cagents {
                 self.context_sections.set_open(section, open);
             }
             Action::Show(view) => {
-                if view == WorkspaceView::Changes && self.active_folder_scope() {
+                if view == WorkspaceView::SourceControl && self.active_folder_scope() {
                     return Task::none();
                 }
                 self.context_sections.workspace_view = view;
@@ -178,7 +178,7 @@ impl Cagents {
             }
         }
         let save = self.save_settings_task(false);
-        // Files read untracked paths the Changes view does not, so a newly
+        // Files read untracked paths source control does not, so a newly
         // shown view reads the worktree again.
         let shown = self.workspace_view_shown();
         let reload = match self.sidebar_state.active_worktree().cloned() {
@@ -285,10 +285,13 @@ impl Cagents {
         }
         let toggle = crate::interaction::hover(
             widget::button::custom(
-                widget::row::with_children(label)
-                    .spacing(space::XS)
-                    .align_y(Alignment::Center)
-                    .width(Length::Fill),
+                widget::container(
+                    widget::row::with_children(label)
+                        .spacing(space::XS)
+                        .align_y(Alignment::Center)
+                        .width(Length::Fill),
+                )
+                .center_y(Length::Fill),
             )
             .name(name)
             .class(crate::ui_controls::control_style(false, None))
@@ -485,17 +488,24 @@ impl Cagents {
         let open = self.context_sections.is_open(Section::Workspace);
         let view = self.workspace_view();
         let git = !self.active_folder_scope();
-        let dirty = git.then(|| self.context_rail_indicators().dirty).flatten();
-        let count = dirty.map(|dirty| {
-            (
-                dirty.split_whitespace().next().unwrap_or(dirty).to_owned(),
-                design::warning_text as _,
-            )
-        });
+        let indicators = git.then(|| self.context_rail_indicators());
+        // Uncommitted changes are what source control lists; beside Files the
+        // same figure would read as a number of files.
+        let (count, description) = match indicators {
+            Some(sidebar::WorktreeIndicators {
+                dirty: Some(dirty),
+                dirty_count: Some(count),
+                ..
+            }) if view == WorkspaceView::SourceControl => (
+                Some((count.to_string(), design::warning_text as _)),
+                Some(dirty.to_owned()),
+            ),
+            _ => (None, None),
+        };
         // One view is not a choice: a plain folder draws no switch.
         let controls = if git {
             vec![crate::ui_controls::segmented_controls(
-                [WorkspaceView::Changes, WorkspaceView::Files]
+                [WorkspaceView::SourceControl, WorkspaceView::Files]
                     .into_iter()
                     .map(|choice| {
                         crate::ui_controls::icon_button(
@@ -519,7 +529,7 @@ impl Cagents {
             section: Section::Workspace,
             title: view.label().into(),
             count,
-            description: dirty.map(|dirty| format!("{dirty} uncommitted")),
+            description,
             controls,
             height: Height::Share,
             body: open.then(|| self.workspace_body(view, width)),
@@ -537,7 +547,7 @@ impl Cagents {
                 width,
                 self.modal_is_open(),
             ),
-            WorkspaceView::Changes => sidebar::git_panel(
+            WorkspaceView::SourceControl => sidebar::git_panel(
                 &self.sidebar_model,
                 &self.sidebar_state,
                 width,
@@ -550,7 +560,7 @@ impl Cagents {
     /// A remote device's worktree opens in its own window rather than being
     /// read through this one.
     fn device_workspace_body(&self, view: WorkspaceView) -> Element<'_, Message> {
-        let changes = view == WorkspaceView::Changes;
+        let changes = view == WorkspaceView::SourceControl;
         let panel = if changes {
             device_ui::Panel::Changes
         } else {
@@ -678,7 +688,7 @@ mod tests {
             assert!(sections.is_open(section), "{section:?} starts collapsed");
         }
         assert!(!sections.is_open(Section::Workspace));
-        assert_eq!(sections.workspace_view, WorkspaceView::Changes);
+        assert_eq!(sections.workspace_view, WorkspaceView::SourceControl);
     }
 
     #[test]

@@ -1844,7 +1844,7 @@ mod tests {
             assert_eq!(app.workspace.focused(), Some(editor.id));
             assert_eq!(
                 app.workspace_view_shown(),
-                Some(context_sections::WorkspaceView::Changes)
+                Some(context_sections::WorkspaceView::SourceControl)
             );
             assert_eq!(app.context_inspector_open, !was_overlay);
             if was_overlay {

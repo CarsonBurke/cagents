@@ -7435,13 +7435,15 @@ fn worktree_accessible_name(
 /// What a worktree's own state contributes to an indicator, as inputs rather
 /// than widgets.
 ///
-/// The navigation rail's row and the context rail's tabs both resolve their
-/// badges through this, so the two rails cannot report the same worktree
+/// The navigation rail's row and the context inspector both resolve their
+/// badges through this, so the two cannot report the same worktree
 /// differently.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WorktreeIndicators<'a> {
-    /// The dirty badge's label, which is also its change count.
+    /// The dirty badge's label, such as `3 changes`.
     pub dirty: Option<&'a str>,
+    /// The count that label states.
+    pub dirty_count: Option<u64>,
     pub pull_request: Option<&'a SidebarPullRequest>,
     pub pending_checks: bool,
 }
@@ -7450,6 +7452,11 @@ pub fn worktree_indicators(worktree: &SidebarWorktree) -> WorktreeIndicators<'_>
     let pull_request = worktree.chrome.pull_request.as_ref();
     WorktreeIndicators {
         dirty: worktree.chrome.dirty_badge.as_deref(),
+        dirty_count: worktree
+            .dirty
+            .as_ref()
+            .filter(|dirty| dirty.is_dirty())
+            .map(dirty_count),
         pull_request,
         pending_checks: pull_request.is_some_and(SidebarPullRequest::has_pending_checks),
     }
