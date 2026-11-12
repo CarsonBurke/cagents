@@ -186,19 +186,19 @@ still reads at a glance, and the inspector remembers which are expanded.
   (untracked files included) and their line counts. The row for the current
   worktree says so; choosing another opens it, which moves the workspace to
   that worktree.
-- **Changes** and **Files** share one section, behind a switch in its header,
-  and show the current worktree. It starts collapsed while the sections
+- **Source control** and **Files** share one section, titled for the view
+  shown, behind a switch in its header; both show the current worktree. It starts collapsed while the sections
   above have something to show, and is always shown when they have nothing.
   A folder that is not a Git worktree has only **Files**.
 - With an editor focused, **Problems** lists its language server's
   diagnostics, and a references or definitions request lists its results.
   Neither appears while there is nothing to show.
 
-The Changes and Files views:
+The Source control and Files views:
 
 - **Files** browses the selected worktree and can list untracked, nonignored
   file names.
-- **Changes** provides diffs, staging, commits, push/publish, and history. Its
+- **Source control** provides diffs, staging, commits, push/publish, and history. Its
   views are **Changes** (staged, unstaged, and untracked files), **Branch**
   (everything changed since the merge base with the default branch), and
   **History** (commits, their changed files, and diffs against the first
