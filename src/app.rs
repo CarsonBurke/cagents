@@ -16631,11 +16631,11 @@ impl Application for Cagents {
                 }
             }
             Message::ResizeCardFinished(card) => {
-                self.workspace.finish_card_resize(card);
+                let update = self.workspace.finish_card_resize(card);
                 if self.card_state(card).is_some() {
                     self.persist();
                 }
-                Task::none()
+                self.apply_viewport(update, true, DurableChange::None)
             }
             Message::CloseCard(_) if self.dirty_repository_close.is_some() => Task::none(),
             Message::CloseCard(id) if matches!(self.cards.get(&id), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation()) => {
@@ -24331,14 +24331,24 @@ mod tests {
             );
             let mut found = Vec::new();
             rules(&node, iced::Point::ORIGIN, &mut found);
-            let rightmost = found
+            // Every rule that runs toward the edge reaches it, rather than
+            // stopping where the resize border begins: the header rule of the
+            // rightmost surface and the status bar rule, at least.
+            let toward_edge: Vec<_> = found
                 .iter()
-                .map(|rule| rule.x + rule.width)
-                .fold(0.0_f32, f32::max);
-            assert_eq!(
-                rightmost, width,
-                "inspector {inspector}: a rule stops short of the window edge: {found:?}"
+                .filter(|rule| rule.x + rule.width > width - border - 1.0)
+                .collect();
+            assert!(
+                toward_edge.len() >= 2,
+                "inspector {inspector}: expected the header and status bar rules: {found:?}"
             );
+            for rule in toward_edge {
+                assert_eq!(
+                    rule.x + rule.width,
+                    width,
+                    "inspector {inspector}: a rule stops short of the window edge: {rule:?}"
+                );
+            }
             let nodes = element.as_widget().a11y_nodes(
                 Layout::new(&node),
                 &tree,
@@ -24348,7 +24358,12 @@ mod tests {
                 .root()
                 .iter()
                 .chain(nodes.children())
-                .filter(|node| node.node().role() == Role::Button)
+                .filter(|node| {
+                    matches!(
+                        node.node().role(),
+                        Role::Button | Role::Splitter | Role::ScrollBar | Role::Slider
+                    )
+                })
                 .filter_map(|node| node.node().bounds())
                 .collect();
             assert!(!controls.is_empty());
