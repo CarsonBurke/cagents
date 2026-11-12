@@ -82,7 +82,7 @@ const HOST_CHECK: Millis = 3_000;
 /// than a tick, so a focused window reads it on every one: a local read
 /// costs nobody's patience, and Omp records figures as it works.
 const OMP_REREAD: Millis = 20_000;
-const STATUS_BAR_HEIGHT: f32 = 24.0;
+pub(super) const STATUS_BAR_HEIGHT: f32 = 24.0;
 const CHIP_HEIGHT: f32 = 20.0;
 const CHIP_ICON_SIZE: u16 = 12;
 const POPOVER_WIDTH: f32 = 320.0;

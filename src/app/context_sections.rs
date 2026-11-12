@@ -125,6 +125,23 @@ enum Height {
 /// row shows there is more.
 const LIST_ROWS_SHOWN: f32 = 5.5;
 
+/// A section header's height: a dense row and its padding.
+const SECTION_HEADER_HEIGHT: f32 = design::DENSE_ROW_HEIGHT + 2.0 * space::XXS;
+
+/// The height a short list takes before it scrolls.
+fn list_height(rows: f32) -> f32 {
+    design::DENSE_ROW_HEIGHT * 2.0 * rows
+}
+
+/// The height the first open list may take when no section shares the
+/// panel: what is left of `panel` after the `sections` headers, the rules
+/// between and below them, and the `others` lists' own heights, and never
+/// less than its usual `own` height.
+fn lead_list_height(panel: f32, sections: usize, own: f32, others: f32) -> f32 {
+    let headers = sections as f32 * (SECTION_HEADER_HEIGHT + design::BORDER_WIDTH);
+    (panel - headers - others).max(own)
+}
+
 /// A header's count and the text style that says what kind of count it is.
 type Count = (String, fn(&cosmic::Theme) -> iced::widget::text::Style);
 
@@ -145,6 +162,16 @@ impl Cagents {
     /// rather than left as a lone collapsed header over an empty panel.
     fn workspace_alone(&self) -> bool {
         !self.pull_requests_listed() && self.edited_worktrees().is_empty()
+    }
+
+    /// The inspector's height beneath its header, above the status bar.
+    fn inspector_body_height(&self) -> f32 {
+        let status = if self.settings.show_status_bar {
+            super::account_ui::STATUS_BAR_HEIGHT
+        } else {
+            0.0
+        };
+        self.window_height - design::HEADER_HEIGHT - design::BORDER_WIDTH - status
     }
 
     fn workspace_open(&self) -> bool {
@@ -217,6 +244,24 @@ impl Cagents {
         let shared = panes
             .iter()
             .any(|pane| pane.body.is_some() && pane.height == Height::Share);
+        let lists: Vec<f32> = panes
+            .iter()
+            .filter_map(|pane| match (&pane.body, pane.height) {
+                (Some(_), Height::Content { rows }) => Some(list_height(rows)),
+                _ => None,
+            })
+            .collect();
+        // With nothing sharing the height, the first open list grows into
+        // what the headers and the other lists leave, rather than scrolling
+        // within a few rows above an empty panel.
+        let mut lead = (!shared).then(|| {
+            lead_list_height(
+                self.inspector_body_height(),
+                panes.len(),
+                lists.first().copied().unwrap_or_default(),
+                lists.iter().skip(1).sum(),
+            )
+        });
         let mut children: Vec<Element<'_, Message>> = Vec::with_capacity(panes.len() * 3 + 1);
         for (index, pane) in panes.into_iter().enumerate() {
             if index > 0 {
@@ -241,7 +286,7 @@ impl Cagents {
                         .into(),
                     Height::Content { rows } => widget::container(body)
                         .width(Length::Fill)
-                        .max_height(design::DENSE_ROW_HEIGHT * 2.0 * rows)
+                        .max_height(lead.take().unwrap_or_else(|| list_height(rows)))
                         .into(),
                 });
             }
@@ -725,6 +770,22 @@ mod tests {
         }
         assert!(!sections.is_open(Section::Workspace));
         assert_eq!(sections.workspace_view, WorkspaceView::SourceControl);
+    }
+
+    #[test]
+    fn a_leading_list_takes_the_height_nothing_else_needs_and_never_less_than_its_rows() {
+        let own = list_height(LIST_ROWS_SHOWN);
+        let others = list_height(LIST_ROWS_SHOWN);
+        // Three headers in an 870 px panel leave room for more than its
+        // usual rows, less the other list's height.
+        let grown = lead_list_height(870.0, 3, own, others);
+        assert_eq!(
+            grown,
+            870.0 - 3.0 * (SECTION_HEADER_HEIGHT + design::BORDER_WIDTH) - others
+        );
+        assert!(grown > own);
+        // A panel too short for that keeps the usual rows and scrolls.
+        assert_eq!(lead_list_height(300.0, 3, own, others), own);
     }
 
     #[test]
