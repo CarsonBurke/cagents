@@ -14,6 +14,7 @@ mod icon;
 mod icon_button;
 mod labeled_controls;
 mod labelled;
+mod list_row;
 mod owned;
 mod placeholder;
 mod popover;
@@ -34,6 +35,7 @@ pub use icon_button::{
 };
 pub use labeled_controls::labeled_controls;
 pub use labelled::labelled;
+pub use list_row::{ListRow, list_row, row_label};
 pub use owned::owned;
 pub use placeholder::{Placeholder, placeholder};
 pub use popover::{popover, popover_item};

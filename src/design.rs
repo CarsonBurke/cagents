@@ -3,11 +3,12 @@
 //! COSMIC supplies the palette and the widget toolkit; everything a surface
 //! needs to look like part of this workbench is named here. Dimensions live
 //! in this module, the spacing scale in [`space`], semantic color in `color`,
-//! the type scale in `typography`, and the responsive mounting of the shell's
-//! regions in `layout`. Composed controls live in [`crate::ui_controls`].
+//! the type scale and its spacing rhythm in `typography`, the shared list grid
+//! in [`list`], and the responsive mounting of the shell's regions in `layout`. Composed controls live in [`crate::ui_controls`].
 
 mod color;
 mod layout;
+pub mod list;
 pub mod space;
 mod typography;
 
