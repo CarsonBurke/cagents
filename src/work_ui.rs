@@ -1645,9 +1645,12 @@ mod tests {
         }
     }
 
-    /// One frame of a Work board at a long-lived installation's scale: 600
-    /// cards, every one with an open pull request whose checks and review
-    /// are known, in the board and list layouts. Run it optimized:
+    /// Frames of a Work board at a long-lived installation's scale, 600 cards
+    /// and, for headroom, 3,000, every one with an open pull request whose
+    /// checks and review are known, in the board and list layouts. A rebuilt
+    /// frame makes the view again, as every message does; a scrolled frame
+    /// delivers a wheel step and the redraw that follows it, as scrolling
+    /// does. Run it optimized:
     ///
     /// ```sh
     /// scripts/cargo-gate test --locked --profile local --no-default-features --features ui \
@@ -1658,79 +1661,148 @@ mod tests {
     fn board_frame_workload() {
         use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
         use std::time::{Duration, Instant};
-        const CARDS: usize = 600;
         const FRAMES: usize = 48;
         const WARMUP: usize = 8;
+        const SCREEN: iced::Size = iced::Size::new(1240.0, 900.0);
+        const STEP: f32 = 96.0;
+
+        /// The furthest any scrollable has been scrolled down.
+        struct Scrolled(f32);
+        impl iced::advanced::widget::Operation for Scrolled {
+            fn traverse(
+                &mut self,
+                operate: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation<()>),
+            ) {
+                operate(self);
+            }
+            fn scrollable(
+                &mut self,
+                _id: Option<&iced::advanced::widget::Id>,
+                _bounds: iced::Rectangle,
+                _content_bounds: iced::Rectangle,
+                translation: iced::Vector,
+                _state: &mut dyn iced::advanced::widget::operation::Scrollable,
+            ) {
+                self.0 = self.0.max(translation.y);
+            }
+        }
+
         let reviews = [
             Some(crate::work::Review::Approved),
             Some(crate::work::Review::ChangesRequested),
             Some(crate::work::Review::Required),
             None,
         ];
-        let items = (0..CARDS)
-            .map(|index| {
-                let mut item = item(&format!("feature/change-{index}"), "cagents");
-                item.column = [Column::Active, Column::InProgress, Column::InReview][index % 3];
-                item.pull_request = Some(PullRequest {
-                    number: index as u64 + 1,
-                    title: format!("Change number {index}"),
-                    url: format!("https://github.com/o/cagents/pull/{}", index + 1),
-                    state: PullRequestState::Open,
-                    draft: false,
-                    head_oid: "a".into(),
-                    contains_local_head: true,
-                    checks: Some(crate::work::Checks {
-                        passed: 40 + index as u32 % 7,
-                        failed: index as u32 % 3,
-                        pending: index as u32 % 2,
-                    }),
-                    review: reviews[index % reviews.len()],
-                    updated_at: String::new(),
-                });
-                item
-            })
-            .collect();
-        let mut state = State::default();
-        connected(&mut state, 1, board(items));
+        let millis = |took: Duration| took.as_secs_f64() * 1e3;
         let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
         let theme = cosmic::Theme::dark();
-        for (name, list) in [("board", false), ("list", true)] {
-            if list {
-                state.update(Action::Layout(Layout::List));
-            }
-            let mut cache = Cache::new();
-            // The view is built lazily inside layout, so building the
-            // interface is where the cards' widgets are made.
-            let mut stages = [Duration::ZERO; 2];
-            for frame in 0..WARMUP + FRAMES {
-                let clock = Instant::now();
-                let mut ui = UserInterface::build(
-                    state.view(),
-                    iced::Size::new(1240.0, 900.0),
-                    std::mem::replace(&mut cache, Cache::new()),
-                    &mut renderer,
-                );
-                let built = clock.elapsed();
-                let clock = Instant::now();
-                ui.draw(
-                    &mut renderer,
-                    &theme,
-                    &iced::advanced::renderer::Style::default(),
-                    iced::mouse::Cursor::Unavailable,
-                );
-                let drawn = clock.elapsed();
-                cache = ui.into_cache();
-                if frame >= WARMUP {
-                    for (stage, took) in stages.iter_mut().zip([built, drawn]) {
-                        *stage += took;
+        let style = iced::advanced::renderer::Style::default();
+        for cards in [600, 3000] {
+            let items = (0..cards)
+                .map(|index| {
+                    let mut item = item(&format!("feature/change-{index}"), "cagents");
+                    item.column = [Column::Active, Column::InProgress, Column::InReview][index % 3];
+                    item.pull_request = Some(PullRequest {
+                        number: index as u64 + 1,
+                        title: format!("Change number {index}"),
+                        url: format!("https://github.com/o/cagents/pull/{}", index + 1),
+                        state: PullRequestState::Open,
+                        draft: false,
+                        head_oid: "a".into(),
+                        contains_local_head: true,
+                        checks: Some(crate::work::Checks {
+                            passed: 40 + index as u32 % 7,
+                            failed: index as u32 % 3,
+                            pending: index as u32 % 2,
+                        }),
+                        review: reviews[index % reviews.len()],
+                        updated_at: String::new(),
+                    });
+                    item
+                })
+                .collect();
+            let mut state = State::default();
+            connected(&mut state, 1, board(items));
+            // Within the first lane, and within the list.
+            for (name, list, pointer) in [
+                ("board", false, iced::Point::new(120.0, 500.0)),
+                ("list", true, iced::Point::new(620.0, 500.0)),
+            ] {
+                if list {
+                    state.update(Action::Layout(Layout::List));
+                }
+                let mut cache = Cache::new();
+                // The view is built lazily inside layout, so building the
+                // interface is where the cards' widgets are made.
+                let mut stages = [Duration::ZERO; 2];
+                for frame in 0..WARMUP + FRAMES {
+                    let clock = Instant::now();
+                    let mut ui = UserInterface::build(
+                        state.view(),
+                        SCREEN,
+                        std::mem::replace(&mut cache, Cache::new()),
+                        &mut renderer,
+                    );
+                    let built = clock.elapsed();
+                    let clock = Instant::now();
+                    ui.draw(
+                        &mut renderer,
+                        &theme,
+                        &style,
+                        iced::mouse::Cursor::Unavailable,
+                    );
+                    let drawn = clock.elapsed();
+                    cache = ui.into_cache();
+                    if frame >= WARMUP {
+                        for (stage, took) in stages.iter_mut().zip([built, drawn]) {
+                            *stage += took;
+                        }
                     }
                 }
+                let [build, draw] = stages.map(|stage| millis(stage) / FRAMES as f64);
+
+                let view = state.view();
+                let mut ui = UserInterface::build(view, SCREEN, cache, &mut renderer);
+                let cursor = iced::mouse::Cursor::Available(pointer);
+                ui.draw(&mut renderer, &theme, &style, cursor);
+                let wheel = iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                    delta: iced::mouse::ScrollDelta::Pixels { x: 0.0, y: -STEP },
+                });
+                let (mut total, mut worst) = (Duration::ZERO, Duration::ZERO);
+                for frame in 0..WARMUP + FRAMES {
+                    let redraw = iced::Event::Window(iced::window::Event::RedrawRequested(
+                        iced::time::Instant::now(),
+                    ));
+                    let clock = Instant::now();
+                    let mut messages = Vec::new();
+                    let _ = ui.update(
+                        &[wheel.clone(), redraw],
+                        cursor,
+                        &mut renderer,
+                        &mut iced::advanced::clipboard::Null,
+                        &mut messages,
+                    );
+                    ui.draw(&mut renderer, &theme, &style, cursor);
+                    let took = clock.elapsed();
+                    if frame >= WARMUP {
+                        total += took;
+                        worst = worst.max(took);
+                    }
+                }
+                let mut scrolled = Scrolled(0.0);
+                ui.operate(&renderer, &mut scrolled);
+                assert!(
+                    scrolled.0 >= STEP * (WARMUP + FRAMES) as f32 * 0.9,
+                    "the {name} scrolled only {} px",
+                    scrolled.0
+                );
+                eprintln!(
+                    "work {name}, {cards} cards: rebuilt frame {build:.3} ms view, build and \
+                     layout + {draw:.3} ms draw; scrolled frame {:.3} ms mean, {:.3} ms worst",
+                    millis(total) / FRAMES as f64,
+                    millis(worst),
+                );
             }
-            let [build, draw] = stages.map(|stage| stage.as_secs_f64() * 1e3 / FRAMES as f64);
-            eprintln!(
-                "work {name}, {CARDS} cards: view, build and layout {build:.3} ms, \
-                 draw {draw:.3} ms per frame"
-            );
         }
     }
 
