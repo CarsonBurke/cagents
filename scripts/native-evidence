@@ -41,7 +41,7 @@ both use the same fixture data and selected providers.
   start SIDE [--width PX] [--height PX] [--keep-state] [--wait-lock SECONDS] [--limit SECONDS]
         [--startup-timeout SECONDS]
         [--portal gtk|kde|gnome|cosmic] [--codex tool-rows|child-errors|terminal-escape]
-        [--instance NAME]
+        [--instance NAME] [--ui-trace]
                   Take the native lock and start a headless session at the
                   requested logical width and height (default 1500x900). The lock is
                   released by stop, or after --limit seconds (default 2700).
@@ -53,6 +53,10 @@ both use the same fixture data and selected providers.
                   as the fixture's codex. --codex-executable ABSOLUTE_PATH copies a
                   real ELF into the isolated fixture, without its config or
                   credentials. With neither option, Codex is not installed.
+                  --ui-trace has the UI log a summary of its UI-thread work
+                  every 5 seconds: updates by message, view, subscription,
+                  layout, draw, events, overlays and the rest of the widget
+                  tree's work, and every call over 50 ms.
   cli ARGS...     Run this side's cagents CLI in the fixture environment.
   env CMD...      Run a command in the fixture environment, which keeps nothing
                   from this shell beyond locale and terminal settings and
@@ -892,6 +896,7 @@ run_app() {
     local status=0 stage_environment=() runner_instance=()
     [ -z "$instance_name" ] || runner_instance=(--instance "$instance_name" --in-session)
     [ -z "${chat_stage_output:-}" ] || stage_environment+=("CAGENTS_CHAT_STAGE_OUTPUT=$chat_stage_output")
+    [ "$(cat "$state/ui-trace" 2>/dev/null)" != 1 ] || stage_environment+=(CAGENTS_UI_TRACE=1)
     fixture_env env "${stage_environment[@]}" CAGENTS_BUILD_LOCK="$state/session-build.lock" CAGENTS_BUILD_SLOTS=1 CAGENTS_BUILD_SEED=0 \
         CAGENTS_BUILD_REMOTE=local CAGENTS_BUILD_FREE_FLOOR_GIB=0 \
         scripts/run-development --browserless "${runner_instance[@]}" \
@@ -978,7 +983,7 @@ cmd_relaunch() {
 }
 
 cmd_start() {
-    local side=${1:-} width=1500 height=900 keep_state=false wait_lock=1800 limit=2700 startup_timeout=180 portal= codex= codex_executable=
+    local side=${1:-} width=1500 height=900 keep_state=false wait_lock=1800 limit=2700 startup_timeout=180 portal= codex= codex_executable= ui_trace=
     require_side "$side"
     shift
     while [ "$#" -gt 0 ]; do
@@ -995,6 +1000,7 @@ cmd_start() {
             --portal) portal=${2:?--portal needs a backend: gtk, kde, gnome or cosmic}; shift 2 ;;
             --codex) codex=${2:?--codex needs a peer: tool-rows, child-errors or terminal-escape}; shift 2 ;;
             --codex-executable) codex_executable=${2:?--codex-executable needs an absolute ELF path}; shift 2 ;;
+            --ui-trace) ui_trace=1; shift ;;
             *) die "unknown start option: $1" 2 ;;
         esac
     done
@@ -1038,6 +1044,7 @@ cmd_start() {
     printf '%s\n' "$startup_timeout" >"$state/startup-timeout"
     printf '%s\n' "$portal" >"$state/portal"
     printf '%s\n' "$codex" >"$state/codex"
+    printf '%s\n' "$ui_trace" >"$state/ui-trace"
     printf 'waiting for the native session (lock wait up to %ss)\n' "$wait_lock"
     # The session outlives this command, so it starts in its own process session.
     setsid nohup "$self" --task "$task" __session "$side" "$width" "$keep_state" "$wait_lock" "$limit" "$$" "$height" "$startup_timeout" \
