@@ -1623,6 +1623,97 @@ mod tests {
         }
     }
 
+    /// One frame of a Work board at a long-lived installation's scale: 600
+    /// cards, every one with an open pull request whose checks and review
+    /// are known, in the board and list layouts. Run it optimized:
+    ///
+    /// ```sh
+    /// scripts/cargo-gate test --locked --profile local --no-default-features --features ui \
+    ///     --lib -- --ignored --nocapture work_ui::tests::board_frame_workload
+    /// ```
+    #[test]
+    #[ignore = "timing workload; run optimized with --ignored --nocapture"]
+    fn board_frame_workload() {
+        use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+        use std::time::{Duration, Instant};
+        const CARDS: usize = 600;
+        const FRAMES: usize = 48;
+        const WARMUP: usize = 8;
+        let reviews = [
+            Some(crate::work::Review::Approved),
+            Some(crate::work::Review::ChangesRequested),
+            Some(crate::work::Review::Required),
+            None,
+        ];
+        let items = (0..CARDS)
+            .map(|index| {
+                let mut item = item(&format!("feature/change-{index}"), "cagents");
+                item.column = [Column::Active, Column::InProgress, Column::InReview][index % 3];
+                item.pull_request = Some(PullRequest {
+                    number: index as u64 + 1,
+                    title: format!("Change number {index}"),
+                    url: format!("https://github.com/o/cagents/pull/{}", index + 1),
+                    state: PullRequestState::Open,
+                    draft: false,
+                    head_oid: "a".into(),
+                    contains_local_head: true,
+                    checks: Some(crate::work::Checks {
+                        passed: 40 + index as u32 % 7,
+                        failed: index as u32 % 3,
+                        pending: index as u32 % 2,
+                    }),
+                    review: reviews[index % reviews.len()],
+                    updated_at: String::new(),
+                });
+                item
+            })
+            .collect();
+        let mut state = State::default();
+        connected(&mut state, 1, board(items));
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let theme = cosmic::Theme::dark();
+        for (name, list) in [("board", false), ("list", true)] {
+            if list {
+                state.update(Action::Layout(Layout::List));
+            }
+            let mut cache = Cache::new();
+            let mut stages = [Duration::ZERO; 3];
+            for frame in 0..WARMUP + FRAMES {
+                let clock = Instant::now();
+                let element = state.view();
+                let viewed = clock.elapsed();
+                let clock = Instant::now();
+                let mut ui = UserInterface::build(
+                    element,
+                    iced::Size::new(1240.0, 900.0),
+                    std::mem::replace(&mut cache, Cache::new()),
+                    &mut renderer,
+                );
+                let laid_out = clock.elapsed();
+                let clock = Instant::now();
+                ui.draw(
+                    &mut renderer,
+                    &theme,
+                    &iced::advanced::renderer::Style::default(),
+                    iced::mouse::Cursor::Unavailable,
+                );
+                let drawn = clock.elapsed();
+                cache = ui.into_cache();
+                if frame >= WARMUP {
+                    for (stage, took) in stages.iter_mut().zip([viewed, laid_out, drawn]) {
+                        *stage += took;
+                    }
+                }
+            }
+            let [view, layout, draw] =
+                stages.map(|stage| stage.as_secs_f64() * 1e3 / FRAMES as f64);
+            eprintln!(
+                "work {name}, {CARDS} cards: view {view:.3} ms, build+layout {layout:.3} ms, \
+                 draw {draw:.3} ms per frame"
+            );
+        }
+    }
+
     #[test]
     fn ages_are_compact() {
         let minute = 60_000;
