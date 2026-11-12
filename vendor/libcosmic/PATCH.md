@@ -21,3 +21,16 @@ ordinary PartialEq.
 The application regression mounts unrelated buttons before an editable field,
 then dispatches numeric IDs from the emitted accessibility tree. It checks editing
 reaches the field and a targeted click reaches only the intended button.
+
+# Overlays inside buttons keep their screen translation
+
+`Button::overlay` and the Wayland `Tooltip::overlay` added their own layout
+position to the `translation` they pass to their content. iced layouts are
+already absolute, so every overlay raised from inside a button, such as a
+tooltip or popover on a control within a list row or card, was displaced by
+the button's origin. Both now pass `translation` through unchanged, as iced's
+own button does.
+
+The application regressions raise a tooltip and a popover from a control in an
+offset `button::custom` and check that each overlay is anchored to its control,
+with any ancestor translation applied once.

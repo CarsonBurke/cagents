@@ -362,7 +362,22 @@ pub fn horizontal_wheel<'a, Message: 'a>(
 ) -> Element<'a, Message> {
     Element::new(WheelInput {
         content: content.into(),
-        pass_to_parent: false,
+        route: WheelRoute::Horizontal,
+    })
+}
+
+/// Treat a vertical mouse wheel as horizontal motion, except over a nested
+/// scrollable that moves vertically, which keeps it.
+///
+/// A row of vertically scrolling lanes inside a horizontal scrollable wants
+/// both: the wheel scrolls the lane under the pointer, and over the headings
+/// and gaps between lanes it moves the row sideways.
+pub fn horizontal_wheel_around_vertical<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    Element::new(WheelInput {
+        content: content.into(),
+        route: WheelRoute::AroundVertical,
     })
 }
 
@@ -373,7 +388,7 @@ pub fn parent_wheel<'a, Message: 'a>(
 ) -> Element<'a, Message> {
     Element::new(WheelInput {
         content: content.into(),
-        pass_to_parent: true,
+        route: WheelRoute::Parent,
     })
 }
 
@@ -855,10 +870,132 @@ impl<Message> Widget<Message, Theme, Renderer> for Layers<'_, Message> {
 
 struct WheelInput<'a, Message> {
     content: Element<'a, Message>,
-    pass_to_parent: bool,
+    route: WheelRoute,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WheelRoute {
+    /// Every wheel moves the content sideways.
+    Horizontal,
+    /// A vertical wheel stays vertical over a scrollable that moves
+    /// vertically; any other wheel moves the content sideways.
+    AroundVertical,
+    /// The wheel skips the content for the enclosing scrollable.
+    Parent,
+}
+
+/// The wheel gesture in progress, and whether it keeps its vertical motion.
+///
+/// iced's scrollable keeps a gesture on the scrollable it started on until
+/// the pointer moves well after the last wheel, a button changes, or the
+/// wheel rests; ending ours by the same rules keeps the two agreeing. A
+/// gesture that moved the content sideways therefore goes on doing so when
+/// that motion brings a lane under the pointer.
+#[derive(Default)]
+struct WheelGesture {
+    current: Option<(bool, Instant)>,
+}
+
+impl WheelGesture {
+    /// iced's scrollable: a pointer motion this soon after a wheel belongs
+    /// to the gesture.
+    const MOTION_GRACE: Duration = Duration::from_millis(100);
+    /// iced's scrollable: a wheel at rest this long has ended its gesture.
+    const REST: Duration = Duration::from_millis(1500);
+
+    fn observe(&mut self, event: &Event) {
+        let ended = match event {
+            Event::Mouse(
+                mouse::Event::ButtonPressed(_)
+                | mouse::Event::ButtonReleased(_)
+                | mouse::Event::CursorLeft,
+            ) => true,
+            Event::Mouse(mouse::Event::CursorMoved { .. }) => self
+                .current
+                .is_some_and(|(_, at)| at.elapsed() > Self::MOTION_GRACE),
+            _ => false,
+        };
+        if ended {
+            self.current = None;
+        }
+    }
+
+    /// Whether this wheel keeps its vertical motion: as the gesture decided
+    /// if one is in progress, otherwise as `decide` says.
+    fn keeps_vertical(&mut self, decide: impl FnOnce() -> bool) -> bool {
+        let keep = match self.current {
+            Some((keep, at)) if at.elapsed() <= Self::REST => keep,
+            _ => decide(),
+        };
+        self.current = Some((keep, Instant::now()));
+        keep
+    }
+}
+
+/// Finds whether a scrollable that moves vertically lies under a point given
+/// in the operated layout's coordinates.
+struct VerticalScrollableAt {
+    point: Point,
+    /// Scrolled distance of the content being visited.
+    offset: Vector,
+    /// Scrolled distance of the scrollable just visited, which its next
+    /// traversal enters.
+    entering: Vector,
+    found: bool,
+}
+
+impl VerticalScrollableAt {
+    fn new(point: Point) -> Self {
+        Self {
+            point,
+            offset: Vector::ZERO,
+            entering: Vector::ZERO,
+            found: false,
+        }
+    }
+}
+
+impl Operation for VerticalScrollableAt {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+        if self.found {
+            return;
+        }
+        let outer = self.offset;
+        self.offset = outer + std::mem::replace(&mut self.entering, Vector::ZERO);
+        operate(self);
+        self.offset = outer;
+    }
+
+    fn scrollable(
+        &mut self,
+        _id: Option<&Id>,
+        bounds: Rectangle,
+        content_bounds: Rectangle,
+        translation: Vector,
+        _state: &mut dyn operation::Scrollable,
+    ) {
+        if content_bounds.height > bounds.height && bounds.contains(self.point + self.offset) {
+            self.found = true;
+        }
+        self.entering = translation;
+    }
+}
+
+/// Whether a wheel moves only vertically.
+fn only_vertical(delta: mouse::ScrollDelta) -> bool {
+    let (x, y) = match delta {
+        mouse::ScrollDelta::Lines { x, y } | mouse::ScrollDelta::Pixels { x, y } => (x, y),
+    };
+    x == 0.0 && y != 0.0
 }
 
 impl<Message> Widget<Message, Theme, Renderer> for WheelInput<'_, Message> {
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<WheelGesture>()
+    }
+    fn state(&self) -> tree::State {
+        tree::State::new(WheelGesture::default())
+    }
     fn children(&self) -> Vec<Tree> {
         vec![Tree::new(&self.content)]
     }
@@ -903,19 +1040,37 @@ impl<Message> Widget<Message, Theme, Renderer> for WheelInput<'_, Message> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
-        if self.pass_to_parent && matches!(event, Event::Mouse(mouse::Event::WheelScrolled { .. }))
+        if self.route == WheelRoute::Parent
+            && matches!(event, Event::Mouse(mouse::Event::WheelScrolled { .. }))
         {
             return;
         }
+        let gesture = tree.state.downcast_mut::<WheelGesture>();
+        gesture.observe(event);
         let remapped;
-        let event = match event {
-            Event::Mouse(mouse::Event::WheelScrolled { delta })
-                if cursor.is_over(layout.bounds()) =>
-            {
-                remapped = wheel_as_horizontal(*delta);
-                &remapped
+        let event = match (event, cursor.position_over(layout.bounds())) {
+            (Event::Mouse(mouse::Event::WheelScrolled { delta }), Some(point)) => {
+                let keep = self.route == WheelRoute::AroundVertical
+                    && gesture.keeps_vertical(|| {
+                        let mut under = VerticalScrollableAt::new(point);
+                        only_vertical(*delta) && {
+                            self.content.as_widget_mut().operate(
+                                &mut tree.children[0],
+                                layout.with_virtual_offset(layout.virtual_offset()),
+                                renderer,
+                                &mut under,
+                            );
+                            under.found
+                        }
+                    });
+                if keep {
+                    event
+                } else {
+                    remapped = wheel_as_horizontal(*delta);
+                    &remapped
+                }
             }
-            other => other,
+            (other, _) => other,
         };
         self.content.as_widget_mut().update(
             &mut tree.children[0],
@@ -2274,6 +2429,86 @@ mod tests {
         );
     }
 
+    /// A Work list row is a `button::custom` holding tooltip-bearing
+    /// controls; the tooltip must open at the control, with the camera
+    /// translation of an enclosing workspace card applied once.
+    #[test]
+    fn tooltips_inside_an_offset_button_anchor_to_their_control() {
+        use cosmic::iced::advanced::clipboard;
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let screen = Size::new(600.0, 400.0);
+        let control = Size::new(24.0, 24.0);
+        let mut element: Element<'_, u8> = widget::container(
+            widget::button::custom(
+                widget::row::with_children(vec![
+                    cosmic::iced::widget::Space::new()
+                        .width(100)
+                        .height(24)
+                        .into(),
+                    tooltip(
+                        cosmic::iced::widget::Space::new()
+                            .width(control.width)
+                            .height(control.height),
+                        "Card actions",
+                    ),
+                ])
+                .spacing(8),
+            )
+            .padding(10)
+            .on_press(1),
+        )
+        .padding(cosmic::iced::Padding {
+            left: 140.0,
+            top: 90.0,
+            ..cosmic::iced::Padding::ZERO
+        })
+        .into();
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, screen),
+        );
+        let anchor = Rectangle::new(Point::new(140.0 + 10.0 + 100.0 + 8.0, 90.0 + 10.0), control);
+        let start = Instant::now();
+        let viewport = Rectangle::with_size(screen);
+        for event in [
+            Event::Mouse(mouse::Event::CursorMoved {
+                position: anchor.center(),
+            }),
+            Event::Window(window::Event::RedrawRequested(start + TOOLTIP_DELAY * 2)),
+        ] {
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Available(anchor.center()),
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut Vec::new()),
+                &viewport,
+            );
+        }
+        for camera in [Vector::ZERO, Vector::new(-60.0, 35.0)] {
+            let mut overlay = element
+                .as_widget_mut()
+                .overlay(&mut tree, Layout::new(&node), &renderer, &viewport, camera)
+                .expect("hovering past the delay opens the tooltip");
+            // An overlay group spans the screen; the surface is its child.
+            let tip = overlay
+                .as_overlay_mut()
+                .layout(&renderer, screen)
+                .children()[0]
+                .bounds();
+            let anchor = anchor + camera;
+            assert!(
+                (tip.center_x() - anchor.center_x()).abs() < 0.5
+                    && (tip.y - (anchor.y + anchor.height + TIP_GAP)).abs() < 0.5,
+                "tooltip {tip:?} is not beneath its control {anchor:?}"
+            );
+        }
+    }
+
     use super::*;
     #[test]
     fn an_exclusive_chooser_narrower_than_its_base_hides_the_base_from_the_pointer() {
@@ -2615,6 +2850,89 @@ mod tests {
             panic!("expected a wheel event");
         };
         assert_eq!(delta, mouse::ScrollDelta::Pixels { x: 60.0, y: 0.0 });
+    }
+
+    #[test]
+    fn a_wheel_scrolls_the_lane_under_the_pointer_and_moves_the_row_between_lanes() {
+        use cosmic::iced::advanced::clipboard;
+        use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+
+        /// Two 200-wide lanes, each a 40-high heading over a scrollable of
+        /// 2000, in a 300-wide row that scrolls sideways by up to 120.
+        fn view() -> Element<'static, ()> {
+            let lane = || -> Element<'static, ()> {
+                widget::column::with_children(vec![
+                    widget::Space::new().width(Length::Fill).height(40).into(),
+                    widget::scrollable(widget::Space::new().width(Length::Fill).height(2000))
+                        .height(Length::Fill)
+                        .into(),
+                ])
+                .width(200)
+                .into()
+            };
+            horizontal_wheel_around_vertical(
+                widget::scrollable::horizontal(
+                    widget::row::with_children(vec![lane(), lane()])
+                        .spacing(20)
+                        .height(Length::Fill),
+                )
+                .width(Length::Fill)
+                .height(Length::Fill),
+            )
+        }
+        /// The row's sideways offset and each lane's offset.
+        struct Offsets(Vec<Vector>);
+        impl Operation for Offsets {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+            fn scrollable(
+                &mut self,
+                _id: Option<&Id>,
+                _bounds: Rectangle,
+                _content_bounds: Rectangle,
+                translation: Vector,
+                _state: &mut dyn operation::Scrollable,
+            ) {
+                self.0.push(translation);
+            }
+        }
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut ui =
+            || UserInterface::build(view(), Size::new(300.0, 400.0), Cache::new(), &mut renderer);
+        let wheel = |ui: &mut UserInterface<'_, (), Theme, Renderer>, x: f32, y: f32| {
+            let position = Point::new(x, y);
+            let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+            let _ = ui.update(
+                &[
+                    Event::Mouse(mouse::Event::CursorMoved { position }),
+                    Event::Mouse(mouse::Event::WheelScrolled {
+                        delta: mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 },
+                    }),
+                ],
+                mouse::Cursor::Available(position),
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut Vec::new(),
+            );
+            let mut offsets = Offsets(Vec::new());
+            ui.operate(&renderer, &mut offsets);
+            let [row, first, second] = offsets.0[..] else {
+                panic!("expected a row and two lanes: {:?}", offsets.0);
+            };
+            (row.x, first.y, second.y)
+        };
+
+        // Over a lane the wheel scrolls that lane, and the row stays put.
+        let mut over_lane = ui();
+        assert_eq!(wheel(&mut over_lane, 100.0, 200.0), (0.0, 60.0, 0.0));
+        assert_eq!(wheel(&mut over_lane, 100.0, 200.0), (0.0, 120.0, 0.0));
+
+        // Over a heading it moves the row sideways, and goes on doing so
+        // when that brings a lane under the pointer mid-gesture.
+        let mut over_heading = ui();
+        assert_eq!(wheel(&mut over_heading, 100.0, 20.0), (60.0, 0.0, 0.0));
+        assert_eq!(wheel(&mut over_heading, 100.0, 200.0), (120.0, 0.0, 0.0));
     }
 
     #[test]

@@ -351,11 +351,10 @@ impl<'a, Message: 'static + Clone, TopLevelMessage: 'static + Clone>
         layout: Layout<'b>,
         renderer: &crate::Renderer,
         viewport: &Rectangle,
-        mut translation: Vector,
+        translation: Vector,
     ) -> Option<overlay::Element<'b, Message, crate::Theme, crate::Renderer>> {
-        let position = layout.bounds().position();
-        translation.x += position.x;
-        translation.y += position.y;
+        // The child layout is already absolute; `translation` stays the
+        // ancestors' screen offset rather than also gaining this position.
         self.content.as_widget_mut().overlay(
             &mut tree.children[0],
             layout
