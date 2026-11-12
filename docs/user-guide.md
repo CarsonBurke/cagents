@@ -443,8 +443,8 @@ cagents reads them from what the conversation and its subagents did, such as
 `#123` references. The list updates on its own; there is nothing to refresh.
 
 A row's glyph is the PR's state: open, draft, merged or closed. Beneath its
-title, the row says why it is listed, then its checks, the lines it adds and
-removes, and any uncommitted changes in its worktree. A PR in another
+title, the row says why it is listed, then its checks and the lines it adds
+and removes. A PR in another
 repository shows as `owner/repo#123`. When GitHub can't be reached, rows keep
 their last known state and say when it was read.
 

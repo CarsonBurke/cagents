@@ -684,7 +684,7 @@ fn work_row<'a>(
 ) -> Element<'a, Action> {
     let (glyph, name, trailing, mut facts): (Element<'a, Action>, String, Option<String>, _) =
         match work {
-            Work::PullRequest { row, worktree } => {
+            Work::PullRequest { row, .. } => {
                 let state = row
                     .pull_request
                     .as_ref()
@@ -730,18 +730,6 @@ fn work_row<'a>(
                         }
                     }
                     _ => facts.push(design::caption("State unknown").into()),
-                }
-                if let Some(worktree) = worktree
-                    && worktree.changed_paths.is_some_and(|count| count > 0)
-                {
-                    facts.push(
-                        design::caption(format!(
-                            "{} uncommitted",
-                            worktree.changed_paths.unwrap_or_default()
-                        ))
-                        .class(cosmic::theme::Text::Custom(design::warning_text))
-                        .into(),
-                    );
                 }
                 (
                     crate::ui_controls::pull_request_state_glyph(state, design::ROW_ICON_SIZE),
