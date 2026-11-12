@@ -146,7 +146,14 @@ pub struct State {
     /// The work the user chose to show in each conversation they chose
     /// any in, so returning to one shows what they left it showing; until
     /// then the inspector shows the work where the conversation runs.
-    chosen: HashMap<TerminalId, WorkKey>,
+    chosen: HashMap<TerminalId, Chosen>,
+}
+
+/// Work the user chose, and whether its details are unfolded beneath it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Chosen {
+    key: WorkKey,
+    details: bool,
 }
 
 impl State {
@@ -210,8 +217,14 @@ impl State {
     }
 
     /// Every piece of work the conversation did, pull requests first. `here`
-    /// is the worktree the conversation runs in.
-    pub(crate) fn work<'a>(&'a self, here: Option<&'a Path>) -> Vec<Work<'a>> {
+    /// is the worktree the conversation runs in, listed when none of the
+    /// work is in a worktree Projects lists, which `openable` says, so its
+    /// changes stay a click away.
+    pub(crate) fn work<'a>(
+        &'a self,
+        here: Option<&'a Path>,
+        openable: &dyn Fn(&Path) -> bool,
+    ) -> Vec<Work<'a>> {
         let mut work: Vec<Work<'a>> = self
             .rows()
             .iter()
@@ -224,7 +237,9 @@ impl State {
         work.extend(self.worktrees_alone().map(Work::Worktree));
         if let Some(here) = here
             && !work.is_empty()
-            && !work.iter().any(|work| work.worktree().is_some())
+            && !work
+                .iter()
+                .any(|work| work.worktree().is_some_and(openable))
         {
             work.push(Work::Here(here));
         }
@@ -241,9 +256,8 @@ impl State {
         here: Option<&Path>,
         openable: &dyn Fn(&Path) -> bool,
     ) -> Option<Work<'w>> {
-        self.conversation
-            .and_then(|conversation| self.chosen.get(&conversation))
-            .and_then(|key| work.iter().find(|work| work.is(key)))
+        self.chosen()
+            .and_then(|chosen| work.iter().find(|work| work.is(&chosen.key)))
             .or_else(|| {
                 here.and_then(|here| work.iter().find(|work| work.worktree() == Some(here)))
             })
@@ -255,10 +269,31 @@ impl State {
             .copied()
     }
 
-    pub(super) fn choose(&mut self, key: WorkKey) {
-        if let Some(conversation) = self.conversation {
-            self.chosen.insert(conversation, key);
+    fn chosen(&self) -> Option<&Chosen> {
+        self.conversation
+            .and_then(|conversation| self.chosen.get(&conversation))
+    }
+
+    /// Chooses `key` to show, unfolding its details. Choosing it again while
+    /// it is `shown_open` folds or unfolds them instead.
+    pub(super) fn choose(&mut self, key: WorkKey, shown_open: bool) {
+        let Some(conversation) = self.conversation else {
+            return;
+        };
+        match self.chosen.get_mut(&conversation) {
+            Some(chosen) if chosen.key == key && shown_open => chosen.details = !chosen.details,
+            _ => {
+                self.chosen
+                    .insert(conversation, Chosen { key, details: true });
+            }
         }
+    }
+
+    /// Whether `work` was chosen and its details are unfolded. Work shown
+    /// only because the conversation runs there stays folded.
+    fn details_open(&self, work: Work<'_>) -> bool {
+        self.chosen()
+            .is_some_and(|chosen| chosen.details && work.is(&chosen.key))
     }
 
     pub(super) fn rows(&self) -> &[ConversationPullRequest] {
@@ -447,7 +482,10 @@ pub(super) fn view<'a>(
     for item in work {
         let chosen = shown.is_some_and(|key| item.is(key));
         children.push(work_row(list, *item, chosen && shown_open, openable));
-        if chosen && let Some(row) = item.pull_request() {
+        if chosen
+            && state.details_open(*item)
+            && let Some(row) = item.pull_request()
+        {
             children.push(chosen_details(row));
         }
     }
@@ -499,6 +537,7 @@ pub(super) fn height(
     show_mentions: bool,
 ) -> Height {
     let expanded = shown
+        .filter(|shown| state.details_open(*shown))
         .and_then(|shown| shown.pull_request())
         .map_or(0.0, |row| {
             ROW_SPACING + detail_rows(row) as f32 * design::DENSE_ROW_HEIGHT
@@ -945,14 +984,22 @@ fn mentioned_row<'a>(
             state.label().to_lowercase()
         ))
     );
-    crate::ui_controls::list_row(None, name.clone())
+    // Another repository's name leads the label rather than following the
+    // number, so a long one is cut short with the title instead of pushing
+    // the label out of the row.
+    let label = if own_repository(list, row) {
+        name.clone()
+    } else {
+        format!("{} · {name}", repository_label(&row.repository))
+    };
+    crate::ui_controls::list_row(None, name)
         .icon_element(crate::ui_controls::pull_request_state_glyph(
             state,
             design::ROW_ICON_SIZE,
         ))
         // Mentions are the long tail, so they read quieter than the work.
         .label(
-            design::body(name)
+            design::body(label)
                 .class(cosmic::theme::Text::Custom(design::muted_text))
                 .wrapping(iced::widget::text::Wrapping::None)
                 .ellipsize(iced::widget::text::Ellipsize::End(
@@ -960,7 +1007,10 @@ fn mentioned_row<'a>(
                 ))
                 .width(Length::Fill),
         )
-        .trailing(design::caption(number).wrapping(iced::widget::text::Wrapping::None))
+        .trailing(
+            design::caption(format!("#{}", row.number))
+                .wrapping(iced::widget::text::Wrapping::None),
+        )
         .name(described)
         .dense()
         .on_press_maybe(open(row))
@@ -1172,16 +1222,26 @@ mod tests {
             true,
         ));
         state.mentions_open = true;
-        let work = state.work(None);
         let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
-        for (shown, show_mentions) in [
-            (None, false),
-            (Some(0), false),
-            (Some(0), true),
-            (Some(1), true),
+        let keys: Vec<WorkKey> = state.work(None, &|_| true).iter().map(Work::key).collect();
+        // Shown work, whether it was chosen and so unfolds its checks, and
+        // whether mentions are listed.
+        for (shown, chosen, show_mentions) in [
+            (None, false, false),
+            (Some(0), false, false),
+            (Some(0), true, false),
+            (Some(0), true, true),
+            (Some(1), true, true),
         ] {
-            let shown = shown.map(|index: usize| work[index]);
-            let key = shown.map(|shown| shown.key());
+            let key = shown.map(|index: usize| keys[index].clone());
+            state.chosen.clear();
+            if chosen && let Some(key) = &key {
+                state.choose(key.clone(), false);
+            }
+            let work = state.work(None, &|_| true);
+            let shown = key
+                .as_ref()
+                .and_then(|key| work.iter().copied().find(|work| work.is(key)));
             let mut element = view(&state, &work, key.as_ref(), true, show_mentions, &|_| true);
             let mut tree = Tree::new(&element);
             let node = element.as_widget_mut().layout(
@@ -1195,7 +1255,7 @@ mod tests {
             let height = height(&state, &work, shown, show_mentions);
             assert!(
                 (node.size().height - height.content).abs() < 0.5,
-                "{shown:?} with mentions {show_mentions}: laid out {} but reported {height:?}",
+                "{key:?} chosen {chosen} with mentions {show_mentions}: laid out {} but reported {height:?}",
                 node.size().height,
             );
         }
@@ -1213,7 +1273,7 @@ mod tests {
             state.update(listed(conversation, 1, rows(), true));
         };
         let shown = |state: &State| {
-            let work = state.work(None);
+            let work = state.work(None, &|_| true);
             state.shown(&work, None, &|_| true).map(|work| work.key())
         };
         let number = |number| WorkKey::PullRequest {
@@ -1222,7 +1282,7 @@ mod tests {
         };
         show(&mut state, first);
         assert_eq!(shown(&state), Some(number(1)));
-        state.choose(number(2));
+        state.choose(number(2), false);
         show(&mut state, second);
         assert_eq!(
             shown(&state),
@@ -1231,6 +1291,77 @@ mod tests {
         );
         show(&mut state, first);
         assert_eq!(shown(&state), Some(number(2)));
+    }
+
+    /// Work shown because the conversation runs there stays folded; choosing
+    /// it unfolds its checks, and choosing it again while its changes are
+    /// open folds them.
+    #[test]
+    fn choosing_shown_work_again_folds_its_details() {
+        let mut state = State::default();
+        let conversation = TerminalId::new();
+        state.retarget(Some((CardId::new(), conversation)));
+        state.update(listed(
+            conversation,
+            1,
+            vec![row(1, Relation::Created)],
+            true,
+        ));
+        let key = WorkKey::PullRequest {
+            repository: repo("me"),
+            number: 1,
+        };
+        let open = |state: &State| {
+            let work = state.work(None, &|_| true);
+            state.details_open(work[0])
+        };
+        assert!(!open(&state), "shown by default, folded");
+        state.choose(key.clone(), true);
+        assert!(open(&state));
+        state.choose(key.clone(), true);
+        assert!(!open(&state), "chosen again while shown folds");
+        // Choosing it while its changes are closed is asking to see it all.
+        state.choose(key.clone(), false);
+        assert!(open(&state));
+    }
+
+    /// The conversation's own worktree stays listed while none of its work
+    /// can be shown here, so its changes are never out of reach.
+    #[test]
+    fn where_the_chat_runs_is_listed_while_no_work_is_in_projects() {
+        let mut state = State::default();
+        let conversation = TerminalId::new();
+        state.retarget(Some((CardId::new(), conversation)));
+        let Watch::Listed { list, .. } = listed(conversation, 1, Vec::new(), true) else {
+            unreachable!()
+        };
+        let mut list = Arc::unwrap_or_clone(list);
+        list.worktrees = vec![worktree("/elsewhere", None)];
+        state.update(Watch::Listed {
+            conversation,
+            revision: 1,
+            list: Arc::new(list),
+            first: true,
+        });
+        let here = Path::new("/scratch");
+        let listed = |openable: &dyn Fn(&Path) -> bool| {
+            state
+                .work(Some(here), openable)
+                .iter()
+                .map(Work::key)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            listed(&|path| path != Path::new("/elsewhere")),
+            [
+                WorkKey::Worktree(PathBuf::from("/elsewhere")),
+                WorkKey::Worktree(PathBuf::from("/scratch")),
+            ]
+        );
+        assert_eq!(
+            listed(&|_| true),
+            [WorkKey::Worktree(PathBuf::from("/elsewhere"))]
+        );
     }
 
     #[test]
@@ -1259,7 +1390,7 @@ mod tests {
             first: true,
         });
         let here = Path::new("/scratch");
-        let work = state.work(Some(here));
+        let work = state.work(Some(here), &|_| true);
         // Mentions are not work, and #2's worktree is shown on its row.
         let keys: Vec<WorkKey> = work.iter().map(Work::key).collect();
         assert_eq!(
@@ -1298,8 +1429,8 @@ mod tests {
                 .map(|work| work.key()),
             Some(keys[2].clone())
         );
-        state.choose(keys[0].clone());
-        let work = state.work(Some(here));
+        state.choose(keys[0].clone(), false);
+        let work = state.work(Some(here), &|_| true);
         assert_eq!(
             state
                 .shown(&work, Some(here), &|_| true)
@@ -1307,8 +1438,8 @@ mod tests {
             Some(keys[0].clone())
         );
         // A choice no longer listed gives way rather than showing nothing.
-        state.choose(WorkKey::Worktree(PathBuf::from("/gone")));
-        let work = state.work(Some(here));
+        state.choose(WorkKey::Worktree(PathBuf::from("/gone")), false);
+        let work = state.work(Some(here), &|_| true);
         assert_eq!(
             state
                 .shown(&work, Some(here), &|_| true)
@@ -1329,7 +1460,7 @@ mod tests {
             true,
         ));
         let here = Path::new("/main");
-        let work = state.work(Some(here));
+        let work = state.work(Some(here), &|_| true);
         assert_eq!(work.len(), 2);
         assert!(matches!(work[1], Work::Here(path) if path == here));
         assert_eq!(work[1].scope_label(), "main");
@@ -1346,7 +1477,7 @@ mod tests {
             vec![row(1, Relation::Mentioned)],
             false,
         ));
-        assert!(state.work(Some(here)).is_empty());
+        assert!(state.work(Some(here), &|_| true).is_empty());
     }
 
     /// An open pull request's checks and review are glyphs that say in

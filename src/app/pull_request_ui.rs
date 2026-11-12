@@ -107,12 +107,14 @@ impl Cagents {
                 Task::none()
             }
             Action::Choose(key) => {
-                conversation.choose(key);
-                // Choosing work is asking to see it.
-                if self
+                let shown_open = self
                     .context_sections
-                    .is_open(context_sections::Section::Workspace)
-                {
+                    .is_open(context_sections::Section::Workspace);
+                self.pull_request_inspector
+                    .conversation
+                    .choose(key, shown_open);
+                // Choosing work is asking to see it.
+                if shown_open {
                     return Task::none();
                 }
                 self.context_sections
@@ -214,7 +216,7 @@ impl Cagents {
         }
         let here = self.inspected_here();
         let openable = |path: &std::path::Path| self.sidebar_model.worktree_at(path).is_some();
-        let work = conversation.work(here.as_deref());
+        let work = conversation.work(here.as_deref(), &openable);
         let shown = conversation.shown(&work, here.as_deref(), &openable);
         let height = conversation::height(
             conversation,
@@ -269,7 +271,8 @@ impl Cagents {
     pub(super) fn work_section(&self, summary: &WorkSummary) -> Element<'_, Message> {
         let here = self.inspected_here();
         let conversation = &self.pull_request_inspector.conversation;
-        let work = conversation.work(here.as_deref());
+        let openable = |path: &std::path::Path| self.sidebar_model.worktree_at(path).is_some();
+        let work = conversation.work(here.as_deref(), &openable);
         let list = conversation::view(
             conversation,
             &work,
@@ -277,7 +280,7 @@ impl Cagents {
             self.context_sections
                 .is_open(context_sections::Section::Workspace),
             self.settings.show_mentioned_pull_requests,
-            &|path| self.sidebar_model.worktree_at(path).is_some(),
+            &openable,
         );
         let content: Element<'_, Action> = widget::scrollable(
             widget::container(list)
