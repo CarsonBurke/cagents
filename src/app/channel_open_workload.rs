@@ -465,3 +465,69 @@ fn channel_open_timing() {
         summary(&format!("  steady frame {label}"), steady);
     }
 }
+
+/// Where a steady frame's build time goes, phase by phase, as
+/// `UserInterface::build` runs them: the named-state extraction, the
+/// reconciliation, the restoration of states that cached subtrees kept, and
+/// layout itself. The headless frame above reports these four together as
+/// "layout".
+#[test]
+#[ignore = "timing workload; run optimized with --ignored --nocapture"]
+fn steady_frame_phases() {
+    use iced::advanced::widget::{Tree, tree::NAMED};
+
+    fn nodes(tree: &Tree) -> usize {
+        1 + tree.children.iter().map(nodes).sum::<usize>()
+    }
+
+    let (mut app, channels, _directory) = large_workspace(&Scale::LARGE);
+    drop(app.update(Message::Sidebar(SidebarAction::OpenChannel {
+        channel_id: channels[1],
+    })));
+    let renderer = super::tests::headless_renderer();
+    let limits =
+        iced::advanced::layout::Limits::new(iced::Size::ZERO, iced::Size::new(1600.0, 1000.0));
+    let mut tree = Tree::empty();
+    let mut phases: [Vec<Duration>; 5] = Default::default();
+    for round in 0..64 {
+        let started = Instant::now();
+        let mut element = app.view();
+        let viewed = Instant::now();
+        NAMED.with(|named| *named.borrow_mut() = tree.take_all_named());
+        let taken = Instant::now();
+        tree.diff(element.as_widget_mut());
+        let diffed = Instant::now();
+        iced::runtime::user_interface::restore_cached_named_states(&mut tree);
+        let restored = Instant::now();
+        drop(
+            element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits),
+        );
+        let laid_out = Instant::now();
+        NAMED.with(|named| named.borrow_mut().clear());
+        if round < 8 {
+            continue;
+        }
+        for (phase, duration) in phases.iter_mut().zip([
+            viewed - started,
+            taken - viewed,
+            diffed - taken,
+            restored - diffed,
+            laid_out - restored,
+        ]) {
+            phase.push(duration);
+        }
+    }
+    eprintln!(
+        "steady frame tree: {} nodes, {} named",
+        nodes(&tree),
+        tree.take_all_named().len()
+    );
+    for (label, phase) in ["view", "take named", "diff", "restore named", "layout"]
+        .into_iter()
+        .zip(phases.iter_mut())
+    {
+        summary(&format!("  steady {label}"), phase);
+    }
+}
