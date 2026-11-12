@@ -3,6 +3,8 @@
 
 #[cfg(feature = "ui")]
 pub mod chat_stage;
+#[cfg(feature = "ui")]
+pub mod ui_trace;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

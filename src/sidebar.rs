@@ -12122,10 +12122,31 @@ mod row_interaction {
             Clipboard, Layout, Shell, Widget, layout, overlay, renderer,
             widget::{Id, Operation, Tree, operation, tree},
         },
+        event::{PlatformSpecific, wayland},
         keyboard, mouse, window,
     };
     use cosmic::{Element, Renderer, Theme};
     use std::{cell::Cell, rc::Rc};
+
+    /// Whether a row scrolled out of the list's view can let `event` pass it
+    /// by. These are what every widget in the window receives on each frame
+    /// or message: a redraw, the runtime's resize request, and pointer
+    /// motion. A row out of view can't be under the pointer, and either isn't
+    /// drawn or, as a member passing under its group's pinned header, is
+    /// drawn hidden by it. Whatever its widgets would note from these, such as
+    /// their hover status, they note from the redraw that precedes their next
+    /// visible draw. Keys, modifier changes, presses and releases still reach
+    /// every row, since a focused or pressed row may be scrolled away.
+    fn unseen_rows_may_skip(event: &Event) -> bool {
+        matches!(
+            event,
+            Event::Window(window::Event::RedrawRequested(_))
+                | Event::Mouse(mouse::Event::CursorMoved { .. })
+                | Event::PlatformSpecific(PlatformSpecific::Wayland(
+                    wayland::Event::RequestResize | wayland::Event::Frame(..)
+                ))
+        )
+    }
 
     /// One coordinate shared by the list and its groups, refreshed on each widget
     /// callback, including operations/accessibility before the next draw.
@@ -12244,8 +12265,14 @@ mod row_interaction {
         drop: Option<(Option<super::SelectionRow>, f32)>,
         hovered: bool,
         focused: bool,
+        /// Whether any control in the row has focus, such as its delete
+        /// button, not only the row's own target.
+        focus_within: bool,
         /// Whether the last layout narrowed the base row for its actions.
         revealed: bool,
+        /// Whether something in the row, such as a menu, was open the last
+        /// time the window collected overlays.
+        overlaid: Cell<bool>,
         header_node: Option<layout::Node>,
         scroll: Option<Box<FilterScrollState>>,
     }
@@ -12271,7 +12298,7 @@ mod row_interaction {
     }
 
     #[derive(Default)]
-    struct FocusWithin(bool, Option<Id>, Option<Rectangle>);
+    struct FocusWithin(bool, Option<Id>, Option<Rectangle>, bool);
 
     impl Operation for FocusWithin {
         fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
@@ -12284,6 +12311,7 @@ mod row_interaction {
             bounds: Rectangle,
             state: &mut dyn operation::Focusable,
         ) {
+            self.3 |= state.is_focused();
             if self.1.as_ref().is_none_or(|target| Some(target) == id) {
                 self.0 |= state.is_focused();
                 self.2 = Some(bounds);
@@ -12434,6 +12462,7 @@ mod row_interaction {
             let state = tree.state.downcast_mut::<State>();
             state.focused = focus.0;
             state.selection_bounds = focus.2;
+            state.focus_within = focus.3;
         }
 
         fn header_at(&self, layout: Layout<'_>, point: Point) -> Option<super::SelectionRow> {
@@ -12710,6 +12739,30 @@ mod row_interaction {
             shell: &mut Shell<'_, SidebarAction>,
             viewport: &Rectangle,
         ) {
+            // Without this, every frame and every message walks each of a
+            // long list's rows and their focus, however few are in view. A
+            // row that last saw the pointer, or that a drag started in, still
+            // hears the event that tells it the pointer has gone. A row with
+            // focus anywhere in it keeps every frame: its focused control may
+            // need redraws, such as an input placing its input method, and a
+            // focus moved here by an operation reveals the row's actions on
+            // the next one. Containers such as a group don't track focus, which
+            // would walk their members on each event; a focused member of a
+            // group out of view hears the redraw that brings it back into view
+            // before it is drawn.
+            // So does a row whose tooltip or menu is still on screen: a
+            // tooltip fades out over the frames after the pointer leaves, and
+            // would stay frozen there without them.
+            let state = tree.state.downcast_ref::<State>();
+            if !layout.bounds().intersects(viewport)
+                && !state.hovered
+                && !state.focus_within
+                && !state.overlaid.get()
+                && state.origin.is_none()
+                && unseen_rows_may_skip(event)
+            {
+                return;
+            }
             self.focus(tree, layout, renderer);
             if let Kind::Reorder {
                 viewport: sticky, ..
@@ -13062,6 +13115,10 @@ mod row_interaction {
             if state.dragging {
                 return mouse::Interaction::Grabbing;
             }
+            // The pointer can't be over a row out of view.
+            if !layout.bounds().intersects(viewport) {
+                return mouse::Interaction::None;
+            }
             if cursor.is_over(*viewport)
                 && cursor
                     .position()
@@ -13244,6 +13301,17 @@ mod row_interaction {
                 sticky.0.set(viewport.y - translation.y);
             }
             let state = tree.state.downcast_ref::<State>();
+            // The window collects overlays twice a frame, so a long list
+            // must not ask each row it has scrolled away. Such a row has
+            // nothing to show unless something it had open, such as a menu,
+            // is still open as it leaves.
+            if !(layout.bounds() + translation).intersects(viewport)
+                && !state.overlaid.get()
+                && !state.hovered
+                && !state.focus_within
+            {
+                return None;
+            }
             let hide_actions =
                 matches!(self.kind, Kind::Actions { .. }) && !(state.hovered || state.focused);
             let overlays = self
@@ -13263,6 +13331,10 @@ mod row_interaction {
                         .overlay(tree, layout, renderer, viewport, translation)
                 })
                 .collect::<Vec<_>>();
+            tree.state
+                .downcast_ref::<State>()
+                .overlaid
+                .set(!overlays.is_empty());
             (!overlays.is_empty()).then(|| overlay::Group::with_children(overlays).overlay())
         }
 
@@ -20096,6 +20168,539 @@ pub(crate) mod tests {
             &layout::Limits::new(Size::ZERO, Size::new(320.0, 640.0)),
         ));
         assert_eq!(layouts() - start, 3, "a rebuilt list is laid out again");
+    }
+
+    /// A row content that notes each update, cursor query and overlay
+    /// request reaching it, reports focus while `focus` names it, and has a
+    /// menu open while `menu` does. Laid out 20 pixels tall.
+    mod row_probe {
+        use super::*;
+        use cosmic::iced::{
+            Event, Length, Vector,
+            advanced::{
+                Clipboard, Shell, Widget, mouse, overlay, renderer,
+                widget::{Operation, operation},
+            },
+        };
+        use cosmic::{Renderer, Theme};
+        use std::{
+            cell::{Cell, RefCell},
+            rc::Rc,
+        };
+
+        pub(super) type Log = Rc<RefCell<Vec<usize>>>;
+
+        #[derive(Clone, Default)]
+        pub(super) struct Logs {
+            pub(super) updates: Log,
+            pub(super) queries: Log,
+            pub(super) overlays: Log,
+            pub(super) menu: Rc<Cell<Option<usize>>>,
+            pub(super) focus: Rc<Cell<Option<usize>>>,
+        }
+
+        impl Logs {
+            /// `count` action rows of probes, in a column.
+            pub(super) fn rows(&self, count: usize) -> Element<'static, SidebarAction> {
+                widget::column::with_children(
+                    (0..count)
+                        .map(|row| {
+                            let probe = || {
+                                Element::new(Probe {
+                                    row,
+                                    logs: self.clone(),
+                                })
+                            };
+                            row_interaction::RowInteraction::actions(probe(), probe(), 0.0)
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .into()
+            }
+
+            /// `count` selectable rows of probes, in a column. A probe's focus
+            /// is not the row's own target, as a row's delete button isn't.
+            pub(super) fn selectable_rows(&self, count: usize) -> Element<'static, SidebarAction> {
+                let state = SidebarState::default();
+                widget::column::with_children(
+                    (0..count)
+                        .map(|row| {
+                            row_interaction::RowInteraction::selectable(
+                                Element::new(Probe {
+                                    row,
+                                    logs: self.clone(),
+                                }),
+                                SelectionRow::Channel(ChannelId::new()),
+                                &state,
+                                true,
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .into()
+            }
+
+            /// The rows each log names since it was last taken, in order and
+            /// without repeats.
+            pub(super) fn take(log: &Log) -> Vec<usize> {
+                let mut rows = std::mem::take(&mut *log.borrow_mut());
+                rows.dedup();
+                rows
+            }
+        }
+
+        struct Probe {
+            row: usize,
+            logs: Logs,
+        }
+
+        struct Menu;
+
+        impl overlay::Overlay<SidebarAction, Theme, Renderer> for Menu {
+            fn layout(&mut self, _: &Renderer, bounds: Size) -> layout::Node {
+                layout::Node::new(bounds)
+            }
+            fn draw(
+                &self,
+                _: &mut Renderer,
+                _: &Theme,
+                _: &renderer::Style,
+                _: Layout<'_>,
+                _: mouse::Cursor,
+            ) {
+            }
+        }
+
+        struct Focus(bool);
+
+        impl operation::Focusable for Focus {
+            fn is_focused(&self) -> bool {
+                self.0
+            }
+            fn focus(&mut self) {}
+            fn unfocus(&mut self) {}
+        }
+
+        impl Widget<SidebarAction, Theme, Renderer> for Probe {
+            fn size(&self) -> Size<Length> {
+                Size::new(Length::Fill, Length::Fixed(20.0))
+            }
+            fn layout(
+                &mut self,
+                _: &mut Tree,
+                _: &Renderer,
+                limits: &layout::Limits,
+            ) -> layout::Node {
+                layout::Node::new(limits.resolve(Length::Fill, Length::Fixed(20.0), Size::ZERO))
+            }
+            fn draw(
+                &self,
+                _: &Tree,
+                _: &mut Renderer,
+                _: &Theme,
+                _: &renderer::Style,
+                _: Layout<'_>,
+                _: mouse::Cursor,
+                _: &Rectangle,
+            ) {
+            }
+            fn operate(
+                &mut self,
+                _: &mut Tree,
+                layout: Layout<'_>,
+                _: &Renderer,
+                operation: &mut dyn Operation,
+            ) {
+                operation.focusable(
+                    None,
+                    layout.bounds(),
+                    &mut Focus(self.logs.focus.get() == Some(self.row)),
+                );
+            }
+            fn update(
+                &mut self,
+                _: &mut Tree,
+                _: &Event,
+                _: Layout<'_>,
+                _: mouse::Cursor,
+                _: &Renderer,
+                _: &mut dyn Clipboard,
+                _: &mut Shell<'_, SidebarAction>,
+                _: &Rectangle,
+            ) {
+                self.logs.updates.borrow_mut().push(self.row);
+            }
+            fn mouse_interaction(
+                &self,
+                _: &Tree,
+                _: Layout<'_>,
+                _: mouse::Cursor,
+                _: &Rectangle,
+                _: &Renderer,
+            ) -> mouse::Interaction {
+                self.logs.queries.borrow_mut().push(self.row);
+                mouse::Interaction::None
+            }
+            fn overlay<'a>(
+                &'a mut self,
+                _: &'a mut Tree,
+                _: Layout<'a>,
+                _: &Renderer,
+                _: &Rectangle,
+                _: Vector,
+            ) -> Option<overlay::Element<'a, SidebarAction, Theme, Renderer>> {
+                self.logs.overlays.borrow_mut().push(self.row);
+                (self.logs.menu.get() == Some(self.row))
+                    .then(|| overlay::Element::new(Box::new(Menu)))
+            }
+        }
+    }
+
+    /// Visits every widget, as the runtime's focus operations do.
+    struct VisitAll;
+
+    impl cosmic::iced::advanced::widget::Operation for VisitAll {
+        fn traverse(
+            &mut self,
+            operate: &mut dyn FnMut(&mut dyn cosmic::iced::advanced::widget::Operation),
+        ) {
+            operate(self);
+        }
+    }
+
+    /// Every frame and every message sends each widget in the window a
+    /// redraw or resize request, so a long list must not walk the rows it has
+    /// scrolled away. Input that can concern any row, such as keys for a
+    /// focused one, still reaches them all; a row that was hovered hears the
+    /// redraw that tells it the pointer has gone; and a focused row keeps
+    /// every frame.
+    #[test]
+    fn rows_out_of_view_let_frame_broadcasts_pass() {
+        use cosmic::iced::{
+            Event, Point, Vector,
+            advanced::{Shell, clipboard, mouse},
+            event::{PlatformSpecific, wayland},
+            keyboard,
+            time::Instant,
+            window,
+        };
+        use row_probe::Logs;
+
+        let logs = Logs::default();
+        let mut list = logs.rows(100);
+        let renderer = headless_renderer();
+        let mut tree = Tree::new(&list);
+        let node = list.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(280.0, 2000.0)),
+        );
+        let list = &mut list;
+        let tree = &mut tree;
+        // Rows 0 to 9 fill the first 200 pixels; rows 50 to 59 the view
+        // scrolled to 1000.
+        let top = Rectangle::new(Point::ORIGIN, Size::new(280.0, 200.0));
+        let scrolled = Rectangle::new(Point::new(0.0, 1000.0), Size::new(280.0, 200.0));
+        let send = |list: &mut Element<'_, SidebarAction>,
+                    tree: &mut Tree,
+                    event: Event,
+                    cursor: mouse::Cursor,
+                    viewport: &Rectangle| {
+            let mut messages = Vec::new();
+            list.as_widget_mut().update(
+                tree,
+                &event,
+                Layout::new(&node),
+                cursor,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                viewport,
+            );
+            Logs::take(&logs.updates)
+        };
+        // Overlays take the window's viewport, and the scroll as translation.
+        let screen = Rectangle::new(Point::ORIGIN, Size::new(280.0, 200.0));
+        let collect = |list: &mut Element<'_, SidebarAction>, tree: &mut Tree, scroll: f32| {
+            let open = list
+                .as_widget_mut()
+                .overlay(
+                    tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &screen,
+                    Vector::new(0.0, -scroll),
+                )
+                .is_some();
+            (Logs::take(&logs.overlays), open)
+        };
+        let focus_on = |list: &mut Element<'_, SidebarAction>, tree: &mut Tree, row| {
+            logs.focus.set(row);
+            list.as_widget_mut()
+                .operate(tree, Layout::new(&node), &renderer, &mut VisitAll);
+        };
+        let redraw = || Event::Window(window::Event::RedrawRequested(Instant::now()));
+        let away = mouse::Cursor::Unavailable;
+        let rows = |rows: &[std::ops::Range<usize>], extra: &[usize]| {
+            rows.iter()
+                .cloned()
+                .flatten()
+                .chain(extra.iter().copied())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(send(list, tree, redraw(), away, &top), rows(&[0..10], &[]));
+        assert_eq!(
+            send(
+                list,
+                tree,
+                Event::PlatformSpecific(PlatformSpecific::Wayland(wayland::Event::RequestResize)),
+                away,
+                &scrolled,
+            ),
+            rows(&[50..60], &[])
+        );
+        assert_eq!(
+            send(
+                list,
+                tree,
+                Event::Keyboard(keyboard::Event::ModifiersChanged(
+                    keyboard::Modifiers::SHIFT
+                )),
+                away,
+                &scrolled,
+            ),
+            rows(&[0..100], &[]),
+            "keys reach rows out of view"
+        );
+        let over_first = mouse::Cursor::Available(Point::new(10.0, 10.0));
+        assert_eq!(
+            send(
+                list,
+                tree,
+                Event::Mouse(mouse::Event::CursorMoved {
+                    position: Point::new(10.0, 10.0)
+                }),
+                over_first,
+                &top,
+            ),
+            rows(&[0..10], &[])
+        );
+        // Row 0 was hovered when the list scrolled away from it.
+        assert_eq!(
+            send(list, tree, redraw(), away, &scrolled),
+            rows(&[0..1, 50..60], &[]),
+            "the hovered row hears that the pointer has gone"
+        );
+        assert_eq!(
+            send(list, tree, redraw(), away, &scrolled),
+            rows(&[50..60], &[])
+        );
+
+        // Focus moved by an operation, as keyboard navigation does, to a row
+        // out of view.
+        focus_on(list, tree, Some(80));
+        assert_eq!(
+            send(list, tree, redraw(), away, &scrolled),
+            rows(&[50..60], &[80]),
+            "a focused row out of view keeps its frames"
+        );
+        focus_on(list, tree, None);
+        assert_eq!(
+            send(list, tree, redraw(), away, &scrolled),
+            rows(&[50..60], &[]),
+            "once focus leaves, so do the frames"
+        );
+
+        let over_scrolled = mouse::Cursor::Available(Point::new(10.0, 1010.0));
+        let _ = list.as_widget().mouse_interaction(
+            tree,
+            Layout::new(&node),
+            over_scrolled,
+            &scrolled,
+            &renderer,
+        );
+        assert_eq!(
+            Logs::take(&logs.queries),
+            rows(&[50..60], &[]),
+            "only rows in view are asked for the cursor"
+        );
+
+        assert_eq!(collect(list, tree, 1000.0), (rows(&[50..60], &[]), false));
+        logs.menu.set(Some(55));
+        assert_eq!(collect(list, tree, 1000.0), (rows(&[50..60], &[]), true));
+        assert_eq!(
+            collect(list, tree, 0.0),
+            (rows(&[0..10], &[55]), true),
+            "a menu still open as its row leaves the view stays open"
+        );
+        assert_eq!(
+            send(list, tree, redraw(), away, &top),
+            rows(&[0..10], &[55]),
+            "a row whose overlay is on screen keeps its frames, so a tooltip \
+             fading out as its row scrolls away can finish"
+        );
+        logs.menu.set(None);
+        assert_eq!(collect(list, tree, 0.0), (rows(&[0..10], &[55]), false));
+        assert_eq!(
+            collect(list, tree, 0.0),
+            (rows(&[0..10], &[]), false),
+            "once closed, the row is left alone"
+        );
+        assert_eq!(
+            send(list, tree, redraw(), away, &top),
+            rows(&[0..10], &[]),
+            "and its frames stop"
+        );
+    }
+
+    /// A control focused inside a row, such as its delete button, keeps the
+    /// row's frames out of view even though the row's own target isn't
+    /// focused.
+    #[test]
+    fn rows_out_of_view_keep_frames_for_a_control_focused_within() {
+        use cosmic::iced::{
+            Event, Point,
+            advanced::{Shell, clipboard, mouse},
+            time::Instant,
+            window,
+        };
+        use row_probe::Logs;
+
+        let logs = Logs::default();
+        let mut list = logs.selectable_rows(30);
+        let renderer = headless_renderer();
+        let mut tree = Tree::new(&list);
+        let node = list.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(280.0, 600.0)),
+        );
+        let top = Rectangle::new(Point::ORIGIN, Size::new(280.0, 200.0));
+        let mut redraw = |list: &mut Element<'_, SidebarAction>, tree: &mut Tree| {
+            let mut messages = Vec::new();
+            list.as_widget_mut().update(
+                tree,
+                &Event::Window(window::Event::RedrawRequested(Instant::now())),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &top,
+            );
+            Logs::take(&logs.updates)
+        };
+        assert_eq!(redraw(&mut list, &mut tree), (0..10).collect::<Vec<_>>());
+        logs.focus.set(Some(20));
+        list.as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut VisitAll);
+        assert_eq!(
+            redraw(&mut list, &mut tree),
+            (0..10).chain([20]).collect::<Vec<_>>()
+        );
+        logs.focus.set(None);
+        list.as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut VisitAll);
+        assert_eq!(
+            redraw(&mut list, &mut tree),
+            (0..10).collect::<Vec<_>>(),
+            "once focus leaves the row, so do its frames"
+        );
+    }
+
+    /// The same culling through the sidebar's own scrollable, which hands its
+    /// content a viewport in content coordinates for events and the cursor,
+    /// and screen coordinates plus its translation for overlays. A test with
+    /// a bare column only stands in for those.
+    #[test]
+    fn rows_out_of_view_of_the_project_scroll_let_frame_broadcasts_pass() {
+        use cosmic::iced::{
+            Event, Point, Vector,
+            advanced::{Shell, clipboard, mouse, widget::operation},
+            time::Instant,
+            window,
+        };
+        use row_probe::Logs;
+
+        let logs = Logs::default();
+        let mut list = project_scroll(
+            logs.rows(100),
+            SidebarFilter::All,
+            row_interaction::StickyViewport::default(),
+        );
+        let renderer = headless_renderer();
+        let mut tree = Tree::new(&list);
+        let node = list.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(280.0, 200.0)),
+        );
+        let screen = Rectangle::new(Point::ORIGIN, Size::new(280.0, 200.0));
+        let mut redraw = |list: &mut Element<'_, SidebarAction>, tree: &mut Tree| {
+            let mut messages = Vec::new();
+            list.as_widget_mut().update(
+                tree,
+                &Event::Window(window::Event::RedrawRequested(Instant::now())),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &screen,
+            );
+            Logs::take(&logs.updates)
+        };
+        assert_eq!(redraw(&mut list, &mut tree), (0..10).collect::<Vec<_>>());
+
+        list.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::scrollable::scroll_to::<()>(
+                stable_id("projects.scroll"),
+                operation::scrollable::AbsoluteOffset {
+                    x: None,
+                    y: Some(1000.0),
+                },
+            ),
+        );
+        drop(Logs::take(&logs.updates));
+        assert_eq!(
+            redraw(&mut list, &mut tree),
+            (50..60).collect::<Vec<_>>(),
+            "scrolled, the rows in view are those the scroll shows"
+        );
+
+        let _ = list.as_widget().mouse_interaction(
+            &tree,
+            Layout::new(&node),
+            mouse::Cursor::Available(Point::new(10.0, 10.0)),
+            &screen,
+            &renderer,
+        );
+        assert_eq!(
+            Logs::take(&logs.queries),
+            (50..60).collect::<Vec<_>>(),
+            "only rows in view are asked for the cursor"
+        );
+
+        logs.menu.set(Some(52));
+        let open = list
+            .as_widget_mut()
+            .overlay(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &screen,
+                Vector::ZERO,
+            )
+            .is_some();
+        assert_eq!(
+            (Logs::take(&logs.overlays), open),
+            ((50..60).collect::<Vec<_>>(), true),
+            "overlays are collected from the rows the scroll shows"
+        );
     }
 
     /// A row's overlay, such as its menu, handles events apart from the list's
