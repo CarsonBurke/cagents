@@ -433,31 +433,39 @@ a proven **NotCreated** outcome permits a fresh attempt; **OutcomeUnknown**
 requires manual inspection. The Git ownership lock is held through the durable
 Created commit, and a failure to release it is reported rather than hidden.
 
-## A conversation's pull requests
+## A conversation's work
 
-The inspector's **Pull requests** section lists the PRs the focused
-conversation worked on. Nobody declares them: cagents reads them from what the
-conversation and its subagents did, such as `gh pr create` output, pushed
-branches, checkouts, reviews, and PR links or `#123` references. The list
-updates on its own; there is nothing to refresh.
+The inspector's **Work** section lists what the focused conversation worked
+on: each pull request it created, pushed, edited or checked out, and each
+worktree it edited whose branch heads none of them. Nobody declares them:
+cagents reads them from what the conversation and its subagents did, such as
+`gh pr create` output, pushed branches, checkouts, reviews, and PR links or
+`#123` references. The list updates on its own; there is nothing to refresh.
 
-Each row says why it is listed (created, pushed, edited or checked out), then
-the PR's state, the lines it adds and removes, its checks and its review. The
-checks chip names the state that most needs attention, such as **2 failing**
-or **3 running**; choose it to list every check, and choose a check to open
-its page. Choosing the row opens the PR where **Settings → Open pull requests
-in** says: the review pane, or GitHub. A PR in another repository shows as
-`owner/repo#123`. When GitHub can't be reached, rows keep their last known
-state and say when it was read.
+A row's glyph is the PR's state: open, draft, merged or closed. An open PR's
+row ends with a glyph for its checks, the worst of them, and one for its
+review decision, as the board shows them; hover either for the detail.
+Beneath its title, the row gives how many files its worktree has not
+committed yet, the lines it adds and removes, and why it is listed. A PR in
+another repository names that repository beneath its title. When GitHub can't
+be reached, rows keep their last known state and say when it was read.
 
-A branch the conversation edited in a worktree is listed once. When the
-branch heads a PR it worked on, the PR's row adds a line for the worktree:
-its branch, uncommitted changes and their line counts. Choose that line to
-open the worktree; the rest of the row opens the PR.
+The **Changes** and **Files** section below shows one piece of work: its header
+names which while it is collapsed, and its first row once it is open. Choose a
+row to show it there. Until you do, it shows the worktree the conversation runs
+in, else the first work checked out in Projects.
+Work whose worktree isn't in Projects says so in place of changes, rather than
+showing another worktree's.
+Choosing work changes only what the inspector shows; the sidebar keeps its
+selection, and each conversation keeps its choice while cagents runs. The
+chosen PR also lists its checks, the ones most in need of
+attention first; choose a check to open its page, or **Open pull request** to
+open it where **Settings → Open pull requests in** says: the review pane, or
+GitHub. A PR with no worktree here says so in place of changes.
 
 PRs the conversation only mentioned are left out unless **Settings →
-Appearance → Mentioned pull requests** is on. They then follow under
-**Mentioned**, muted; past the first five, they fold behind **Show N more**.
+Appearance → Mentioned pull requests** is on. They then fold under
+**Mentioned** at the foot of the list; choose one to open it.
 
 ## Work board
 

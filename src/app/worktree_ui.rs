@@ -156,6 +156,13 @@ impl WorktreePathIndex {
         self.first_row.get(path).copied()
     }
 
+    /// Whether Projects lists a row, a project folder's or a worktree's, at
+    /// `path`: what `SidebarModel::worktree_at` finds, without scanning every
+    /// row.
+    pub(super) fn lists(&self, path: &Path) -> bool {
+        self.first_row.contains_key(path)
+    }
+
     /// Every worktree row at `path`.
     fn rows(&self, path: &Path) -> &[(ProjectId, WorktreeId)] {
         self.rows.get(path).map_or(&[], Vec::as_slice)
