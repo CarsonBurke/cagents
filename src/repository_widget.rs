@@ -2397,13 +2397,6 @@ pub struct RepositoryInspectorContext {
     pub can_back: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RepositoryRuntimeStatus {
-    Loading,
-    Ready,
-    Unavailable,
-}
-
 impl RepositoryRuntime {
     fn protect_editor_worktree(&mut self, directory: &Path) -> std::io::Result<()> {
         if self
@@ -5582,34 +5575,6 @@ impl RepositoryRuntime {
             can_back: selected
                 && self.descriptor.selected_file.is_none()
                 && !self.blocks_navigation(),
-        }
-    }
-
-    pub fn inspector_runtime_status(&self) -> RepositoryRuntimeStatus {
-        match &self.files {
-            FileListState::Loading => return RepositoryRuntimeStatus::Loading,
-            FileListState::Failed(_) => return RepositoryRuntimeStatus::Unavailable,
-            FileListState::Ready(_) => {}
-        }
-        match &self.document {
-            DocumentState::Loading { .. } => RepositoryRuntimeStatus::Loading,
-            DocumentState::Failed { .. } => RepositoryRuntimeStatus::Unavailable,
-            _ if self.source_surface == SourceSurface::Diff => match &self.basis_resolution {
-                Some(BasisResolution::Resolving(_)) => RepositoryRuntimeStatus::Loading,
-                Some(
-                    BasisResolution::NeedsBase(_)
-                    | BasisResolution::NoCommits
-                    | BasisResolution::Unavailable(_),
-                ) => RepositoryRuntimeStatus::Unavailable,
-                None => match self.diff_state(&self.diff_basis) {
-                    Some(DiffState::Loading { .. }) => RepositoryRuntimeStatus::Loading,
-                    Some(DiffState::Ready(RenderedDiff::Error(_), _)) => {
-                        RepositoryRuntimeStatus::Unavailable
-                    }
-                    _ => RepositoryRuntimeStatus::Ready,
-                },
-            },
-            _ => RepositoryRuntimeStatus::Ready,
         }
     }
 
@@ -16218,10 +16183,6 @@ mod tests {
             worktree: PathBuf::from("/repo"),
         };
         let mut runtime = RepositoryRuntime::new(view);
-        assert_eq!(
-            runtime.inspector_runtime_status(),
-            RepositoryRuntimeStatus::Loading
-        );
         assert_eq!(runtime.inspector_context().file_list, "Loading");
 
         let file = RepositoryFile {
@@ -16286,17 +16247,9 @@ mod tests {
                 cancellation: CancellationToken::new(),
             },
         );
-        assert_eq!(
-            runtime.inspector_runtime_status(),
-            RepositoryRuntimeStatus::Loading
-        );
         runtime.set_diff_state(
             DiffBasis::HeadToIndex,
             DiffState::ready(RenderedDiff::Error("diff failed".into())),
-        );
-        assert_eq!(
-            runtime.inspector_runtime_status(),
-            RepositoryRuntimeStatus::Unavailable
         );
         assert_eq!(
             runtime.inspector_context().diff_error.as_deref(),

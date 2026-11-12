@@ -220,10 +220,7 @@ fn the_list_ranks_worked_on_first_and_marks_the_current_branch() {
         (branch(None, "feat"), Relation::Pushed, false),
     ]);
     let mut observed = BTreeMap::new();
-    observed.insert(
-        key("other", 7),
-        observed_now(board::convert(&listed(7, "x", "OPEN"), false)),
-    );
+    observed.insert(key("other", 7), observed_now(&listed(7, "x", "OPEN")));
     let list = assemble(&watched, Some(&facts), &observed, &BTreeMap::new(), None);
     assert_eq!(list.repository, Some(repo("me")));
     assert_eq!(
@@ -345,10 +342,7 @@ fn numbers_appear_only_once_github_says_they_are_pull_requests() {
         ),
     ]);
     let mut observed = BTreeMap::new();
-    observed.insert(
-        key("me", 40),
-        observed_now(board::convert(&listed(40, "x", "OPEN"), false)),
-    );
+    observed.insert(key("me", 40), observed_now(&listed(40, "x", "OPEN")));
     observed.insert(
         key("me", 41),
         Observed {
@@ -680,4 +674,307 @@ fn work_on_the_current_branch_stays_with_that_branch_after_a_switch() {
         watched.references.keys().cloned().collect::<Vec<_>>(),
         vec![branch(None, "feat"), branch(None, "main")]
     );
+}
+
+#[test]
+fn edited_worktrees_are_listed_most_recent_first_and_outside_ones_dropped() {
+    let mut watched = Watched::new();
+    let edit = |directory: &str, by_subagent: bool| transcript::Found {
+        signal: Signal {
+            reference: Reference::CurrentBranch {
+                directory: Some(directory.to_owned()),
+            },
+            relation: Relation::Edited,
+        },
+        by_subagent,
+    };
+    watched.apply(
+        Scanned {
+            found: vec![
+                edit("/w/app/src", false),
+                edit("/w/app/.worktrees/feat/src/deep", true),
+                edit("/elsewhere/project", false),
+                edit(".worktrees/feat", true),
+            ],
+            coverage: TranscriptCoverage::Complete,
+        },
+        Some(&facts("/w/app")),
+    );
+    let facts = facts("/w/app");
+    let list = assemble(
+        &watched,
+        Some(&facts),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        None,
+    );
+    assert_eq!(
+        list.worktrees
+            .iter()
+            .map(|worktree| (
+                worktree.path.to_str().unwrap(),
+                worktree.branch.as_deref(),
+                worktree.by_subagent
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            ("/w/app/.worktrees/feat", Some("feat"), true),
+            ("/w/app", Some("main"), false),
+        ]
+    );
+    // The feat branch heads #1, which editing it worked on, so the row shows
+    // the worktree; main heads nothing.
+    assert!(
+        list.pull_requests
+            .iter()
+            .any(|row| row.number == 1 && row.relation == Relation::Edited)
+    );
+    assert_eq!(
+        list.worktrees
+            .iter()
+            .map(|worktree| worktree.pull_request)
+            .collect::<Vec<_>>(),
+        vec![Some(1), None]
+    );
+    // Editing a directory again is the newest edit, by the conversation
+    // itself this time.
+    watched.apply(
+        Scanned {
+            found: vec![edit("/w/app", false), edit("/w/app/.worktrees/feat", false)],
+            coverage: TranscriptCoverage::Complete,
+        },
+        Some(&facts),
+    );
+    let list = assemble(
+        &watched,
+        Some(&facts),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        None,
+    );
+    assert_eq!(
+        list.worktrees
+            .iter()
+            .map(|worktree| (worktree.path.to_str().unwrap(), worktree.by_subagent))
+            .collect::<Vec<_>>(),
+        vec![("/w/app/.worktrees/feat", false), ("/w/app", false)]
+    );
+}
+
+#[test]
+fn an_edit_stays_with_the_pull_request_it_was_made_for_and_not_with_a_reused_name() {
+    // A worktree has `old` checked out at `oid`; #2 heads `old` at `abc`
+    // and is `state`.
+    let facts_at = |oid: &str, state: &str| {
+        let mut facts = facts("/w/app");
+        let project = facts.project.as_mut().unwrap();
+        let mut snapshot = (**project.snapshot.as_ref().unwrap()).clone();
+        snapshot.pull_requests = vec![listed(1, "feat", "OPEN"), listed(2, "old", state)];
+        project.snapshot = Some(Arc::new(snapshot));
+        let mut local = (**project.local.as_ref().unwrap()).clone();
+        let mut reused = worktree("/w/app/.worktrees/old", "old");
+        reused.head = Some(crate::work::Head {
+            oid: oid.to_owned(),
+            committed_at_unix_ms: None,
+        });
+        local.worktrees.push(reused);
+        project.local = Some(Arc::new(local));
+        facts
+    };
+    let edit = |watched: &mut Watched, facts: &Facts| {
+        watched.apply(
+            Scanned {
+                found: vec![transcript::Found {
+                    signal: Signal {
+                        reference: Reference::CurrentBranch {
+                            directory: Some(".worktrees/old/src".to_owned()),
+                        },
+                        relation: Relation::Edited,
+                    },
+                    by_subagent: false,
+                }],
+                coverage: TranscriptCoverage::Complete,
+            },
+            Some(facts),
+        );
+    };
+    let list = |watched: &mut Watched, facts: &Facts| {
+        watched.pin_edits(Some(facts), &BTreeMap::new(), &BTreeMap::new());
+        assemble(
+            watched,
+            Some(facts),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            None,
+        )
+    };
+    let edited_two = |list: &ConversationPullRequests| {
+        list.pull_requests
+            .iter()
+            .any(|row| row.number == 2 && row.relation == Relation::Edited)
+    };
+
+    // Editing #2's branch while it is open is work on #2, and stays so once
+    // it merges and the worktree moves past it.
+    let mut watched = Watched::new();
+    let open = facts_at("abc", "OPEN");
+    edit(&mut watched, &open);
+    assert!(edited_two(&list(&mut watched, &open)));
+    let moved_on = facts_at("def", "MERGED");
+    let after = list(&mut watched, &moved_on);
+    assert!(edited_two(&after), "the merged pull request lost its edit");
+    // The worktree is no longer #2's branch, so it is listed on its own.
+    assert_eq!(after.worktrees[0].pull_request, None);
+
+    // The name reused after the merge is new work: no #2 row.
+    let mut watched = Watched::new();
+    edit(&mut watched, &moved_on);
+    let list_now = list(&mut watched, &moved_on);
+    assert!(!edited_two(&list_now));
+    assert_eq!(
+        list_now
+            .worktrees
+            .iter()
+            .map(|worktree| (worktree.path.to_str().unwrap(), worktree.pull_request))
+            .collect::<Vec<_>>(),
+        vec![("/w/app/.worktrees/old", None)]
+    );
+
+    // Still at the merged commit, it is #2's branch.
+    let mut watched = Watched::new();
+    let at_merge = facts_at("abc", "MERGED");
+    edit(&mut watched, &at_merge);
+    let list_now = list(&mut watched, &at_merge);
+    assert!(edited_two(&list_now));
+    assert_eq!(list_now.worktrees[0].pull_request, Some(2));
+}
+
+#[test]
+fn edited_directories_are_bounded_by_recency() {
+    let mut watched = Watched::new();
+    for index in 0..EDITED_DIRECTORIES + 8 {
+        watched.edited_in(PathBuf::from(format!("/w/app/{index}")), false);
+    }
+    assert_eq!(watched.edited.len(), EDITED_DIRECTORIES);
+    assert!(!watched.edited.contains_key(Path::new("/w/app/0")));
+    assert!(
+        watched
+            .edited
+            .contains_key(&PathBuf::from(format!("/w/app/{}", EDITED_DIRECTORIES + 7)))
+    );
+}
+
+#[test]
+fn a_pull_request_row_carries_its_changes_and_every_check_as_it_ended() {
+    let mut found = listed(9, "feat", "OPEN");
+    found.additions = Some(12);
+    found.deletions = Some(3);
+    found.status_check_rollup = serde_json::from_value(serde_json::json!([
+        {"__typename": "CheckRun", "name": "test", "workflowName": "CI",
+         "status": "COMPLETED", "conclusion": "SUCCESS",
+         "detailsUrl": "https://github.com/me/repo/runs/1"},
+        {"__typename": "CheckRun", "name": "docs", "workflowName": "CI",
+         "status": "COMPLETED", "conclusion": "SKIPPED"},
+        {"__typename": "CheckRun", "name": "deploy", "workflowName": "Release",
+         "status": "COMPLETED", "conclusion": "CANCELLED"},
+        {"__typename": "CheckRun", "name": "lint", "workflowName": "CI",
+         "status": "IN_PROGRESS"},
+        {"__typename": "StatusContext", "context": "ci/legacy", "state": "FAILURE",
+         "targetUrl": "https://ci.invalid/1"},
+    ]))
+    .unwrap();
+    let detail = Detail::of(&found);
+    assert_eq!(
+        detail.diff,
+        Some(DiffStat {
+            additions: 12,
+            deletions: 3
+        })
+    );
+    assert_eq!(
+        detail
+            .checks
+            .iter()
+            .map(|check| (check.state, check.workflow.as_str(), check.name.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (CheckState::Failed, "", "ci/legacy"),
+            (CheckState::Pending, "CI", "lint"),
+            (CheckState::Cancelled, "Release", "deploy"),
+            (CheckState::Passed, "CI", "test"),
+            (CheckState::Skipped, "CI", "docs"),
+        ]
+    );
+    // A check without its own page links to the pull request.
+    assert_eq!(detail.checks[1].url, "https://github.com/me/repo/pull/9");
+}
+
+#[test]
+fn an_edited_worktree_counts_its_changed_paths_and_takes_its_measured_lines() {
+    let mut facts = facts("/w/app");
+    let project = facts.project.as_mut().unwrap();
+    let mut local = (**project.local.as_ref().unwrap()).clone();
+    local.worktrees[0].dirty = Some(crate::work::Dirty {
+        paths: 3,
+        conflicted: 0,
+        newest_modified_at_unix_ms: Some(5),
+    });
+    project.local = Some(Arc::new(local));
+    let mut watched = Watched::new();
+    watched.edited_in(PathBuf::from("/w/app/src"), false);
+    watched.edited_in(PathBuf::from("/w/app/.worktrees/feat"), false);
+    let mut list = assemble(
+        &watched,
+        Some(&facts),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        None,
+    );
+    let counted = |list: &ConversationPullRequests| {
+        list.worktrees
+            .iter()
+            .map(|worktree| {
+                (
+                    worktree.path.to_str().unwrap().to_owned(),
+                    (worktree.changed_paths, worktree.diff),
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    // The scan has not read the linked worktree's status yet.
+    assert_eq!(
+        counted(&list),
+        BTreeMap::from([
+            ("/w/app".to_owned(), (Some(3), None)),
+            ("/w/app/.worktrees/feat".to_owned(), (None, None)),
+        ])
+    );
+    let project = facts.project.as_ref().unwrap();
+    let main = &project.local.as_ref().unwrap().worktrees[0];
+    let measured = BTreeMap::from([(
+        PathBuf::from("/w/app"),
+        Measured {
+            fingerprint: Fingerprint::of(main),
+            diff: Some(DiffStat {
+                additions: 7,
+                deletions: 2,
+            }),
+        },
+    )]);
+    with_measured(&mut list, &measured);
+    assert_eq!(
+        counted(&list)["/w/app"],
+        (
+            Some(3),
+            Some(DiffStat {
+                additions: 7,
+                deletions: 2
+            })
+        )
+    );
+    // Any change to its status, such as another edit's time, is a new
+    // fingerprint and so is measured again.
+    let mut edited = main.clone();
+    edited.dirty.as_mut().unwrap().newest_modified_at_unix_ms = Some(6);
+    assert_ne!(Fingerprint::of(&edited), Fingerprint::of(main));
 }

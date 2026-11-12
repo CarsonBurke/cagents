@@ -1,4 +1,5 @@
-//! The pull requests each watched conversation worked on or mentioned.
+//! The pull requests each watched conversation worked on or mentioned, and
+//! the worktrees it edited.
 //!
 //! A window watching a conversation's inspector subscribes to it. This
 //! service then reads the provider's own transcript files incrementally,
@@ -23,7 +24,10 @@ use crate::{
     model::TerminalId,
     pull_request_signals::{PullRequestKeyOrd, Reference, Relation, RepoKeyOrd},
     terminal_ipc::ServerMessage,
-    work::{ConversationPullRequest, ConversationPullRequests, PullRequest, TranscriptCoverage},
+    work::{
+        Check, CheckState, ConversationPullRequest, ConversationPullRequests, ConversationWorktree,
+        DiffStat, PullRequest, TranscriptCoverage,
+    },
 };
 use std::{
     collections::BTreeMap,
@@ -54,11 +58,17 @@ const FIRST_READ: u64 = 64 * 1024 * 1024;
 const MAX_LINE: usize = 4 * 1024 * 1024;
 /// Distinct references kept per conversation; the oldest mentions go first.
 const REFERENCES: usize = 256;
+/// Distinct edited directories kept per conversation; the least recently
+/// edited go first. Worktrees are resolved from them when a list is built,
+/// so a worktree the board scans later is still found.
+const EDITED_DIRECTORIES: usize = 256;
 /// Subagent transcripts read per conversation, the most recently written
 /// first.
 const SUBAGENTS: usize = 256;
 /// Forge lookups per pass, across every watched conversation.
 const LOOKUPS_PER_PASS: usize = 4;
+/// Edited worktrees diffed in one pass; the rest wait for the next.
+const MEASURES_PER_PASS: usize = 4;
 /// Of the mentions, only the most recent are looked up.
 const MENTIONS_LOOKED_UP: usize = 24;
 const OPEN_FOR: Duration = Duration::from_secs(60);
@@ -85,6 +95,9 @@ struct State {
     /// Which pull request heads a branch, by (base repository, branch).
     branches: BTreeMap<(RepoKeyOrd, String), BranchLookup>,
     forge_error: Option<String>,
+    /// The line totals of edited worktrees' uncommitted changes, by path,
+    /// with the status they were measured at.
+    measured: BTreeMap<PathBuf, Measured>,
     /// Lookups that failed in a row, and when the last did; while GitHub
     /// cannot be reached, lookups back off rather than retry every pass.
     failures: u32,
@@ -119,6 +132,8 @@ fn backoff(failures: u32) -> Duration {
 #[derive(Debug, Clone, Default)]
 struct Observed {
     pull_request: Option<PullRequest>,
+    /// What it changes and its head's checks, as last read with it.
+    detail: Detail,
     observed_at_unix_ms: Option<u64>,
     checked: Option<Instant>,
     /// GitHub says the number is an issue, or there is no such pull request.
@@ -160,6 +175,9 @@ struct Watched {
     source: Source,
     files: BTreeMap<PathBuf, Cursor>,
     references: BTreeMap<Reference, Aggregate>,
+    /// Absolute directories files were edited in, with when they last were
+    /// and whether only subagents edited there.
+    edited: BTreeMap<PathBuf, Edit>,
     sequence: u64,
     coverage: TranscriptCoverage,
     revision: u64,
@@ -201,6 +219,12 @@ struct Located {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct Edit {
+    by_subagent: bool,
+    seen: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
 struct Aggregate {
     relation: Relation,
     /// Every signal came from a subagent.
@@ -226,6 +250,7 @@ impl Watched {
             source: Source::Pending,
             files: BTreeMap::new(),
             references: BTreeMap::new(),
+            edited: BTreeMap::new(),
             sequence: 0,
             coverage: TranscriptCoverage::Pending,
             revision: 0,
@@ -242,15 +267,25 @@ impl Watched {
     /// it to another branch's pull request.
     fn apply(&mut self, scanned: Scanned, facts: Option<&Facts>) {
         for mut found in scanned.found {
-            if let (Reference::CurrentBranch { directory }, Some(facts)) =
-                (&found.signal.reference, facts)
-                && let Some(branch) = facts.project.as_ref().and_then(|project| {
-                    let directory = match directory {
-                        Some(directory) => normalize(&facts.directory.join(directory)),
-                        None => facts.directory.clone(),
-                    };
-                    project.worktree(&directory)?.branch.clone()
-                })
+            let Some(facts) = facts else {
+                self.record(found);
+                continue;
+            };
+            let Reference::CurrentBranch { directory } = &found.signal.reference else {
+                self.record(found);
+                continue;
+            };
+            let directory = match directory {
+                Some(directory) => normalize(&facts.directory.join(directory)),
+                None => facts.directory.clone(),
+            };
+            if found.signal.relation == Relation::Edited {
+                self.edited_in(directory.clone(), found.by_subagent);
+            }
+            if let Some(branch) = facts
+                .project
+                .as_ref()
+                .and_then(|project| project.worktree(&directory)?.branch.clone())
             {
                 found.signal.reference = Reference::Branch {
                     repository: None,
@@ -260,6 +295,76 @@ impl Watched {
             self.record(found);
         }
         self.coverage = scanned.coverage;
+    }
+
+    /// Pins each edit made on a branch to the pull request the branch heads
+    /// while the edit is still that pull request's work, so the edit stays
+    /// with it after it merges and its worktree is removed or moves on. An
+    /// edit not yet pinned is judged by the branch as it is now.
+    fn pin_edits(
+        &mut self,
+        facts: Option<&Facts>,
+        observed: &BTreeMap<PullRequestKeyOrd, Observed>,
+        branches: &BTreeMap<(RepoKeyOrd, String), BranchLookup>,
+    ) {
+        let Some((facts, project)) = facts.and_then(|facts| Some((facts, facts.project.as_ref()?)))
+        else {
+            return;
+        };
+        let pinned = self
+            .references
+            .iter()
+            .filter_map(|(reference, aggregate)| {
+                let Reference::Branch {
+                    repository: None,
+                    name,
+                } = reference
+                else {
+                    return None;
+                };
+                if aggregate.relation != Relation::Edited {
+                    return None;
+                }
+                let Resolved::Key(key) = resolve(reference, facts, branches) else {
+                    return None;
+                };
+                (project.edits_belong_to(&key, name, observed) == Some(true))
+                    .then(|| (reference.clone(), key))
+            })
+            .collect::<Vec<_>>();
+        for (reference, key) in pinned {
+            let Some(edit) = self.references.remove(&reference) else {
+                continue;
+            };
+            let entry = self
+                .references
+                .entry(Reference::PullRequest(key))
+                .or_insert(edit);
+            entry.relation = entry.relation.min(edit.relation);
+            entry.by_subagent &= edit.by_subagent;
+            entry.seen = entry.seen.max(edit.seen);
+        }
+    }
+
+    fn edited_in(&mut self, directory: PathBuf, by_subagent: bool) {
+        self.sequence += 1;
+        let seen = self.sequence;
+        let entry = self
+            .edited
+            .entry(directory)
+            .or_insert(Edit { by_subagent, seen });
+        entry.by_subagent &= by_subagent;
+        entry.seen = seen;
+        if self.edited.len() > EDITED_DIRECTORIES {
+            let oldest = self
+                .edited
+                .iter()
+                .min_by_key(|(_, edit)| edit.seen)
+                .map(|(directory, _)| directory.clone());
+            if let Some(oldest) = oldest {
+                self.edited.remove(&oldest);
+            }
+        }
     }
 
     fn record(&mut self, found: transcript::Found) {
@@ -321,6 +426,40 @@ impl ProjectFacts {
                 .iter()
                 .any(|worktree| worktree.branch.as_deref() == Some(branch))
         })
+    }
+
+    /// Whether edits made on `branch` now are work on its pull request
+    /// `key`: it is open, or a worktree still has `branch` at its head
+    /// commit. A branch name reused after its pull request merged or closed
+    /// is new work, not an edit of that pull request. `None` until GitHub
+    /// has described the pull request.
+    fn edits_belong_to(
+        &self,
+        key: &PullRequestKeyOrd,
+        branch: &str,
+        observed: &BTreeMap<PullRequestKeyOrd, Observed>,
+    ) -> Option<bool> {
+        let (open, head) = match self.listed(key) {
+            Some(found) => (found.state.0 == "OPEN", found.head_ref_oid.as_str()),
+            None => {
+                let found = observed.get(key)?.pull_request.as_ref()?;
+                (
+                    found.state == crate::work::PullRequestState::Open,
+                    found.head_oid.as_str(),
+                )
+            }
+        };
+        Some(
+            open || self.local.as_deref().is_some_and(|local| {
+                local.worktrees.iter().any(|worktree| {
+                    worktree.branch.as_deref() == Some(branch)
+                        && worktree
+                            .head
+                            .as_ref()
+                            .is_some_and(|found| found.oid == head)
+                })
+            }),
+        )
     }
 
     /// The worktree containing `directory`, the deepest when they nest.
@@ -393,13 +532,16 @@ impl Handle {
         let forge_error = state.forge_error.clone();
         let observed = state.observed.clone();
         let branches = state.branches.clone();
+        let measured = state.measured.clone();
         let watched = state
             .watched
             .entry(conversation)
             .or_insert_with(Watched::new);
         watched.watchers.insert(client, delivery);
         watched.unwatched_since = None;
-        let list = assemble(watched, facts.as_ref(), &observed, &branches, forge_error);
+        watched.pin_edits(facts.as_ref(), &observed, &branches);
+        let mut list = assemble(watched, facts.as_ref(), &observed, &branches, forge_error);
+        with_measured(&mut list, &measured);
         let mut comparable = list.clone();
         comparable.generated_at_unix_ms = 0;
         if watched.sent.as_ref() != Some(&comparable) {
@@ -503,6 +645,7 @@ impl Handle {
                         watched.source = source;
                         watched.files.clear();
                         watched.references.clear();
+                        watched.edited.clear();
                     }
                 }
                 (watched.source.clone(), std::mem::take(&mut watched.files))
@@ -519,9 +662,11 @@ impl Handle {
             }
         }
         self.look_up(&conversations, &facts);
+        self.measure(&conversations, &facts);
         let mut state = self.conversations();
         let observed = state.observed.clone();
         let branches = state.branches.clone();
+        let measured = state.measured.clone();
         let forge_error = state.forge_error.clone();
         let proof = Arc::new(
             host.lock()
@@ -534,7 +679,9 @@ impl Handle {
                 continue;
             };
             let facts = facts.get(&conversation).and_then(Option::as_ref);
-            let list = assemble(watched, facts, &observed, &branches, forge_error.clone());
+            watched.pin_edits(facts, &observed, &branches);
+            let mut list = assemble(watched, facts, &observed, &branches, forge_error.clone());
+            with_measured(&mut list, &measured);
             let mut comparable = list.clone();
             comparable.generated_at_unix_ms = 0;
             if watched.sent.as_ref() == Some(&comparable) {
@@ -605,6 +752,58 @@ impl Handle {
             Some(facts)
         });
         Some(Facts { directory, project })
+    }
+
+    /// Measures the uncommitted lines of each worktree a watched
+    /// conversation edited whose status changed since it was last measured.
+    /// The board's scan, which its file watcher drives, says when one did, so
+    /// an unchanged worktree is never diffed again.
+    fn measure(&self, conversations: &[TerminalId], facts: &BTreeMap<TerminalId, Option<Facts>>) {
+        let due = {
+            let mut state = self.conversations();
+            let mut wanted = BTreeMap::new();
+            for conversation in conversations {
+                let (Some(watched), Some(Some(facts))) =
+                    (state.watched.get(conversation), facts.get(conversation))
+                else {
+                    continue;
+                };
+                let Some(project) = &facts.project else {
+                    continue;
+                };
+                for (worktree, _) in edited(watched, project) {
+                    wanted.insert(worktree.path.clone(), Fingerprint::of(worktree));
+                }
+            }
+            state.measured.retain(|path, _| wanted.contains_key(path));
+            wanted
+                .into_iter()
+                .filter(|(path, fingerprint)| {
+                    state
+                        .measured
+                        .get(path)
+                        .is_none_or(|measured| measured.fingerprint != *fingerprint)
+                })
+                .collect::<Vec<_>>()
+        };
+        let git = crate::repository::RepositoryService::system("git");
+        for (path, fingerprint) in due.into_iter().take(MEASURES_PER_PASS) {
+            let diff = match &fingerprint.dirty {
+                // Until its status is read there is nothing to say.
+                None => None,
+                Some(dirty) if dirty.paths == 0 => Some(DiffStat::default()),
+                Some(_) => git
+                    .uncommitted_line_totals(&path, &self.0.cancellation)
+                    .ok()
+                    .map(|(additions, deletions)| DiffStat {
+                        additions,
+                        deletions,
+                    }),
+            };
+            self.conversations()
+                .measured
+                .insert(path, Measured { fingerprint, diff });
+        }
     }
 
     /// Asks GitHub about the few pull requests and branches most worth it.
@@ -695,10 +894,7 @@ impl Handle {
                             if let Some(found) = &found
                                 && let Ok(key) = PullRequestKey::new(base.clone(), found.number)
                             {
-                                state.observed.insert(
-                                    (&key).into(),
-                                    observed_now(board::convert(found, false)),
-                                );
+                                state.observed.insert((&key).into(), observed_now(found));
                             }
                             state.branches.insert(
                                 (base_key, branch),
@@ -736,7 +932,7 @@ impl Handle {
                     entry.checked = Some(Instant::now());
                     match result {
                         Ok(found) => {
-                            *entry = observed_now(board::convert(&found, false));
+                            *entry = observed_now(&found);
                             state.succeeded();
                         }
                         Err(error) if answered(&error) => {
@@ -767,9 +963,59 @@ enum Lookup {
     },
 }
 
-fn observed_now(pull_request: PullRequest) -> Observed {
+/// What a pull request's row shows beyond its state: the lines it changes
+/// and its head's checks.
+#[derive(Debug, Clone, Default)]
+struct Detail {
+    diff: Option<DiffStat>,
+    checks: Vec<Check>,
+}
+
+impl Detail {
+    fn of(found: &crate::github::PullRequest) -> Self {
+        let diff = found
+            .additions
+            .zip(found.deletions)
+            .map(|(additions, deletions)| DiffStat {
+                additions,
+                deletions,
+            });
+        let mut checks = found
+            .check_summaries()
+            .into_iter()
+            .filter_map(|check| {
+                // The summary's buckets count a skipped check as passing and
+                // a cancelled one as failing; the row says which it was.
+                let state = match (check.state.0.as_str(), check.bucket.0.as_str()) {
+                    ("SKIPPED", _) => CheckState::Skipped,
+                    ("CANCELLED", _) => CheckState::Cancelled,
+                    (_, "pass") => CheckState::Passed,
+                    (_, "fail") => CheckState::Failed,
+                    (_, "pending") => CheckState::Pending,
+                    _ => return None,
+                };
+                Some(Check {
+                    name: check.name,
+                    workflow: check.workflow,
+                    state,
+                    url: check.link.to_string(),
+                })
+            })
+            .collect::<Vec<_>>();
+        checks.sort_by(|a, b| {
+            a.state
+                .cmp(&b.state)
+                .then_with(|| a.workflow.cmp(&b.workflow))
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        Self { diff, checks }
+    }
+}
+
+fn observed_now(found: &crate::github::PullRequest) -> Observed {
     Observed {
-        pull_request: Some(pull_request),
+        pull_request: Some(board::convert(found, false)),
+        detail: Detail::of(found),
         observed_at_unix_ms: Some(now_unix_ms()),
         checked: Some(Instant::now()),
         missing: false,
@@ -948,6 +1194,18 @@ fn assemble(
         let Resolved::Key(key) = resolve(reference, facts, branches) else {
             continue;
         };
+        // An edit is pinned to the branch it was made on, whose name may
+        // since head an old pull request rather than the work.
+        if aggregate.relation == Relation::Edited
+            && let Reference::Branch {
+                repository: None,
+                name,
+            } = reference
+            && let Some(project) = project
+            && project.edits_belong_to(&key, name, observed) == Some(false)
+        {
+            continue;
+        }
         match rows.entry(key) {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert((*aggregate, false));
@@ -967,7 +1225,7 @@ fn assemble(
         .filter_map(|(key, (aggregate, current_branch))| {
             let listed = project
                 .and_then(|project| project.listed(&key))
-                .map(|found| board::convert(found, false));
+                .map(|found| (board::convert(found, false), Detail::of(found)));
             let observation = observed.get(&key);
             if listed.is_none() && observation.is_some_and(|observation| observation.missing) {
                 return None;
@@ -979,8 +1237,13 @@ fn assemble(
             }) && !watched.references.iter().any(|(reference, _)| {
                 matches!(reference, Reference::PullRequest(other) if *other == key)
             });
-            let pull_request = listed
-                .or_else(|| observation.and_then(|observation| observation.pull_request.clone()));
+            let (pull_request, detail) = match listed {
+                Some((pull_request, detail)) => (Some(pull_request), detail),
+                None => observation.map_or_else(
+                    || (None, Detail::default()),
+                    |observation| (observation.pull_request.clone(), observation.detail.clone()),
+                ),
+            };
             if pull_request.is_none() && named_by_number && !current_branch {
                 return None;
             }
@@ -1031,6 +1294,8 @@ fn assemble(
                     current_branch,
                     pull_request,
                     observed_at_unix_ms,
+                    diff: detail.diff,
+                    checks: detail.checks,
                 },
             ))
         })
@@ -1047,9 +1312,116 @@ fn assemble(
     ConversationPullRequests {
         generated_at_unix_ms: now_unix_ms(),
         repository,
-        pull_requests: pull_requests.into_iter().map(|(_, row)| row).collect(),
         transcript: watched.coverage.clone(),
         forge_error,
+        worktrees: facts
+            .zip(project)
+            .map_or_else(Vec::new, |(facts, project)| {
+                edited_worktrees(watched, project, |branch| {
+                    let Resolved::Key(key) = resolve(
+                        &Reference::Branch {
+                            repository: None,
+                            name: branch.to_owned(),
+                        },
+                        facts,
+                        branches,
+                    ) else {
+                        return None;
+                    };
+                    if project.edits_belong_to(&key, branch, observed) == Some(false) {
+                        return None;
+                    }
+                    pull_requests
+                        .iter()
+                        .any(|(_, row)| {
+                            row.relation != Relation::Mentioned
+                                && row.number == key.number
+                                && RepoKeyOrd::from(&row.repository) == key.repository
+                        })
+                        .then_some(key.number)
+                })
+            }),
+        pull_requests: pull_requests.into_iter().map(|(_, row)| row).collect(),
+    }
+}
+
+/// The project's worktrees holding the directories `watched` edited, most
+/// recently edited first. A directory outside every worktree, such as another
+/// project's, names none.
+///
+/// `listed` names the worked-on pull request a branch heads, if any.
+fn edited_worktrees(
+    watched: &Watched,
+    project: &ProjectFacts,
+    listed: impl Fn(&str) -> Option<u64>,
+) -> Vec<ConversationWorktree> {
+    edited(watched, project)
+        .into_iter()
+        .map(|(worktree, edit)| ConversationWorktree {
+            path: worktree.path.clone(),
+            branch: worktree.branch.clone(),
+            by_subagent: edit.by_subagent,
+            changed_paths: worktree.dirty.as_ref().map(|dirty| dirty.paths),
+            // Filled in from what was measured, which the scan does not hold.
+            diff: None,
+            pull_request: worktree.branch.as_deref().and_then(&listed),
+        })
+        .collect()
+}
+
+/// The project's worktrees holding the directories `watched` edited, with
+/// how they were edited, most recently edited first.
+fn edited<'a>(
+    watched: &Watched,
+    project: &'a ProjectFacts,
+) -> Vec<(&'a super::scan::Worktree, Edit)> {
+    let mut worktrees: BTreeMap<&Path, (&super::scan::Worktree, Edit)> = BTreeMap::new();
+    for (directory, edit) in &watched.edited {
+        let Some(worktree) = project.worktree(directory) else {
+            continue;
+        };
+        worktrees
+            .entry(worktree.path.as_path())
+            .and_modify(|(_, found)| {
+                found.by_subagent &= edit.by_subagent;
+                found.seen = found.seen.max(edit.seen);
+            })
+            .or_insert((worktree, *edit));
+    }
+    let mut worktrees = worktrees.into_values().collect::<Vec<_>>();
+    worktrees.sort_by(|(_, a), (_, b)| b.seen.cmp(&a.seen));
+    worktrees
+}
+
+/// What a worktree's uncommitted lines were measured against: a commit or
+/// any change to its status, which the scan reads again on every edit,
+/// measures it again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Fingerprint {
+    head: Option<String>,
+    dirty: Option<crate::work::Dirty>,
+}
+
+impl Fingerprint {
+    fn of(worktree: &super::scan::Worktree) -> Self {
+        Self {
+            head: worktree.head.as_ref().map(|head| head.oid.clone()),
+            dirty: worktree.dirty.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Measured {
+    fingerprint: Fingerprint,
+    diff: Option<DiffStat>,
+}
+
+fn with_measured(list: &mut ConversationPullRequests, measured: &BTreeMap<PathBuf, Measured>) {
+    for worktree in &mut list.worktrees {
+        worktree.diff = measured
+            .get(&worktree.path)
+            .and_then(|measured| measured.diff);
     }
 }
 

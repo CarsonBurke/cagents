@@ -221,7 +221,10 @@ use crate::{
 /// are reserved for parallel branches and are not adopted here.
 /// Version 166 adds a tool status for an agent waiting on its own background
 /// work, which an older client is sent as running.
-pub const PROTOCOL_VERSION: u16 = 166;
+/// Version 172 appends the worktrees a conversation edited to
+/// `ConversationPullRequests`. 167 to 171 are reserved for parallel branches
+/// and are not adopted here.
+pub const PROTOCOL_VERSION: u16 = 172;
 /// The install candidate line's protocol. Every message an update exchanges
 /// with its daemon (Connect, the upgrade preview and preparation, and the
 /// inspector's frozen and saved-history requests) has this release's

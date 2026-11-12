@@ -26,7 +26,6 @@ pub(super) struct State {
     pub(super) source_cancel: Option<CancellationToken>,
     pub(super) projects: HashMap<ProjectId, CancellationToken>,
     schedule: ProjectSchedule,
-    last_pull_request: Instant,
 }
 
 impl Default for State {
@@ -39,7 +38,6 @@ impl Default for State {
             source_cancel: None,
             projects: HashMap::new(),
             schedule: ProjectSchedule::default(),
-            last_pull_request: Instant::now(),
         }
     }
 }
@@ -291,7 +289,7 @@ impl Cagents {
             }
         }
         if self.context_inspector_open
-            && matches!(self.context_tab, ContextTab::Files | ContextTab::Changes)
+            && self.workspace_view_shown().is_some()
             && self.refresh_ui.source_cancel.is_none()
             && let Some(key) = self
                 .sidebar_model
@@ -321,12 +319,6 @@ impl Cagents {
                     pull_request_review::Action::RefreshIfDue(now)
                 },
             ));
-        }
-        if regained_focus
-            || now.duration_since(self.refresh_ui.last_pull_request) >= Duration::from_secs(30)
-        {
-            self.refresh_ui.last_pull_request = now;
-            tasks.push(self.maybe_refresh_pull_request());
         }
         let projects = &self.sidebar_model.projects;
         self.refresh_ui

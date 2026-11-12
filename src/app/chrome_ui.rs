@@ -3338,81 +3338,7 @@ impl Cagents {
             .unwrap_or_default()
     }
 
-    pub(super) fn context_panel(
-        &self,
-        model: Option<inspector::InspectorModel>,
-        width: f32,
-    ) -> Element<'_, Message> {
-        let indicators = self.context_rail_indicators();
-        // A conversation that worked on or mentioned pull requests lists
-        // them wherever it runs, folder scope included.
-        let conversation_pull_requests = self.conversation_lists_pull_requests();
-        let tabs = widget::row::with_children(
-            ContextTab::ALL
-                .into_iter()
-                .filter(|tab| match tab {
-                    ContextTab::Changes => !self.active_folder_scope(),
-                    ContextTab::PullRequest => {
-                        !self.active_folder_scope() || conversation_pull_requests
-                    }
-                    ContextTab::Files | ContextTab::Details => true,
-                })
-                .map(|tab| {
-                    let selected = self.context_tab == tab;
-                    let enabled = !self.modal_is_open()
-                        && (tab != ContextTab::PullRequest
-                            || self.active_workspace.is_some()
-                            || conversation_pull_requests);
-                    let icon = match tab {
-                        ContextTab::Files => Icon::Folder,
-                        ContextTab::Changes => Icon::Changes,
-                        ContextTab::PullRequest => Icon::PullRequest,
-                        ContextTab::Details => Icon::Info,
-                    };
-                    let visual = (tab == ContextTab::PullRequest)
-                        .then_some(indicators.pull_request)
-                        .flatten()
-                        .map(sidebar::pull_request_visual);
-                    let dirty = (tab == ContextTab::Changes)
-                        .then_some(indicators.dirty)
-                        .flatten();
-                    // The tab's one icon carries the worktree's state: the pull
-                    // request's own glyph and tone, the changes tab tinted while the
-                    // tree is dirty. What the tint means is said by the tab's name,
-                    // which is the tooltip and the accessible name; a second icon
-                    // beside the tab was the same fact drawn twice.
-                    let mut name = format!("{} panel tab", tab.label());
-                    match tab {
-                        ContextTab::Changes => {
-                            if let Some(label) = dirty {
-                                name.push_str(": ");
-                                name.push_str(label);
-                            }
-                        }
-                        ContextTab::PullRequest if indicators.pending_checks => {
-                            name.push_str(": checks pending");
-                        }
-                        _ => {}
-                    }
-                    let control = crate::ui_controls::icon_button(
-                        visual
-                            .as_ref()
-                            .map_or_else(|| icon.handle(), |(icon, _)| icon.clone()),
-                        name,
-                    )
-                    .selected(selected)
-                    .on_press_maybe(enabled.then_some(Message::SelectContextTab(tab)));
-                    match (&visual, dirty) {
-                        (Some((_, color)), _) => control.tone(*color).into(),
-                        (None, Some(_)) => control
-                            .tone(design::Tone::Themed(design::warning_color))
-                            .into(),
-                        (None, None) => control.into(),
-                    }
-                }),
-        )
-        .spacing(space::XXS)
-        .align_y(Alignment::Center);
+    pub(super) fn context_panel(&self, width: f32) -> Element<'_, Message> {
         // Keep named controls in fixed slots as notices and updates come and go.
         // Alerts and updates remain beside the window controls; the toggle
         // belongs at the leading edge of the inspector it controls.
@@ -3427,111 +3353,11 @@ impl Cagents {
         .align_y(Alignment::Center)
         .into();
         let heading = self.native_header(self.sidebar_toggle(), Some(end), true);
-        let tabs = widget::container(tabs)
-            .padding([0.0, space::S])
-            .center_y(design::HEADER_CONTENT_HEIGHT)
-            .width(Length::Fill);
-        let body = match self.context_tab {
-            ContextTab::Files | ContextTab::Changes if crate::device::is_remote() => {
-                let changes = self.context_tab == ContextTab::Changes;
-                let panel = if changes {
-                    device_ui::Panel::Changes
-                } else {
-                    device_ui::Panel::Files
-                };
-                let path = self.active_workspace.as_ref();
-                widget::container(
-                    widget::column::with_children(vec![
-                        crate::interaction::tooltip(
-                            design::caption(
-                                path.and_then(|path| path.file_name())
-                                    .map(|name| name.to_string_lossy().into_owned())
-                                    .unwrap_or_else(|| "Device".into()),
-                            )
-                            .width(Length::Fill),
-                            path.map(|path| path.display().to_string())
-                                .unwrap_or_else(|| {
-                                    crate::device::selected()
-                                        .map(|device| device.name.clone())
-                                        .unwrap_or_default()
-                                }),
-                        ),
-                        crate::ui_controls::button::secondary(if changes {
-                            "Open changes"
-                        } else {
-                            "Open files"
-                        })
-                        .icon(if changes {
-                            Icon::Diff
-                        } else {
-                            Icon::OpenFolder
-                        })
-                        .name(if changes {
-                            "Open device changes"
-                        } else {
-                            "Open device files"
-                        })
-                        .on_press_maybe((!self.modal_is_open()).then_some(Message::Device(
-                            device_ui::Action::OpenIn {
-                                path: path.cloned(),
-                                panel,
-                            },
-                        )))
-                        .into(),
-                    ])
-                    .spacing(space::M),
-                )
-                .padding(space::L)
-                .width(Length::Fill)
-                .into()
-            }
-            ContextTab::Files => sidebar::file_panel(
-                &self.sidebar_model,
-                &self.sidebar_state,
-                width,
-                self.modal_is_open(),
-            )
-            .map(Message::Sidebar),
-            ContextTab::Changes => sidebar::git_panel(
-                &self.sidebar_model,
-                &self.sidebar_state,
-                width,
-                self.modal_is_open(),
-            )
-            .map(Message::Sidebar),
-            ContextTab::PullRequest => self.pull_request_panel(width),
-            ContextTab::Details => model.map_or_else(
-                || {
-                    widget::container(
-                        widget::column::with_children(vec![
-                            design::caption("No pane selected")
-                                .width(Length::Fill)
-                                .into(),
-                            crate::ui_controls::icon_button(Icon::OpenFolder, "Browse files")
-                                .on_press(Message::SelectContextTab(ContextTab::Files))
-                                .into(),
-                        ])
-                        .spacing(space::S),
-                    )
-                    .padding(space::M)
-                    .width(Length::Fill)
-                    .into()
-                },
-                |model| {
-                    let diagnostics_open = self.inspector_diagnostics_card == Some(model.card_id);
-                    let icon = self.card_icon(model.card_id);
-                    inspector::view(model, icon, width, diagnostics_open)
-                        .map(Message::ContextInspector)
-                },
-            ),
-        };
         widget::container(
             widget::column::with_children(vec![
                 heading.into(),
                 crate::design::horizontal_rule().into(),
-                tabs.into(),
-                crate::design::horizontal_rule().into(),
-                body,
+                self.context_sections_view(width),
             ])
             .width(Length::Fill)
             .height(Length::Fill),

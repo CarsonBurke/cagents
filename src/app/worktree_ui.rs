@@ -1835,13 +1835,17 @@ mod tests {
                 ..WorkspaceState::default()
             });
             app.window_width = width;
-            app.context_tab = ContextTab::Changes;
+            app.context_sections
+                .set_open(context_sections::Section::Workspace, true);
             let _ = app.restore_worktree_scope();
             let key = app.sidebar_state.active_worktree().unwrap().clone();
             let was_overlay = app.context_inspector_is_overlay();
             let _ = app.route_panel_open(&key, &RepoPath::parse("src/main.rs").unwrap());
             assert_eq!(app.workspace.focused(), Some(editor.id));
-            assert_eq!(app.context_tab, ContextTab::Changes);
+            assert_eq!(
+                app.workspace_view_shown(),
+                Some(context_sections::WorkspaceView::SourceControl)
+            );
             assert_eq!(app.context_inspector_open, !was_overlay);
             if was_overlay {
                 assert!(app.workspace_inputs_blocked());

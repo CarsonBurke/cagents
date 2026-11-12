@@ -631,6 +631,16 @@ fn settings_category_controls<'a>(
                         },
                     )
                     .keywords("Show worktree changes icons worktree_changes_icons show_worktree_changes_icons"),
+                    crate::settings_widgets::toggle(
+                        "Show mentioned pull requests",
+                        "In a channel's Pull requests section, also list pull requests it only mentioned, below the ones it worked on.",
+                        draft.show_mentioned_pull_requests,
+                        |enabled| Message::SettingsChanged {
+                            field: SettingsField::ShowMentionedPullRequests,
+                            value: enabled.to_string(),
+                        },
+                    )
+                    .keywords("Mentioned pull requests show_mentioned_pull_requests"),
                 ],
             ),
             settings_group(

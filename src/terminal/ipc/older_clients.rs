@@ -57,7 +57,7 @@ pub struct OlderClient {
 /// across an update to this release and keep running its CLI.
 const CANDIDATE_LINE: OlderClient = OlderClient {
     protocol: CANDIDATE_LINE_PROTOCOL,
-    proven_at: 166,
+    proven_at: 172,
     client_requests: 74,
     server_messages: 17,
     server_responses: 40,
@@ -538,6 +538,7 @@ mod tests {
                     pull_requests: Vec::new(),
                     transcript: crate::work::TranscriptCoverage::Complete,
                     forge_error: None,
+                    worktrees: Vec::new(),
                 }),
             }))
         );

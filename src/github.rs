@@ -41,7 +41,8 @@ const PR_LIST_FIELDS: &str = "id,number,title,state,isDraft,headRefName,headRefO
 /// only. Check rollups are the expensive part of a listing (a hundred of them
 /// can time out GitHub's GraphQL), so they are read for open ones alone.
 const PR_AUTHORED_FIELDS: &str = "number,title,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,updatedAt,url";
-const PR_AUTHORED_REVIEW_FIELDS: &str = "number,title,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,updatedAt,url,reviewDecision,statusCheckRollup";
+/// Open ones also carry what they change, for the inspector's rows.
+const PR_AUTHORED_REVIEW_FIELDS: &str = "number,title,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,updatedAt,url,reviewDecision,statusCheckRollup,additions,deletions";
 const PR_VIEW_FIELDS: &str = "id,number,title,body,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,baseRefOid,author,createdAt,updatedAt,url,mergeable,mergeStateStatus,reviewDecision,labels,additions,deletions,changedFiles,statusCheckRollup";
 /// The fields every review comment carries, whichever query returns it.
 const REVIEW_COMMENT_FIELDS: &str = "id author{login} body createdAt url viewerDidAuthor viewerCanUpdate viewerCanDelete commentState:state";
@@ -378,6 +379,9 @@ pub enum PullRequestCheckRollup {
         started_at: Option<String>,
         #[serde(default)]
         completed_at: Option<String>,
+        /// The workflow the run belongs to, when Actions ran it.
+        #[serde(default)]
+        workflow_name: String,
     },
     #[serde(rename_all = "camelCase")]
     StatusContext {
@@ -399,7 +403,7 @@ impl PullRequest {
             .unwrap_or_default()
             .iter()
             .map(|check| {
-                let (name, state, link, started_at, completed_at) = match check {
+                let (name, state, link, started_at, completed_at, workflow) = match check {
                     PullRequestCheckRollup::CheckRun {
                         name,
                         status,
@@ -407,6 +411,7 @@ impl PullRequest {
                         details_url,
                         started_at,
                         completed_at,
+                        workflow_name,
                     } => (
                         name,
                         if status.0 == "COMPLETED" {
@@ -420,13 +425,21 @@ impl PullRequest {
                         details_url,
                         started_at.clone(),
                         completed_at.clone(),
+                        workflow_name.clone(),
                     ),
                     PullRequestCheckRollup::StatusContext {
                         context,
                         state,
                         target_url,
                         created_at,
-                    } => (context, state, target_url, created_at.clone(), None),
+                    } => (
+                        context,
+                        state,
+                        target_url,
+                        created_at.clone(),
+                        None,
+                        String::new(),
+                    ),
                 };
                 let bucket = match state.0.as_str() {
                     "SUCCESS" | "NEUTRAL" | "SKIPPED" => "pass",
@@ -449,7 +462,7 @@ impl PullRequest {
                     name: name.clone(),
                     started_at,
                     state: state.clone(),
-                    workflow: String::new(),
+                    workflow,
                 }
             })
             .collect()
@@ -1332,6 +1345,15 @@ pub enum GitHubError {
 }
 
 impl GitHubError {
+    /// What a surface reports about this failure: for a `gh` that exited
+    /// non-zero, the line it wrote about why, rather than its exit status.
+    pub fn reported_detail(&self) -> String {
+        match self {
+            Self::Process(failure) => failure.reported_detail(),
+            other => other.to_string(),
+        }
+    }
+
     pub fn rate_limit(&self) -> Option<polling::RateLimit> {
         match self {
             Self::RateLimited { limit } => Some(limit.clone()),
@@ -2022,7 +2044,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
                 scope.spawn(|| self.cached_checks(repository, &pull_request, cancellation));
             let conversation = self
                 .conversation(&key, cancellation)
-                .map_err(|error| error.to_string());
+                .map_err(|error| error.reported_detail());
             (
                 checks
                     .join()
@@ -2334,7 +2356,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
         let (checks, ttl) = match self.checks(&key.pull_request, cancellation) {
             Ok(checks) => (checks, CHECKS_CACHE_TTL),
             Err(GitHubError::ChecksPending { checks, .. }) => (checks, Duration::from_secs(2)),
-            Err(error) => return Err(error.to_string()),
+            Err(error) => return Err(error.reported_detail()),
         };
         if !cancellation.is_cancelled() {
             lock_checks_cache().insert(

@@ -173,12 +173,32 @@ determine which models and permission modes are available.
 
 ## Inspector and source control
 
-The right-hand inspector has icon tabs for **Files**, **Changes**, **Pull
-request**, and **Details**; the sidebar toggle hides or reveals it.
+The right-hand inspector stacks collapsible sections; the sidebar toggle hides
+or reveals it. Each header counts what its section holds, so a collapsed one
+still reads at a glance, and the inspector remembers which are expanded.
+
+- **Pull requests** lists the PRs the focused conversation worked on (see
+  [A conversation's pull requests](#a-conversations-pull-requests)). It appears
+  once there is one.
+- **Worktrees** lists the other worktrees the conversation edited, most
+  recently edited first: those whose branch heads no PR it worked on, such as
+  the default branch. Each row shows its branch, uncommitted changes
+  (untracked files included) and their line counts. The row for the current
+  worktree says so; choosing another opens it, which moves the workspace to
+  that worktree.
+- **Source control** and **Files** share one section, titled for the view
+  shown, behind a switch in its header; both show the current worktree. It starts collapsed while the sections
+  above have something to show, and is always shown when they have nothing.
+  A folder that is not a Git worktree has only **Files**.
+- With an editor focused, **Problems** lists its language server's
+  diagnostics, and a references or definitions request lists its results.
+  Neither appears while there is nothing to show.
+
+The Source control and Files views:
 
 - **Files** browses the selected worktree and can list untracked, nonignored
   file names.
-- **Changes** provides diffs, staging, commits, push/publish, and history. Its
+- **Source control** provides diffs, staging, commits, push/publish, and history. Its
   views are **Changes** (staged, unstaged, and untracked files), **Branch**
   (everything changed since the merge base with the default branch), and
   **History** (commits, their changed files, and diffs against the first
@@ -190,13 +210,6 @@ request**, and **Details**; the sidebar toggle hides or reveals it.
   A running Git command keeps its progress and blocks another command in that
   worktree until it finishes, including after leaving and returning.
   `Ctrl+Enter` commits when either field is focused and staged changes are ready.
-- **Pull request** lists the focused conversation's pull requests (see
-  [A conversation's pull requests](#a-conversations-pull-requests)). Below the
-  list, it shows one PR in detail, with its description, checks and discussion
-  in collapsible sections. It shows the PR you chose. If you chose none, it
-  shows the PR for the worktree's branch. If that branch has none, it shows
-  the PR the conversation worked on most.
-- **Details** follows the focused pane.
 
 File lists support **Tree** and **Flat** modes, and filters open from their
 search icons. Change rows color their status and line counts and swap them for
@@ -422,17 +435,29 @@ Created commit, and a failure to release it is reported rather than hidden.
 
 ## A conversation's pull requests
 
-The inspector's **Pull request** tab lists the PRs the focused conversation
-worked on or mentioned. Nobody declares them: cagents reads them from what the
+The inspector's **Pull requests** section lists the PRs the focused
+conversation worked on. Nobody declares them: cagents reads them from what the
 conversation and its subagents did, such as `gh pr create` output, pushed
-branches, checkouts, reviews, and PR links or `#123` references.
+branches, checkouts, reviews, and PR links or `#123` references. The list
+updates on its own; there is nothing to refresh.
 
-**Worked on** lists PRs the conversation created, pushed, edited or checked out,
-with the reason beside each. **Mentioned** follows, muted; past the first five,
-mentions fold behind **Show N more**. A PR in another repository shows as
-`owner/repo#123`. Each row shows the PR's state, checks and review. Choose a row
-to show that PR below the list, and choose it again to go back. When GitHub
-can't be reached, rows keep their last known state and say when it was read.
+Each row says why it is listed (created, pushed, edited or checked out), then
+the PR's state, the lines it adds and removes, its checks and its review. The
+checks chip names the state that most needs attention, such as **2 failing**
+or **3 running**; choose it to list every check, and choose a check to open
+its page. Choosing the row opens the PR where **Settings → Open pull requests
+in** says: the review pane, or GitHub. A PR in another repository shows as
+`owner/repo#123`. When GitHub can't be reached, rows keep their last known
+state and say when it was read.
+
+A branch the conversation edited in a worktree is listed once. When the
+branch heads a PR it worked on, the PR's row adds a line for the worktree:
+its branch, uncommitted changes and their line counts. Choose that line to
+open the worktree; the rest of the row opens the PR.
+
+PRs the conversation only mentioned are left out unless **Settings →
+Appearance → Mentioned pull requests** is on. They then follow under
+**Mentioned**, muted; past the first five, they fold behind **Show N more**.
 
 ## Work board
 

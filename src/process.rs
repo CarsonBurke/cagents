@@ -304,7 +304,7 @@ impl ProcessFailure {
     ///
     /// [`ProcessFailureKind::Exit`] is the one kind whose own `message` says
     /// nothing: `Display` renders it as `{program}: process exited with status
-    /// Some(4)`, a number standing in for the two sentences `gh` wrote about
+    /// 4`, a number standing in for the two sentences `gh` wrote about
     /// how to log in, or for `fatal: not a git repository`. So it is the one
     /// kind whose stderr is preferred, and only when there is some.
     ///
@@ -361,7 +361,11 @@ impl ProcessOutput {
                 signal: self.signal,
                 stdout: self.stdout,
                 stderr: self.stderr,
-                message: format!("process exited with status {:?}", self.exit_code),
+                message: match (self.exit_code, self.signal) {
+                    (Some(code), _) => format!("process exited with status {code}"),
+                    (None, Some(signal)) => format!("process was terminated by signal {signal}"),
+                    (None, None) => "process exited unsuccessfully".to_owned(),
+                },
                 started: true,
             })
         }
@@ -887,6 +891,28 @@ fn failure_excerpt(mut output: Vec<u8>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_exit_names_its_status_or_signal_rather_than_an_option() {
+        let failure = |exit_code, signal| {
+            ProcessOutput {
+                exit_code,
+                signal,
+                success: false,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            }
+            .require_success(Path::new("gh"))
+            .unwrap_err()
+            .to_string()
+        };
+        assert_eq!(failure(Some(1), None), "gh: process exited with status 1");
+        assert_eq!(
+            failure(None, Some(9)),
+            "gh: process was terminated by signal 9"
+        );
+        assert_eq!(failure(None, None), "gh: process exited unsuccessfully");
+    }
 
     #[test]
     #[cfg(target_os = "linux")]

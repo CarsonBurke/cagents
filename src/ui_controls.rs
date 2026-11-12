@@ -29,7 +29,8 @@ pub use gauge::{
 };
 pub use icon::{Icon, ceditor_icon, ceditor_window_icon, passive_icon, provider_icon};
 pub use icon_button::{
-    IconButton, control_style, icon_button, segmented_controls, toolbar_actions,
+    IconButton, control_style, icon_button, outlined_control_style, segmented_controls,
+    toolbar_actions,
 };
 pub use labeled_controls::labeled_controls;
 pub use labelled::labelled;
