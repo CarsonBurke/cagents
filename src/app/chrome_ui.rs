@@ -2670,8 +2670,17 @@ impl Cagents {
                     header.on_minimize(Message::NativeWindowAction(cosmic::app::Action::Minimize));
             }
         }
+        // The header holding the window controls is the rightmost one: its
+        // fill runs to the window edge and the controls stay out of the
+        // resize border.
+        let inset = if window_controls {
+            self.trailing_edge_inset()
+        } else {
+            0.0
+        };
         widget::container(header)
             .center_y(design::HEADER_CONTENT_HEIGHT)
+            .padding(Padding::ZERO.right(inset))
             .width(Length::Fill)
             .class(cosmic::theme::Container::Background)
             .into()
@@ -2691,11 +2700,6 @@ impl Cagents {
     }
 
     fn workspace_header_width(&self) -> f32 {
-        let navigator = if should_show_card_navigator(self.workspace.cards().len()) {
-            design::PANE_NAVIGATOR_RESERVED_WIDTH
-        } else {
-            0.0
-        };
         let controls = if self.context_inspector_open {
             0.0
         } else {
@@ -2730,7 +2734,7 @@ impl Cagents {
         } else {
             0.0
         };
-        let width = navigator + controls + update + notice + attention + 16.0;
+        let width = controls + update + notice + attention + 16.0;
         if self.workspace.viewport_width() > 0.0 {
             width.min(self.workspace.viewport_width())
         } else {
@@ -2879,51 +2883,9 @@ impl Cagents {
         if self.context_inspector_is_overlay() {
             return Vec::new();
         }
-        let mut actions = Vec::with_capacity(8);
-        let total = self.workspace.cards().len();
-        if should_show_card_navigator(total) {
-            let current = self
-                .workspace
-                .focused()
-                .and_then(|id| self.workspace.order().position(|candidate| candidate == id))
-                .map_or(0, |index| index + 1);
-            actions.push(command(
-                Icon::ChevronLeft,
-                workspace_widget::shortcut_tooltip(
-                    workspace_widget::GlobalShortcut::FocusAdjacent(
-                        crate::workspace::FocusDirection::Left,
-                    ),
-                    &self.settings.keyboard_shortcuts,
-                ),
-                widget::Id::new("command.previous-column"),
-                (current > 1).then_some(Message::FocusAdjacent(
-                    crate::workspace::FocusDirection::Left,
-                )),
-            ));
-            actions.push(
-                iced::widget::container(crate::design::caption(format!("{current} / {total}")))
-                    .center_y(ICON_CONTROL_SIZE)
-                    .align_x(Alignment::Center)
-                    .width(
-                        (format!("{current} / {total}").len() as f32 * 7.0 + 16.0)
-                            .max(design::PANE_NAVIGATOR_MIN_WIDTH),
-                    )
-                    .into(),
-            );
-            actions.push(command(
-                Icon::ChevronRight,
-                workspace_widget::shortcut_tooltip(
-                    workspace_widget::GlobalShortcut::FocusAdjacent(
-                        crate::workspace::FocusDirection::Right,
-                    ),
-                    &self.settings.keyboard_shortcuts,
-                ),
-                widget::Id::new("command.next-column"),
-                (current > 0 && current < total).then_some(Message::FocusAdjacent(
-                    crate::workspace::FocusDirection::Right,
-                )),
-            ));
-        }
+        // The tab strip already names every pane and marks the focused one,
+        // and the pane shortcuts move between them, so the header carries no
+        // separate "1 / 2" pager.
         // The inspector panel's own header mounts the notice control, the update
         // control and the inspector toggle, and the two headers must never
         // mount the same one at once: a custom `widget::Id` may name only one
@@ -2944,10 +2906,6 @@ impl Cagents {
         // put the two icons on opposite ends of the window.
         let panel_owns_shared_controls = self.context_inspector_visible();
         vec![
-            widget::row::with_children(actions)
-                .spacing(space::XXS)
-                .align_y(Alignment::Center)
-                .into(),
             widget::row::with_children(
                 (!panel_owns_shared_controls).then(|| self.attention_and_notice_controls()),
             )
@@ -3353,17 +3311,24 @@ impl Cagents {
         .align_y(Alignment::Center)
         .into();
         let heading = self.native_header(self.sidebar_toggle(), Some(end), true);
+        // The panel, its header and the rule under it run to the window edge.
+        // The sections keep their scrollbar out of the resize border.
+        let inset = self.trailing_edge_inset();
         widget::container(
             widget::column::with_children(vec![
                 heading.into(),
                 crate::design::horizontal_rule().into(),
-                self.context_sections_view(width),
+                widget::container(self.context_sections_view(width))
+                    .padding(Padding::ZERO.right(inset))
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into(),
             ])
             .width(Length::Fill)
             .height(Length::Fill),
         )
         .class(cosmic::theme::Container::Background)
-        .width(width)
+        .width(width + inset)
         .height(Length::Fill)
         .into()
     }
