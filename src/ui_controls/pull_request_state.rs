@@ -130,6 +130,17 @@ pub const fn check_state_look(state: CheckState) -> (Icon, fn(&cosmic::Theme) ->
     }
 }
 
+/// A check's state in a word, as summaries count it: `failing`, `running`.
+pub const fn check_state_label(state: CheckState) -> &'static str {
+    match state {
+        CheckState::Failed => "failing",
+        CheckState::Pending => "running",
+        CheckState::Passed => "passed",
+        CheckState::Cancelled => "cancelled",
+        CheckState::Skipped => "skipped",
+    }
+}
+
 /// What a set of checks comes to: the state most in need of attention, and
 /// how many are in each state, in words.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,14 +151,13 @@ pub struct ChecksSummary {
 }
 
 impl ChecksSummary {
-    /// The states in the order a summary names them, worst first, with
-    /// their words.
-    const ORDER: [(CheckState, &'static str); 5] = [
-        (CheckState::Failed, "failing"),
-        (CheckState::Pending, "running"),
-        (CheckState::Cancelled, "cancelled"),
-        (CheckState::Passed, "passed"),
-        (CheckState::Skipped, "skipped"),
+    /// The states in the order a summary names them, worst first.
+    const ORDER: [CheckState; 5] = [
+        CheckState::Failed,
+        CheckState::Pending,
+        CheckState::Cancelled,
+        CheckState::Passed,
+        CheckState::Skipped,
     ];
 
     /// Summarises the states of a pull request's checks; `None` when it has
@@ -181,12 +191,12 @@ impl ChecksSummary {
     }
 
     fn of_each(counts: [usize; Self::ORDER.len()]) -> Option<Self> {
-        let worst = Self::ORDER[counts.iter().position(|count| *count > 0)?].0;
+        let worst = Self::ORDER[counts.iter().position(|count| *count > 0)?];
         let label = Self::ORDER
             .iter()
             .zip(counts)
             .filter(|(_, count)| *count > 0)
-            .map(|((_, word), count)| format!("{count} {word}"))
+            .map(|(state, count)| format!("{count} {}", check_state_label(*state)))
             .collect::<Vec<_>>()
             .join(", ");
         Some(Self { worst, label })
