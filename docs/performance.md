@@ -94,6 +94,29 @@ unfocused spinners instead of stopping them costs little: an earlier revision
 that stopped them entirely measured 1.0-1.6% with another window focused
 (3 wakeups/s).
 
+## UI thread trace
+
+Development UI builds started with `CAGENTS_UI_TRACE` set log, every five
+seconds, how much wall time the UI thread spent in `update` (by the message's
+outer two variant names, such as `ChatUi(Stream`), `view`, `subscription`, and
+the window content's layout, draw, event handling (by event kind), tree diff,
+widget operations, accessibility tree and overlay collection. Beneath each
+total, the sidebar's and the workspace's shares are broken out. Each call that
+takes 50 ms or more is logged as it returns, as `ui-trace slow PHASE LABEL MS`.
+A nested `update` counts toward the outermost one. Overlays' own layout and
+drawing, the libcosmic chrome around the application view, and the renderer's
+presentation run outside the measured root, so the thread's CPU time exceeds
+the traced total.
+`scripts/native-evidence start SIDE --ui-trace` sets the variable for a session;
+the lines go to its `logs/ui-SIDE.log`. Without the variable a scope reads one
+flag, and other builds compile the trace out.
+
+Use it to tell which work keeps the UI thread busy when the app stalls. Pair it
+with `/proc/PID/task/PID/syscall` sampling to see whether the thread is ever
+blocked rather than busy: a thread in `epoll_pwait` is idle, while `futex`,
+`read` or `wait4` on the UI thread is a stall that no amount of view caching
+fixes.
+
 ## Native chat stage attribution
 
 Development UI builds can record bounded, content-free **inclusive wall time**
