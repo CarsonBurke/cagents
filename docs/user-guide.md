@@ -456,7 +456,7 @@ worktree the conversation runs in, else the first work checked out in Projects.
 Work whose worktree isn't in Projects says so in place of changes, rather than
 showing another worktree's.
 Choosing work changes only what the inspector shows; the sidebar keeps its
-selection. The chosen PR also lists its checks, the ones most in need of
+selection, and each conversation keeps its choice while cagents runs. The chosen PR also lists its checks, the ones most in need of
 attention first; choose a check to open its page, or **Open pull request** to
 open it where **Settings → Open pull requests in** says: the review pane, or
 GitHub. A PR with no worktree here says so in place of changes.

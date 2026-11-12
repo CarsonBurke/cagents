@@ -143,9 +143,10 @@ pub struct State {
     listed_before: bool,
     /// Whether the mentioned pull requests are unfolded.
     pub(super) mentions_open: bool,
-    /// The work the user chose to show; until then the inspector shows the
-    /// work where the conversation runs.
-    chosen: Option<WorkKey>,
+    /// The work the user chose to show in each conversation they chose
+    /// any in, so returning to one shows what they left it showing; until
+    /// then the inspector shows the work where the conversation runs.
+    chosen: HashMap<TerminalId, WorkKey>,
 }
 
 impl State {
@@ -191,6 +192,7 @@ impl State {
             conversation,
             listed_before: conversation.is_some()
                 && (!self.rows().is_empty() || !self.worktrees().is_empty()),
+            chosen: std::mem::take(&mut self.chosen),
             ..Self::default()
         };
         true
@@ -239,8 +241,8 @@ impl State {
         here: Option<&Path>,
         openable: &dyn Fn(&Path) -> bool,
     ) -> Option<Work<'w>> {
-        self.chosen
-            .as_ref()
+        self.conversation
+            .and_then(|conversation| self.chosen.get(&conversation))
             .and_then(|key| work.iter().find(|work| work.is(key)))
             .or_else(|| {
                 here.and_then(|here| work.iter().find(|work| work.worktree() == Some(here)))
@@ -254,7 +256,9 @@ impl State {
     }
 
     pub(super) fn choose(&mut self, key: WorkKey) {
-        self.chosen = Some(key);
+        if let Some(conversation) = self.conversation {
+            self.chosen.insert(conversation, key);
+        }
     }
 
     pub(super) fn rows(&self) -> &[ConversationPullRequest] {
@@ -1197,6 +1201,38 @@ mod tests {
         }
     }
 
+    /// Returning to a conversation shows the work chosen in it, not the
+    /// work chosen in the one visited in between.
+    #[test]
+    fn each_conversation_keeps_the_work_chosen_in_it() {
+        let mut state = State::default();
+        let (first, second) = (TerminalId::new(), TerminalId::new());
+        let rows = || vec![row(1, Relation::Created), row(2, Relation::Pushed)];
+        let show = |state: &mut State, conversation| {
+            state.retarget(Some((CardId::new(), conversation)));
+            state.update(listed(conversation, 1, rows(), true));
+        };
+        let shown = |state: &State| {
+            let work = state.work(None);
+            state.shown(&work, None, &|_| true).map(|work| work.key())
+        };
+        let number = |number| WorkKey::PullRequest {
+            repository: repo("me"),
+            number,
+        };
+        show(&mut state, first);
+        assert_eq!(shown(&state), Some(number(1)));
+        state.choose(number(2));
+        show(&mut state, second);
+        assert_eq!(
+            shown(&state),
+            Some(number(1)),
+            "a new conversation starts at its default"
+        );
+        show(&mut state, first);
+        assert_eq!(shown(&state), Some(number(2)));
+    }
+
     #[test]
     fn work_lists_pull_requests_then_lone_worktrees_and_shows_where_the_chat_runs() {
         let mut state = State::default();
@@ -1279,10 +1315,6 @@ mod tests {
                 .map(|work| work.key()),
             Some(WorkKey::Worktree(PathBuf::from("/scratch")))
         );
-        // Another conversation starts with nothing chosen.
-        state.choose(keys[0].clone());
-        state.retarget(Some((CardId::new(), TerminalId::new())));
-        assert!(state.chosen.is_none());
     }
 
     #[test]
