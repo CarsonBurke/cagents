@@ -173,6 +173,9 @@ impl Cagents {
             Action::Toggle(section) => {
                 let open = !self.context_sections.is_open(section);
                 self.context_sections.set_open(section, open);
+                if section == Section::PullRequests && !open {
+                    self.close_checks_popup();
+                }
             }
             Action::Show(view) => {
                 if view == WorkspaceView::SourceControl && self.active_folder_scope() {

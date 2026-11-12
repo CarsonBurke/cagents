@@ -6275,6 +6275,7 @@ impl Cagents {
         if self.focused_repository_is_saving() && self.context_inspector_is_overlay() {
             self.context_inspector_open = false;
             self.context_inspector_transition = None;
+            self.close_checks_popup();
         }
         self.sync_context_overlay_state()
     }
@@ -13143,6 +13144,9 @@ impl Cagents {
         }
         let from = self.context_inspector_progress();
         self.context_inspector_open = open;
+        if !open {
+            self.close_checks_popup();
+        }
         self.context_inspector_transition = Some(InspectorTransition {
             started_at: Instant::now(),
             from,

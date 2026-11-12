@@ -133,9 +133,20 @@ impl Cagents {
         self.pull_request_inspector.conversation.retarget(inspected);
     }
 
-    /// Whether a pull request's checks are open in a popup.
+    /// Whether a pull request's checks popup is on screen, which takes the
+    /// inspector and its Pull requests section being open.
     pub(super) fn checks_popup_open(&self) -> bool {
-        self.pull_request_inspector.conversation.checks_popup_open()
+        self.context_inspector_open
+            && self
+                .context_sections
+                .is_open(context_sections::Section::PullRequests)
+            && self.pull_request_inspector.conversation.checks_popup_open()
+    }
+
+    /// Forgets the checks popup once what draws it is hidden, so it does
+    /// not hold Escape while unseen or return when its section comes back.
+    pub(super) fn close_checks_popup(&mut self) {
+        self.pull_request_inspector.conversation.show_checks(None);
     }
 
     /// Whether the Pull requests section has anything to list.
@@ -369,6 +380,40 @@ mod tests {
         }));
         assert!(!app.checks_popup_open());
         assert!(app.context_inspector_open);
+    }
+
+    #[test]
+    fn a_hidden_checks_popup_is_forgotten_rather_than_kept_behind_its_section() {
+        let (mut app, conversation, _) = conversation_app();
+        app.sync_pull_request_inspector();
+        drop(app.handle_pull_request_ui(listed(conversation, 1, &[(4, Relation::Created)], true)));
+        let repository = GitHubRepoKey::new("listed-inspector.invalid", None, "o", "r").unwrap();
+        let show = Action::ShowChecks(Some((repository, 4)));
+
+        drop(app.handle_pull_request_ui(show.clone()));
+        drop(
+            app.update(Message::ContextSection(context_sections::Action::Toggle(
+                context_sections::Section::PullRequests,
+            ))),
+        );
+        assert!(!app.checks_popup_open());
+        drop(
+            app.update(Message::ContextSection(context_sections::Action::Toggle(
+                context_sections::Section::PullRequests,
+            ))),
+        );
+        assert!(
+            !app.checks_popup_open(),
+            "the popup came back with its section"
+        );
+
+        drop(app.handle_pull_request_ui(show));
+        drop(app.set_context_inspector_open(false));
+        drop(app.set_context_inspector_open(true));
+        assert!(
+            !app.checks_popup_open(),
+            "the popup came back with the inspector"
+        );
     }
 
     #[test]
