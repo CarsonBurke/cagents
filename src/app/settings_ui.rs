@@ -247,21 +247,17 @@ fn settings_category_controls<'a>(
             let mut controls: Vec<_> = fields
                 .into_iter()
                 .map(|(field, label, detail)| {
-                    setting_field(
+                    crate::settings_widgets::toggle_enabled(
                         label,
                         detail,
-                        crate::settings_widgets::toggle_enabled(
-                            label,
-                            draft.notifications.get(field),
-                            matches!(field, Field::Enabled | Field::MessagePreviews)
-                                || draft.notifications.get(Field::Enabled),
-                            move |enabled| Message::SettingsChanged {
-                                field: SettingsField::Notifications(field),
-                                value: enabled.to_string(),
-                            },
-                        ),
+                        draft.notifications.get(field),
+                        matches!(field, Field::Enabled | Field::MessagePreviews)
+                            || draft.notifications.get(Field::Enabled),
+                        move |enabled| Message::SettingsChanged {
+                            field: SettingsField::Notifications(field),
+                            value: enabled.to_string(),
+                        },
                     )
-                    .label_in_control()
                 })
                 .collect();
             controls.push(setting_field(
@@ -278,7 +274,8 @@ fn settings_category_controls<'a>(
                         .then_some(Message::NotificationUi(notification_ui::Action::Test)),
                 )
                 .into(),
-            ));
+            )
+            .label_in_control());
             vec![settings_group(
                 "Agent notifications",
                 "Private alerts show the provider and folder. Message previews are available when you choose to enable them.",
@@ -349,18 +346,16 @@ fn settings_category_controls<'a>(
                             .width(Length::Fill)
                             .into(),
                     ),
-                    setting_field(
-                        SettingsField::CheckForUpdates.label(),
+                    crate::settings_widgets::toggle(
+                        "Check for updates automatically",
                         "Look for a new release at startup and every six hours. A check that cannot reach the server is retried quietly; only one you ask for reports a failure.",
-                        crate::settings_widgets::toggle(
-                            "Check for updates automatically",
-                            draft.check_for_updates,
-                            |enabled| Message::SettingsChanged {
-                                field: SettingsField::CheckForUpdates,
-                                value: enabled.to_string(),
-                            },
-                        ),
-                    ),
+                        draft.check_for_updates,
+                        |enabled| Message::SettingsChanged {
+                            field: SettingsField::CheckForUpdates,
+                            value: enabled.to_string(),
+                        },
+                    )
+                    .keywords("check_for_updates"),
                 ],
             )]
         }
@@ -377,7 +372,8 @@ fn settings_category_controls<'a>(
                 crate::ui_controls::button::secondary("Open Accounts")
                     .on_press(Message::AccountUi(account_ui::Action::OpenPane))
                     .into(),
-            ));
+            )
+            .label_in_control());
             vec![settings_group(
                 "Default accounts",
                 "Each provider's CLI keeps every login in a home of its own. cagents never reads credentials.",
@@ -392,7 +388,8 @@ fn settings_category_controls<'a>(
                     .id(widget::Id::new("settings.reset"))
                     .on_press(Message::ResetSettings)
                     .into(),
-            );
+            )
+            .label_in_control();
             let directory = setting_input(
                 "Absolute path, or relative to the repository root. Defaults to .worktrees/. Each new worktree gets its own subdirectory.",
                 &draft.managed_worktree_directory,
@@ -411,18 +408,16 @@ fn settings_category_controls<'a>(
                     )
                 }),
             );
-            let cleanup = setting_field(
-                "Merged worktrees",
+            let cleanup = crate::settings_widgets::toggle(
+                "Notify about merged worktrees",
                 "Show a notice when a GitHub worktree's pull request is merged, naming uncommitted changes and ignored files such as .env that deleting it would discard. Worktrees are never deleted automatically.",
-                crate::settings_widgets::toggle(
-                    "Notify about merged worktrees",
-                    draft.auto_delete_merged_worktrees,
-                    |enabled| Message::SettingsChanged {
-                        field: SettingsField::AutoDeleteMergedWorktrees,
-                        value: enabled.to_string(),
-                    },
-                ),
-            );
+                draft.auto_delete_merged_worktrees,
+                |enabled| Message::SettingsChanged {
+                    field: SettingsField::AutoDeleteMergedWorktrees,
+                    value: enabled.to_string(),
+                },
+            )
+            .keywords("merged_worktrees");
             let channel_pane = settings_choice(
                 "Default channel pane",
                 "Open this pane in an empty channel. An unused native chat is removed when you switch channels.",
@@ -451,18 +446,16 @@ fn settings_category_controls<'a>(
                     ),
                 ],
             );
-            let activation = setting_field(
-                "Pane focus",
+            let activation = crate::settings_widgets::toggle(
+                "Focus follows mouse",
                 "When on, resting the pointer on a pane focuses it and puts the keyboard in its message input, terminal or editor, without scrolling. Typing, clicking or dragging before then keeps focus where it is. When off, click a pane or use pane navigation to focus it.",
-                crate::settings_widgets::toggle(
-                    "Focus follows mouse",
-                    draft.focus_follows_mouse,
-                    |enabled| Message::SettingsChanged {
-                        field: SettingsField::FocusFollowsMouse,
-                        value: enabled.to_string(),
-                    },
-                ),
-            );
+                draft.focus_follows_mouse,
+                |enabled| Message::SettingsChanged {
+                    field: SettingsField::FocusFollowsMouse,
+                    value: enabled.to_string(),
+                },
+            )
+            .keywords("Pane focus pane_focus");
             let hot_panes = setting_input(
                 "At least 1 pane. Extra background panes may hibernate.",
                 &draft.max_hot_cards,
@@ -513,30 +506,26 @@ fn settings_category_controls<'a>(
             "Native chat",
             "Message composition and conversation presentation.",
             vec![
-                setting_field(
-                    "Chat send key",
+                crate::settings_widgets::toggle(
+                    "Enter sends a chat message",
                     "Enter sends the message and Shift+Enter breaks the line. Turn this off to compose with Enter and send with Ctrl+Enter.",
-                    crate::settings_widgets::toggle(
-                        "Enter sends a chat message",
-                        draft.chat_enter_sends,
-                        |enabled| Message::SettingsChanged {
-                            field: SettingsField::ChatEnterSends,
-                            value: enabled.to_string(),
-                        },
-                    ),
-                ),
-                setting_field(
-                    "Tool groups",
-                    "New tool-call groups start collapsed. Individual disclosure choices are remembered while paging.",
-                    crate::settings_widgets::toggle(
-                        "Expand tool groups by default",
-                        draft.chat_expand_tool_groups,
-                        |enabled| Message::SettingsChanged {
-                            field: SettingsField::ChatExpandToolGroups,
-                            value: enabled.to_string(),
-                        },
-                    ),
-                ),
+                    draft.chat_enter_sends,
+                    |enabled| Message::SettingsChanged {
+                        field: SettingsField::ChatEnterSends,
+                        value: enabled.to_string(),
+                    },
+                )
+                .keywords("Chat send key chat_send_key"),
+                crate::settings_widgets::toggle(
+                    "Expand tool groups by default",
+                    "Choose whether new tool-call groups start expanded. Individual disclosure choices are remembered while paging.",
+                    draft.chat_expand_tool_groups,
+                    |enabled| Message::SettingsChanged {
+                        field: SettingsField::ChatExpandToolGroups,
+                        value: enabled.to_string(),
+                    },
+                )
+                .keywords("tool_groups"),
             ],
         )],
         SettingsCategory::Editor => vec![
@@ -576,17 +565,14 @@ fn settings_category_controls<'a>(
                         value: theme.key().into(),
                     },
                 );
-                options.push(setting_field(
+                options.push(crate::settings_widgets::toggle(
                     "Hide unchanged diff lines",
                     "Fold unchanged context between hunks. Turn off to show the complete file.",
-                    crate::settings_widgets::toggle(
-                        "Hide unchanged diff lines",
-                        draft.diff_hide_unchanged,
-                        |enabled| Message::SettingsChanged {
-                            field: SettingsField::DiffHideUnchanged,
-                            value: enabled.to_string(),
-                        },
-                    ),
+                    draft.diff_hide_unchanged,
+                    |enabled| Message::SettingsChanged {
+                        field: SettingsField::DiffHideUnchanged,
+                        value: enabled.to_string(),
+                    },
                 ));
                 options
             }),
@@ -625,30 +611,26 @@ fn settings_category_controls<'a>(
                         1.0,
                         "×",
                     ),
-                    setting_field(
-                        "Status bar",
-                        "A thin bar along the bottom of the window showing how much of each signed-in Claude Code, Codex and Omp account's usage limits is left.",
-                        crate::settings_widgets::toggle(
-                            "Show the status bar",
-                            draft.show_status_bar,
-                            |enabled| Message::SettingsChanged {
-                                field: SettingsField::ShowStatusBar,
-                                value: enabled.to_string(),
-                            },
-                        ),
-                    ),
-                    setting_field(
-                        "Worktree changes icons",
+                    crate::settings_widgets::toggle(
+                        "Show the status bar",
+                        "See each signed-in account's remaining usage at the bottom of the window.",
+                        draft.show_status_bar,
+                        |enabled| Message::SettingsChanged {
+                            field: SettingsField::ShowStatusBar,
+                            value: enabled.to_string(),
+                        },
+                    )
+                    .keywords("status_bar"),
+                    crate::settings_widgets::toggle(
+                        "Show worktree change badges",
                         "Show a changes badge beside worktrees with uncommitted changes in Projects.",
-                        crate::settings_widgets::toggle(
-                            "Show worktree changes icons",
-                            draft.show_worktree_changes_icons,
-                            |enabled| Message::SettingsChanged {
-                                field: SettingsField::ShowWorktreeChangesIcons,
-                                value: enabled.to_string(),
-                            },
-                        ),
-                    ),
+                        draft.show_worktree_changes_icons,
+                        |enabled| Message::SettingsChanged {
+                            field: SettingsField::ShowWorktreeChangesIcons,
+                            value: enabled.to_string(),
+                        },
+                    )
+                    .keywords("Show worktree changes icons worktree_changes_icons show_worktree_changes_icons"),
                 ],
             ),
             settings_group(
@@ -746,18 +728,16 @@ fn settings_category_controls<'a>(
                         "×",
                     ),
                     terminal_theme_choice(&draft.terminal_theme, draft.has_custom_terminal_theme),
-                    setting_field(
-                        "Multiline paste",
+                    crate::settings_widgets::toggle(
+                        "Confirm multiline paste",
                         "Warn before pasting multiple lines when the program does not support bracketed paste.",
-                        crate::settings_widgets::toggle(
-                            "Confirm multiline paste",
-                            draft.confirm_multiline_paste,
-                            |enabled| Message::SettingsChanged {
-                                field: SettingsField::ConfirmMultilinePaste,
-                                value: enabled.to_string(),
-                            },
-                        ),
-                    ),
+                        draft.confirm_multiline_paste,
+                        |enabled| Message::SettingsChanged {
+                            field: SettingsField::ConfirmMultilinePaste,
+                            value: enabled.to_string(),
+                        },
+                    )
+                    .keywords("multiline_paste"),
                     settings_choice(
                         "Cursor shape",
                         "Bar is the default. Application follows program cursor requests; explicit shapes override requests without forcing a hidden cursor visible.",
@@ -792,34 +772,30 @@ fn settings_category_controls<'a>(
             settings_group(
                 "Closing",
                 "Idle shells close immediately. Terminal identity is always checked.",
-                vec![setting_field(
-                    "Active processes",
+                vec![crate::settings_widgets::toggle(
+                    "Confirm closing active processes",
                     "Ask before closing a terminal with a foreground program or background jobs.",
-                    crate::settings_widgets::toggle(
-                        "Confirm closing active processes",
-                        draft.confirm_terminal_close,
-                        |enabled| Message::SettingsChanged {
-                            field: SettingsField::ConfirmTerminalClose,
-                            value: enabled.to_string(),
-                        },
-                    ),
-                )],
+                    draft.confirm_terminal_close,
+                    |enabled| Message::SettingsChanged {
+                        field: SettingsField::ConfirmTerminalClose,
+                        value: enabled.to_string(),
+                    },
+                )
+                .keywords("active_processes")],
             ),
             settings_group(
                 "Upgrades",
                 "Replacing the daemon checkpoints terminals and conversations, then resumes them.",
-                vec![setting_field(
-                    "Unresumable agents",
+                vec![crate::settings_widgets::toggle(
+                    "Relaunch unresumable agents on upgrade",
                     "Reopen an agent whose conversation cannot be resumed exactly in its resume picker, instead of refusing the upgrade. Other running jobs still block it.",
-                    crate::settings_widgets::toggle(
-                        "Relaunch agents on upgrade",
-                        draft.relaunch_agents_on_upgrade,
-                        |enabled| Message::SettingsChanged {
-                            field: SettingsField::RelaunchAgentsOnUpgrade,
-                            value: enabled.to_string(),
-                        },
-                    ),
-                )],
+                    draft.relaunch_agents_on_upgrade,
+                    |enabled| Message::SettingsChanged {
+                        field: SettingsField::RelaunchAgentsOnUpgrade,
+                        value: enabled.to_string(),
+                    },
+                )
+                .keywords("unresumable_agents")],
             ),
         ],
         SettingsCategory::Links => vec![settings_group(
@@ -839,7 +815,8 @@ fn settings_category_controls<'a>(
                     crate::ui_controls::button::secondary("Import browser logins")
                         .on_press(Message::BrowserImport(browser_import_ui::Action::Open))
                         .into(),
-                ),
+                )
+                .label_in_control(),
                 settings_choice(
                     "Open links in",
                     "Regular clicks use this destination. Ctrl+click and Ctrl+Shift+click override it.",

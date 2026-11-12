@@ -242,28 +242,30 @@ impl<'a, Message: Clone + 'a> Group<'a, Message> {
     }
 }
 
-/// A labelled switch that spans its setting row: the label reads from the
-/// left edge and the switch sits at the right, clear of any label length.
-pub fn toggle<'a, Message: 'static>(
-    label: &str,
+/// A setting with one label beside its switch and supporting detail below.
+pub fn toggle<'a, Message: Clone + 'static>(
+    label: &'static str,
+    detail: impl Into<Cow<'a, str>>,
     value: bool,
     on_toggle: impl Fn(bool) -> Message + 'a,
-) -> Element<'a, Message> {
-    toggle_enabled(label, value, true, on_toggle)
+) -> Setting<'a, Message> {
+    toggle_enabled(label, detail, value, true, on_toggle)
 }
 
-pub fn toggle_enabled<'a, Message: 'static>(
-    label: &str,
+pub fn toggle_enabled<'a, Message: Clone + 'static>(
+    label: &'static str,
+    detail: impl Into<Cow<'a, str>>,
     value: bool,
     enabled: bool,
     on_toggle: impl Fn(bool) -> Message + 'a,
-) -> Element<'a, Message> {
-    crate::ui_controls::field::toggle(value)
+) -> Setting<'a, Message> {
+    let control = crate::ui_controls::field::toggle(value)
         .label(label.to_owned())
         .spacing(space::M)
         .width(Length::Fill)
         .on_toggle_maybe(enabled.then_some(on_toggle))
-        .into()
+        .into();
+    field(label, detail, control).label_in_control()
 }
 
 pub fn editor_options<'a, Message: Clone + 'static>(
@@ -275,16 +277,20 @@ pub fn editor_options<'a, Message: Clone + 'static>(
     on_syntax: impl Fn(EditorSyntaxTheme) -> Message + Send + Sync + 'static,
 ) -> Vec<Setting<'a, Message>> {
     vec![
-        field(
-            "Auto-save",
+        toggle(
+            "Save files automatically",
             "Save files after a pause. Conflicting disk changes still require a decision.",
-            toggle("Save files automatically", auto_save, on_save),
-        ),
-        field(
-            "Word wrap",
+            auto_save,
+            on_save,
+        )
+        .keywords("Auto-save auto_save"),
+        toggle(
+            "Wrap long lines",
             "Wrap long editor lines to the available width.",
-            toggle("Wrap long lines", wrap, on_wrap),
-        ),
+            wrap,
+            on_wrap,
+        )
+        .keywords("Word wrap word_wrap"),
         field(
             "Syntax theme",
             "Syntax highlighting in editors and diffs. Match app follows the application appearance theme.",
@@ -323,6 +329,74 @@ pub fn search_id() -> widget::Id {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn switch_settings_have_one_named_control_and_detail_at_both_widths() {
+        use iced::advanced::{Layout, layout, mouse, widget::Tree};
+        use iced_accessibility::accesskit::{Role, Toggled};
+
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        for width in [220.0, 600.0] {
+            for query in ["", "status"] {
+                let mut setting = toggle(
+                    "Show the status bar",
+                    "See each signed-in account's remaining usage at the bottom of the window.",
+                    true,
+                    |_| (),
+                )
+                .view(query);
+                let mut tree = Tree::new(&setting);
+                let node = setting.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 600.0)),
+                );
+                assert_eq!(node.children().len(), 2, "one control row and its detail");
+                assert_eq!(node.size().width, width);
+                let switch = &node.children()[0];
+                let label = &switch.children()[0];
+                let control = &switch.children()[1];
+                assert!(label.bounds().x + label.size().width <= control.bounds().x);
+                assert!(control.bounds().x + control.size().width <= width);
+
+                let accessible = setting.as_widget().a11y_nodes(
+                    Layout::new(&node),
+                    &tree,
+                    mouse::Cursor::Unavailable,
+                );
+                let named: Vec<_> = accessible
+                    .root()
+                    .iter()
+                    .chain(accessible.children())
+                    .filter(|node| node.node().label() == Some("Show the status bar"))
+                    .collect();
+                assert_eq!(named.len(), 1, "the label is announced once");
+                assert_eq!(named[0].node().role(), Role::Switch);
+                assert_eq!(named[0].node().toggled(), Some(Toggled::True));
+            }
+        }
+    }
+
+    #[test]
+    fn combined_editor_switches_keep_familiar_search_terms() {
+        let settings = editor_options(
+            false,
+            false,
+            EditorSyntaxTheme::default(),
+            |_| (),
+            |_| (),
+            |_| (),
+        );
+        for (index, queries) in [
+            (0, ["auto-save", "auto_save", "Save files automatically"]),
+            (1, ["word wrap", "word_wrap", "Wrap long lines"]),
+        ] {
+            for query in queries {
+                assert!(settings[index].matches("Editor", query), "{query}");
+            }
+        }
+    }
+
     #[test]
     fn settings_search_preserves_label_and_group_title_line_boxes() {
         use iced::advanced::{layout, widget::Tree};
