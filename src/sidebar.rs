@@ -4746,6 +4746,10 @@ impl NavigationCache {
 ///   nothing inside has asked for a new one. The window's layout holds only the
 ///   list's size; every call reaches the rows through the kept layout, placed
 ///   where the window put the list.
+///
+/// A named state therefore cannot move between the list and the rest of the
+/// window. None needs to: only the list's scrollable is named on both sides,
+/// when the last project goes, and an empty list has nothing to scroll.
 mod cached_projects {
     use super::SidebarAction;
     use cosmic::{Element, Renderer, Theme, iced};
@@ -4793,10 +4797,11 @@ mod cached_projects {
         element: Element<'static, SidebarAction>,
         /// The element's Tree. Kept out of the tree children; see the module.
         tree: Tree,
+        /// The rows' layout, until they are rebuilt; the window lays the new
+        /// rows out before anything else reaches them.
         layout: Option<Kept>,
-        /// The rows asked for a new layout, or were rebuilt. Until the window
-        /// lays out again, the rows keep using the kept one, as the window
-        /// keeps using its own.
+        /// The rows asked for a new layout. Until the window lays out again,
+        /// they keep using the kept one, as the window keeps using its own.
         stale: bool,
     }
 
@@ -4819,7 +4824,8 @@ mod cached_projects {
         /// among this list's own widgets. States of rows that are gone are
         /// dropped with the scope; the window's own extracted states, which
         /// the runtime is still reconciling around this widget, are put back
-        /// untouched.
+        /// untouched. The old rows' layout goes with them, before the new rows
+        /// are laid out, so the new layout can reuse its memory.
         fn rebuild(
             &mut self,
             dependency: Dependency,
@@ -4833,8 +4839,24 @@ mod cached_projects {
             NAMED.with(|cell| *cell.borrow_mut() = window);
             self.element = element;
             self.dependency = dependency;
-            self.stale = true;
+            self.layout = None;
         }
+    }
+
+    /// Runs `update` and says whether it asked for a new layout, apart from any
+    /// request made before it, which is left as it was.
+    fn requests_layout(
+        shell: &mut Shell<'_, SidebarAction>,
+        update: impl FnOnce(&mut Shell<'_, SidebarAction>),
+    ) -> bool {
+        let mut earlier = false;
+        shell.revalidate_layout(|| earlier = true);
+        update(shell);
+        let requested = shell.is_layout_invalid();
+        if earlier {
+            shell.invalidate_layout();
+        }
+        requested
     }
 
     impl Widget<SidebarAction, Theme, Renderer> for CachedProjects<'_> {
@@ -4886,8 +4908,8 @@ mod cached_projects {
                 _ => {
                     #[cfg(test)]
                     LAYOUTS.with(|layouts| layouts.set(layouts.get() + 1));
-                    // Free the old rows' layout first, as the window frees its
-                    // own before laying out again, so the new one reuses it.
+                    // Free the stale layout first, as the window frees its own
+                    // before laying out again, so the new one reuses it.
                     state.layout = None;
                     let node =
                         state
@@ -4944,27 +4966,20 @@ mod cached_projects {
             else {
                 return;
             };
-            // Learn whether a row asked for a new layout, such as a hovered
-            // row making room for its actions, apart from any widget before
-            // this one, and leave the window's own request as it was.
-            let mut window_invalid = false;
-            shell.revalidate_layout(|| window_invalid = true);
-            element.as_widget_mut().update(
-                child,
-                event,
-                kept.place(layout),
-                cursor,
-                renderer,
-                clipboard,
-                shell,
-                viewport,
-            );
-            if shell.is_layout_invalid() {
-                *stale = true;
-            }
-            if window_invalid {
-                shell.invalidate_layout();
-            }
+            // A row may ask for a new layout, such as a hovered row making
+            // room for its actions.
+            *stale |= requests_layout(shell, |shell| {
+                element.as_widget_mut().update(
+                    child,
+                    event,
+                    kept.place(layout),
+                    cursor,
+                    renderer,
+                    clipboard,
+                    shell,
+                    viewport,
+                );
+            });
         }
 
         fn mouse_interaction(
@@ -5128,17 +5143,12 @@ mod cached_projects {
             clipboard: &mut dyn Clipboard,
             shell: &mut Shell<'_, SidebarAction>,
         ) {
-            let mut window_invalid = false;
-            shell.revalidate_layout(|| window_invalid = true);
-            self.content
-                .as_overlay_mut()
-                .update(event, layout, cursor, renderer, clipboard, shell);
-            if shell.is_layout_invalid() {
-                *self.stale = true;
-            }
-            if window_invalid {
-                shell.invalidate_layout();
-            }
+            let content = &mut self.content;
+            *self.stale |= requests_layout(shell, |shell| {
+                content
+                    .as_overlay_mut()
+                    .update(event, layout, cursor, renderer, clipboard, shell);
+            });
         }
 
         fn mouse_interaction(
@@ -19860,6 +19870,8 @@ pub(crate) mod tests {
         use cosmic::iced::{
             Event, Point, Vector,
             advanced::{Shell, clipboard, mouse, widget::operation},
+            time::Instant,
+            window,
         };
         let renderer = headless_renderer();
         let model = SidebarModel::ready(SidebarMode::Expanded, vec![display_project()]);
@@ -19954,7 +19966,9 @@ pub(crate) mod tests {
             "hovering a row with a quick action relays the list"
         );
 
-        // Keyboard focus onto a channel row reveals its quick action too.
+        // Keyboard focus onto a channel row reveals its quick action too. The
+        // window moves focus with an operation, which has no shell, and then
+        // redraws: that redraw must ask for the layout that reveals it.
         let channel = ChannelId::from_uuid(Uuid::from_u128(91));
         let focus = selection_row_focus_id(SelectionRow::Channel(channel));
         for (element, tree, node) in [
@@ -19970,9 +19984,7 @@ pub(crate) mod tests {
             let mut shell = Shell::new(&mut messages);
             element.as_widget_mut().update(
                 tree,
-                &Event::Mouse(mouse::Event::CursorMoved {
-                    position: Point::new(-10.0, -10.0),
-                }),
+                &Event::Window(window::Event::RedrawRequested(Instant::now())),
                 Layout::new(node),
                 mouse::Cursor::Unavailable,
                 &renderer,
@@ -19980,6 +19992,7 @@ pub(crate) mod tests {
                 &mut shell,
                 &viewport,
             );
+            assert!(shell.is_layout_invalid(), "the redraw after focus relays");
         }
         let before = bounds(cached_projects::content_layout(&cached_tree));
         cached_node = cached
@@ -20080,6 +20093,131 @@ pub(crate) mod tests {
             &layout::Limits::new(Size::ZERO, Size::new(320.0, 640.0)),
         ));
         assert_eq!(layouts() - start, 3, "a rebuilt list is laid out again");
+    }
+
+    /// A row's overlay, such as its menu, handles events apart from the list's
+    /// own update. When it asks for a new layout, the list lays its rows out
+    /// again too, and still reports the request to the window.
+    #[test]
+    fn cached_project_list_relays_when_a_row_overlay_asks() {
+        use cosmic::iced::{
+            Event, Length, Point, Vector,
+            advanced::{Clipboard, Shell, Widget, clipboard, mouse, overlay, renderer},
+        };
+        use cosmic::{Renderer, Theme};
+
+        /// A row whose overlay asks for a new layout on every event.
+        struct Row;
+        struct Menu;
+        impl Widget<SidebarAction, Theme, Renderer> for Row {
+            fn size(&self) -> Size<Length> {
+                Size::new(Length::Fill, Length::Fixed(20.0))
+            }
+            fn layout(
+                &mut self,
+                _: &mut Tree,
+                _: &Renderer,
+                limits: &layout::Limits,
+            ) -> layout::Node {
+                layout::Node::new(limits.resolve(Length::Fill, Length::Fixed(20.0), Size::ZERO))
+            }
+            fn draw(
+                &self,
+                _: &Tree,
+                _: &mut Renderer,
+                _: &Theme,
+                _: &renderer::Style,
+                _: Layout<'_>,
+                _: mouse::Cursor,
+                _: &Rectangle,
+            ) {
+            }
+            fn overlay<'a>(
+                &'a mut self,
+                _: &'a mut Tree,
+                _: Layout<'a>,
+                _: &Renderer,
+                _: &Rectangle,
+                _: Vector,
+            ) -> Option<overlay::Element<'a, SidebarAction, Theme, Renderer>> {
+                Some(overlay::Element::new(Box::new(Menu)))
+            }
+        }
+        impl overlay::Overlay<SidebarAction, Theme, Renderer> for Menu {
+            fn layout(&mut self, _: &Renderer, bounds: Size) -> layout::Node {
+                layout::Node::new(bounds)
+            }
+            fn draw(
+                &self,
+                _: &mut Renderer,
+                _: &Theme,
+                _: &renderer::Style,
+                _: Layout<'_>,
+                _: mouse::Cursor,
+            ) {
+            }
+            fn update(
+                &mut self,
+                _: &Event,
+                _: Layout<'_>,
+                _: mouse::Cursor,
+                _: &Renderer,
+                _: &mut dyn Clipboard,
+                shell: &mut Shell<'_, SidebarAction>,
+            ) {
+                shell.invalidate_layout();
+            }
+        }
+
+        let renderer = headless_renderer();
+        let viewport = Rectangle::with_size(Size::new(280.0, 640.0));
+        let limits = layout::Limits::new(Size::ZERO, viewport.size());
+        let mut element = cached_projects::view((1, false, false), || Element::new(Row));
+        let mut tree = Tree::new(&element);
+        let layouts = || cached_projects::LAYOUTS.with(std::cell::Cell::get);
+        let start = layouts();
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        drop(
+            element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits),
+        );
+        assert_eq!(layouts() - start, 1);
+
+        let mut messages = Vec::new();
+        let mut shell = Shell::new(&mut messages);
+        {
+            let mut menu = element
+                .as_widget_mut()
+                .overlay(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &viewport,
+                    Vector::ZERO,
+                )
+                .expect("the row's overlay is forwarded");
+            let menu_node = menu.as_overlay_mut().layout(&renderer, viewport.size());
+            menu.as_overlay_mut().update(
+                &Event::Mouse(mouse::Event::CursorMoved {
+                    position: Point::new(4.0, 4.0),
+                }),
+                Layout::new(&menu_node),
+                mouse::Cursor::Available(Point::new(4.0, 4.0)),
+                &renderer,
+                &mut clipboard::Null,
+                &mut shell,
+            );
+        }
+        assert!(shell.is_layout_invalid(), "the window lays out again");
+        drop(
+            element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits),
+        );
+        assert_eq!(layouts() - start, 2, "and so does the list");
     }
 
     /// A pane drag that is cancelled while it highlights a channel, as when a

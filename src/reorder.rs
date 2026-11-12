@@ -291,6 +291,22 @@ thread_local! {
     static CANCELLING_CHANNEL_GESTURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Runs `diff` with the channel gesture cancelled if `cancel` is set or an
+/// enclosing scope already cancelled it, restoring the enclosing value after,
+/// even when `diff` unwinds.
+fn cancelling_channel_gesture<T>(cancel: bool, diff: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CANCELLING_CHANNEL_GESTURE.set(self.0);
+        }
+    }
+    let outer = CANCELLING_CHANNEL_GESTURE.get();
+    let _restore = Restore(outer);
+    CANCELLING_CHANNEL_GESTURE.set(outer || cancel);
+    diff()
+}
+
 /// A cancelled channel gesture is cleared from every tree under its scope,
 /// during the scope's diff, since a modal may keep the base from seeing
 /// another event. A widget that keeps a child Tree out of its tree children,
@@ -328,10 +344,7 @@ pub(crate) mod channel_gesture_tests {
 
     /// Runs `diff` as a channel scope cancelling its gesture runs it.
     pub(crate) fn cancelling<T>(diff: impl FnOnce() -> T) -> T {
-        let outer = CANCELLING_CHANNEL_GESTURE.replace(true);
-        let result = diff();
-        CANCELLING_CHANNEL_GESTURE.set(outer);
-        result
+        super::cancelling_channel_gesture(true, diff)
     }
 }
 
@@ -374,10 +387,9 @@ impl<Message> Widget<Message, Theme, Renderer> for Reorder<'_, Message> {
         }
         let cancel_channel = matches!(&self.kind, Kind::ChannelScope { generation, enabled, .. }
             if !enabled || state.channel_drag.as_ref().is_some_and(|drag| drag.generation != *generation));
-        let outer = CANCELLING_CHANNEL_GESTURE.get();
-        CANCELLING_CHANNEL_GESTURE.set(outer || cancel_channel);
-        tree.diff_children(std::slice::from_mut(&mut self.content));
-        CANCELLING_CHANNEL_GESTURE.set(outer);
+        cancelling_channel_gesture(cancel_channel, || {
+            tree.diff_children(std::slice::from_mut(&mut self.content));
+        });
         if cancel_channel {
             // A modal overlay can consume release without updating the base tree.
             clear_channel_gesture(tree);
