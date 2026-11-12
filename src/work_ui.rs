@@ -1869,6 +1869,17 @@ mod tests {
             Cache::new(),
             &mut renderer,
         );
+        // The runtime redraws before any input arrives; a scrollable's first
+        // redraw records its viewport.
+        let _ = ui.update(
+            &[iced::Event::Window(iced::window::Event::RedrawRequested(
+                iced::time::Instant::now(),
+            ))],
+            iced::mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut Vec::new(),
+        );
         // Within the second lane, In progress, where the cards are.
         let position = iced::Point::new(440.0, 400.0);
         let _ = ui.update(

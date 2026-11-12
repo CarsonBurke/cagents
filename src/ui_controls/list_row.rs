@@ -60,6 +60,13 @@ pub fn row_label<'a, Message: 'a>(label: impl Into<Cow<'a, str>> + 'a) -> Elemen
 }
 
 impl<'a, Message: Clone + 'a> ListRow<'a, Message> {
+    /// Replaces the icon with other content for the icon column, such as a
+    /// glyph tinted by the state it shows. It is centred in the column.
+    pub fn icon_element(mut self, icon: impl Into<Element<'a, Message>>) -> Self {
+        self.icon = Some(icon.into());
+        self
+    }
+
     /// Replaces the label with other one-line content, such as a label with
     /// its search matches marked. It is centred like the plain label.
     pub fn label(mut self, label: impl Into<Element<'a, Message>>) -> Self {
@@ -122,6 +129,13 @@ impl<'a, Message: Clone + 'a> ListRow<'a, Message> {
 
     pub fn on_press(mut self, message: Message) -> Self {
         self.on_press = Some(message);
+        self
+    }
+
+    /// Presses send `message` when there is one; without one the row is
+    /// drawn disabled.
+    pub fn on_press_maybe(mut self, message: Option<Message>) -> Self {
+        self.on_press = message;
         self
     }
 

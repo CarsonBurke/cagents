@@ -2820,6 +2820,13 @@ pub struct SidebarState {
     expanded_worktree_groups: BTreeSet<ProjectId>,
     selection: Option<SidebarSelection>,
     active_worktree: Option<ActiveWorktreeKey>,
+    /// The worktree focus names, which the list draws as current. It is the
+    /// panel's worktree unless [`Self::pin_panel_worktree`] binds the panel
+    /// to another one.
+    followed_worktree: Option<ActiveWorktreeKey>,
+    /// A worktree the panel shows in place of the one focus names, such as
+    /// the one chosen in the context inspector.
+    panel_pin: Option<PathBuf>,
     channel_selected: bool,
     /// Sections toggled away from their default. Storing the toggles rather
     /// than the open set keeps `default()` meaningful: `Changes` starts open
@@ -3791,10 +3798,19 @@ impl SidebarState {
         self.active_worktree.as_ref()
     }
 
-    /// The row the list draws as current: the worktree the source-control
-    /// panel is bound to, otherwise the user's selection.
+    /// Binds the source-control and file panels to the worktree at `path`
+    /// rather than the one focus names, or follows focus again with `None`.
+    /// The list's selection keeps following focus either way. Takes effect at
+    /// the next [`Self::sync_active_worktree`].
+    pub fn pin_panel_worktree(&mut self, path: Option<PathBuf>) {
+        self.panel_pin = path;
+    }
+
+    /// The row the list draws as current: the worktree focus names,
+    /// otherwise the user's selection.
     fn drawn_selection(&self) -> Option<SidebarSelection> {
-        self.active_worktree()
+        self.followed_worktree
+            .as_ref()
             .map(|key| SidebarSelection::Worktree {
                 project_id: key.project_id,
                 worktree_id: key.worktree_id,
@@ -3875,15 +3891,19 @@ impl SidebarState {
     ///
     /// Returns true when the bound worktree changed, which is the application's
     /// signal to load a snapshot for the new one.
+    ///
+    /// A pinned worktree binds the panel instead while it still exists; the
+    /// list's selection and disclosure follow focus regardless, so choosing a
+    /// worktree for the panel never moves the list.
     pub fn sync_active_worktree(&mut self, model: &SidebarModel, focus: &SidebarFocus) -> bool {
-        let next = match focus.path().and_then(|path| model.worktree_at(path)) {
+        let followed = match focus.path().and_then(|path| model.worktree_at(path)) {
             Some(key) => Some(key),
             None => self
-                .active_worktree
+                .followed_worktree
                 .clone()
                 .filter(|key| model.contains_worktree(key)),
         };
-        self.selection = next.as_ref().map(|key| {
+        self.selection = followed.as_ref().map(|key| {
             if model
                 .project(key.project_id)
                 .is_some_and(|project| project.kind == ProjectKind::Folder)
@@ -3897,8 +3917,8 @@ impl SidebarState {
             }
         });
         if !self.channel_selected
-            && self.active_worktree != next
-            && let Some(key) = &next
+            && self.followed_worktree != followed
+            && let Some(key) = &followed
             && model.project(key.project_id).is_some_and(|project| {
                 project.worktrees.iter().any(|worktree| {
                     worktree.id == key.worktree_id
@@ -3909,6 +3929,12 @@ impl SidebarState {
             self.expanded_worktree_groups.insert(key.project_id);
             self.collapsed_projects.remove(&key.project_id);
         }
+        let pinned = self
+            .panel_pin
+            .as_deref()
+            .and_then(|path| model.worktree_at(path));
+        let next = pinned.or_else(|| followed.clone());
+        self.followed_worktree = followed;
         if self.active_worktree == next {
             return false;
         }
@@ -4628,7 +4654,7 @@ struct NavigationSnapshot {
     worktree_display_overrides: BTreeMap<ProjectId, crate::settings::SidebarWorktrees>,
     expanded_worktree_groups: BTreeSet<ProjectId>,
     selection: Option<SidebarSelection>,
-    active_worktree: Option<ActiveWorktreeKey>,
+    followed_worktree: Option<ActiveWorktreeKey>,
     channel_selected: bool,
     worktree_sort: crate::settings::WorktreeSort,
     hide_worktree_changes_icons: bool,
@@ -4654,7 +4680,7 @@ impl NavigationSnapshot {
             && self.worktree_display_overrides == state.worktree_display_overrides
             && self.expanded_worktree_groups == state.expanded_worktree_groups
             && self.selection == state.selection
-            && self.active_worktree == state.active_worktree
+            && self.followed_worktree == state.followed_worktree
             && self.channel_selected == state.channel_selected
             && self.worktree_sort == state.worktree_sort
             && self.hide_worktree_changes_icons == state.hide_worktree_changes_icons
@@ -4680,7 +4706,7 @@ impl NavigationSnapshot {
             worktree_display_overrides: state.worktree_display_overrides.clone(),
             expanded_worktree_groups: state.expanded_worktree_groups.clone(),
             selection: state.selection,
-            active_worktree: state.active_worktree.clone(),
+            followed_worktree: state.followed_worktree.clone(),
             channel_selected: state.channel_selected,
             worktree_sort: state.worktree_sort,
             hide_worktree_changes_icons: state.hide_worktree_changes_icons,
@@ -5405,7 +5431,8 @@ pub(crate) fn selected_project<'a>(
     state: &SidebarState,
 ) -> Option<&'a SidebarProject> {
     let project_id = state
-        .active_worktree()
+        .followed_worktree
+        .as_ref()
         .map(|key| key.project_id)
         .or_else(|| {
             state.selection.map(|selection| match selection {
@@ -14320,7 +14347,7 @@ pub(crate) mod tests {
         let mut state = SidebarState::default();
         let cache = NavigationCache::default();
         let mut previous = cache.generation(&model, &state);
-        state.active_worktree = Some(main_key());
+        state.followed_worktree = Some(main_key());
         let next = cache.generation(&model, &state);
         assert_ne!(previous, next);
         previous = next;
@@ -15064,7 +15091,7 @@ pub(crate) mod tests {
             !visible_selection_rows(&model, &state, true).contains(&row),
             "an idle worktree is off the rail"
         );
-        state.active_worktree = Some(ActiveWorktreeKey {
+        state.followed_worktree = Some(ActiveWorktreeKey {
             project_id: project,
             worktree_id: worktree.id,
             canonical_path: worktree.path.clone(),
@@ -23586,6 +23613,47 @@ pub(crate) mod tests {
         assert!(state.sync_active_worktree(&emptied, &SidebarFocus::None));
         assert_eq!(state.active_worktree(), None);
         assert!(bound_source_control(&emptied, &state).is_none());
+    }
+
+    #[test]
+    fn a_pinned_panel_worktree_binds_the_panel_without_moving_the_list() {
+        let model = panel_model();
+        let mut state = SidebarState::default();
+        assert!(state.sync_active_worktree(&model, &focus_on(&main_key())));
+        let selected = state.selection;
+        let drawn = state.drawn_selection();
+
+        state.pin_panel_worktree(Some(fix_key().canonical_path));
+        assert!(state.sync_active_worktree(&model, &focus_on(&main_key())));
+        assert_eq!(state.active_worktree(), Some(&fix_key()));
+        // The list still draws, and acts on, what focus names.
+        assert_eq!(state.selection, selected);
+        assert_eq!(state.drawn_selection(), drawn);
+        assert_eq!(
+            selected_project(&model, &state).map(|project| project.id),
+            Some(main_key().project_id)
+        );
+
+        // Focus moving keeps the pinned panel; the list follows focus.
+        assert!(!state.sync_active_worktree(&model, &focus_on(&fix_key())));
+        assert_eq!(
+            state.drawn_selection(),
+            Some(SidebarSelection::Worktree {
+                project_id: fix_key().project_id,
+                worktree_id: fix_key().worktree_id,
+            })
+        );
+
+        // Unpinned, the panel follows focus again.
+        state.pin_panel_worktree(None);
+        assert!(state.sync_active_worktree(&model, &focus_on(&main_key())));
+        assert_eq!(state.active_worktree(), Some(&main_key()));
+
+        // A pin to a worktree no project lists falls back to focus, not to
+        // the worktree bound before.
+        state.pin_panel_worktree(Some(PathBuf::from("/nowhere")));
+        assert!(!state.sync_active_worktree(&model, &focus_on(&main_key())));
+        assert_eq!(state.active_worktree(), Some(&main_key()));
     }
 
     #[test]
