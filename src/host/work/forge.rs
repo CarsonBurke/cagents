@@ -1,6 +1,7 @@
 //! The user's pull requests in each GitHub repository, read by bounded `gh`
 //! calls on a thread of their own, so a slow or failing GitHub never delays a
-//! local scan. Two listings serve every card of a repository; a checked-out
+//! local scan. One GraphQL document serves every card of a repository, read
+//! only when a free conditional probe says it may have changed; a checked-out
 //! branch whose pull request someone else opened costs one cached lookup.
 use std::{
     collections::BTreeMap,
@@ -12,10 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use super::scan::ForgeHints;
 use crate::{
-    github::{
-        AuthoredPullRequestsRequest, GitHubRepoKey, GitHubService, PullRequest,
-        PullRequestStateFilter, remote_repository_key,
-    },
+    github::{GitHubRepoKey, GitHubService, PullRequest, Revalidation, remote_repository_key},
     repository::{CancellationToken, RepositoryService},
 };
 
@@ -29,6 +27,14 @@ const OTHERS_PER_POLL: usize = 4;
 const OTHERS_FOUND_FOR: Duration = Duration::from_secs(15 * 60);
 const OTHERS_MISSING_FOR: Duration = Duration::from_secs(30 * 60);
 const REPOSITORY_FOR: Duration = Duration::from_secs(60 * 60);
+/// Checks GitHub doesn't date are read again at least this often while
+/// someone reads the project, such as a rerun of a finished check.
+const RELIST_WATCHED: Duration = Duration::from_secs(5 * 60);
+const RELIST_UNWATCHED: Duration = Duration::from_secs(30 * 60);
+/// How long after a push a pull request with no checks may still get some.
+const CHECKS_START_WITHIN: Duration = Duration::from_secs(10 * 60);
+/// A probe that failed for any reason but quota is retried after this.
+const PROBE_UNAVAILABLE_FOR: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Snapshot {
@@ -81,6 +87,17 @@ impl Snapshot {
     }
 }
 
+/// How current a poll must make the listing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Freshness {
+    /// Nobody reads the project: merges and pins only.
+    Unwatched,
+    /// Someone reads the project.
+    Watched,
+    /// Someone asked for a refresh: read the listing whatever the probe says.
+    Fresh,
+}
+
 /// What a poll needs to know about the project.
 #[derive(Debug, Clone)]
 pub(super) struct Target {
@@ -98,6 +115,28 @@ pub(super) struct Memory {
     /// Branch to when someone else's pull request was last looked up, at
     /// which head, and what was found.
     others: BTreeMap<String, (Instant, String, Option<PullRequest>)>,
+    listing: Option<Listing>,
+}
+
+/// The last listing read, and how to ask whether it is still current.
+#[derive(Debug, Clone)]
+struct Listing {
+    repository: GitHubRepoKey,
+    at: Instant,
+    pull_requests: Vec<PullRequest>,
+    /// Who `@me` was, whose pull requests the probe asks about.
+    viewer: String,
+    probe: Probe,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Probe {
+    /// No validator yet: the next probe establishes one.
+    Unknown,
+    Validator(String),
+    /// The repository can't be probed, such as one with issues disabled;
+    /// its listing is read every poll until then.
+    Unavailable(Instant),
 }
 
 #[derive(Debug)]
@@ -110,9 +149,10 @@ pub(super) enum Outcome {
 pub(super) fn poll(
     target: &Target,
     memory: &mut Memory,
+    freshness: Freshness,
     cancellation: &CancellationToken,
 ) -> Outcome {
-    match read(target, memory, cancellation) {
+    match read(target, memory, freshness, cancellation) {
         Ok(Some(snapshot)) => Outcome::Synced(snapshot),
         Ok(None) => Outcome::NotGitHub,
         Err(error) => Outcome::Failed(error),
@@ -122,6 +162,7 @@ pub(super) fn poll(
 fn read(
     target: &Target,
     memory: &mut Memory,
+    freshness: Freshness,
     cancellation: &CancellationToken,
 ) -> Result<Option<Snapshot>, String> {
     let git = RepositoryService::system("git");
@@ -161,35 +202,7 @@ fn read(
         keys.push(repository.clone());
     }
 
-    let request = |state, limit, review| AuthoredPullRequestsRequest {
-        repository: repository.clone(),
-        state,
-        limit,
-        review,
-    };
-    let (authored, open) = std::thread::scope(|scope| {
-        let open = scope.spawn(|| {
-            gh.list_authored(
-                &request(PullRequestStateFilter::Open, OPEN, true),
-                cancellation,
-            )
-        });
-        let authored = gh.list_authored(
-            &request(PullRequestStateFilter::All, AUTHORED, false),
-            cancellation,
-        );
-        (
-            authored,
-            open.join().unwrap_or_else(|_| {
-                Err(crate::github::GitHubError::Inspection(
-                    "the open pull request listing panicked".into(),
-                ))
-            }),
-        )
-    });
-    let authored = authored.map_err(|error| error.to_string())?;
-    let open = open.map_err(|error| error.to_string())?;
-    let pull_requests = merge(authored, open);
+    let pull_requests = listing(&gh, &repository, memory, freshness, cancellation)?;
 
     let mut snapshot = Snapshot {
         repository: repository.clone(),
@@ -247,8 +260,125 @@ fn read(
     Ok(Some(snapshot))
 }
 
+/// The user's pull requests, read again only when GitHub says they may have
+/// changed. A pull request's `updatedAt`, which the probe watches, moves with
+/// pushes, reviews, comments, edits, merges and closes, but not with its
+/// checks, so a listing whose checks are still settling is read every poll,
+/// and any listing is read again once it is `relist_after` old.
+fn listing<E: crate::repository::ProcessExecutor>(
+    gh: &GitHubService<E>,
+    repository: &GitHubRepoKey,
+    memory: &mut Memory,
+    freshness: Freshness,
+    cancellation: &CancellationToken,
+) -> Result<Vec<PullRequest>, String> {
+    let previous = memory
+        .listing
+        .take()
+        .filter(|listing| listing.repository == *repository);
+    // Asked before the listing is read, so a change landing between the two
+    // shows as a change next time rather than hiding under a new validator.
+    let probed = previous.as_ref().and_then(|listing| {
+        let validator = match &listing.probe {
+            Probe::Unavailable(at) if at.elapsed() < PROBE_UNAVAILABLE_FOR => return None,
+            Probe::Validator(etag) => Some(etag.as_str()),
+            Probe::Unknown | Probe::Unavailable(_) => None,
+        };
+        Some(
+            match gh.revalidate(
+                repository,
+                &probe_path(repository, &listing.viewer),
+                validator,
+                cancellation,
+            ) {
+                Ok(Revalidation::NotModified) => (true, listing.probe.clone()),
+                Ok(Revalidation::Modified { etag }) => {
+                    (false, etag.map_or(Probe::Unknown, Probe::Validator))
+                }
+                // Out of REST quota, GraphQL may still answer; the probe is
+                // asked again next poll.
+                Err(error) if error.rate_limit().is_some() => (false, Probe::Unknown),
+                Err(_) => (false, Probe::Unavailable(Instant::now())),
+            },
+        )
+    });
+    let current = matches!(probed, Some((true, _)))
+        && freshness != Freshness::Fresh
+        && previous.as_ref().is_some_and(|listing| {
+            listing.at.elapsed() < relist_after(freshness) && !settling(&listing.pull_requests)
+        });
+    let (previous, probed) = match (current, previous, probed) {
+        (true, Some(mut listing), Some((_, probe))) => {
+            listing.probe = probe;
+            let pull_requests = listing.pull_requests.clone();
+            memory.listing = Some(listing);
+            return Ok(pull_requests);
+        }
+        (_, previous, probed) => (previous, probed),
+    };
+    let read = gh
+        .authored_pull_requests(repository, OPEN, AUTHORED, cancellation)
+        .map_err(|error| error.to_string())?;
+    let probe = match (previous, probed) {
+        // A validator is for one viewer's pull requests.
+        (Some(previous), Some((_, probe))) if previous.viewer == read.viewer => probe,
+        (Some(previous), None) if previous.viewer == read.viewer => previous.probe,
+        _ => Probe::Unknown,
+    };
+    let pull_requests = merge(read.all, read.open);
+    memory.listing = Some(Listing {
+        repository: repository.clone(),
+        at: Instant::now(),
+        pull_requests: pull_requests.clone(),
+        viewer: read.viewer,
+        probe,
+    });
+    Ok(pull_requests)
+}
+
+/// The viewer's most recently updated issue or pull request in the
+/// repository. Unlike a pull request listing, whose rows embed the
+/// repository and change with any push to it, an issue row changes only
+/// with the issue or pull request itself.
+fn probe_path(repository: &GitHubRepoKey, viewer: &str) -> String {
+    format!(
+        "repos/{}/{}/issues?creator={viewer}&state=all&sort=updated&direction=desc&per_page=1",
+        repository.owner, repository.name
+    )
+}
+
+fn relist_after(freshness: Freshness) -> Duration {
+    match freshness {
+        Freshness::Unwatched => RELIST_UNWATCHED,
+        Freshness::Watched | Freshness::Fresh => RELIST_WATCHED,
+    }
+}
+
+/// Whether an open pull request's checks may still change without its
+/// `updatedAt` moving: some are pending, or none have reported yet for a
+/// pull request updated so lately that its CI may not have started.
+fn settling(pull_requests: &[PullRequest]) -> bool {
+    let recent = |pull_request: &PullRequest| {
+        pull_request
+            .updated_at
+            .parse::<jiff::Timestamp>()
+            .is_ok_and(|updated| {
+                jiff::Timestamp::now().duration_since(updated)
+                    < jiff::SignedDuration::try_from(CHECKS_START_WITHIN).unwrap_or_default()
+            })
+    };
+    pull_requests
+        .iter()
+        .filter(|pull_request| pull_request.state.0 == "OPEN")
+        .any(|pull_request| {
+            let checks = pull_request.check_summaries();
+            checks.iter().any(|check| check.bucket.0 == "pending")
+                || (checks.is_empty() && recent(pull_request))
+        })
+}
+
 /// One list, newest first, in which an open pull request's entry carries the
-/// review and check state its second listing read.
+/// review and check state its second search read.
 fn merge(authored: Vec<PullRequest>, open: Vec<PullRequest>) -> Vec<PullRequest> {
     let mut open = open
         .into_iter()
@@ -297,8 +427,13 @@ pub(super) fn interval(watched: bool, failures: u32) -> Duration {
 mod tests {
     use std::collections::BTreeSet;
 
+    use std::sync::Arc;
+
     use super::*;
-    use crate::github::RemoteValue;
+    use crate::{
+        github::RemoteValue,
+        repository::{CommandSpec, ProcessExecutor, ProcessFailure, ProcessOutput},
+    };
 
     fn pull_request(
         number: u64,
@@ -382,6 +517,199 @@ mod tests {
             [2, 1, 9]
         );
         assert_eq!(merged[0], reviewed);
+    }
+
+    /// A forge answering the probe and the authored listing, counting each.
+    struct Forge {
+        etag: std::sync::Mutex<String>,
+        pending: std::sync::atomic::AtomicBool,
+        probe_fails: std::sync::atomic::AtomicBool,
+        calls: std::sync::Mutex<Vec<&'static str>>,
+    }
+
+    impl Forge {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                etag: std::sync::Mutex::new("W/\"1\"".into()),
+                pending: false.into(),
+                probe_fails: false.into(),
+                calls: Default::default(),
+            })
+        }
+
+        fn take(&self) -> Vec<&'static str> {
+            std::mem::take(&mut self.calls.lock().unwrap())
+        }
+    }
+
+    impl ProcessExecutor for Forge {
+        fn execute(
+            &self,
+            command: &CommandSpec,
+            _: &CancellationToken,
+        ) -> Result<ProcessOutput, ProcessFailure> {
+            use std::sync::atomic::Ordering;
+            let arguments = command
+                .arguments
+                .iter()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            let output = |success, stdout: String| {
+                Ok(ProcessOutput {
+                    success,
+                    exit_code: Some(if success { 0 } else { 1 }),
+                    signal: None,
+                    stdout: stdout.into_bytes(),
+                    stderr: vec![],
+                })
+            };
+            if arguments.iter().any(|argument| argument == "graphql") {
+                self.calls.lock().unwrap().push("listing");
+                let checks = if self.pending.load(Ordering::SeqCst) {
+                    "IN_PROGRESS"
+                } else {
+                    "COMPLETED"
+                };
+                let mut open = serde_json::to_value(pull_request(
+                    1,
+                    "feature",
+                    "a",
+                    "OPEN",
+                    "2026-01-01T00:00:00Z",
+                ))
+                .unwrap();
+                open["commits"] = serde_json::json!({"nodes": [{"commit": {"statusCheckRollup": {"contexts": {"nodes": [
+                    {"__typename": "CheckRun", "name": "ci", "status": checks, "conclusion": "SUCCESS"}
+                ]}}}}]});
+                let body = serde_json::json!({"data": {
+                    "viewer": {"login": "me"},
+                    "open": {"nodes": [open]},
+                    "all": {"nodes": []},
+                }});
+                return output(true, format!("HTTP/2.0 200 OK\r\n\r\n{body}"));
+            }
+            self.calls.lock().unwrap().push("probe");
+            assert!(
+                arguments
+                    .last()
+                    .is_some_and(|path| path.starts_with("repos/me/repo/issues?creator=me&"))
+            );
+            if self.probe_fails.load(Ordering::SeqCst) {
+                return output(false, "HTTP/2.0 410 Gone\r\n\r\n{}".into());
+            }
+            let etag = self.etag.lock().unwrap().clone();
+            if arguments.contains(&format!("If-None-Match: {etag}")) {
+                return output(false, "HTTP/2.0 304 Not Modified\r\n\r\n".into());
+            }
+            output(true, format!("HTTP/2.0 200 OK\r\nEtag: {etag}\r\n\r\n[]"))
+        }
+    }
+
+    #[test]
+    fn an_unchanged_listing_costs_a_free_probe_until_its_checks_or_age_say_otherwise() {
+        use std::sync::atomic::Ordering;
+        let forge = Forge::new();
+        let gh = GitHubService::new("gh", forge.clone());
+        let repository = key("me");
+        let cancellation = CancellationToken::new();
+        let mut memory = Memory::default();
+        let mut poll = |freshness| {
+            listing(&gh, &repository, &mut memory, freshness, &cancellation).unwrap();
+            forge.take()
+        };
+
+        // Nothing to compare with yet, then a validator to establish.
+        assert_eq!(poll(Freshness::Watched), ["listing"]);
+        assert_eq!(poll(Freshness::Watched), ["probe", "listing"]);
+        // Unchanged: the probe's 304 costs no rate limit and no listing.
+        assert_eq!(poll(Freshness::Watched), ["probe"]);
+        assert_eq!(poll(Freshness::Unwatched), ["probe"]);
+        // A refresh reads the listing whatever the probe says.
+        assert_eq!(poll(Freshness::Fresh), ["probe", "listing"]);
+        // A change GitHub dates.
+        *forge.etag.lock().unwrap() = "W/\"2\"".into();
+        assert_eq!(poll(Freshness::Watched), ["probe", "listing"]);
+        assert_eq!(poll(Freshness::Watched), ["probe"]);
+
+        // Pending checks change without the probe noticing.
+        forge.pending.store(true, Ordering::SeqCst);
+        assert_eq!(poll(Freshness::Fresh), ["probe", "listing"]);
+        assert_eq!(poll(Freshness::Watched), ["probe", "listing"]);
+        forge.pending.store(false, Ordering::SeqCst);
+        assert_eq!(poll(Freshness::Watched), ["probe", "listing"]);
+        assert_eq!(poll(Freshness::Watched), ["probe"]);
+        drop(poll);
+
+        // An old listing is read again: soon while watched, rarely unwatched.
+        let age = |memory: &mut Memory, by: Duration| {
+            let listing = memory.listing.as_mut().unwrap();
+            listing.at = Instant::now().checked_sub(by).unwrap();
+        };
+        age(&mut memory, RELIST_WATCHED);
+        listing(
+            &gh,
+            &repository,
+            &mut memory,
+            Freshness::Unwatched,
+            &cancellation,
+        )
+        .unwrap();
+        assert_eq!(forge.take(), ["probe"]);
+        age(&mut memory, RELIST_WATCHED);
+        listing(
+            &gh,
+            &repository,
+            &mut memory,
+            Freshness::Watched,
+            &cancellation,
+        )
+        .unwrap();
+        assert_eq!(forge.take(), ["probe", "listing"]);
+        age(&mut memory, RELIST_UNWATCHED);
+        listing(
+            &gh,
+            &repository,
+            &mut memory,
+            Freshness::Unwatched,
+            &cancellation,
+        )
+        .unwrap();
+        assert_eq!(forge.take(), ["probe", "listing"]);
+
+        // A repository that can't be probed is listed every poll, and asked
+        // again only after a while.
+        forge.probe_fails.store(true, Ordering::SeqCst);
+        listing(
+            &gh,
+            &repository,
+            &mut memory,
+            Freshness::Watched,
+            &cancellation,
+        )
+        .unwrap();
+        assert_eq!(forge.take(), ["probe", "listing"]);
+        listing(
+            &gh,
+            &repository,
+            &mut memory,
+            Freshness::Watched,
+            &cancellation,
+        )
+        .unwrap();
+        assert_eq!(forge.take(), ["listing"]);
+    }
+
+    #[test]
+    fn a_pull_request_without_checks_settles_once_ci_has_had_time_to_start() {
+        let mut fresh = pull_request(1, "a", "a", "OPEN", &jiff::Timestamp::now().to_string());
+        fresh.status_check_rollup = Some(vec![]);
+        assert!(settling(std::slice::from_ref(&fresh)));
+        let mut quiet = pull_request(1, "a", "a", "OPEN", "2026-01-01T00:00:00Z");
+        quiet.status_check_rollup = Some(vec![]);
+        assert!(!settling(&[quiet]));
+        let mut closed = fresh;
+        closed.state = RemoteValue("MERGED".into());
+        assert!(!settling(&[closed]));
     }
 
     #[test]

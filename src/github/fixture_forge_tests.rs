@@ -83,20 +83,11 @@ fn the_fixture_forge_reaches_ready_and_lists_nothing() {
         };
         assert!(service.list(&request, &cancellation).unwrap().is_empty());
     }
-    for review in [false, true] {
-        let request = AuthoredPullRequestsRequest {
-            repository: key.clone(),
-            state: PullRequestStateFilter::Open,
-            limit: 30,
-            review,
-        };
-        assert!(
-            service
-                .list_authored(&request, &cancellation)
-                .unwrap()
-                .is_empty()
-        );
-    }
+    let authored = service
+        .authored_pull_requests(&key, 50, 100, &cancellation)
+        .unwrap();
+    assert_eq!(authored.viewer, "fixture");
+    assert!(authored.open.is_empty() && authored.all.is_empty());
     let head = "a".repeat(40);
     assert!(
         service
@@ -196,17 +187,35 @@ fn the_fixture_forge_answers_with_a_seeded_pull_request() {
     let history = service.recent_history(&key, 50, &cancellation).unwrap();
     assert!(history[0].check_summaries().is_empty());
     let authored = service
-        .list_authored(
-            &AuthoredPullRequestsRequest {
-                repository: key.clone(),
-                state: PullRequestStateFilter::Open,
-                limit: 30,
-                review: true,
-            },
-            &cancellation,
-        )
+        .authored_pull_requests(&key, 50, 100, &cancellation)
         .unwrap();
-    assert_eq!(authored.len(), 1);
+    assert_eq!(authored.open.len(), 1);
+    assert_eq!(authored.all.len(), 1);
+    assert_eq!(authored.open[0].check_summaries()[0].state.0, "FAILURE");
+    assert_eq!(authored.all[0].status_check_rollup, None);
+
+    // The board's probe is unchanged until a seed it covers changes.
+    let probe = "repos/Fixture-Owner/fixture-app/issues?creator=fixture&state=all&sort=updated&direction=desc&per_page=1";
+    let Revalidation::Modified { etag: Some(etag) } = service
+        .revalidate(&key, probe, None, &cancellation)
+        .unwrap()
+    else {
+        panic!("the probe returns a validator");
+    };
+    assert_eq!(
+        service
+            .revalidate(&key, probe, Some(&etag), &cancellation)
+            .unwrap(),
+        Revalidation::NotModified
+    );
+    seeded_checks[0]["updatedAt"] = "2026-11-03T00:00:00Z".into();
+    std::fs::write(&forge.seed, seeded_checks.to_string()).unwrap();
+    assert!(matches!(
+        service
+            .revalidate(&key, probe, Some(&etag), &cancellation)
+            .unwrap(),
+        Revalidation::Modified { etag: Some(next) } if next != etag
+    ));
 
     let viewed = service
         .view(&PullRequestKey::new(key.clone(), 7).unwrap(), &cancellation)

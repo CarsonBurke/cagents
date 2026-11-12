@@ -280,6 +280,7 @@ pr() {
                 | .[:$limit]' | select_fields "$fields"
             ;;
         view | checks)
+            trace "pr $subcommand repository=$slug"
             case $number in
                 '' | *[!0-9]*) unsupported pr "$subcommand" "$number" ;;
             esac
@@ -299,11 +300,19 @@ pr() {
 
 api() {
     include=false method= endpoint= query= number= fields=false owner= name= limit=50
+    search_open= search_all= open_limit=50 all_limit=100 if_none_match=
     while [ "$#" -gt 0 ]; do
         case $1 in
             -i | --include) include=true ;;
             -X | --method) need "$#" "$1"; shift; method=$1 ;;
-            --hostname | -H | --header | --input | -q | --jq | -t | --template | --cache) need "$#" "$1"; shift ;;
+            -H | --header)
+                need "$#" "$1"
+                shift
+                case $1 in
+                    [Ii][Ff]-[Nn]one-[Mm]atch:*) if_none_match=$(printf '%s' "${1#*:}" | sed 's/^ *//') ;;
+                esac
+                ;;
+            --hostname | --input | -q | --jq | -t | --template | --cache) need "$#" "$1"; shift ;;
             -f | --raw-field | -F | --field)
                 need "$#" "$1"
                 shift
@@ -313,6 +322,10 @@ api() {
                     owner=*) owner=${1#owner=} ;;
                     name=*) name=${1#name=} ;;
                     limit=*) limit=${1#limit=} ;;
+                    open=*) search_open=${1#open=} ;;
+                    all=*) search_all=${1#all=} ;;
+                    openLimit=*) open_limit=${1#openLimit=} ;;
+                    allLimit=*) all_limit=${1#allLimit=} ;;
                 esac
                 fields=true
                 ;;
@@ -325,8 +338,29 @@ api() {
     if [ -z "$method" ]; then
         if "$fields"; then method=POST; else method=GET; fi
     fi
+    if [ "$endpoint" = graphql ] && [ -n "$search_all" ]; then
+        # The Work board's authored listing: both searches name the
+        # repository as repo:OWNER/NAME and the viewer as @me.
+        slug=$(printf '%s\n' "$search_all" | sed -nE 's#.*repo:([^ ]+).*#\1#p')
+        trace "api graphql CagentsAuthoredPullRequests repository=$slug"
+        check_seed
+        ! "$include" || headers '200 OK' graphql
+        seeded "$slug" | jq -c --arg login "$login" --argjson open "$open_limit" --argjson all "$all_limit" '
+            map(select(.author.login == $login)) | sort_by(.updatedAt) | reverse
+            | def identity: {number, title, state, isDraft, headRefName, headRefOid,
+                headRepository, headRepositoryOwner, baseRefName, updatedAt, url};
+            {data: {viewer: {login: $login},
+                open: {nodes: (map(select(.state == "OPEN")) | .[:$open] | map(identity + {
+                    reviewDecision, additions, deletions,
+                    commits: {nodes: [{commit: {statusCheckRollup:
+                        (if (.statusCheckRollup // [] | length) == 0 then null
+                         else {contexts: {nodes: .statusCheckRollup}} end)}}]}}))},
+                all: {nodes: (.[:$all] | map(identity))}}}'
+        return
+    fi
     if [ "$endpoint" = graphql ]; then
-        trace "api graphql repository=$owner/$name"
+        operation=$(printf '%s\n' "$query" | sed -nE '1s/^[[:space:]]*(query|mutation)[[:space:]]+([A-Za-z0-9_]+).*/\2/p')
+        trace "api graphql ${operation:-anonymous} repository=$owner/$name"
         case $query in
             'query SidebarPullRequests('* | 'query SidebarHistory('*)
                 check_seed
@@ -375,7 +409,32 @@ api() {
         esac
         return
     fi
+    trace "api $method ${endpoint%%\?*}"
     case $method:$endpoint in
+        GET:repos/*/issues\?*)
+            # The viewer's most recently updated issue or pull request, whose
+            # validator changes with the seeded pull requests it covers.
+            slug=${endpoint#repos/}
+            slug=${slug%%/issues*}
+            creator=$(printf '%s\n' "$endpoint" | sed -nE 's#.*[?&]creator=([^&]+).*#\1#p')
+            check_seed
+            page=$(seeded "$slug" | jq -c --arg creator "$creator" '
+                map(select($creator == "" or .author.login == $creator))
+                | sort_by(.updatedAt) | reverse | .[:1]
+                | map({number, title, state: (if .state == "OPEN" then "open" else "closed" end),
+                    updated_at: .updatedAt, html_url: .url, pull_request: {html_url: .url}})')
+            etag="W/\"$(printf '%s' "$page" | cksum | cut -d' ' -f1)\""
+            if [ "$if_none_match" = "$etag" ]; then
+                ! "$include" || headers '304 Not Modified' core
+                printf '%s\n' 'gh: HTTP 304' >&2
+                exit 1
+            fi
+            if "$include"; then
+                headers '200 OK' core | sed '$d'
+                printf 'Etag: %s\r\n\r\n' "$etag"
+            fi
+            printf '%s\n' "$page"
+            ;;
         GET:repos/*/releases | GET:repos/*/releases\?*)
             ! "$include" || headers '200 OK' core
             printf '[]\n'
@@ -398,12 +457,14 @@ case ${1:-} in
         shift
         [ "${1:-}" = status ] || unsupported auth "$@"
         shift
+        trace "auth status"
         auth_status "$@"
         ;;
     repo)
         shift
         [ "${1:-}" = view ] || unsupported repo "$@"
         shift
+        trace "repo view"
         repo_view "$@"
         ;;
     pr) shift; pr "$@" ;;
