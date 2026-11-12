@@ -1849,3 +1849,125 @@ fn cold_open(items: Vec<chat::Item>, cycles: usize, parsers: usize, ranked: bool
         ));
     }
 }
+
+/// Pull request links in each finished answer of the full window.
+const LINKS_PER_ANSWER: u64 = 3;
+
+/// The full window, each answer ending with links to the pull requests it
+/// made: forty-eight links across sixteen exchanges.
+pub(super) fn linked_transcript(turns: usize) -> Vec<chat::Item> {
+    let mut items = transcript(turns);
+    for (turn, item) in items
+        .iter_mut()
+        .filter(|item| item.id.ends_with("-answer"))
+        .enumerate()
+    {
+        let ItemContent::Text { text, .. } = &mut item.content else {
+            unreachable!("an answer is prose");
+        };
+        let first = 1_000 + turn as u64 * LINKS_PER_ANSWER;
+        text.push_str(&format!(
+            "\nOpened https://github.com/acme/widgets/pull/{first}, rebased \
+             https://github.com/acme/widgets/pull/{} onto it, and closed \
+             https://github.com/acme/widgets/pull/{} as superseded.\n",
+            first + 1,
+            first + 2,
+        ));
+    }
+    items
+}
+
+/// What the window knows of the transcript's pull requests, with the state of
+/// `flipped` changed, as a poll that saw it merge would report it.
+fn known_links(turns: usize, flipped: Option<u64>) -> Arc<pull_request_links::Labels> {
+    use crate::work::PullRequestState;
+    let numbers = 1_000..1_000 + turns as u64 * LINKS_PER_ANSWER;
+    let list = crate::work::ConversationPullRequests {
+        generated_at_unix_ms: 0,
+        repository: Some(pull_request_links::fixture::repository("acme", "widgets")),
+        pull_requests: numbers
+            .map(|number| {
+                let state = if Some(number) == flipped {
+                    PullRequestState::Merged
+                } else {
+                    PullRequestState::Open
+                };
+                pull_request_links::fixture::row(
+                    "acme",
+                    "widgets",
+                    number,
+                    Some(("Keep the parser cursor across refreshes", state, false)),
+                )
+            })
+            .collect(),
+        transcript: crate::work::TranscriptCoverage::Complete,
+        forge_error: None,
+        worktrees: Vec::new(),
+    };
+    Arc::new(pull_request_links::fixture::of(&list))
+}
+
+/// A frame of the full window with forty-eight pull request links, before
+/// and after their labels are known, and what a change to one label costs
+/// the update that delivers it.
+///
+/// The labels are applied on the UI thread; preparing the one message whose
+/// link reads otherwise happens on a worker and is reported apart.
+#[test]
+#[ignore = "a measurement, not a check; see the module documentation"]
+fn a_frame_of_a_window_of_pull_request_links() {
+    const TURNS: usize = 16;
+    let mut pane = Pane::new(linked_transcript(TURNS));
+    println!(
+        "{} items, {} pull request links:",
+        pane.items.len(),
+        TURNS as u64 * LINKS_PER_ANSWER
+    );
+    pane.sample(|_, _| {}).row("steady, unlabelled");
+    pane.runtime
+        .set_pull_request_labels(known_links(TURNS, None));
+    pane.settle_geometry();
+    let markdown::Item::Paragraph(text) = pane.runtime.cache["0-answer"]
+        .markdown
+        .items()
+        .last()
+        .expect("the answer's last paragraph")
+    else {
+        panic!("the links close the answer in a paragraph");
+    };
+    assert!(
+        text.plain().contains("#1000\u{a0}Keep"),
+        "{:?}",
+        text.plain()
+    );
+    pane.sample(|_, _| {}).row("steady, labelled");
+
+    // A label that changes, and labels that arrive unchanged.
+    let mut relabel = Stage::default();
+    let mut unchanged = Stage::default();
+    let mut prepare = Stage::default();
+    for round in 0..WARMUP + SAMPLES {
+        let flipped =
+            (round % 2 == 0).then_some(1_000 + round as u64 % (TURNS as u64 * LINKS_PER_ANSWER));
+        let labels = known_links(TURNS, flipped);
+        let clock = Instant::now();
+        pane.runtime.set_pull_request_labels(labels);
+        let relabelled = clock.elapsed();
+        let clock = Instant::now();
+        pane.settle_geometry();
+        let prepared = clock.elapsed();
+        let labels = known_links(TURNS, flipped);
+        let clock = Instant::now();
+        pane.runtime.set_pull_request_labels(labels);
+        let same = clock.elapsed();
+        if round >= WARMUP {
+            relabel.0.push(relabelled);
+            prepare.0.push(prepared);
+            unchanged.0.push(same);
+        }
+    }
+    relabel.report("one label changed (update)");
+    prepare.report("one label changed (fixture preparation and install)");
+    unchanged.report("labels unchanged (update)");
+    pane.stream_prose().row("streaming, labelled");
+}

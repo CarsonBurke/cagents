@@ -101,6 +101,8 @@ mod preparation;
 mod prompt;
 mod prose;
 mod prose_document;
+mod pull_request_links;
+pub(super) use pull_request_links::Board as PullRequestBoard;
 mod reader_source;
 mod retained;
 pub(super) use closed_draft::closed_draft_source_matches;
@@ -1454,6 +1456,9 @@ struct CachedItem {
     /// What a plain tool call's row says it did, read from its input once
     /// per change to the call rather than while drawing or regrouping.
     title: Option<tool_title::Title>,
+    /// The pull requests the prepared text links to, so a change of labels
+    /// finds what it relabels without reading any text.
+    pull_request_links: Box<[crate::github_identity::PullRequestKey]>,
 }
 impl Drop for CachedItem {
     fn drop(&mut self) {
@@ -1516,6 +1521,21 @@ fn recorded_message_stamp(
 }
 
 impl CachedItem {
+    /// Marks this message to be prepared again with the current labels, and
+    /// gives the id to forget its preparation by. What is shown stays until
+    /// the worker returns the relabelled text, as when the syntax theme
+    /// changes.
+    fn relabel(&mut self) -> Option<String> {
+        // A closed report and a diagnostic are not prepared until shown, and
+        // then with the labels of the time.
+        if self.diagnostic || self.report_expanded == Some(false) {
+            return None;
+        }
+        let id = self.item.as_ref()?.id.clone();
+        self.preparing = true;
+        self.revision = Self::next_revision();
+        Some(id)
+    }
     /// What `item`'s row says it did, when this presentation was formed from
     /// that very call. A presentation of an earlier state of the call, or one
     /// still being prepared, has none to offer.
@@ -1682,9 +1702,11 @@ impl CachedItem {
                     cached.coordination.take(),
                     std::mem::take(&mut cached.blocks),
                     cached.palette_views.take(),
+                    // The kept card still shows the labels of these links.
+                    std::mem::take(&mut cached.pull_request_links),
                 )
             });
-        let (retained_coordination, retained_blocks, retained_palettes) =
+        let (retained_coordination, retained_blocks, retained_palettes, retained_links) =
             retained_coordination.unwrap_or_default();
         let item = previous.as_ref().and_then(|cached| cached.item.clone());
         let stamp = previous.as_ref().and_then(|cached| cached.stamp.clone());
@@ -1872,6 +1894,7 @@ impl CachedItem {
                 .map(|prepared| Box::new(coordination::Coordinated::from_prepared(prepared)))
                 .or(retained_coordination),
             title,
+            pull_request_links: retained_links,
         };
         if expanded
             && matches!(
@@ -1984,7 +2007,8 @@ impl CachedItem {
             match self.source.advance_append(body, growing) {
                 markdown_source::Step::Append(text) => self.markdown.push_str(&text),
                 markdown_source::Step::Restart(text) => {
-                    self.markdown = markdown::Content::parse(&text);
+                    self.markdown =
+                        markdown::Content::parse_labelled(&text, self.markdown.labels().clone());
                 }
             }
         }
@@ -2559,6 +2583,13 @@ pub(super) struct Runtime {
     preview_request: Option<String>,
     /// The palette the cache's code blocks are highlighted in.
     syntax_theme: crate::settings::EditorSyntaxTheme,
+    /// How the conversation's pull request links read, from what the window
+    /// already holds of the pull requests it mentions.
+    pull_request_labels: Arc<pull_request_links::Labels>,
+    /// What the inspector last listed for this conversation.
+    pull_request_inspected: pull_request_links::Inspected,
+    /// What the labels were last built from.
+    pull_request_labels_built_from: Option<LabelSources>,
     /// The snapshot's items grouped into stretches of work, rebuilt only when
     /// the snapshot changes rather than once per frame.
     turns: Vec<turn::Turn>,
@@ -3681,6 +3712,9 @@ impl Runtime {
             last_presented_tail: None,
             preview_request: None,
             syntax_theme,
+            pull_request_labels: Arc::default(),
+            pull_request_inspected: Default::default(),
+            pull_request_labels_built_from: None,
             turns: Vec::new(),
             selected_subagent: None,
             observed_scroll: Default::default(),
@@ -4269,6 +4303,41 @@ impl Runtime {
     fn choosing(&self) -> bool {
         self.is_draft() && self.queued.is_none() && self.attachment_chooser_pending.is_none()
     }
+    /// Reads pull request links as `labels` say from now on, and parses again
+    /// only the messages whose links now read otherwise; the rest keep their
+    /// parsed text and their place.
+    fn set_pull_request_labels(&mut self, labels: Arc<pull_request_links::Labels>) {
+        if *self.pull_request_labels == *labels {
+            return;
+        }
+        let previous = std::mem::replace(&mut self.pull_request_labels, labels.clone());
+        self.preparation.set_labels(labels.clone());
+        let mut changed = false;
+        // Each prepared message knows what it links to, so this reads no
+        // text. One still being prepared is checked when it arrives.
+        for cached in self.cache.values_mut().chain(self.child_cache.values_mut()) {
+            if cached
+                .pull_request_links
+                .iter()
+                .all(|key| previous.reads_alike(&labels, key))
+            {
+                continue;
+            }
+            if let Some(id) = cached.relabel() {
+                self.preparation.forget(&id);
+                changed = true;
+            }
+        }
+        if changed && self.visible.load(Ordering::Relaxed) {
+            let snapshot = self.snapshot.clone();
+            self.prepare_transcript_cache(&snapshot);
+        }
+        if changed {
+            // A search reads links as their labels, which have just changed.
+            self.refresh_find_work();
+        }
+    }
+
     /// Highlights the transcript's code blocks in `theme` from now on.
     pub(super) fn set_syntax_theme(&mut self, theme: crate::settings::EditorSyntaxTheme) {
         if self.syntax_theme == theme {
@@ -4830,12 +4899,27 @@ impl Runtime {
             self.resume_preparation();
             return;
         }
+        let labels = self.pull_request_labels.clone();
         let Some(cached) = self.presentation_cache_mut().get_mut(id) else {
             prepared.discard();
             return;
         };
         let regroup = cached.coordination.is_some() || prepared.is_coordination();
+        let parsed_with = prepared.labels().clone();
         prepared.install(cached, managed, expanded);
+        // The labels changed while it was being prepared.
+        let stale = !Arc::ptr_eq(&parsed_with, &labels)
+            && cached
+                .pull_request_links
+                .iter()
+                .any(|key| !parsed_with.reads_alike(&labels, key));
+        if stale && let Some(id) = cached.relabel() {
+            self.preparation.forget(&id);
+            if self.visible.load(Ordering::Relaxed) {
+                let snapshot = self.snapshot.clone();
+                self.prepare_transcript_cache(&snapshot);
+            }
+        }
         self.resume_preparation();
         if regroup && self.selected_subagent.is_none() {
             let turns = turn::group(
@@ -6359,6 +6443,145 @@ const QUEUED_BLOCKER: &str = "Wait for the first message to be sent before leavi
 /// the conversation to list the model it was meant to be sent to, before
 /// going to the provider's default instead.
 const MODEL_PATIENCE: Duration = Duration::from_secs(10);
+
+/// What a chat's pull request labels were built from: the generations of
+/// the window's pull request and worktree indexes, the conversation, and
+/// whether the inspector held a current list of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LabelSources {
+    board: u64,
+    worktrees: u64,
+    conversation: TerminalId,
+    watched: bool,
+}
+
+impl Cagents {
+    /// Keeps every chat's pull request labels current with what the window
+    /// holds. Run after each update: unless the projects' pull requests, their
+    /// repositories or the worktree rows changed, it compares a revision per
+    /// project and a stamp per chat and does nothing else.
+    pub(super) fn sync_pull_request_labels(&mut self) {
+        let github = &self.github_availability;
+        self.pull_request_board
+            .refresh(&self.sidebar_model.projects, |project| {
+                github
+                    .get(&project)
+                    .and_then(GitHubAvailability::repository_key)
+            });
+        let (board, worktrees) = (
+            self.pull_request_board.generation(),
+            self.worktree_paths.generation(),
+        );
+        // A conversation counts as watched once the shown inspector holds a
+        // list taken since it last turned to it, not merely while it is shown:
+        // until then what a chat took earlier may no longer be true.
+        let watched = self.inspector_watched_conversation().filter(|watched| {
+            self.pull_request_inspector
+                .conversation_list()
+                .is_some_and(|(listed, _, _)| listed == *watched)
+        });
+        let stale = self
+            .cards
+            .iter()
+            .filter_map(|(card, runtime)| match runtime {
+                CardRuntime::Chat(runtime) => {
+                    let conversation = runtime.session.id;
+                    let built_from = LabelSources {
+                        board,
+                        worktrees,
+                        conversation,
+                        watched: watched == Some(conversation),
+                    };
+                    (runtime.pull_request_labels_built_from != Some(built_from))
+                        .then_some((*card, built_from))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for (card, built_from) in stale {
+            self.relabel_chat(card, built_from);
+        }
+    }
+
+    /// Builds one chat's labels from the window's index and what the
+    /// inspector listed for its conversation.
+    fn relabel_chat(&mut self, card: CardId, built_from: LabelSources) {
+        // The project whose repository the chat works in, whatever channel it
+        // is filed under: the sidebar's channel filing is not where it works.
+        let project = self.card_state(card).and_then(|state| {
+            let directory = self.unchanneled_card_worktree_indexed(state, &&self.worktree_paths)?;
+            self.worktree_paths.project_of(directory)
+        });
+        let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) else {
+            return;
+        };
+        // What was listed for a conversation the chat has since left says
+        // nothing of the one it is in.
+        if runtime
+            .pull_request_inspected
+            .conversation()
+            .is_some_and(|listed| listed != runtime.session.id)
+        {
+            runtime.pull_request_inspected = pull_request_links::Inspected::default();
+        }
+        // A list the inspector took before this runtime existed, or while it
+        // was parked, is still the latest for its conversation.
+        if let Some((conversation, revision, list)) =
+            self.pull_request_inspector.conversation_list()
+            && conversation == runtime.session.id
+        {
+            runtime
+                .pull_request_inspected
+                .accept(conversation, revision, true, list);
+        }
+        let labels = self.pull_request_board.labels(
+            project,
+            &runtime.pull_request_inspected,
+            built_from.watched,
+        );
+        runtime.pull_request_labels_built_from = Some(built_from);
+        runtime.set_pull_request_labels(Arc::new(labels));
+    }
+
+    /// Labels the inspected conversation's chats from the list the inspector
+    /// was just sent, so they never watch the conversation themselves.
+    pub(super) fn label_chat_pull_request_links(
+        &mut self,
+        watch: &crate::app::pull_request_ui::ConversationWatch,
+    ) {
+        let crate::app::pull_request_ui::ConversationWatch::Listed {
+            conversation,
+            revision,
+            list,
+            first,
+        } = watch
+        else {
+            return;
+        };
+        // A list just sent is current, though the inspector takes it only
+        // after this.
+        let built_from = LabelSources {
+            board: self.pull_request_board.generation(),
+            worktrees: self.worktree_paths.generation(),
+            conversation: *conversation,
+            watched: self.inspector_watched_conversation() == Some(*conversation),
+        };
+        let changed = self
+            .cards
+            .iter_mut()
+            .filter_map(|(card, runtime)| match runtime {
+                CardRuntime::Chat(runtime) if runtime.session.id == *conversation => runtime
+                    .pull_request_inspected
+                    .accept(*conversation, *revision, *first, list)
+                    .then_some(*card),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for card in changed {
+            self.relabel_chat(card, built_from);
+        }
+    }
+}
 
 impl Cagents {
     /// Whether the focused chat has a menu or picker open; see
@@ -10567,6 +10790,8 @@ impl Cagents {
                 if let Some(mut runtime) = self.chat_ui.parked.remove(&card) {
                     runtime.show(true);
                     runtime.refresh();
+                    // Its labels missed whatever changed while it was parked.
+                    runtime.pull_request_labels_built_from = None;
                     let session = runtime.session.clone();
                     if let Some(CardRuntime::Terminal(terminal)) =
                         self.cards.insert(card, CardRuntime::Chat(runtime))
@@ -14157,6 +14382,31 @@ pub(super) fn draft_launch_for_test(
         runtime.snapshot.permission_mode.clone(),
         runtime.session.clone(),
     )
+}
+
+/// Opens a prepared live chat on `card` whose `turns` answers each link to
+/// three pull requests, from #1000 up in `acme/widgets`, shown or not.
+#[cfg(test)]
+pub(super) fn open_linked_chat_for_test(
+    app: &mut Cagents,
+    card: CardId,
+    turns: usize,
+    shown: bool,
+) {
+    let mut runtime = view::linked_runtime_for_test(turns);
+    runtime.target.card = card;
+    runtime.visible.store(shown, Ordering::Relaxed);
+    app.cards.insert(card, CardRuntime::Chat(Box::new(runtime)));
+}
+
+/// Runs every chat's queued preparation and installs what it prepared.
+#[cfg(test)]
+pub(super) fn drain_preparation_for_test(app: &mut Cagents) {
+    for runtime in app.cards.values_mut() {
+        if let CardRuntime::Chat(runtime) = runtime {
+            preparation::drain_fixture(runtime);
+        }
+    }
 }
 
 /// The reason draft `card` last failed to start, which it shows.
@@ -21646,6 +21896,139 @@ mod tests {
         }
         assert!(chat_runtime(app, card).queued.is_none());
         card
+    }
+
+    #[test]
+    fn a_chat_labels_its_links_from_the_projects_and_the_inspector() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("session"));
+        let project = ProjectId::new();
+        let mut listed = SidebarPullRequest::new(
+            project,
+            20,
+            "Retry stalled daemon handshakes".into(),
+            "https://github.com/acme/widgets/pull/20".parse().unwrap(),
+            "retry".into(),
+            None,
+            false,
+            crate::sidebar::CheckStatus::Unknown,
+        );
+        listed.state = Some(crate::sidebar::WorktreePullRequestState::Merged);
+        let mut row = SidebarProject::new(
+            project,
+            crate::repository::RepositoryId(project.as_uuid()),
+            "widgets".into(),
+            "/w/widgets".into(),
+            Vec::new(),
+            Vec::new(),
+        );
+        row.replace_pull_requests(vec![listed]);
+        app.sidebar_model.projects.push(row);
+        let label = |app: &Cagents, number: u64| {
+            chat_runtime(app, card).pull_request_labels.label(
+                &crate::github_identity::PullRequestKey::from_url(&format!(
+                    "https://github.com/acme/widgets/pull/{number}"
+                ))
+                .unwrap(),
+            )
+        };
+        assert_eq!(label(&app, 20).glyph, None);
+        // Any update brings the chat up to date with what the projects list.
+        drop(app.update(Message::ChatUi(Action::Tick)));
+        assert_eq!(
+            label(&app, 20).glyph,
+            Some(crate::sidebar::WorktreePullRequestState::Merged)
+        );
+        assert!(
+            label(&app, 20)
+                .text
+                .ends_with("Retry stalled daemon handshakes")
+        );
+        let labels = chat_runtime(&app, card).pull_request_labels.clone();
+        drop(app.update(Message::ChatUi(Action::Tick)));
+        assert!(
+            Arc::ptr_eq(&labels, &chat_runtime(&app, card).pull_request_labels),
+            "nothing changed, so nothing is rebuilt"
+        );
+
+        // A pull request no project lists reads from the inspector's list
+        // for this conversation, and from nothing else.
+        assert_eq!(label(&app, 21).glyph, None);
+        let conversation = chat_runtime(&app, card).session.id;
+        let mut list = pull_request_links::fixture::fixture_list();
+        list.repository = None;
+        let watch = |conversation| crate::app::pull_request_ui::ConversationWatch::Listed {
+            conversation,
+            revision: 1,
+            list: Arc::new(list.clone()),
+            first: true,
+        };
+        drop(app.update(Message::PullRequestUi(
+            crate::app::pull_request_ui::Action::Conversation(watch(TerminalId::new())),
+        )));
+        assert_eq!(label(&app, 21).glyph, None, "another conversation's list");
+        drop(app.update(Message::PullRequestUi(
+            crate::app::pull_request_ui::Action::Conversation(watch(conversation)),
+        )));
+        assert_eq!(
+            label(&app, 21).glyph,
+            Some(crate::sidebar::WorktreePullRequestState::Merged)
+        );
+        // What a project lists stays first, merged as its poll says, though
+        // the inspector's list still has it open.
+        assert_eq!(
+            label(&app, 20).glyph,
+            Some(crate::sidebar::WorktreePullRequestState::Merged)
+        );
+
+        // Once the inspector is closed nothing keeps its list current, so a
+        // pull request only it named keeps its title but no longer claims a
+        // state; what a project lists is still kept current by its poll.
+        assert_eq!(app.inspector_watched_conversation(), Some(conversation));
+        app.context_inspector_open = false;
+        app.context_inspector_transition = None;
+        drop(app.update(Message::ChatUi(Action::Tick)));
+        assert_eq!(app.inspector_watched_conversation(), None);
+        assert_eq!(label(&app, 21).glyph, None);
+        assert!(label(&app, 21).text.len() > "#21".len(), "keeps its title");
+        assert!(
+            label(&app, 21)
+                .tip("https://github.com/acme/widgets/pull/21")
+                .contains("State unknown")
+        );
+        assert_eq!(
+            label(&app, 20).glyph,
+            Some(crate::sidebar::WorktreePullRequestState::Merged)
+        );
+        app.context_inspector_open = true;
+        drop(app.update(Message::ChatUi(Action::Tick)));
+        assert_eq!(
+            label(&app, 21).glyph,
+            Some(crate::sidebar::WorktreePullRequestState::Merged),
+            "watched again"
+        );
+
+        // Turning to another conversation and back starts the inspector's
+        // list afresh, so what the chat took before is no longer vouched for
+        // until the inspector lists the conversation again.
+        let other = live_chat(&mut app, Some("other-session"));
+        drop(app.update(Message::FocusCard(other)));
+        drop(app.update(Message::ChatUi(Action::Tick)));
+        assert_ne!(app.inspector_watched_conversation(), Some(conversation));
+        assert_eq!(label(&app, 21).glyph, None);
+        drop(app.update(Message::FocusCard(card)));
+        drop(app.update(Message::ChatUi(Action::Tick)));
+        assert_eq!(app.inspector_watched_conversation(), Some(conversation));
+        assert_eq!(label(&app, 21).glyph, None, "not listed since");
+        assert!(label(&app, 21).text.len() > "#21".len(), "keeps its title");
+        drop(app.update(Message::PullRequestUi(
+            crate::app::pull_request_ui::Action::Conversation(watch(conversation)),
+        )));
+        assert_eq!(
+            label(&app, 21).glyph,
+            Some(crate::sidebar::WorktreePullRequestState::Merged),
+            "listed again"
+        );
     }
 
     #[test]

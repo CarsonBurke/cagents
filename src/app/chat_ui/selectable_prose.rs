@@ -21,6 +21,8 @@ pub(super) struct State {
     pub(super) logical_active: bool,
     a11y_id: iced::advanced::widget::Id,
     pub(super) plain: Arc<str>,
+    /// What parts of `plain` copy as instead; see [`markdown::Inlines`].
+    pub(super) inlines: Option<Arc<markdown::Inlines>>,
     pub(super) target: Option<Target>,
     pub(super) managed: bool,
     pub(super) dirty: bool,
@@ -47,6 +49,12 @@ pub(super) struct State {
     pub(super) end: usize,
     dragging: bool,
     focused: bool,
+    /// The pull request link the pointer rests on: the bounds of the part
+    /// of it under the pointer, and its tooltip.
+    tip: Option<(Rectangle, crate::interaction::PartTip<Message>)>,
+    /// Whether a button is held over the text, as while a selection is
+    /// dragged, whoever draws the selection.
+    pressed: bool,
 }
 
 impl Default for State {
@@ -57,6 +65,7 @@ impl Default for State {
             logical: None,
             logical_active: false,
             plain: Arc::from(""),
+            inlines: None,
             target: None,
             managed: false,
             dirty: false,
@@ -72,6 +81,8 @@ impl Default for State {
             end: 0,
             dragging: false,
             focused: false,
+            tip: None,
+            pressed: false,
         }
     }
 }
@@ -102,6 +113,13 @@ impl Shape {
 }
 
 impl State {
+    /// `plain[range]` as Copy gives it.
+    pub(super) fn copied(&self, range: std::ops::Range<usize>) -> String {
+        match &self.inlines {
+            Some(inlines) => inlines.copy(&self.plain, range),
+            None => self.plain[range].to_owned(),
+        }
+    }
     #[cfg(test)]
     pub(super) fn flow_readiness(&self) -> Option<bool> {
         self.flow.as_ref().map(|_| self.flow_ready.is_some())
@@ -210,9 +228,17 @@ impl State {
     }
 
     pub(super) fn link(&self, position: Point) -> Option<markdown::Uri> {
+        self.spans
+            .as_ref()?
+            .get(self.span_at(position)?)?
+            .link
+            .clone()
+    }
+
+    /// The span whose glyph is under `position`.
+    fn span_at(&self, position: Point) -> Option<usize> {
         if self.flow.is_some() {
-            let metadata = self.flow_ready.as_ref()?.link(position)?;
-            return self.spans.as_ref()?.get(metadata)?.link.clone();
+            return self.flow_ready.as_ref()?.link(position);
         }
         // Link activation uses the glyph under the pointer, rather than a
         // caret offset: iced's hit_span rejects line.len() even with Before
@@ -227,7 +253,49 @@ impl State {
                 })
                 .flatten()
         })?;
-        self.spans.as_ref()?.get(index)?.link.clone()
+        Some(index)
+    }
+
+    /// Follows the pointer onto and off a pull request link, whose tooltip
+    /// opens after the pointer rests on it.
+    fn hover(&mut self, position: Option<Point>, line: f32, now: iced::time::Instant) -> bool {
+        // Text without pull request links never looks up what is hovered.
+        let hovered = position
+            .filter(|_| {
+                self.inlines
+                    .as_ref()
+                    .is_some_and(|inlines| !inlines.tips.is_empty())
+            })
+            .and_then(|position| {
+                let span = self.span_at(position)?;
+                let tip = self.inlines.as_ref()?.tip(span)?.clone();
+                Some((span, position, tip))
+            });
+        let Some((span, position, tip)) = hovered else {
+            return self.tip.take().is_some();
+        };
+        if self
+            .tip
+            .as_ref()
+            .is_some_and(|(_, shown)| Arc::ptr_eq(shown.label(), &tip))
+        {
+            return false;
+        }
+        let line = Rectangle::new(
+            Point::new(position.x, position.y - line / 2.0),
+            Size::new(1.0, line),
+        );
+        let anchor = if self.flow.is_none() {
+            self.paragraph()
+                .span_bounds(span)
+                .into_iter()
+                .find(|bounds| bounds.y <= position.y && position.y < bounds.y + bounds.height)
+                .unwrap_or(line)
+        } else {
+            line
+        };
+        self.tip = Some((anchor, crate::interaction::PartTip::new(tip, now)));
+        true
     }
 
     fn validate_selection(&mut self, plain: &str) {
@@ -253,7 +321,21 @@ pub(super) fn logical_text(
     find: Option<&str>,
     logical: Logical,
 ) -> Element<'static, Message> {
-    build_text(spans, size, font, target, find, Some(logical), None)
+    build_text(spans, None, size, font, target, find, Some(logical), None)
+}
+
+/// Rich text whose pull request links draw their state glyphs, from a
+/// paragraph's [`markdown::Text::inlines`].
+pub(super) fn labelled_text(
+    spans: Arc<[Span<'static, markdown::Uri>]>,
+    inlines: Option<Arc<markdown::Inlines>>,
+    size: iced::Pixels,
+    font: iced::Font,
+    target: Target,
+    find: Option<&str>,
+    logical: Option<Logical>,
+) -> Element<'static, Message> {
+    build_text(spans, inlines, size, font, target, find, logical, None)
 }
 
 pub(super) fn text(
@@ -263,7 +345,7 @@ pub(super) fn text(
     target: Target,
     find: Option<&str>,
 ) -> Element<'static, Message> {
-    build_text(spans, size, font, target, find, None, None)
+    build_text(spans, None, size, font, target, find, None, None)
 }
 pub(super) fn flow_source(
     size: iced::Pixels,
@@ -297,6 +379,7 @@ pub(super) fn flow_source_optional(
     };
     let body = Element::new(Selectable {
         find_enabled: find.is_some(),
+        inlines: None,
         logical,
         flow: Some(flow),
         flow_ready: ready,
@@ -540,6 +623,28 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for FlowFindNotice {
             renderer,
         )
     }
+    fn overlay<'a>(
+        &'a mut self,
+        tree: &'a mut Tree,
+        layout: Layout<'a>,
+        renderer: &cosmic::Renderer,
+        viewport: &Rectangle,
+        translation: iced::Vector,
+    ) -> Option<iced::advanced::overlay::Element<'a, Message, cosmic::Theme, cosmic::Renderer>>
+    {
+        let offset = layout.virtual_offset();
+        self.body.as_widget_mut().overlay(
+            &mut tree.children[0],
+            layout
+                .children()
+                .next()
+                .unwrap()
+                .with_virtual_offset(offset),
+            renderer,
+            viewport,
+            translation,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -552,11 +657,21 @@ pub(super) fn flow_text(
     logical: Logical,
     flow: flow_layout::Handle,
 ) -> Element<'static, Message> {
-    build_text(spans, size, font, target, find, Some(logical), Some(flow))
+    build_text(
+        spans,
+        None,
+        size,
+        font,
+        target,
+        find,
+        Some(logical),
+        Some(flow),
+    )
 }
 
 fn build_text(
     spans: Arc<[Span<'static, markdown::Uri>]>,
+    inlines: Option<Arc<markdown::Inlines>>,
     size: iced::Pixels,
     font: iced::Font,
     target: Target,
@@ -579,6 +694,7 @@ fn build_text(
     let body = Element::new(Selectable {
         find_enabled: find.is_some(),
         flow_ready,
+        inlines,
         spans,
         plain,
         size,
@@ -618,6 +734,9 @@ pub(super) fn plain(
 
 struct Selectable {
     find_enabled: bool,
+    /// The paragraph's pull request link glyphs; a flow layout carries its
+    /// own with the spans it shaped.
+    inlines: Option<Arc<markdown::Inlines>>,
     flow: Option<flow_layout::Handle>,
     flow_ready: Option<Arc<flow_layout::Prepared>>,
     logical: Option<Logical>,
@@ -878,6 +997,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
             }
             if state.flow.is_none() || !same_flow {
                 state.plain = self.plain.clone();
+                state.inlines = self.inlines.clone();
             }
         }
         // Selection bytes cannot outlive a streamed paragraph's replacement.
@@ -899,6 +1019,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
             state.flow_ready = flow.prepared();
             if let Some(ready) = &state.flow_ready {
                 state.plain = ready.plain.clone();
+                state.inlines = ready.inlines.clone();
                 state.spans = Some(ready.spans.clone());
             }
             state.validate_selection(&state.plain.clone());
@@ -993,6 +1114,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
                         renderer,
                         projection,
                         &ready.spans,
+                        ready.inlines.as_deref(),
                         &if self.find_enabled {
                             flow.borrow_mut()
                                 .find_highlights_for(self.target, &ready.plain)
@@ -1094,6 +1216,27 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
                 }
             }
         }
+        for (index, glyph) in self
+            .inlines
+            .iter()
+            .flat_map(|inlines| inlines.glyphs.iter())
+        {
+            let Some(span) = self.spans.get(*index) else {
+                continue;
+            };
+            // A label wider than the line can be split even inside its
+            // glyph's room; the glyph goes once, where the label starts.
+            if let Some(bounds) = paragraph.span_bounds(*index).into_iter().next() {
+                pull_request_links::draw_glyph(
+                    renderer,
+                    *glyph,
+                    bounds + translation,
+                    span.size.unwrap_or(self.size).0,
+                    theme,
+                    *viewport,
+                );
+            }
+        }
         renderer.fill_paragraph(paragraph, layout.position(), defaults.text_color, *viewport);
     }
     fn update(
@@ -1140,6 +1283,60 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
             && let Some(id) = flow.borrow_mut().find_request_id(self.target)
         {
             shell.publish(action(Action::FindHighlight(self.target, id)));
+        }
+        match event {
+            Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                let position = cursor
+                    .position_in(layout.bounds())
+                    .filter(|_| !state.pressed && cursor.is_over(*viewport));
+                let line = iced::widget::text::LineHeight::default()
+                    .to_absolute(self.size)
+                    .0;
+                let now = iced::time::Instant::now();
+                let shown = state
+                    .tip
+                    .as_ref()
+                    .is_some_and(|(_, tip)| now >= tip.opens_at());
+                if state.hover(position, line, now) {
+                    // A tip already shown goes at once, even for another.
+                    if shown || state.tip.is_none() {
+                        shell.request_redraw();
+                    }
+                    if let Some((_, tip)) = &state.tip {
+                        shell.request_redraw_at(tip.opens_at());
+                    }
+                }
+            }
+            Event::Mouse(
+                mouse::Event::CursorLeft
+                | mouse::Event::ButtonPressed(_)
+                | mouse::Event::WheelScrolled { .. },
+            )
+            | Event::Window(iced::window::Event::Unfocused) => {
+                state.pressed = matches!(event, Event::Mouse(mouse::Event::ButtonPressed(_)))
+                    && cursor.is_over(layout.bounds());
+                if state.tip.take().is_some() {
+                    shell.request_redraw();
+                }
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(_)) => state.pressed = false,
+            Event::Window(iced::window::Event::RedrawRequested(now)) => {
+                // Text that moves under a still pointer, as a streamed answer
+                // scrolls, takes its tip along only while the pointer is on it.
+                if state.tip.is_some()
+                    && (!cursor.is_over(*viewport) || !cursor.is_over(layout.bounds()))
+                {
+                    state.tip = None;
+                    shell.request_redraw();
+                } else if let Some((_, tip)) = &state.tip {
+                    if *now < tip.opens_at() {
+                        shell.request_redraw_at(tip.opens_at());
+                    } else if *now < tip.settles_at() {
+                        shell.request_redraw();
+                    }
+                }
+            }
+            _ => {}
         }
         if state.managed {
             return;
@@ -1202,8 +1399,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
                     super::text_copy::invalidate();
                     clipboard.write(
                         iced::advanced::clipboard::Kind::Standard,
-                        state.plain[state.anchor.min(state.end)..state.anchor.max(state.end)]
-                            .to_owned(),
+                        state.copied(state.anchor.min(state.end)..state.anchor.max(state.end)),
                     );
                     shell.capture_event();
                 } else if key.eq_ignore_ascii_case("a") {
@@ -1239,6 +1435,21 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
         } else {
             mouse::Interaction::None
         }
+    }
+    fn overlay<'a>(
+        &'a mut self,
+        tree: &'a mut Tree,
+        layout: Layout<'a>,
+        _renderer: &cosmic::Renderer,
+        _viewport: &Rectangle,
+        translation: iced::Vector,
+    ) -> Option<iced::advanced::overlay::Element<'a, Message, cosmic::Theme, cosmic::Renderer>>
+    {
+        let (anchor, tip) = tree.state.downcast_mut::<State>().tip.as_mut()?;
+        tip.overlay(
+            *anchor + (layout.position() - Point::ORIGIN) + translation,
+            iced::time::Instant::now(),
+        )
     }
 }
 
@@ -1292,6 +1503,7 @@ mod tests {
                     .collect::<String>()
                     .into();
                 let mut selectable = Selectable {
+                    inlines: None,
                     find_enabled: true,
                     plain: plain.clone(),
                     spans,
@@ -1372,6 +1584,7 @@ mod tests {
             for find in [false, true] {
                 let mut renderer = crate::app::tests::headless_renderer();
                 let mut selectable = Selectable {
+                    inlines: None,
                     find_enabled: true,
                     plain: source.into(),
                     spans: vec![Span::new(source)].into(),
@@ -1464,6 +1677,7 @@ mod tests {
         let mut renderer = crate::app::tests::headless_renderer();
         let source = "hello שלום world";
         let mut selectable = Selectable {
+            inlines: None,
             find_enabled: true,
             plain: source.into(),
             spans: vec![Span::new(source)].into(),
@@ -1591,6 +1805,7 @@ mod tests {
         let spans: Arc<[Span<'static, markdown::Uri>]> =
             vec![Span::new("α first\nβ second")].into();
         let selectable = Selectable {
+            inlines: None,
             find_enabled: true,
             logical: None,
             flow: None,
@@ -1736,6 +1951,7 @@ mod tests {
         let spans: Arc<[Span<'static, markdown::Uri>]> =
             vec![Span::new(source.clone()).link(markdown::Uri::from("https://example.com"))].into();
         let mut selectable = Selectable {
+            inlines: None,
             find_enabled: true,
             plain: source.clone().into(),
             spans,
@@ -1856,6 +2072,7 @@ mod tests {
         ]
         .into();
         let selectable = Selectable {
+            inlines: None,
             find_enabled: true,
             logical: None,
             flow: None,
@@ -1902,6 +2119,7 @@ mod tests {
     #[test]
     fn unicode_find_highlights_original_text_across_syntax_spans() {
         let selectable = Selectable {
+            inlines: None,
             find_enabled: true,
             logical: None,
             flow: None,
@@ -1930,6 +2148,7 @@ mod tests {
     #[test]
     fn find_marks_only_the_matching_text() {
         let selectable = Selectable {
+            inlines: None,
             find_enabled: true,
             logical: None,
             flow: None,

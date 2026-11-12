@@ -1535,18 +1535,74 @@ struct Tip<'a, Message> {
 
 impl<'a, Message: 'a> Tip<'a, Message> {
     fn content(&mut self) -> &mut Element<'a, Message> {
-        self.content.get_or_insert_with(|| {
-            // The shell's type scale owns this size. Tooltip text is the
-            // whole content of its surface rather than secondary metadata
-            // beside something else, so it takes the body role;
-            // `design::caption` also mutes its color, which an overlay with
-            // its own background must not do.
-            cosmic::widget::container(crate::design::body(self.label.clone()))
-                .class(crate::design::transparent())
-                .padding([space::XS, space::S])
-                .max_width(TIP_MAX_WIDTH)
-                .into()
-        })
+        self.content
+            .get_or_insert_with(|| tip_surface(self.label.clone()))
+    }
+}
+
+/// What a tooltip's surface holds: its label, padded and wrapped.
+fn tip_surface<'a, Message: 'a>(label: Cow<'a, str>) -> Element<'a, Message> {
+    // The shell's type scale owns this size. Tooltip text is the whole
+    // content of its surface rather than secondary metadata beside something
+    // else, so it takes the body role; `design::caption` also mutes its
+    // color, which an overlay with its own background must not do.
+    cosmic::widget::container(crate::design::body(label))
+        .class(crate::design::transparent())
+        .padding([space::XS, space::S])
+        .max_width(TIP_MAX_WIDTH)
+        .into()
+}
+
+/// A tooltip for part of a widget rather than a whole control, such as one
+/// link among a paragraph's words, with the surface, delay and fade of
+/// [`tooltip`]. Its owner keeps it while the pointer stays on that part and
+/// drops it when the pointer leaves, and asks for frames until it
+/// [settles](Self::settles_at).
+pub(crate) struct PartTip<Message> {
+    label: Arc<str>,
+    content: Element<'static, Message>,
+    tree: Tree,
+    hovered: Instant,
+}
+
+impl<Message: 'static> PartTip<Message> {
+    pub(crate) fn new(label: Arc<str>, hovered: Instant) -> Self {
+        let content = tip_surface(Cow::Owned(label.to_string()));
+        let tree = Tree::new(&content);
+        Self {
+            label,
+            content,
+            tree,
+            hovered,
+        }
+    }
+    pub(crate) fn label(&self) -> &Arc<str> {
+        &self.label
+    }
+    /// When the tip starts to fade in.
+    pub(crate) fn opens_at(&self) -> Instant {
+        self.hovered + TOOLTIP_DELAY
+    }
+    /// When the tip has finished fading in.
+    pub(crate) fn settles_at(&self) -> Instant {
+        self.hovered + TOOLTIP_DELAY + HOVER_DURATION
+    }
+    /// The tip beside `anchor`, the part's bounds in the overlay's frame,
+    /// once the pointer has rested there long enough.
+    pub(crate) fn overlay(
+        &mut self,
+        anchor: Rectangle,
+        now: Instant,
+    ) -> Option<overlay::Element<'_, Message, Theme, Renderer>> {
+        let shown = now.checked_duration_since(self.hovered + TOOLTIP_DELAY)?;
+        let progress = (shown.as_secs_f32() / HOVER_DURATION.as_secs_f32()).min(1.0);
+        Some(overlay::Element::new(Box::new(TipOverlay {
+            content: &mut self.content,
+            tree: &mut self.tree,
+            anchor,
+            progress,
+            prefer_above: false,
+        })))
     }
 }
 

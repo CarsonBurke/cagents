@@ -241,6 +241,8 @@ impl std::ops::Deref for Ranges {
 struct Block {
     identity: u64,
     plain: Arc<str>,
+    /// What parts of `plain` copy as instead; see [`markdown::Inlines`].
+    copies: Option<Arc<markdown::Inlines>>,
     bounds: Rectangle,
     visible: Option<Rectangle>,
     hit: usize,
@@ -252,6 +254,17 @@ struct Block {
 struct LogicalText {
     identity: u64,
     plain: Arc<str>,
+    copies: Option<Arc<markdown::Inlines>>,
+}
+
+impl Block {
+    /// `plain[range]` as Copy gives it.
+    fn copied(&self, range: Range<usize>) -> String {
+        match &self.copies {
+            Some(copies) => copies.copy(&self.plain, range),
+            None => self.plain[range].to_owned(),
+        }
+    }
 }
 
 // Native row positions and clip extents can round on opposite sides of one
@@ -517,7 +530,7 @@ impl Read {
                 }
                 let indent = parents.last().map_or(0, |list| list.content_indent);
                 value.push_str(&Self::list_text(
-                    &block.plain[range.clone()],
+                    &block.copied(range.clone()),
                     lists,
                     range.start == 0,
                     indent,
@@ -615,11 +628,7 @@ impl Read {
                 }
             }
             if !range.is_empty() && block.cell.is_none() {
-                append(
-                    block.plain[range.clone()].to_owned(),
-                    &block.lists,
-                    range.start == 0,
-                );
+                append(block.copied(range.clone()), &block.lists, range.start == 0);
             }
         }
         result
@@ -792,7 +801,7 @@ impl Operation for Read {
             y: bounds.y - self.translation.y,
             ..bounds
         };
-        let (identity, plain, hit, link, mounted, empty_caret) =
+        let (identity, plain, copies, hit, link, mounted, empty_caret) =
             if let Some(prose) = state.downcast_mut::<Prose>() {
                 prose.managed = true;
                 prose.logical_active = self.catalog.is_some() && prose.logical.is_some();
@@ -801,11 +810,19 @@ impl Operation for Read {
                     .clip
                     .map_or(self.pointer, |clip| clipped_pointer(self.pointer, clip))
                     .map(|point| point - Vector::new(bounds.x, bounds.y));
+                let catalogued = logical.and_then(|logical| {
+                    let catalog = self.catalog.as_ref()?;
+                    Some((
+                        catalog.text(logical.identity)?,
+                        catalog.copies(logical.identity),
+                    ))
+                });
+                let (plain, copies) =
+                    catalogued.unwrap_or_else(|| (prose.plain.clone(), prose.inlines.clone()));
                 (
                     logical.map_or(prose.identity, |logical| logical.identity),
-                    logical
-                        .and_then(|logical| self.catalog.as_ref()?.text(logical.identity))
-                        .unwrap_or_else(|| prose.plain.clone()),
+                    plain,
+                    copies,
                     position.map_or(0, |point| {
                         self.terminal_caret_end(prose, native_bounds)
                             .unwrap_or_else(|| prose.hit(point))
@@ -821,6 +838,7 @@ impl Operation for Read {
                 (
                     logical.identity,
                     logical.plain.clone(),
+                    logical.copies.clone(),
                     0,
                     None,
                     false,
@@ -878,6 +896,7 @@ impl Operation for Read {
             lists,
             cell,
             plain,
+            copies,
             bounds,
             visible: mounted
                 .then(|| {
@@ -2963,6 +2982,7 @@ mod tests {
                 lists: Vec::new(),
                 cell: None,
                 plain: Arc::from(plain),
+                copies: None,
                 bounds: Rectangle::default(),
                 visible: Some(Rectangle::default()),
                 hit: 0,

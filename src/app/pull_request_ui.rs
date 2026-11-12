@@ -9,6 +9,8 @@ use super::*;
 mod conversation;
 
 pub(super) use conversation::WorkKey;
+// The inspected conversation's chats label their links from the same list.
+pub(super) use conversation::Watch as ConversationWatch;
 
 #[derive(Debug, Clone)]
 pub enum Action {
@@ -94,8 +96,23 @@ pub struct State {
     conversation: conversation::State,
 }
 
+impl State {
+    /// The inspected conversation's latest list of pull requests, with its
+    /// revision, which its chats label their links from.
+    pub(super) fn conversation_list(
+        &self,
+    ) -> Option<(TerminalId, u64, &Arc<crate::work::ConversationPullRequests>)> {
+        self.conversation.latest_list()
+    }
+}
+
 impl Cagents {
     pub(super) fn handle_pull_request_ui(&mut self, action: Action) -> Task<Message> {
+        if let Action::Conversation(watch) = &action {
+            // The conversation's chat labels its links from the same list
+            // rather than watching it a second time.
+            self.label_chat_pull_request_links(watch);
+        }
         let conversation = &mut self.pull_request_inspector.conversation;
         match action {
             Action::Conversation(watch) => {
@@ -173,13 +190,19 @@ impl Cagents {
     /// pushed by the daemon while the inspector is shown, so their headers
     /// count them even while collapsed.
     pub(super) fn conversation_pull_request_subscription(&self) -> Subscription<Message> {
-        match self.pull_request_inspector.conversation.conversation {
-            Some(conversation) if self.context_inspector_visible() => {
-                conversation::subscription(conversation)
-                    .map(|watch| Message::PullRequestUi(Action::Conversation(watch)))
-            }
-            _ => Subscription::none(),
+        match self.inspector_watched_conversation() {
+            Some(conversation) => conversation::subscription(conversation)
+                .map(|watch| Message::PullRequestUi(Action::Conversation(watch))),
+            None => Subscription::none(),
         }
+    }
+
+    /// The conversation whose pull requests the shown inspector watches.
+    pub(super) fn inspector_watched_conversation(&self) -> Option<TerminalId> {
+        self.pull_request_inspector
+            .conversation
+            .conversation
+            .filter(|_| self.context_inspector_visible())
     }
 
     /// Follows the focused conversation.

@@ -71,8 +71,8 @@ pub(super) struct WorktreePathIndex {
     /// Every worktree row at each path: a path listed under two projects is a
     /// row of both.
     rows: HashMap<PathBuf, Vec<(ProjectId, WorktreeId)>>,
-    #[cfg(test)]
-    builds: usize,
+    /// Counts rebuilds, so what is derived from the maps can tell they moved.
+    generation: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -117,10 +117,7 @@ impl WorktreePathIndex {
         if unchanged {
             return;
         }
-        #[cfg(test)]
-        {
-            self.builds += 1;
-        }
+        self.generation += 1;
         self.built_from = path_sources(known, projects)
             .map(|(source, path)| (source, path.to_owned()))
             .collect();
@@ -161,6 +158,19 @@ impl WorktreePathIndex {
     /// row.
     pub(super) fn lists(&self, path: &Path) -> bool {
         self.first_row.contains_key(path)
+    }
+
+    /// Counts the rebuilds of the maps.
+    pub(super) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The project whose root or worktree holds `directory`.
+    pub(super) fn project_of(&self, directory: &Path) -> Option<ProjectId> {
+        directory
+            .ancestors()
+            .find_map(|ancestor| self.first_row.get(ancestor))
+            .map(|(project, _)| *project)
     }
 
     /// Every worktree row at `path`.
@@ -2254,7 +2264,11 @@ mod tests {
         let mut index = WorktreePathIndex::default();
         index.refresh(&known, &projects);
         index.refresh(&known, &projects);
-        assert_eq!(index.builds, 1, "unchanged rows and roots keep the index");
+        assert_eq!(
+            index.generation(),
+            1,
+            "unchanged rows and roots keep the index"
+        );
         // Both projects list /root, so it is a row of each; attention goes to
         // the first loaded row there, the folder's own.
         assert_eq!(
@@ -2277,7 +2291,7 @@ mod tests {
 
         projects[1].worktrees[1] = row(nested_row, "/root/moved");
         index.refresh(&known, &projects);
-        assert_eq!(index.builds, 2, "a moved row rebuilds the index");
+        assert_eq!(index.generation(), 2, "a moved row rebuilds the index");
         assert_eq!(index.rows(Path::new("/root/nested")), []);
         assert_eq!(
             (&index).resolve(Path::new("/root/moved/src")),
@@ -2286,7 +2300,11 @@ mod tests {
 
         known.insert("/admitted".into());
         index.refresh(&known, &projects);
-        assert_eq!(index.builds, 3, "a newly known root rebuilds the index");
+        assert_eq!(
+            index.generation(),
+            3,
+            "a newly known root rebuilds the index"
+        );
         assert_eq!(
             (&index).resolve(Path::new("/admitted/src")),
             Some(Path::new("/admitted"))
@@ -2294,7 +2312,11 @@ mod tests {
 
         let folder_project = projects.remove(0);
         index.refresh(&known, &projects);
-        assert_eq!(index.builds, 4, "a removed project rebuilds the index");
+        assert_eq!(
+            index.generation(),
+            4,
+            "a removed project rebuilds the index"
+        );
         assert_eq!(index.rows(Path::new("/root")), [(repository, shared_row)]);
         assert_eq!(
             index.first_row(Path::new("/root")),
@@ -2303,7 +2325,7 @@ mod tests {
 
         projects.push(folder_project);
         index.refresh(&known, &projects);
-        assert_eq!(index.builds, 5, "an added project rebuilds the index");
+        assert_eq!(index.generation(), 5, "an added project rebuilds the index");
         assert_eq!(
             index.first_row(Path::new("/root")),
             Some((repository, shared_row)),
@@ -2311,7 +2333,11 @@ mod tests {
         );
         projects.swap(0, 1);
         index.refresh(&known, &projects);
-        assert_eq!(index.builds, 6, "reordered projects rebuild the index");
+        assert_eq!(
+            index.generation(),
+            6,
+            "reordered projects rebuild the index"
+        );
         assert_eq!(
             index.first_row(Path::new("/root")),
             Some((folder_key.project_id, folder_key.worktree_id))
@@ -2319,7 +2345,11 @@ mod tests {
 
         projects[0].kind = ProjectKind::Git;
         index.refresh(&known, &projects);
-        assert_eq!(index.builds, 7, "a folder becoming a repository rebuilds");
+        assert_eq!(
+            index.generation(),
+            7,
+            "a folder becoming a repository rebuilds"
+        );
         assert_eq!(
             index.first_row(Path::new("/root")),
             Some((folder, folder_row)),
@@ -2327,7 +2357,11 @@ mod tests {
         );
         projects[1].kind = ProjectKind::Folder;
         index.refresh(&known, &projects);
-        assert_eq!(index.builds, 8, "a repository becoming a folder rebuilds");
+        assert_eq!(
+            index.generation(),
+            8,
+            "a repository becoming a folder rebuilds"
+        );
         let became_folder = projects[1].folder_key().unwrap();
         assert_eq!(
             index.first_row(Path::new("/root")),
