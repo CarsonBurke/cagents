@@ -541,8 +541,8 @@ impl Relation {
 }
 
 /// The pull requests one conversation's agents and user worked on or
-/// mentioned, read from its transcript rather than declared, with what the
-/// forge last said about each.
+/// mentioned, and the worktrees they edited, read from its transcript rather
+/// than declared, with what the forge last said about each pull request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConversationPullRequests {
     pub generated_at_unix_ms: u64,
@@ -555,6 +555,20 @@ pub struct ConversationPullRequests {
     /// Why some pull requests could not be read from GitHub, which then
     /// show what was last read about them.
     pub forge_error: Option<String>,
+    /// The project's worktrees the conversation edited files in, most
+    /// recently edited first.
+    #[serde(default)]
+    pub worktrees: Vec<ConversationWorktree>,
+}
+
+/// A worktree of the conversation's project that its agents edited.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationWorktree {
+    pub path: std::path::PathBuf,
+    /// The branch checked out there when the list was built.
+    pub branch: Option<String>,
+    /// Every edit there came from a subagent the conversation started.
+    pub by_subagent: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

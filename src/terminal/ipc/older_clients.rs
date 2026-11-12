@@ -538,6 +538,7 @@ mod tests {
                     pull_requests: Vec::new(),
                     transcript: crate::work::TranscriptCoverage::Complete,
                     forge_error: None,
+                    worktrees: Vec::new(),
                 }),
             }))
         );

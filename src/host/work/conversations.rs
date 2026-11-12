@@ -1,4 +1,5 @@
-//! The pull requests each watched conversation worked on or mentioned.
+//! The pull requests each watched conversation worked on or mentioned, and
+//! the worktrees it edited.
 //!
 //! A window watching a conversation's inspector subscribes to it. This
 //! service then reads the provider's own transcript files incrementally,
@@ -23,7 +24,10 @@ use crate::{
     model::TerminalId,
     pull_request_signals::{PullRequestKeyOrd, Reference, Relation, RepoKeyOrd},
     terminal_ipc::ServerMessage,
-    work::{ConversationPullRequest, ConversationPullRequests, PullRequest, TranscriptCoverage},
+    work::{
+        ConversationPullRequest, ConversationPullRequests, ConversationWorktree, PullRequest,
+        TranscriptCoverage,
+    },
 };
 use std::{
     collections::BTreeMap,
@@ -54,6 +58,10 @@ const FIRST_READ: u64 = 64 * 1024 * 1024;
 const MAX_LINE: usize = 4 * 1024 * 1024;
 /// Distinct references kept per conversation; the oldest mentions go first.
 const REFERENCES: usize = 256;
+/// Distinct edited directories kept per conversation; the least recently
+/// edited go first. Worktrees are resolved from them when a list is built,
+/// so a worktree the board scans later is still found.
+const EDITED_DIRECTORIES: usize = 256;
 /// Subagent transcripts read per conversation, the most recently written
 /// first.
 const SUBAGENTS: usize = 256;
@@ -160,6 +168,9 @@ struct Watched {
     source: Source,
     files: BTreeMap<PathBuf, Cursor>,
     references: BTreeMap<Reference, Aggregate>,
+    /// Absolute directories files were edited in, with when they last were
+    /// and whether only subagents edited there.
+    edited: BTreeMap<PathBuf, Edit>,
     sequence: u64,
     coverage: TranscriptCoverage,
     revision: u64,
@@ -201,6 +212,12 @@ struct Located {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct Edit {
+    by_subagent: bool,
+    seen: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
 struct Aggregate {
     relation: Relation,
     /// Every signal came from a subagent.
@@ -226,6 +243,7 @@ impl Watched {
             source: Source::Pending,
             files: BTreeMap::new(),
             references: BTreeMap::new(),
+            edited: BTreeMap::new(),
             sequence: 0,
             coverage: TranscriptCoverage::Pending,
             revision: 0,
@@ -242,15 +260,25 @@ impl Watched {
     /// it to another branch's pull request.
     fn apply(&mut self, scanned: Scanned, facts: Option<&Facts>) {
         for mut found in scanned.found {
-            if let (Reference::CurrentBranch { directory }, Some(facts)) =
-                (&found.signal.reference, facts)
-                && let Some(branch) = facts.project.as_ref().and_then(|project| {
-                    let directory = match directory {
-                        Some(directory) => normalize(&facts.directory.join(directory)),
-                        None => facts.directory.clone(),
-                    };
-                    project.worktree(&directory)?.branch.clone()
-                })
+            let Some(facts) = facts else {
+                self.record(found);
+                continue;
+            };
+            let Reference::CurrentBranch { directory } = &found.signal.reference else {
+                self.record(found);
+                continue;
+            };
+            let directory = match directory {
+                Some(directory) => normalize(&facts.directory.join(directory)),
+                None => facts.directory.clone(),
+            };
+            if found.signal.relation == Relation::Edited {
+                self.edited_in(directory.clone(), found.by_subagent);
+            }
+            if let Some(branch) = facts
+                .project
+                .as_ref()
+                .and_then(|project| project.worktree(&directory)?.branch.clone())
             {
                 found.signal.reference = Reference::Branch {
                     repository: None,
@@ -260,6 +288,27 @@ impl Watched {
             self.record(found);
         }
         self.coverage = scanned.coverage;
+    }
+
+    fn edited_in(&mut self, directory: PathBuf, by_subagent: bool) {
+        self.sequence += 1;
+        let seen = self.sequence;
+        let entry = self
+            .edited
+            .entry(directory)
+            .or_insert(Edit { by_subagent, seen });
+        entry.by_subagent &= by_subagent;
+        entry.seen = seen;
+        if self.edited.len() > EDITED_DIRECTORIES {
+            let oldest = self
+                .edited
+                .iter()
+                .min_by_key(|(_, edit)| edit.seen)
+                .map(|(directory, _)| directory.clone());
+            if let Some(oldest) = oldest {
+                self.edited.remove(&oldest);
+            }
+        }
     }
 
     fn record(&mut self, found: transcript::Found) {
@@ -503,6 +552,7 @@ impl Handle {
                         watched.source = source;
                         watched.files.clear();
                         watched.references.clear();
+                        watched.edited.clear();
                     }
                 }
                 (watched.source.clone(), std::mem::take(&mut watched.files))
@@ -1050,7 +1100,37 @@ fn assemble(
         pull_requests: pull_requests.into_iter().map(|(_, row)| row).collect(),
         transcript: watched.coverage.clone(),
         forge_error,
+        worktrees: project.map_or_else(Vec::new, |project| edited_worktrees(watched, project)),
     }
+}
+
+/// The project's worktrees holding the directories `watched` edited, most
+/// recently edited first. A directory outside every worktree, such as another
+/// project's, names none.
+fn edited_worktrees(watched: &Watched, project: &ProjectFacts) -> Vec<ConversationWorktree> {
+    let mut worktrees: BTreeMap<&Path, (Edit, Option<&str>)> = BTreeMap::new();
+    for (directory, edit) in &watched.edited {
+        let Some(worktree) = project.worktree(directory) else {
+            continue;
+        };
+        worktrees
+            .entry(worktree.path.as_path())
+            .and_modify(|(found, _)| {
+                found.by_subagent &= edit.by_subagent;
+                found.seen = found.seen.max(edit.seen);
+            })
+            .or_insert((*edit, worktree.branch.as_deref()));
+    }
+    let mut worktrees = worktrees.into_iter().collect::<Vec<_>>();
+    worktrees.sort_by(|(_, (a, _)), (_, (b, _))| b.seen.cmp(&a.seen));
+    worktrees
+        .into_iter()
+        .map(|(path, (edit, branch))| ConversationWorktree {
+            path: path.to_owned(),
+            branch: branch.map(str::to_owned),
+            by_subagent: edit.by_subagent,
+        })
+        .collect()
 }
 
 /// Where a conversation's provider keeps its transcript, once it has

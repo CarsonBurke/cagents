@@ -681,3 +681,89 @@ fn work_on_the_current_branch_stays_with_that_branch_after_a_switch() {
         vec![branch(None, "feat"), branch(None, "main")]
     );
 }
+
+#[test]
+fn edited_worktrees_are_listed_most_recent_first_and_outside_ones_dropped() {
+    let mut watched = Watched::new();
+    let edit = |directory: &str, by_subagent: bool| transcript::Found {
+        signal: Signal {
+            reference: Reference::CurrentBranch {
+                directory: Some(directory.to_owned()),
+            },
+            relation: Relation::Edited,
+        },
+        by_subagent,
+    };
+    watched.apply(
+        Scanned {
+            found: vec![
+                edit("/w/app/src", false),
+                edit("/w/app/.worktrees/feat/src/deep", true),
+                edit("/elsewhere/project", false),
+                edit(".worktrees/feat", true),
+            ],
+            coverage: TranscriptCoverage::Complete,
+        },
+        Some(&facts("/w/app")),
+    );
+    let facts = facts("/w/app");
+    let list = assemble(
+        &watched,
+        Some(&facts),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        None,
+    );
+    assert_eq!(
+        list.worktrees
+            .iter()
+            .map(|worktree| (
+                worktree.path.to_str().unwrap(),
+                worktree.branch.as_deref(),
+                worktree.by_subagent
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            ("/w/app/.worktrees/feat", Some("feat"), true),
+            ("/w/app", Some("main"), false),
+        ]
+    );
+    // Editing a directory again is the newest edit, by the conversation
+    // itself this time.
+    watched.apply(
+        Scanned {
+            found: vec![edit("/w/app", false), edit("/w/app/.worktrees/feat", false)],
+            coverage: TranscriptCoverage::Complete,
+        },
+        Some(&facts),
+    );
+    let list = assemble(
+        &watched,
+        Some(&facts),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        None,
+    );
+    assert_eq!(
+        list.worktrees
+            .iter()
+            .map(|worktree| (worktree.path.to_str().unwrap(), worktree.by_subagent))
+            .collect::<Vec<_>>(),
+        vec![("/w/app/.worktrees/feat", false), ("/w/app", false)]
+    );
+}
+
+#[test]
+fn edited_directories_are_bounded_by_recency() {
+    let mut watched = Watched::new();
+    for index in 0..EDITED_DIRECTORIES + 8 {
+        watched.edited_in(PathBuf::from(format!("/w/app/{index}")), false);
+    }
+    assert_eq!(watched.edited.len(), EDITED_DIRECTORIES);
+    assert!(!watched.edited.contains_key(Path::new("/w/app/0")));
+    assert!(
+        watched
+            .edited
+            .contains_key(&PathBuf::from(format!("/w/app/{}", EDITED_DIRECTORIES + 7)))
+    );
+}

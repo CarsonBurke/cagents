@@ -2441,6 +2441,7 @@ mod tests {
                     .collect(),
                 transcript: crate::work::TranscriptCoverage::Complete,
                 forge_error: None,
+                worktrees: Vec::new(),
             }),
             first,
         })

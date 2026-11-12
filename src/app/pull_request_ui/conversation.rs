@@ -603,6 +603,7 @@ mod tests {
                 pull_requests: rows,
                 transcript: TranscriptCoverage::Complete,
                 forge_error: None,
+                worktrees: Vec::new(),
             }),
             first,
         }
@@ -704,6 +705,7 @@ mod tests {
             pull_requests: Vec::new(),
             transcript: TranscriptCoverage::Complete,
             forge_error: None,
+            worktrees: Vec::new(),
         };
         assert_eq!(name(&list, &delegated), "#2 Change 2");
         delegated.repository = repo("upstream");
