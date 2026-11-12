@@ -709,11 +709,12 @@ fn worktree_facts(worktree: &ConversationWorktree, facts: &mut Vec<Fact>) {
 
 /// What a pull request's row says about it, the facts most in need of
 /// attention first: whose it is when not this repository's, how current
-/// it is, its size, and why it is listed. Its checks and review are
-/// [`pull_request_marks`].
+/// it is, what its worktree has not committed yet, its size, and why it is
+/// listed. Its checks and review are [`pull_request_marks`].
 fn pull_request_facts(
     list: Option<&ConversationPullRequests>,
     row: &ConversationPullRequest,
+    worktree: Option<&ConversationWorktree>,
 ) -> Vec<Fact> {
     let mut facts = Vec::with_capacity(6);
     // Another repository's number would crowd the title, so it goes
@@ -735,6 +736,16 @@ fn pull_request_facts(
             "as of {}",
             crate::work_ui::age(list.generated_at_unix_ms, at, true)
         )));
+    }
+    // Work not pushed yet is not in the pull request's size beside it.
+    if let Some(count) = worktree
+        .and_then(|worktree| worktree.changed_paths)
+        .filter(|count| *count > 0)
+    {
+        facts.push(Fact::toned(
+            format!("{count} uncommitted"),
+            design::warning_text,
+        ));
     }
     if let Some(diff) = row.diff {
         facts.extend(Fact::change_counts(diff.additions, diff.deletions));
@@ -771,13 +782,50 @@ fn pull_request_marks<'a>(row: &ConversationPullRequest) -> Vec<(Element<'a, Act
     marks
 }
 
-fn work_row<'a>(
+/// What a row of the Work list draws and says.
+struct RowParts<'a> {
+    glyph: Element<'a, Action>,
+    name: String,
+    /// The name read out: a pull request's adds its state and number, which
+    /// its glyph and trailing number draw.
+    spoken: String,
+    trailing: Option<String>,
+    marks: Vec<(Element<'a, Action>, String)>,
+    facts: Vec<Fact>,
+}
+
+impl RowParts<'_> {
+    /// The row's accessible name. The facts line may be cut short, so it
+    /// says them all. Pressing a shown pull request again folds or unfolds
+    /// its details, which nothing on the row draws, so it says which.
+    fn described(&self, work: Work<'_>, marked: bool, details: bool) -> String {
+        let spoken = &self.spoken;
+        let shown = match work.pull_request() {
+            Some(row) if marked => {
+                let what = if lists_checks(row) {
+                    "its checks"
+                } else {
+                    "its details"
+                };
+                let verb = if details { "hide" } else { "list" };
+                format!("{spoken}, shown below, press to {verb} {what}")
+            }
+            None if marked => format!("{spoken}, shown below"),
+            _ => format!("Show {spoken}"),
+        };
+        std::iter::once(shown)
+            .chain(self.marks.iter().map(|(_, said)| said.clone()))
+            .chain(self.facts.iter().map(Fact::text))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+fn row_parts<'a>(
     list: Option<&ConversationPullRequests>,
     work: Work<'_>,
-    marked: bool,
-    details: bool,
     openable: &dyn Fn(&Path) -> bool,
-) -> Element<'a, Action> {
+) -> RowParts<'a> {
     let mut facts: Vec<Fact> = Vec::with_capacity(6);
     // Work this window cannot show says so before anything else, since it
     // is why choosing it shows no changes.
@@ -787,20 +835,26 @@ fn work_row<'a>(
         facts.push(Fact::plain("Not in Projects"));
     }
     let mut marks: Vec<(Element<'a, Action>, String)> = Vec::new();
+    let mut spoken = None;
     let (glyph, name, trailing): (Element<'a, Action>, String, Option<String>) = match work {
-        Work::PullRequest { row, .. } => {
+        Work::PullRequest { row, worktree } => {
             marks = pull_request_marks(row);
             let state = row
                 .pull_request
                 .as_ref()
                 .map(crate::sidebar::WorktreePullRequestState::from_work);
-            facts.extend(pull_request_facts(list, row));
+            facts.extend(pull_request_facts(list, row, worktree));
+            let number = number_label(list, row);
+            let name = row
+                .pull_request
+                .as_ref()
+                .map_or_else(|| number.clone(), |pull_request| pull_request.title.clone());
+            // Not yet known, a pull request is named by its number already.
+            spoken =
+                state.map(|state| format!("{name}, {}, {number}", state.label().to_lowercase()));
             (
                 crate::ui_controls::pull_request_state_glyph(state, design::ROW_ICON_SIZE),
-                row.pull_request.as_ref().map_or_else(
-                    || number_label(list, row),
-                    |pull_request| pull_request.title.clone(),
-                ),
+                name,
                 Some(format!("#{}", row.number)),
             )
         }
@@ -832,19 +886,33 @@ fn work_row<'a>(
             )
         }
     };
-    // The facts line may be cut short, so the name read out says them all.
-    // Pressing a shown pull request again folds or unfolds its checks, which
-    // nothing on the row draws, so its name says which it will do.
-    let described = std::iter::once(match (marked, work.pull_request()) {
-        (true, Some(_)) if details => format!("{name}, shown below, press to hide its checks"),
-        (true, Some(_)) => format!("{name}, shown below, press to list its checks"),
-        (true, None) => format!("{name}, shown below"),
-        (false, _) => format!("Show {name}"),
-    })
-    .chain(marks.iter().map(|(_, said)| said.clone()))
-    .chain(facts.iter().map(Fact::text))
-    .collect::<Vec<_>>()
-    .join(", ");
+    RowParts {
+        glyph,
+        spoken: spoken.unwrap_or_else(|| name.clone()),
+        name,
+        trailing,
+        marks,
+        facts,
+    }
+}
+
+fn work_row<'a>(
+    list: Option<&ConversationPullRequests>,
+    work: Work<'_>,
+    marked: bool,
+    details: bool,
+    openable: &dyn Fn(&Path) -> bool,
+) -> Element<'a, Action> {
+    let parts = row_parts(list, work, openable);
+    let described = parts.described(work, marked, details);
+    let RowParts {
+        glyph,
+        name,
+        trailing,
+        marks,
+        facts,
+        ..
+    } = parts;
     let mut row = crate::ui_controls::list_row(None, name)
         .icon_element(glyph)
         .caption_element(facts_line(&facts))
@@ -890,16 +958,6 @@ fn lists_checks(row: &ConversationPullRequest) -> bool {
             .is_some_and(|pull_request| pull_request.state == crate::work::PullRequestState::Open)
 }
 
-fn check_state_label(state: CheckState) -> &'static str {
-    match state {
-        CheckState::Failed => "failing",
-        CheckState::Pending => "running",
-        CheckState::Passed => "passed",
-        CheckState::Cancelled => "cancelled",
-        CheckState::Skipped => "skipped",
-    }
-}
-
 /// What a chosen pull request adds beneath its row: its checks, the ones
 /// most in need of attention first, and a way to open it. Its rows hang
 /// from the row's label column, so they read as belonging to it.
@@ -917,7 +975,7 @@ fn chosen_details<'a>(row: &ConversationPullRequest) -> Element<'a, Action> {
                     .name(format!(
                         "Open the {} check, {}",
                         check.name,
-                        check_state_label(check.state)
+                        crate::ui_controls::check_state_label(check.state)
                     ))
                     .dense()
                     .on_press_maybe(Url::parse(&check.url).ok().map(Action::OpenCheck))
@@ -1510,6 +1568,66 @@ mod tests {
         open.checks.clear();
         open.pull_request.as_mut().unwrap().review = None;
         assert!(pull_request_marks(&open).is_empty());
+    }
+
+    /// A row's accessible name says what its glyphs and number draw, and
+    /// what pressing it will do.
+    #[test]
+    fn a_rows_name_says_its_state_number_marks_and_facts() {
+        let list = ConversationPullRequests {
+            generated_at_unix_ms: 0,
+            repository: Some(repo("me")),
+            pull_requests: Vec::new(),
+            transcript: TranscriptCoverage::Complete,
+            forge_error: None,
+            worktrees: Vec::new(),
+        };
+        let list = Some(&list);
+        let mut draft = row(9, Relation::Edited);
+        draft.pull_request.as_mut().unwrap().draft = true;
+        draft.pull_request.as_mut().unwrap().review = Some(crate::work::Review::Required);
+        draft.checks = vec![check("test", CheckState::Pending)];
+        let mut checked_out = worktree("/repo/fix-cache", Some(9));
+        checked_out.changed_paths = Some(2);
+        let work = Work::PullRequest {
+            row: &draft,
+            worktree: Some(&checked_out),
+        };
+        let parts = row_parts(list, work, &|_| true);
+        assert_eq!(
+            parts.described(work, false, false),
+            "Show Change 9, draft, #9, Checks: 1 running, Review required, 2 uncommitted, Edited"
+        );
+        assert_eq!(
+            parts.described(work, true, false),
+            "Change 9, draft, #9, shown below, press to list its checks, \
+             Checks: 1 running, Review required, 2 uncommitted, Edited"
+        );
+        assert_eq!(
+            parts.described(work, true, true),
+            "Change 9, draft, #9, shown below, press to hide its checks, \
+             Checks: 1 running, Review required, 2 uncommitted, Edited"
+        );
+
+        // A merged one lists no checks, so pressing it shows only its link.
+        let mut merged = row(3, Relation::Created);
+        merged.pull_request.as_mut().unwrap().state = PullRequestState::Merged;
+        merged.checks = vec![check("test", CheckState::Passed)];
+        let work = Work::PullRequest {
+            row: &merged,
+            worktree: None,
+        };
+        assert_eq!(
+            row_parts(list, work, &|_| true).described(work, true, true),
+            "Change 3, merged, #3, shown below, press to hide its details, Created"
+        );
+
+        let edited = worktree("/repo/notes", None);
+        let work = Work::Worktree(&edited);
+        assert_eq!(
+            row_parts(list, work, &|_| false).described(work, true, false),
+            "repo/notes, shown below, Not in Projects, 1 uncommitted, Edited"
+        );
     }
 
     #[test]

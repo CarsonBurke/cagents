@@ -567,6 +567,17 @@ mod tests {
                 .map(|key| key.canonical_path.clone())
         };
         assert_eq!(active(&app), pinned);
+        // What the panels bind with nothing pinned: the focused card's
+        // worktree.
+        let unpinned = {
+            let mut state = app.sidebar_state.clone();
+            state.pin_panel_worktree(None);
+            state.sync_active_worktree(&app.sidebar_model, &app.sidebar_focus());
+            state
+                .active_worktree()
+                .map(|key| key.canonical_path.clone())
+        };
+        assert_ne!(unpinned, pinned, "the test needs focus elsewhere");
         drop(app.set_context_inspector_open(false));
         // The close finishes on an animation frame, which rebinds nothing
         // else; the panels must still let go of the work.
@@ -575,7 +586,7 @@ mod tests {
         )));
         assert!(!app.context_inspector_visible());
         assert_eq!(app.inspector_panel_pin(), None);
-        assert_ne!(active(&app), pinned);
+        assert_eq!(active(&app), unpinned);
     }
 }
 
