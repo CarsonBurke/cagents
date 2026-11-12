@@ -12741,10 +12741,14 @@ mod row_interaction {
             // row keeps every frame: its focused control may need redraws,
             // such as an input placing its input method, and a focus moved
             // here by an operation reveals the row's actions on the next one.
+            // So does a row whose tooltip or menu is still on screen: a
+            // tooltip fades out over the frames after the pointer leaves, and
+            // would stay frozen there without them.
             let state = tree.state.downcast_ref::<State>();
             if !layout.bounds().intersects(viewport)
                 && !state.hovered
                 && !state.focused
+                && !state.overlaid.get()
                 && state.origin.is_none()
                 && unseen_rows_may_skip(event)
             {
@@ -20360,139 +20364,37 @@ pub(crate) mod tests {
             &renderer,
             &layout::Limits::new(Size::ZERO, Size::new(280.0, 2000.0)),
         );
+        let list = &mut list;
+        let tree = &mut tree;
         // Rows 0 to 9 fill the first 200 pixels; rows 50 to 59 the view
         // scrolled to 1000.
         let top = Rectangle::new(Point::ORIGIN, Size::new(280.0, 200.0));
         let scrolled = Rectangle::new(Point::new(0.0, 1000.0), Size::new(280.0, 200.0));
-        let mut send = |event: Event, cursor: mouse::Cursor, viewport: &Rectangle| {
+        let send = |list: &mut Element<'_, SidebarAction>,
+                    tree: &mut Tree,
+                    event: Event,
+                    cursor: mouse::Cursor,
+                    viewport: &Rectangle| {
             let mut messages = Vec::new();
-            let mut shell = Shell::new(&mut messages);
             list.as_widget_mut().update(
-                &mut tree,
+                tree,
                 &event,
                 Layout::new(&node),
                 cursor,
                 &renderer,
                 &mut clipboard::Null,
-                &mut shell,
+                &mut Shell::new(&mut messages),
                 viewport,
             );
             Logs::take(&logs.updates)
         };
-        let redraw = || Event::Window(window::Event::RedrawRequested(Instant::now()));
-        let away = mouse::Cursor::Unavailable;
-
-        assert_eq!(send(redraw(), away, &top), (0..10).collect::<Vec<_>>());
-        assert_eq!(
-            send(
-                Event::PlatformSpecific(PlatformSpecific::Wayland(wayland::Event::RequestResize)),
-                away,
-                &scrolled,
-            ),
-            (50..60).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            send(
-                Event::Keyboard(keyboard::Event::ModifiersChanged(
-                    keyboard::Modifiers::SHIFT
-                )),
-                away,
-                &scrolled,
-            ),
-            (0..100).collect::<Vec<_>>(),
-            "keys reach rows out of view"
-        );
-        let over_first = mouse::Cursor::Available(Point::new(10.0, 10.0));
-        assert_eq!(
-            send(
-                Event::Mouse(mouse::Event::CursorMoved {
-                    position: Point::new(10.0, 10.0)
-                }),
-                over_first,
-                &top,
-            ),
-            (0..10).collect::<Vec<_>>()
-        );
-        // Row 0 was hovered when the list scrolled away from it.
-        assert_eq!(
-            send(redraw(), away, &scrolled),
-            std::iter::once(0).chain(50..60).collect::<Vec<_>>(),
-            "the hovered row hears that the pointer has gone"
-        );
-        assert_eq!(
-            send(redraw(), away, &scrolled),
-            (50..60).collect::<Vec<_>>()
-        );
-        drop(send);
-
-        // Focus moved by an operation, as keyboard navigation does, to a row
-        // out of view.
-        let focus_on = |list: &mut Element<'_, SidebarAction>, tree: &mut Tree, row| {
-            logs.focus.set(row);
-            list.as_widget_mut()
-                .operate(tree, Layout::new(&node), &renderer, &mut VisitAll);
-        };
-        focus_on(&mut list, &mut tree, Some(80));
-        let mut send = |event: Event, viewport: &Rectangle| {
-            let mut messages = Vec::new();
-            let mut shell = Shell::new(&mut messages);
-            list.as_widget_mut().update(
-                &mut tree,
-                &event,
-                Layout::new(&node),
-                away,
-                &renderer,
-                &mut clipboard::Null,
-                &mut shell,
-                viewport,
-            );
-            Logs::take(&logs.updates)
-        };
-        assert_eq!(
-            send(redraw(), &scrolled),
-            (50..60).chain([80]).collect::<Vec<_>>(),
-            "a focused row out of view keeps its frames"
-        );
-        drop(send);
-        focus_on(&mut list, &mut tree, None);
-        let mut messages = Vec::new();
-        list.as_widget_mut().update(
-            &mut tree,
-            &redraw(),
-            Layout::new(&node),
-            away,
-            &renderer,
-            &mut clipboard::Null,
-            &mut Shell::new(&mut messages),
-            &scrolled,
-        );
-        assert_eq!(
-            Logs::take(&logs.updates),
-            (50..60).collect::<Vec<_>>(),
-            "once focus leaves, so do the frames"
-        );
-
-        let over_scrolled = mouse::Cursor::Available(Point::new(10.0, 1010.0));
-        let _ = list.as_widget().mouse_interaction(
-            &tree,
-            Layout::new(&node),
-            over_scrolled,
-            &scrolled,
-            &renderer,
-        );
-        assert_eq!(
-            Logs::take(&logs.queries),
-            (50..60).collect::<Vec<_>>(),
-            "only rows in view are asked for the cursor"
-        );
-
         // Overlays take the window's viewport, and the scroll as translation.
         let screen = Rectangle::new(Point::ORIGIN, Size::new(280.0, 200.0));
-        let mut collect = |scroll: f32| {
+        let collect = |list: &mut Element<'_, SidebarAction>, tree: &mut Tree, scroll: f32| {
             let open = list
                 .as_widget_mut()
                 .overlay(
-                    &mut tree,
+                    tree,
                     Layout::new(&node),
                     &renderer,
                     &screen,
@@ -20501,23 +20403,123 @@ pub(crate) mod tests {
                 .is_some();
             (Logs::take(&logs.overlays), open)
         };
-        assert_eq!(collect(1000.0), ((50..60).collect::<Vec<_>>(), false));
-        logs.menu.set(Some(55));
-        assert_eq!(collect(1000.0), ((50..60).collect::<Vec<_>>(), true));
+        let focus_on = |list: &mut Element<'_, SidebarAction>, tree: &mut Tree, row| {
+            logs.focus.set(row);
+            list.as_widget_mut()
+                .operate(tree, Layout::new(&node), &renderer, &mut VisitAll);
+        };
+        let redraw = || Event::Window(window::Event::RedrawRequested(Instant::now()));
+        let away = mouse::Cursor::Unavailable;
+        let rows = |rows: &[std::ops::Range<usize>], extra: &[usize]| {
+            rows.iter()
+                .cloned()
+                .flatten()
+                .chain(extra.iter().copied())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(send(list, tree, redraw(), away, &top), rows(&[0..10], &[]));
         assert_eq!(
-            collect(0.0),
-            ((0..10).chain([55]).collect::<Vec<_>>(), true),
+            send(
+                list,
+                tree,
+                Event::PlatformSpecific(PlatformSpecific::Wayland(wayland::Event::RequestResize)),
+                away,
+                &scrolled,
+            ),
+            rows(&[50..60], &[])
+        );
+        assert_eq!(
+            send(
+                list,
+                tree,
+                Event::Keyboard(keyboard::Event::ModifiersChanged(
+                    keyboard::Modifiers::SHIFT
+                )),
+                away,
+                &scrolled,
+            ),
+            rows(&[0..100], &[]),
+            "keys reach rows out of view"
+        );
+        let over_first = mouse::Cursor::Available(Point::new(10.0, 10.0));
+        assert_eq!(
+            send(
+                list,
+                tree,
+                Event::Mouse(mouse::Event::CursorMoved {
+                    position: Point::new(10.0, 10.0)
+                }),
+                over_first,
+                &top,
+            ),
+            rows(&[0..10], &[])
+        );
+        // Row 0 was hovered when the list scrolled away from it.
+        assert_eq!(
+            send(list, tree, redraw(), away, &scrolled),
+            rows(&[0..1, 50..60], &[]),
+            "the hovered row hears that the pointer has gone"
+        );
+        assert_eq!(
+            send(list, tree, redraw(), away, &scrolled),
+            rows(&[50..60], &[])
+        );
+
+        // Focus moved by an operation, as keyboard navigation does, to a row
+        // out of view.
+        focus_on(list, tree, Some(80));
+        assert_eq!(
+            send(list, tree, redraw(), away, &scrolled),
+            rows(&[50..60], &[80]),
+            "a focused row out of view keeps its frames"
+        );
+        focus_on(list, tree, None);
+        assert_eq!(
+            send(list, tree, redraw(), away, &scrolled),
+            rows(&[50..60], &[]),
+            "once focus leaves, so do the frames"
+        );
+
+        let over_scrolled = mouse::Cursor::Available(Point::new(10.0, 1010.0));
+        let _ = list.as_widget().mouse_interaction(
+            tree,
+            Layout::new(&node),
+            over_scrolled,
+            &scrolled,
+            &renderer,
+        );
+        assert_eq!(
+            Logs::take(&logs.queries),
+            rows(&[50..60], &[]),
+            "only rows in view are asked for the cursor"
+        );
+
+        assert_eq!(collect(list, tree, 1000.0), (rows(&[50..60], &[]), false));
+        logs.menu.set(Some(55));
+        assert_eq!(collect(list, tree, 1000.0), (rows(&[50..60], &[]), true));
+        assert_eq!(
+            collect(list, tree, 0.0),
+            (rows(&[0..10], &[55]), true),
             "a menu still open as its row leaves the view stays open"
         );
-        logs.menu.set(None);
         assert_eq!(
-            collect(0.0),
-            ((0..10).chain([55]).collect::<Vec<_>>(), false)
+            send(list, tree, redraw(), away, &top),
+            rows(&[0..10], &[55]),
+            "a row whose overlay is on screen keeps its frames, so a tooltip \
+             fading out as its row scrolls away can finish"
+        );
+        logs.menu.set(None);
+        assert_eq!(collect(list, tree, 0.0), (rows(&[0..10], &[55]), false));
+        assert_eq!(
+            collect(list, tree, 0.0),
+            (rows(&[0..10], &[]), false),
+            "once closed, the row is left alone"
         );
         assert_eq!(
-            collect(0.0),
-            ((0..10).collect::<Vec<_>>(), false),
-            "once closed, the row is left alone"
+            send(list, tree, redraw(), away, &top),
+            rows(&[0..10], &[]),
+            "and its frames stop"
         );
     }
 
