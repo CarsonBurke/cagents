@@ -291,12 +291,9 @@ pub(super) fn perform(
     } else {
         previous.unwrap_or_else(|| root.to_owned())
     };
-    if restored_previous {
-        // current names the restored matched set again. Any reopen, including
-        // the guard's own after a failed recovery, must use its UI rather
-        // than this candidate's, which cannot serve the restored daemon.
-        guard.set_fallback_executable(reopen.join("bin/cagents-ui"));
-    }
+    // Any reopen, including the guard's own after a failed recovery, uses
+    // the UI matched to the daemon chosen above, never this worker's own.
+    guard.set_fallback_executable(reopen.join("bin/cagents-ui"));
     let recovery_result = finish_handoff(
         installation,
         state,

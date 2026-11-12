@@ -1557,7 +1557,8 @@ impl UiUpdateGuard {
         let mut saved = Vec::with_capacity(lingering.len());
         for slot in &lingering {
             match self.saved_window(slot, flushed) {
-                Ok(window) => saved.push((slot.as_str(), window)),
+                Ok(Some(window)) => saved.push((slot.as_str(), window)),
+                Ok(None) => eprintln!("Window {slot} exited at the close deadline."),
                 Err(reason) => {
                     eprintln!(
                         "Window {slot} is still open after {}s and {reason}; it keeps running.",
@@ -1580,25 +1581,33 @@ impl UiUpdateGuard {
         Ok(())
     }
 
-    /// The pinned window for `slot`, if it is proven to have nothing unsaved.
+    /// The pinned window for `slot` if it is proven to have nothing unsaved,
+    /// or None if that process has already exited and released its slot.
     fn saved_window(
         &self,
         slot: &str,
         flushed: &impl Fn(u32, u64) -> io::Result<bool>,
-    ) -> Result<&VerifiedWindow, String> {
-        let Some((_, requested)) = self.close.committed.iter().find(|(s, _)| s == slot) else {
-            return Err("did not acknowledge closing".into());
-        };
+    ) -> Result<Option<&VerifiedWindow>, String> {
         let Some((_, window)) = self.close.pinned.iter().find(|(s, _)| s == slot) else {
             return Err("its process was not identified when the update prepared it".into());
         };
+        // An exit between listing slots and verifying the process is success,
+        // not an unverifiable window: its procfs entries are already gone.
+        let exited = |window: &VerifiedWindow| !window.is_alive();
+        if exited(window) {
+            return Ok(None);
+        }
+        let Some((_, requested)) = self.close.committed.iter().find(|(s, _)| s == slot) else {
+            return Err("did not acknowledge closing".into());
+        };
         match window.still_owns_lease() {
             Ok(true) => {}
+            _ if exited(window) => return Ok(None),
             Ok(false) => return Err("its slot now belongs to a different process".into()),
             Err(error) => return Err(format!("its process could not be verified: {error}")),
         }
         match flushed(window.pid, *requested) {
-            Ok(true) => Ok(window),
+            Ok(true) => Ok(Some(window)),
             Ok(false) => Err("has not reported that its workspace was saved".into()),
             Err(error) => Err(format!("its save report could not be read: {error}")),
         }
@@ -1633,7 +1642,8 @@ impl UiUpdateGuard {
         let mut saved = Vec::new();
         for slot in self.closed.iter().filter(|slot| live.contains(slot)) {
             match self.saved_window(slot, &flushed) {
-                Ok(window) => saved.push((slot.as_str(), window)),
+                Ok(Some(window)) => saved.push((slot.as_str(), window)),
+                Ok(None) => {}
                 Err(reason) => {
                     eprintln!(
                         "Window {slot} is still closing after {}s and {reason}; it keeps running.",
@@ -3266,6 +3276,28 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(error.to_string().contains("second"), "{error}");
+    }
+
+    #[test]
+    fn a_window_that_exits_while_being_verified_counts_as_closed() {
+        let runtime = tempdir().unwrap();
+        let mut guard = guard_in(runtime.path());
+        let mut window = LingeringWindow::spawn(runtime.path(), "second", false);
+        pin_committed(&mut guard, "second");
+        // It exits after its slot was listed but before it was verified:
+        // its procfs entries vanish, which must not read as unverifiable.
+        window.0.kill().unwrap();
+        window.0.wait().unwrap();
+        let unreadable = |_, _| Err(io::Error::other("no save report"));
+        assert!(matches!(
+            guard.saved_window("second", &unreadable),
+            Ok(None)
+        ));
+        guard.close.committed.clear();
+        assert!(
+            matches!(guard.saved_window("second", &unreadable), Ok(None)),
+            "an exited window needs no commit acknowledgement either"
+        );
     }
 
     #[test]
