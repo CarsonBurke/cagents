@@ -123,7 +123,7 @@ fn named_glyph<'a, Message: 'a>(
 pub const fn check_state_look(state: CheckState) -> (Icon, fn(&cosmic::Theme) -> Color) {
     match state {
         CheckState::Failed => (Icon::Error, design::destructive_color),
-        CheckState::Pending => (Icon::Loading, design::warning_color),
+        CheckState::Pending => (Icon::CheckRunning, design::warning_color),
         CheckState::Passed => (Icon::Check, design::success_color),
         CheckState::Cancelled => (Icon::Cancel, design::muted_color),
         CheckState::Skipped => (Icon::Minus, design::muted_color),
@@ -140,26 +140,49 @@ pub struct ChecksSummary {
 }
 
 impl ChecksSummary {
+    /// The states in the order a summary names them, worst first, with
+    /// their words.
+    const ORDER: [(CheckState, &'static str); 5] = [
+        (CheckState::Failed, "failing"),
+        (CheckState::Pending, "running"),
+        (CheckState::Cancelled, "cancelled"),
+        (CheckState::Passed, "passed"),
+        (CheckState::Skipped, "skipped"),
+    ];
+
     /// Summarises the states of a pull request's checks; `None` when it has
     /// none.
     pub fn of(states: impl IntoIterator<Item = CheckState>) -> Option<Self> {
-        const ORDER: [(CheckState, &str); 5] = [
-            (CheckState::Failed, "failing"),
-            (CheckState::Pending, "running"),
-            (CheckState::Cancelled, "cancelled"),
-            (CheckState::Passed, "passed"),
-            (CheckState::Skipped, "skipped"),
-        ];
-        let mut counts = [0_usize; ORDER.len()];
+        let mut counts = [0_usize; Self::ORDER.len()];
         for state in states {
-            let index = ORDER
-                .iter()
-                .position(|(each, _)| *each == state)
-                .expect("every check state has a word");
+            let index = match state {
+                CheckState::Failed => 0,
+                CheckState::Pending => 1,
+                CheckState::Cancelled => 2,
+                CheckState::Passed => 3,
+                CheckState::Skipped => 4,
+            };
             counts[index] += 1;
         }
-        let worst = ORDER[counts.iter().position(|count| *count > 0)?].0;
-        let label = ORDER
+        Self::of_each(counts)
+    }
+
+    /// Summarises the counts a work item keeps of its pull request's checks,
+    /// in constant time however many checks there are.
+    pub fn of_counts(checks: crate::work::Checks) -> Option<Self> {
+        let count = |n: u32| usize::try_from(n).unwrap_or(usize::MAX);
+        Self::of_each([
+            count(checks.failed),
+            count(checks.pending),
+            0,
+            count(checks.passed),
+            0,
+        ])
+    }
+
+    fn of_each(counts: [usize; Self::ORDER.len()]) -> Option<Self> {
+        let worst = Self::ORDER[counts.iter().position(|count| *count > 0)?].0;
+        let label = Self::ORDER
             .iter()
             .zip(counts)
             .filter(|(_, count)| *count > 0)
@@ -167,22 +190,6 @@ impl ChecksSummary {
             .collect::<Vec<_>>()
             .join(", ");
         Some(Self { worst, label })
-    }
-
-    /// Summarises the counts a work item keeps of its pull request's checks.
-    pub fn of_counts(checks: crate::work::Checks) -> Option<Self> {
-        let count = |n: u32| usize::try_from(n).unwrap_or(usize::MAX);
-        Self::of(
-            std::iter::repeat_n(CheckState::Failed, count(checks.failed))
-                .chain(std::iter::repeat_n(
-                    CheckState::Pending,
-                    count(checks.pending),
-                ))
-                .chain(std::iter::repeat_n(
-                    CheckState::Passed,
-                    count(checks.passed),
-                )),
-        )
     }
 
     /// The checks' name on hover and to assistive technology:
@@ -218,8 +225,10 @@ pub const fn review_label(review: Review) -> &'static str {
     }
 }
 
-/// How a review decision looks: a comment bubble whose mark says the outcome,
-/// so the three read as one family apart from the checks' marks.
+/// How a review decision looks: a comment bubble, so the three read as one
+/// family apart from the checks' marks. A decision fills the bubble and cuts
+/// its mark out, a check or a cross, heavy enough to read at the compact size;
+/// a review still required leaves the bubble hollow.
 pub const fn review_look(review: Review) -> (Icon, fn(&cosmic::Theme) -> Color) {
     match review {
         Review::Approved => (Icon::ReviewApproved, design::success_color),
@@ -241,6 +250,63 @@ pub fn pull_request_review_glyph<'a, Message: 'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Which pixels a bundled glyph covers when drawn at `size`.
+    fn silhouette(svg: &[u8], size: u32) -> Vec<bool> {
+        let tree = resvg::usvg::Tree::from_data(svg, &resvg::usvg::Options::default())
+            .expect("a bundled glyph parses");
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(size, size).unwrap();
+        let scale = size as f32 / tree.size().width();
+        resvg::render(
+            &tree,
+            resvg::tiny_skia::Transform::from_scale(scale, scale),
+            &mut pixmap.as_mut(),
+        );
+        pixmap
+            .pixels()
+            .iter()
+            .map(|pixel| pixel.alpha() >= 128)
+            .collect()
+    }
+
+    /// Tone alone must not tell these glyphs apart: someone who cannot see
+    /// red from green still reads the decision from the shape, at the
+    /// compact size rows draw them.
+    #[test]
+    fn review_and_running_glyphs_differ_in_shape_at_the_compact_size() {
+        let size = u32::from(design::COMPACT_ICON_SIZE);
+        let glyphs = [
+            (
+                "approved",
+                &include_bytes!("../icons/review-approved.svg")[..],
+            ),
+            (
+                "changes",
+                &include_bytes!("../icons/review-changes.svg")[..],
+            ),
+            (
+                "required",
+                &include_bytes!("../icons/review-required.svg")[..],
+            ),
+            ("running", &include_bytes!("../icons/check-running.svg")[..]),
+        ]
+        .map(|(name, svg)| (name, silhouette(svg, size)));
+        for (index, (name, pixels)) in glyphs.iter().enumerate() {
+            let covered = pixels.iter().filter(|covered| **covered).count();
+            assert!(covered >= 20, "{name} is too faint to read: {covered} px");
+            for (other, other_pixels) in &glyphs[index + 1..] {
+                let differing = pixels
+                    .iter()
+                    .zip(other_pixels)
+                    .filter(|(a, b)| a != b)
+                    .count();
+                assert!(
+                    differing >= 12,
+                    "{name} and {other} differ in only {differing} px at {size} px"
+                );
+            }
+        }
+    }
 
     #[test]
     fn each_state_draws_its_own_glyph() {

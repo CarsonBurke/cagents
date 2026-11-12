@@ -40,8 +40,6 @@ pub const TAB_STATUS_ICON_SIZE: u16 = 14;
 pub const WINDOW_CONTROL_SIZE: f32 = 32.0;
 pub const COMMAND_POPOVER_WIDTH: f32 = 292.0;
 pub const NOTICE_POPOVER_WIDTH: f32 = 408.0;
-pub const PANE_NAVIGATOR_MIN_WIDTH: f32 = 42.0;
-pub const PANE_NAVIGATOR_RESERVED_WIDTH: f32 = 110.0;
 pub const TAB_MIN_WIDTH: f32 = 160.0;
 pub const TAB_MAX_WIDTH: f32 = 420.0;
 /// New panes fill a tiled workspace without changing existing pane widths.
