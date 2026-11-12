@@ -1677,19 +1677,18 @@ mod tests {
                 state.update(Action::Layout(Layout::List));
             }
             let mut cache = Cache::new();
-            let mut stages = [Duration::ZERO; 3];
+            // The view is built lazily inside layout, so building the
+            // interface is where the cards' widgets are made.
+            let mut stages = [Duration::ZERO; 2];
             for frame in 0..WARMUP + FRAMES {
                 let clock = Instant::now();
-                let element = state.view();
-                let viewed = clock.elapsed();
-                let clock = Instant::now();
                 let mut ui = UserInterface::build(
-                    element,
+                    state.view(),
                     iced::Size::new(1240.0, 900.0),
                     std::mem::replace(&mut cache, Cache::new()),
                     &mut renderer,
                 );
-                let laid_out = clock.elapsed();
+                let built = clock.elapsed();
                 let clock = Instant::now();
                 ui.draw(
                     &mut renderer,
@@ -1700,15 +1699,14 @@ mod tests {
                 let drawn = clock.elapsed();
                 cache = ui.into_cache();
                 if frame >= WARMUP {
-                    for (stage, took) in stages.iter_mut().zip([viewed, laid_out, drawn]) {
+                    for (stage, took) in stages.iter_mut().zip([built, drawn]) {
                         *stage += took;
                     }
                 }
             }
-            let [view, layout, draw] =
-                stages.map(|stage| stage.as_secs_f64() * 1e3 / FRAMES as f64);
+            let [build, draw] = stages.map(|stage| stage.as_secs_f64() * 1e3 / FRAMES as f64);
             eprintln!(
-                "work {name}, {CARDS} cards: view {view:.3} ms, build+layout {layout:.3} ms, \
+                "work {name}, {CARDS} cards: view, build and layout {build:.3} ms, \
                  draw {draw:.3} ms per frame"
             );
         }
