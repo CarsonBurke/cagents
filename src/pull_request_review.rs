@@ -3214,8 +3214,13 @@ pub fn browser_row<'a>(
             button::custom(content)
                 .class(sidebar_button_style(selected))
                 .name(format!(
-                    "Review pull request #{} {}",
-                    pull_request.number, pull_request.title
+                    "Review {} pull request #{} {}",
+                    state
+                        .unwrap_or(WorktreePullRequestState::Open)
+                        .label()
+                        .to_lowercase(),
+                    pull_request.number,
+                    pull_request.title
                 ))
                 .selected(selected)
                 .padding([space::XS, space::S])

@@ -858,7 +858,7 @@ impl State {
                         Some(state),
                         design::COMPACT_ICON_SIZE,
                     ),
-                    format!("Pull request {}", state.label().to_lowercase()),
+                    format!("{} pull request", state.label()),
                 ));
             }
             facts.extend(pull_request_badges(pull_request));
@@ -1163,40 +1163,44 @@ fn dot(tone: Toned) -> cosmic::theme::Container<'static> {
 /// Whether the card's leading glyph is its pull request's state, rather than
 /// an agent's activity or a branch.
 fn status_glyph_is_pull_request(item: &Item) -> bool {
-    item.pull_request.is_some()
-        && !item.sessions.iter().any(|session| {
-            matches!(
-                session.state,
-                ActivityState::Working | ActivityState::Waiting
-            )
-        })
+    matches!(Leading::of(item), Leading::PullRequest(_))
 }
 
-/// What the card's leading glyph says at a glance: a working agent, else the
-/// pull request's state, else a branch.
+/// What the card's leading glyph says at a glance: a working agent, else an
+/// agent waiting, else the pull request's state, else a branch.
+enum Leading<'a> {
+    Working,
+    Waiting,
+    PullRequest(&'a crate::work::PullRequest),
+    Branch,
+}
+
+impl<'a> Leading<'a> {
+    fn of(item: &'a Item) -> Self {
+        let any = |state| item.sessions.iter().any(|session| session.state == state);
+        if any(ActivityState::Working) {
+            Self::Working
+        } else if any(ActivityState::Waiting) {
+            Self::Waiting
+        } else if let Some(pull_request) = &item.pull_request {
+            Self::PullRequest(pull_request)
+        } else {
+            Self::Branch
+        }
+    }
+}
+
 fn status_glyph<'a>(item: &Item) -> Element<'a, Action> {
-    if item
-        .sessions
-        .iter()
-        .any(|session| session.state == ActivityState::Working)
-    {
-        return widget::container(crate::ui_controls::activity_spinner(
+    match Leading::of(item) {
+        Leading::Working => widget::container(crate::ui_controls::activity_spinner(
             12.0,
             design::accent_color,
         ))
         .center(Length::Fixed(f32::from(design::ROW_ICON_SIZE)))
-        .into();
-    }
-    if item
-        .sessions
-        .iter()
-        .any(|session| session.state == ActivityState::Waiting)
-    {
-        return glyph(Icon::AgentWaiting, design::warning_color);
-    }
-    match &item.pull_request {
-        Some(pull_request) => pull_request_glyph(pull_request),
-        None => glyph(Icon::Branch, design::muted_color),
+        .into(),
+        Leading::Waiting => glyph(Icon::AgentWaiting, design::warning_color),
+        Leading::PullRequest(pull_request) => pull_request_glyph(pull_request),
+        Leading::Branch => glyph(Icon::Branch, design::muted_color),
     }
 }
 
