@@ -390,8 +390,12 @@ impl<Message> Widget<Message, Theme, Renderer> for CulledColumn<'_, Message> {
         operation: &mut dyn Operation,
     ) {
         let offset = layout.virtual_offset();
+        // An operation may skip this column's rows, as a search that has
+        // already found its widget does; then nothing was learnt of focus.
         let mut focused = None;
+        let mut visited = false;
         operation.traverse(&mut |operation| {
+            visited = true;
             for (((index, row), child), child_layout) in self
                 .mounted
                 .iter_mut()
@@ -416,8 +420,9 @@ impl<Message> Widget<Message, Theme, Renderer> for CulledColumn<'_, Message> {
                 }
             }
         });
-        let state = tree.state.downcast_mut::<State>();
-        state.focused = focused;
+        if visited {
+            tree.state.downcast_mut::<State>().focused = focused;
+        }
     }
 
     fn overlay<'b>(
@@ -660,6 +665,15 @@ mod tests {
         let mounted = harness.mounted();
         assert!(mounted.contains(&(last_built + 3)), "{mounted:?}");
         assert!(mounted.contains(&2500));
+        // An operation that skips the rows, as a finished search does,
+        // learns nothing of focus and must not make the column forget it.
+        struct Skips;
+        impl Operation for Skips {
+            fn traverse(&mut self, _operate: &mut dyn FnMut(&mut dyn Operation)) {}
+        }
+        harness.run(Box::new(Skips));
+        assert!(!harness.scroll_to(2500.0 * (ROW + SPACING)));
+        assert_eq!(harness.focused(), Some(last_built + 3));
     }
 
     #[test]
