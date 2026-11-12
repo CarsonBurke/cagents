@@ -58,7 +58,8 @@ const SESSION_SAMPLE: Duration = Duration::from_secs(15);
 /// How often an agent's work in one worktree is written down.
 const SESSION_STAMP: Duration = Duration::from_secs(60);
 const MODEL_REFRESH: Duration = Duration::from_secs(30);
-/// A board counts as being read for this long after a request.
+/// A project counts as being read for this long after a request, or after a
+/// watched conversation last needed its facts.
 const READ_WINDOW: Duration = Duration::from_secs(120);
 const FIRST_SCAN_WAIT: Duration = Duration::from_secs(5);
 const FRESH_WAIT: Duration = Duration::from_secs(20);
@@ -202,6 +203,9 @@ struct Tracked {
     next_poll: Instant,
     failures: u32,
     memory: forge::Memory,
+    /// When a CLI board or a watched conversation last read this project.
+    /// Only the projects someone reads poll at the watched cadence.
+    read_at: Option<Instant>,
 }
 
 impl Tracked {
@@ -228,7 +232,35 @@ impl Tracked {
             next_poll: Instant::now(),
             failures: 0,
             memory: forge::Memory::default(),
+            read_at: None,
         }
+    }
+
+    fn read_recently(&self) -> bool {
+        self.read_at
+            .is_some_and(|read_at| read_at.elapsed() < READ_WINDOW)
+    }
+
+    /// Records a read of this project. The first in a while brings its forge
+    /// poll forward to the watched cadence, and refreshes a healthy listing
+    /// that went stale while nobody read it, as a board request does. Returns
+    /// whether the forge poller must reconsider its deadlines.
+    fn read(&mut self, watching: bool) -> bool {
+        let was_read = watching || self.read_recently();
+        self.read_at = Some(Instant::now());
+        if was_read || self.forge == Forge::NotGitHub {
+            return false;
+        }
+        let Some(last) = self.last_poll else {
+            return false;
+        };
+        self.next_poll = self
+            .next_poll
+            .min(last + forge::interval(true, self.failures));
+        if self.failures == 0 && last.elapsed() >= forge::WATCHED_INTERVAL {
+            self.poll_requested = true;
+        }
+        true
     }
 
     /// The shortest gap before this project's next scan.
@@ -301,8 +333,11 @@ struct Shared {
     /// Why Linear cannot be asked about tickets cards still want.
     linear_unavailable: Option<String>,
     stale_after_days: u16,
-    /// A CLI read keeps its short freshness window independently of UI watches.
-    read_at: Option<Instant>,
+    /// When a CLI request last read the board. Tickets are resolved only
+    /// while the board is read; a watched conversation reads its project's
+    /// forge facts but shows no tickets.
+    board_read_at: Option<Instant>,
+    /// Whether a window watches the whole board.
     watching: bool,
     /// Forge listings read from the store for projects not yet tracked.
     restored: BTreeMap<PathBuf, (u64, forge::Snapshot)>,
@@ -342,11 +377,18 @@ impl Shared {
         wanted
     }
 
-    fn being_read(&self) -> bool {
+    /// Whether anyone reads the board, which shows every project's tickets.
+    fn board_being_read(&self) -> bool {
         self.watching
             || self
-                .read_at
+                .board_read_at
                 .is_some_and(|read_at| read_at.elapsed() < READ_WINDOW)
+    }
+
+    /// Whether `tracked` polls at the watched cadence: a window watches the
+    /// whole board, or a request or conversation read this project lately.
+    fn being_read(&self, tracked: &Tracked) -> bool {
+        self.watching || tracked.read_recently()
     }
 
     /// A departing window stops the fast cadence immediately. Keep explicit
@@ -357,11 +399,11 @@ impl Shared {
             return;
         }
         self.watching = watching;
-        let reading = self.being_read();
         for tracked in self.projects.values_mut() {
             if tracked.forge != Forge::NotGitHub
                 && let Some(last) = tracked.last_poll
             {
+                let reading = watching || tracked.read_recently();
                 let deadline = last + forge::interval(reading, tracked.failures);
                 tracked.next_poll = if tracked.failures > 0 {
                     tracked.next_poll.max(deadline)
@@ -519,7 +561,7 @@ impl Service {
             tickets: BTreeMap::new(),
             linear_unavailable: None,
             stale_after_days: stale_after_days(),
-            read_at: None,
+            board_read_at: None,
             watching: false,
             restored: BTreeMap::new(),
         };
@@ -737,7 +779,16 @@ impl Handle {
 
     fn board(&self, host: &SharedHost, scope: &Scope, fresh: bool) -> Result<Board, String> {
         let selected = self.resolve(host, scope)?;
-        self.shared().read_at = Some(Instant::now());
+        {
+            let mut shared = self.shared();
+            shared.board_read_at = Some(Instant::now());
+            // Only the projects in scope poll faster; settling wakes the
+            // poller to reconsider them.
+            let watching = shared.watching;
+            for (repository, name) in &selected {
+                shared.track(repository, name).read(watching);
+            }
+        }
         self.settle(&selected, fresh);
         Ok(self.assemble(host, &selected))
     }
@@ -1266,7 +1317,7 @@ impl Handle {
                 });
             }
             let mut shared = self.shared();
-            let watched = shared.being_read();
+            let watching = shared.watching;
             // A project closed, or closed and reopened, while it was polled.
             let Some(tracked) = shared
                 .projects
@@ -1315,7 +1366,7 @@ impl Handle {
                 + if tracked.forge == Forge::NotGitHub {
                     forge::NOT_GITHUB_INTERVAL
                 } else {
-                    forge::interval(watched, tracked.failures)
+                    forge::interval(watching || tracked.read_recently(), tracked.failures)
                 };
             drop(shared);
             self.changed();
@@ -1325,7 +1376,7 @@ impl Handle {
         // daemon never reaches for Linear credentials unattended.
         let wanted = {
             let shared = self.shared();
-            shared.being_read().then(|| {
+            shared.board_being_read().then(|| {
                 shared
                     .wanted_tickets()
                     .into_iter()
@@ -1642,7 +1693,7 @@ mod tests {
                 tickets: BTreeMap::new(),
                 linear_unavailable: None,
                 stale_after_days: 7,
-                read_at: None,
+                board_read_at: None,
                 watching: false,
                 restored: BTreeMap::new(),
             }),
@@ -1682,13 +1733,13 @@ mod tests {
         }
         handle.unwatch(1);
         assert!(
-            handle.shared().being_read(),
+            handle.shared().board_being_read(),
             "the other window still reads Work"
         );
         handle.unwatch(2);
         let shared = handle.shared();
         assert!(
-            !shared.being_read(),
+            !shared.board_being_read(),
             "UI watches leave no two-minute read lease"
         );
         assert_eq!(
@@ -1706,27 +1757,88 @@ mod tests {
         tracked.last_poll = Some(last);
         tracked.failures = 2;
         tracked.poll_requested = true;
-        shared.read_at = Some(last);
+        tracked.read_at = Some(last);
         shared.set_watching(true);
         shared.set_watching(false);
+        let tracked = &shared.projects[Path::new("/fixture/repo")];
         assert!(
-            shared.being_read(),
+            shared.being_read(tracked),
             "an explicit CLI read retains its own lease"
         );
-        let tracked = &shared.projects[Path::new("/fixture/repo")];
         assert_eq!(tracked.next_poll, last + forge::interval(true, 2));
         assert!(
             tracked.poll_requested,
             "an explicit fresh request is not lost"
         );
-        shared.read_at = Some(last - READ_WINDOW);
+        shared
+            .projects
+            .get_mut(Path::new("/fixture/repo"))
+            .unwrap()
+            .read_at = Some(last - READ_WINDOW);
         shared.set_watching(true);
         shared.set_watching(false);
-        assert!(!shared.being_read());
+        assert!(!shared.being_read(&shared.projects[Path::new("/fixture/repo")]));
         assert_eq!(
             shared.projects[Path::new("/fixture/repo")].next_poll,
             last + forge::interval(false, 2)
         );
+    }
+
+    /// A watched conversation reads its own project. The others keep the
+    /// unwatched cadence, and the board's tickets stay unread.
+    #[test]
+    fn reading_one_project_leaves_the_others_at_the_unwatched_cadence() {
+        let handle = polling_handle();
+        let mut shared = handle.shared();
+        let last = Instant::now() - forge::WATCHED_INTERVAL;
+        for name in ["read", "other"] {
+            let tracked = shared.track(&Path::new("/fixture").join(name), name);
+            tracked.last_poll = Some(last);
+            tracked.next_poll = last + forge::interval(false, 0);
+        }
+        let watching = shared.watching;
+        let read = shared.track(Path::new("/fixture/read"), "read");
+        assert!(read.read(watching), "the first read reschedules the poller");
+        assert_eq!(read.next_poll, last + forge::WATCHED_INTERVAL);
+        assert!(
+            read.poll_requested,
+            "a listing gone stale while unread is refreshed"
+        );
+        assert!(!read.read(watching), "a repeated read changes nothing");
+        assert!(!shared.board_being_read());
+        let other = &shared.projects[Path::new("/fixture/other")];
+        assert!(!shared.being_read(other));
+        assert_eq!(other.next_poll, last + forge::interval(false, 0));
+        assert!(!other.poll_requested);
+
+        // A window watching the board and leaving keeps each project's own
+        // cadence.
+        shared.set_watching(true);
+        shared.set_watching(false);
+        assert_eq!(
+            shared.projects[Path::new("/fixture/read")].next_poll,
+            last + forge::WATCHED_INTERVAL
+        );
+        assert_eq!(
+            shared.projects[Path::new("/fixture/other")].next_poll,
+            last + forge::interval(false, 0)
+        );
+    }
+
+    /// A read while failing keeps the backoff, only shortened to the watched
+    /// one, and asks for no extra poll.
+    #[test]
+    fn reading_a_failing_project_keeps_its_backoff() {
+        let handle = polling_handle();
+        let mut shared = handle.shared();
+        let last = Instant::now() - forge::WATCHED_INTERVAL;
+        let tracked = shared.track(Path::new("/fixture/repo"), "repo");
+        tracked.last_poll = Some(last);
+        tracked.failures = 2;
+        tracked.next_poll = last + forge::interval(false, 2);
+        assert!(tracked.read(false));
+        assert_eq!(tracked.next_poll, last + forge::interval(true, 2));
+        assert!(!tracked.poll_requested);
     }
 
     #[test]

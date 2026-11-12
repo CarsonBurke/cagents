@@ -710,8 +710,9 @@ impl Handle {
     }
 
     /// The board's facts for a conversation's directory. Watching a
-    /// conversation counts as reading the board, which tracks its project
-    /// and keeps its forge poll at the watched cadence.
+    /// conversation counts as reading its own project, which tracks it and
+    /// keeps that project's forge poll at the watched cadence; other projects
+    /// and the board's tickets are not read.
     fn facts(&self, host: &SharedHost, conversation: TerminalId) -> Option<Facts> {
         let directory = host
             .lock()
@@ -728,11 +729,14 @@ impl Handle {
             .resolve(host, &crate::work::Scope::Project(directory.clone()))
             .ok();
         let mut shared = self.shared();
-        shared.read_at = Some(Instant::now());
+        let watching = shared.watching;
         let project = selected.and_then(|selected| {
             let (repository, name) = selected.into_iter().next()?;
             let new = !shared.projects.contains_key(&repository);
             let tracked = shared.track(&repository, &name);
+            if tracked.read(watching) {
+                self.0.forge.notify();
+            }
             let facts = ProjectFacts {
                 snapshot: tracked.snapshot.clone(),
                 local: tracked.local.clone(),
