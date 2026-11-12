@@ -3151,9 +3151,6 @@ pub fn browser_row<'a>(
     if let Some(author) = &pull_request.author {
         detail.push(author.login.clone());
     }
-    if pull_request.is_draft {
-        detail.push("Draft".into());
-    }
     if let Some(label) = review_request {
         detail.push(label.into());
     }

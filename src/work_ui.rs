@@ -849,6 +849,18 @@ impl State {
             ));
         }
         if let Some(pull_request) = &item.pull_request {
+            // The leading glyph gives the state unless an agent's activity
+            // has its place; then a small glyph beside the facts says it.
+            if !status_glyph_is_pull_request(item) {
+                let state = crate::sidebar::WorktreePullRequestState::from_work(pull_request);
+                facts.push(crate::interaction::tooltip(
+                    crate::ui_controls::pull_request_state_glyph(
+                        Some(state),
+                        design::COMPACT_ICON_SIZE,
+                    ),
+                    format!("Pull request {}", state.label().to_lowercase()),
+                ));
+            }
             facts.extend(pull_request_badges(pull_request));
             if pull_request.state == PullRequestState::Open
                 && !pull_request.contains_local_head
@@ -1148,6 +1160,18 @@ fn dot(tone: Toned) -> cosmic::theme::Container<'static> {
     })
 }
 
+/// Whether the card's leading glyph is its pull request's state, rather than
+/// an agent's activity or a branch.
+fn status_glyph_is_pull_request(item: &Item) -> bool {
+    item.pull_request.is_some()
+        && !item.sessions.iter().any(|session| {
+            matches!(
+                session.state,
+                ActivityState::Working | ActivityState::Waiting
+            )
+        })
+}
+
 /// What the card's leading glyph says at a glance: a working agent, else the
 /// pull request's state, else a branch.
 fn status_glyph<'a>(item: &Item) -> Element<'a, Action> {
@@ -1188,12 +1212,12 @@ pub(crate) fn pull_request_glyph<'a, Message: 'a>(
     )
 }
 
-/// What is true of a pull request now: its state, then, while it is open,
-/// its checks and review.
+/// What is true of an open pull request now: its checks and review. Its
+/// state is its glyph's to say.
 pub(crate) fn pull_request_badges<'a, Message: 'a>(
     pull_request: &crate::work::PullRequest,
 ) -> Vec<Element<'a, Message>> {
-    let mut badges = vec![pull_request_state_badge(pull_request)];
+    let mut badges = Vec::new();
     if pull_request.state != PullRequestState::Open {
         return badges;
     }
@@ -1216,14 +1240,6 @@ pub(crate) fn pull_request_badges<'a, Message: 'a>(
     }
     badges.extend(pull_request_review_badge(pull_request));
     badges
-}
-
-/// Open, draft, merged or closed, as a pill.
-pub(crate) fn pull_request_state_badge<'a, Message: 'a>(
-    pull_request: &crate::work::PullRequest,
-) -> Element<'a, Message> {
-    let state = crate::sidebar::WorktreePullRequestState::from_work(pull_request);
-    badge(state.label(), Tone::Themed(state.tone()))
 }
 
 /// The review decision of an open pull request, as a pill.
