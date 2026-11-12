@@ -584,7 +584,7 @@ impl State {
         if fits {
             row.width(Length::Fill).into()
         } else {
-            crate::interaction::horizontal_wheel(
+            crate::interaction::horizontal_wheel_around_vertical(
                 widget::scrollable::horizontal(row)
                     .direction(iced::widget::scrollable::Direction::Horizontal(
                         design::scrollbar(),
@@ -1710,6 +1710,75 @@ mod tests {
                  draw {draw:.3} ms per frame"
             );
         }
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_lane_under_the_pointer_when_the_board_scrolls_sideways() {
+        use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+        struct Offsets(Vec<iced::Vector>);
+        impl iced::advanced::widget::Operation for Offsets {
+            fn traverse(
+                &mut self,
+                operate: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation<()>),
+            ) {
+                operate(self);
+            }
+            fn scrollable(
+                &mut self,
+                _id: Option<&iced::advanced::widget::Id>,
+                _bounds: iced::Rectangle,
+                _content_bounds: iced::Rectangle,
+                translation: iced::Vector,
+                _state: &mut dyn iced::advanced::widget::operation::Scrollable,
+            ) {
+                self.0.push(translation);
+            }
+        }
+        let items = (0..30)
+            .map(|index| item(&format!("feature/change-{index}"), "cagents"))
+            .collect();
+        let mut state = State::default();
+        connected(&mut state, 1, board(items));
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        // Too narrow for every lane, so the board scrolls sideways.
+        let mut ui = UserInterface::build(
+            state.view(),
+            iced::Size::new(1000.0, 700.0),
+            Cache::new(),
+            &mut renderer,
+        );
+        // The runtime redraws before any input arrives; a scrollable's first
+        // redraw records its viewport.
+        let _ = ui.update(
+            &[iced::Event::Window(iced::window::Event::RedrawRequested(
+                iced::time::Instant::now(),
+            ))],
+            iced::mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut Vec::new(),
+        );
+        // Within the second lane, In progress, where the cards are.
+        let position = iced::Point::new(440.0, 400.0);
+        let _ = ui.update(
+            &[
+                iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }),
+                iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                    delta: iced::mouse::ScrollDelta::Lines { x: 0.0, y: -2.0 },
+                }),
+            ],
+            iced::mouse::Cursor::Available(position),
+            &mut renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut Vec::new(),
+        );
+        let mut offsets = Offsets(Vec::new());
+        ui.operate(&renderer, &mut offsets);
+        // The board's own scrollable stays put, and the lane scrolls.
+        assert_eq!(
+            offsets.0,
+            [iced::Vector::new(0.0, 0.0), iced::Vector::new(0.0, 120.0)]
+        );
     }
 
     #[test]
