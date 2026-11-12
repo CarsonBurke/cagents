@@ -160,6 +160,7 @@ STUBS = {
             rm -f "$STUB_LOG/ui-absent"
             printf '%s\\n' "$$" > "$STUB_LOG/ui-pid"
             printf '%s\\n' "$*" > "$STUB_LOG/ui-ran"
+            printf '%s\\n' "${CAGENTS_UI_TRACE:-unset}" > "$STUB_LOG/ui-trace"
             exec sleep 300
         fi
         printf '%s\\n' "$*" >> "$STUB_LOG/cli"
@@ -722,6 +723,15 @@ class Evidence(unittest.TestCase):
                              if "niri-harness session start" in line)
                 self.assertEqual(shlex.split(outer)[:4], ["-k", "5", str(seconds + 60), "niri-harness"])
                 self.assertTrue((self.logs / "ui-ran").is_file())
+                self.run_tool("stop")
+
+    def test_ui_trace_reaches_only_the_session_that_asked_for_it(self) -> None:
+        self.built()
+        for options, expected in (([], "unset"), (["--ui-trace"], "1"), ([], "unset")):
+            with self.subTest(options=options):
+                (self.logs / "ui-ran").unlink(missing_ok=True)
+                self.run_tool("start", "after", *options)
+                self.assertEqual((self.logs / "ui-trace").read_text(), f"{expected}\n")
                 self.run_tool("stop")
 
     def test_startup_timeout_rejects_invalid_or_missing_seconds_before_launch(self) -> None:
@@ -1967,12 +1977,12 @@ class RemoteEvidence(unittest.TestCase):
         steps.write_text('evidence drive click "Open repository"\nevidence shot "home-$SIDE"\n')
         self.run_tool("pair", "--before", str(before), "--after", str(after),
                       "--steps", str(steps), "--width", "1200", "--height", "800", "--portal", "gtk",
-                      "--codex", "tool-rows", "--startup-timeout", "900")
+                      "--codex", "tool-rows", "--startup-timeout", "900", "--ui-trace")
         self.assertTrue((self.task / "shots" / "before-home-before.webp").exists())
         self.assertTrue((self.task / "shots" / "after-home-after.webp").exists())
         calls = self.tool_calls()
         for side in ("before", "after"):
-            self.assertIn(f"start {side} --width 1200 --height 800 --portal gtk --codex tool-rows --startup-timeout 900", calls)
+            self.assertIn(f"start {side} --width 1200 --height 800 --portal gtk --codex tool-rows --startup-timeout 900 --ui-trace", calls)
         self.assertIn("drive click Open repository", calls)
         self.assertEqual(calls.count("stop"), 2)
 
