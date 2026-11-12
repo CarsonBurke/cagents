@@ -9,7 +9,12 @@
 //!
 //! - Heights are measured as rows are laid out and kept per key, so content
 //!   above and below the mounted rows keeps its place while scrolling. A row
-//!   never measured at the current width counts as `estimate` until it is.
+//!   never measured at the current width counts as the mean height of the
+//!   first rows laid out at that width, or as `estimate` before then. The
+//!   assumption is fixed once made, so measuring more rows corrects only
+//!   their own heights: rows of similar height keep the column's height, and
+//!   its scrollbar, steady from the first layout, and content above the
+//!   viewport never moves because rows elsewhere were measured.
 //! - Row widget state is kept per key, as in a keyed list, so hover, focus
 //!   and open tooltips stay with their row when the mounted window moves.
 //! - When the viewport moves past what is mounted, the column asks for a new
@@ -70,7 +75,7 @@ impl<Message> CulledColumn<'_, Message> {
         self
     }
 
-    /// The height assumed for a row until it has been measured.
+    /// The height assumed for every row until one has been measured.
     pub fn estimate(mut self, estimate: f32) -> Self {
         self.estimate = estimate;
         self
@@ -81,6 +86,9 @@ impl<Message> CulledColumn<'_, Message> {
 struct State {
     /// Measured row heights, by key, at `width`.
     heights: HashMap<u64, f32>,
+    /// The height assumed for unmeasured rows at `width`, once any were laid
+    /// out at it.
+    assumed: Option<f32>,
     width: f32,
     /// The keys whose trees are `tree.children`, in order.
     mounted: Vec<u64>,
@@ -119,10 +127,11 @@ impl<Message> CulledColumn<'_, Message> {
     /// column's end last.
     fn tops(&self, state: &State) -> Vec<f32> {
         let mut tops = Vec::with_capacity(self.keys.len() + 1);
+        let unmeasured = state.assumed.unwrap_or(self.estimate);
         let mut y = 0.0;
         for key in &self.keys {
             tops.push(y);
-            y += state.height(*key, self.estimate) + self.spacing;
+            y += state.height(*key, unmeasured) + self.spacing;
         }
         tops.push(y);
         tops
@@ -223,6 +232,7 @@ impl<Message> Widget<Message, Theme, Renderer> for CulledColumn<'_, Message> {
         let state = tree.state.downcast_mut::<State>();
         if (state.width - width).abs() > 0.5 {
             state.heights.clear();
+            state.assumed = None;
             state.width = width;
         }
         let tops = self.tops(state);
@@ -264,6 +274,10 @@ impl<Message> Widget<Message, Theme, Renderer> for CulledColumn<'_, Message> {
         state.laid_out_focus = state.focused;
         for (index, node) in rows.iter().zip(&nodes) {
             state.heights.insert(self.keys[*index], node.size().height);
+        }
+        if state.assumed.is_none() && !nodes.is_empty() {
+            state.assumed =
+                Some(nodes.iter().map(|node| node.size().height).sum::<f32>() / nodes.len() as f32);
         }
         // Place rows by the measured heights, which may differ from the
         // estimates the window was chosen by.
@@ -502,10 +516,22 @@ mod tests {
     /// A column of `rows` focusable rows of height `ROW`, logging which rows
     /// were built.
     fn column<'a>(rows: usize, built: Rc<RefCell<Vec<usize>>>) -> cosmic::Element<'a, ()> {
+        column_of(rows, built, |_| ROW)
+    }
+
+    /// A column like [`column`] whose row at `index` is `height(index)` tall,
+    /// though the column still assumes `ROW` before measuring any.
+    fn column_of<'a>(
+        rows: usize,
+        built: Rc<RefCell<Vec<usize>>>,
+        height: fn(usize) -> f32,
+    ) -> cosmic::Element<'a, ()> {
         culled_column((0..rows as u64).collect(), move |index| {
             built.borrow_mut().push(index);
             cosmic_widget::button::custom(
-                cosmic_widget::Space::new().width(Length::Fill).height(ROW),
+                cosmic_widget::Space::new()
+                    .width(Length::Fill)
+                    .height(height(index)),
             )
             .id(widget::Id::new(format!("row-{index}")))
             .on_press(())
@@ -703,5 +729,40 @@ mod tests {
             &mut probe,
         );
         assert_eq!(probe.0, Some(widget::Id::new("row-1")));
+    }
+
+    #[test]
+    fn the_column_keeps_its_height_while_scrolling_through_rows_taller_than_the_estimate() {
+        // Cards come out taller than their estimate, and not all alike; the
+        // scrollbar must not creep or jump as newly built rows are measured.
+        let built = Rc::new(RefCell::new(Vec::new()));
+        let mut harness = Harness::new(column_of(3000, built, |index| {
+            if index % 3 == 0 { 70.0 } else { 55.0 }
+        }));
+        let first = harness.node.size().height;
+        let exact = 1000.0 * 70.0 + 2000.0 * 55.0 + 2999.0 * SPACING;
+        assert!(
+            (first - exact).abs() / exact < 0.005,
+            "{first} after the first layout, {exact} measured in full"
+        );
+        // Scroll through every row a screen at a time, as a fast wheel or a
+        // dragged thumb does, laying out whenever the column asks.
+        let mut top = 0.0;
+        let mut previous = first;
+        while top < harness.node.size().height {
+            if harness.scroll_to(top) {
+                harness.relayout();
+            }
+            let height = harness.node.size().height;
+            // Each newly built row corrects the column by its own difference
+            // from the assumed height, at most 15 px, and they cancel out.
+            assert!(
+                (height - previous).abs() <= 30.0 && (height - exact).abs() / exact < 0.005,
+                "the column went from {previous} to {height} at {top}, of {exact}"
+            );
+            previous = height;
+            top += SCREEN.height;
+        }
+        assert_eq!(harness.node.size().height, exact);
     }
 }
