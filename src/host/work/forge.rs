@@ -33,8 +33,12 @@ const RELIST_WATCHED: Duration = Duration::from_secs(5 * 60);
 const RELIST_UNWATCHED: Duration = Duration::from_secs(30 * 60);
 /// How long after a push a pull request with no checks may still get some.
 const CHECKS_START_WITHIN: Duration = Duration::from_secs(10 * 60);
-/// A probe that failed for any reason but quota is retried after this.
+/// A probe GitHub refused, such as for a repository with issues disabled, is
+/// asked again after this.
 const PROBE_UNAVAILABLE_FOR: Duration = Duration::from_secs(10 * 60);
+/// How long GitHub's search, which the listing reads, may take to show a
+/// change its REST API, which the probe reads, already does.
+const SEARCH_LAG: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Snapshot {
@@ -122,11 +126,74 @@ pub(super) struct Memory {
 #[derive(Debug, Clone)]
 struct Listing {
     repository: GitHubRepoKey,
+    /// Whose credentials read it: after `gh auth switch` it is another
+    /// account's listing.
+    credential: Option<String>,
     at: Instant,
+    /// When it was read by this clock, to compare with GitHub's dates.
+    read_at: jiff::Timestamp,
     pull_requests: Vec<PullRequest>,
     /// Who `@me` was, whose pull requests the probe asks about.
     viewer: String,
     probe: Probe,
+}
+
+impl Listing {
+    /// Whether this listing already shows the newest change the probe saw.
+    /// The probe's REST answer can be ahead of the search the listing reads.
+    fn reflects(&self, newest: &Newest) -> bool {
+        match newest {
+            Newest::Nothing => self.pull_requests.is_empty(),
+            Newest::PullRequest(number, updated) => self.pull_requests.iter().any(|pull_request| {
+                pull_request.number == *number
+                    && pull_request.updated_at.parse::<jiff::Timestamp>().ok() == Some(*updated)
+            }),
+            // An issue isn't listed, but nothing of the viewer's changed
+            // after it, so a listing read well after it shows everything.
+            Newest::Issue(updated) => jiff::SignedDuration::try_from(SEARCH_LAG)
+                .ok()
+                .and_then(|lag| updated.checked_add(lag).ok())
+                .is_some_and(|settled| self.read_at >= settled),
+        }
+    }
+}
+
+/// The viewer's most recently updated issue or pull request in the
+/// repository, as the probe's answer names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Newest {
+    Nothing,
+    Issue(jiff::Timestamp),
+    PullRequest(u64, jiff::Timestamp),
+}
+
+impl Newest {
+    fn of(body: &[u8]) -> Option<Self> {
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(body).ok()?;
+        let Some(row) = rows.first() else {
+            return Some(Self::Nothing);
+        };
+        let updated = row.get("updated_at")?.as_str()?.parse().ok()?;
+        Some(if row.get("pull_request").is_some() {
+            Self::PullRequest(row.get("number")?.as_u64()?, updated)
+        } else {
+            Self::Issue(updated)
+        })
+    }
+}
+
+/// What the probe said about the last listing.
+enum Answer {
+    /// It is still current; keep this validator with it.
+    Current(Probe),
+    /// It may not be: read it again, and keep this validator.
+    Unknown(Probe),
+    /// Something changed: read it again, and keep `etag` only if that read
+    /// shows `newest`, so search lag can't hide behind a new validator.
+    Changed {
+        etag: Option<String>,
+        newest: Newest,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -272,68 +339,112 @@ fn listing<E: crate::repository::ProcessExecutor>(
     freshness: Freshness,
     cancellation: &CancellationToken,
 ) -> Result<Vec<PullRequest>, String> {
-    let previous = memory
+    let credential = crate::github_status::credential_fingerprint().ok();
+    let Some(mut previous) = memory
         .listing
         .take()
-        .filter(|listing| listing.repository == *repository);
+        .filter(|listing| listing.repository == *repository && listing.credential == credential)
+    else {
+        let read = read_listing(gh, repository, credential, Probe::Unknown, cancellation)?;
+        let pull_requests = read.pull_requests.clone();
+        memory.listing = Some(read);
+        return Ok(pull_requests);
+    };
     // Asked before the listing is read, so a change landing between the two
     // shows as a change next time rather than hiding under a new validator.
-    let probed = previous.as_ref().and_then(|listing| {
-        let validator = match &listing.probe {
-            Probe::Unavailable(at) if at.elapsed() < PROBE_UNAVAILABLE_FOR => return None,
-            Probe::Validator(etag) => Some(etag.as_str()),
-            Probe::Unknown | Probe::Unavailable(_) => None,
-        };
-        Some(
-            match gh.revalidate(
-                repository,
-                &probe_path(repository, &listing.viewer),
-                validator,
-                cancellation,
-            ) {
-                Ok(Revalidation::NotModified) => (true, listing.probe.clone()),
-                Ok(Revalidation::Modified { etag }) => {
-                    (false, etag.map_or(Probe::Unknown, Probe::Validator))
-                }
-                // Out of REST quota, GraphQL may still answer; the probe is
-                // asked again next poll.
-                Err(error) if error.rate_limit().is_some() => (false, Probe::Unknown),
-                Err(_) => (false, Probe::Unavailable(Instant::now())),
-            },
-        )
-    });
-    let current = matches!(probed, Some((true, _)))
+    let answer = ask(gh, repository, &previous, cancellation);
+    if let Answer::Current(probe) = &answer
         && freshness != Freshness::Fresh
-        && previous.as_ref().is_some_and(|listing| {
-            listing.at.elapsed() < relist_after(freshness) && !settling(&listing.pull_requests)
-        });
-    let (previous, probed) = match (current, previous, probed) {
-        (true, Some(mut listing), Some((_, probe))) => {
-            listing.probe = probe;
-            let pull_requests = listing.pull_requests.clone();
-            memory.listing = Some(listing);
-            return Ok(pull_requests);
+        && previous.at.elapsed() < relist_after(freshness)
+        && !settling(&previous.pull_requests)
+    {
+        previous.probe = probe.clone();
+        let pull_requests = previous.pull_requests.clone();
+        memory.listing = Some(previous);
+        return Ok(pull_requests);
+    }
+    let (probe, newest) = match answer {
+        Answer::Current(probe) | Answer::Unknown(probe) => (probe, None),
+        Answer::Changed { etag, newest } => {
+            (etag.map_or(Probe::Unknown, Probe::Validator), Some(newest))
         }
-        (_, previous, probed) => (previous, probed),
     };
+    match read_listing(gh, repository, credential, probe, cancellation) {
+        Ok(mut read) => {
+            // A validator is for one viewer's pull requests, and one read
+            // that shows what the probe saw.
+            if read.viewer != previous.viewer
+                || newest.is_some_and(|newest| !read.reflects(&newest))
+            {
+                read.probe = Probe::Unknown;
+            }
+            let pull_requests = read.pull_requests.clone();
+            memory.listing = Some(read);
+            Ok(pull_requests)
+        }
+        Err(error) => {
+            // Its validator still matches it, for when GitHub answers again.
+            memory.listing = Some(previous);
+            Err(error)
+        }
+    }
+}
+
+fn ask<E: crate::repository::ProcessExecutor>(
+    gh: &GitHubService<E>,
+    repository: &GitHubRepoKey,
+    listing: &Listing,
+    cancellation: &CancellationToken,
+) -> Answer {
+    let validator = match &listing.probe {
+        Probe::Unavailable(at) if at.elapsed() < PROBE_UNAVAILABLE_FOR => {
+            return Answer::Unknown(listing.probe.clone());
+        }
+        Probe::Validator(etag) => Some(etag.as_str()),
+        Probe::Unknown | Probe::Unavailable(_) => None,
+    };
+    match gh.revalidate(
+        repository,
+        &probe_path(repository, &listing.viewer),
+        validator,
+        cancellation,
+    ) {
+        Ok(Revalidation::NotModified) => Answer::Current(listing.probe.clone()),
+        Ok(Revalidation::Modified { etag, body }) => match Newest::of(&body) {
+            // Unchanged in effect, such as the first validator after a read.
+            Some(newest) if listing.reflects(&newest) => {
+                Answer::Current(etag.map_or(Probe::Unknown, Probe::Validator))
+            }
+            Some(newest) => Answer::Changed { etag, newest },
+            None => Answer::Unknown(Probe::Unknown),
+        },
+        Ok(Revalidation::Refused) => Answer::Unknown(Probe::Unavailable(Instant::now())),
+        // Out of quota, deferred or unreachable: the validator still matches
+        // the listing it came with.
+        Err(_) => Answer::Unknown(listing.probe.clone()),
+    }
+}
+
+fn read_listing<E: crate::repository::ProcessExecutor>(
+    gh: &GitHubService<E>,
+    repository: &GitHubRepoKey,
+    credential: Option<String>,
+    probe: Probe,
+    cancellation: &CancellationToken,
+) -> Result<Listing, String> {
+    let read_at = jiff::Timestamp::now();
     let read = gh
         .authored_pull_requests(repository, OPEN, AUTHORED, cancellation)
         .map_err(|error| error.to_string())?;
-    let probe = match (previous, probed) {
-        // A validator is for one viewer's pull requests.
-        (Some(previous), Some((_, probe))) if previous.viewer == read.viewer => probe,
-        (Some(previous), None) if previous.viewer == read.viewer => previous.probe,
-        _ => Probe::Unknown,
-    };
-    let pull_requests = merge(read.all, read.open);
-    memory.listing = Some(Listing {
+    Ok(Listing {
         repository: repository.clone(),
+        credential,
         at: Instant::now(),
-        pull_requests: pull_requests.clone(),
+        read_at,
+        pull_requests: merge(read.all, read.open),
         viewer: read.viewer,
         probe,
-    });
-    Ok(pull_requests)
+    })
 }
 
 /// The viewer's most recently updated issue or pull request in the
@@ -520,25 +631,46 @@ mod tests {
     }
 
     /// A forge answering the probe and the authored listing, counting each.
+    /// The probe sees `updated` at once; the listing's search sees it unless
+    /// it lags.
     struct Forge {
         etag: std::sync::Mutex<String>,
+        updated: std::sync::Mutex<String>,
+        lagging: std::sync::atomic::AtomicBool,
         pending: std::sync::atomic::AtomicBool,
-        probe_fails: std::sync::atomic::AtomicBool,
+        /// How the probe fails, if it does: a status line.
+        probe_fails: std::sync::Mutex<Option<&'static str>>,
+        listing_fails: std::sync::atomic::AtomicBool,
+        listed: std::sync::Mutex<String>,
         calls: std::sync::Mutex<Vec<&'static str>>,
     }
+
+    const FIRST: &str = "2026-01-01T00:00:00Z";
+    const SECOND: &str = "2026-01-02T00:00:00Z";
+    const THIRD: &str = "2026-01-03T00:00:00Z";
 
     impl Forge {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 etag: std::sync::Mutex::new("W/\"1\"".into()),
+                updated: std::sync::Mutex::new(FIRST.into()),
+                lagging: false.into(),
                 pending: false.into(),
-                probe_fails: false.into(),
+                probe_fails: Default::default(),
+                listing_fails: false.into(),
+                listed: std::sync::Mutex::new(FIRST.into()),
                 calls: Default::default(),
             })
         }
 
         fn take(&self) -> Vec<&'static str> {
             std::mem::take(&mut self.calls.lock().unwrap())
+        }
+
+        /// The pull request changes: GitHub dates it and its validator moves.
+        fn change(&self, updated: &str, etag: &str) {
+            *self.updated.lock().unwrap() = updated.into();
+            *self.etag.lock().unwrap() = etag.into();
         }
     }
 
@@ -565,19 +697,20 @@ mod tests {
             };
             if arguments.iter().any(|argument| argument == "graphql") {
                 self.calls.lock().unwrap().push("listing");
+                if self.listing_fails.load(Ordering::SeqCst) {
+                    return output(false, "HTTP/2.0 502 Bad Gateway\r\n\r\n".into());
+                }
+                if !self.lagging.load(Ordering::SeqCst) {
+                    *self.listed.lock().unwrap() = self.updated.lock().unwrap().clone();
+                }
                 let checks = if self.pending.load(Ordering::SeqCst) {
                     "IN_PROGRESS"
                 } else {
                     "COMPLETED"
                 };
-                let mut open = serde_json::to_value(pull_request(
-                    1,
-                    "feature",
-                    "a",
-                    "OPEN",
-                    "2026-01-01T00:00:00Z",
-                ))
-                .unwrap();
+                let listed = self.listed.lock().unwrap().clone();
+                let mut open =
+                    serde_json::to_value(pull_request(1, "feature", "a", "OPEN", &listed)).unwrap();
                 open["commits"] = serde_json::json!({"nodes": [{"commit": {"statusCheckRollup": {"contexts": {"nodes": [
                     {"__typename": "CheckRun", "name": "ci", "status": checks, "conclusion": "SUCCESS"}
                 ]}}}}]});
@@ -594,14 +727,22 @@ mod tests {
                     .last()
                     .is_some_and(|path| path.starts_with("repos/me/repo/issues?creator=me&"))
             );
-            if self.probe_fails.load(Ordering::SeqCst) {
-                return output(false, "HTTP/2.0 410 Gone\r\n\r\n{}".into());
+            if let Some(status) = *self.probe_fails.lock().unwrap() {
+                return output(false, format!("HTTP/2.0 {status}\r\n\r\n{{}}"));
             }
             let etag = self.etag.lock().unwrap().clone();
             if arguments.contains(&format!("If-None-Match: {etag}")) {
                 return output(false, "HTTP/2.0 304 Not Modified\r\n\r\n".into());
             }
-            output(true, format!("HTTP/2.0 200 OK\r\nEtag: {etag}\r\n\r\n[]"))
+            let newest = serde_json::json!([{
+                "number": 1,
+                "updated_at": *self.updated.lock().unwrap(),
+                "pull_request": {"url": "https://api.github.com/repos/me/repo/pulls/1"},
+            }]);
+            output(
+                true,
+                format!("HTTP/2.0 200 OK\r\nEtag: {etag}\r\n\r\n{newest}"),
+            )
         }
     }
 
@@ -618,16 +759,25 @@ mod tests {
             forge.take()
         };
 
-        // Nothing to compare with yet, then a validator to establish.
+        // The first probe's validator is for the listing already read.
         assert_eq!(poll(Freshness::Watched), ["listing"]);
-        assert_eq!(poll(Freshness::Watched), ["probe", "listing"]);
+        assert_eq!(poll(Freshness::Watched), ["probe"]);
         // Unchanged: the probe's 304 costs no rate limit and no listing.
         assert_eq!(poll(Freshness::Watched), ["probe"]);
         assert_eq!(poll(Freshness::Unwatched), ["probe"]);
         // A refresh reads the listing whatever the probe says.
         assert_eq!(poll(Freshness::Fresh), ["probe", "listing"]);
         // A change GitHub dates.
-        *forge.etag.lock().unwrap() = "W/\"2\"".into();
+        forge.change(SECOND, "W/\"2\"");
+        assert_eq!(poll(Freshness::Watched), ["probe", "listing"]);
+        assert_eq!(poll(Freshness::Watched), ["probe"]);
+
+        // Search not yet showing the change is read until it does.
+        forge.lagging.store(true, Ordering::SeqCst);
+        forge.change(THIRD, "W/\"3\"");
+        assert_eq!(poll(Freshness::Watched), ["probe", "listing"]);
+        assert_eq!(poll(Freshness::Watched), ["probe", "listing"]);
+        forge.lagging.store(false, Ordering::SeqCst);
         assert_eq!(poll(Freshness::Watched), ["probe", "listing"]);
         assert_eq!(poll(Freshness::Watched), ["probe"]);
 
@@ -645,58 +795,106 @@ mod tests {
             let listing = memory.listing.as_mut().unwrap();
             listing.at = Instant::now().checked_sub(by).unwrap();
         };
+        let mut poll = |memory: &mut Memory, freshness| {
+            let read = listing(&gh, &repository, memory, freshness, &cancellation);
+            (read.is_ok(), forge.take())
+        };
         age(&mut memory, RELIST_WATCHED);
-        listing(
-            &gh,
-            &repository,
-            &mut memory,
-            Freshness::Unwatched,
-            &cancellation,
-        )
-        .unwrap();
-        assert_eq!(forge.take(), ["probe"]);
+        assert_eq!(
+            poll(&mut memory, Freshness::Unwatched),
+            (true, vec!["probe"])
+        );
         age(&mut memory, RELIST_WATCHED);
-        listing(
-            &gh,
-            &repository,
-            &mut memory,
-            Freshness::Watched,
-            &cancellation,
-        )
-        .unwrap();
-        assert_eq!(forge.take(), ["probe", "listing"]);
+        assert_eq!(
+            poll(&mut memory, Freshness::Watched),
+            (true, vec!["probe", "listing"])
+        );
         age(&mut memory, RELIST_UNWATCHED);
-        listing(
-            &gh,
-            &repository,
-            &mut memory,
-            Freshness::Unwatched,
-            &cancellation,
-        )
-        .unwrap();
-        assert_eq!(forge.take(), ["probe", "listing"]);
+        assert_eq!(
+            poll(&mut memory, Freshness::Unwatched),
+            (true, vec!["probe", "listing"])
+        );
 
-        // A repository that can't be probed is listed every poll, and asked
-        // again only after a while.
-        forge.probe_fails.store(true, Ordering::SeqCst);
+        // A failed listing keeps the last one and its validator.
+        forge.listing_fails.store(true, Ordering::SeqCst);
+        assert_eq!(
+            poll(&mut memory, Freshness::Fresh),
+            (false, vec!["probe", "listing"])
+        );
+        forge.listing_fails.store(false, Ordering::SeqCst);
+        assert_eq!(poll(&mut memory, Freshness::Watched), (true, vec!["probe"]));
+
+        // A probe that fails in passing keeps its validator for the next.
+        *forge.probe_fails.lock().unwrap() = Some("502 Bad Gateway");
+        assert_eq!(
+            poll(&mut memory, Freshness::Watched),
+            (true, vec!["probe", "listing"])
+        );
+        *forge.probe_fails.lock().unwrap() = None;
+        assert_eq!(poll(&mut memory, Freshness::Watched), (true, vec!["probe"]));
+
+        // A repository GitHub refuses to probe is listed every poll, and
+        // asked again only after a while.
+        *forge.probe_fails.lock().unwrap() = Some("410 Gone");
+        assert_eq!(
+            poll(&mut memory, Freshness::Watched),
+            (true, vec!["probe", "listing"])
+        );
+        assert_eq!(
+            poll(&mut memory, Freshness::Watched),
+            (true, vec!["listing"])
+        );
+    }
+
+    #[test]
+    fn a_listing_is_one_accounts_and_one_repositorys() {
+        let forge = Forge::new();
+        let gh = GitHubService::new("gh", forge.clone());
+        let cancellation = CancellationToken::new();
+        let mut memory = Memory::default();
         listing(
             &gh,
-            &repository,
+            &key("me"),
             &mut memory,
             Freshness::Watched,
             &cancellation,
         )
         .unwrap();
-        assert_eq!(forge.take(), ["probe", "listing"]);
+        memory.listing.as_mut().unwrap().credential = Some("another account".into());
         listing(
             &gh,
-            &repository,
+            &key("me"),
             &mut memory,
             Freshness::Watched,
             &cancellation,
         )
         .unwrap();
-        assert_eq!(forge.take(), ["listing"]);
+        assert_eq!(forge.take(), ["listing", "listing"]);
+    }
+
+    #[test]
+    fn the_newest_change_shows_in_a_listing_that_has_it() {
+        let listing = |updated: &str, read_at: &str| Listing {
+            repository: key("me"),
+            credential: None,
+            at: Instant::now(),
+            read_at: read_at.parse().unwrap(),
+            pull_requests: vec![pull_request(1, "a", "a", "OPEN", updated)],
+            viewer: "me".into(),
+            probe: Probe::Unknown,
+        };
+        let newest = |body: serde_json::Value| Newest::of(body.to_string().as_bytes()).unwrap();
+        let pull =
+            newest(serde_json::json!([{"number": 1, "updated_at": SECOND, "pull_request": {}}]));
+        assert_eq!(pull, Newest::PullRequest(1, SECOND.parse().unwrap()));
+        assert!(listing(SECOND, FIRST).reflects(&pull));
+        assert!(!listing(FIRST, THIRD).reflects(&pull));
+        // An issue isn't listed: a listing read once search caught up is.
+        let issue = newest(serde_json::json!([{"number": 2, "updated_at": SECOND}]));
+        assert!(!listing(FIRST, "2026-01-02T00:00:30Z").reflects(&issue));
+        assert!(listing(FIRST, "2026-01-02T00:01:00Z").reflects(&issue));
+        assert!(!listing(FIRST, THIRD).reflects(&newest(serde_json::json!([]))));
+        assert_eq!(Newest::of(b"{\"message\":\"no\"}"), None);
     }
 
     #[test]

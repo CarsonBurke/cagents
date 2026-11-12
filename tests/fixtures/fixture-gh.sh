@@ -354,7 +354,11 @@ api() {
                     reviewDecision, additions, deletions,
                     commits: {nodes: [{commit: {statusCheckRollup:
                         (if (.statusCheckRollup // [] | length) == 0 then null
-                         else {contexts: {nodes: .statusCheckRollup}} end)}}]}}))},
+                         else {contexts: {nodes: (.statusCheckRollup | map(
+                            if .__typename == "CheckRun"
+                            then del(.workflowName) + {checkSuite: (if .workflowName
+                                then {workflowRun: {workflow: {name: .workflowName}}} else null end)}
+                            else . end))}} end)}}]}}))},
                 all: {nodes: (.[:$all] | map(identity))}}}'
         return
     fi

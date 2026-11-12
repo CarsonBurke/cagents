@@ -86,7 +86,9 @@ sets `GIT_ALLOW_PROTOCOL=file`, so Git never fetches from or pushes to it.
 
 The named `SidebarPullRequests` and `SidebarHistory` GraphQL queries, and the
 Work board's `CagentsAuthoredPullRequests`, use seeded rows too; the board's
-lists `fixture`'s seeds, newest `updatedAt` first. The open query computes the aggregate check state from the seed's
+lists `fixture`'s seeds, newest `updatedAt` first, and moves each check run's
+`workflowName` to `checkSuite.workflowRun.workflow.name`, where GraphQL keeps
+it. The open query computes the aggregate check state from the seed's
 `statusCheckRollup`; history omits checks. This exercises the native sidebar's
 actual query and decoder without a GitHub account.
 

@@ -6,7 +6,7 @@ use super::*;
 const IDENTITY: &str = "number title state isDraft headRefName headRefOid headRepository{name} headRepositoryOwner{login} baseRefName updatedAt url";
 /// Review and check state, which GitHub computes per pull request (a hundred
 /// rollups can time out a query), so it is asked for open ones alone.
-const REVIEW: &str = "reviewDecision additions deletions commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{__typename ...on CheckRun{name status conclusion detailsUrl startedAt completedAt} ...on StatusContext{context state targetUrl createdAt}}}}}}}";
+const REVIEW: &str = "reviewDecision additions deletions commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{__typename ...on CheckRun{name status conclusion detailsUrl startedAt completedAt checkSuite{workflowRun{workflow{name}}}} ...on StatusContext{context state targetUrl createdAt}}}}}}}";
 
 /// The user's pull requests in one repository, newest first.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,10 +79,22 @@ fn decode_authored(
             if review {
                 // gh's shape: a pull request with no checks has an empty
                 // rollup, which the board reads as known, not unknown.
-                let contexts = node
+                let mut contexts = node
                     .pointer_mut("/commits/nodes/0/commit/statusCheckRollup/contexts/nodes")
                     .map(serde_json::Value::take)
                     .unwrap_or_else(|| serde_json::json!([]));
+                // gh's shape names a check run's workflow beside it.
+                for context in contexts.as_array_mut().into_iter().flatten() {
+                    let Some(suite) = context
+                        .as_object_mut()
+                        .and_then(|context| context.remove("checkSuite"))
+                    else {
+                        continue;
+                    };
+                    if let Some(workflow) = suite.pointer("/workflowRun/workflow/name") {
+                        context["workflowName"] = workflow.clone();
+                    }
+                }
                 node["statusCheckRollup"] = contexts;
             }
             if let Some(object) = node.as_object_mut() {
@@ -144,7 +156,8 @@ mod tests {
         checked["reviewDecision"] = "APPROVED".into();
         checked["additions"] = 7.into();
         checked["commits"] = serde_json::json!({"nodes": [{"commit": {"statusCheckRollup": {"contexts": {"nodes": [
-            {"__typename": "CheckRun", "name": "ci", "status": "COMPLETED", "conclusion": "FAILURE"},
+            {"__typename": "CheckRun", "name": "ci", "status": "COMPLETED", "conclusion": "FAILURE",
+             "checkSuite": {"workflowRun": {"workflow": {"name": "Build"}}}},
             {"__typename": "StatusContext", "context": "lint", "state": "PENDING"}
         ]}}}}]});
         let mut unchecked = node(3, "OPEN");
@@ -173,6 +186,10 @@ mod tests {
             .map(|check| check.bucket.0)
             .collect::<Vec<_>>();
         assert_eq!(buckets, ["fail", "pending"]);
+        assert!(matches!(
+            &listing.open[0].status_check_rollup.as_deref().unwrap()[0],
+            PullRequestCheckRollup::CheckRun { workflow_name, .. } if workflow_name == "Build"
+        ));
         assert_eq!(
             listing.open[0].review_decision,
             Some(RemoteValue("APPROVED".into()))

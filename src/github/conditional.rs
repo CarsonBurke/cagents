@@ -10,12 +10,19 @@ pub enum Revalidation {
     /// Unchanged since the validator the caller sent.
     NotModified,
     /// Changed, or there was nothing to compare with: the validator to send
-    /// next time, when GitHub returned one.
-    Modified { etag: Option<String> },
+    /// next time, when GitHub returned one, and what the resource now holds.
+    Modified { etag: Option<String>, body: Vec<u8> },
+    /// GitHub refuses the resource itself, such as the issues of a repository
+    /// that disabled them, so asking again soon would be refused again.
+    Refused,
 }
 
 impl<E: ProcessExecutor> GitHubService<E> {
     /// Asks whether the REST resource at `path` changed since `etag`.
+    ///
+    /// Only a rate limit charges the host's budget: a probe answers whether
+    /// to read, so its other outcomes say nothing about the reads it guards,
+    /// and a free answer must not clear their backoff.
     pub fn revalidate(
         &self,
         repository: &GitHubRepoKey,
@@ -29,25 +36,30 @@ impl<E: ProcessExecutor> GitHubService<E> {
                 return Err(GitHubError::RateLimited { limit });
             }
             let command = self.revalidate_command(repository, path, etag);
-            let result = self
-                .execute(&command, cancellation)
-                .map_err(GitHubError::from)
-                .and_then(|output| {
-                    let head =
-                        &output.stdout[..output.stdout.len() - graphql_body(&output.stdout).len()];
-                    // gh reports a 304 as a failure, with the response's
-                    // headers on standard output.
-                    if etag.is_some() && status_code(head) == Some(304) {
-                        return Ok(Revalidation::NotModified);
-                    }
-                    let output = self.checked_output(output, repository)?;
-                    let head =
-                        &output.stdout[..output.stdout.len() - graphql_body(&output.stdout).len()];
+            let output = self.execute(&command, cancellation)?;
+            let head = &output.stdout[..output.stdout.len() - graphql_body(&output.stdout).len()];
+            let status = status_code(head);
+            // gh reports a 304 as a failure, with the response's headers on
+            // standard output.
+            if etag.is_some() && status == Some(304) {
+                return Ok(Revalidation::NotModified);
+            }
+            match self.checked_output(output, repository) {
+                Ok(output) => {
+                    let body = graphql_body(&output.stdout);
+                    let head = &output.stdout[..output.stdout.len() - body.len()];
                     Ok(Revalidation::Modified {
                         etag: response_header(head, "etag"),
+                        body: body.to_vec(),
                     })
-                });
-            charge_host(repository, result)
+                }
+                Err(error) if error.rate_limit().is_some() => {
+                    polling::failed(&repository.authority(), &error);
+                    Err(error)
+                }
+                Err(_) if matches!(status, Some(403 | 404 | 410)) => Ok(Revalidation::Refused),
+                Err(error) => Err(error),
+            }
         })
     }
 
@@ -192,13 +204,35 @@ mod tests {
                 )
                 .unwrap(),
             Revalidation::Modified {
-                etag: Some("W/\"next\"".into())
+                etag: Some("W/\"next\"".into()),
+                body: b"[{\"number\":1}]".to_vec(),
             }
         );
     }
 
     #[test]
-    fn a_304_without_a_validator_sent_and_other_failures_are_errors() {
+    fn a_refused_resource_is_refused_and_other_failures_are_errors() {
+        let host = "revalidate-410.invalid";
+        let gone = GitHubService::new(
+            "gh",
+            answer(
+                false,
+                "HTTP/2.0 410 Gone\r\n\r\n{\"message\":\"Issues are disabled for this repo\"}",
+                "gh: Issues are disabled for this repo (HTTP 410)\n",
+            ),
+        );
+        assert_eq!(
+            gone.revalidate(
+                &repository(host),
+                "repos/owner/repo/issues",
+                Some("W/\"abc\""),
+                &CancellationToken::new(),
+            )
+            .unwrap(),
+            Revalidation::Refused
+        );
+        // A probe's failure leaves the reads it guards to find their own.
+        assert!(polling::ready(host, false));
         // Nothing to be unchanged from: a proxy's 304 is not an answer.
         let unexpected = GitHubService::new(
             "gh",
@@ -214,23 +248,21 @@ mod tests {
                 )
                 .is_err()
         );
-        let gone = GitHubService::new(
+        let unavailable = GitHubService::new(
             "gh",
-            answer(
-                false,
-                "HTTP/2.0 410 Gone\r\n\r\n{\"message\":\"Issues are disabled for this repo\"}",
-                "gh: Issues are disabled for this repo (HTTP 410)\n",
-            ),
+            answer(false, "HTTP/2.0 502 Bad Gateway\r\n\r\n", "gh: HTTP 502\n"),
         );
         assert!(
-            gone.revalidate(
-                &repository("revalidate-410.invalid"),
-                "repos/owner/repo/issues",
-                Some("W/\"abc\""),
-                &CancellationToken::new(),
-            )
-            .is_err()
+            unavailable
+                .revalidate(
+                    &repository("revalidate-502.invalid"),
+                    "repos/owner/repo/issues",
+                    Some("W/\"abc\""),
+                    &CancellationToken::new(),
+                )
+                .is_err()
         );
+        assert!(polling::ready("revalidate-502.invalid", false));
     }
 
     #[test]

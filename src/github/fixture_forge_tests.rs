@@ -196,7 +196,9 @@ fn the_fixture_forge_answers_with_a_seeded_pull_request() {
 
     // The board's probe is unchanged until a seed it covers changes.
     let probe = "repos/Fixture-Owner/fixture-app/issues?creator=fixture&state=all&sort=updated&direction=desc&per_page=1";
-    let Revalidation::Modified { etag: Some(etag) } = service
+    let Revalidation::Modified {
+        etag: Some(etag), ..
+    } = service
         .revalidate(&key, probe, None, &cancellation)
         .unwrap()
     else {
@@ -214,7 +216,9 @@ fn the_fixture_forge_answers_with_a_seeded_pull_request() {
         service
             .revalidate(&key, probe, Some(&etag), &cancellation)
             .unwrap(),
-        Revalidation::Modified { etag: Some(next) } if next != etag
+        Revalidation::Modified {
+            etag: Some(next), ..
+        } if next != etag
     ));
 
     let viewed = service

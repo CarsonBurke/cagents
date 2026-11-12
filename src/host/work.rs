@@ -203,6 +203,8 @@ struct Tracked {
     /// only to ask whether it changed.
     fresh_requested: bool,
     last_poll: Option<Instant>,
+    /// When a poll that read the listing whatever the probe said finished.
+    last_fresh_poll: Option<Instant>,
     next_poll: Instant,
     failures: u32,
     memory: forge::Memory,
@@ -233,6 +235,7 @@ impl Tracked {
             poll_requested: false,
             fresh_requested: false,
             last_poll: None,
+            last_fresh_poll: None,
             next_poll: Instant::now(),
             failures: 0,
             memory: forge::Memory::default(),
@@ -838,13 +841,16 @@ impl Handle {
                         tracked.scans + 1
                     }
                 });
-                let poll =
-                    (fresh && tracked.forge != Forge::NotGitHub && !recent(tracked.last_poll))
-                        .then(|| {
-                            tracked.poll_requested = true;
-                            tracked.fresh_requested = true;
-                            tracked.polls_started + 1
-                        });
+                // A poll that only probed can miss what the probe can't see,
+                // such as a rerun check, so only a read listing answers.
+                let poll = (fresh
+                    && tracked.forge != Forge::NotGitHub
+                    && !recent(tracked.last_fresh_poll))
+                .then(|| {
+                    tracked.poll_requested = true;
+                    tracked.fresh_requested = true;
+                    tracked.polls_started + 1
+                });
                 // Unread, listings go stale for minutes; the first read in a
                 // while refreshes them without waiting for the answer.
                 if tracked.failures == 0
@@ -1351,6 +1357,9 @@ impl Handle {
             tracked.memory = memory;
             tracked.polls = sequence;
             tracked.last_poll = Some(Instant::now());
+            if freshness == forge::Freshness::Fresh {
+                tracked.last_fresh_poll = tracked.last_poll;
+            }
             match outcome {
                 forge::Outcome::Synced(snapshot) => {
                     tracked.failures = 0;
