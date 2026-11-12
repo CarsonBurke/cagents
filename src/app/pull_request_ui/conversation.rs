@@ -456,11 +456,13 @@ fn open(row: &ConversationPullRequest) -> Option<Action> {
     })
 }
 
-fn glyph<'a>(row: &ConversationPullRequest, muted: bool) -> Element<'a, Action> {
-    match &row.pull_request {
-        Some(pull_request) if !muted => crate::work_ui::pull_request_glyph(pull_request),
-        _ => crate::ui_controls::passive_icon(Icon::PullRequest.handle(), design::ROW_ICON_SIZE),
-    }
+fn glyph<'a>(row: &ConversationPullRequest) -> Element<'a, Action> {
+    crate::ui_controls::pull_request_state_glyph(
+        row.pull_request
+            .as_ref()
+            .map(crate::sidebar::WorktreePullRequestState::from_work),
+        design::ROW_ICON_SIZE,
+    )
 }
 
 fn state_tone(state: CheckState) -> fn(&cosmic::Theme) -> iced::Color {
@@ -731,7 +733,7 @@ fn worked_on_row<'a>(
 ) -> Element<'a, Action> {
     let name = name(list, row);
     let title = widget::row::with_children(vec![
-        glyph(row, false),
+        glyph(row),
         design::heading(name.clone())
             .wrapping(iced::widget::text::Wrapping::None)
             .ellipsize(iced::widget::text::Ellipsize::End(
@@ -745,7 +747,6 @@ fn worked_on_row<'a>(
     let mut facts = vec![design::caption(reason(row)).into()];
     match &row.pull_request {
         Some(pull_request) => {
-            facts.push(crate::work_ui::pull_request_state_badge(pull_request));
             if let Some(diff) = row.diff {
                 let counts = crate::repository::line_change_counts(
                     Some(diff.additions),
@@ -814,7 +815,7 @@ fn mentioned_row<'a>(
 ) -> Element<'a, Action> {
     let name = name(list, row);
     let mut parts = vec![
-        glyph(row, true),
+        glyph(row),
         design::body(name.clone())
             .class(cosmic::theme::Text::Custom(design::muted_text))
             .wrapping(iced::widget::text::Wrapping::None)
@@ -826,9 +827,7 @@ fn mentioned_row<'a>(
     ];
     match &row.pull_request {
         None => parts.push(design::caption("State unknown").into()),
-        Some(pull_request) if pull_request.state != crate::work::PullRequestState::Open => {
-            parts.push(crate::work_ui::pull_request_state_badge(pull_request));
-        }
+        // The glyph says the state.
         Some(_) => {}
     }
     if row.by_subagent {

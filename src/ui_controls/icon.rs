@@ -88,6 +88,7 @@ icons! {
         CopyPath => "copy-path",
         CopyRelativePath => "copy-relative",
         Diff => "diff",
+        DraftPullRequest => "draft-pull-request",
         Duplicate => "duplicate",
         Edit => "edit",
         ExpandAll => "expand-all",

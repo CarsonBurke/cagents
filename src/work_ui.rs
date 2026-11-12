@@ -849,6 +849,18 @@ impl State {
             ));
         }
         if let Some(pull_request) = &item.pull_request {
+            // The leading glyph gives the state unless an agent's activity
+            // has its place; then a small glyph beside the facts says it.
+            if !status_glyph_is_pull_request(item) {
+                let state = crate::sidebar::WorktreePullRequestState::from_work(pull_request);
+                facts.push(crate::interaction::tooltip(
+                    crate::ui_controls::pull_request_state_glyph(
+                        Some(state),
+                        design::COMPACT_ICON_SIZE,
+                    ),
+                    format!("{} pull request", state.label()),
+                ));
+            }
             facts.extend(pull_request_badges(pull_request));
             if pull_request.state == PullRequestState::Open
                 && !pull_request.contains_local_head
@@ -1118,13 +1130,9 @@ fn column_tone(column: Column) -> Toned {
     }
 }
 
-/// Merged work reads as done, apart from work under review.
+/// Landed work takes the tone merged pull requests have everywhere.
 fn merged_color(theme: &Theme) -> iced::Color {
-    design::mix(
-        design::accent_color(theme),
-        design::success_color(theme),
-        0.5,
-    )
+    crate::sidebar::WorktreePullRequestState::Merged.color(theme)
 }
 
 fn empty_lane(column: Column) -> &'static str {
@@ -1152,31 +1160,47 @@ fn dot(tone: Toned) -> cosmic::theme::Container<'static> {
     })
 }
 
-/// What the card's leading glyph says at a glance: a working agent, else the
-/// pull request's state, else a branch.
+/// Whether the card's leading glyph is its pull request's state, rather than
+/// an agent's activity or a branch.
+fn status_glyph_is_pull_request(item: &Item) -> bool {
+    matches!(Leading::of(item), Leading::PullRequest(_))
+}
+
+/// What the card's leading glyph says at a glance: a working agent, else an
+/// agent waiting, else the pull request's state, else a branch.
+enum Leading<'a> {
+    Working,
+    Waiting,
+    PullRequest(&'a crate::work::PullRequest),
+    Branch,
+}
+
+impl<'a> Leading<'a> {
+    fn of(item: &'a Item) -> Self {
+        let any = |state| item.sessions.iter().any(|session| session.state == state);
+        if any(ActivityState::Working) {
+            Self::Working
+        } else if any(ActivityState::Waiting) {
+            Self::Waiting
+        } else if let Some(pull_request) = &item.pull_request {
+            Self::PullRequest(pull_request)
+        } else {
+            Self::Branch
+        }
+    }
+}
+
 fn status_glyph<'a>(item: &Item) -> Element<'a, Action> {
-    if item
-        .sessions
-        .iter()
-        .any(|session| session.state == ActivityState::Working)
-    {
-        return widget::container(crate::ui_controls::activity_spinner(
+    match Leading::of(item) {
+        Leading::Working => widget::container(crate::ui_controls::activity_spinner(
             12.0,
             design::accent_color,
         ))
         .center(Length::Fixed(f32::from(design::ROW_ICON_SIZE)))
-        .into();
-    }
-    if item
-        .sessions
-        .iter()
-        .any(|session| session.state == ActivityState::Waiting)
-    {
-        return glyph(Icon::AgentWaiting, design::warning_color);
-    }
-    match &item.pull_request {
-        Some(pull_request) => pull_request_glyph(pull_request),
-        None => glyph(Icon::Branch, design::muted_color),
+        .into(),
+        Leading::Waiting => glyph(Icon::AgentWaiting, design::warning_color),
+        Leading::PullRequest(pull_request) => pull_request_glyph(pull_request),
+        Leading::Branch => glyph(Icon::Branch, design::muted_color),
     }
 }
 
@@ -1184,22 +1208,20 @@ fn status_glyph<'a>(item: &Item) -> Element<'a, Action> {
 pub(crate) fn pull_request_glyph<'a, Message: 'a>(
     pull_request: &crate::work::PullRequest,
 ) -> Element<'a, Message> {
-    match pull_request.state {
-        PullRequestState::Merged => glyph(Icon::MergedPullRequest, merged_color),
-        PullRequestState::Closed => glyph(Icon::ClosedPullRequest, design::destructive_color),
-        PullRequestState::Open if pull_request.draft => {
-            glyph(Icon::PullRequest, design::muted_color)
-        }
-        PullRequestState::Open => glyph(Icon::PullRequest, design::success_color),
-    }
+    crate::ui_controls::pull_request_state_glyph(
+        Some(crate::sidebar::WorktreePullRequestState::from_work(
+            pull_request,
+        )),
+        design::ROW_ICON_SIZE,
+    )
 }
 
-/// What is true of a pull request now: its state, then, while it is open,
-/// its checks and review.
+/// What is true of an open pull request now: its checks and review. Its
+/// state is its glyph's to say.
 pub(crate) fn pull_request_badges<'a, Message: 'a>(
     pull_request: &crate::work::PullRequest,
 ) -> Vec<Element<'a, Message>> {
-    let mut badges = vec![pull_request_state_badge(pull_request)];
+    let mut badges = Vec::new();
     if pull_request.state != PullRequestState::Open {
         return badges;
     }
@@ -1222,19 +1244,6 @@ pub(crate) fn pull_request_badges<'a, Message: 'a>(
     }
     badges.extend(pull_request_review_badge(pull_request));
     badges
-}
-
-/// Open, draft, merged or closed, as a pill.
-pub(crate) fn pull_request_state_badge<'a, Message: 'a>(
-    pull_request: &crate::work::PullRequest,
-) -> Element<'a, Message> {
-    let (label, tone): (&str, Toned) = match (pull_request.state, pull_request.draft) {
-        (PullRequestState::Open, true) => ("Draft", design::muted_color),
-        (PullRequestState::Open, false) => ("Open", design::success_color),
-        (PullRequestState::Merged, _) => ("Merged", design::accent_color),
-        (PullRequestState::Closed, _) => ("Closed", design::destructive_color),
-    };
-    badge(label, Tone::Themed(tone))
 }
 
 /// The review decision of an open pull request, as a pill.
