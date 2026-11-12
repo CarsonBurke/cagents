@@ -947,7 +947,8 @@ impl Cagents {
         self.refresh_ui.started(project);
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                let availability = load_repository_github(&snapshot.repository, &cancellation);
+                let availability =
+                    load_repository_github(&snapshot.repository, true, &cancellation);
                 let archived = if let GitHubAvailability::Ready {
                     repository_key,
                     pull_requests,
