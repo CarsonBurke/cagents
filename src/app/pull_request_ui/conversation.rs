@@ -662,7 +662,8 @@ fn worktree_facts(worktree: &ConversationWorktree, facts: &mut Vec<Fact>) {
 
 /// What a pull request's row says about it, the facts most in need of
 /// attention first: whose it is when not this repository's, how current
-/// it is, its checks and review, its size, and why it is listed.
+/// it is, its size, and why it is listed. Its checks and review are
+/// [`pull_request_marks`].
 fn pull_request_facts(
     list: Option<&ConversationPullRequests>,
     row: &ConversationPullRequest,
@@ -673,11 +674,11 @@ fn pull_request_facts(
     if !own_repository(list, row) {
         facts.push(Fact::plain(repository_label(&row.repository)));
     }
-    let Some(pull_request) = &row.pull_request else {
+    if row.pull_request.is_none() {
         facts.push(Fact::plain("State unknown"));
         facts.push(Fact::plain(reason(row)));
         return facts;
-    };
+    }
     if let Some(list) = list
         && list.forge_error.is_some()
         && let Some(at) = row.observed_at_unix_ms
@@ -688,19 +689,39 @@ fn pull_request_facts(
             crate::work_ui::age(list.generated_at_unix_ms, at, true)
         )));
     }
-    if pull_request.state == crate::work::PullRequestState::Open
-        && let Some((overall, label)) = checks_summary(&row.checks)
-    {
-        facts.push(Fact::toned(label, state_text(overall)));
-    }
-    if let Some((label, tone)) = review_fact(pull_request) {
-        facts.push(Fact::toned(label, tone));
-    }
     if let Some(diff) = row.diff {
         facts.extend(Fact::change_counts(diff.additions, diff.deletions));
     }
     facts.push(Fact::plain(reason(row)));
     facts
+}
+
+/// An open pull request's checks and review as glyphs, as the board marks
+/// them, each with what it says in words.
+fn pull_request_marks<'a>(row: &ConversationPullRequest) -> Vec<(Element<'a, Action>, String)> {
+    let mut marks = Vec::with_capacity(2);
+    let Some(pull_request) = row
+        .pull_request
+        .as_ref()
+        .filter(|pull_request| pull_request.state == crate::work::PullRequestState::Open)
+    else {
+        return marks;
+    };
+    if let Some(checks) =
+        crate::ui_controls::ChecksSummary::of(row.checks.iter().map(|check| check.state))
+    {
+        marks.push((
+            crate::ui_controls::checks_glyph(&checks, design::COMPACT_ICON_SIZE),
+            checks.name(),
+        ));
+    }
+    if let Some(review) = pull_request.review {
+        marks.push((
+            crate::ui_controls::pull_request_review_glyph(review, design::COMPACT_ICON_SIZE),
+            crate::ui_controls::review_label(review).to_owned(),
+        ));
+    }
+    marks
 }
 
 fn work_row<'a>(
@@ -717,8 +738,10 @@ fn work_row<'a>(
     {
         facts.push(Fact::plain("Not in Projects"));
     }
+    let mut marks: Vec<(Element<'a, Action>, String)> = Vec::new();
     let (glyph, name, trailing): (Element<'a, Action>, String, Option<String>) = match work {
         Work::PullRequest { row, .. } => {
+            marks = pull_request_marks(row);
             let state = row
                 .pull_request
                 .as_ref()
@@ -767,6 +790,7 @@ fn work_row<'a>(
     } else {
         format!("Show {name}")
     })
+    .chain(marks.iter().map(|(_, said)| said.clone()))
     .chain(facts.iter().map(Fact::text))
     .collect::<Vec<_>>()
     .join(", ");
@@ -776,6 +800,9 @@ fn work_row<'a>(
         .name(described)
         .selected(marked)
         .on_press(Action::Choose(work.key()));
+    for (mark, _) in marks {
+        row = row.trailing(mark);
+    }
     if let Some(trailing) = trailing {
         row = row.trailing(design::caption(trailing).wrapping(iced::widget::text::Wrapping::None));
     }
@@ -833,10 +860,9 @@ fn chosen_details<'a>(row: &ConversationPullRequest) -> Element<'a, Action> {
         for check in checks.iter().take(CHECKS_SHOWN) {
             rows.push(
                 crate::ui_controls::list_row(None, check.name.clone())
-                    .icon_element(tinted_icon(
-                        state_icon(check.state),
-                        state_tone(check.state),
-                    ))
+                    .icon_element(tinted_icon(crate::ui_controls::check_state_look(
+                        check.state,
+                    )))
                     .name(format!(
                         "Open the {} check, {}",
                         check.name,
@@ -943,23 +969,6 @@ fn own_repository(list: Option<&ConversationPullRequests>, row: &ConversationPul
         .is_some_and(|own| own.same_repository(&row.repository))
 }
 
-/// An open pull request's review decision, in its tone.
-fn review_fact(
-    pull_request: &crate::work::PullRequest,
-) -> Option<(
-    &'static str,
-    fn(&cosmic::Theme) -> iced::widget::text::Style,
-)> {
-    if pull_request.state != crate::work::PullRequestState::Open {
-        return None;
-    }
-    Some(match pull_request.review? {
-        crate::work::Review::Approved => ("Approved", design::success_text),
-        crate::work::Review::ChangesRequested => ("Changes requested", design::destructive_text),
-        crate::work::Review::Required => ("Review required", design::muted_text),
-    })
-}
-
 /// The number a row's pull request goes by: `#12`, after its repository
 /// when that is not the conversation's.
 fn number_label(list: Option<&ConversationPullRequests>, row: &ConversationPullRequest) -> String {
@@ -1006,35 +1015,8 @@ fn open(row: &ConversationPullRequest) -> Option<Action> {
     })
 }
 
-fn state_tone(state: CheckState) -> fn(&cosmic::Theme) -> iced::Color {
-    match state {
-        CheckState::Failed => design::destructive_color,
-        CheckState::Pending => design::warning_color,
-        CheckState::Passed => design::success_color,
-        CheckState::Cancelled | CheckState::Skipped => design::muted_color,
-    }
-}
-
-fn state_text(state: CheckState) -> fn(&cosmic::Theme) -> iced::widget::text::Style {
-    match state {
-        CheckState::Failed => design::destructive_text,
-        CheckState::Pending => design::warning_text,
-        CheckState::Passed => design::success_text,
-        CheckState::Cancelled | CheckState::Skipped => design::muted_text,
-    }
-}
-
-fn state_icon(state: CheckState) -> Icon {
-    match state {
-        CheckState::Failed => Icon::Error,
-        CheckState::Pending => Icon::Loading,
-        CheckState::Passed => Icon::Check,
-        CheckState::Cancelled => Icon::Cancel,
-        CheckState::Skipped => Icon::Minus,
-    }
-}
-
-fn tinted_icon<'a>(icon: Icon, tone: fn(&cosmic::Theme) -> iced::Color) -> Element<'a, Action> {
+/// A check's glyph in its tone, for a row that names it itself.
+fn tinted_icon<'a>((icon, tone): (Icon, fn(&cosmic::Theme) -> iced::Color)) -> Element<'a, Action> {
     widget::icon(icon.handle())
         .size(design::COMPACT_ICON_SIZE)
         .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(move |theme| {
@@ -1043,20 +1025,6 @@ fn tinted_icon<'a>(icon: Icon, tone: fn(&cosmic::Theme) -> iced::Color) -> Eleme
             }
         })))
         .into()
-}
-
-/// The checks' overall state, the worst of any check, and how many share it.
-fn checks_summary(checks: &[Check]) -> Option<(CheckState, String)> {
-    let worst = checks.iter().map(|check| check.state).min()?;
-    let count = checks.iter().filter(|check| check.state == worst).count();
-    let label = match worst {
-        CheckState::Failed => format!("{count} failing"),
-        CheckState::Pending => format!("{count} running"),
-        CheckState::Cancelled => format!("{count} cancelled"),
-        CheckState::Passed => "Checks passed".to_owned(),
-        CheckState::Skipped => format!("{count} skipped"),
-    };
-    Some((worst, label))
 }
 
 #[cfg(test)]
@@ -1349,48 +1317,28 @@ mod tests {
         assert!(state.work(Some(here)).is_empty());
     }
 
+    /// An open pull request's checks and review are glyphs that say in
+    /// words what they mark; a closed one's no longer matter.
     #[test]
-    fn the_checks_chip_reports_the_worst_state_and_how_many_share_it() {
-        assert_eq!(checks_summary(&[]), None);
-        let checks = [
-            check("lint", CheckState::Passed),
-            check("test", CheckState::Pending),
+    fn an_open_pull_request_marks_its_checks_and_review() {
+        let mut open = row(1, Relation::Created);
+        open.checks = vec![
+            check("lint", CheckState::Failed),
+            check("test", CheckState::Passed),
             check("build", CheckState::Passed),
         ];
-        assert_eq!(
-            checks_summary(&checks),
-            Some((CheckState::Pending, "1 running".into()))
-        );
-        let checks = [
-            check("lint", CheckState::Failed),
-            check("test", CheckState::Failed),
-            check("build", CheckState::Pending),
-        ];
-        assert_eq!(
-            checks_summary(&checks),
-            Some((CheckState::Failed, "2 failing".into()))
-        );
-        let checks = [
-            check("a", CheckState::Passed),
-            check("b", CheckState::Skipped),
-        ];
-        assert_eq!(
-            checks_summary(&checks),
-            Some((CheckState::Passed, "Checks passed".into()))
-        );
-        let checks = [
-            check("a", CheckState::Passed),
-            check("b", CheckState::Cancelled),
-        ];
-        assert_eq!(
-            checks_summary(&checks),
-            Some((CheckState::Cancelled, "1 cancelled".into()))
-        );
-        let checks = [check("a", CheckState::Skipped)];
-        assert_eq!(
-            checks_summary(&checks),
-            Some((CheckState::Skipped, "1 skipped".into()))
-        );
+        open.pull_request.as_mut().unwrap().review = Some(crate::work::Review::ChangesRequested);
+        let said: Vec<String> = pull_request_marks(&open)
+            .into_iter()
+            .map(|(_, said)| said)
+            .collect();
+        assert_eq!(said, ["Checks: 1 failing, 2 passed", "Changes requested"]);
+        let mut merged = open.clone();
+        merged.pull_request.as_mut().unwrap().state = PullRequestState::Merged;
+        assert!(pull_request_marks(&merged).is_empty());
+        open.checks.clear();
+        open.pull_request.as_mut().unwrap().review = None;
+        assert!(pull_request_marks(&open).is_empty());
     }
 
     #[test]

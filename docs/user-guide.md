@@ -442,9 +442,11 @@ cagents reads them from what the conversation and its subagents did, such as
 `gh pr create` output, pushed branches, checkouts, reviews, and PR links or
 `#123` references. The list updates on its own; there is nothing to refresh.
 
-A row's glyph is the PR's state: open, draft, merged or closed. Beneath its
-title, the row says why it is listed, then its checks, its review decision
-and the lines it adds and removes. A PR in another repository names that
+A row's glyph is the PR's state: open, draft, merged or closed. An open PR's
+row ends with a glyph for its checks, the worst of them, and one for its
+review decision, as the board shows them; hover either for the detail.
+Beneath its title, the row gives the lines it adds and removes and why it is
+listed. A PR in another repository names that
 repository beneath its title. When GitHub can't be reached, rows keep their
 last known state and say when it was read.
 
