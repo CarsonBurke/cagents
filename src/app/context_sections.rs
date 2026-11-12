@@ -1,12 +1,12 @@
 //! The context inspector as vertical, collapsible sections.
 //!
-//! A channel's conversation is the inspector's subject, so its sections lead
-//! with what that conversation produced: the pull requests it worked on, then
-//! the worktrees it edited. The active worktree's changes and files follow
-//! behind one switch, collapsed until asked for unless nothing else is shown,
-//! and a focused editor adds what its language server found. Each section
-//! says how much it holds in its header, so a collapsed one still reads at a
-//! glance.
+//! A channel's conversation is the inspector's subject, so it leads with what
+//! that conversation produced: its Work, each pull request it worked on and
+//! each worktree it edited. Beneath it, one switch shows the changes or files
+//! of the work chosen there, and its header names that work, so the changes
+//! shown never belong to a worktree the reader has to guess at. A focused
+//! editor adds what its language server found. Each section says how much it
+//! holds in its header, so a collapsed one still reads at a glance.
 //!
 //! Expanded sections share the panel's height the way a stack of panes does:
 //! the worktree's tree takes what is left, and the short lists take only the
@@ -17,8 +17,8 @@ use super::*;
 /// One of the context inspector's sections, in the order they stack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Section {
-    PullRequests,
-    Worktrees,
+    /// The pull requests and worktrees the inspected conversation worked on.
+    Work,
     /// The active worktree's changes or files, whichever [`WorkspaceView`]
     /// is chosen.
     Workspace,
@@ -59,8 +59,8 @@ impl WorkspaceView {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Sections {
-    pull_requests: bool,
-    worktrees: bool,
+    #[serde(alias = "pull_requests")]
+    work: bool,
     workspace: bool,
     problems: bool,
     locations: bool,
@@ -72,8 +72,7 @@ impl Default for Sections {
     /// and files are a click away rather than a tall tree beneath it.
     fn default() -> Self {
         Self {
-            pull_requests: true,
-            worktrees: true,
+            work: true,
             workspace: false,
             problems: true,
             locations: true,
@@ -85,8 +84,7 @@ impl Default for Sections {
 impl Sections {
     pub fn is_open(self, section: Section) -> bool {
         match section {
-            Section::PullRequests => self.pull_requests,
-            Section::Worktrees => self.worktrees,
+            Section::Work => self.work,
             Section::Workspace => self.workspace,
             Section::Problems => self.problems,
             Section::Locations => self.locations,
@@ -95,8 +93,7 @@ impl Sections {
 
     pub fn set_open(&mut self, section: Section, open: bool) {
         *match section {
-            Section::PullRequests => &mut self.pull_requests,
-            Section::Worktrees => &mut self.worktrees,
+            Section::Work => &mut self.work,
             Section::Workspace => &mut self.workspace,
             Section::Problems => &mut self.problems,
             Section::Locations => &mut self.locations,
@@ -149,6 +146,9 @@ struct Pane<'a> {
     section: Section,
     title: Cow<'a, str>,
     count: Option<Count>,
+    /// What the section is about, after its title: the work whose changes
+    /// or files it shows.
+    scope: Option<String>,
     /// Spoken after the title, for what the count and its tone mean.
     description: Option<String>,
     controls: Vec<Element<'a, Message>>,
@@ -161,7 +161,7 @@ impl Cagents {
     /// conversation's pull requests or worktrees lead it. It is then shown
     /// rather than left as a lone collapsed header over an empty panel.
     fn workspace_alone(&self) -> bool {
-        !self.pull_requests_listed() && self.edited_worktrees().is_empty()
+        !self.work_listed()
     }
 
     /// An estimate of the sections' height until they have been laid out:
@@ -201,9 +201,6 @@ impl Cagents {
             Action::Toggle(section) => {
                 let open = !self.context_sections.is_open(section);
                 self.context_sections.set_open(section, open);
-                if section == Section::PullRequests && !open {
-                    self.close_checks_popup();
-                }
             }
             Action::Show(view) => {
                 if view == WorkspaceView::SourceControl && self.active_folder_scope() {
@@ -234,11 +231,8 @@ impl Cagents {
     /// The inspector's sections beneath its header.
     pub(super) fn context_sections_view(&self, width: f32) -> Element<'_, Message> {
         let mut panes = Vec::with_capacity(5);
-        if self.pull_requests_listed() {
-            panes.push(self.pull_requests_pane());
-        }
-        if let Some(pane) = self.worktrees_pane() {
-            panes.push(pane);
+        if self.work_listed() {
+            panes.push(self.work_pane());
         }
         panes.push(self.workspace_pane(width));
         panes.extend(self.language_server_panes());
@@ -273,13 +267,22 @@ impl Cagents {
                 section,
                 title,
                 count,
+                scope,
                 description,
                 controls,
                 height,
                 body,
             } = pane;
             let open = body.is_some();
-            children.push(self.section_header(section, title, count, description, controls, open));
+            children.push(self.section_header(
+                section,
+                title,
+                count,
+                scope,
+                description,
+                controls,
+                open,
+            ));
             if let Some(body) = body {
                 children.push(match height {
                     Height::Share => widget::container(body)
@@ -315,6 +318,7 @@ impl Cagents {
         section: Section,
         title: Cow<'a, str>,
         count: Option<Count>,
+        scope: Option<String>,
         description: Option<String>,
         controls: Vec<Element<'a, Message>>,
         open: bool,
@@ -330,7 +334,7 @@ impl Cagents {
         } else {
             format!("{title} section")
         };
-        let mut label: Vec<Element<'a, Message>> = Vec::with_capacity(3);
+        let mut label: Vec<Element<'a, Message>> = Vec::with_capacity(4);
         if collapsible {
             label.push(crate::ui_controls::passive_icon(
                 if open { Icon::PanDown } else { Icon::PanEnd }.handle(),
@@ -351,6 +355,28 @@ impl Cagents {
                     .wrapping(iced::widget::text::Wrapping::None)
                     .class(cosmic::theme::Text::Custom(style))
                     .into(),
+            );
+        }
+        if let Some(scope) = scope {
+            name.push_str(", for ");
+            name.push_str(&scope);
+            label.push(
+                widget::row::with_children(vec![
+                    crate::ui_controls::passive_icon(
+                        sidebar::worktree_icon(),
+                        design::COMPACT_ICON_SIZE,
+                    ),
+                    design::caption(scope)
+                        .wrapping(iced::widget::text::Wrapping::None)
+                        .ellipsize(iced::widget::text::Ellipsize::End(
+                            iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+                        ))
+                        .into(),
+                ])
+                .spacing(space::XXS)
+                .align_y(Alignment::Center)
+                .width(Length::Fill)
+                .into(),
             );
         }
         let toggle = crate::interaction::hover(
@@ -386,193 +412,24 @@ impl Cagents {
         .into()
     }
 
-    fn pull_requests_pane(&self) -> Pane<'_> {
-        let open = self.context_sections.is_open(Section::PullRequests);
-        let count = self.pull_request_count();
+    fn work_pane(&self) -> Pane<'_> {
+        let open = self.context_sections.is_open(Section::Work);
+        let count = self.work_count();
         Pane {
-            section: Section::PullRequests,
-            title: "Pull requests".into(),
+            section: Section::Work,
+            title: "Work".into(),
             count: (count > 0).then(|| (count.to_string(), design::muted_text as _)),
+            scope: None,
             description: None,
             controls: Vec::new(),
+            // Each row is about two lines, so its count bounds the list's
+            // height and the leading list need not leave room for rows not
+            // there. The quarter row covers the list's padding.
             height: Height::Content {
-                rows: LIST_ROWS_SHOWN,
+                rows: (self.work_rows() as f32 + 0.25).min(LIST_ROWS_SHOWN),
             },
-            body: open.then(|| self.pull_request_section()),
+            body: open.then(|| self.work_section()),
         }
-    }
-
-    fn worktrees_pane(&self) -> Option<Pane<'_>> {
-        let edited = self.edited_worktrees();
-        if edited.is_empty() {
-            return None;
-        }
-        let open = self.context_sections.is_open(Section::Worktrees);
-        Some(Pane {
-            section: Section::Worktrees,
-            title: "Worktrees".into(),
-            count: Some((edited.len().to_string(), design::muted_text as _)),
-            description: Some(if edited.len() == 1 {
-                "1 edited".to_owned()
-            } else {
-                format!("{} edited", edited.len())
-            }),
-            controls: Vec::new(),
-            // Each row is two lines, so its count bounds the list's height
-            // and the leading list need not leave room for rows not there.
-            // The quarter row covers the list's padding.
-            height: Height::Content {
-                rows: (edited.len() as f32 + 0.25).min(LIST_ROWS_SHOWN),
-            },
-            body: open.then(|| self.edited_worktrees_view(edited)),
-        })
-    }
-
-    /// The project and worktree Projects lists at `path`.
-    fn project_worktree(
-        &self,
-        path: &std::path::Path,
-    ) -> Option<(&sidebar::SidebarProject, &sidebar::SidebarWorktree)> {
-        self.sidebar_model.projects.iter().find_map(|project| {
-            project
-                .worktrees
-                .iter()
-                .find(|worktree| worktree.path == path)
-                .map(|worktree| (project, worktree))
-        })
-    }
-
-    /// Where the edited worktree at `path` stands in this window.
-    pub(super) fn worktree_placement(&self, path: &std::path::Path) -> pull_request_ui::Placement {
-        let current = self
-            .sidebar_state
-            .active_worktree()
-            .is_some_and(|key| key.canonical_path == path);
-        pull_request_ui::Placement {
-            openable: self.project_worktree(path).is_some(),
-            // Point at the workspace section only while it shows the current
-            // worktree; collapsed, the row just marks which one is current.
-            current: current.then(|| {
-                if self.workspace_view_shown().is_some() {
-                    "Shown below"
-                } else {
-                    "Current"
-                }
-            }),
-        }
-    }
-
-    /// Opens the worktree Projects lists at `path`.
-    pub(super) fn open_worktree_message(&self, path: &std::path::Path) -> Option<Message> {
-        let (project, worktree) = self.project_worktree(path)?;
-        Some(Message::Sidebar(SidebarAction::OpenWorktree {
-            project_id: project.id,
-            worktree_id: worktree.id,
-            path: worktree.path.clone(),
-        }))
-    }
-
-    /// The edited worktrees no pull request row shows, each with its branch,
-    /// its uncommitted changes and any pull request Projects knows for it.
-    /// Opening one goes to it.
-    fn edited_worktrees_view<'a>(
-        &'a self,
-        edited: Vec<&'a crate::work::ConversationWorktree>,
-    ) -> Element<'a, Message> {
-        let rows = edited.into_iter().map(|edited| {
-            let found = self.project_worktree(&edited.path);
-            let placement = self.worktree_placement(&edited.path);
-            let indicators = found
-                .map(|(_, worktree)| sidebar::worktree_indicators(worktree))
-                .unwrap_or_default();
-            let label = found.map_or_else(
-                || {
-                    sidebar::worktree_display_name(
-                        &edited.path,
-                        edited.branch.as_deref(),
-                        edited.branch.is_none(),
-                    )
-                },
-                |(_, worktree)| worktree.label().to_owned(),
-            );
-            let visual = indicators.pull_request.map(sidebar::pull_request_visual);
-            let glyph: Element<'a, Message> = match visual {
-                Some((icon, color)) => widget::icon(icon)
-                    .size(design::ROW_ICON_SIZE)
-                    .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(move |_| {
-                        cosmic::iced::widget::svg::Style { color: Some(color) }
-                    })))
-                    .into(),
-                None => crate::ui_controls::passive_icon(
-                    sidebar::worktree_icon(),
-                    design::ROW_ICON_SIZE,
-                ),
-            };
-            // A pull request the conversation did not work on, such as one
-            // merged before it began, is still worth naming.
-            let mut facts: Vec<Element<'a, Message>> = Vec::with_capacity(6);
-            if let Some(pull_request) = indicators.pull_request {
-                facts.push(design::caption(format!("#{}", pull_request.number)).into());
-            }
-            facts.extend(pull_request_ui::worktree_facts(edited, placement));
-            let lines = widget::column::with_children(vec![
-                widget::row::with_children(vec![
-                    glyph,
-                    design::body(label.clone())
-                        .wrapping(iced::widget::text::Wrapping::None)
-                        .ellipsize(iced::widget::text::Ellipsize::End(
-                            iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                        ))
-                        .width(Length::Fill)
-                        .into(),
-                ])
-                .spacing(space::S)
-                .align_y(Alignment::Center)
-                .into(),
-                widget::container(
-                    widget::row::with_children(pull_request_ui::separated(facts))
-                        .spacing(space::XS)
-                        .align_y(Alignment::Center)
-                        .wrap(),
-                )
-                .padding(Padding {
-                    left: f32::from(design::ROW_ICON_SIZE) + space::S,
-                    ..Padding::ZERO
-                })
-                .into(),
-            ])
-            .spacing(space::XXS);
-            let button = widget::button::custom(lines)
-                .name(format!("Open worktree {label}"))
-                .class(crate::ui_controls::control_style(
-                    placement.current.is_some(),
-                    None,
-                ))
-                .padding([space::XS, space::S])
-                .width(Length::Fill)
-                .on_press_maybe(
-                    self.open_worktree_message(&edited.path)
-                        .filter(|_| !self.modal_is_open()),
-                );
-            crate::interaction::tooltip(
-                crate::interaction::hover(button),
-                edited.path.display().to_string(),
-            )
-        });
-        widget::scrollable(
-            widget::column::with_children(rows.collect::<Vec<_>>())
-                .spacing(space::XXS)
-                .padding(design::with_vertical_rail(Padding::from([
-                    space::XXS,
-                    space::S,
-                ])))
-                .width(Length::Fill),
-        )
-        .direction(iced::widget::scrollable::Direction::Vertical(
-            design::scrollbar(),
-        ))
-        .width(Length::Fill)
-        .into()
     }
 
     fn workspace_pane(&self, width: f32) -> Pane<'_> {
@@ -616,15 +473,74 @@ impl Cagents {
         } else {
             Vec::new()
         };
+        let scope = self.work_scope();
         Pane {
             section: Section::Workspace,
             title: view.label().into(),
             count,
+            scope: match &scope {
+                pull_request_ui::WorkScope::Focus => None,
+                pull_request_ui::WorkScope::Worktree { label, .. }
+                | pull_request_ui::WorkScope::Elsewhere { label, .. } => Some(label.clone()),
+            },
             description,
             controls,
             height: Height::Share,
-            body: open.then(|| self.workspace_body(view, width)),
+            body: open.then(|| match scope {
+                pull_request_ui::WorkScope::Elsewhere {
+                    repository,
+                    number,
+                    url,
+                    ..
+                } => self.elsewhere_body(repository, number, url),
+                _ => self.workspace_body(view, width),
+            }),
         }
+    }
+
+    /// A pull request with no worktree here has no changes or files to show
+    /// in this window, which says so rather than showing another worktree's.
+    fn elsewhere_body(
+        &self,
+        repository: GitHubRepoKey,
+        number: u64,
+        url: Option<Url>,
+    ) -> Element<'_, Message> {
+        let mut actions: Vec<Element<'_, Message>> = Vec::with_capacity(1);
+        if let Some(url) = url {
+            actions.push(
+                crate::ui_controls::button::secondary("Open pull request")
+                    .icon(Icon::PopOut.handle())
+                    .name(format!("Open #{number}"))
+                    .on_press_maybe((!self.modal_is_open()).then(|| {
+                        Message::PullRequestUi(pull_request_ui::Action::Open {
+                            repository,
+                            number,
+                            url,
+                        })
+                    }))
+                    .into(),
+            );
+        }
+        let mut lines: Vec<Element<'_, Message>> = vec![
+            design::heading(format!("#{number} isn't checked out here"))
+                .wrapping(iced::widget::text::Wrapping::Word)
+                .width(Length::Fill)
+                .into(),
+            design::caption("Its changes show once a worktree in Projects is on its branch.")
+                .wrapping(iced::widget::text::Wrapping::Word)
+                .width(Length::Fill)
+                .into(),
+        ];
+        lines.extend(actions);
+        widget::container(
+            widget::column::with_children(lines)
+                .spacing(space::S)
+                .width(Length::Fill),
+        )
+        .padding(space::L)
+        .width(Length::Fill)
+        .into()
     }
 
     fn workspace_body(&self, view: WorkspaceView, width: f32) -> Element<'_, Message> {
@@ -737,6 +653,7 @@ impl Cagents {
                 section: Section::Problems,
                 title: "Problems".into(),
                 count: (count > 0).then(|| (count.to_string(), style)),
+                scope: None,
                 description: None,
                 // A request's failure notice lingers until it is dismissed.
                 controls: lsp.notice.is_some().then(dismiss).into_iter().collect(),
@@ -751,6 +668,7 @@ impl Cagents {
                 section: Section::Locations,
                 title: inspector::locations_title(*kind).into(),
                 count: Some((locations.len().to_string(), design::muted_text as _)),
+                scope: None,
                 description: None,
                 controls: vec![dismiss()],
                 height: Height::Share,
@@ -770,12 +688,7 @@ mod tests {
     #[test]
     fn what_the_conversation_did_leads_and_the_worktree_tree_waits_to_be_asked_for() {
         let sections = Sections::default();
-        for section in [
-            Section::PullRequests,
-            Section::Worktrees,
-            Section::Problems,
-            Section::Locations,
-        ] {
+        for section in [Section::Work, Section::Problems, Section::Locations] {
             assert!(sections.is_open(section), "{section:?} starts collapsed");
         }
         assert!(!sections.is_open(Section::Workspace));
@@ -801,8 +714,7 @@ mod tests {
     #[test]
     fn each_section_toggles_alone() {
         for section in [
-            Section::PullRequests,
-            Section::Worktrees,
+            Section::Work,
             Section::Workspace,
             Section::Problems,
             Section::Locations,
@@ -823,7 +735,7 @@ mod tests {
     fn sections_survive_a_restart_and_older_saves_keep_what_they_had() {
         let mut sections = Sections::default();
         sections.set_open(Section::Workspace, true);
-        sections.set_open(Section::PullRequests, false);
+        sections.set_open(Section::Work, false);
         sections.workspace_view = WorkspaceView::Files;
         let saved = serde_json::to_string(&sections).unwrap();
         assert_eq!(serde_json::from_str::<Sections>(&saved).unwrap(), sections);
@@ -831,7 +743,10 @@ mod tests {
         // A window saved before a section existed keeps the rest of its state.
         let partial: Sections = serde_json::from_str(r#"{"workspace":true}"#).unwrap();
         assert!(partial.is_open(Section::Workspace));
-        assert!(partial.is_open(Section::PullRequests));
+        assert!(partial.is_open(Section::Work));
+        // A window saved when the section was Pull requests keeps its fold.
+        let renamed: Sections = serde_json::from_str(r#"{"pull_requests":false}"#).unwrap();
+        assert!(!renamed.is_open(Section::Work));
     }
 
     #[test]

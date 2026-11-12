@@ -1,14 +1,14 @@
-//! The inspector's Pull requests section: the pull requests the inspected
-//! conversation worked on, and, when the settings ask, those it only
-//! mentioned. The daemon keeps the list and each pull request's state,
-//! changes and checks current; a row opens its pull request where Projects
-//! opens one.
+//! The inspector's Work section: the pull requests the inspected
+//! conversation worked on and the worktrees it edited, and, when the
+//! settings ask, the pull requests it only mentioned. The daemon keeps the
+//! list and each pull request's state, changes and checks current. Choosing
+//! a row binds the inspector's changes and files to that work.
 
 use super::*;
 
 mod conversation;
 
-pub(super) use conversation::{Placement, separated, worktree_facts};
+pub(super) use conversation::WorkKey;
 
 #[derive(Debug, Clone)]
 pub enum Action {
@@ -21,21 +21,35 @@ pub enum Action {
         number: u64,
         url: Url,
     },
-    /// Open this pull request's checks in a popup, or with `None` close it.
-    ShowChecks(Option<(GitHubRepoKey, u64)>),
+    /// Show this work's changes and files in the inspector.
+    Choose(WorkKey),
     /// Open one check's details page.
     OpenCheck(Url),
-    /// Open the worktree at this path, where the conversation edited a
-    /// listed pull request's branch.
-    OpenWorktree(PathBuf),
-    /// Show every mentioned pull request, or again only the first few.
-    ToggleAllMentions,
+    /// Unfold the mentioned pull requests, or fold them again.
+    ToggleMentions,
 }
 
 impl Action {
     pub(super) fn allowed_while_modal(&self) -> bool {
-        matches!(self, Self::Conversation(..) | Self::ShowChecks(None))
+        matches!(self, Self::Conversation(..))
     }
+}
+
+/// What the inspector's changes and files show.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum WorkScope {
+    /// The worktree the focused card names, as without a conversation.
+    Focus,
+    /// The worktree of the work shown, named by its branch.
+    Worktree { path: PathBuf, label: String },
+    /// A pull request with no worktree here, which has no local changes or
+    /// files to show.
+    Elsewhere {
+        label: String,
+        repository: GitHubRepoKey,
+        number: u64,
+        url: Option<Url>,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -51,22 +65,18 @@ impl Cagents {
                 conversation.update(watch);
                 Task::none()
             }
-            Action::ToggleAllMentions => {
-                conversation.all_mentions = !conversation.all_mentions;
+            Action::ToggleMentions => {
+                conversation.mentions_open = !conversation.mentions_open;
                 Task::none()
             }
-            Action::ShowChecks(shown) => {
-                conversation.show_checks(shown);
-                Task::none()
+            Action::Choose(key) => {
+                conversation.choose(key);
+                // Choosing work is asking to see it.
+                self.context_sections
+                    .set_open(context_sections::Section::Workspace, true);
+                self.save_settings_task(false)
             }
-            Action::OpenCheck(url) => {
-                conversation.show_checks(None);
-                self.open_clicked_link(url)
-            }
-            Action::OpenWorktree(path) => match self.open_worktree_message(&path) {
-                Some(open) => self.update(open),
-                None => Task::none(),
-            },
+            Action::OpenCheck(url) => self.open_clicked_link(url),
             Action::Open {
                 repository,
                 number,
@@ -133,53 +143,111 @@ impl Cagents {
         self.pull_request_inspector.conversation.retarget(inspected);
     }
 
-    /// Whether a pull request's checks popup is on screen, which takes the
-    /// inspector and its Pull requests section being open.
-    pub(super) fn checks_popup_open(&self) -> bool {
-        self.context_inspector_open
-            && self
-                .context_sections
-                .is_open(context_sections::Section::PullRequests)
-            && self.pull_request_inspector.conversation.checks_popup_open()
+    /// The worktree the inspected conversation runs in, as Projects knows
+    /// it.
+    fn inspected_here(&self) -> Option<PathBuf> {
+        let card = self.pull_request_inspector.conversation.card?;
+        let CardKind::Chat(session) = &self.card_state(card)?.kind else {
+            return None;
+        };
+        self.sidebar_model
+            .worktree_at(&session.launch.recipe.working_directory)
+            .map(|key| key.canonical_path)
     }
 
-    /// Forgets the checks popup once what draws it is hidden, so it does
-    /// not hold Escape while unseen or return when its section comes back.
-    pub(super) fn close_checks_popup(&mut self) {
-        self.pull_request_inspector.conversation.show_checks(None);
-    }
-
-    /// Whether the Pull requests section has anything to list.
-    pub(super) fn pull_requests_listed(&self) -> bool {
+    /// Whether the Work section has anything to list.
+    pub(super) fn work_listed(&self) -> bool {
         self.pull_request_inspector
             .conversation
             .lists_any(self.settings.show_mentioned_pull_requests)
     }
 
-    /// How many pull requests the section lists, for its header.
-    pub(super) fn pull_request_count(&self) -> usize {
+    /// How many pieces of work the section lists, for its header.
+    pub(super) fn work_count(&self) -> usize {
+        let here = self.inspected_here();
         self.pull_request_inspector
             .conversation
-            .listed(self.settings.show_mentioned_pull_requests)
+            .work(here.as_deref())
+            .iter()
+            .filter(|work| !matches!(work, conversation::Work::Here(_)))
             .count()
     }
 
-    /// The worktrees the inspected conversation edited that no pull
-    /// request row shows, most recently edited first.
-    pub(super) fn edited_worktrees(&self) -> Vec<&crate::work::ConversationWorktree> {
-        self.pull_request_inspector
-            .conversation
-            .worktrees_alone()
-            .collect()
+    /// How many rows the Work section draws, which bounds its height.
+    pub(super) fn work_rows(&self) -> usize {
+        let here = self.inspected_here();
+        let conversation = &self.pull_request_inspector.conversation;
+        let mentions = if self.settings.show_mentioned_pull_requests {
+            let mentioned = conversation
+                .rows()
+                .iter()
+                .filter(|row| !row.relation.worked_on())
+                .count();
+            match mentioned {
+                0 => 0,
+                _ if conversation.mentions_open => mentioned + 1,
+                _ => 1,
+            }
+        } else {
+            0
+        };
+        conversation.work(here.as_deref()).len() + mentions
     }
 
-    pub(super) fn pull_request_section(&self) -> Element<'_, Message> {
+    /// What the inspector's changes and files show while the Work section
+    /// leads it: the shown work's worktree, else focus.
+    pub(super) fn work_scope(&self) -> WorkScope {
+        if !self.work_listed() {
+            return WorkScope::Focus;
+        }
+        let here = self.inspected_here();
+        let conversation = &self.pull_request_inspector.conversation;
+        let work = conversation.work(here.as_deref());
+        match conversation.shown(&work, here.as_deref()) {
+            None => WorkScope::Focus,
+            Some(shown) => match (shown.worktree(), shown.pull_request()) {
+                (Some(path), _) => WorkScope::Worktree {
+                    path: path.to_path_buf(),
+                    label: shown.scope_label(),
+                },
+                (None, Some(row)) => WorkScope::Elsewhere {
+                    label: shown.scope_label(),
+                    repository: row.repository.clone(),
+                    number: row.number,
+                    url: Url::parse(&row.url()).ok(),
+                },
+                (None, None) => WorkScope::Focus,
+            },
+        }
+    }
+
+    /// The worktree the source-control and file panels are pinned to, in
+    /// place of the focused card's, while the inspector shows a
+    /// conversation's work.
+    pub(super) fn inspector_panel_pin(&self) -> Option<PathBuf> {
+        if !self.context_inspector_visible() {
+            return None;
+        }
+        match self.work_scope() {
+            WorkScope::Worktree { path, .. } => Some(path),
+            WorkScope::Focus | WorkScope::Elsewhere { .. } => None,
+        }
+    }
+
+    pub(super) fn work_section(&self) -> Element<'_, Message> {
+        let here = self.inspected_here();
+        let conversation = &self.pull_request_inspector.conversation;
+        let work = conversation.work(here.as_deref());
+        let shown = conversation
+            .shown(&work, here.as_deref())
+            .map(|work| work.key());
         let list = conversation::view(
-            &self.pull_request_inspector.conversation,
+            conversation,
+            &work,
+            shown.as_ref(),
             self.settings.show_mentioned_pull_requests,
-            &|worktree| self.worktree_placement(&worktree.path),
-        )
-        .unwrap_or_else(|| widget::Space::new().height(0).into());
+            &|path| self.sidebar_model.worktree_at(path).is_some(),
+        );
         let content: Element<'_, Action> = widget::scrollable(
             widget::container(list)
                 .padding(design::with_vertical_rail(Padding::from([
@@ -295,35 +363,40 @@ mod tests {
     fn the_section_follows_the_focused_conversation_and_lists_mentions_only_when_asked() {
         let (mut app, conversation, terminal) = conversation_app();
         app.sync_pull_request_inspector();
-        assert!(!app.pull_requests_listed());
+        assert!(!app.work_listed());
         drop(app.handle_pull_request_ui(listed(
             conversation,
             1,
             &[(4, Relation::Created), (5, Relation::Mentioned)],
             true,
         )));
-        // Mentions are left out unless the settings ask for them.
+        // Mentions are left out unless the settings ask for them, and even
+        // then are folded beneath the work rather than counted with it.
         assert!(!app.settings.show_mentioned_pull_requests);
-        assert!(app.pull_requests_listed());
-        assert_eq!(app.pull_request_count(), 1);
+        assert!(app.work_listed());
+        assert_eq!(app.work_count(), 1);
+        assert_eq!(app.work_rows(), 1);
         app.settings.show_mentioned_pull_requests = true;
-        assert_eq!(app.pull_request_count(), 2);
+        assert_eq!(app.work_count(), 1);
+        assert_eq!(app.work_rows(), 2, "the folded mentions take one row");
+        drop(app.handle_pull_request_ui(Action::ToggleMentions));
+        assert_eq!(app.work_rows(), 3);
         app.settings.show_mentioned_pull_requests = false;
 
-        // A conversation that only mentioned pull requests lists none.
+        // A conversation that only mentioned pull requests lists no work.
         drop(app.handle_pull_request_ui(listed(
             conversation,
             2,
             &[(5, Relation::Mentioned)],
             false,
         )));
-        assert!(!app.pull_requests_listed());
+        assert!(!app.work_listed());
 
         // Focusing another card in the workspace keeps the conversation.
         drop(app.workspace.focus(terminal));
         app.sync_pull_request_inspector();
         drop(app.handle_pull_request_ui(listed(conversation, 3, &[(6, Relation::Pushed)], false)));
-        assert_eq!(app.pull_request_count(), 1);
+        assert_eq!(app.work_count(), 1);
     }
 
     #[test]
@@ -336,20 +409,10 @@ mod tests {
             conversation,
             1,
             &[],
-            vec![crate::work::ConversationWorktree {
-                path: PathBuf::from("/tmp/edited"),
-                branch: Some("fix".into()),
-                by_subagent: false,
-                changed_paths: Some(2),
-                diff: Some(crate::work::DiffStat {
-                    additions: 3,
-                    deletions: 1,
-                }),
-                pull_request: None,
-            }],
+            vec![edited("/tmp/edited", None)],
             true,
         )));
-        assert_eq!(app.edited_worktrees().len(), 1);
+        assert_eq!(app.work_count(), 1);
         assert_eq!(app.workspace_view_shown(), None);
         let _ = app.update(Message::ContextSection(context_sections::Action::Toggle(
             context_sections::Section::Workspace,
@@ -357,101 +420,77 @@ mod tests {
         assert!(app.workspace_view_shown().is_some());
     }
 
-    #[test]
-    fn escape_closes_the_checks_popup_before_anything_beneath_it() {
-        let (mut app, conversation, _) = conversation_app();
-        app.sync_pull_request_inspector();
-        drop(app.handle_pull_request_ui(listed(conversation, 1, &[(4, Relation::Created)], true)));
-        let repository = GitHubRepoKey::new("listed-inspector.invalid", None, "o", "r").unwrap();
-        drop(app.handle_pull_request_ui(Action::ShowChecks(Some((repository, 4)))));
-        assert!(app.checks_popup_open());
-        let escape = keyboard::Key::Named(keyboard::key::Named::Escape);
-        drop(app.update(Message::KeyEvent {
-            event: keyboard::Event::KeyPressed {
-                key: escape.clone(),
-                modified_key: escape,
-                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
-                location: keyboard::Location::Standard,
-                modifiers: keyboard::Modifiers::empty(),
-                text: None,
-                repeat: false,
-            },
-            captured: false,
-        }));
-        assert!(!app.checks_popup_open());
-        assert!(app.context_inspector_open);
-    }
-
-    #[test]
-    fn a_hidden_checks_popup_is_forgotten_rather_than_kept_behind_its_section() {
-        let (mut app, conversation, _) = conversation_app();
-        app.sync_pull_request_inspector();
-        drop(app.handle_pull_request_ui(listed(conversation, 1, &[(4, Relation::Created)], true)));
-        let repository = GitHubRepoKey::new("listed-inspector.invalid", None, "o", "r").unwrap();
-        let show = Action::ShowChecks(Some((repository, 4)));
-
-        drop(app.handle_pull_request_ui(show.clone()));
-        drop(
-            app.update(Message::ContextSection(context_sections::Action::Toggle(
-                context_sections::Section::PullRequests,
-            ))),
-        );
-        assert!(!app.checks_popup_open());
-        drop(
-            app.update(Message::ContextSection(context_sections::Action::Toggle(
-                context_sections::Section::PullRequests,
-            ))),
-        );
-        assert!(
-            !app.checks_popup_open(),
-            "the popup came back with its section"
-        );
-
-        drop(app.handle_pull_request_ui(show));
-        drop(app.set_context_inspector_open(false));
-        drop(app.set_context_inspector_open(true));
-        assert!(
-            !app.checks_popup_open(),
-            "the popup came back with the inspector"
-        );
-    }
-
-    #[test]
-    fn a_worktree_shows_once_on_the_row_of_the_pull_request_its_branch_heads() {
-        let (mut app, conversation, _) = conversation_app();
-        app.sync_pull_request_inspector();
-        let worktree = |path: &str, pull_request| crate::work::ConversationWorktree {
+    fn edited(path: &str, pull_request: Option<u64>) -> crate::work::ConversationWorktree {
+        crate::work::ConversationWorktree {
             path: PathBuf::from(path),
-            branch: Some(path.trim_start_matches('/').into()),
+            branch: Some(path.rsplit('/').next().unwrap().into()),
             by_subagent: false,
-            changed_paths: Some(1),
-            diff: None,
+            changed_paths: Some(2),
+            diff: Some(crate::work::DiffStat {
+                additions: 3,
+                deletions: 1,
+            }),
             pull_request,
-        };
+        }
+    }
+
+    #[test]
+    fn choosing_work_scopes_the_changes_to_it_and_a_pull_request_not_here_says_so() {
+        let (mut app, conversation, _) = conversation_app();
+        app.sync_pull_request_inspector();
+        app.context_sections
+            .set_open(context_sections::Section::Workspace, false);
         drop(app.handle_pull_request_ui(listed_with(
             conversation,
             1,
-            &[(4, Relation::Created), (5, Relation::Mentioned)],
-            vec![
-                worktree("/on-the-row", Some(4)),
-                worktree("/no-pull-request", None),
-                // Only a worked-on row takes its worktree.
-                worktree("/mentioned", Some(5)),
-            ],
+            &[(4, Relation::Created), (7, Relation::Pushed)],
+            vec![edited("/on-four", Some(4)), edited("/alone", None)],
             true,
         )));
+        // Two pull requests and the worktree no pull request heads.
+        assert_eq!(app.work_count(), 3);
+        // Nothing chosen and the chat runs in none of them: the first one
+        // checked out is shown.
         assert_eq!(
-            app.edited_worktrees()
-                .iter()
-                .map(|worktree| worktree.path.to_str().unwrap())
-                .collect::<Vec<_>>(),
-            vec!["/no-pull-request", "/mentioned"]
+            app.work_scope(),
+            WorkScope::Worktree {
+                path: PathBuf::from("/on-four"),
+                label: "on-four".into()
+            }
         );
-        // The row's worktree line opens nothing Projects does not list.
+        assert_eq!(app.inspector_panel_pin(), Some(PathBuf::from("/on-four")));
+
+        drop(
+            app.handle_pull_request_ui(Action::Choose(WorkKey::Worktree(PathBuf::from("/alone")))),
+        );
         assert!(
-            !app.worktree_placement(std::path::Path::new("/on-the-row"))
-                .openable
+            app.context_sections
+                .is_open(context_sections::Section::Workspace),
+            "choosing work opens what it shows"
         );
-        drop(app.handle_pull_request_ui(Action::OpenWorktree(PathBuf::from("/on-the-row"))));
+        assert_eq!(app.inspector_panel_pin(), Some(PathBuf::from("/alone")));
+
+        let repository = GitHubRepoKey::new("listed-inspector.invalid", None, "o", "r").unwrap();
+        drop(
+            app.handle_pull_request_ui(Action::Choose(WorkKey::PullRequest {
+                repository,
+                number: 7,
+            })),
+        );
+        assert!(matches!(
+            app.work_scope(),
+            WorkScope::Elsewhere { number: 7, .. }
+        ));
+        // The panels fall back to focus rather than keep another worktree's.
+        assert_eq!(app.inspector_panel_pin(), None);
+
+        // A hidden inspector pins nothing, so the rail follows focus again.
+        drop(app.set_context_inspector_open(false));
+        app.context_inspector_transition = None;
+        drop(
+            app.handle_pull_request_ui(Action::Choose(WorkKey::Worktree(PathBuf::from("/alone")))),
+        );
+        assert!(!app.context_inspector_visible());
+        assert_eq!(app.inspector_panel_pin(), None);
     }
 }

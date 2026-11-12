@@ -6280,7 +6280,6 @@ impl Cagents {
         if self.focused_repository_is_saving() && self.context_inspector_is_overlay() {
             self.context_inspector_open = false;
             self.context_inspector_transition = None;
-            self.close_checks_popup();
         }
         self.sync_context_overlay_state()
     }
@@ -11460,6 +11459,10 @@ impl Cagents {
     /// a session restoring, a project list arriving. Rebinding drops the
     /// previous worktree's model outright, so a stale row can never be pressed.
     fn rebind_source_control(&mut self) -> Task<Message> {
+        // Work chosen in the inspector binds the panel without moving the
+        // list's selection, which stays with the focused card.
+        self.sidebar_state
+            .pin_panel_worktree(self.inspector_panel_pin());
         let focus = self.sidebar_focus();
         let changed = self
             .sidebar_state
@@ -13149,9 +13152,6 @@ impl Cagents {
         }
         let from = self.context_inspector_progress();
         self.context_inspector_open = open;
-        if !open {
-            self.close_checks_popup();
-        }
         self.context_inspector_transition = Some(InspectorTransition {
             started_at: Instant::now(),
             from,
@@ -17946,10 +17946,6 @@ impl Application for Cagents {
                         }
                         return cosmic::task::message(Message::CancelRepositoryClose);
                     }
-                    // A popup is the innermost thing the user is looking at.
-                    if self.checks_popup_open() {
-                        return self.handle_pull_request_ui(pull_request_ui::Action::ShowChecks(None));
-                    }
                     // Ahead of the inspector and the sidebar because the find
                     // bar is the innermost thing the user is looking at, and
                     // behind the confirmations above because those are modal.
@@ -21900,10 +21896,10 @@ mod tests {
         let steps = [
             Action::Show(WorkspaceView::Files),
             Action::Show(WorkspaceView::SourceControl),
-            Action::Toggle(Section::PullRequests),
+            Action::Toggle(Section::Work),
             Action::Toggle(Section::Workspace),
             Action::Show(WorkspaceView::Files),
-            Action::Toggle(Section::PullRequests),
+            Action::Toggle(Section::Work),
         ];
         draw_frames(&mut app, steps.len(), |app, frame| {
             let _ = app.update(Message::ContextSection(steps[frame]));
