@@ -762,12 +762,15 @@ fn edited_worktrees_are_listed_most_recent_first_and_outside_ones_dropped() {
 }
 
 #[test]
-fn new_work_on_a_merged_pull_request_s_branch_name_is_not_an_edit_of_it() {
-    // `old` headed #2, merged at commit `abc`; a worktree has `old` checked
-    // out again.
-    let facts_at = |oid: &str| {
+fn an_edit_stays_with_the_pull_request_it_was_made_for_and_not_with_a_reused_name() {
+    // A worktree has `old` checked out at `oid`; #2 heads `old` at `abc`
+    // and is `state`.
+    let facts_at = |oid: &str, state: &str| {
         let mut facts = facts("/w/app");
         let project = facts.project.as_mut().unwrap();
+        let mut snapshot = (**project.snapshot.as_ref().unwrap()).clone();
+        snapshot.pull_requests = vec![listed(1, "feat", "OPEN"), listed(2, "old", state)];
+        project.snapshot = Some(Arc::new(snapshot));
         let mut local = (**project.local.as_ref().unwrap()).clone();
         let mut reused = worktree("/w/app/.worktrees/old", "old");
         reused.head = Some(crate::work::Head {
@@ -778,8 +781,7 @@ fn new_work_on_a_merged_pull_request_s_branch_name_is_not_an_edit_of_it() {
         project.local = Some(Arc::new(local));
         facts
     };
-    let edited = |facts: &Facts| {
-        let mut watched = Watched::new();
+    let edit = |watched: &mut Watched, facts: &Facts| {
         watched.apply(
             Scanned {
                 found: vec![transcript::Found {
@@ -795,21 +797,43 @@ fn new_work_on_a_merged_pull_request_s_branch_name_is_not_an_edit_of_it() {
             },
             Some(facts),
         );
+    };
+    let list = |watched: &mut Watched, facts: &Facts| {
+        watched.pin_edits(Some(facts), &BTreeMap::new(), &BTreeMap::new());
         assemble(
-            &watched,
+            watched,
             Some(facts),
             &BTreeMap::new(),
             &BTreeMap::new(),
             None,
         )
     };
+    let edited_two = |list: &ConversationPullRequests| {
+        list.pull_requests
+            .iter()
+            .any(|row| row.number == 2 && row.relation == Relation::Edited)
+    };
 
-    // Past the merge, the edit is new work: no #2 row, and the worktree is
-    // listed on its own.
-    let list = edited(&facts_at("def"));
-    assert!(list.pull_requests.iter().all(|row| row.number != 2));
+    // Editing #2's branch while it is open is work on #2, and stays so once
+    // it merges and the worktree moves past it.
+    let mut watched = Watched::new();
+    let open = facts_at("abc", "OPEN");
+    edit(&mut watched, &open);
+    assert!(edited_two(&list(&mut watched, &open)));
+    let moved_on = facts_at("def", "MERGED");
+    let after = list(&mut watched, &moved_on);
+    assert!(edited_two(&after), "the merged pull request lost its edit");
+    // The worktree is no longer #2's branch, so it is listed on its own.
+    assert_eq!(after.worktrees[0].pull_request, None);
+
+    // The name reused after the merge is new work: no #2 row.
+    let mut watched = Watched::new();
+    edit(&mut watched, &moved_on);
+    let list_now = list(&mut watched, &moved_on);
+    assert!(!edited_two(&list_now));
     assert_eq!(
-        list.worktrees
+        list_now
+            .worktrees
             .iter()
             .map(|worktree| (worktree.path.to_str().unwrap(), worktree.pull_request))
             .collect::<Vec<_>>(),
@@ -817,13 +841,12 @@ fn new_work_on_a_merged_pull_request_s_branch_name_is_not_an_edit_of_it() {
     );
 
     // Still at the merged commit, it is #2's branch.
-    let list = edited(&facts_at("abc"));
-    assert!(
-        list.pull_requests
-            .iter()
-            .any(|row| row.number == 2 && row.relation == Relation::Edited)
-    );
-    assert_eq!(list.worktrees[0].pull_request, Some(2));
+    let mut watched = Watched::new();
+    let at_merge = facts_at("abc", "MERGED");
+    edit(&mut watched, &at_merge);
+    let list_now = list(&mut watched, &at_merge);
+    assert!(edited_two(&list_now));
+    assert_eq!(list_now.worktrees[0].pull_request, Some(2));
 }
 
 #[test]

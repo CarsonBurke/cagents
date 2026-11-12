@@ -297,6 +297,55 @@ impl Watched {
         self.coverage = scanned.coverage;
     }
 
+    /// Pins each edit made on a branch to the pull request the branch heads
+    /// while the edit is still that pull request's work, so the edit stays
+    /// with it after it merges and its worktree is removed or moves on. An
+    /// edit not yet pinned is judged by the branch as it is now.
+    fn pin_edits(
+        &mut self,
+        facts: Option<&Facts>,
+        observed: &BTreeMap<PullRequestKeyOrd, Observed>,
+        branches: &BTreeMap<(RepoKeyOrd, String), BranchLookup>,
+    ) {
+        let Some((facts, project)) = facts.and_then(|facts| Some((facts, facts.project.as_ref()?)))
+        else {
+            return;
+        };
+        let pinned = self
+            .references
+            .iter()
+            .filter_map(|(reference, aggregate)| {
+                let Reference::Branch {
+                    repository: None,
+                    name,
+                } = reference
+                else {
+                    return None;
+                };
+                if aggregate.relation != Relation::Edited {
+                    return None;
+                }
+                let Resolved::Key(key) = resolve(reference, facts, branches) else {
+                    return None;
+                };
+                (project.edits_belong_to(&key, name, observed) == Some(true))
+                    .then(|| (reference.clone(), key))
+            })
+            .collect::<Vec<_>>();
+        for (reference, key) in pinned {
+            let Some(edit) = self.references.remove(&reference) else {
+                continue;
+            };
+            let entry = self
+                .references
+                .entry(Reference::PullRequest(key))
+                .or_insert(edit);
+            entry.relation = entry.relation.min(edit.relation);
+            entry.by_subagent &= edit.by_subagent;
+            entry.seen = entry.seen.max(edit.seen);
+        }
+    }
+
     fn edited_in(&mut self, directory: PathBuf, by_subagent: bool) {
         self.sequence += 1;
         let seen = self.sequence;
@@ -379,39 +428,38 @@ impl ProjectFacts {
         })
     }
 
-    /// Whether edits made on `branch` are work on its pull request `key`:
-    /// it is open, or a worktree still has `branch` at its head commit. A
-    /// branch name reused after its pull request merged or closed is new
-    /// work, not an edit of that pull request. Unread pull requests keep
-    /// the edit until GitHub says otherwise.
+    /// Whether edits made on `branch` now are work on its pull request
+    /// `key`: it is open, or a worktree still has `branch` at its head
+    /// commit. A branch name reused after its pull request merged or closed
+    /// is new work, not an edit of that pull request. `None` until GitHub
+    /// has described the pull request.
     fn edits_belong_to(
         &self,
         key: &PullRequestKeyOrd,
         branch: &str,
         observed: &BTreeMap<PullRequestKeyOrd, Observed>,
-    ) -> bool {
+    ) -> Option<bool> {
         let (open, head) = match self.listed(key) {
             Some(found) => (found.state.0 == "OPEN", found.head_ref_oid.as_str()),
-            None => match observed
-                .get(key)
-                .and_then(|observation| observation.pull_request.as_ref())
-            {
-                Some(found) => (
+            None => {
+                let found = observed.get(key)?.pull_request.as_ref()?;
+                (
                     found.state == crate::work::PullRequestState::Open,
                     found.head_oid.as_str(),
-                ),
-                None => return true,
-            },
+                )
+            }
         };
-        open || self.local.as_deref().is_some_and(|local| {
-            local.worktrees.iter().any(|worktree| {
-                worktree.branch.as_deref() == Some(branch)
-                    && worktree
-                        .head
-                        .as_ref()
-                        .is_some_and(|found| found.oid == head)
-            })
-        })
+        Some(
+            open || self.local.as_deref().is_some_and(|local| {
+                local.worktrees.iter().any(|worktree| {
+                    worktree.branch.as_deref() == Some(branch)
+                        && worktree
+                            .head
+                            .as_ref()
+                            .is_some_and(|found| found.oid == head)
+                })
+            }),
+        )
     }
 
     /// The worktree containing `directory`, the deepest when they nest.
@@ -491,6 +539,7 @@ impl Handle {
             .or_insert_with(Watched::new);
         watched.watchers.insert(client, delivery);
         watched.unwatched_since = None;
+        watched.pin_edits(facts.as_ref(), &observed, &branches);
         let mut list = assemble(watched, facts.as_ref(), &observed, &branches, forge_error);
         with_measured(&mut list, &measured);
         let mut comparable = list.clone();
@@ -630,6 +679,7 @@ impl Handle {
                 continue;
             };
             let facts = facts.get(&conversation).and_then(Option::as_ref);
+            watched.pin_edits(facts, &observed, &branches);
             let mut list = assemble(watched, facts, &observed, &branches, forge_error.clone());
             with_measured(&mut list, &measured);
             let mut comparable = list.clone();
@@ -1152,7 +1202,7 @@ fn assemble(
                 name,
             } = reference
             && let Some(project) = project
-            && !project.edits_belong_to(&key, name, observed)
+            && project.edits_belong_to(&key, name, observed) == Some(false)
         {
             continue;
         }
@@ -1278,7 +1328,7 @@ fn assemble(
                     ) else {
                         return None;
                     };
-                    if !project.edits_belong_to(&key, branch, observed) {
+                    if project.edits_belong_to(&key, branch, observed) == Some(false) {
                         return None;
                     }
                     pull_requests
