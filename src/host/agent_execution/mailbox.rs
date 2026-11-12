@@ -20,7 +20,8 @@ use crate::{
         AcceptanceError, Authority, Lineage, Origin,
         directory::{Member, Scope, UsageLimit},
         mailbox::{
-            Delivery, Inbox, Message, Outgoing, Party, Reach, Receipt, Seal, Sent, State, To,
+            Delivery, Handed, Handoff, Inbox, Message, Outgoing, Party, Reach, Receipt, Seal, Sent,
+            State, To,
         },
     },
     chat::{self, runtime::Rejection},
@@ -55,8 +56,207 @@ pub(in crate::host) fn send(
 ///
 /// A recipient stopped by a usage limit keeps the message until the limit
 /// resets, so the sender is not left waiting on a reply that cannot come
-/// before then. One whose provider exited cannot receive it at all.
+/// before then.
 pub(in crate::host) fn post(
+    host: &SharedHost,
+    authority: &Authority,
+    outgoing: Outgoing,
+) -> Result<Delivery, AcceptanceError> {
+    let delivery = leave(host, authority, outgoing)?;
+    wake(host);
+    Ok(delivery)
+}
+
+/// Leaves a message as `post` does, and has an agent cagents hosts take it as
+/// its next run: now, reopening its conversation if its process ended, or
+/// once its current work ends.
+pub(in crate::host) fn hand(
+    host: &SharedHost,
+    authority: &Authority,
+    outgoing: Outgoing,
+) -> Result<Handed, AcceptanceError> {
+    let delivery = leave(host, authority, outgoing)?;
+    let limited = delivery
+        .recipient
+        .as_ref()
+        .is_some_and(|member| member.limit.is_some());
+    let handoff = (|| {
+        let registry = registry(host)?;
+        let seal = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .mailbox_seal
+            .clone()
+            .ok_or("The mailbox key is unavailable")?;
+        let message = &delivery.sent.message;
+        let handoff = to_agent(host, &registry, &seal, message, limited)?;
+        if handoff.is_some() {
+            return Ok(handoff);
+        }
+        // The courier may have handed it over first.
+        let Some(agent) = message
+            .to
+            .lineage
+            .map(|lineage| {
+                registry
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .lineage_agent(lineage)
+            })
+            .transpose()?
+            .flatten()
+        else {
+            return Ok(None);
+        };
+        let Some(accepted) = registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .previous_agent_acceptance(&agent.origin, &message_run(agent.id, message, &seal))?
+        else {
+            return Ok(None);
+        };
+        let start = super::start(host, &accepted)?;
+        Ok::<_, String>(Some(Handoff::Run {
+            agent: agent.id,
+            run: accepted.run.id,
+            start,
+        }))
+    })();
+    wake(host);
+    // The message is left either way; a failure to start its run is how the
+    // agent takes it, not a failure to send it.
+    let agent = handoff.unwrap_or_else(|reason| {
+        delivery
+            .sent
+            .message
+            .to
+            .lineage
+            .and_then(|lineage| {
+                registry(host)
+                    .ok()?
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .lineage_agent(lineage)
+                    .ok()
+                    .flatten()
+            })
+            .map(|agent| Handoff::Held {
+                agent: agent.id,
+                reason,
+            })
+    });
+    Ok(Handed { delivery, agent })
+}
+
+/// The run an agent takes `message` as.
+fn message_run(
+    agent: crate::model::AgentId,
+    message: &Message,
+    seal: &Seal,
+) -> crate::agent_execution::Submit {
+    crate::agent_execution::Submit {
+        name: None,
+        destination: crate::agent_execution::Destination::Existing(agent),
+        prompt: seal.seal(message, message.created_ms),
+        idempotency_key: format!("{}{}", crate::host::model::MESSAGE_RUN_KEY, message.id),
+    }
+}
+
+/// Has the agent cagents hosts for `message`'s recipient take it as its next
+/// run, when it can now. `None` when the recipient is no such agent, or the
+/// message already became a run once: it then reaches the recipient as a
+/// message to any other session does.
+///
+/// Only an agent a session or the user's CLI owns qualifies, and only until
+/// a person takes it over: an automation's agent runs only what its schedule
+/// gives it, and a person's conversation is theirs to prompt.
+pub(super) fn to_agent(
+    host: &SharedHost,
+    registry: &SharedRegistry,
+    seal: &Seal,
+    message: &Message,
+    limited: bool,
+) -> Result<Option<Handoff>, String> {
+    let Some(lineage) = message.to.lineage else {
+        return Ok(None);
+    };
+    let (agent, request, previous, interactive, ahead) = {
+        let store = registry.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(agent) = store.lineage_agent(lineage)? else {
+            return Ok(None);
+        };
+        let request = message_run(agent.id, message, seal);
+        let previous = store.previous_agent_acceptance(&agent.origin, &request)?;
+        let interactive = store.agent_is_interactive(agent.id)?;
+        let ahead = store
+            .unfinished_agent_runs(agent.id)?
+            .first()
+            .map(|run| run.id);
+        (agent, request, previous, interactive, ahead)
+    };
+    let Some(crate::agent_execution::HostedSession::Chat(session)) = &agent.session else {
+        return Ok(None);
+    };
+    if agent.closed
+        || matches!(agent.origin, Origin::Automation { .. })
+        || interactive
+        || previous.is_some()
+    {
+        return Ok(None);
+    }
+    if limited {
+        return Ok(Some(Handoff::Held {
+            agent: agent.id,
+            reason: "A usage limit stops its conversation; it receives the message once the limit resets".into(),
+        }));
+    }
+    if ahead.is_some()
+        || matches!(
+            super::provider(host, registry, &agent)?,
+            Some(super::Provider::Busy)
+        )
+    {
+        return Ok(Some(Handoff::Waiting {
+            agent: agent.id,
+            behind: ahead,
+        }));
+    }
+    let accepted = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .hand_message_to_agent(
+            message.id,
+            session.id,
+            &agent.origin,
+            &request,
+            super::now(),
+        );
+    let accepted = match accepted {
+        Ok(Some(accepted)) => accepted,
+        Ok(None) => return Ok(None),
+        Err(reason) => {
+            return Ok(Some(Handoff::Held {
+                agent: agent.id,
+                reason,
+            }));
+        }
+    };
+    super::announce(host, registry);
+    match super::start(host, &accepted) {
+        Ok(start) => Ok(Some(Handoff::Run {
+            agent: agent.id,
+            run: accepted.run.id,
+            start,
+        })),
+        // Its run is recorded failed and the message waits again.
+        Err(reason) => Ok(Some(Handoff::Held {
+            agent: agent.id,
+            reason,
+        })),
+    }
+}
+
+fn leave(
     host: &SharedHost,
     authority: &Authority,
     outgoing: Outgoing,
@@ -76,10 +276,19 @@ pub(in crate::host) fn post(
     let now = super::now();
     let (message, reach, recipient) = {
         let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-        let lineages =
-            registry.session_lineages(live.iter().map(|entry| entry.id).chain(session))?;
-        let lineage_of = |id: TerminalId| lineages.get(&id).copied().unwrap_or(Lineage(id));
         let model = registry.model()?;
+        // An agent's session can be named while its process is stopped.
+        let bound = model
+            .agents
+            .iter()
+            .filter_map(|agent| agent.session.as_ref().map(|session| session.id()));
+        let lineages = registry.session_lineages(
+            live.iter()
+                .map(|entry| entry.id)
+                .chain(session)
+                .chain(bound),
+        )?;
+        let lineage_of = |id: TerminalId| lineages.get(&id).copied().unwrap_or(Lineage(id));
         // As in a directory listing, a delegated agent without a title of its
         // own is named by the channel its prompt titled.
         let title_of = |id: TerminalId| {
@@ -173,7 +382,6 @@ pub(in crate::host) fn post(
         registry.post_message(&message)?;
         (message, reach, recipient)
     };
-    wake(host);
     Ok(Delivery {
         sent: Sent { message, reach },
         recipient,
@@ -339,7 +547,8 @@ fn terminal_attention(
         .collect()
 }
 
-/// The one lineage `handle` names among live agent sessions: by session ID,
+/// The one lineage `handle` names among live agent sessions and the open
+/// agents cagents hosts, including one whose process stopped: by session ID,
 /// lineage, or delegated agent ID, whole or a prefix.
 fn resolve(
     agents: &[crate::agent_execution::Agent],
@@ -368,10 +577,19 @@ fn resolve(
             found.insert(lineage);
         }
     }
+    for agent in agents.iter().filter(|agent| !agent.closed) {
+        let Some(session) = agent.session.as_ref().map(|session| session.id()) else {
+            continue;
+        };
+        let lineage = lineage_of(session);
+        if matches(&session) || matches(&lineage) || matches(&agent.id) {
+            found.insert(lineage);
+        }
+    }
     match found.len() {
         1 => Ok(found.pop_first().expect("one lineage")),
         0 => Err(format!(
-            "No live agent session matches {handle}; list them with `cagents sessions --all`"
+            "No session or agent matches {handle}; list them with `cagents sessions --all`"
         )),
         _ => Err(format!(
             "{} sessions match {handle}; give more of the ID",
@@ -718,11 +936,29 @@ impl Handle {
             .filter(|at| *at >= 0)
             .map(|at| (at as u64).saturating_mul(1000))
             .min();
+        self.start_queued(host);
         let released = self.deliver_messages(host, &limits)?;
         Ok(match (released, reset) {
             (Some(released), Some(reset)) => Some(released.min(reset)),
             (released, reset) => released.or(reset),
         })
+    }
+
+    /// Starts the prompts agents hold behind work that has since ended.
+    fn start_queued(&self, host: &SharedHost) {
+        // As for a message, an upgrade checkpoint must see each prompt sent.
+        let gate = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .control_gate
+            .clone();
+        let _control = gate.read().unwrap_or_else(|p| p.into_inner());
+        if crate::host::client::ensure_control_open(host).is_err() {
+            return;
+        }
+        if let Err(error) = super::start_queued(host) {
+            tracing::warn!(%error, "cannot start queued agent prompts");
+        }
     }
 
     fn deliver_messages(
@@ -788,6 +1024,20 @@ impl Handle {
             let Some(recipient) = message.to.lineage else {
                 continue;
             };
+            let limited = chats
+                .iter()
+                .any(|(id, _, _)| lineages.get(id) == Some(&recipient) && limits.contains_key(id));
+            match to_agent(host, &self.0.registry, &self.0.seal, &message, limited) {
+                Ok(Some(Handoff::Run { .. } | Handoff::Waiting { .. })) => continue,
+                Ok(Some(Handoff::Held { reason, .. })) => {
+                    tracing::debug!(%reason, message = %message.id, "an agent holds a message");
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(%error, message = %message.id, "cannot hand a message to its agent");
+                    continue;
+                }
+            }
             let Some((session, _, handle)) = chats.iter().find(|(id, _, handle)| {
                 lineages.get(id) == Some(&recipient) && handle.is_idle() && !limits.contains_key(id)
             }) else {

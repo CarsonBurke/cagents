@@ -180,6 +180,8 @@ fn lost_agent(host: &SharedHost, directory: &std::path::Path, source: &Session) 
     let accepted = registry
         .submit_agent(&Origin::User, &submit(directory, "lost-agent"), 1)
         .unwrap();
+    // Claimed, so the crash may have left its prompt sent.
+    assert!(registry.claim_agent_dispatch(&accepted, 1).unwrap());
     registry
         .bind_agent(accepted.agent.id, None, HostedSession::Chat(source.clone()))
         .unwrap();
@@ -461,6 +463,7 @@ fn closing_a_lost_childs_pane_ends_only_that_child() {
                     3,
                 )
                 .unwrap();
+            assert!(registry.claim_agent_dispatch(&child, 3).unwrap());
             registry
                 .bind_agent(child.agent.id, None, HostedSession::Chat(source.clone()))
                 .unwrap();

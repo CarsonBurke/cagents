@@ -235,7 +235,25 @@ pub struct Submit {
     pub idempotency_key: String,
 }
 
+/// Prefixes the idempotency key of the run an agent takes a message as, so
+/// each message becomes at most one run. Only the daemon's courier makes such
+/// keys: [`Submit::validate_client`] refuses them from clients, so no client
+/// key can claim to carry a message.
+pub const MESSAGE_RUN_KEY: &str = "cagents-message:";
+
 impl Submit {
+    /// [`Submit::validate`] for a request a client made, whose idempotency
+    /// key cannot use the daemon's reserved message-run namespace.
+    pub fn validate_client(&self) -> Result<(), String> {
+        self.validate()?;
+        if self.idempotency_key.starts_with(MESSAGE_RUN_KEY) {
+            return Err(format!(
+                "Idempotency keys starting with {MESSAGE_RUN_KEY} are reserved for messages"
+            ));
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if let Some(name) = &self.name {
             if !matches!(&self.destination, Destination::New(_)) {
@@ -533,6 +551,27 @@ pub enum Operation {
     /// its recipient can do with it now. `SendMessage` is this as older CLIs
     /// send it.
     Send(mailbox::Outgoing),
+    /// `Submit` for an existing agent that also says whether its prompt was
+    /// sent now or waits behind the agent's current work. `interrupt` stops
+    /// that work first, so the prompt goes as soon as it has stopped.
+    Prompt {
+        request: Submit,
+        interrupt: bool,
+    },
+    /// `Send` that also says how an agent recipient takes the message: as a
+    /// run started now, or one waiting behind its current work.
+    Deliver(mailbox::Outgoing),
+}
+
+/// What became of a prompt accepted for an existing agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Start {
+    /// It went to the agent's provider now. `resumed` when the agent's
+    /// process had ended, so its conversation was reopened to take it.
+    Sent { resumed: bool },
+    /// It waits, unsent, until the agent's current work ends: the named run,
+    /// or a turn no run started, such as one a background task woke.
+    Queued { behind: Option<RunId> },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -601,6 +640,11 @@ pub enum Reply {
     Members(directory::Members),
     Sessions(directory::Sessions),
     Delivered(mailbox::Delivery),
+    Prompted {
+        accepted: Accepted,
+        start: Start,
+    },
+    Handed(mailbox::Handed),
 }
 
 /// Already correlated to one accepted RunId by the provider adapter. A late

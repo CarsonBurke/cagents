@@ -42,6 +42,7 @@ pub(super) mod floor;
 pub(super) use execution::ResidentRelease;
 mod lineage;
 mod mailbox;
+pub(super) use mailbox::MESSAGE_RUN_KEY;
 mod native_actor;
 mod native_actor_retirement;
 pub(super) use native_actor::NativeActorEvent;

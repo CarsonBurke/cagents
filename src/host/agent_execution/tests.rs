@@ -2299,8 +2299,8 @@ fn graceful_daemon_restart_keeps_delegated_agents_that_close_without_their_proce
             .len(),
         1
     );
-    // Work for the stopped agent is never sent to a process that is gone; it
-    // fails with a way forward instead.
+    // Work for the stopped agent is never sent to a process that is gone. A
+    // conversation that cannot reopen by itself fails with a way forward.
     let refused = submit(
         &restarted,
         &Authority::default(),
@@ -2319,7 +2319,7 @@ fn graceful_daemon_restart_keeps_delegated_agents_that_close_without_their_proce
             .result
             .diagnostic
             .as_deref()
-            .is_some_and(|text| text.contains("reopen its conversation")),
+            .is_some_and(|text| text.contains("Resume it from its pane")),
         "{refused:?}"
     );
     // Closing needs no teardown proof from the gone actor: the stop recorded
@@ -5787,5 +5787,311 @@ fn console_names_a_paged_command_once() {
     assert_eq!(
         console_line(&command, 0).as_deref(),
         Some("Ran cargo test\n")
+    );
+}
+
+/// Waits for `condition`, failing with `reason` after a few seconds.
+fn eventually(mut condition: impl FnMut() -> bool, reason: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !condition() {
+        assert!(Instant::now() < deadline, "{reason}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn deliver(host: &SharedHost, to: String, body: &str) -> crate::agent_execution::mailbox::Handed {
+    use crate::agent_execution::mailbox::{Outgoing, To};
+    let Reply::Handed(handed) = process(
+        host,
+        Authority::default(),
+        Operation::Deliver(Outgoing {
+            to: To::Session(to),
+            body: body.into(),
+            wait_ms: None,
+        }),
+    )
+    .unwrap() else {
+        panic!("expected a handed receipt");
+    };
+    handed
+}
+
+fn prompts(root: &Path) -> usize {
+    std::fs::read_to_string(root.join("prompts"))
+        .unwrap_or_default()
+        .lines()
+        .count()
+}
+
+/// Starts the agent's first run on a turn the fake provider holds until
+/// `cleanup-release` exists, and returns once the provider is in that turn.
+fn busy_agent(host: &SharedHost, mut request: Submit, root: &Path) -> Accepted {
+    request.prompt = "HOLD_CLEANUP_BUSY".into();
+    let accepted = submit(host, &Authority::default(), request).unwrap();
+    eventually(
+        || root.join("cleanup-busy").exists(),
+        "the provider never began its held turn",
+    );
+    accepted
+}
+
+#[test]
+fn a_message_to_a_settled_agent_starts_a_run_with_it() {
+    use crate::agent_execution::{
+        Start,
+        mailbox::{Handoff, State as Delivery},
+    };
+    if isolated("a_message_to_a_settled_agent_starts_a_run_with_it").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap();
+    let first = submit(&host, &Authority::default(), request).unwrap();
+    assert_eq!(settled(&host, first.run.id).state, State::Succeeded);
+
+    let handed = deliver(&host, first.agent.id.to_string(), "Review the result");
+    let Some(Handoff::Run {
+        agent,
+        run,
+        start: Start::Sent { resumed: false },
+    }) = handed.agent
+    else {
+        panic!("a settled agent takes the message as a run now: {handed:?}");
+    };
+    assert_eq!(agent, first.agent.id);
+    let run = settled(&host, run);
+    assert_eq!(run.state, State::Succeeded, "{run:?}");
+    // Its owner sees the work as the agent's latest run, not a turn no run
+    // recorded.
+    let (_, latest) = status(&host, &Authority::default(), agent).unwrap();
+    assert_eq!(latest.id, run.id);
+    let message = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .message(handed.delivery.sent.message.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(message.state, Delivery::Delivered);
+    assert_eq!(prompts(root), 2);
+    assert_eq!(
+        std::fs::read_to_string(root.join("spawns"))
+            .unwrap()
+            .lines()
+            .count(),
+        1,
+        "the same provider took it"
+    );
+}
+
+#[test]
+fn a_message_to_a_busy_agent_becomes_its_next_run_when_the_run_settles() {
+    use crate::agent_execution::mailbox::{Handoff, State as Delivery};
+    if isolated("a_message_to_a_busy_agent_becomes_its_next_run_when_the_run_settles").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap();
+    let first = busy_agent(&host, request, root);
+    let courier = mailbox::Courier::start(&host).unwrap();
+
+    let handed = deliver(&host, first.agent.id.to_string(), "After your run");
+    assert_eq!(
+        handed.agent,
+        Some(Handoff::Waiting {
+            agent: first.agent.id,
+            behind: Some(first.run.id),
+        })
+    );
+    let message = |host: &SharedHost| {
+        registry(host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .message(handed.delivery.sent.message.id)
+            .unwrap()
+            .unwrap()
+    };
+    courier.wake_and_wait_for_scan();
+    assert_eq!(
+        message(&host).state,
+        Delivery::Pending,
+        "nothing interrupts"
+    );
+    assert_eq!(prompts(root), 1);
+
+    std::fs::write(root.join("cleanup-release"), "").unwrap();
+    assert_eq!(settled(&host, first.run.id).state, State::Succeeded);
+    let latest = || {
+        registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .latest_agent_run(first.agent.id)
+            .unwrap()
+    };
+    eventually(
+        || latest().id != first.run.id,
+        "the message never became a run",
+    );
+    let next = settled(&host, latest().id);
+    assert_eq!(next.state, State::Succeeded, "{next:?}");
+    assert_eq!(message(&host).state, Delivery::Delivered);
+    assert_eq!(prompts(root), 2);
+    drop(courier);
+}
+
+#[test]
+fn a_prompt_for_a_busy_agent_waits_unsent_and_runs_when_the_run_settles() {
+    use crate::agent_execution::Start;
+    if isolated("a_prompt_for_a_busy_agent_waits_unsent_and_runs_when_the_run_settles").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap();
+    let first = busy_agent(&host, request.clone(), root);
+    let courier = mailbox::Courier::start(&host).unwrap();
+    let follow_up = Submit {
+        destination: Destination::Existing(first.agent.id),
+        prompt: "Next".into(),
+        idempotency_key: "busy-follow-up".into(),
+        ..request
+    };
+    let prompt = |follow_up: Submit| {
+        let Reply::Prompted { accepted, start } = process(
+            &host,
+            Authority::default(),
+            Operation::Prompt {
+                request: follow_up,
+                interrupt: false,
+            },
+        )
+        .unwrap() else {
+            panic!("expected a prompted receipt");
+        };
+        (accepted, start)
+    };
+    let (queued, start) = prompt(follow_up.clone());
+    assert_eq!(
+        start,
+        Start::Queued {
+            behind: Some(first.run.id)
+        }
+    );
+    assert_eq!(queued.run.state, State::Accepted);
+    // A retry whose answer was lost says the same.
+    let (retried, start) = prompt(follow_up);
+    assert_eq!((retried.run.id, retried.created), (queued.run.id, false));
+    assert!(matches!(start, Start::Queued { .. }), "{start:?}");
+    courier.wake_and_wait_for_scan();
+    assert_eq!(prompts(root), 1, "the queued prompt was not sent early");
+
+    std::fs::write(root.join("cleanup-release"), "").unwrap();
+    assert_eq!(settled(&host, first.run.id).state, State::Succeeded);
+    let next = settled(&host, queued.run.id);
+    assert_eq!(next.state, State::Succeeded, "{next:?}");
+    assert_eq!(prompts(root), 2);
+    drop(courier);
+}
+
+#[test]
+fn an_interrupt_withdraws_the_prompts_waiting_behind_the_run() {
+    if isolated("an_interrupt_withdraws_the_prompts_waiting_behind_the_run").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap();
+    let first = busy_agent(&host, request.clone(), root);
+    let queued = submit(
+        &host,
+        &Authority::default(),
+        Submit {
+            destination: Destination::Existing(first.agent.id),
+            prompt: "Withdrawn".into(),
+            idempotency_key: "withdrawn".into(),
+            ..request
+        },
+    )
+    .unwrap();
+    // Let the held turn end with the interrupt, as a provider does.
+    std::fs::write(root.join("cleanup-release"), "").unwrap();
+    let _ = process(
+        &host,
+        Authority::default(),
+        Operation::Control {
+            agent: first.agent.id,
+            command: Control::Interrupt {
+                including_subagents: false,
+            },
+        },
+    );
+    let withdrawn = settled(&host, queued.run.id);
+    assert_eq!(withdrawn.state, State::Cancelled, "{withdrawn:?}");
+    assert_eq!(
+        withdrawn.result.diagnostic.as_deref(),
+        Some(WITHDRAWN),
+        "{withdrawn:?}"
+    );
+    settled(&host, first.run.id);
+    let courier = mailbox::Courier::start(&host).unwrap();
+    courier.wake_and_wait_for_scan();
+    assert_eq!(prompts(root), 1, "a withdrawn prompt is never sent");
+}
+
+/// A message for an agent whose process stopped and whose conversation cannot
+/// reopen by itself is held, not lost, and says why; it becomes a run once.
+#[test]
+fn a_message_to_a_stopped_agent_that_cannot_reopen_waits_and_says_why() {
+    use crate::agent_execution::mailbox::{Handoff, Reach, State as Delivery};
+    if isolated("a_message_to_a_stopped_agent_that_cannot_reopen_waits_and_says_why").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
+    super::super::finish_chat_shutdown(&host).unwrap();
+    drop(host);
+    let mut state = HostState::new(HostSessionProof {
+        host_session_id: HostSessionId::new("restarted-delivery-fixture"),
+        boot_id: crate::daemon::read_boot_id().unwrap(),
+        host_incarnation: HostIncarnation::new("restarted-delivery"),
+    });
+    state.install_model(Registry::at(&path).unwrap());
+    let host = Arc::new(crate::host::state::HostLock::new(state));
+
+    // The agent is named though no session of it runs.
+    let handed = deliver(&host, accepted.agent.id.to_string(), "Are you there?");
+    assert_eq!(handed.delivery.sent.reach, Reach::Offline);
+    let Some(Handoff::Held { agent, reason }) = &handed.agent else {
+        panic!("{handed:?}");
+    };
+    assert_eq!(*agent, accepted.agent.id);
+    assert!(reason.contains("Resume it from its pane"), "{reason}");
+    let (message, latest) = {
+        let registry = registry(&host).unwrap();
+        let registry = registry.lock().unwrap();
+        (
+            registry
+                .message(handed.delivery.sent.message.id)
+                .unwrap()
+                .unwrap(),
+            registry.latest_agent_run(accepted.agent.id).unwrap(),
+        )
+    };
+    assert_eq!(message.state, Delivery::Pending, "the message is not lost");
+    assert_eq!(latest.state, State::Failed, "{latest:?}");
+    // The courier does not try again with every scan.
+    let courier = mailbox::Courier::start(&host).unwrap();
+    courier.wake_and_wait_for_scan();
+    courier.wake_and_wait_for_scan();
+    assert_eq!(
+        registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .latest_agent_run(accepted.agent.id)
+            .unwrap()
+            .id,
+        latest.id
     );
 }

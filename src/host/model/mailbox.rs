@@ -15,6 +15,8 @@ use rusqlite::{
     types::{ToSql, ToSqlOutput},
 };
 
+pub(crate) use crate::agent_execution::MESSAGE_RUN_KEY;
+
 /// How many messages `cagents inbox --all` lists.
 const RECENT: usize = 50;
 
@@ -424,6 +426,54 @@ impl Registry {
                 "UPDATE messages SET state = 'delivered', delivered_session = ?2, settled_ms = ?3
                  WHERE id = ?1 AND state = 'pending'",
                 params![id.to_string(), session.to_string(), now as i64],
+            )
+            .map(|changed| changed == 1)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Settles a pending message as given to its recipient agent and accepts
+    /// `request`, the message's prompt, as that agent's next run, in one
+    /// transaction: neither the message nor the run exists without the other.
+    /// `None` when the message was already settled.
+    pub(crate) fn hand_message_to_agent(
+        &mut self,
+        id: MessageId,
+        session: TerminalId,
+        origin: &crate::agent_execution::Origin,
+        request: &crate::agent_execution::Submit,
+        now: u64,
+    ) -> Result<Option<crate::agent_execution::Accepted>, String> {
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let claimed = tx
+            .execute(
+                "UPDATE messages SET state = 'delivered', delivered_session = ?2, settled_ms = ?3
+                 WHERE id = ?1 AND state = 'pending'",
+                params![id.to_string(), session.to_string(), now as i64],
+            )
+            .map_err(|error| error.to_string())?
+            == 1;
+        if !claimed {
+            return Ok(None);
+        }
+        let accepted = Self::submit_agent_in(&tx, origin, request, now)?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(Some(accepted))
+    }
+
+    /// Returns the message `run` was made of to its recipient's queue: the
+    /// run ended before its prompt reached the provider, so the message has
+    /// not been received.
+    pub(crate) fn return_run_message(&mut self, run: crate::model::RunId) -> Result<bool, String> {
+        self.db
+            .execute(
+                "UPDATE messages SET state = 'pending', delivered_session = NULL, settled_ms = NULL
+                 WHERE state = 'delivered' AND id = (
+                     SELECT substr(idempotency_key, length(?2) + 1) FROM agent_runs
+                     WHERE id = ?1 AND substr(idempotency_key, 1, length(?2)) = ?2)",
+                params![run.to_string(), MESSAGE_RUN_KEY],
             )
             .map(|changed| changed == 1)
             .map_err(|error| error.to_string())

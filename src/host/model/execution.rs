@@ -1156,18 +1156,31 @@ impl Registry {
         }
         check_parent_depth(tx, origin)?;
 
-        let (running, owned): (usize, usize) = tx
-            .query_row(
-                "SELECT count(*), coalesce(sum(r.origin = ?1), 0)
-                 FROM agent_runs r JOIN agents a ON a.id = r.agent
-                 WHERE r.state IN ('accepted', 'running', 'waiting')
-                    OR (r.state = 'interrupted' AND a.closed = 0)",
-                [&origin_json],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .map_err(|error| error.to_string())?;
-        if running >= MAX_RUNNING || owned >= MAX_PARENT_RUNNING {
-            return Err("Agent concurrency limit reached; wait for or close existing work".into());
+        // A follow-up behind an agent's own unfinished run waits for it, so it
+        // adds no concurrent work and is held only to the agent's queue bound.
+        let behind = match &request.destination {
+            Destination::Existing(id) => active_run(tx, *id)?.is_some(),
+            Destination::New(_) => false,
+        };
+        if !behind {
+            // Queued runs wait behind their agent's head and are not counted.
+            let (running, owned): (usize, usize) = tx
+                .query_row(
+                    "SELECT count(*), coalesce(sum(r.origin = ?1), 0)
+                     FROM agent_runs r JOIN agents a ON a.id = r.agent
+                     WHERE (r.state IN ('accepted', 'running', 'waiting')
+                            AND NOT EXISTS(SELECT 1 FROM agent_runs e WHERE e.agent = r.agent
+                                AND e.rowid < r.rowid AND e.state IN ('accepted', 'running', 'waiting')))
+                        OR (r.state = 'interrupted' AND a.closed = 0)",
+                    [&origin_json],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(|error| error.to_string())?;
+            if running >= MAX_RUNNING || owned >= MAX_PARENT_RUNNING {
+                return Err(
+                    "Agent concurrency limit reached; wait for or close existing work".into(),
+                );
+            }
         }
         let agent = match &request.destination {
             Destination::Existing(id) => {
@@ -1178,16 +1191,42 @@ impl Registry {
                 if agent.closed {
                     return Err("The agent is closed".into());
                 }
-                let active: bool = tx
+                // An interrupted run's effects are unknown; more work waits
+                // until someone has looked. Unfinished runs only queue it.
+                let unverified: bool = tx
                     .query_row(
                         "SELECT EXISTS(SELECT 1 FROM agent_runs WHERE agent = ?1
-                     AND state IN ('accepted', 'running', 'waiting', 'interrupted'))",
+                     AND state = 'interrupted')",
                         [id.to_string()],
                         |row| row.get(0),
                     )
                     .map_err(|error| error.to_string())?;
-                if active {
-                    return Err("The agent has unfinished or unverified work; inspect and close it before starting another run".into());
+                if unverified {
+                    return Err(UNVERIFIED_REFUSAL.into());
+                }
+                // An automation's schedule decides when it runs; nothing waits
+                // in its queue.
+                if matches!(agent.origin, Origin::Automation { .. })
+                    && active_run(tx, *id)?.is_some()
+                {
+                    return Err(
+                        "The agent has unfinished work; wait for it before starting another run"
+                            .into(),
+                    );
+                }
+                let queued: usize = tx
+                    .query_row(
+                        &format!(
+                            "SELECT count(*) FROM agent_runs r WHERE r.agent = ?1 AND {UNSENT}"
+                        ),
+                        [id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| error.to_string())?;
+                if queued >= MAX_QUEUED {
+                    return Err(format!(
+                        "The agent already has {MAX_QUEUED} prompts waiting for its current run; wait for them or close the agent"
+                    ));
                 }
                 // A removed channel must never be resurrected by a follow-up.
                 require_placement(&tx, &agent.placement, &agent.spec.target.repository)?;
@@ -1294,6 +1333,94 @@ impl Registry {
             run,
             created: true,
         })
+    }
+
+    /// The earliest unfinished run of the agent that was accepted before
+    /// `run`, which `run` waits behind.
+    pub(crate) fn run_ahead_of(&self, run: RunId) -> Result<Option<RunId>, String> {
+        self.db
+            .query_row(
+                "SELECT e.id FROM agent_runs r JOIN agent_runs e ON e.agent = r.agent
+                 WHERE r.id = ?1 AND e.rowid < r.rowid
+                   AND e.state IN ('accepted', 'running', 'waiting')
+                 ORDER BY e.rowid LIMIT 1",
+                [run.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .map(|id| id.parse().map_err(|_| "Invalid stored run ID".to_string()))
+            .transpose()
+    }
+
+    /// Each open agent's next queued prompt that nothing waits ahead of: an
+    /// unsent accepted run, the agent's earliest unfinished one.
+    pub(crate) fn queued_agent_runs(&self) -> Result<Vec<Accepted>, String> {
+        let mut query = self
+            .db
+            .prepare(&format!(
+                "SELECT r.record, a.record FROM agent_runs r JOIN agents a ON a.id = r.agent
+                 WHERE a.closed = 0 AND {UNSENT}
+                   AND NOT EXISTS(SELECT 1 FROM agent_runs e WHERE e.agent = r.agent
+                       AND e.rowid < r.rowid AND e.state IN ('accepted', 'running', 'waiting'))
+                 ORDER BY r.rowid"
+            ))
+            .map_err(|e| e.to_string())?;
+        let rows = query
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
+            .map_err(|e| e.to_string())?;
+        rows.iter()
+            .map(|(run, agent)| {
+                Ok(Accepted {
+                    agent: decode(agent)?,
+                    run: decode(run)?,
+                    created: true,
+                })
+            })
+            .collect()
+    }
+
+    /// Returns a claimed run to its agent's queue: its dispatcher found the
+    /// provider busy before it sent anything. Only an accepted run qualifies.
+    pub(crate) fn release_agent_dispatch(&mut self, run: RunId) -> Result<bool, String> {
+        self.db
+            .execute(
+                "DELETE FROM agent_dispatches WHERE run = ?1
+                 AND EXISTS(SELECT 1 FROM agent_runs WHERE id = ?1 AND state = 'accepted')",
+                [run.to_string()],
+            )
+            .map(|deleted| deleted == 1)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Whether `run` waits in its agent's queue, proved unsent.
+    pub(crate) fn agent_run_is_queued(&self, run: RunId) -> Result<bool, String> {
+        self.db
+            .query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM agent_runs r WHERE r.id = ?1 AND {UNSENT})"),
+                [run.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())
+    }
+
+    /// The agent's unfinished runs, earliest first.
+    pub(crate) fn unfinished_agent_runs(&self, agent: AgentId) -> Result<Vec<Run>, String> {
+        let mut query = self
+            .db
+            .prepare(
+                "SELECT record FROM agent_runs WHERE agent = ?1
+                 AND state IN ('accepted', 'running', 'waiting') ORDER BY rowid",
+            )
+            .map_err(|e| e.to_string())?;
+        let records = query
+            .query_map([agent.to_string()], |row| row.get::<_, String>(0))
+            .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
+            .map_err(|e| e.to_string())?;
+        records.iter().map(|record| decode(record)).collect()
     }
 
     pub(crate) fn agent_run(&self, id: RunId) -> Result<Run, String> {
@@ -1644,7 +1771,14 @@ impl Registry {
                 } else {
                     end
                 };
-                let records = tx.prepare("SELECT record FROM agent_runs WHERE agent = ?1 AND state IN ('accepted', 'running', 'waiting')")
+                // A stop leaves unsent queued prompts for the resumed successor;
+                // closing the agent withdraws them with everything else.
+                let kept = if end == ProcessEnd::Stopped {
+                    format!(" AND NOT ({UNSENT})")
+                } else {
+                    String::new()
+                };
+                let records = tx.prepare(&format!("SELECT r.record FROM agent_runs r WHERE r.agent = ?1 AND r.state IN ('accepted', 'running', 'waiting'){kept}"))
                     .map_err(|e| e.to_string())?.query_map([agent.id.to_string()], |row| row.get::<_, String>(0))
                     .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>).map_err(|e| e.to_string())?;
                 for record in records {
@@ -1788,11 +1922,15 @@ impl Registry {
             [predecessor.id.to_string()],
         )
         .map_err(|error| error.to_string())?;
+        // A prompt still queued unsent belongs to the agent, not to the ended
+        // process, and goes to the successor.
         let unsettled: bool = tx
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM agent_runs WHERE agent = ?1
-                     AND state IN ('accepted', 'running', 'waiting'))
-                 OR EXISTS(SELECT 1 FROM agent_launches WHERE agent = ?1)",
+                &format!(
+                    "SELECT EXISTS(SELECT 1 FROM agent_runs r WHERE r.agent = ?1
+                     AND r.state IN ('accepted', 'running', 'waiting') AND NOT ({UNSENT}))
+                 OR EXISTS(SELECT 1 FROM agent_launches WHERE agent = ?1)"
+                ),
                 [agent.id.to_string()],
                 |row| row.get(0),
             )
@@ -2012,7 +2150,8 @@ impl Registry {
         let records = self
             .db
             .prepare(
-                "SELECT record FROM agent_runs WHERE state IN ('accepted', 'running', 'waiting')",
+                &format!("SELECT r.record FROM agent_runs r WHERE r.state IN ('accepted', 'running', 'waiting')
+                 AND NOT ({UNSENT})"),
             )
             .map_err(|error| error.to_string())?
             .query_map([], |row| row.get::<_, String>(0))
@@ -2200,6 +2339,35 @@ fn process_ended(tx: &Connection, agent: AgentId) -> Result<bool, String> {
         |row| row.get(0),
     )
     .map_err(|e| e.to_string())
+}
+
+/// An accepted run no dispatcher has claimed: its prompt is proved unsent, so
+/// it waits in its agent's queue, survives a restart, and a stop or a
+/// resumption leaves it waiting. An automation's runs are its scheduler's to
+/// dispatch and keep their own recovery. Expects the run's table alias `r`.
+const UNSENT: &str = "r.state = 'accepted'
+    AND NOT EXISTS(SELECT 1 FROM agent_dispatches d WHERE d.run = r.id)
+    AND NOT EXISTS(SELECT 1 FROM agents q WHERE q.id = r.agent
+        AND json_extract(q.origin, '$.Automation') IS NOT NULL)";
+
+/// The most prompts an agent holds while its current run continues.
+pub(crate) const MAX_QUEUED: usize = 8;
+
+/// Why an agent whose latest outcome is unknown takes no more work.
+pub(crate) const UNVERIFIED_REFUSAL: &str = "The agent has unverified work: a run was interrupted without proof of its outcome. Inspect its conversation, then close the agent before giving it more work";
+
+/// The earliest of `agent`'s runs that has not finished, if any.
+fn active_run(db: &Connection, agent: AgentId) -> Result<Option<RunId>, String> {
+    db.query_row(
+        "SELECT id FROM agent_runs WHERE agent = ?1
+         AND state IN ('accepted', 'running', 'waiting') ORDER BY rowid LIMIT 1",
+        [agent.to_string()],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(|e| e.to_string())?
+    .map(|id| id.parse().map_err(|_| "Invalid stored run ID".to_string()))
+    .transpose()
 }
 
 /// Why a confirmed-stopped process ends its agent's execution.
@@ -2905,6 +3073,9 @@ mod tests {
         for mismatch in 0..6 {
             let (mut registry, _directory, request) = fixture();
             let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+            // A claimed run may have reached its provider; only an unclaimed
+            // one is proved unsent, and waits instead.
+            assert!(registry.claim_agent_dispatch(&accepted, 1).unwrap());
             let mut source = source();
             let HostedSession::Chat(chat) = &mut source else {
                 unreachable!()
@@ -3327,7 +3498,9 @@ mod tests {
             idempotency_key: "unsettled".into(),
             ..request
         };
-        registry.submit_agent(&Origin::User, &follow_up, 3).unwrap();
+        let follow_up = registry.submit_agent(&Origin::User, &follow_up, 3).unwrap();
+        // Claimed, so it may have been sent to the stopped process.
+        assert!(registry.claim_agent_dispatch(&follow_up, 3).unwrap());
         assert!(
             registry
                 .adopt_successor(chat, &successor)
@@ -4616,6 +4789,7 @@ mod tests {
         let (mut registry, directory, mut request) = fixture();
         request.name = Some("reviewer".into());
         let first = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+        assert!(registry.claim_agent_dispatch(&first, 1).unwrap());
         assert_eq!(first.agent.name.as_deref(), Some("reviewer"));
         assert_eq!(
             registry

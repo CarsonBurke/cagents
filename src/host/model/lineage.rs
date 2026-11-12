@@ -207,6 +207,23 @@ impl Registry {
         Ok(agents)
     }
 
+    /// The open agent bound to a session of `lineage`, if exactly one is: the
+    /// agent a message to that lineage is for.
+    pub(crate) fn lineage_agent(&self, lineage: Lineage) -> Result<Option<Agent>, String> {
+        let mut members = self.lineage_members(lineage)?;
+        if !members.contains(&lineage.0) {
+            members.push(lineage.0);
+        }
+        let mut agents = Vec::new();
+        for member in members {
+            agents.extend(self.agent_for_session(member)?);
+        }
+        Ok(match <[Agent; 1]>::try_from(agents) {
+            Ok([agent]) => Some(agent),
+            Err(_) => None,
+        })
+    }
+
     /// Whether `id` was registered as a session or names a lineage.
     pub(crate) fn lineage_recorded(&self, id: TerminalId) -> Result<bool, String> {
         self.db

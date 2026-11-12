@@ -227,7 +227,10 @@ use crate::{
 /// Version 173 appends `ServerMessage::ChatAgentAddresses`, which says how a
 /// provider addresses a chat's subagents. Snapshots keep their layout, which
 /// the update sources share.
-pub const PROTOCOL_VERSION: u16 = 173;
+/// Version 174 appends the agent operations `Prompt` and `Deliver`, which say
+/// whether an existing agent took a prompt or message as a run now or holds
+/// it behind its current work, and their replies `Prompted` and `Handed`.
+pub const PROTOCOL_VERSION: u16 = 174;
 /// The install candidate line's protocol. Every message an update exchanges
 /// with its daemon (Connect, the upgrade preview and preparation, and the
 /// inspector's frozen and saved-history requests) has this release's

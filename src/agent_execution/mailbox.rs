@@ -14,7 +14,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::Lineage;
-use crate::model::{MessageId, TerminalId};
+use crate::model::{AgentId, MessageId, RunId, TerminalId};
 
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 /// How many undelivered messages one lineage may hold, so that two agents
@@ -167,6 +167,35 @@ pub struct Delivery {
     /// reply that cannot come before then. Absent for the user and for a
     /// recipient no session of which runs.
     pub recipient: Option<super::directory::Member>,
+}
+
+/// How an agent cagents hosts takes a message: as its next run, so its owner
+/// sees the work and its outcome like any prompt.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum Handoff {
+    /// The message is the prompt of this run of the agent.
+    Run {
+        agent: AgentId,
+        run: RunId,
+        start: super::Start,
+    },
+    /// The message waits until the agent's current work ends, and then
+    /// becomes its next run.
+    Waiting {
+        agent: AgentId,
+        behind: Option<RunId>,
+    },
+    /// The agent cannot take it as a run, for this reason; the message waits
+    /// as one to any other session would.
+    Held { agent: AgentId, reason: String },
+}
+
+/// A sent message, what its recipient can do with it now, and, for an agent
+/// recipient, how that agent takes it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Handed {
+    pub delivery: Delivery,
+    pub agent: Option<Handoff>,
 }
 
 /// A read of the caller's messages. Each message it returns that its recipient

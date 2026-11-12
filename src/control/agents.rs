@@ -70,12 +70,20 @@ pub enum AgentCommand {
         #[command(flatten)]
         show: ShowArgs,
     },
-    /// Send a follow-up prompt to an owned, settled agent.
+    /// Send a follow-up prompt to an owned agent.
+    ///
+    /// An idle agent starts a run with it now, reopening its conversation if
+    /// its process stopped. A busy one holds it, unsent, and runs it as soon
+    /// as its current work ends.
     Send {
         /// The agent, by ID or a unique prefix of it.
         agent: String,
         #[command(flatten)]
         prompt: PromptArgs,
+        /// Interrupt the agent's current turn, so this prompt runs as soon as
+        /// that turn stops. Prompts already waiting still run first.
+        #[arg(long)]
+        interrupt: bool,
         #[command(flatten)]
         retry: RetryArgs,
         #[command(flatten)]
@@ -431,6 +439,7 @@ impl ControlClient {
                 command: crate::agent_execution::ConsoleCommand::Submit { .. },
                 ..
             } => Some(AGENT_SUBMIT_TIMEOUT),
+            Operation::Prompt { .. } | Operation::Deliver(_) => Some(AGENT_RESUME_TIMEOUT),
             _ => None,
         }
         .map(|budget| Instant::now() + budget);
@@ -820,20 +829,22 @@ impl Session {
 
     /// Submits once, and once more with the same key if the daemon's answer
     /// was lost: the key makes the retry return the first acceptance rather
-    /// than start the work twice. Says whether it retried.
-    fn submit(&mut self, request: Submit) -> Result<(Reply, bool), AppError> {
+    /// than start the work twice. Says whether it retried. `operation` makes
+    /// the request's operation, which is `Submit` or `Prompt`.
+    fn submit(
+        &mut self,
+        request: Submit,
+        operation: impl Fn(Submit) -> Operation,
+    ) -> Result<(Reply, bool), AppError> {
         let authority = self.context.authority.clone();
-        match self
-            .client()?
-            .agent(authority, Operation::Submit(request.clone()))
-        {
+        match self.client()?.agent(authority, operation(request.clone())) {
             Ok(reply) => Ok((reply, false)),
             Err(
                 ControlError::Frame(_) | ControlError::ConnectionClosed | ControlError::Connect(_),
             ) => {
                 // A new connection, to the daemon that is running now.
                 self.connection = None;
-                Ok((self.call(Operation::Submit(request))?, true))
+                Ok((self.call(operation(request))?, true))
             }
             Err(error) => Err(protocol_error(error)),
         }
@@ -1034,12 +1045,13 @@ pub(super) fn execute_with_context(
                 prompt,
                 idempotency_key: retry.key(),
             };
-            let output = submitted(&mut session, "agent.spawn", request, wait, show)?;
+            let output = submitted(&mut session, "agent.spawn", request, None, wait, show)?;
             Ok(with_placement_warning(output, placement_warning))
         }
         AgentCommand::Send {
             agent,
             prompt,
+            interrupt,
             retry,
             wait,
             show,
@@ -1058,8 +1070,15 @@ pub(super) fn execute_with_context(
             // The daemon refuses an agent stopped until a known reset, after
             // answering a retry of an accepted submission with its acceptance.
             let now = super::sessions::now_ms();
-            let mut output = submitted(&mut session, "agent.send", request, wait, show)
-                .map_err(|error| limited_refusal(error, limit.as_ref(), now))?;
+            let mut output = submitted(
+                &mut session,
+                "agent.send",
+                request,
+                Some(interrupt),
+                wait,
+                show,
+            )
+            .map_err(|error| limited_refusal(error, limit.as_ref(), now))?;
             if let Some(limit) = limit {
                 let notice = format!(
                     "Its provider last stopped at a usage limit ({}); the run fails the same way unless the limit has lifted, as when the conversation's account changed.",
@@ -1251,16 +1270,43 @@ fn is_limited_refusal(error: &AppError) -> bool {
         .starts_with(crate::agent_execution::LIMITED_REFUSAL)
 }
 
-/// Reports an acceptance, after waiting on its run when asked to.
+/// How a follow-up's acceptance line ends: whether the prompt went to the
+/// agent now or waits, and for what.
+fn start_phrase(start: &crate::agent_execution::Start, interrupted: bool) -> String {
+    use crate::agent_execution::Start;
+    match start {
+        Start::Sent { resumed: false } => "; sent it to the agent now".into(),
+        Start::Sent { resumed: true } => {
+            "; the agent's process had stopped, so cagents reopened its conversation and sent it"
+                .into()
+        }
+        Start::Queued { behind } => {
+            let ahead = match behind {
+                Some(run) => format!("run {}", short(*run)),
+                None => "the agent's current turn".into(),
+            };
+            if interrupted {
+                format!("; interrupted {ahead}, and it starts once that has stopped")
+            } else {
+                format!("; it waits, unsent, until {ahead} ends, then starts")
+            }
+        }
+    }
+}
+
+/// Reports an acceptance, after waiting on its run when asked to. A
+/// follow-up for an existing agent says whether `interrupt` is to stop its
+/// current work, and is reported with whether it was sent now.
 fn submitted(
     session: &mut Session,
     command: &'static str,
     request: Submit,
+    interrupt: Option<bool>,
     wait: WaitArgs,
     show: ShowArgs,
 ) -> Result<CommandOutput, AppError> {
     request
-        .validate()
+        .validate_client()
         .map_err(|e| AppError::new("agent_request", e))?;
     let key = request.idempotency_key.clone();
     let device = crate::device::selected()
@@ -1268,7 +1314,11 @@ fn submitted(
         .unwrap_or("local");
     // Whether a failed submission was accepted is unknown, so the key that
     // makes retrying it safe goes with the error.
-    let (reply, retried) = session.submit(request).map_err(|mut error| {
+    let operation = |request| match interrupt {
+        Some(interrupt) => Operation::Prompt { request, interrupt },
+        None => Operation::Submit(request),
+    };
+    let (reply, retried) = session.submit(request, operation).map_err(|mut error| {
         // A limit's refusal is definite: nothing was accepted to retry.
         if is_limited_refusal(&error) {
             return error;
@@ -1285,8 +1335,10 @@ fn submitted(
         error.details = Some(Value::Object(details));
         error
     })?;
-    let Reply::Accepted(accepted) = reply else {
-        return Err(AppError::new(command, "Unexpected submit response"));
+    let (accepted, start) = match reply {
+        Reply::Accepted(accepted) => (accepted, None),
+        Reply::Prompted { accepted, start } => (accepted, Some(start)),
+        _ => return Err(AppError::new(command, "Unexpected submit response")),
     };
     let mut human = format!(
         "{} agent {} run {}",
@@ -1299,9 +1351,13 @@ fn submitted(
         short(accepted.agent.id),
         short(accepted.run.id)
     );
+    if let Some(start) = &start {
+        human.push_str(&start_phrase(start, interrupt == Some(true)));
+    }
     let mut data = json!({
         "agent": accepted.agent,
         "run": accepted.run,
+        "start": start,
         "created": accepted.created,
         // Whether this invocation resubmitted after losing the daemon's
         // answer. A retry reports `created: false` even when its own lost
@@ -3164,6 +3220,67 @@ mod tests {
             prompt.read().is_err(),
             "standard input is read only when asked for"
         );
+    }
+
+    #[test]
+    fn a_follow_up_says_whether_it_went_now_or_waits() {
+        use crate::agent_execution::Start;
+        let AgentCommand::Send { interrupt, .. } = parse(&["send", "1a2b", "Stop that"]) else {
+            panic!("agent send")
+        };
+        assert!(
+            !interrupt,
+            "a busy agent's follow-up waits unless asked to interrupt"
+        );
+        let AgentCommand::Send { interrupt, .. } =
+            parse(&["send", "1a2b", "Stop that", "--interrupt"])
+        else {
+            panic!("agent send")
+        };
+        assert!(interrupt);
+
+        assert_eq!(
+            start_phrase(&Start::Sent { resumed: false }, false),
+            "; sent it to the agent now"
+        );
+        assert!(start_phrase(&Start::Sent { resumed: true }, false).contains("reopened"));
+        let run = crate::model::RunId::new();
+        assert_eq!(
+            start_phrase(&Start::Queued { behind: Some(run) }, false),
+            format!(
+                "; it waits, unsent, until run {} ends, then starts",
+                short(run)
+            )
+        );
+        assert_eq!(
+            start_phrase(&Start::Queued { behind: None }, true),
+            "; interrupted the agent's current turn, and it starts once that has stopped"
+        );
+    }
+
+    #[test]
+    fn a_client_cannot_mint_a_message_run_key() {
+        let mut request = crate::agent_execution::Submit {
+            name: None,
+            destination: crate::agent_execution::Destination::Existing(crate::model::AgentId::new()),
+            prompt: "Carry on".into(),
+            idempotency_key: format!(
+                "{}{}",
+                crate::agent_execution::MESSAGE_RUN_KEY,
+                crate::model::MessageId::new()
+            ),
+        };
+        // The daemon's courier makes such requests itself, so they are well
+        // formed; only a client is refused them.
+        assert!(request.validate().is_ok());
+        assert!(
+            request
+                .validate_client()
+                .unwrap_err()
+                .contains("reserved for messages")
+        );
+        request.idempotency_key = "retry-1".into();
+        assert!(request.validate_client().is_ok());
     }
 
     #[test]

@@ -90,6 +90,9 @@ const NOTIFICATION_PRESENCE_TIMEOUT: Duration = Duration::from_secs(20);
 // claim are durable. Each waits on an fsync, which a heavily loaded disk can
 // hold for several seconds; that wait is not an unresponsive daemon.
 const AGENT_SUBMIT_TIMEOUT: Duration = Duration::from_secs(30);
+// A prompt or message for an agent whose process stopped first reopens its
+// conversation, which waits for the provider to confirm it, then submits.
+const AGENT_RESUME_TIMEOUT: Duration = Duration::from_secs(90);
 // Close is acknowledged only after interruption and process teardown. Allow
 // those grace periods plus time to schedule the worker and deliver its reply.
 const CHAT_CLOSE_TIMEOUT: Duration = crate::chat::INTERRUPT_TIMEOUT
