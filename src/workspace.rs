@@ -364,6 +364,50 @@ impl StripGeometry {
         };
         Some(target.clamp(0.0, self.max_offset(viewport_width)))
     }
+
+    /// Where the camera comes to rest when `id` takes focus: as near the
+    /// [minimal movement](Self::focus_offset) as it can be without showing
+    /// part of a pane.
+    ///
+    /// Moving as little as possible can rest with a neighbour cut at the
+    /// viewport edge: a half-width pane focused between its partner and a
+    /// full-width pane shows half of a page laid out for the whole strip.
+    /// Where some offset shows the focused pane and only whole panes beside
+    /// it, the nearest such offset wins; panes whose widths cannot tile the
+    /// viewport keep the minimal movement. A viewport reflow keeps using
+    /// [`Self::focus_offset`], so resizing the window never snaps the strip.
+    pub fn rest_offset(&self, id: CardId, viewport_width: f32, current_offset: f32) -> Option<f32> {
+        let target = self.focus_offset(id, viewport_width, current_offset)?;
+        let card = self.card(id)?;
+        let viewport_width = finite_nonnegative(viewport_width);
+        let max_offset = self.max_offset(viewport_width);
+        if !self.cuts_a_pane(target, viewport_width) {
+            return Some(target);
+        }
+        let window = self.intersecting_range(
+            (card.end - viewport_width).max(0.0),
+            card.start + viewport_width,
+        );
+        self.cards[window]
+            .iter()
+            .flat_map(|other| [other.start, other.end - viewport_width])
+            .map(|offset| offset.clamp(0.0, max_offset))
+            .filter(|offset| {
+                *offset <= card.start + WIDTH_TOLERANCE
+                    && offset + viewport_width + WIDTH_TOLERANCE >= card.end
+                    && !self.cuts_a_pane(*offset, viewport_width)
+            })
+            .min_by(|a, b| (a - target).abs().total_cmp(&(b - target).abs()))
+            .or(Some(target))
+    }
+
+    /// Whether a viewport at `offset` shows only part of some pane.
+    fn cuts_a_pane(&self, offset: f32, viewport_width: f32) -> bool {
+        let end = offset + viewport_width;
+        self.cards[self.intersecting_range(offset, end)]
+            .iter()
+            .any(|card| card.start < offset - WIDTH_TOLERANCE || card.end > end + WIDTH_TOLERANCE)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1626,7 +1670,7 @@ impl Workspace {
         };
         if let Some(target) =
             self.geometry
-                .focus_offset(focused, self.viewport_width, self.camera.target())
+                .rest_offset(focused, self.viewport_width, self.camera.target())
         {
             self.camera.animate_to(target);
         }
@@ -2450,6 +2494,42 @@ mod tests {
         assert_eq!(geometry.focus_offset(ids[1], 700.0, 700.0), Some(480.0));
         assert_eq!(geometry.focus_offset(ids[2], 700.0, 260.0), Some(740.0));
         assert_eq!(geometry.focus_offset(ids[0], 700.0, 260.0), Some(0.0));
+    }
+
+    #[test]
+    fn focus_never_rests_on_part_of_a_wide_pane_beside_a_narrow_pair() {
+        for widths in [[1.0, 0.5, 0.5], [0.5, 0.5, 1.0]] {
+            let mut workspace = workspace_with_widths(&widths.map(CardWidth::Fraction), 850.0);
+            let ids: Vec<_> = workspace.order().collect();
+            let geometry = workspace.geometry().clone();
+            // The pair keeps its widths: neither half fills.
+            assert_eq!(
+                ids.iter()
+                    .map(|id| geometry.card(*id).unwrap().width())
+                    .collect::<Vec<_>>(),
+                widths.map(|fraction| fraction * 850.0).to_vec(),
+                "{widths:?}"
+            );
+            // Walk focus across the strip and back; wherever it rests, every
+            // pane in view is whole.
+            let walk = (0..ids.len()).chain((0..ids.len()).rev());
+            for index in walk {
+                workspace.focus(ids[index]).unwrap();
+                workspace.tick(Duration::from_secs(2));
+                let offset = workspace.camera().offset();
+                let geometry = workspace.geometry();
+                for id in &ids {
+                    let card = geometry.card(*id).unwrap();
+                    let shown = (card.end.min(offset + 850.0) - card.start.max(offset)).max(0.0);
+                    assert!(
+                        shown <= 0.5 || (shown - card.width()).abs() <= 0.5,
+                        "{widths:?}: focusing {index} rests at {offset} with {card:?} cut"
+                    );
+                }
+                let focused = geometry.card(ids[index]).unwrap();
+                assert!(focused.start >= offset - 0.5 && focused.end <= offset + 850.5);
+            }
+        }
     }
 
     /// Full-width cycling sized a pane to the viewport, where rounding left
