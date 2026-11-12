@@ -961,8 +961,7 @@ fn save_status<'a>(
 /// Card width below which the category rail folds above the settings. The
 /// rail needs its own width plus a readable column beside it.
 const RAIL_BREAKPOINT: f32 = 560.0;
-/// Card width below which two category columns no longer fit their labels,
-/// so the picker collapses to a single dropdown under the search field.
+/// The width of the category rail beside the settings.
 const RAIL_WIDTH: f32 = 42.0 * design::GRID_UNIT;
 /// How narrow a shortcut's action name may become beside its keys before the
 /// keys move beneath it: room for a short name, such as "Close pane", or about
@@ -1126,46 +1125,58 @@ fn settings_layout<'a>(
                 .into(),
         );
     }
-    // The page title outranks the section titles under it.
-    let mut header = vec![
-        design::display(if searching {
-            "Search results"
-        } else {
-            category.label()
-        })
-        .width(Length::Fill)
-        .into(),
-    ];
-    header.extend(save_status(feedback, invalid.len()));
-    let mut header = vec![
-        widget::row::with_children(header)
-            .align_y(Alignment::Center)
-            .spacing(space::S)
+    // The page title outranks the section titles under it. A narrow page
+    // leaves the category's name to the picker above it, which already says
+    // it, and keeps the row only to report whether the page was saved.
+    let status = save_status(feedback, invalid.len());
+    let titled = searching || !narrow;
+    let mut header: Vec<Element<'a, Message>> = Vec::new();
+    if titled || status.is_some() {
+        let title: Element<'a, Message> = if titled {
+            design::display(if searching {
+                "Search results"
+            } else {
+                category.label()
+            })
             .width(Length::Fill)
-            // The height of the search field beside it, so the page title
-            // and the field share one centre line.
-            .height(design::DENSE_ROW_HEIGHT)
-            .into(),
-    ];
-    if let Some(description) = page_description {
+            .into()
+        } else {
+            iced::widget::Space::new().width(Length::Fill).into()
+        };
         header.push(
-            iced::widget::Space::new()
-                .height(design::rhythm::TITLE_TO_DESCRIPTION)
+            widget::row::with_children(std::iter::once(title).chain(status))
+                .align_y(Alignment::Center)
+                .spacing(space::S)
+                .width(Length::Fill)
+                // The height of the search field beside it, so the page
+                // title and the field share one centre line.
+                .height(design::DENSE_ROW_HEIGHT)
                 .into(),
         );
+    }
+    if let Some(description) = page_description {
+        if !header.is_empty() {
+            header.push(
+                iced::widget::Space::new()
+                    .height(design::rhythm::TITLE_TO_DESCRIPTION)
+                    .into(),
+            );
+        }
         header.push(design::description(description).into());
     }
-    let header = widget::container(
-        widget::container(widget::column::with_children(header).width(Length::Fill))
-            .max_width(content_max_width),
-    )
-    .padding(iced::Padding {
-        top: space::M,
-        right: gutter,
-        bottom: 0.0,
-        left: gutter,
-    })
-    .width(Length::Fill);
+    let header = (!header.is_empty()).then(|| {
+        widget::container(
+            widget::container(widget::column::with_children(header).width(Length::Fill))
+                .max_width(content_max_width),
+        )
+        .padding(iced::Padding {
+            top: space::M,
+            right: gutter,
+            bottom: 0.0,
+            left: gutter,
+        })
+        .width(Length::Fill)
+    });
     let scroll = widget::scrollable(
         widget::container(
             widget::column::with_children(results)
@@ -1190,7 +1201,7 @@ fn settings_layout<'a>(
     .height(Length::Fill);
     // The title and save state stay put while the page scrolls under them.
     let content: Element<'a, Message> =
-        widget::column::with_children(vec![header.into(), scroll.into()])
+        widget::column::with_children(header.map(Element::from).into_iter().chain([scroll.into()]))
             .width(Length::Fill)
             .height(Length::Fill)
             .into();
@@ -1666,7 +1677,7 @@ mod keyboard_table_tests {
     /// Focusable controls and their bounds, in traversal order. A text field
     /// reports itself as focusable too.
     #[derive(Default)]
-    struct Focusables(Vec<iced::Rectangle>);
+    struct Focusables(Vec<iced::Rectangle>, Vec<(String, iced::Rectangle)>);
 
     impl iced::advanced::widget::Operation for Focusables {
         fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation)) {
@@ -1680,9 +1691,18 @@ mod keyboard_table_tests {
         ) {
             self.0.push(bounds);
         }
+        fn text(&mut self, _: Option<&widget::Id>, bounds: iced::Rectangle, text: &str) {
+            self.1.push((text.to_owned(), bounds));
+        }
     }
 
     fn laid_out_settings(category: SettingsCategory, width: f32) -> Vec<iced::Rectangle> {
+        laid_out(category, width).0
+    }
+
+    /// The focusable controls and the text runs of a settings page laid out
+    /// at `width`.
+    fn laid_out(category: SettingsCategory, width: f32) -> Focusables {
         use iced::advanced::{Layout, layout, widget::Tree};
         let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
         let draft = SettingsDraft::from_settings(&AppSettings::default());
@@ -1714,7 +1734,38 @@ mod keyboard_table_tests {
         element
             .as_widget_mut()
             .operate(&mut tree, Layout::new(&node), &renderer, &mut found);
-        found.0
+        found
+    }
+
+    /// A wide page is titled with its category; a narrow one leaves that to
+    /// the category picker above it rather than naming the page twice. A
+    /// page whose only group shares its name keeps that group's description,
+    /// set once, above its settings.
+    #[test]
+    fn a_page_names_its_category_once_at_every_width() {
+        let category = SettingsCategory::NativeChat;
+        for (width, titles) in [(900.0, 1), (400.0, 0)] {
+            let texts = laid_out(category, width).1;
+            let display = texts
+                .iter()
+                .filter(|(text, bounds)| {
+                    text == category.label() && bounds.height == design::LINE_DISPLAY
+                })
+                .count();
+            assert_eq!(display, titles, "page titles at {width}");
+            let sections = texts
+                .iter()
+                .filter(|(text, bounds)| {
+                    text == category.label() && bounds.height == design::LINE_TITLE
+                })
+                .count();
+            assert_eq!(sections, 0, "section titled like its page at {width}");
+            let description = texts
+                .iter()
+                .filter(|(text, _)| text.starts_with("Message composition"))
+                .count();
+            assert_eq!(description, 1, "page description at {width}");
+        }
     }
 
     #[test]
