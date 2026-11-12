@@ -1546,10 +1546,6 @@ fn sweep_needs_rearming(pending: Option<Instant>, requested: Instant) -> bool {
     pending.is_none_or(|deadline| requested < deadline)
 }
 
-fn should_show_card_navigator(total: usize) -> bool {
-    total > 1
-}
-
 fn card_control_id(id: CardId, control: &str) -> widget::Id {
     widget::Id::new(format!("card.{id}.{control}"))
 }
@@ -6267,6 +6263,18 @@ impl Cagents {
         } else {
             design::WINDOW_RESIZE_BORDER / self.settings.ui_scale
         }
+    }
+
+    /// The trailing padding the rightmost surface gives its interactive edge
+    /// content - its scrollbar rail, its trailing controls - so they stay out
+    /// of the window's resize border.
+    ///
+    /// Surfaces, rules and backgrounds still run flush to the window edge;
+    /// only what a press could land on is inset. The window controls' header,
+    /// the status bar, the workspace strip while nothing is docked beside it
+    /// and the docked inspector each apply it themselves.
+    pub(super) fn trailing_edge_inset(&self) -> f32 {
+        self.window_edge_inset()
     }
 
     /// The window width left to the interface beside the resize border.
@@ -16607,11 +16615,7 @@ impl Application for Cagents {
                 let Some(card) = self.workspace.focused() else {
                     return Task::none();
                 };
-                let Some(width) = self
-                    .workspace
-                    .card(card)
-                    .map(|card| card.width.next_preset())
-                else {
+                let Some(width) = self.workspace.next_width_preset(card) else {
                     return Task::none();
                 };
                 match self.workspace.animate_card_width(card, width) {
@@ -16630,11 +16634,11 @@ impl Application for Cagents {
                 }
             }
             Message::ResizeCardFinished(card) => {
-                self.workspace.finish_card_resize(card);
+                let update = self.workspace.finish_card_resize(card);
                 if self.card_state(card).is_some() {
                     self.persist();
                 }
-                Task::none()
+                self.apply_viewport(update, true, DurableChange::None)
             }
             Message::CloseCard(_) if self.dirty_repository_close.is_some() => Task::none(),
             Message::CloseCard(id) if matches!(self.cards.get(&id), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation()) => {
@@ -19362,6 +19366,23 @@ impl Application for Cagents {
             )
         };
 
+        // The strip keeps its scrollbars and trailing controls out of the
+        // window's resize border while it is the rightmost surface. The wrapper
+        // is always mounted, so docking the inspector changes only its
+        // padding and never remounts the workspace.
+        let strip_is_rightmost = !matches!(
+            self.context_inspector_mount(),
+            Some(InspectorLayout::Docked)
+        );
+        let workspace: Element<'_, Message> = widget::container(workspace)
+            .padding(Padding::ZERO.right(if strip_is_rightmost {
+                self.trailing_edge_inset()
+            } else {
+                0.0
+            }))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into();
         let workspace = crate::performance::ui_trace::region("workspace", workspace);
         let main_content = self.workspace_chrome(workspace);
 
@@ -19372,7 +19393,10 @@ impl Application for Cagents {
                 .clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH)
                 .min(content_width);
             let progress = self.context_inspector_progress();
-            let visible_width = width * progress;
+            // The panel runs flush to the window edge; the resize border's
+            // share of it is padding inside, not a gap outside.
+            let panel_width = width + self.trailing_edge_inset();
+            let visible_width = panel_width * progress;
             let splitter: Element<'_, Message> = Splitter::new(
                 widget::Id::new("context-inspector.resize-handle"),
                 inspector::RESIZE_HANDLE_NAME,
@@ -19386,7 +19410,8 @@ impl Application for Cagents {
             )
             .default_width(design::INSPECTOR_DEFAULT_WIDTH)
             .into();
-            let pane = crate::interaction::reveal_width(self.context_panel(width), width, progress);
+            let pane =
+                crate::interaction::reveal_width(self.context_panel(width), panel_width, progress);
             match self
                 .context_inspector_mount()
                 .expect("an open contextual inspector with a model has a mount")
@@ -19484,11 +19509,6 @@ impl Application for Cagents {
         .width(Length::Fill)
         .height(Length::Fill)
         .into();
-        // Only the inset changes with the window state, so the tree, and
-        // every scroll offset and focus in it, survives a maximize.
-        let surface: Element<'_, Message> = widget::container(surface)
-            .padding(iced::Padding::ZERO.right(self.window_edge_inset()))
-            .into();
         let switcher = self
             .palette_surface()
             .or_else(|| self.pane_rename_surface())
@@ -24284,6 +24304,88 @@ mod tests {
     }
 
     #[test]
+    fn surfaces_and_rules_reach_a_free_right_edge_while_controls_keep_out_of_its_border() {
+        use cosmic::iced::Size;
+        use cosmic::iced::advanced::{Layout, layout, mouse, widget::Tree};
+        use iced_accessibility::accesskit::Role;
+
+        fn rules(node: &layout::Node, origin: iced::Point, out: &mut Vec<iced::Rectangle>) {
+            let bounds = node.bounds() + iced::Vector::new(origin.x, origin.y);
+            if node.children().is_empty() && bounds.height == design::BORDER_WIDTH {
+                out.push(bounds);
+            }
+            for child in node.children() {
+                rules(child, bounds.position(), out);
+            }
+        }
+
+        let width = 1500.0;
+        let border = design::WINDOW_RESIZE_BORDER;
+        for inspector in [false, true] {
+            let mut app = context_inspector_test_app(true);
+            app.settings.ui_scale = 1.0;
+            app.window_width = width;
+            app.context_inspector_open = inspector;
+            assert_eq!(app.trailing_edge_inset(), border);
+            if inspector {
+                assert_eq!(app.context_inspector_mount(), Some(InspectorLayout::Docked));
+            }
+            let renderer = headless_renderer();
+            let mut element = app.view();
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(width, 900.0)),
+            );
+            let mut found = Vec::new();
+            rules(&node, iced::Point::ORIGIN, &mut found);
+            // Every rule that runs toward the edge reaches it, rather than
+            // stopping where the resize border begins: the header rule of the
+            // rightmost surface and the status bar rule, at least.
+            let toward_edge: Vec<_> = found
+                .iter()
+                .filter(|rule| rule.x + rule.width > width - border - 1.0)
+                .collect();
+            assert!(
+                toward_edge.len() >= 2,
+                "inspector {inspector}: expected the header and status bar rules: {found:?}"
+            );
+            for rule in toward_edge {
+                assert_eq!(
+                    rule.x + rule.width,
+                    width,
+                    "inspector {inspector}: a rule stops short of the window edge: {rule:?}"
+                );
+            }
+            let nodes = element.as_widget().a11y_nodes(
+                Layout::new(&node),
+                &tree,
+                mouse::Cursor::Unavailable,
+            );
+            let controls: Vec<_> = nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .filter(|node| {
+                    matches!(
+                        node.node().role(),
+                        Role::Button | Role::Splitter | Role::ScrollBar | Role::Slider
+                    )
+                })
+                .filter_map(|node| node.node().bounds())
+                .collect();
+            assert!(!controls.is_empty());
+            for bounds in controls {
+                assert!(
+                    bounds.x1 <= f64::from(width - border) + 0.5,
+                    "inspector {inspector}: a control reaches into the resize border: {bounds:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn content_stays_out_of_the_resize_border_of_a_free_right_edge() {
         use cosmic::cctk::sctk::reexports::csd_frame::WindowState;
         use iced::event::{PlatformSpecific, wayland};
@@ -25373,13 +25475,6 @@ mod tests {
             app.nested_modal_focus_target().unwrap().to_string(),
             context_inspector_toggle_id().to_string()
         );
-    }
-
-    #[test]
-    fn column_navigator_appears_only_when_movement_is_possible() {
-        assert!(!should_show_card_navigator(0));
-        assert!(!should_show_card_navigator(1));
-        assert!(should_show_card_navigator(2));
     }
 
     #[test]
@@ -31822,7 +31917,10 @@ mod tests {
             app.card_state_mut(card).unwrap().kind = kind;
             app.card_state_mut(card).unwrap().width_fraction = 0.61;
             app.workspace = Cagents::rebuild_workspace(&app.durable);
-            app.workspace.resize_viewport(900.0);
+            // Wide enough that every preset resolves to a readable width, so
+            // the cycle visits all of them rather than skipping the narrow
+            // ones a smaller strip could not show.
+            app.workspace.resize_viewport(1500.0);
             for fraction in [2.0 / 3.0, 1.0, 1.0 / 3.0, 0.5, 2.0 / 3.0] {
                 let _ = app.update(Message::CyclePaneWidth);
                 let saved = serde_json::to_vec(app.durable.as_ref()).unwrap();
@@ -31835,7 +31933,7 @@ mod tests {
                     app.workspace.card(card).unwrap().width,
                     CardWidth::Fraction(fraction)
                 );
-                assert_eq!(app.workspace.geometry().card(card).unwrap().width(), 900.0);
+                assert_eq!(app.workspace.geometry().card(card).unwrap().width(), 1500.0);
             }
         }
     }
