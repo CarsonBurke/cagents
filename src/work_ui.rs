@@ -33,6 +33,26 @@ const COLUMN_WIDTH: f32 = 280.0;
 const SCOPE_MENU_WIDTH: f32 = 280.0;
 const CARD_MENU_WIDTH: f32 = 264.0;
 
+/// A board card's height before it has been measured: branch, title, facts
+/// and footer at the compact sizes.
+const CARD_ESTIMATE: f32 = 104.0;
+/// A list row's height before it has been measured: title and facts lines.
+const ROW_ESTIMATE: f32 = 54.0;
+
+/// The keys a culled column keeps each card's widget state by.
+fn card_keys(items: &[&Item]) -> Vec<u64> {
+    use std::hash::{Hash, Hasher};
+    items
+        .iter()
+        .map(|item| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            item.project.hash(&mut hasher);
+            item.key.hash(&mut hasher);
+            hasher.finish()
+        })
+        .collect()
+}
+
 /// One card on the board, by what identifies it to the daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CardRef {
@@ -625,13 +645,13 @@ impl State {
             .into()
         } else {
             widget::scrollable(
-                widget::column::with_children(
-                    items
-                        .into_iter()
-                        .map(|item| self.card(item))
-                        .collect::<Vec<_>>(),
+                widget::container(
+                    crate::ui_controls::culled_column(card_keys(&items), move |index| {
+                        self.card(items[index])
+                    })
+                    .spacing(space::S)
+                    .estimate(CARD_ESTIMATE),
                 )
-                .spacing(space::S)
                 .padding(design::with_vertical_rail(Padding::from([0.0, space::XS]))),
             )
             .direction(iced::widget::scrollable::Direction::Vertical(
@@ -657,20 +677,22 @@ impl State {
     }
 
     fn list_view(&self) -> Element<'_, Action> {
-        let rows = self
-            .visible()
-            .map(|item| self.row(item))
-            .collect::<Vec<_>>();
-        if rows.is_empty() {
+        let items = self.visible().collect::<Vec<_>>();
+        if items.is_empty() {
             return self.no_match();
         }
         widget::scrollable(
-            widget::column::with_children(rows)
+            widget::container(
+                crate::ui_controls::culled_column(card_keys(&items), move |index| {
+                    self.row(items[index])
+                })
                 .spacing(space::XS)
-                .padding(design::with_vertical_rail(Padding::from([
-                    space::M,
-                    space::L,
-                ]))),
+                .estimate(ROW_ESTIMATE),
+            )
+            .padding(design::with_vertical_rail(Padding::from([
+                space::M,
+                space::L,
+            ]))),
         )
         .direction(iced::widget::scrollable::Direction::Vertical(
             design::scrollbar(),
