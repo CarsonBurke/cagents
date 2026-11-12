@@ -195,9 +195,15 @@ impl Cagents {
         let CardKind::Chat(session) = &self.card_state(card)?.kind else {
             return None;
         };
-        self.sidebar_model
-            .worktree_at(&session.launch.recipe.working_directory)
-            .map(|key| key.canonical_path)
+        let directory = &session.launch.recipe.working_directory;
+        self.lists_worktree(directory).then(|| directory.clone())
+    }
+
+    /// Whether Projects lists a worktree at `path`, so its changes can be
+    /// shown. This runs for each piece of work on every frame, so it reads
+    /// the path index the update keeps rather than scanning every row.
+    fn lists_worktree(&self, path: &std::path::Path) -> bool {
+        self.worktree_paths.lists(path)
     }
 
     /// Whether the Work section has anything to list.
@@ -215,7 +221,7 @@ impl Cagents {
             return WorkSummary::default();
         }
         let here = self.inspected_here();
-        let openable = |path: &std::path::Path| self.sidebar_model.worktree_at(path).is_some();
+        let openable = |path: &std::path::Path| self.lists_worktree(path);
         let work = conversation.work(here.as_deref(), &openable);
         let shown = conversation.shown(&work, here.as_deref(), &openable);
         let height = conversation::height(
@@ -271,7 +277,7 @@ impl Cagents {
     pub(super) fn work_section(&self, summary: &WorkSummary) -> Element<'_, Message> {
         let here = self.inspected_here();
         let conversation = &self.pull_request_inspector.conversation;
-        let openable = |path: &std::path::Path| self.sidebar_model.worktree_at(path).is_some();
+        let openable = |path: &std::path::Path| self.lists_worktree(path);
         let work = conversation.work(here.as_deref(), &openable);
         let list = conversation::view(
             conversation,
@@ -302,7 +308,7 @@ mod tests {
     use crate::work::Relation;
 
     /// A window with a chat card, focused, and a terminal card beside it.
-    fn conversation_app() -> (Cagents, TerminalId, CardId) {
+    pub(super) fn conversation_app() -> (Cagents, TerminalId, CardId) {
         let mut app = super::super::tests::context_inspector_test_app(false);
         let conversation = TerminalId::new();
         let chat = CardState {
@@ -354,7 +360,7 @@ mod tests {
         listed_with(conversation, revision, rows, Vec::new(), first)
     }
 
-    fn listed_with(
+    pub(super) fn listed_with(
         conversation: TerminalId,
         revision: u64,
         rows: &[(u64, Relation)],
@@ -480,6 +486,8 @@ mod tests {
         let (mut app, conversation, _) = conversation_app();
         // Projects lists /repo/main and /repo/fix-sidebar.
         app.sidebar_model = crate::sidebar::tests::panel_model();
+        // As the update that loads Projects does.
+        app.refresh_sidebar_worktree_panes();
         app.sync_pull_request_inspector();
         app.context_sections
             .set_open(context_sections::Section::Workspace, false);
@@ -555,5 +563,121 @@ mod tests {
         app.context_inspector_transition = None;
         assert!(!app.context_inspector_visible());
         assert_eq!(app.inspector_panel_pin(), None);
+    }
+}
+
+/// What the Work section costs a frame in a workspace the size of a
+/// long-lived installation, with the conversation's work in its last
+/// worktrees. The timing run is ignored by default; build it optimized:
+///
+/// ```sh
+/// scripts/cargo-gate test --locked --profile local --no-default-features --features ui \
+///     --lib -- --ignored --nocapture app::pull_request_ui::workload
+/// ```
+#[cfg(test)]
+mod workload {
+    use super::*;
+    use crate::work::{ConversationWorktree, Relation};
+    use std::time::{Duration, Instant};
+
+    const WORKTREES: usize = 3000;
+
+    #[test]
+    #[ignore = "timing workload; run optimized with --ignored --nocapture"]
+    fn work_section_frame_cost() {
+        let (mut app, conversation, _) = super::tests::conversation_app();
+        let paths: Vec<PathBuf> = (0..WORKTREES)
+            .map(|index| PathBuf::from(format!("/w/app-wt/wt-{index}")))
+            .collect();
+        app.sidebar_model
+            .projects
+            .push(crate::sidebar::SidebarProject::new(
+                crate::model::ProjectId::new(),
+                crate::repository::RepositoryId::new(),
+                "app".into(),
+                PathBuf::from("/w/app/.git"),
+                paths
+                    .iter()
+                    .map(|path| {
+                        crate::sidebar::SidebarWorktree::new(
+                            crate::model::WorktreeId::new(),
+                            path.clone(),
+                            Some("feature".into()),
+                            false,
+                            false,
+                            None,
+                            None,
+                            None,
+                        )
+                    })
+                    .collect(),
+                vec![],
+            ));
+        // The chat runs in the last worktree; its work is in the ones before.
+        let chat = app.durable.focused.unwrap();
+        if let Some(card) = Arc::make_mut(&mut app.durable)
+            .cards
+            .iter_mut()
+            .find(|card| card.id == chat)
+            && let CardKind::Chat(session) = &mut card.kind
+        {
+            session.launch.recipe.working_directory = paths[WORKTREES - 1].clone();
+        }
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.index_cards();
+        app.refresh_sidebar_worktree_panes();
+        app.sync_pull_request_inspector();
+        let worktree = |index: usize, pull_request| ConversationWorktree {
+            path: paths[index].clone(),
+            branch: Some(format!("feature/{index}")),
+            by_subagent: false,
+            changed_paths: Some(3),
+            diff: None,
+            pull_request,
+        };
+        let rows: Vec<(u64, Relation)> = (1..=4)
+            .map(|number| (number, Relation::Pushed))
+            .chain((10..30).map(|number| (number, Relation::Mentioned)))
+            .collect();
+        let worktrees = (1..=4)
+            .map(|number| worktree(WORKTREES - 1 - number as usize, Some(number)))
+            .chain([worktree(WORKTREES - 8, None), worktree(WORKTREES - 9, None)])
+            .collect();
+        drop(app.handle_pull_request_ui(super::tests::listed_with(
+            conversation,
+            1,
+            &rows,
+            worktrees,
+            true,
+        )));
+        app.settings.show_mentioned_pull_requests = true;
+        assert_eq!(app.work_summary().count, 6);
+
+        let time = |label: &str, run: &dyn Fn()| {
+            for _ in 0..16 {
+                run();
+            }
+            let mut samples: Vec<Duration> = (0..256)
+                .map(|_| {
+                    let started = Instant::now();
+                    run();
+                    started.elapsed()
+                })
+                .collect();
+            let summary = crate::performance::LatencySummary::from_durations(&mut samples).unwrap();
+            eprintln!(
+                "{label:<24} median {:>9.2?}  p95 {:>9.2?}  worst {:>9.2?}",
+                summary.median, summary.p95, summary.worst
+            );
+        };
+        time("work summary", &|| {
+            drop(std::hint::black_box(app.work_summary()))
+        });
+        time("panel pin (per update)", &|| {
+            drop(std::hint::black_box(app.inspector_panel_pin()))
+        });
+        time("sections view", &|| {
+            drop(std::hint::black_box(app.context_sections_view(360.0)))
+        });
     }
 }
