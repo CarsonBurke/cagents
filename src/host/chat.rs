@@ -595,6 +595,12 @@ fn changed_for_instance(
                 report: report.clone(),
                 observed_at: *observed_at,
             },
+            // Every surface keeps them, whether or not it is showing this
+            // conversation, since it learns of them only as they change.
+            Update::AgentAddresses(addresses) => ServerMessage::ChatAgentAddresses {
+                chat_id: id,
+                addresses: addresses.clone(),
+            },
             _ => continue,
         };
         if let Some(delivery) = clients.get(&client) {
@@ -643,6 +649,22 @@ fn session_snapshot(session: &Session, handle: &Handle) -> Result<ServerResponse
     session.launch.session_id = snapshot.session_id.clone();
     session.native_continuity = snapshot.native_continuity.clone();
     Ok(ServerResponse::ChatAttached { session, snapshot })
+}
+
+/// What a new subscriber is told of how the provider addresses a chat's
+/// subagents, when it knows any.
+pub(super) fn agent_addresses(host: &SharedHost, chat_id: TerminalId) -> Option<ServerMessage> {
+    let handle = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .chats
+        .get(&chat_id)?
+        .handle
+        .clone();
+    // Read outside HostState: a retained actor answers from its last
+    // published metadata, a local one from its own lock.
+    let addresses = handle.agent_addresses();
+    (!addresses.is_empty()).then_some(ServerMessage::ChatAgentAddresses { chat_id, addresses })
 }
 
 fn current_session_snapshot(
@@ -8323,6 +8345,134 @@ done
         assert!(client.list_chats().unwrap().is_empty());
         drop(client);
         server.join().unwrap();
+    }
+
+    /// Every surface showing a conversation hears how the provider addresses
+    /// its subagents as each is learned, and one attaching later is told
+    /// those already known.
+    #[test]
+    fn agent_addresses_reach_every_subscriber_and_each_new_one() {
+        struct Addresser;
+        impl Adapter for Addresser {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Ok(Step {
+                    suppress_current_notification: false,
+                    notification_preview: None,
+                    writes: vec![json!({"tick": true})],
+                    events: Vec::new(),
+                })
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                Ok(Step {
+                    suppress_current_notification: false,
+                    notification_preview: None,
+                    writes: Vec::new(),
+                    events: vec![Event::AgentAddress(chat::AgentAddress {
+                        address: "a1892b93e88999a7d".into(),
+                        subagent: "toolu_relocate".into(),
+                    })],
+                })
+            }
+        }
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new("agent-addresses"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        };
+        let host = Arc::new(crate::host::state::HostLock::new(HostState::new(
+            proof.clone(),
+        )));
+        let chat_id = TerminalId::new();
+        let recipe = LaunchRecipe {
+            unset_environment: Default::default(),
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: std::env::temp_dir(),
+            environment: BTreeMap::new(),
+        };
+        let spec = ProcessSpec::from(&recipe);
+        let mut initial = Step::default();
+        let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
+        let weak = Arc::downgrade(&host);
+        let handle = Handle::start(
+            spec,
+            Box::new(Addresser),
+            initial,
+            store,
+            None,
+            move |update| changed(&weak, chat_id, update),
+        )
+        .unwrap();
+        let queue = {
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            let queue = state.register_client(1);
+            state.chats.insert(
+                chat_id,
+                Record {
+                    execution_instance: uuid::Uuid::nil(),
+                    console_recipe: None,
+                    paired_terminal: None,
+                    session: Session {
+                        native_continuity: Default::default(),
+                        owned_codex_listener: None,
+                        id: chat_id,
+                        launch: chat::Launch {
+                            provider: Provider::Claude,
+                            recipe,
+                            session_id: None,
+                        },
+                        proof: Some(proof),
+                        terminal: None,
+                    },
+                    handle: handle.clone(),
+                    source_process: None,
+                    // Hidden, as most surfaces showing it are.
+                    subscribers: BTreeMap::from([(1, false)]),
+                    observations: BTreeMap::new(),
+                    completion_observed: false,
+                    returning_terminal: false,
+                },
+            );
+            queue
+        };
+        assert!(
+            agent_addresses(&host, chat_id).is_none(),
+            "a conversation that knows none tells a new subscriber nothing"
+        );
+        let (heard, hearing) = crossbeam_channel::unbounded();
+        let reader = thread::spawn({
+            let queue = queue.clone();
+            move || {
+                while let Some(outbound) = queue.pop() {
+                    if let ServerMessage::ChatAgentAddresses { chat_id, addresses } =
+                        outbound.message
+                    {
+                        let _ = heard.send((chat_id, addresses));
+                    }
+                }
+            }
+        });
+        handle.command(Command::Interrupt).unwrap();
+        let expected = vec![chat::AgentAddress {
+            address: "a1892b93e88999a7d".into(),
+            subagent: "toolu_relocate".into(),
+        }];
+        assert_eq!(
+            hearing.recv_timeout(Duration::from_secs(5)).unwrap(),
+            (chat_id, expected.clone())
+        );
+        let Some(ServerMessage::ChatAgentAddresses { addresses, .. }) =
+            agent_addresses(&host, chat_id)
+        else {
+            panic!("a new subscriber is told the addresses known");
+        };
+        assert_eq!(addresses, expected);
+        handle.close().unwrap();
+        queue.close_after_drain();
+        reader.join().unwrap();
     }
 
     #[test]

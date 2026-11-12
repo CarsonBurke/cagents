@@ -57,7 +57,7 @@ pub struct OlderClient {
 /// across an update to this release and keep running its CLI.
 const CANDIDATE_LINE: OlderClient = OlderClient {
     protocol: CANDIDATE_LINE_PROTOCOL,
-    proven_at: 172,
+    proven_at: 173,
     client_requests: 74,
     server_messages: 17,
     server_responses: 40,
@@ -520,6 +520,32 @@ mod tests {
         for protocol in [0, 77, 119, 127, PROTOCOL_VERSION + 1, u16::MAX] {
             assert_eq!(older_client(protocol), None, "{protocol}");
         }
+    }
+
+    /// How a provider addresses a chat's subagents reaches only a client of
+    /// this protocol: no listed older client could decode it, so it is
+    /// withheld rather than sent, and a card there names such an agent only
+    /// as "an agent".
+    #[test]
+    fn a_chats_agent_addresses_are_withheld_from_every_older_client() {
+        let addresses = ServerMessage::ChatAgentAddresses {
+            chat_id: crate::model::TerminalId::new(),
+            addresses: vec![crate::chat::AgentAddress {
+                address: "a1892b93e88999a7d".into(),
+                subagent: "toolu_agent".into(),
+            }],
+        };
+        assert!(!OLDER_CLIENTS.is_empty());
+        for client in OLDER_CLIENTS {
+            assert!(client.protocol < 173);
+            assert!(
+                !client.admits_message(&addresses),
+                "protocol {} clients cannot decode it",
+                client.protocol
+            );
+        }
+        // Appended after every message the oldest listed client knows.
+        assert!(variant_index(&addresses).unwrap() >= CANDIDATE_LINE.server_messages);
     }
 
     #[test]

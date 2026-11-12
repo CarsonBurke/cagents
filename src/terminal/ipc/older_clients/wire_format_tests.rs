@@ -586,3 +586,27 @@ fn lifecycle_proof_detects_variant_positions_and_reachable_payload_changes() {
     variants.push(("unrelated_variant".into(), Some(Fields::Unit)));
     assert!(lifecycle_differences(&baseline, &changed, &[]).is_empty());
 }
+
+/// How a provider addresses a chat's subagents travels beside its snapshot,
+/// whose layout every admitted update source shares, so neither an older
+/// listed client nor an older source daemon could be sent or send it.
+#[test]
+fn agent_addresses_are_beyond_every_older_recording() {
+    let addresses = ServerMessage::ChatAgentAddresses {
+        chat_id: crate::model::TerminalId::new(),
+        addresses: Vec::new(),
+    };
+    let index = super::variant_index(&addresses).unwrap();
+    assert_eq!(index + 1, variant_count(&traced(), "ServerMessage"));
+    let older = OLDER_CLIENTS
+        .iter()
+        .map(|client| client.protocol)
+        .chain(crate::update::source::current_client_protocols())
+        .filter(|protocol| *protocol < PROTOCOL_VERSION);
+    for protocol in older {
+        assert!(
+            variant_count(&recorded(protocol), "ServerMessage") <= index,
+            "protocol {protocol} already had a message at its position"
+        );
+    }
+}

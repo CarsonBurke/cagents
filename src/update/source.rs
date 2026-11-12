@@ -500,7 +500,7 @@ impl InstalledIdentity {
 /// ShutdownV1 includes preflight, stop and confirmed shutdown; List/BuildInfo
 /// include status reads. StartupState and every nested phase are frozen for
 /// readiness checks on all admitted Current sources. Current-only ChatLimit
-/// cannot arrive from historical sources; the full current-wire recording test
+/// and ChatAgentAddresses cannot arrive from historical sources; the full current-wire recording test
 /// covers that message.
 /// Keep this beside source admission so adding support always runs the proof.
 #[cfg(test)]

@@ -695,6 +695,14 @@ impl Handle {
             Owner::Remote(remote) => remote.state().interrupt_subagents.clone(),
         }
     }
+    /// How the provider addresses the conversation's subagents, where that
+    /// is not by the IDs its snapshot lists them under.
+    pub(crate) fn agent_addresses(&self) -> Vec<chat::AgentAddress> {
+        match &self.0 {
+            Owner::Local(local) => local.agent_addresses(),
+            Owner::Remote(remote) => remote.state().agent_addresses.clone(),
+        }
+    }
     pub(crate) fn title(&self) -> Option<String> {
         match &self.0 {
             Owner::Local(local) => local.title(),
