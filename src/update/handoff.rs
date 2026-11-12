@@ -24,8 +24,14 @@ pub(super) fn wait_daemon_stopped(
             source_answered(source::Client::connect(&paths.socket), &proof)
         },
         stop_empty_contender,
+        SOURCE_EXIT_AFTER_RELEASE,
     )
 }
+
+/// How long a source that released its lease may take to finish exiting.
+/// A daemon unlocks its lease, records its exit and then tears its process
+/// down; successor store maintenance refuses until that process is gone.
+const SOURCE_EXIT_AFTER_RELEASE: Duration = Duration::from_secs(10);
 
 fn source_answered(
     reply: Result<source::Client, crate::control::ControlError>,
@@ -59,6 +65,7 @@ fn wait_with_observers(
     job: &mut UpdateJob,
     mut serving: impl FnMut(&crate::daemon::RuntimePaths) -> bool,
     mut stop_contender: impl FnMut(&crate::daemon::RuntimePaths, i32) -> Result<(), UpdateError>,
+    exit_after_release: Duration,
 ) -> Result<crate::daemon::lease_handoff::LeaseHandoff, UpdateError> {
     use crate::daemon::lease_handoff::{LeaseHandoff, holder_pid};
     use std::sync::mpsc::{self, RecvTimeoutError};
@@ -88,7 +95,7 @@ fn wait_with_observers(
     loop {
         match receiver.recv_timeout(Duration::from_millis(100)) {
             Ok(result) => {
-                return result
+                let lease = result
                     .and_then(|lease| {
                         lease
                             .ok_or_else(|| io::Error::other("daemon lease waiter cancelled").into())
@@ -96,7 +103,18 @@ fn wait_with_observers(
                     .map_err(|error| {
                         eprintln!("Could not acquire daemon descriptor: {error}");
                         invalid(SERVICE_NOT_STOPPED)
-                    });
+                    })?;
+                // The lease is free while the source is still exiting. Hand
+                // it on only once the pinned process has gone, so the
+                // successor's store maintenance never sees a live source.
+                if !source.exited_within(exit_after_release)? {
+                    eprintln!(
+                        "Source {pid} released the daemon descriptor but did not exit within {}s",
+                        exit_after_release.as_secs()
+                    );
+                    return Err(invalid(SERVICE_NOT_STOPPED));
+                }
+                return Ok(lease);
             }
             Err(RecvTimeoutError::Disconnected) => {
                 eprintln!("Daemon descriptor waiter exited unexpectedly");
@@ -285,6 +303,9 @@ json.dump({'pid':os.getpid(), 'proof':json.loads(sys.argv[2])}, lock)
 lock.flush()
 print('ready', flush=True)
 while not Path(sys.argv[3]).exists(): time.sleep(.005)
+# A daemon unlocks its lease before its process finishes exiting.
+fcntl.flock(lock, fcntl.LOCK_UN)
+while Path(sys.argv[3] + '.linger').exists(): time.sleep(.005)
 "#,
                 ])
                 .arg(&paths.lock)
@@ -339,6 +360,7 @@ while not Path(sys.argv[3]).exists(): time.sleep(.005)
             &mut job,
             |_| true,
             |_, _| panic!("the original daemon must not be stopped"),
+            Duration::from_secs(5),
         );
         assert_eq!(result.err().unwrap().to_string(), SOURCE_RESUMED);
         assert!(source_service.0.try_wait().unwrap().is_none());
@@ -347,6 +369,44 @@ while not Path(sys.argv[3]).exists(): time.sleep(.005)
         // still held its lock. Releasing it cannot wake a forgotten contender.
         fs::write(root.path().join("release"), b"exit").unwrap();
         assert!(source_service.0.wait().unwrap().success());
+    }
+
+    #[test]
+    fn lease_is_handed_over_only_after_the_releasing_source_exits() {
+        if !crate::daemon::isolated_handoff_coordinator() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let (paths, mut job) = fixture(root.path());
+        let (mut source_service, source) = service(root.path(), &paths);
+        let linger = root.path().join("release.linger");
+        fs::write(&linger, b"").unwrap();
+        // The source unlocks its lease and keeps running, as a daemon does
+        // while it records its exit and tears its process down.
+        fs::write(root.path().join("release"), b"exit").unwrap();
+        while crate::daemon::HostLease::is_held(&paths).unwrap() {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let finish = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            fs::remove_file(linger).unwrap();
+        });
+        let lease = wait_with_observers(
+            paths.clone(),
+            source,
+            root.path(),
+            &mut job,
+            |_| false,
+            |_, _| panic!("the original daemon must not be stopped"),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        // Successor store maintenance refuses a recorded daemon that is still
+        // running, so the handoff must not complete before the source exits.
+        assert!(source_service.0.try_wait().unwrap().is_some());
+        finish.join().unwrap();
+        assert!(crate::daemon::HostLease::is_held(&paths).unwrap());
+        drop(lease);
     }
 
     #[test]
@@ -368,6 +428,7 @@ while not Path(sys.argv[3]).exists(): time.sleep(.005)
                 true
             },
             |_, _| panic!("the original daemon must not be stopped"),
+            Duration::from_secs(5),
         )
         .unwrap();
         assert!(crate::daemon::HostLease::is_held(&paths).unwrap());
@@ -426,6 +487,7 @@ print(json.dumps({{'ok':True,'command':'daemon.stop','data':{{'outcome':'accepte
                         Ok(Some(cli.with_file_name("cagentsd")))
                     })
                 },
+                Duration::from_secs(5),
             );
             assert_eq!(
                 fs::read_to_string(root.path().join("release.attempts")).unwrap(),
@@ -571,6 +633,9 @@ print(json.dumps({{'ok':True,'command':'daemon.stop','data':{{'outcome':'accepte
                         answered
                     },
                     stop_empty_contender,
+                    // This test process is the pinned source: it releases
+                    // the lock but cannot exit.
+                    Duration::from_millis(200),
                 )
             };
             server.join().unwrap();
@@ -578,8 +643,9 @@ print(json.dumps({{'ok':True,'command':'daemon.stop','data':{{'outcome':'accepte
                 assert_eq!(result.err().unwrap().to_string(), SOURCE_RESUMED);
             } else {
                 // A successful, authenticated Connected for another incarnation
-                // must not be mistaken for the pinned source resuming.
-                drop(result.unwrap());
+                // must not be mistaken for the pinned source resuming. Its
+                // lock was released, but the pinned process never exited.
+                assert_eq!(result.err().unwrap().to_string(), SERVICE_NOT_STOPPED);
             }
             assert_eq!(
                 crate::daemon::HostLease::is_held(&paths).unwrap(),
