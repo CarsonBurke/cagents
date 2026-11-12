@@ -1119,12 +1119,9 @@ fn column_tone(column: Column) -> Toned {
 }
 
 /// Merged work reads as done, apart from work under review.
+/// Landed work takes the tone merged pull requests have everywhere.
 fn merged_color(theme: &Theme) -> iced::Color {
-    design::mix(
-        design::accent_color(theme),
-        design::success_color(theme),
-        0.5,
-    )
+    crate::sidebar::WorktreePullRequestState::Merged.color(theme)
 }
 
 fn empty_lane(column: Column) -> &'static str {
@@ -1184,14 +1181,12 @@ fn status_glyph<'a>(item: &Item) -> Element<'a, Action> {
 pub(crate) fn pull_request_glyph<'a, Message: 'a>(
     pull_request: &crate::work::PullRequest,
 ) -> Element<'a, Message> {
-    match pull_request.state {
-        PullRequestState::Merged => glyph(Icon::MergedPullRequest, merged_color),
-        PullRequestState::Closed => glyph(Icon::ClosedPullRequest, design::destructive_color),
-        PullRequestState::Open if pull_request.draft => {
-            glyph(Icon::PullRequest, design::muted_color)
-        }
-        PullRequestState::Open => glyph(Icon::PullRequest, design::success_color),
-    }
+    crate::ui_controls::pull_request_state_glyph(
+        Some(crate::sidebar::WorktreePullRequestState::from_work(
+            pull_request,
+        )),
+        design::ROW_ICON_SIZE,
+    )
 }
 
 /// What is true of a pull request now: its state, then, while it is open,

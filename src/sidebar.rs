@@ -1259,11 +1259,9 @@ pub fn pull_request_visual(pr: &SidebarPullRequest) -> (widget::icon::Handle, co
 
 /// The glyph a pull request draws. No theme decides it.
 fn pull_request_icon(pr: &SidebarPullRequest) -> widget::icon::Handle {
-    Icon::handle(match pr.state {
-        Some(WorktreePullRequestState::Merged) => Icon::MergedPullRequest,
-        Some(WorktreePullRequestState::Closed) => Icon::ClosedPullRequest,
-        _ => Icon::PullRequest,
-    })
+    pr.state
+        .map_or(Icon::PullRequest, WorktreePullRequestState::icon)
+        .handle()
 }
 
 /// The semantic role that decides a pull request's tone.
@@ -1291,12 +1289,10 @@ fn pull_request_tone(pr: &SidebarPullRequest) -> PullRequestTone {
 
 impl PullRequestTone {
     fn color(self, theme: &cosmic::Theme) -> cosmic::iced::Color {
-        let cosmic = theme.cosmic();
         match self {
-            // Merged is GitHub's purple, which no COSMIC role names.
-            Self::Merged => cosmic::iced::Color::from_rgb8(163, 113, 247),
+            Self::Merged => WorktreePullRequestState::Merged.color(theme),
             Self::Review => design::accent_color(theme),
-            Self::Danger => cosmic.destructive.base.into(),
+            Self::Danger => WorktreePullRequestState::Closed.color(theme),
             Self::Draft | Self::Neutral => design::muted_icon_color(theme),
         }
     }

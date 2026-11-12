@@ -2176,14 +2176,12 @@ impl State {
         };
         let pull_request = &target.pull_request;
         let state = WorktreePullRequestState::from_github(pull_request);
-        let (icon, state_label) = match state {
-            Some(WorktreePullRequestState::Merged) => (Icon::MergedPullRequest, "Merged"),
-            Some(WorktreePullRequestState::Closed) => (Icon::ClosedPullRequest, "Closed"),
-            Some(WorktreePullRequestState::Draft) => (Icon::PullRequest, "Draft"),
-            Some(WorktreePullRequestState::Open) | None => (Icon::PullRequest, "Open"),
-        };
+        let shown = state.unwrap_or(WorktreePullRequestState::Open);
+        let (icon, state_label) = (shown.icon(), shown.label());
         let tone = match state {
-            Some(WorktreePullRequestState::Merged) => design::Tone::Themed(design::accent_color),
+            Some(WorktreePullRequestState::Merged) => {
+                design::Tone::Themed(merged_pull_request_color)
+            }
             Some(WorktreePullRequestState::Closed) => {
                 design::Tone::Themed(design::destructive_color)
             }
@@ -3149,13 +3147,11 @@ pub fn browser_row<'a>(
 ) -> Element<'a, Action> {
     let state = WorktreePullRequestState::from_github(pull_request);
     let checks = CheckStatus::from_checks(&pull_request.check_summaries());
-    let icon = Icon::handle(match state {
-        Some(WorktreePullRequestState::Merged) => Icon::MergedPullRequest,
-        Some(WorktreePullRequestState::Closed) => Icon::ClosedPullRequest,
-        _ => Icon::PullRequest,
-    });
+    let icon = state
+        .map_or(Icon::PullRequest, WorktreePullRequestState::icon)
+        .handle();
     let tone: fn(&cosmic::Theme) -> iced::Color = match (state, checks) {
-        (Some(WorktreePullRequestState::Merged), _) => design::accent_color,
+        (Some(WorktreePullRequestState::Merged), _) => merged_pull_request_color,
         (Some(WorktreePullRequestState::Closed), _) | (_, CheckStatus::Failing) => {
             design::destructive_color
         }
@@ -5744,4 +5740,9 @@ mod browser_window_tests {
         assert_eq!(browser_row_window(10_000, f32::MAX, 480.0).end, 10_000);
         assert!(browser_row_window(0, 10.0, 480.0).is_empty());
     }
+}
+
+/// Merged pull requests take the one tone every list gives them.
+fn merged_pull_request_color(theme: &cosmic::Theme) -> iced::Color {
+    WorktreePullRequestState::Merged.color(theme)
 }
