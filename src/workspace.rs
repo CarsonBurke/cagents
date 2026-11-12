@@ -188,15 +188,35 @@ impl CardGeometry {
     }
 }
 
+/// How far two panes' widths may overshoot the viewport and still count as
+/// fitting it side by side, absorbing fractions such as 1/2 + 1/2 rounding up.
+const WIDTH_TOLERANCE: f32 = 0.5;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct StripGeometry {
     cards: Vec<CardGeometry>,
     prefix_ends: Vec<f32>,
     total_width: f32,
+    /// Panes drawn across the viewport although they prefer to be narrower.
+    filled: Vec<CardId>,
 }
 
 impl StripGeometry {
     pub fn build(cards: &[WorkspaceCard], viewport_width: f32, config: WorkspaceConfig) -> Self {
+        Self::build_holding(cards, viewport_width, config, None)
+    }
+
+    /// Builds the strip, keeping the panes in `held` filled and every other
+    /// pane at its own width, instead of deciding afresh which panes fill.
+    /// A resize gesture holds the decision it started with, so dragging one
+    /// divider never makes a neighbour jump between its width and the
+    /// viewport's halfway through the drag.
+    fn build_holding(
+        cards: &[WorkspaceCard],
+        viewport_width: f32,
+        config: WorkspaceConfig,
+        held: Option<&HashSet<CardId>>,
+    ) -> Self {
         let viewport_width = finite_nonnegative(viewport_width);
         let mut cursor = config.leading_padding;
         let mut geometry = Vec::with_capacity(cards.len());
@@ -206,11 +226,40 @@ impl StripGeometry {
             - config.trailing_padding
             - config.gap * cards.len().saturating_sub(1) as f32)
             .max(0.0);
-        let preferred_total = cards
+        let preferred: Vec<f32> = cards
             .iter()
             .map(|card| card.width.resolve(viewport_width, config.width_limits))
-            .sum::<f32>();
+            .collect();
+        let preferred_total = preferred.iter().sum::<f32>();
         let expand = cards.len() > 1 && preferred_total > 0.0 && preferred_total < available;
+        // Panes that overflow the viewport scroll. A pane too narrow to read
+        // there, which cannot share the viewport whole with either neighbour,
+        // fills the viewport instead: the strip then pages one pane at a time
+        // rather than resting with that pane beside the start of one laid out
+        // wider than the part of it that shows. Narrow panes that pair up,
+        // such as three half-width terminals, keep their widths and page two
+        // at a time. Stored preferences are untouched, so the narrow width
+        // returns once everything fits again.
+        let overflow = cards.len() > 1 && preferred_total > available;
+        let readable = config.width_limits.minimum.min(available);
+        let inner = (viewport_width - config.leading_padding - config.trailing_padding).max(0.0);
+        let pairs = |index: usize, other: Option<usize>| {
+            other
+                .and_then(|other| preferred.get(other))
+                .is_some_and(|other| {
+                    preferred[index] + config.gap + other <= inner + WIDTH_TOLERANCE
+                })
+        };
+        let fills = |index: usize| match held {
+            Some(held) => held.contains(&cards[index].id),
+            None => {
+                overflow
+                    && preferred[index] < readable
+                    && !pairs(index, index.checked_sub(1))
+                    && !pairs(index, Some(index + 1))
+            }
+        };
+        let mut filled = Vec::new();
 
         for (index, card) in cards.iter().enumerate() {
             let start = cursor;
@@ -219,10 +268,12 @@ impl StripGeometry {
             } else if expand {
                 // Fill spare space proportionally without changing the user's
                 // preferences. Adding another pane can restore those widths.
-                card.width.resolve(viewport_width, config.width_limits) / preferred_total
-                    * available
+                preferred[index] / preferred_total * available
+            } else if fills(index) {
+                filled.push(card.id);
+                available
             } else {
-                card.width.resolve(viewport_width, config.width_limits)
+                preferred[index]
             };
             let end = if expand && index + 1 == cards.len() {
                 // Absorb rounding at the outer edge, avoiding a fractional
@@ -256,6 +307,7 @@ impl StripGeometry {
             cards: geometry,
             prefix_ends,
             total_width,
+            filled,
         }
     }
 
@@ -311,6 +363,50 @@ impl StripGeometry {
             current_offset.clamp(lowest, card.start)
         };
         Some(target.clamp(0.0, self.max_offset(viewport_width)))
+    }
+
+    /// Where the camera comes to rest when `id` takes focus: as near the
+    /// [minimal movement](Self::focus_offset) as it can be without showing
+    /// part of a pane.
+    ///
+    /// Moving as little as possible can rest with a neighbour cut at the
+    /// viewport edge: a half-width pane focused between its partner and a
+    /// full-width pane shows half of a page laid out for the whole strip.
+    /// Where some offset shows the focused pane and only whole panes beside
+    /// it, the nearest such offset wins; panes whose widths cannot tile the
+    /// viewport keep the minimal movement. A viewport reflow keeps using
+    /// [`Self::focus_offset`], so resizing the window never snaps the strip.
+    pub fn rest_offset(&self, id: CardId, viewport_width: f32, current_offset: f32) -> Option<f32> {
+        let target = self.focus_offset(id, viewport_width, current_offset)?;
+        let card = self.card(id)?;
+        let viewport_width = finite_nonnegative(viewport_width);
+        let max_offset = self.max_offset(viewport_width);
+        if !self.cuts_a_pane(target, viewport_width) {
+            return Some(target);
+        }
+        let window = self.intersecting_range(
+            (card.end - viewport_width).max(0.0),
+            card.start + viewport_width,
+        );
+        self.cards[window]
+            .iter()
+            .flat_map(|other| [other.start, other.end - viewport_width])
+            .map(|offset| offset.clamp(0.0, max_offset))
+            .filter(|offset| {
+                *offset <= card.start + WIDTH_TOLERANCE
+                    && offset + viewport_width + WIDTH_TOLERANCE >= card.end
+                    && !self.cuts_a_pane(*offset, viewport_width)
+            })
+            .min_by(|a, b| (a - target).abs().total_cmp(&(b - target).abs()))
+            .or(Some(target))
+    }
+
+    /// Whether a viewport at `offset` shows only part of some pane.
+    fn cuts_a_pane(&self, offset: f32, viewport_width: f32) -> bool {
+        let end = offset + viewport_width;
+        self.cards[self.intersecting_range(offset, end)]
+            .iter()
+            .any(|card| card.start < offset - WIDTH_TOLERANCE || card.end > end + WIDTH_TOLERANCE)
     }
 }
 
@@ -639,6 +735,9 @@ pub struct Workspace {
     pending_widget_focus: Option<CardId>,
     pending_close: Option<PendingClose>,
     resize_limits: Option<(CardId, WidthLimits)>,
+    /// The panes a resize gesture keeps filled until it ends; see
+    /// [`StripGeometry::build_holding`].
+    held_fill: Option<HashSet<CardId>>,
     config: WorkspaceConfig,
 }
 
@@ -660,6 +759,7 @@ impl Workspace {
             pending_widget_focus: None,
             pending_close: None,
             resize_limits: None,
+            held_fill: None,
             config,
         })
     }
@@ -756,6 +856,33 @@ impl Workspace {
             visible_width
         }
     }
+    /// The next width preset for `id` that changes how wide it is drawn.
+    ///
+    /// A preset is judged by the width the strip would draw, not the width it
+    /// stores: beside panes that overflow the viewport, a narrow preset fills
+    /// it, so pressing for it would visibly do nothing. When no preset changes
+    /// what is drawn, such as for a lone pane, which always fills, the stored
+    /// preference still advances for when the pane has company.
+    pub fn next_width_preset(&self, id: CardId) -> Option<CardWidth> {
+        let index = *self.card_indices.get(&id)?;
+        let current = self.cards[index].width;
+        let drawn = self.geometry.card(id)?.width();
+        let mut cards = self.cards.clone();
+        let mut next = current.next_preset();
+        for _ in 0..4 {
+            cards[index].width = next;
+            let width = self
+                .build_geometry_for(&cards)
+                .card(id)
+                .map_or(drawn, |card| card.width());
+            if (width - drawn).abs() > WIDTH_TOLERANCE {
+                return Some(next);
+            }
+            next = next.next_preset();
+        }
+        Some(current.next_preset())
+    }
+
     pub fn fractional_width_limits(&self) -> WidthLimits {
         let available = self.viewport_width;
         let maximum = if available > 0.0 {
@@ -788,18 +915,47 @@ impl Workspace {
     }
 
     pub fn begin_card_resize(&mut self, id: CardId) -> WidthLimits {
+        if let Some((resizing, limits)) = self.resize_limits
+            && resizing == id
+        {
+            return limits;
+        }
         let limits = self.card_resize_limits(id);
         self.resize_limits = Some((id, limits));
+        // The neighbours keep whether they fill for the length of the drag;
+        // the dragged pane is drawn at the width it is being given.
+        self.held_fill = Some(
+            self.geometry
+                .filled
+                .iter()
+                .copied()
+                .filter(|card| *card != id)
+                .collect(),
+        );
         limits
     }
 
-    pub fn finish_card_resize(&mut self, id: CardId) {
-        if self
+    /// Ends a resize of `id`. The strip then decides again which panes fill,
+    /// so a neighbour the new width leaves unable to share the viewport fills
+    /// it once the pointer lets go.
+    pub fn finish_card_resize(&mut self, id: CardId) -> ViewportUpdate {
+        if !self
             .resize_limits
             .is_some_and(|(resizing, _)| resizing == id)
         {
-            self.resize_limits = None;
+            return ViewportUpdate::unchanged();
         }
+        self.resize_limits = None;
+        let held = self.held_fill.take();
+        if held.is_some_and(|held| {
+            let filled = self.build_geometry(self.viewport_width).filled;
+            filled.len() == held.len() && filled.iter().all(|card| held.contains(card))
+        }) {
+            return ViewportUpdate::unchanged();
+        }
+        self.rebuild_geometry();
+        self.reveal_focused();
+        self.refresh_visibility(false)
     }
 
     pub fn visibility(&self, id: CardId) -> Option<VisibilityClass> {
@@ -1056,7 +1212,8 @@ impl Workspace {
     }
 
     pub fn commit_close(&mut self, id: CardId) -> Result<ViewportUpdate, WorkspaceError> {
-        self.finish_card_resize(id);
+        // The pane is going, and the close rebuilds the strip below.
+        let _ = self.finish_card_resize(id);
         let pending = self.pending_close.ok_or(WorkspaceError::NoClosePending)?;
         if pending.id != id {
             return Err(WorkspaceError::WrongPendingClose {
@@ -1309,7 +1466,7 @@ impl Workspace {
         let (geometry, target) = if (viewport_width - self.viewport_width).abs() <= f32::EPSILON {
             (self.presentation_geometry(), &self.geometry)
         } else {
-            rebuilt_geometry = StripGeometry::build(&self.cards, viewport_width, self.config);
+            rebuilt_geometry = self.build_geometry(viewport_width);
             (&rebuilt_geometry, &rebuilt_geometry)
         };
         let offset = self
@@ -1391,9 +1548,27 @@ impl Workspace {
         );
     }
 
+    fn build_geometry(&self, viewport_width: f32) -> StripGeometry {
+        StripGeometry::build_holding(
+            &self.cards,
+            viewport_width,
+            self.config,
+            self.held_fill.as_ref(),
+        )
+    }
+
+    fn build_geometry_for(&self, cards: &[WorkspaceCard]) -> StripGeometry {
+        StripGeometry::build_holding(
+            cards,
+            self.viewport_width,
+            self.config,
+            self.held_fill.as_ref(),
+        )
+    }
+
     fn rebuild_geometry(&mut self) {
         self.layout_transition = None;
-        self.geometry = StripGeometry::build(&self.cards, self.viewport_width, self.config);
+        self.geometry = self.build_geometry(self.viewport_width);
         self.visibility_bands = None;
         self.camera
             .clamp(self.geometry.max_offset(self.viewport_width));
@@ -1496,10 +1671,20 @@ impl Workspace {
         let Some(focused) = self.focused else {
             return;
         };
-        if let Some(target) =
-            self.geometry
-                .focus_offset(focused, self.viewport_width, self.camera.target())
-        {
+        // While a splitter is dragged the strip stays under the pointer:
+        // a width that happens to tile the viewport must not swing the
+        // camera to a tidier offset mid-drag. The drag's end reveals again.
+        let offset = if self.resize_limits.is_some() {
+            StripGeometry::focus_offset
+        } else {
+            StripGeometry::rest_offset
+        };
+        if let Some(target) = offset(
+            &self.geometry,
+            focused,
+            self.viewport_width,
+            self.camera.target(),
+        ) {
             self.camera.animate_to(target);
         }
     }
@@ -2281,7 +2466,7 @@ mod tests {
 
     #[test]
     fn the_card_at_the_viewport_edge_follows_the_camera() {
-        let mut filled = workspace_with_widths(&[CardWidth::Fraction(0.5); 4], 800.0);
+        let mut filled = workspace_with_widths(&[CardWidth::Fraction(0.5); 4], 1_000.0);
         let cards: Vec<_> = filled
             .geometry()
             .cards()
@@ -2290,9 +2475,9 @@ mod tests {
             .collect();
         // Unscrolled, the second of four half-width cards meets the edge.
         assert_eq!(filled.card_at_viewport_edge(), Some(cards[1]));
-        filled.camera.jump_to(200.0);
+        filled.camera.jump_to(250.0);
         assert_eq!(filled.card_at_viewport_edge(), None);
-        filled.camera.jump_to(400.0);
+        filled.camera.jump_to(500.0);
         assert_eq!(filled.card_at_viewport_edge(), Some(cards[2]));
 
         let underfilled = workspace_with_widths(&[CardWidth::Fraction(0.3); 2], 800.0);
@@ -2322,6 +2507,140 @@ mod tests {
         assert_eq!(geometry.focus_offset(ids[1], 700.0, 700.0), Some(480.0));
         assert_eq!(geometry.focus_offset(ids[2], 700.0, 260.0), Some(740.0));
         assert_eq!(geometry.focus_offset(ids[0], 700.0, 260.0), Some(0.0));
+    }
+
+    #[test]
+    fn focus_never_rests_on_part_of_a_wide_pane_beside_a_narrow_pair() {
+        for widths in [[1.0, 0.5, 0.5], [0.5, 0.5, 1.0]] {
+            let mut workspace = workspace_with_widths(&widths.map(CardWidth::Fraction), 850.0);
+            let ids: Vec<_> = workspace.order().collect();
+            let geometry = workspace.geometry().clone();
+            // The pair keeps its widths: neither half fills.
+            assert_eq!(
+                ids.iter()
+                    .map(|id| geometry.card(*id).unwrap().width())
+                    .collect::<Vec<_>>(),
+                widths.map(|fraction| fraction * 850.0).to_vec(),
+                "{widths:?}"
+            );
+            // Walk focus across the strip and back; wherever it rests, every
+            // pane in view is whole.
+            let walk = (0..ids.len()).chain((0..ids.len()).rev());
+            for index in walk {
+                workspace.focus(ids[index]).unwrap();
+                workspace.tick(Duration::from_secs(2));
+                let offset = workspace.camera().offset();
+                let geometry = workspace.geometry();
+                for id in &ids {
+                    let card = geometry.card(*id).unwrap();
+                    let shown = (card.end.min(offset + 850.0) - card.start.max(offset)).max(0.0);
+                    assert!(
+                        shown <= 0.5 || (shown - card.width()).abs() <= 0.5,
+                        "{widths:?}: focusing {index} rests at {offset} with {card:?} cut"
+                    );
+                }
+                let focused = geometry.card(ids[index]).unwrap();
+                assert!(focused.start >= offset - 0.5 && focused.end <= offset + 850.5);
+            }
+        }
+    }
+
+    #[test]
+    fn a_drag_through_a_tiling_width_leaves_the_camera_where_it_was() {
+        // Three 500px panes overflow 800px, so focusing the middle one rests
+        // with its neighbour partly shown. Dragging it to 300px would let
+        // [500, 300] tile the viewport; mid-drag the camera stays put.
+        let mut workspace = workspace_with_widths(&[CardWidth::Fixed(500.0); 3], 800.0);
+        let middle = workspace.order().nth(1).unwrap();
+        workspace.focus(middle).unwrap();
+        workspace.tick(Duration::from_secs(2));
+        let before = workspace.camera().target();
+        workspace.begin_card_resize(middle);
+        workspace
+            .set_card_width(middle, CardWidth::Fixed(300.0))
+            .unwrap();
+        workspace.tick(Duration::from_secs(2));
+        let during = workspace.camera().target();
+        let card = workspace.geometry().card(middle).unwrap();
+        assert!(card.start >= during - 0.5 && card.end <= during + 800.5);
+        assert_eq!(
+            during,
+            workspace
+                .geometry()
+                .focus_offset(middle, 800.0, before)
+                .unwrap()
+        );
+        let _ = workspace.finish_card_resize(middle);
+        workspace.tick(Duration::from_secs(2));
+        let rest = workspace.camera().target();
+        assert_eq!(
+            Some(rest),
+            workspace.geometry().rest_offset(middle, 800.0, during)
+        );
+    }
+
+    /// The strip's work on the UI path at a long session's scale: 60 open
+    /// panes of mixed widths in an 850px strip. Each figure is the mean cost
+    /// of one call. Run it optimized:
+    ///
+    /// ```sh
+    /// scripts/cargo-gate test --locked --profile local --no-default-features --features ui \
+    ///     --lib -- --ignored --nocapture workspace::tests::strip_workload
+    /// ```
+    #[test]
+    #[ignore = "timing workload; run optimized with --ignored --nocapture"]
+    fn strip_workload() {
+        use std::time::Instant;
+        const PANES: usize = 60;
+        const ROUNDS: usize = 50;
+        let widths: Vec<_> = (0..PANES)
+            .map(|index| CardWidth::Fraction([1.0, 0.5, 0.5, 1.0 / 3.0, 2.0 / 3.0][index % 5]))
+            .collect();
+        let mut workspace = workspace_with_widths(&widths, 850.0);
+        let ids: Vec<_> = workspace.order().collect();
+        let mean =
+            |start: Instant, calls: usize| start.elapsed().as_secs_f64() * 1e6 / calls as f64;
+
+        let start = Instant::now();
+        for _ in 0..ROUNDS {
+            for id in &ids {
+                workspace.focus(*id).unwrap();
+            }
+        }
+        let focus = mean(start, ROUNDS * PANES);
+
+        let start = Instant::now();
+        let mut presets = 0;
+        for _ in 0..ROUNDS {
+            for id in &ids {
+                presets += usize::from(workspace.next_width_preset(*id).is_some());
+            }
+        }
+        let cycle = mean(start, ROUNDS * PANES);
+        assert_eq!(presets, ROUNDS * PANES);
+
+        let dragged = ids[PANES / 2];
+        workspace.focus(dragged).unwrap();
+        workspace.begin_card_resize(dragged);
+        let start = Instant::now();
+        for step in 0..ROUNDS * 20 {
+            let width = 300.0 + (step % 500) as f32;
+            workspace
+                .set_card_width(dragged, CardWidth::Fixed(width))
+                .unwrap();
+        }
+        let drag = mean(start, ROUNDS * 20);
+
+        let start = Instant::now();
+        for step in 0..ROUNDS * 20 {
+            workspace.resize_viewport(850.0 + (step % 850) as f32);
+        }
+        let reflow = mean(start, ROUNDS * 20);
+
+        eprintln!(
+            "strip workload, {PANES} panes: focus {focus:.2} us, Alt+R preset {cycle:.2} us, \
+             drag step {drag:.2} us, viewport reflow {reflow:.2} us"
+        );
     }
 
     /// Full-width cycling sized a pane to the viewport, where rounding left
@@ -2368,6 +2687,7 @@ mod tests {
             }],
             prefix_ends: vec![end],
             total_width: end + 8.0,
+            filled: Vec::new(),
         };
         assert_eq!(geometry.focus_offset(id, viewport, 0.0), Some(start));
     }
@@ -2610,7 +2930,7 @@ mod tests {
     }
 
     #[test]
-    fn cycled_fractional_columns_use_the_actual_viewport_without_peek_or_width_clamps() {
+    fn cycled_fractional_columns_use_the_actual_viewport_and_fill_it_when_unreadable() {
         let mut workspace = workspace_with_widths(&[CardWidth::Fraction(0.61)], 320.0);
         let id = workspace.focused().unwrap();
         workspace
@@ -2624,13 +2944,140 @@ mod tests {
             for fraction in [2.0 / 3.0, 1.0, 1.0 / 3.0, 0.5, 2.0 / 3.0] {
                 let next = workspace.card(id).unwrap().width.next_preset();
                 workspace.set_card_width(id, next).unwrap();
-                assert!(
-                    (workspace.geometry().card(id).unwrap().width() - viewport * fraction).abs()
-                        < 0.001
-                );
+                // Beside the full-width pane the strip overflows, so a preset
+                // too narrow to read fills it rather than resting half shown.
+                let expected = if viewport * fraction < 480.0_f32.min(viewport) {
+                    viewport
+                } else {
+                    viewport * fraction
+                };
+                assert!((workspace.geometry().card(id).unwrap().width() - expected).abs() < 0.001);
                 assert_eq!(workspace.focused(), Some(id));
             }
         }
+    }
+
+    #[test]
+    fn a_narrow_strip_pages_whole_panes_instead_of_resting_on_half_of_one() {
+        // A 1500px window with the sidebar and the inspector docked leaves an
+        // 850px strip. A chat kept at half width and a pane opened at full
+        // width used to rest as 425px of chat beside the first 425px of an
+        // 850px pane, its text and switches cut off at the strip's edge.
+        let mut workspace =
+            workspace_with_widths(&[CardWidth::Fraction(0.5), CardWidth::Fraction(1.0)], 850.0);
+        let [chat, settings] = [workspace.cards()[0].id, workspace.cards()[1].id];
+        for focused in [chat, settings, chat] {
+            workspace.focus(focused).unwrap();
+            workspace.tick(Duration::from_secs(2));
+            let offset = workspace.camera().offset();
+            for card in workspace.geometry().cards() {
+                let shown = (card.end.min(offset + 850.0) - card.start.max(offset)).max(0.0);
+                assert!(
+                    shown == 0.0 || (shown - card.width()).abs() < 0.5,
+                    "{:?} rests {shown}px of {}px on screen",
+                    card.id,
+                    card.width()
+                );
+            }
+            assert_eq!(workspace.geometry().card(focused).unwrap().width(), 850.0);
+        }
+        // Wide enough for both, each returns to its own width.
+        workspace.resize_viewport(1_700.0);
+        assert_eq!(workspace.geometry().card(chat).unwrap().width(), 850.0);
+        assert_eq!(workspace.cards()[0].width, CardWidth::Fraction(0.5));
+    }
+
+    #[test]
+    fn narrow_panes_that_pair_up_keep_their_widths_when_the_strip_overflows() {
+        // Three half-width terminals in an 850px strip page two at a time;
+        // none of them is cut by the viewport the way a pane beside a
+        // full-width one was.
+        let workspace = workspace_with_widths(&[CardWidth::Fraction(0.5); 3], 850.0);
+        for card in workspace.geometry().cards() {
+            assert_eq!(card.width(), 425.0);
+        }
+        // Four 0.3 panes in a 1000px strip, likewise.
+        let workspace = workspace_with_widths(&[CardWidth::Fraction(0.3); 4], 1_000.0);
+        for card in workspace.geometry().cards() {
+            assert_eq!(card.width(), 300.0);
+        }
+        // A narrow pane between two full-width ones pairs with neither.
+        let workspace = workspace_with_widths(
+            &[
+                CardWidth::Fraction(1.0),
+                CardWidth::Fraction(0.5),
+                CardWidth::Fraction(1.0),
+            ],
+            850.0,
+        );
+        assert_eq!(workspace.geometry().card_at(1).unwrap().width(), 850.0);
+    }
+
+    #[test]
+    fn a_resize_keeps_each_neighbour_filled_or_not_until_it_ends() {
+        // A chat at 0.35 beside a 0.6 pane fits a 1200px strip. Dragging the
+        // pane wider overflows it, which would have made the chat jump to the
+        // full strip under the pointer.
+        let mut workspace = workspace_with_widths(
+            &[CardWidth::Fraction(0.35), CardWidth::Fraction(0.6)],
+            1_200.0,
+        );
+        let [chat, pane] = [workspace.cards()[0].id, workspace.cards()[1].id];
+        let before = workspace.geometry().card(chat).unwrap().width();
+        workspace.begin_card_resize(pane);
+        workspace
+            .set_card_width(pane, CardWidth::Fixed(900.0))
+            .unwrap();
+        // It returns to its own width as the strip stops expanding, but not
+        // to the full strip.
+        assert!(before > 420.0);
+        assert_eq!(workspace.geometry().card(chat).unwrap().width(), 420.0);
+        assert_eq!(workspace.geometry().card(pane).unwrap().width(), 900.0);
+        // Released, the strip decides again: the chat cannot share the strip
+        // with a 900px pane, so it fills it.
+        workspace.finish_card_resize(pane);
+        assert_eq!(workspace.geometry().card(chat).unwrap().width(), 1_200.0);
+    }
+
+    #[test]
+    fn cycling_judges_presets_by_the_width_they_draw() {
+        // The chat is stored at half width but filled beside a full-width
+        // pane. Its next drawn change is 2/3; when nothing would change what
+        // is drawn, as for a lone pane, the stored preference still cycles.
+        let workspace =
+            workspace_with_widths(&[CardWidth::Fraction(0.5), CardWidth::Fraction(1.0)], 850.0);
+        let chat = workspace.cards()[0].id;
+        assert_eq!(
+            workspace.next_width_preset(chat),
+            Some(CardWidth::Fraction(2.0 / 3.0))
+        );
+        let lone = workspace_with_widths(&[CardWidth::Fraction(0.5)], 850.0);
+        let id = lone.cards()[0].id;
+        assert_eq!(
+            lone.next_width_preset(id),
+            Some(CardWidth::Fraction(0.5).next_preset())
+        );
+    }
+
+    #[test]
+    fn cycling_skips_presets_too_narrow_to_read() {
+        let mut workspace =
+            workspace_with_widths(&[CardWidth::Fraction(1.0), CardWidth::Fraction(1.0)], 850.0);
+        let id = workspace.cards()[0].id;
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            let next = workspace.next_width_preset(id).unwrap();
+            workspace.set_card_width(id, next).unwrap();
+            seen.push(workspace.card(id).unwrap().width);
+        }
+        assert_eq!(
+            seen,
+            [
+                CardWidth::Fraction(2.0 / 3.0),
+                CardWidth::Fraction(1.0),
+                CardWidth::Fraction(2.0 / 3.0),
+            ]
+        );
     }
 
     #[test]
@@ -2662,7 +3109,11 @@ mod tests {
         workspace
             .add_card(card(CardWidth::Fraction(1.0)), 3, false)
             .unwrap();
+        // Beside a full-width pane the strip overflows. The 240px pane can
+        // still share the viewport whole with its 120px neighbour, so it
+        // keeps its own width rather than filling the strip.
         assert_eq!(workspace.geometry().cards()[0].width(), 240.0);
+        assert_eq!(workspace.cards()[0].width, CardWidth::Fraction(0.2));
         assert!(workspace.geometry().max_offset(1_200.0) > 0.0);
         workspace.resize_viewport(0.0);
         assert!(
@@ -2873,7 +3324,7 @@ mod tests {
 
     #[test]
     fn focus_navigation_stops_at_edges_and_close_keeps_focus_valid() {
-        let mut workspace = workspace_with_widths(&[CardWidth::Fraction(0.6); 3], 700.0);
+        let mut workspace = workspace_with_widths(&[CardWidth::Fraction(0.6); 3], 900.0);
         let ids: Vec<_> = workspace.order().collect();
         workspace.focus_adjacent(FocusDirection::Left).unwrap();
         assert_eq!(workspace.focused(), Some(ids[0]));
