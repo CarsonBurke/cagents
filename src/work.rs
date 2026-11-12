@@ -569,6 +569,43 @@ pub struct ConversationWorktree {
     pub branch: Option<String>,
     /// Every edit there came from a subagent the conversation started.
     pub by_subagent: bool,
+    /// Uncommitted changed paths, untracked ones included; `None` until the
+    /// worktree's status has been read.
+    #[serde(default)]
+    pub changed_paths: Option<u32>,
+    /// Lines its uncommitted changes to tracked files add and remove.
+    #[serde(default)]
+    pub diff: Option<DiffStat>,
+}
+
+/// Lines a change adds and removes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffStat {
+    pub additions: u64,
+    pub deletions: u64,
+}
+
+/// One check on a pull request's head, as GitHub buckets it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Check {
+    pub name: String,
+    /// The workflow it belongs to, when GitHub names one.
+    pub workflow: String,
+    pub state: CheckState,
+    /// Its details page.
+    pub url: String,
+}
+
+/// Ordered from what most needs attention: a cancelled check leaves its
+/// pull request as unproven as a failing one is broken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckState {
+    Failed,
+    Pending,
+    Cancelled,
+    Passed,
+    Skipped,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -583,6 +620,12 @@ pub struct ConversationPullRequest {
     /// What GitHub last said; `None` until it has answered once.
     pub pull_request: Option<PullRequest>,
     pub observed_at_unix_ms: Option<u64>,
+    /// Lines the pull request adds and removes, when GitHub said.
+    #[serde(default)]
+    pub diff: Option<DiffStat>,
+    /// Its head's checks, failing first, when GitHub listed them.
+    #[serde(default)]
+    pub checks: Vec<Check>,
 }
 
 impl ConversationPullRequest {

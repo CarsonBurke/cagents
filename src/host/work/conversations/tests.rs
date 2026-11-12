@@ -220,10 +220,7 @@ fn the_list_ranks_worked_on_first_and_marks_the_current_branch() {
         (branch(None, "feat"), Relation::Pushed, false),
     ]);
     let mut observed = BTreeMap::new();
-    observed.insert(
-        key("other", 7),
-        observed_now(board::convert(&listed(7, "x", "OPEN"), false)),
-    );
+    observed.insert(key("other", 7), observed_now(&listed(7, "x", "OPEN")));
     let list = assemble(&watched, Some(&facts), &observed, &BTreeMap::new(), None);
     assert_eq!(list.repository, Some(repo("me")));
     assert_eq!(
@@ -345,10 +342,7 @@ fn numbers_appear_only_once_github_says_they_are_pull_requests() {
         ),
     ]);
     let mut observed = BTreeMap::new();
-    observed.insert(
-        key("me", 40),
-        observed_now(board::convert(&listed(40, "x", "OPEN"), false)),
-    );
+    observed.insert(key("me", 40), observed_now(&listed(40, "x", "OPEN")));
     observed.insert(
         key("me", 41),
         Observed {
@@ -766,4 +760,119 @@ fn edited_directories_are_bounded_by_recency() {
             .edited
             .contains_key(&PathBuf::from(format!("/w/app/{}", EDITED_DIRECTORIES + 7)))
     );
+}
+
+#[test]
+fn a_pull_request_row_carries_its_changes_and_every_check_as_it_ended() {
+    let mut found = listed(9, "feat", "OPEN");
+    found.additions = Some(12);
+    found.deletions = Some(3);
+    found.status_check_rollup = serde_json::from_value(serde_json::json!([
+        {"__typename": "CheckRun", "name": "test", "workflowName": "CI",
+         "status": "COMPLETED", "conclusion": "SUCCESS",
+         "detailsUrl": "https://github.com/me/repo/runs/1"},
+        {"__typename": "CheckRun", "name": "docs", "workflowName": "CI",
+         "status": "COMPLETED", "conclusion": "SKIPPED"},
+        {"__typename": "CheckRun", "name": "deploy", "workflowName": "Release",
+         "status": "COMPLETED", "conclusion": "CANCELLED"},
+        {"__typename": "CheckRun", "name": "lint", "workflowName": "CI",
+         "status": "IN_PROGRESS"},
+        {"__typename": "StatusContext", "context": "ci/legacy", "state": "FAILURE",
+         "targetUrl": "https://ci.invalid/1"},
+    ]))
+    .unwrap();
+    let detail = Detail::of(&found);
+    assert_eq!(
+        detail.diff,
+        Some(DiffStat {
+            additions: 12,
+            deletions: 3
+        })
+    );
+    assert_eq!(
+        detail
+            .checks
+            .iter()
+            .map(|check| (check.state, check.workflow.as_str(), check.name.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (CheckState::Failed, "", "ci/legacy"),
+            (CheckState::Pending, "CI", "lint"),
+            (CheckState::Cancelled, "Release", "deploy"),
+            (CheckState::Passed, "CI", "test"),
+            (CheckState::Skipped, "CI", "docs"),
+        ]
+    );
+    // A check without its own page links to the pull request.
+    assert_eq!(detail.checks[1].url, "https://github.com/me/repo/pull/9");
+}
+
+#[test]
+fn an_edited_worktree_counts_its_changed_paths_and_takes_its_measured_lines() {
+    let mut facts = facts("/w/app");
+    let project = facts.project.as_mut().unwrap();
+    let mut local = (**project.local.as_ref().unwrap()).clone();
+    local.worktrees[0].dirty = Some(crate::work::Dirty {
+        paths: 3,
+        conflicted: 0,
+        newest_modified_at_unix_ms: Some(5),
+    });
+    project.local = Some(Arc::new(local));
+    let mut watched = Watched::new();
+    watched.edited_in(PathBuf::from("/w/app/src"), false);
+    watched.edited_in(PathBuf::from("/w/app/.worktrees/feat"), false);
+    let mut list = assemble(
+        &watched,
+        Some(&facts),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        None,
+    );
+    let counted = |list: &ConversationPullRequests| {
+        list.worktrees
+            .iter()
+            .map(|worktree| {
+                (
+                    worktree.path.to_str().unwrap().to_owned(),
+                    (worktree.changed_paths, worktree.diff),
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    // The scan has not read the linked worktree's status yet.
+    assert_eq!(
+        counted(&list),
+        BTreeMap::from([
+            ("/w/app".to_owned(), (Some(3), None)),
+            ("/w/app/.worktrees/feat".to_owned(), (None, None)),
+        ])
+    );
+    let project = facts.project.as_ref().unwrap();
+    let main = &project.local.as_ref().unwrap().worktrees[0];
+    let measured = BTreeMap::from([(
+        PathBuf::from("/w/app"),
+        Measured {
+            fingerprint: Fingerprint::of(main),
+            diff: Some(DiffStat {
+                additions: 7,
+                deletions: 2,
+            }),
+        },
+    )]);
+    with_measured(&mut list, &measured);
+    assert_eq!(
+        counted(&list)["/w/app"],
+        (
+            Some(3),
+            Some(DiffStat {
+                additions: 7,
+                deletions: 2
+            })
+        )
+    );
+    // Any change to its status, such as another edit's time, is a new
+    // fingerprint and so is measured again.
+    let mut edited = main.clone();
+    edited.dirty.as_mut().unwrap().newest_modified_at_unix_ms = Some(6);
+    assert_ne!(Fingerprint::of(&edited), Fingerprint::of(main));
 }

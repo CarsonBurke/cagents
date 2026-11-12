@@ -11732,6 +11732,52 @@
         ]
       ]
     },
+    "cagents::work::Check": {
+      "Struct": [
+        [
+          "name",
+          "Str"
+        ],
+        [
+          "workflow",
+          "Str"
+        ],
+        [
+          "state",
+          {
+            "Container": "cagents::work::CheckState"
+          }
+        ],
+        [
+          "url",
+          "Str"
+        ]
+      ]
+    },
+    "cagents::work::CheckState": {
+      "Enum": [
+        [
+          "failed",
+          "Unit"
+        ],
+        [
+          "pending",
+          "Unit"
+        ],
+        [
+          "cancelled",
+          "Unit"
+        ],
+        [
+          "passed",
+          "Unit"
+        ],
+        [
+          "skipped",
+          "Unit"
+        ]
+      ]
+    },
     "cagents::work::Checks": {
       "Struct": [
         [
@@ -11827,6 +11873,22 @@
           {
             "Option": "U64"
           }
+        ],
+        [
+          "diff",
+          {
+            "Option": {
+              "Container": "cagents::work::DiffStat"
+            }
+          }
+        ],
+        [
+          "checks",
+          {
+            "Seq": {
+              "Container": "cagents::work::Check"
+            }
+          }
         ]
       ]
     },
@@ -11889,6 +11951,32 @@
         [
           "by_subagent",
           "Bool"
+        ],
+        [
+          "changed_paths",
+          {
+            "Option": "U32"
+          }
+        ],
+        [
+          "diff",
+          {
+            "Option": {
+              "Container": "cagents::work::DiffStat"
+            }
+          }
+        ]
+      ]
+    },
+    "cagents::work::DiffStat": {
+      "Struct": [
+        [
+          "additions",
+          "U64"
+        ],
+        [
+          "deletions",
+          "U64"
         ]
       ]
     },
