@@ -31892,7 +31892,10 @@ mod tests {
             app.card_state_mut(card).unwrap().kind = kind;
             app.card_state_mut(card).unwrap().width_fraction = 0.61;
             app.workspace = Cagents::rebuild_workspace(&app.durable);
-            app.workspace.resize_viewport(900.0);
+            // Wide enough that every preset resolves to a readable width, so
+            // the cycle visits all of them rather than skipping the narrow
+            // ones a smaller strip could not show.
+            app.workspace.resize_viewport(1500.0);
             for fraction in [2.0 / 3.0, 1.0, 1.0 / 3.0, 0.5, 2.0 / 3.0] {
                 let _ = app.update(Message::CyclePaneWidth);
                 let saved = serde_json::to_vec(app.durable.as_ref()).unwrap();
@@ -31905,7 +31908,7 @@ mod tests {
                     app.workspace.card(card).unwrap().width,
                     CardWidth::Fraction(fraction)
                 );
-                assert_eq!(app.workspace.geometry().card(card).unwrap().width(), 900.0);
+                assert_eq!(app.workspace.geometry().card(card).unwrap().width(), 1500.0);
             }
         }
     }
