@@ -73,6 +73,7 @@ icons! {
         Channel => "channel",
         ChannelAdd => "channel-add",
         Chat => "chat",
+        CheckRunning => "check-running",
         Checkbox => "checkbox",
         CheckboxChecked => "checkbox-checked",
         CheckboxMixed => "checkbox-mixed",

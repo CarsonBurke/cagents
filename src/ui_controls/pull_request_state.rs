@@ -123,7 +123,7 @@ fn named_glyph<'a, Message: 'a>(
 pub const fn check_state_look(state: CheckState) -> (Icon, fn(&cosmic::Theme) -> Color) {
     match state {
         CheckState::Failed => (Icon::Error, design::destructive_color),
-        CheckState::Pending => (Icon::Loading, design::warning_color),
+        CheckState::Pending => (Icon::CheckRunning, design::warning_color),
         CheckState::Passed => (Icon::Check, design::success_color),
         CheckState::Cancelled => (Icon::Cancel, design::muted_color),
         CheckState::Skipped => (Icon::Minus, design::muted_color),
@@ -225,8 +225,10 @@ pub const fn review_label(review: Review) -> &'static str {
     }
 }
 
-/// How a review decision looks: a comment bubble whose mark says the outcome,
-/// so the three read as one family apart from the checks' marks.
+/// How a review decision looks: a comment bubble, so the three read as one
+/// family apart from the checks' marks. A decision fills the bubble and cuts
+/// its mark out, a check or a cross, heavy enough to read at the compact size;
+/// a review still required leaves the bubble hollow.
 pub const fn review_look(review: Review) -> (Icon, fn(&cosmic::Theme) -> Color) {
     match review {
         Review::Approved => (Icon::ReviewApproved, design::success_color),
@@ -248,6 +250,63 @@ pub fn pull_request_review_glyph<'a, Message: 'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Which pixels a bundled glyph covers when drawn at `size`.
+    fn silhouette(svg: &[u8], size: u32) -> Vec<bool> {
+        let tree = resvg::usvg::Tree::from_data(svg, &resvg::usvg::Options::default())
+            .expect("a bundled glyph parses");
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(size, size).unwrap();
+        let scale = size as f32 / tree.size().width();
+        resvg::render(
+            &tree,
+            resvg::tiny_skia::Transform::from_scale(scale, scale),
+            &mut pixmap.as_mut(),
+        );
+        pixmap
+            .pixels()
+            .iter()
+            .map(|pixel| pixel.alpha() >= 128)
+            .collect()
+    }
+
+    /// Tone alone must not tell these glyphs apart: someone who cannot see
+    /// red from green still reads the decision from the shape, at the
+    /// compact size rows draw them.
+    #[test]
+    fn review_and_running_glyphs_differ_in_shape_at_the_compact_size() {
+        let size = u32::from(design::COMPACT_ICON_SIZE);
+        let glyphs = [
+            (
+                "approved",
+                &include_bytes!("../icons/review-approved.svg")[..],
+            ),
+            (
+                "changes",
+                &include_bytes!("../icons/review-changes.svg")[..],
+            ),
+            (
+                "required",
+                &include_bytes!("../icons/review-required.svg")[..],
+            ),
+            ("running", &include_bytes!("../icons/check-running.svg")[..]),
+        ]
+        .map(|(name, svg)| (name, silhouette(svg, size)));
+        for (index, (name, pixels)) in glyphs.iter().enumerate() {
+            let covered = pixels.iter().filter(|covered| **covered).count();
+            assert!(covered >= 20, "{name} is too faint to read: {covered} px");
+            for (other, other_pixels) in &glyphs[index + 1..] {
+                let differing = pixels
+                    .iter()
+                    .zip(other_pixels)
+                    .filter(|(a, b)| a != b)
+                    .count();
+                assert!(
+                    differing >= 12,
+                    "{name} and {other} differ in only {differing} px at {size} px"
+                );
+            }
+        }
+    }
 
     #[test]
     fn each_state_draws_its_own_glyph() {
