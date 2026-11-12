@@ -9,8 +9,8 @@
 use super::*;
 use crate::design::list;
 use crate::work::{
-    Check, CheckState, ConversationPullRequest, ConversationPullRequests, ConversationWorktree,
-    Relation, TranscriptCoverage,
+    Check, ConversationPullRequest, ConversationPullRequests, ConversationWorktree, Relation,
+    TranscriptCoverage,
 };
 use cosmic::iced::futures::SinkExt;
 
@@ -1150,7 +1150,7 @@ fn tinted_icon<'a>((icon, tone): (Icon, fn(&cosmic::Theme) -> iced::Color)) -> E
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::work::{PullRequest, PullRequestState};
+    use crate::work::{CheckState, PullRequest, PullRequestState};
 
     fn repo(owner: &str) -> GitHubRepoKey {
         GitHubRepoKey::new("github.com", None, owner, "repo").unwrap()
