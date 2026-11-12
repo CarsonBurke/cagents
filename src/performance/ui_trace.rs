@@ -11,7 +11,7 @@
 //! libcosmic chrome and the renderer, so they are not counted. Without the
 //! variable, or in other builds, a scope checks one flag and records nothing.
 
-use cosmic::iced::advanced::widget::{Operation, Tree};
+use cosmic::iced::advanced::widget::{Id, Operation, Tree};
 use cosmic::iced::advanced::{Clipboard, Layout, Shell, Widget, layout, mouse, overlay, renderer};
 use cosmic::iced::{Event, Length, Rectangle, Size, Vector};
 use cosmic::{Element, Renderer, Theme};
@@ -322,6 +322,14 @@ impl<Message> Widget<Message, Theme, Renderer> for Region<'_, Message> {
 
     fn children(&self) -> Vec<Tree> {
         vec![Tree::new(&self.content)]
+    }
+
+    fn id(&self) -> Option<Id> {
+        self.content.as_widget().id()
+    }
+
+    fn set_id(&mut self, id: Id) {
+        self.content.as_widget_mut().set_id(id);
     }
 
     fn diff(&mut self, tree: &mut Tree) {

@@ -2285,13 +2285,57 @@ mod tests {
             Some(Path::new("/admitted"))
         );
 
-        projects.remove(0);
+        let folder_project = projects.remove(0);
         index.refresh(&known, &projects);
         assert_eq!(index.builds, 4, "a removed project rebuilds the index");
         assert_eq!(index.rows(Path::new("/root")), [(repository, shared_row)]);
         assert_eq!(
             index.first_row(Path::new("/root")),
             Some((repository, shared_row))
+        );
+
+        projects.push(folder_project);
+        index.refresh(&known, &projects);
+        assert_eq!(index.builds, 5, "an added project rebuilds the index");
+        assert_eq!(
+            index.first_row(Path::new("/root")),
+            Some((repository, shared_row)),
+            "the first project listing a path owns its attention"
+        );
+        projects.swap(0, 1);
+        index.refresh(&known, &projects);
+        assert_eq!(index.builds, 6, "reordered projects rebuild the index");
+        assert_eq!(
+            index.first_row(Path::new("/root")),
+            Some((folder_key.project_id, folder_key.worktree_id))
+        );
+
+        projects[0].kind = ProjectKind::Git;
+        index.refresh(&known, &projects);
+        assert_eq!(index.builds, 7, "a folder becoming a repository rebuilds");
+        assert_eq!(
+            index.first_row(Path::new("/root")),
+            Some((folder, folder_row)),
+            "without its folder key, the project's own row is first"
+        );
+        projects[1].kind = ProjectKind::Folder;
+        index.refresh(&known, &projects);
+        assert_eq!(index.builds, 8, "a repository becoming a folder rebuilds");
+        let became_folder = projects[1].folder_key().unwrap();
+        assert_eq!(
+            index.first_row(Path::new("/root")),
+            Some((folder, folder_row))
+        );
+        projects.swap(0, 1);
+        index.refresh(&known, &projects);
+        assert_eq!(
+            index.first_row(Path::new("/root")),
+            Some((became_folder.project_id, became_folder.worktree_id)),
+            "a folder's key comes before its rows"
+        );
+        assert_eq!(
+            index.rows(Path::new("/root")),
+            [(repository, shared_row), (folder, folder_row)]
         );
     }
 
