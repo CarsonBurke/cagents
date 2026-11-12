@@ -18,9 +18,7 @@ use crate::{
     design::{self, Tone, space},
     model::TerminalId,
     ui_controls::{Icon, badge, icon_button, placeholder, popover, popover_item},
-    work::{
-        ActivitySource, Board, CheckOutcome, Column, Forge, Item, ItemKey, PullRequestState, Review,
-    },
+    work::{ActivitySource, Board, Column, Forge, Item, ItemKey, PullRequestState},
 };
 
 /// A semantic color, read from the drawing theme.
@@ -1238,49 +1236,27 @@ pub(crate) fn pull_request_glyph<'a, Message: 'a>(
     )
 }
 
-/// What is true of an open pull request now: its checks and review. Its
-/// state is its glyph's to say.
+/// What is true of an open pull request now: its checks and review, as
+/// glyphs whose tooltips say the counts and the decision. Its state is its
+/// leading glyph's to say.
 pub(crate) fn pull_request_badges<'a, Message: 'a>(
     pull_request: &crate::work::PullRequest,
 ) -> Vec<Element<'a, Message>> {
-    let mut badges = Vec::new();
     if pull_request.state != PullRequestState::Open {
-        return badges;
+        return Vec::new();
     }
-    if let Some((label, tone)) = pull_request.checks.and_then(|checks| {
-        checks.outcome().map(|outcome| -> (String, Toned) {
-            match outcome {
-                CheckOutcome::Passing => (format!("✓ {}", checks.passed), design::success_color),
-                CheckOutcome::Pending => (
-                    format!("● {} running", checks.pending),
-                    design::warning_color,
-                ),
-                CheckOutcome::Failing => (
-                    format!("✕ {} failing", checks.failed),
-                    design::destructive_color,
-                ),
-            }
-        })
-    }) {
-        badges.push(badge(label, Tone::Themed(tone)));
-    }
-    badges.extend(pull_request_review_badge(pull_request));
-    badges
-}
-
-/// The review decision of an open pull request, as a pill.
-pub(crate) fn pull_request_review_badge<'a, Message: 'a>(
-    pull_request: &crate::work::PullRequest,
-) -> Option<Element<'a, Message>> {
-    if pull_request.state != PullRequestState::Open {
-        return None;
-    }
-    let (label, tone): (&str, Toned) = match pull_request.review? {
-        Review::Approved => ("Approved", design::success_color),
-        Review::ChangesRequested => ("Changes requested", design::destructive_color),
-        Review::Required => ("Review required", design::muted_color),
-    };
-    Some(badge(label, Tone::Themed(tone)))
+    let size = design::COMPACT_ICON_SIZE;
+    pull_request
+        .checks
+        .and_then(crate::ui_controls::ChecksSummary::of_counts)
+        .map(|summary| crate::ui_controls::checks_glyph(&summary, size))
+        .into_iter()
+        .chain(
+            pull_request
+                .review
+                .map(|review| crate::ui_controls::pull_request_review_glyph(review, size)),
+        )
+        .collect()
 }
 
 fn glyph<'a, Message: 'a>(icon: Icon, tone: Toned) -> Element<'a, Message> {
@@ -1590,6 +1566,172 @@ mod tests {
         // A card that comes back does not reopen its menu.
         watched(&mut state, 4, board(vec![item("feat/board", "cagents")]));
         assert_eq!(state.menu, None);
+    }
+
+    #[test]
+    fn an_open_pull_request_says_its_checks_and_review_as_named_glyphs() {
+        use cosmic::iced::advanced::{Layout, layout, mouse, widget::Tree};
+        let mut pull_request = PullRequest {
+            number: 42,
+            title: "Fix login redirect".into(),
+            url: "https://github.com/o/redact/pull/42".into(),
+            state: PullRequestState::Open,
+            draft: false,
+            head_oid: "a".into(),
+            contains_local_head: true,
+            checks: Some(crate::work::Checks {
+                passed: 10,
+                failed: 2,
+                pending: 0,
+            }),
+            review: Some(crate::work::Review::ChangesRequested),
+            updated_at: String::new(),
+        };
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let described = |pull_request: &PullRequest| {
+            let mut element: Element<'_, ()> =
+                widget::row::with_children(pull_request_badges(pull_request)).into();
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(400.0, 40.0)),
+            );
+            let mut texts = Vec::new();
+            element.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut Texts(&mut texts),
+            );
+            let nodes = element.as_widget().a11y_nodes(
+                Layout::new(&node),
+                &tree,
+                mouse::Cursor::Unavailable,
+            );
+            let names = nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .filter_map(|node| node.node().label().map(str::to_owned))
+                .collect::<Vec<_>>();
+            (names, texts, node.size().height)
+        };
+        let (names, texts, height) = described(&pull_request);
+        assert_eq!(names, ["Checks: 2 failing, 10 passed", "Changes requested"]);
+        assert!(texts.is_empty(), "no words are drawn: {texts:?}");
+        assert_eq!(height, f32::from(design::COMPACT_ICON_SIZE));
+        // A merged pull request's checks and review are history; its state
+        // glyph says all a card needs.
+        pull_request.state = PullRequestState::Merged;
+        assert!(described(&pull_request).0.is_empty());
+
+        struct Texts<'a>(&'a mut Vec<String>);
+        impl iced::advanced::widget::Operation for Texts<'_> {
+            fn traverse(
+                &mut self,
+                operate: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation<()>),
+            ) {
+                operate(self);
+            }
+            fn text(
+                &mut self,
+                _id: Option<&iced::advanced::widget::Id>,
+                _bounds: iced::Rectangle,
+                text: &str,
+            ) {
+                self.0.push(text.to_owned());
+            }
+        }
+    }
+
+    /// One frame of a Work board at a long-lived installation's scale: 600
+    /// cards, every one with an open pull request whose checks and review
+    /// are known, in the board and list layouts. Run it optimized:
+    ///
+    /// ```sh
+    /// scripts/cargo-gate test --locked --profile local --no-default-features --features ui \
+    ///     --lib -- --ignored --nocapture work_ui::tests::board_frame_workload
+    /// ```
+    #[test]
+    #[ignore = "timing workload; run optimized with --ignored --nocapture"]
+    fn board_frame_workload() {
+        use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+        use std::time::{Duration, Instant};
+        const CARDS: usize = 600;
+        const FRAMES: usize = 48;
+        const WARMUP: usize = 8;
+        let reviews = [
+            Some(crate::work::Review::Approved),
+            Some(crate::work::Review::ChangesRequested),
+            Some(crate::work::Review::Required),
+            None,
+        ];
+        let items = (0..CARDS)
+            .map(|index| {
+                let mut item = item(&format!("feature/change-{index}"), "cagents");
+                item.column = [Column::Active, Column::InProgress, Column::InReview][index % 3];
+                item.pull_request = Some(PullRequest {
+                    number: index as u64 + 1,
+                    title: format!("Change number {index}"),
+                    url: format!("https://github.com/o/cagents/pull/{}", index + 1),
+                    state: PullRequestState::Open,
+                    draft: false,
+                    head_oid: "a".into(),
+                    contains_local_head: true,
+                    checks: Some(crate::work::Checks {
+                        passed: 40 + index as u32 % 7,
+                        failed: index as u32 % 3,
+                        pending: index as u32 % 2,
+                    }),
+                    review: reviews[index % reviews.len()],
+                    updated_at: String::new(),
+                });
+                item
+            })
+            .collect();
+        let mut state = State::default();
+        connected(&mut state, 1, board(items));
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let theme = cosmic::Theme::dark();
+        for (name, list) in [("board", false), ("list", true)] {
+            if list {
+                state.update(Action::Layout(Layout::List));
+            }
+            let mut cache = Cache::new();
+            // The view is built lazily inside layout, so building the
+            // interface is where the cards' widgets are made.
+            let mut stages = [Duration::ZERO; 2];
+            for frame in 0..WARMUP + FRAMES {
+                let clock = Instant::now();
+                let mut ui = UserInterface::build(
+                    state.view(),
+                    iced::Size::new(1240.0, 900.0),
+                    std::mem::replace(&mut cache, Cache::new()),
+                    &mut renderer,
+                );
+                let built = clock.elapsed();
+                let clock = Instant::now();
+                ui.draw(
+                    &mut renderer,
+                    &theme,
+                    &iced::advanced::renderer::Style::default(),
+                    iced::mouse::Cursor::Unavailable,
+                );
+                let drawn = clock.elapsed();
+                cache = ui.into_cache();
+                if frame >= WARMUP {
+                    for (stage, took) in stages.iter_mut().zip([built, drawn]) {
+                        *stage += took;
+                    }
+                }
+            }
+            let [build, draw] = stages.map(|stage| stage.as_secs_f64() * 1e3 / FRAMES as f64);
+            eprintln!(
+                "work {name}, {CARDS} cards: view, build and layout {build:.3} ms, \
+                 draw {draw:.3} ms per frame"
+            );
+        }
     }
 
     #[test]

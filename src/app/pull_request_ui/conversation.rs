@@ -759,7 +759,14 @@ fn worked_on_row<'a>(
             if pull_request.state == crate::work::PullRequestState::Open {
                 facts.extend(checks_chip(state, row));
             }
-            facts.extend(crate::work_ui::pull_request_review_badge(pull_request));
+            if pull_request.state == crate::work::PullRequestState::Open
+                && let Some(review) = pull_request.review
+            {
+                facts.push(crate::ui_controls::pull_request_review_glyph(
+                    review,
+                    design::COMPACT_ICON_SIZE,
+                ));
+            }
             if list.forge_error.is_some()
                 && let Some(at) = row.observed_at_unix_ms
                 && list.generated_at_unix_ms.saturating_sub(at) > STALE_AFTER_MS
