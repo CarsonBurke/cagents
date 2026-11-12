@@ -13308,7 +13308,7 @@ mod row_interaction {
             if !(layout.bounds() + translation).intersects(viewport)
                 && !state.overlaid.get()
                 && !state.hovered
-                && !state.focused
+                && !state.focus_within
             {
                 return None;
             }
@@ -20598,6 +20598,14 @@ pub(crate) mod tests {
         assert_eq!(
             redraw(&mut list, &mut tree),
             (0..10).chain([20]).collect::<Vec<_>>()
+        );
+        logs.focus.set(None);
+        list.as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut VisitAll);
+        assert_eq!(
+            redraw(&mut list, &mut tree),
+            (0..10).collect::<Vec<_>>(),
+            "once focus leaves the row, so do its frames"
         );
     }
 
