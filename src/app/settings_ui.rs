@@ -1013,6 +1013,10 @@ fn settings_layout<'a>(
             Message::SettingsSearchChanged(String::new()),
         ));
     }
+    // Whether the page was saved is reported beside whatever names the page:
+    // its title, or in a narrow pane the category picker, so the report never
+    // adds a row that pushes the settings down under the pointer.
+    let mut status = save_status(feedback, invalid.len());
     let navigation: Element<'a, Message> = if narrow {
         let mut rows: Vec<Element<'a, Message>> = vec![search.into()];
         // Search results span every category, so the picker gives its room
@@ -1022,12 +1026,17 @@ fn settings_layout<'a>(
             let selected = SettingsCategory::ALL
                 .iter()
                 .position(|item| *item == category);
+            let picker = crate::ui_controls::field::select(labels, selected, |index| {
+                Message::SelectSettingsCategory(SettingsCategory::ALL[index])
+            })
+            .width(Length::Fill)
+            .into();
             rows.push(
-                crate::ui_controls::field::select(labels, selected, |index| {
-                    Message::SelectSettingsCategory(SettingsCategory::ALL[index])
-                })
-                .width(Length::Fill)
-                .into(),
+                widget::row::with_children(std::iter::once(picker).chain(status.take()))
+                    .spacing(space::S)
+                    .align_y(Alignment::Center)
+                    .width(Length::Fill)
+                    .into(),
             );
         }
         widget::container(
@@ -1126,9 +1135,7 @@ fn settings_layout<'a>(
         );
     }
     // The page title outranks the section titles under it. A narrow page
-    // leaves the category's name to the picker above it, which already says
-    // it, and keeps the row only to report whether the page was saved.
-    let status = save_status(feedback, invalid.len());
+    // leaves the category's name, and its save state, to the picker above it.
     let titled = searching || !narrow;
     let mut header: Vec<Element<'a, Message>> = Vec::new();
     if titled || status.is_some() {
@@ -1703,12 +1710,20 @@ mod keyboard_table_tests {
     /// The focusable controls and the text runs of a settings page laid out
     /// at `width`.
     fn laid_out(category: SettingsCategory, width: f32) -> Focusables {
+        laid_out_with(category, width, None)
+    }
+
+    fn laid_out_with(
+        category: SettingsCategory,
+        width: f32,
+        feedback: Option<&SettingsFeedback>,
+    ) -> Focusables {
         use iced::advanced::{Layout, layout, widget::Tree};
         let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
         let draft = SettingsDraft::from_settings(&AppSettings::default());
         let invalid = HashMap::new();
         let context = SettingsContext {
-            feedback: None,
+            feedback,
             invalid: &invalid,
             pressed_key: None,
             accounts: Vec::new(),
@@ -1735,6 +1750,22 @@ mod keyboard_table_tests {
             .as_widget_mut()
             .operate(&mut tree, Layout::new(&node), &renderer, &mut found);
         found
+    }
+
+    /// Reporting that a change was saved adds no row: the controls stay where
+    /// they were, so a second click on a stepper lands on the same control.
+    #[test]
+    fn saving_does_not_move_the_settings_under_the_pointer() {
+        for width in [400.0, 900.0] {
+            let category = SettingsCategory::Appearance;
+            let unsaved = laid_out_with(category, width, None);
+            let saved = laid_out_with(category, width, Some(&SettingsFeedback::Saved));
+            assert_eq!(unsaved.0, saved.0, "controls moved at {width}");
+            assert!(
+                saved.1.iter().any(|(text, _)| text == "Saved"),
+                "no save report at {width}"
+            );
+        }
     }
 
     /// A wide page is titled with its category; a narrow one leaves that to
