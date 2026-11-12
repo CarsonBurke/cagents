@@ -536,7 +536,7 @@ fn checks_chip<'a>(state: &State, row: &ConversationPullRequest) -> Option<Eleme
         .align_y(Alignment::Center),
     )
     .name(format!("Show the checks of #{}", row.number))
-    .class(crate::ui_controls::control_style(shown, None))
+    .class(crate::ui_controls::outlined_control_style(shown))
     .padding([1.0, space::XS])
     .on_press(Action::ShowChecks(
         (!shown).then(|| (row.repository.clone(), row.number)),
@@ -689,6 +689,9 @@ fn worktree_line<'a>(worktree: &ConversationWorktree, placement: Placement) -> E
         ),
         design::caption(branch.clone())
             .wrapping(iced::widget::text::Wrapping::None)
+            .ellipsize(iced::widget::text::Ellipsize::End(
+                iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+            ))
             .into(),
     ];
     let facts = worktree_facts(worktree, placement);
@@ -703,7 +706,11 @@ fn worktree_line<'a>(worktree: &ConversationWorktree, placement: Placement) -> E
             .wrap(),
     )
     .name(format!("Open worktree {branch}"))
-    .class(crate::ui_controls::control_style(false, None))
+    .class(if placement.openable {
+        crate::ui_controls::outlined_control_style(false)
+    } else {
+        crate::ui_controls::control_style(false, None)
+    })
     .padding([space::XXS, space::XS])
     .on_press_maybe(
         placement
