@@ -478,15 +478,18 @@ pub fn withheld_diagnostics_label(withheld: usize) -> String {
 }
 
 /// Whether the focused editor has anything for the Problems section: a
-/// language server serving it, or diagnostics it reported. A file type with no
-/// server configured has none, and draws no section saying so.
+/// diagnostic, a notice, or a language server that could not start or died.
+/// A healthy server with nothing to report, like a file type with none
+/// configured, draws no section saying so.
 pub fn has_problems(lsp: &LspInspectorContext) -> bool {
     !lsp.diagnostics.is_empty()
         || lsp.notice.is_some()
-        || lsp
-            .status
-            .as_ref()
-            .is_some_and(|status| !matches!(status, LspStatus::Disabled))
+        || lsp.status.as_ref().is_some_and(|status| {
+            matches!(
+                status,
+                LspStatus::Unavailable { .. } | LspStatus::Failed { .. }
+            )
+        })
 }
 
 /// The Problems section's tone: the worst severity reported.
@@ -1200,14 +1203,23 @@ mod tests {
     }
 
     #[test]
-    fn a_quiet_language_server_context_has_no_problems_section() {
+    fn a_quiet_or_healthy_language_server_has_no_problems_section() {
         assert!(!has_problems(&LspInspectorContext::default()));
         assert!(!has_problems(&LspInspectorContext {
             status: Some(LspStatus::Disabled),
             ..LspInspectorContext::default()
         }));
+        for status in [LspStatus::Ready, LspStatus::Starting] {
+            assert!(!has_problems(&LspInspectorContext {
+                status: Some(status),
+                ..LspInspectorContext::default()
+            }));
+        }
         assert!(has_problems(&LspInspectorContext {
-            status: Some(LspStatus::Ready),
+            status: Some(LspStatus::Failed {
+                reason: "exited".into(),
+                stderr_tail: Vec::new(),
+            }),
             ..LspInspectorContext::default()
         }));
     }
