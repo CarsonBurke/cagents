@@ -40,7 +40,10 @@ pub use list_row::{ListRow, list_row, row_label};
 pub use owned::owned;
 pub use placeholder::{Placeholder, placeholder};
 pub use popover::{popover, popover_item};
-pub use pull_request_state::{WorktreePullRequestState, pull_request_state_glyph};
+pub use pull_request_state::{
+    ChecksSummary, WorktreePullRequestState, check_state_glyph, check_state_look, checks_glyph,
+    pull_request_review_glyph, pull_request_state_glyph, review_label, review_look,
+};
 pub use responsive::responsive;
 pub use shrinkable::shrinkable;
 pub use tabs::{ViewTab, nested_view_tabs, view_tab, view_tab_height, view_tabs};
