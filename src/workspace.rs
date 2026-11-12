@@ -1668,10 +1668,20 @@ impl Workspace {
         let Some(focused) = self.focused else {
             return;
         };
-        if let Some(target) =
-            self.geometry
-                .rest_offset(focused, self.viewport_width, self.camera.target())
-        {
+        // While a splitter is dragged the strip stays under the pointer:
+        // a width that happens to tile the viewport must not swing the
+        // camera to a tidier offset mid-drag. The drag's end reveals again.
+        let offset = if self.resize_limits.is_some() {
+            StripGeometry::focus_offset
+        } else {
+            StripGeometry::rest_offset
+        };
+        if let Some(target) = offset(
+            &self.geometry,
+            focused,
+            self.viewport_width,
+            self.camera.target(),
+        ) {
             self.camera.animate_to(target);
         }
     }
@@ -2530,6 +2540,40 @@ mod tests {
                 assert!(focused.start >= offset - 0.5 && focused.end <= offset + 850.5);
             }
         }
+    }
+
+    #[test]
+    fn a_drag_through_a_tiling_width_leaves_the_camera_where_it_was() {
+        // Three 500px panes overflow 800px, so focusing the middle one rests
+        // with its neighbour partly shown. Dragging it to 300px would let
+        // [500, 300] tile the viewport; mid-drag the camera stays put.
+        let mut workspace = workspace_with_widths(&[CardWidth::Fixed(500.0); 3], 800.0);
+        let middle = workspace.order().nth(1).unwrap();
+        workspace.focus(middle).unwrap();
+        workspace.tick(Duration::from_secs(2));
+        let before = workspace.camera().target();
+        workspace.begin_card_resize(middle);
+        workspace
+            .set_card_width(middle, CardWidth::Fixed(300.0))
+            .unwrap();
+        workspace.tick(Duration::from_secs(2));
+        let during = workspace.camera().target();
+        let card = workspace.geometry().card(middle).unwrap();
+        assert!(card.start >= during - 0.5 && card.end <= during + 800.5);
+        assert_eq!(
+            during,
+            workspace
+                .geometry()
+                .focus_offset(middle, 800.0, before)
+                .unwrap()
+        );
+        let _ = workspace.finish_card_resize(middle);
+        workspace.tick(Duration::from_secs(2));
+        let rest = workspace.camera().target();
+        assert_eq!(
+            Some(rest),
+            workspace.geometry().rest_offset(middle, 800.0, during)
+        );
     }
 
     /// Full-width cycling sized a pane to the viewport, where rounding left
