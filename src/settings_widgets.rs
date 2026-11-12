@@ -47,11 +47,17 @@ impl<'a, Message: Clone + 'a> Setting<'a, Message> {
         )
     }
 
+    /// Label, control, error and description, at the fixed distances
+    /// [`design::rhythm`] sets between those roles.
     fn view(self, query: &str) -> Element<'a, Message> {
+        use design::rhythm;
+        let gap = |height: f32| -> Element<'a, Message> {
+            iced::widget::Space::new().height(height).into()
+        };
         let mut children = Vec::new();
         if !self.label_in_control {
             children.push(if query.trim().is_empty() {
-                design::heading(self.label).into()
+                design::heading(self.label).width(Length::Fill).into()
             } else {
                 highlighted(
                     self.label.to_owned(),
@@ -61,27 +67,30 @@ impl<'a, Message: Clone + 'a> Setting<'a, Message> {
                     design::LINE_BODY,
                 )
             });
+            children.push(gap(rhythm::LABEL_TO_CONTROL));
         }
         children.push(self.control);
+        // A switch carries its label on its own line, so what follows reads
+        // as the label's description; under a control below its label it
+        // reads as the control's.
+        let after_control = if self.label_in_control {
+            rhythm::LABEL_TO_DESCRIPTION
+        } else {
+            rhythm::LABEL_TO_CONTROL
+        };
         if let Some(error) = self.error {
+            children.push(gap(after_control));
             children.push(
-                design::caption(error)
+                design::description(error)
                     .class(cosmic::theme::Text::Custom(design::destructive_text))
-                    .wrapping(iced::widget::text::Wrapping::Word)
-                    .width(Length::Fill)
                     .into(),
             );
         }
         if !self.detail.is_empty() {
-            children.push(
-                design::caption(self.detail)
-                    .wrapping(iced::widget::text::Wrapping::Word)
-                    .width(Length::Fill)
-                    .into(),
-            );
+            children.push(gap(after_control));
+            children.push(design::description(self.detail).into());
         }
         widget::column::with_children(children)
-            .spacing(space::XS)
             .width(Length::Fill)
             .into()
     }
@@ -171,6 +180,7 @@ pub struct Group<'a, Message> {
     detail: &'static str,
     settings: Vec<Setting<'a, Message>>,
     compact: bool,
+    untitled: bool,
 }
 
 pub fn group<'a, Message>(
@@ -183,6 +193,7 @@ pub fn group<'a, Message>(
         detail,
         settings,
         compact: false,
+        untitled: false,
     }
 }
 
@@ -192,14 +203,33 @@ impl<'a, Message: Clone + 'a> Group<'a, Message> {
         self
     }
 
+    /// Where a search result sits: the category, then the group unless the
+    /// group is named after it, which would read "Editor > Editor".
     pub fn breadcrumb(&self, category: &str) -> String {
-        format!("{category} > {}", self.title)
+        if self.title == category {
+            category.to_owned()
+        } else {
+            format!("{category} > {}", self.title)
+        }
+    }
+
+    /// Leaves the title and description to the page, for a page whose own
+    /// title already names this, its only group. Returns the description,
+    /// which the page sets under its title.
+    pub fn untitled(&mut self) -> &'static str {
+        self.untitled = true;
+        self.detail
+    }
+
+    pub fn title(&self) -> &'static str {
+        self.title
     }
 
     pub fn view(self, category: &str, query: &str) -> Option<Element<'a, Message>> {
+        use design::rhythm;
         let breadcrumb = self.breadcrumb(category);
         let context = format!("{category} {} {}", self.title, self.detail);
-        let mut settings: Vec<_> = self
+        let settings: Vec<_> = self
             .settings
             .into_iter()
             .filter(|setting| setting.matches(&context, query))
@@ -208,34 +238,45 @@ impl<'a, Message: Clone + 'a> Group<'a, Message> {
         if settings.is_empty() {
             return None;
         }
-        let mut heading: Vec<Element<'a, Message>> = vec![if query.trim().is_empty() {
-            design::title(self.title).into()
-        } else {
-            highlighted(
+        let searching = !query.trim().is_empty();
+        let mut heading: Vec<Element<'a, Message>> = Vec::new();
+        if searching {
+            heading.push(highlighted(
                 breadcrumb,
                 query,
                 design::title_font(),
                 design::TEXT_TITLE,
                 design::LINE_TITLE,
-            )
-        }];
-        if !self.detail.is_empty() {
-            heading.push(
-                design::caption(self.detail)
-                    .wrapping(iced::widget::text::Wrapping::Word)
+            ));
+        } else if !self.untitled {
+            heading.push(design::title(self.title).width(Length::Fill).into());
+        }
+        if !self.detail.is_empty() && (searching || !self.untitled) {
+            if !heading.is_empty() {
+                heading.push(
+                    iced::widget::Space::new()
+                        .height(rhythm::TITLE_TO_DESCRIPTION)
+                        .into(),
+                );
+            }
+            heading.push(design::description(self.detail).into());
+        }
+        let mut children = Vec::with_capacity(settings.len() + 1);
+        if !heading.is_empty() {
+            children.push(
+                widget::column::with_children(heading)
                     .width(Length::Fill)
                     .into(),
             );
         }
-        let mut children = vec![
-            widget::column::with_children(heading)
-                .spacing(space::XS)
-                .into(),
-        ];
-        children.append(&mut settings);
+        children.extend(settings);
         Some(
             widget::column::with_children(children)
-                .spacing(if self.compact { space::XS } else { space::L })
+                .spacing(if self.compact {
+                    space::XS
+                } else {
+                    rhythm::ITEM_TO_ITEM
+                })
                 .width(Length::Fill)
                 .into(),
         )
@@ -259,8 +300,14 @@ pub fn toggle_enabled<'a, Message: Clone + 'static>(
     enabled: bool,
     on_toggle: impl Fn(bool) -> Message + 'a,
 ) -> Setting<'a, Message> {
+    // The switch's label is a setting label like any other, so it takes the
+    // label role rather than the toggler's regular-weight default.
     let control = crate::ui_controls::field::toggle(value)
         .label(label.to_owned())
+        .font(design::heading_font())
+        .text_line_height(iced::widget::text::LineHeight::Absolute(
+            design::LINE_BODY.into(),
+        ))
         .spacing(space::M)
         .width(Length::Fill)
         .on_toggle_maybe(enabled.then_some(on_toggle))
@@ -351,7 +398,15 @@ mod tests {
                     &renderer,
                     &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 600.0)),
                 );
-                assert_eq!(node.children().len(), 2, "one control row and its detail");
+                assert_eq!(
+                    node.children().len(),
+                    3,
+                    "one control row, the rhythm gap and its detail"
+                );
+                assert_eq!(
+                    node.children()[1].size().height,
+                    design::rhythm::LABEL_TO_DESCRIPTION
+                );
                 assert_eq!(node.size().width, width);
                 let switch = &node.children()[0];
                 let label = &switch.children()[0];
@@ -498,8 +553,11 @@ mod tests {
 
     #[test]
     fn results_carry_category_and_group() {
-        let group = group::<()>("Font", "", vec![]);
-        assert_eq!(group.breadcrumb("Editor"), "Editor > Font");
+        let font = group::<()>("Font", "", vec![]);
+        assert_eq!(font.breadcrumb("Editor"), "Editor > Font");
+        // A group named after its category is not named twice.
+        let named_after = group::<()>("Editor", "", vec![]);
+        assert_eq!(named_after.breadcrumb("Editor"), "Editor");
     }
 
     #[test]

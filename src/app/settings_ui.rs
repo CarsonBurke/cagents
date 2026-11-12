@@ -908,43 +908,17 @@ fn category_button<'a>(
     selected: SettingsCategory,
     refused: bool,
 ) -> Element<'a, Message> {
-    let mut row = vec![
-        settings_icon(category_icon(item)).into(),
-        // One line, cut short in a pane too narrow for the full
-        // label; the button's accessible name keeps all of it.
-        design::body(item.label())
-            .wrapping(cosmic::iced::widget::text::Wrapping::None)
-            .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                cosmic::iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-            ))
-            .width(Length::Fill)
-            .into(),
-    ];
+    let mut row = crate::ui_controls::list_row(Some(category_icon(item)), item.label())
+        .selected(item == selected)
+        .on_press(Message::SelectSettingsCategory(item));
     if refused {
         // Points back to a refused value from wherever the user went next.
-        row.push(refused_marker());
+        row = row.trailing(refused_marker()).name(format!(
+            "{}, has a setting that was not saved",
+            item.label()
+        ));
     }
-    crate::interaction::hover(
-        widget::button::custom(
-            widget::row::with_children(row)
-                .align_y(Alignment::Center)
-                .spacing(space::S),
-        )
-        .name(if refused {
-            Cow::Owned(format!(
-                "{}, has a setting that was not saved",
-                item.label()
-            ))
-        } else {
-            Cow::Borrowed(item.label())
-        })
-        .class(crate::sidebar::sidebar_button_style(item == selected))
-        .selected(item == selected)
-        .on_press(Message::SelectSettingsCategory(item))
-        .padding([space::XS, space::S])
-        .height(design::ROW_HEIGHT)
-        .width(Length::Fill),
-    )
+    row.into()
 }
 
 /// A small dot in the error tone, beside a category holding a refused value.
@@ -987,8 +961,7 @@ fn save_status<'a>(
 /// Card width below which the category rail folds above the settings. The
 /// rail needs its own width plus a readable column beside it.
 const RAIL_BREAKPOINT: f32 = 560.0;
-/// Card width below which two category columns no longer fit their labels,
-/// so the picker collapses to a single dropdown under the search field.
+/// The width of the category rail beside the settings.
 const RAIL_WIDTH: f32 = 42.0 * design::GRID_UNIT;
 /// How narrow a shortcut's action name may become beside its keys before the
 /// keys move beneath it: room for a short name, such as "Close pane", or about
@@ -1040,6 +1013,10 @@ fn settings_layout<'a>(
             Message::SettingsSearchChanged(String::new()),
         ));
     }
+    // Whether the page was saved is reported beside whatever names the page:
+    // its title, or in a narrow pane the category picker, so the report never
+    // adds a row that pushes the settings down under the pointer.
+    let mut status = save_status(feedback, invalid.len());
     let navigation: Element<'a, Message> = if narrow {
         let mut rows: Vec<Element<'a, Message>> = vec![search.into()];
         // Search results span every category, so the picker gives its room
@@ -1049,12 +1026,17 @@ fn settings_layout<'a>(
             let selected = SettingsCategory::ALL
                 .iter()
                 .position(|item| *item == category);
+            let picker = crate::ui_controls::field::select(labels, selected, |index| {
+                Message::SelectSettingsCategory(SettingsCategory::ALL[index])
+            })
+            .width(Length::Fill)
+            .into();
             rows.push(
-                crate::ui_controls::field::select(labels, selected, |index| {
-                    Message::SelectSettingsCategory(SettingsCategory::ALL[index])
-                })
-                .width(Length::Fill)
-                .into(),
+                widget::row::with_children(std::iter::once(picker).chain(status.take()))
+                    .spacing(space::S)
+                    .align_y(Alignment::Center)
+                    .width(Length::Fill)
+                    .into(),
             );
         }
         widget::container(
@@ -1066,6 +1048,9 @@ fn settings_layout<'a>(
         .width(Length::Fill)
         .into()
     } else {
+        // The search field and the rows share one gutter, so the field and
+        // a selected row's highlight span the same width; the scrollbar rail
+        // lives inside the rows' trailing gutter. See `design::list`.
         let categories = widget::scrollable(
             widget::container(
                 widget::column::with_children(
@@ -1073,10 +1058,10 @@ fn settings_layout<'a>(
                         .into_iter()
                         .map(|item| category_button(item, category, refused(item))),
                 )
-                .spacing(space::XS)
+                .spacing(space::XXS)
                 .width(Length::Fill),
             )
-            .padding(design::with_vertical_rail([space::XS, space::S].into()))
+            .padding(design::list::scroll_padding(space::XS))
             .width(Length::Fill),
         )
         .direction(cosmic::iced::widget::scrollable::Direction::Vertical(
@@ -1087,12 +1072,8 @@ fn settings_layout<'a>(
         .height(Length::Fill);
         widget::column::with_children(vec![
             widget::container(search)
-                .padding(iced::Padding {
-                    top: space::M,
-                    right: space::S,
-                    bottom: 0.0,
-                    left: space::S,
-                })
+                .padding(design::list::edge_padding(space::M, 0.0))
+                .width(Length::Fill)
                 .into(),
             categories.into(),
         ])
@@ -1110,6 +1091,7 @@ fn settings_layout<'a>(
         vec![category]
     };
     let mut results = Vec::new();
+    let mut page_description = None;
     for category in categories {
         let filter = if context.pressed_key.is_some()
             || crate::settings_widgets::matches(category.label(), query)
@@ -1118,8 +1100,18 @@ fn settings_layout<'a>(
         } else {
             query
         };
+        let mut groups = settings_category_controls(category, draft, context);
+        // A page with one group of its own name would say it twice, once as
+        // the page title and again, larger, as the section title. Its
+        // description then introduces the page, under the page title.
+        if !searching
+            && let [group] = groups.as_mut_slice()
+            && group.title() == category.label()
+        {
+            page_description = Some(group.untitled()).filter(|detail| !detail.is_empty());
+        }
         results.extend(
-            settings_category_controls(category, draft, context)
+            groups
                 .into_iter()
                 .filter_map(|group| group.view(category.label(), filter)),
         );
@@ -1142,40 +1134,69 @@ fn settings_layout<'a>(
                 .into(),
         );
     }
-    let mut header = vec![
-        design::heading(if searching {
-            "Search results"
+    // The page title outranks the section titles under it. A narrow page
+    // leaves the category's name, and its save state, to the picker above it.
+    let titled = searching || !narrow;
+    let mut header: Vec<Element<'a, Message>> = Vec::new();
+    if titled || status.is_some() {
+        let title: Element<'a, Message> = if titled {
+            design::display(if searching {
+                "Search results"
+            } else {
+                category.label()
+            })
+            .width(Length::Fill)
+            .into()
         } else {
-            category.label()
-        })
-        .width(Length::Fill)
-        .into(),
-    ];
-    header.extend(save_status(feedback, invalid.len()));
-    let header = widget::container(
-        widget::container(
-            widget::row::with_children(header)
+            iced::widget::Space::new().width(Length::Fill).into()
+        };
+        header.push(
+            widget::row::with_children(std::iter::once(title).chain(status))
                 .align_y(Alignment::Center)
                 .spacing(space::S)
-                .width(Length::Fill),
+                .width(Length::Fill)
+                // The height of the search field beside it, so the page
+                // title and the field share one centre line.
+                .height(design::DENSE_ROW_HEIGHT)
+                .into(),
+        );
+    }
+    if let Some(description) = page_description {
+        if !header.is_empty() {
+            header.push(
+                iced::widget::Space::new()
+                    .height(design::rhythm::TITLE_TO_DESCRIPTION)
+                    .into(),
+            );
+        }
+        header.push(design::description(description).into());
+    }
+    let header = (!header.is_empty()).then(|| {
+        widget::container(
+            widget::container(widget::column::with_children(header).width(Length::Fill))
+                .max_width(content_max_width),
         )
-        .max_width(content_max_width),
-    )
-    .padding(iced::Padding {
-        top: space::M,
-        right: gutter,
-        bottom: 0.0,
-        left: gutter,
-    })
-    .width(Length::Fill);
+        .padding(iced::Padding {
+            top: space::M,
+            right: gutter,
+            bottom: 0.0,
+            left: gutter,
+        })
+        .width(Length::Fill)
+    });
     let scroll = widget::scrollable(
         widget::container(
             widget::column::with_children(results)
-                .spacing(5.0 * design::GRID_UNIT)
+                .spacing(design::rhythm::SECTION_TO_SECTION)
                 .width(Length::Fill)
                 .max_width(content_max_width),
         )
-        .padding([space::M, gutter])
+        .padding(iced::Padding {
+            top: design::rhythm::PAGE_TO_SECTION,
+            right: gutter,
+            bottom: space::XL,
+            left: gutter,
+        })
         .width(Length::Fill),
     )
     .direction(cosmic::iced::widget::scrollable::Direction::Vertical(
@@ -1187,7 +1208,7 @@ fn settings_layout<'a>(
     .height(Length::Fill);
     // The title and save state stay put while the page scrolls under them.
     let content: Element<'a, Message> =
-        widget::column::with_children(vec![header.into(), scroll.into()])
+        widget::column::with_children(header.map(Element::from).into_iter().chain([scroll.into()]))
             .width(Length::Fill)
             .height(Length::Fill)
             .into();
@@ -1654,6 +1675,161 @@ mod keyboard_table_tests {
                         node.size().height <= 64.0,
                         "{field:?} atwide table must stay compact: {:?}",
                         node.size()
+                    );
+                }
+            }
+        }
+    }
+
+    /// Focusable controls and their bounds, in traversal order. A text field
+    /// reports itself as focusable too.
+    #[derive(Default)]
+    struct Focusables(Vec<iced::Rectangle>, Vec<(String, iced::Rectangle)>);
+
+    impl iced::advanced::widget::Operation for Focusables {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation)) {
+            visit(self);
+        }
+        fn focusable(
+            &mut self,
+            _: Option<&widget::Id>,
+            bounds: iced::Rectangle,
+            _: &mut dyn iced::advanced::widget::operation::Focusable,
+        ) {
+            self.0.push(bounds);
+        }
+        fn text(&mut self, _: Option<&widget::Id>, bounds: iced::Rectangle, text: &str) {
+            self.1.push((text.to_owned(), bounds));
+        }
+    }
+
+    fn laid_out_settings(category: SettingsCategory, width: f32) -> Vec<iced::Rectangle> {
+        laid_out(category, width).0
+    }
+
+    /// The focusable controls and the text runs of a settings page laid out
+    /// at `width`.
+    fn laid_out(category: SettingsCategory, width: f32) -> Focusables {
+        laid_out_with(category, width, None)
+    }
+
+    fn laid_out_with(
+        category: SettingsCategory,
+        width: f32,
+        feedback: Option<&SettingsFeedback>,
+    ) -> Focusables {
+        use iced::advanced::{Layout, layout, widget::Tree};
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let draft = SettingsDraft::from_settings(&AppSettings::default());
+        let invalid = HashMap::new();
+        let context = SettingsContext {
+            feedback,
+            invalid: &invalid,
+            pressed_key: None,
+            accounts: Vec::new(),
+            updates: update_ui::UpdateSummary {
+                status: String::new(),
+                failed: false,
+                checking: false,
+                can_check: false,
+                available: None,
+                apply_blocker: None,
+                detail: String::new(),
+            },
+            testing_notification: false,
+        };
+        let mut element = settings_layout(category, &draft, "", &context, width);
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 2000.0)),
+        );
+        let mut found = Focusables::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut found);
+        found
+    }
+
+    /// Reporting that a change was saved adds no row: the controls stay where
+    /// they were, so a second click on a stepper lands on the same control.
+    #[test]
+    fn saving_does_not_move_the_settings_under_the_pointer() {
+        for width in [400.0, 900.0] {
+            let category = SettingsCategory::Appearance;
+            let unsaved = laid_out_with(category, width, None);
+            let saved = laid_out_with(category, width, Some(&SettingsFeedback::Saved));
+            assert_eq!(unsaved.0, saved.0, "controls moved at {width}");
+            assert!(
+                saved.1.iter().any(|(text, _)| text == "Saved"),
+                "no save report at {width}"
+            );
+        }
+    }
+
+    /// A wide page is titled with its category; a narrow one leaves that to
+    /// the category picker above it rather than naming the page twice. A
+    /// page whose only group shares its name keeps that group's description,
+    /// set once, above its settings.
+    #[test]
+    fn a_page_names_its_category_once_at_every_width() {
+        let category = SettingsCategory::NativeChat;
+        for (width, titles) in [(900.0, 1), (400.0, 0)] {
+            let texts = laid_out(category, width).1;
+            let display = texts
+                .iter()
+                .filter(|(text, bounds)| {
+                    text == category.label() && bounds.height == design::LINE_DISPLAY
+                })
+                .count();
+            assert_eq!(display, titles, "page titles at {width}");
+            let sections = texts
+                .iter()
+                .filter(|(text, bounds)| {
+                    text == category.label() && bounds.height == design::LINE_TITLE
+                })
+                .count();
+            assert_eq!(sections, 0, "section titled like its page at {width}");
+            let description = texts
+                .iter()
+                .filter(|(text, _)| text.starts_with("Message composition"))
+                .count();
+            assert_eq!(description, 1, "page description at {width}");
+        }
+    }
+
+    #[test]
+    fn category_rows_span_the_search_field_and_share_its_text_column() {
+        let found = laid_out_settings(SettingsCategory::Appearance, 900.0);
+        let search = found[0];
+        assert_eq!(search.x, design::list::GUTTER);
+        let rows: Vec<_> = found
+            .iter()
+            .skip(1)
+            .take(SettingsCategory::ALL.len())
+            .collect();
+        assert_eq!(rows.len(), SettingsCategory::ALL.len());
+        for row in rows {
+            assert_eq!(row.x, search.x, "{row:?} against {search:?}");
+            assert_eq!(row.width, search.width, "{row:?} against {search:?}");
+            assert_eq!(row.height, design::ROW_HEIGHT);
+        }
+        assert_eq!(
+            search.x + search.width,
+            RAIL_WIDTH - design::list::GUTTER,
+            "the field and the rows end one gutter before the rail's edge"
+        );
+    }
+
+    #[test]
+    fn every_control_stays_inside_the_pane_at_every_width() {
+        for category in SettingsCategory::ALL {
+            for width in [320.0, 480.0, 560.0, 720.0, 1200.0] {
+                for bounds in laid_out_settings(category, width) {
+                    assert!(
+                        bounds.x >= 0.0 && bounds.x + bounds.width <= width + 0.5,
+                        "{category:?} at {width}: control {bounds:?} leaves the pane",
                     );
                 }
             }
