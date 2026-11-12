@@ -762,6 +762,71 @@ fn edited_worktrees_are_listed_most_recent_first_and_outside_ones_dropped() {
 }
 
 #[test]
+fn new_work_on_a_merged_pull_request_s_branch_name_is_not_an_edit_of_it() {
+    // `old` headed #2, merged at commit `abc`; a worktree has `old` checked
+    // out again.
+    let facts_at = |oid: &str| {
+        let mut facts = facts("/w/app");
+        let project = facts.project.as_mut().unwrap();
+        let mut local = (**project.local.as_ref().unwrap()).clone();
+        let mut reused = worktree("/w/app/.worktrees/old", "old");
+        reused.head = Some(crate::work::Head {
+            oid: oid.to_owned(),
+            committed_at_unix_ms: None,
+        });
+        local.worktrees.push(reused);
+        project.local = Some(Arc::new(local));
+        facts
+    };
+    let edited = |facts: &Facts| {
+        let mut watched = Watched::new();
+        watched.apply(
+            Scanned {
+                found: vec![transcript::Found {
+                    signal: Signal {
+                        reference: Reference::CurrentBranch {
+                            directory: Some(".worktrees/old/src".to_owned()),
+                        },
+                        relation: Relation::Edited,
+                    },
+                    by_subagent: false,
+                }],
+                coverage: TranscriptCoverage::Complete,
+            },
+            Some(facts),
+        );
+        assemble(
+            &watched,
+            Some(facts),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            None,
+        )
+    };
+
+    // Past the merge, the edit is new work: no #2 row, and the worktree is
+    // listed on its own.
+    let list = edited(&facts_at("def"));
+    assert!(list.pull_requests.iter().all(|row| row.number != 2));
+    assert_eq!(
+        list.worktrees
+            .iter()
+            .map(|worktree| (worktree.path.to_str().unwrap(), worktree.pull_request))
+            .collect::<Vec<_>>(),
+        vec![("/w/app/.worktrees/old", None)]
+    );
+
+    // Still at the merged commit, it is #2's branch.
+    let list = edited(&facts_at("abc"));
+    assert!(
+        list.pull_requests
+            .iter()
+            .any(|row| row.number == 2 && row.relation == Relation::Edited)
+    );
+    assert_eq!(list.worktrees[0].pull_request, Some(2));
+}
+
+#[test]
 fn edited_directories_are_bounded_by_recency() {
     let mut watched = Watched::new();
     for index in 0..EDITED_DIRECTORIES + 8 {

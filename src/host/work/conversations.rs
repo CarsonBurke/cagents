@@ -379,6 +379,41 @@ impl ProjectFacts {
         })
     }
 
+    /// Whether edits made on `branch` are work on its pull request `key`:
+    /// it is open, or a worktree still has `branch` at its head commit. A
+    /// branch name reused after its pull request merged or closed is new
+    /// work, not an edit of that pull request. Unread pull requests keep
+    /// the edit until GitHub says otherwise.
+    fn edits_belong_to(
+        &self,
+        key: &PullRequestKeyOrd,
+        branch: &str,
+        observed: &BTreeMap<PullRequestKeyOrd, Observed>,
+    ) -> bool {
+        let (open, head) = match self.listed(key) {
+            Some(found) => (found.state.0 == "OPEN", found.head_ref_oid.as_str()),
+            None => match observed
+                .get(key)
+                .and_then(|observation| observation.pull_request.as_ref())
+            {
+                Some(found) => (
+                    found.state == crate::work::PullRequestState::Open,
+                    found.head_oid.as_str(),
+                ),
+                None => return true,
+            },
+        };
+        open || self.local.as_deref().is_some_and(|local| {
+            local.worktrees.iter().any(|worktree| {
+                worktree.branch.as_deref() == Some(branch)
+                    && worktree
+                        .head
+                        .as_ref()
+                        .is_some_and(|found| found.oid == head)
+            })
+        })
+    }
+
     /// The worktree containing `directory`, the deepest when they nest.
     fn worktree(&self, directory: &Path) -> Option<&super::scan::Worktree> {
         self.local
@@ -1109,6 +1144,18 @@ fn assemble(
         let Resolved::Key(key) = resolve(reference, facts, branches) else {
             continue;
         };
+        // An edit is pinned to the branch it was made on, whose name may
+        // since head an old pull request rather than the work.
+        if aggregate.relation == Relation::Edited
+            && let Reference::Branch {
+                repository: None,
+                name,
+            } = reference
+            && let Some(project) = project
+            && !project.edits_belong_to(&key, name, observed)
+        {
+            continue;
+        }
         match rows.entry(key) {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert((*aggregate, false));
@@ -1231,6 +1278,9 @@ fn assemble(
                     ) else {
                         return None;
                     };
+                    if !project.edits_belong_to(&key, branch, observed) {
+                        return None;
+                    }
                     pull_requests
                         .iter()
                         .any(|(_, row)| {
