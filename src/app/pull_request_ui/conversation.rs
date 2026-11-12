@@ -850,8 +850,10 @@ fn row_parts<'a>(
                 .as_ref()
                 .map_or_else(|| number.clone(), |pull_request| pull_request.title.clone());
             // Not yet known, a pull request is named by its number already.
-            spoken =
-                state.map(|state| format!("{name}, {}, {number}", state.label().to_lowercase()));
+            // Another repository's name is one of the facts, so the number
+            // read out leaves it off.
+            spoken = state
+                .map(|state| format!("{name}, {}, #{}", state.label().to_lowercase(), row.number));
             (
                 crate::ui_controls::pull_request_state_glyph(state, design::ROW_ICON_SIZE),
                 name,
@@ -1620,6 +1622,18 @@ mod tests {
         assert_eq!(
             row_parts(list, work, &|_| true).described(work, true, true),
             "Change 3, merged, #3, shown below, press to hide its details, Created"
+        );
+
+        // Another repository is named once, among the facts.
+        let mut upstream = row(4, Relation::Reviewed);
+        upstream.repository = repo("upstream");
+        let work = Work::PullRequest {
+            row: &upstream,
+            worktree: None,
+        };
+        assert_eq!(
+            row_parts(list, work, &|_| true).described(work, false, false),
+            "Show Change 4, open, #4, upstream/repo, Reviewed"
         );
 
         let edited = worktree("/repo/notes", None);

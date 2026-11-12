@@ -447,12 +447,13 @@ row ends with a glyph for its checks, the worst of them, and one for its
 review decision, as the board shows them; hover either for the detail.
 Beneath its title, the row gives how many files its worktree has not
 committed yet, the lines it adds and removes, and why it is listed. A PR in
-another repository names that repository beneath its title. When GitHub can't be reached, rows keep their
-last known state and say when it was read.
+another repository names that repository beneath its title. When GitHub can't
+be reached, rows keep their last known state and say when it was read.
 
 The **Changes** and **Files** section below shows one piece of work: its header
-names which while it is collapsed, and its first row once it is open. Choose a row to show it there. Until you do, it shows the
-worktree the conversation runs in, else the first work checked out in Projects.
+names which while it is collapsed, and its first row once it is open. Choose a
+row to show it there. Until you do, it shows the worktree the conversation runs
+in, else the first work checked out in Projects.
 Work whose worktree isn't in Projects says so in place of changes, rather than
 showing another worktree's.
 Choosing work changes only what the inspector shows; the sidebar keeps its
