@@ -5317,6 +5317,7 @@ pub struct Cagents {
     channel_offsets: HashMap<crate::model::ChannelId, f32>,
     worktree_owners: HashMap<CardId, PathBuf>,
     known_worktree_roots: HashSet<PathBuf>,
+    worktree_paths: worktree_ui::WorktreePathIndex,
     workspace_view_generation: u64,
     workspace_scroll_id: widget::Id,
     github_availability: HashMap<ProjectId, GitHubAvailability>,
@@ -14701,6 +14702,7 @@ impl Application for Cagents {
                 .iter()
                 .map(|worktree| worktree.path.clone())
                 .collect(),
+            worktree_paths: worktree_ui::WorktreePathIndex::default(),
             workspace_view_generation: 0,
             workspace_scroll_id: widget::Id::new("workspace-strip-0"),
             github_availability: HashMap::new(),
@@ -30714,6 +30716,7 @@ mod tests {
             worktree_offsets: HashMap::new(),
             worktree_owners: HashMap::new(),
             known_worktree_roots: HashSet::new(),
+            worktree_paths: worktree_ui::WorktreePathIndex::default(),
             workspace_view_generation: 0,
             workspace_scroll_id: widget::Id::new("workspace-strip-0"),
             github_availability: HashMap::new(),

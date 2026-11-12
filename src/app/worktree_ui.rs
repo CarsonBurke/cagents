@@ -1,5 +1,5 @@
 use super::*;
-use crate::model::{Cards, ChannelId};
+use crate::model::{Cards, ChannelId, WorktreeId};
 
 /// Ownership comes from the launch recipe, never a shell's current directory or
 /// OSC title. Component-aware matching also keeps `repo-fix` outside `repo`.
@@ -12,24 +12,162 @@ pub(super) fn worktree_root<'a>(
         .max_by_key(|root| root.components().count())
 }
 
+/// Resolves a directory to the worktree root holding it, a path that lives
+/// as long as `'a` rather than as the resolver.
+pub(super) trait ResolveRoot<'a> {
+    fn resolve(&self, directory: &Path) -> Option<&'a Path>;
+}
+
+/// The nearest root among `directory`'s ancestors, found by looking each up
+/// rather than comparing the directory with every historical checkout.
+fn nearest_root<'a>(
+    directory: &Path,
+    root: impl Fn(&Path) -> Option<&'a Path>,
+) -> Option<&'a Path> {
+    directory
+        .ancestors()
+        .find_map(&root)
+        .or_else(|| root(Path::new("")))
+}
+
 /// Resolve a directory by its ancestors rather than comparing it with every
 /// historical checkout. Built for one immutable workspace projection.
 pub(super) struct WorktreeRoots<'a> {
-    roots: HashMap<&'a Path, &'a Path>,
+    roots: HashSet<&'a Path>,
 }
 
 impl<'a> WorktreeRoots<'a> {
     pub(super) fn new(roots: impl Iterator<Item = &'a Path>) -> Self {
         Self {
-            roots: roots.map(|root| (root, root)).collect(),
+            roots: roots.collect(),
         }
     }
 
     fn resolve(&self, directory: &Path) -> Option<&'a Path> {
-        directory
-            .ancestors()
-            .find_map(|ancestor| self.roots.get(ancestor).copied())
-            .or_else(|| self.roots.get(Path::new("")).copied())
+        nearest_root(directory, |ancestor| self.roots.get(ancestor).copied())
+    }
+}
+
+impl<'a> ResolveRoot<'a> for WorktreeRoots<'a> {
+    fn resolve(&self, directory: &Path) -> Option<&'a Path> {
+        WorktreeRoots::resolve(self, directory)
+    }
+}
+
+/// The worktree rows' paths, indexed for `refresh_sidebar_worktree_panes`,
+/// which runs after nearly every update. Hashing a path walks its components,
+/// so with a long worktree list, building these maps on each pass cost more
+/// than the rest of the update together. They are kept until the known roots
+/// or the rows they were built from change, which comparing ids and path
+/// bytes detects for a small fraction of that cost.
+#[derive(Default)]
+pub(super) struct WorktreePathIndex {
+    /// What the maps were built from, in the order `path_sources` yields it.
+    built_from: Vec<(PathSource, PathBuf)>,
+    /// The known roots and every worktree row's path.
+    roots: HashSet<PathBuf>,
+    /// The first loaded row at each path, which attention is filed under.
+    first_row: HashMap<PathBuf, (ProjectId, WorktreeId)>,
+    /// Every worktree row at each path: a path listed under two projects is a
+    /// row of both.
+    rows: HashMap<PathBuf, Vec<(ProjectId, WorktreeId)>>,
+    #[cfg(test)]
+    builds: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PathSource {
+    Known,
+    Folder(ProjectId, WorktreeId),
+    Worktree(ProjectId, WorktreeId),
+}
+
+fn path_sources<'a>(
+    known: &'a HashSet<PathBuf>,
+    projects: &'a [SidebarProject],
+) -> impl Iterator<Item = (PathSource, &'a Path)> {
+    let known = known.iter().map(|root| (PathSource::Known, root.as_path()));
+    let rows = projects.iter().flat_map(|project| {
+        let folder = project.folder_key().map(|key| {
+            (
+                PathSource::Folder(key.project_id, key.worktree_id),
+                project.repository.as_path(),
+            )
+        });
+        folder
+            .into_iter()
+            .chain(project.worktrees.iter().map(|worktree| {
+                (
+                    PathSource::Worktree(project.id, worktree.id),
+                    worktree.path.as_path(),
+                )
+            }))
+    });
+    known.chain(rows)
+}
+
+impl WorktreePathIndex {
+    /// Rebuilds the maps if the known roots or the rows changed.
+    pub(super) fn refresh(&mut self, known: &HashSet<PathBuf>, projects: &[SidebarProject]) {
+        let unchanged = self
+            .built_from
+            .iter()
+            .map(|(source, path)| (*source, path.as_os_str()))
+            .eq(path_sources(known, projects).map(|(source, path)| (source, path.as_os_str())));
+        if unchanged {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.builds += 1;
+        }
+        self.built_from = path_sources(known, projects)
+            .map(|(source, path)| (source, path.to_owned()))
+            .collect();
+        self.roots.clear();
+        self.first_row.clear();
+        self.rows.clear();
+        for (source, path) in &self.built_from {
+            match *source {
+                PathSource::Known => {
+                    self.roots.insert(path.clone());
+                }
+                PathSource::Folder(project, worktree) => {
+                    self.first_row
+                        .entry(path.clone())
+                        .or_insert((project, worktree));
+                }
+                PathSource::Worktree(project, worktree) => {
+                    self.roots.insert(path.clone());
+                    self.first_row
+                        .entry(path.clone())
+                        .or_insert((project, worktree));
+                    self.rows
+                        .entry(path.clone())
+                        .or_default()
+                        .push((project, worktree));
+                }
+            }
+        }
+    }
+
+    /// The first loaded row, a project folder's or a worktree's, at `path`.
+    fn first_row(&self, path: &Path) -> Option<(ProjectId, WorktreeId)> {
+        self.first_row.get(path).copied()
+    }
+
+    /// Every worktree row at `path`.
+    fn rows(&self, path: &Path) -> &[(ProjectId, WorktreeId)] {
+        self.rows.get(path).map_or(&[], Vec::as_slice)
+    }
+}
+
+impl<'a> ResolveRoot<'a> for &'a WorktreePathIndex {
+    fn resolve(&self, directory: &Path) -> Option<&'a Path> {
+        let index: &'a WorktreePathIndex = self;
+        nearest_root(directory, |ancestor| {
+            index.roots.get(ancestor).map(PathBuf::as_path)
+        })
     }
 }
 
@@ -527,7 +665,9 @@ impl Cagents {
             terminal_output_tests::record_folder_root_refresh();
             self.refresh_worktree_owners(None);
         }
-        let roots = self.indexed_worktree_roots();
+        self.worktree_paths
+            .refresh(&self.known_worktree_roots, &self.sidebar_model.projects);
+        let index = &self.worktree_paths;
         let channeled = self
             .durable
             .channels
@@ -539,37 +679,17 @@ impl Cagents {
             .cards
             .iter()
             .filter(|card| card.existence.is_open() && !channeled.contains(&card.id))
-            .filter_map(|card| self.unchanneled_card_worktree_indexed(card, &roots))
+            .filter_map(|card| self.unchanneled_card_worktree_indexed(card, &index))
             .collect::<HashSet<_>>();
-        let worktrees = self
-            .sidebar_model
-            .projects
+        let worktrees = occupied
             .iter()
-            .flat_map(|project| {
-                project
-                    .worktrees
-                    .iter()
-                    .filter(|worktree| occupied.contains(worktree.path.as_path()))
-                    .map(move |worktree| (project.id, worktree.id))
-            })
+            .flat_map(|path| index.rows(path))
+            .copied()
             .collect();
         // Attention chooses the first matching loaded row, unlike occupancy:
         // the latter deliberately marks every project sharing an exact path.
         // Folder boundaries were admitted above; their keys identify the
         // exact loaded row once the longest-root lookup resolves a directory.
-        let mut loaded = HashMap::new();
-        for project in &self.sidebar_model.projects {
-            if let Some(key) = project.folder_key() {
-                loaded
-                    .entry(project.repository.as_path())
-                    .or_insert((key.project_id, key.worktree_id));
-            }
-            for worktree in &project.worktrees {
-                loaded
-                    .entry(worktree.path.as_path())
-                    .or_insert((project.id, worktree.id));
-            }
-        }
         let attention = self
             .sidebar_state
             .attention_cards()
@@ -583,8 +703,8 @@ impl Cagents {
                             && matches!(card.kind, CardKind::Terminal(_) | CardKind::Chat(_))
                             && !channeled.contains(&id)
                     })
-                    .and_then(|card| self.unchanneled_card_worktree_indexed(card, &roots))
-                    .and_then(|directory| loaded.get(directory).copied());
+                    .and_then(|card| self.unchanneled_card_worktree_indexed(card, &index))
+                    .and_then(|directory| index.first_row(directory));
                 (id, owner)
             })
             .collect::<Vec<_>>();
@@ -662,7 +782,7 @@ impl Cagents {
     pub(super) fn unchanneled_card_worktree_indexed<'a>(
         &'a self,
         card: &'a CardState,
-        roots: &WorktreeRoots<'a>,
+        roots: &impl ResolveRoot<'a>,
     ) -> Option<&'a Path> {
         if let Some(scope) = self
             .worktree_owners
@@ -2092,6 +2212,86 @@ mod tests {
         assert_eq!(
             worktree_root(Path::new("/repo-fix/src"), roots.into_iter()),
             None
+        );
+    }
+
+    #[test]
+    fn worktree_path_index_is_kept_until_its_roots_or_rows_change() {
+        fn row(id: WorktreeId, path: &str) -> SidebarWorktree {
+            SidebarWorktree::new(id, path.into(), None, false, false, None, None, None)
+        }
+        let (folder, repository) = (ProjectId::new(), ProjectId::new());
+        let (folder_row, shared_row, nested_row) =
+            (WorktreeId::new(), WorktreeId::new(), WorktreeId::new());
+        let mut projects = vec![
+            SidebarProject::new(
+                folder,
+                RepositoryId::new(),
+                "Folder".into(),
+                "/root".into(),
+                vec![row(folder_row, "/root")],
+                vec![],
+            )
+            .with_kind(ProjectKind::Folder),
+            SidebarProject::new(
+                repository,
+                RepositoryId::new(),
+                "Repository".into(),
+                "/root".into(),
+                vec![row(shared_row, "/root"), row(nested_row, "/root/nested")],
+                vec![],
+            ),
+        ];
+        let folder_key = projects[0].folder_key().unwrap();
+        let mut known = HashSet::from([PathBuf::from("/known")]);
+        let mut index = WorktreePathIndex::default();
+        index.refresh(&known, &projects);
+        index.refresh(&known, &projects);
+        assert_eq!(index.builds, 1, "unchanged rows and roots keep the index");
+        // Both projects list /root, so it is a row of each; attention goes to
+        // the first loaded row there, the folder's own.
+        assert_eq!(
+            index.rows(Path::new("/root")),
+            [(folder, folder_row), (repository, shared_row)]
+        );
+        assert_eq!(
+            index.first_row(Path::new("/root")),
+            Some((folder_key.project_id, folder_key.worktree_id))
+        );
+        assert_eq!(
+            (&index).resolve(Path::new("/root/nested/src")),
+            Some(Path::new("/root/nested"))
+        );
+        assert_eq!(
+            (&index).resolve(Path::new("/known/src")),
+            Some(Path::new("/known"))
+        );
+        assert_eq!((&index).resolve(Path::new("/elsewhere")), None);
+
+        projects[1].worktrees[1] = row(nested_row, "/root/moved");
+        index.refresh(&known, &projects);
+        assert_eq!(index.builds, 2, "a moved row rebuilds the index");
+        assert_eq!(index.rows(Path::new("/root/nested")), []);
+        assert_eq!(
+            (&index).resolve(Path::new("/root/moved/src")),
+            Some(Path::new("/root/moved"))
+        );
+
+        known.insert("/admitted".into());
+        index.refresh(&known, &projects);
+        assert_eq!(index.builds, 3, "a newly known root rebuilds the index");
+        assert_eq!(
+            (&index).resolve(Path::new("/admitted/src")),
+            Some(Path::new("/admitted"))
+        );
+
+        projects.remove(0);
+        index.refresh(&known, &projects);
+        assert_eq!(index.builds, 4, "a removed project rebuilds the index");
+        assert_eq!(index.rows(Path::new("/root")), [(repository, shared_row)]);
+        assert_eq!(
+            index.first_row(Path::new("/root")),
+            Some((repository, shared_row))
         );
     }
 
