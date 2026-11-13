@@ -122,7 +122,8 @@ fn uncovered_periodic_scans_retry_native_watches_without_a_topology_event() {
             tickets: BTreeMap::new(),
             linear_unavailable: None,
             stale_after_days: crate::work::DEFAULT_STALE_AFTER_DAYS,
-            read_at: None,
+            board_read_at: None,
+            watching: false,
             restored: BTreeMap::new(),
         }),
         updated: Condvar::new(),
@@ -132,6 +133,7 @@ fn uncovered_periodic_scans_retry_native_watches_without_a_topology_event() {
         publication: Mutex::new(Publication::default()),
         jobs: Jobs::default(),
         store: Mutex::new(None),
+        conversations: conversations::Conversations::default(),
         cancellation: CancellationToken::new(),
     }));
     let id = handle.shared().track(&repository, "fixture").id;
