@@ -30,7 +30,8 @@
 #
 #   cards   message-cards (the started agent and the first messages),
 #           message-hover (the pointer on the long message, its tooltip
-#           open), message-menu (that message's context menu) and
+#           open), message-menu (that message's context menu),
+#           message-refused-hover (the refused message's tooltip) and
 #           message-failed (the refused message and the one to an unlisted
 #           agent)
 #   narrow  narrow-message-cards and narrow-message-failed, for a session
@@ -138,6 +139,16 @@ if [ "$scene" = cards ]; then
         sleep 1
     else
         log "not found: the long message"
+    fi
+    # The refused message, its reason in the tooltip.
+    refused=$(locate 'release-notes')
+    if [ -n "$refused" ]; then
+        "$ne" drive move "$refused" >/dev/null 2>&1 || log "hover failed"
+        sleep 3
+        "$ne" shot message-refused-hover >/dev/null && log "shot message-refused-hover" ||
+            log "shot failed: message-refused-hover"
+    else
+        log "not found: the refused message"
     fi
 fi
 scroll "$transcript" 30
