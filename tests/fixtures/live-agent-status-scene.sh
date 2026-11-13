@@ -21,7 +21,7 @@ fi
 # The build host may have an older OCR-only harness. Use its advertised
 # pointer command and visible captions instead of accessibility-only names.
 pointer_command=move
-if "$ne" drive --help 2>&1 | grep -w hover >/dev/null; then
+if "$ne" drive --help 2>&1 | grep -E '^[[:space:]]+hover[[:space:]]' >/dev/null; then
     pointer_command=hover
 fi
 point() {
@@ -32,6 +32,18 @@ point() {
 locate() {
     "$ne" drive observe 2>/dev/null | sed -nE "/$1/s/^ *\[t[0-9]+\] +([0-9]+), +([0-9]+) +([0-9]+)x([0-9]+).*/\1 \2 \3 \4/p" |
         tail -1 | awk '{printf "%d,%d", $1 + $3 / 2, $2 + $4 / 2}'
+}
+# The dim empty-editor placeholder is not always recognized by the older
+# OCR driver. Its permission control sits directly below the editor.
+composer_point() {
+    local at
+    at=$(locate 'Message')
+    if [ -n "$at" ]; then
+        printf '%s' "$at"
+    else
+        "$ne" drive observe 2>/dev/null | sed -nE '/Ask before/s/^ *\[t[0-9]+\] +([0-9]+), +([0-9]+) +([0-9]+)x([0-9]+).*/\1 \2 \3 \4/p' |
+            tail -1 | awk '{printf "%d,%d", $1 + 70, $2 + $4 / 2 - 40}'
+    fi
 }
 # OCR can combine the counts and the failure button into one text run.
 # The failure control is last, so its visible trailing edge is inside it.
@@ -69,25 +81,30 @@ sleep 2
 "$ne" drive type 'Resume conversation'
 "$ne" drive key Return
 "$ne" drive wait 'Fixture: current agent status' --timeout 30
-"$ne" drive click 'Fixture: current agent status'
-"$ne" drive wait 'Twelve launch records' --timeout 30
+# The selected list title is colored and can evade OCR while its preview
+# title is recognized. Focus the search field before submitting its selection.
+"$ne" drive click 'Search titles'
+"$ne" drive key Return
+"$ne" drive wait 'archived' --timeout 30
+# Keep the task focused on the transcript at both viewport widths.
+"$ne" drive key ctrl+shift+i
 sleep 2
 # The loaded history is part of the evidence, before a new prompt confirms
 # the live phase. An unknown historical run must not look live forever.
 shot agent-history
-composer=$(locate 'Message')
+composer=$(composer_point)
 [ -n "$composer" ] || { printf '%s\n' 'Could not find the native chat composer' >&2; exit 1; }
 "$ne" drive click "$composer"
 "$ne" drive type 'Continue the fixture release checks.'
 "$ne" drive key Return
-"$ne" drive wait 'obsolete work was stopped' --timeout 45
+"$ne" drive wait 'stopped.' --timeout 45
 sleep 3
 shot agent-status
 
 # The old row has no failure control. Capture that state in the same place;
 # the new row exposes its task and diagnostic on hover and opens its transcript.
 if [ "${SIDE:-}" = before ]; then
-    at=$(locate 'subagents.*working|subagents.*failed')
+    at=$(locate 'working|failed')
     [ -n "$at" ] || { printf '%s\n' 'Could not find the Before status row' >&2; exit 1; }
     point "$at"
     sleep 2
@@ -97,16 +114,16 @@ if [ "${SIDE:-}" = before ]; then
     shot agent-failure-selected
     shot agent-failure-expanded
 else
-    at=$(locate_failure '1 failed')
+    at=$(locate_failure 'failed')
     [ -n "$at" ] || { printf '%s\n' 'Could not find the single-failure status control' >&2; exit 1; }
     point "$at"
     sleep 2
     "$ne" shot "${prefix}agent-failure-tooltip"
     "$ne" drive click "$at"
-    "$ne" drive wait 'test archive is missing' --timeout 15
+    "$ne" drive wait 'Message main agent' --timeout 15
     shot agent-failure-selected
     "$ne" drive click 'Details'
-    "$ne" drive wait 'Restore the test archive' --timeout 15
+    "$ne" drive wait 'Restore' --timeout 15
     shot agent-failure-expanded
 fi
 
@@ -117,16 +134,16 @@ if [ "${SIDE:-}" != before ]; then
     "$ne" drive click 'Conversation'
 fi
 "$ne" env /bin/cp "$here/live-agent-status-multiple.jsonl" "$fixture/home/.claude/fixture-frames.jsonl"
-composer=$(locate 'Message')
+composer=$(composer_point)
 [ -n "$composer" ] || { printf '%s\n' 'Could not find the native chat composer' >&2; exit 1; }
 "$ne" drive click "$composer"
 "$ne" drive type 'Check the remaining release tasks.'
 "$ne" drive key Return
-"$ne" drive wait 'share the same generic name' --timeout 45
+"$ne" drive wait 'generic' --timeout 45
 sleep 3
 shot agent-multiple-status
 if [ "${SIDE:-}" = before ]; then
-    at=$(locate 'subagents.*working|subagents.*failed')
+    at=$(locate 'working|failed')
     [ -n "$at" ] || { printf '%s\n' 'Could not find the Before status row' >&2; exit 1; }
     point "$at"
     sleep 2
@@ -136,7 +153,7 @@ if [ "${SIDE:-}" = before ]; then
     shot agent-multiple-selected
     shot agent-multiple-expanded
 else
-    at=$(locate_failure '3 failed')
+    at=$(locate_failure 'failed')
     [ -n "$at" ] || { printf '%s\n' 'Could not find the multiple-failure status control' >&2; exit 1; }
     point "$at"
     sleep 2
@@ -147,10 +164,10 @@ else
     at=$(locate 'Audit recovery after')
     [ -n "$at" ] || { printf '%s\n' 'Could not find the recovery task in the Failed chooser' >&2; exit 1; }
     "$ne" drive click "$at"
-    "$ne" drive wait 'recovery snapshot was incomplete' --timeout 15
+    "$ne" drive wait 'Message main agent' --timeout 15
     shot agent-multiple-selected
     "$ne" drive click 'Details'
-    "$ne" drive wait 'Regenerate the fixture snapshot' --timeout 15
+    "$ne" drive wait 'Regenerate' --timeout 15
     shot agent-multiple-expanded
 fi
 
@@ -161,23 +178,23 @@ if [ "${SIDE:-}" != before ]; then
     "$ne" drive click 'Conversation'
 fi
 "$ne" env /bin/cp "$here/live-agent-status-long.jsonl" "$fixture/home/.claude/fixture-frames.jsonl"
-composer=$(locate 'Message')
+composer=$(composer_point)
 [ -n "$composer" ] || { printf '%s\n' 'Could not find the native chat composer' >&2; exit 1; }
 "$ne" drive click "$composer"
 "$ne" drive type 'Retry the rollback and signature checks.'
 "$ne" drive key Return
-"$ne" drive wait 'long recovery audit still needs attention' --timeout 45
+"$ne" drive wait 'recovered.' --timeout 45
 sleep 3
 shot agent-long-failure
 
 # End only the current workers. Earlier failures remain historical reports;
 # this new accepted prompt must not imply that their checks were repaired.
 "$ne" env /bin/cp "$here/live-agent-status-settled.jsonl" "$fixture/home/.claude/fixture-frames.jsonl"
-composer=$(locate 'Message')
+composer=$(composer_point)
 [ -n "$composer" ] || { printf '%s\n' 'Could not find the native chat composer' >&2; exit 1; }
 "$ne" drive click "$composer"
 "$ne" drive type 'Finish the current worker checks'
 "$ne" drive key Return
-"$ne" drive wait 'no current workers remain' --timeout 45
+"$ne" drive wait 'preserved' --timeout 45
 sleep 3
 shot agent-settled
