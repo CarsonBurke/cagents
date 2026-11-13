@@ -5277,6 +5277,10 @@ mod tests {
 
     #[test]
     fn inherited_daemon_lease_is_not_a_serving_daemon() {
+        #[cfg(target_os = "linux")]
+        if crate::retained_fixture::run_isolated() {
+            return;
+        }
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
         const CHILD: &str = "CAGENTS_TEST_INHERITED_STATUS";

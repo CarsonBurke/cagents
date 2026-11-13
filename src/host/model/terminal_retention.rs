@@ -764,6 +764,7 @@ mod tests {
                 super::super::SCHEMA_VERSION
             );
             let mut after = table_rows(&registry.db);
+            assert!(after.remove("console_relaunches").unwrap().is_empty());
             assert!(
                 after.remove("automation_run_attention").unwrap().is_empty(),
                 "the added run-attention table must not replay historical runs"

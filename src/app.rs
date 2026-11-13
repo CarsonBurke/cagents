@@ -31240,7 +31240,8 @@ mod tests {
             .contains(&row)
     }
 
-    /// Gives the project holding `channel` a worktree.
+    /// Gives the project holding `channel` a worktree and shows its row so
+    /// attention retention is exercised independently of group disclosure.
     fn add_attention_worktree(
         app: &mut Cagents,
         channel: crate::model::ChannelId,
@@ -31264,6 +31265,8 @@ mod tests {
                 "/repo/feature".into(),
                 Some("feature".into()),
             ));
+        app.sidebar_state
+            .set_sidebar_worktrees(settings::SidebarWorktrees::Expanded);
         sidebar::SelectionRow::Worktree(project, worktree)
     }
 
@@ -31358,6 +31361,62 @@ mod tests {
             "the pane closed"
         );
         assert!(!attention_lists(&app, worktree_row));
+    }
+
+    #[test]
+    fn attention_rolls_unread_updates_into_a_collapsed_worktree_group() {
+        use cosmic::iced::advanced::{Layout, layout, mouse, widget::Tree};
+
+        let (mut app, card, channel) = attention_channel_test_app();
+        let worktree_row = add_attention_worktree(&mut app, channel);
+        let sidebar::SelectionRow::Worktree(project, worktree) = worktree_row else {
+            unreachable!()
+        };
+        app.sidebar_state
+            .set_sidebar_worktrees(settings::SidebarWorktrees::Grouped);
+        let renderer = headless_renderer();
+        let group_name = |app: &Cagents| {
+            let mut element = sidebar::view(
+                &app.sidebar_model,
+                &app.sidebar_state,
+                SidebarMode::Expanded,
+                320.0,
+                false,
+            );
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(320.0, 900.0)),
+            );
+            let nodes = element.as_widget().a11y_nodes(
+                Layout::new(&node),
+                &tree,
+                mouse::Cursor::Unavailable,
+            );
+            nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .filter_map(|node| node.node().label())
+                .find(|name| name.starts_with("Expand Worktrees (1)"))
+                .map(ToOwned::to_owned)
+        };
+
+        app.sidebar_state
+            .observe_agent_update(card, project, worktree);
+        app.refresh_sidebar_channels();
+        assert!(!attention_lists(&app, worktree_row));
+        assert_eq!(
+            group_name(&app).as_deref(),
+            Some("Expand Worktrees (1), 1 unread conversation")
+        );
+
+        drop(app.update(Message::Sidebar(SidebarAction::MarkChannelRead(channel))));
+        assert!(!app.sidebar_state.has_card_update(card));
+        assert!(attention_lists_channel(&app, channel));
+        assert!(!attention_lists(&app, worktree_row));
+        assert_eq!(group_name(&app).as_deref(), Some("Expand Worktrees (1)"));
     }
 
     fn agent_activity(state: crate::agent::ActivityState) -> Option<crate::agent::Activity> {
