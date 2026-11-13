@@ -1261,15 +1261,31 @@ const UNPROVEN_WINDOW_PROGRESS: Duration = Duration::from_secs(15);
 /// A lingering window that cannot be proven to have saved since closing.
 struct Unproven<'a> {
     reason: String,
-    /// Its pinned process, when verified as the slot's current owner.
-    owner: Option<&'a VerifiedWindow>,
+    /// The pinned process of a window that acknowledged closing and has not
+    /// been seen to give up its slot: a daemon cannot start beside it.
+    /// None for a window that may be healthy, such as one that never
+    /// acknowledged or whose slot another process now holds.
+    closing: Option<Closing<'a>>,
 }
 
-impl Unproven<'_> {
+struct Closing<'a> {
+    window: &'a VerifiedWindow,
+    /// Verified as the slot's current owner, so it may be signalled.
+    owns_slot: bool,
+}
+
+impl<'a> Unproven<'a> {
     fn unknown(reason: impl Into<String>) -> Self {
         Self {
             reason: reason.into(),
-            owner: None,
+            closing: None,
+        }
+    }
+
+    fn closing(reason: String, window: &'a VerifiedWindow, owns_slot: bool) -> Self {
+        Self {
+            reason,
+            closing: Some(Closing { window, owns_slot }),
         }
     }
 }
@@ -1629,23 +1645,25 @@ impl UiUpdateGuard {
                 ));
             }
             Err(error) => {
-                return Err(Unproven::unknown(format!(
-                    "its process could not be verified: {error}"
-                )));
+                return Err(Unproven::closing(
+                    format!("its process could not be verified: {error}"),
+                    window,
+                    false,
+                ));
             }
         }
-        let unsaved = |reason: String| Unproven {
-            reason,
-            owner: Some(window),
-        };
         match flushed(window.pid, *requested) {
             Ok(true) => Ok(Some(window)),
-            Ok(false) => Err(unsaved(
+            Ok(false) => Err(Unproven::closing(
                 "has not reported that its workspace was saved".into(),
+                window,
+                true,
             )),
-            Err(error) => Err(unsaved(format!(
-                "its save report could not be read: {error}"
-            ))),
+            Err(error) => Err(Unproven::closing(
+                format!("its save report could not be read: {error}"),
+                window,
+                true,
+            )),
         }
     }
 
@@ -1653,11 +1671,12 @@ impl UiUpdateGuard {
     /// still holds its slot. A daemon admits only authenticated live windows,
     /// and a half-exited one fails that check: a daemon restarted beside it
     /// exits instead of serving. Wait for committed windows, then end those
-    /// that already saved. Any other committed window gets one SIGTERM and
-    /// is waited for without a cap, since starting beside it cannot succeed;
-    /// only interrupting this worker ends that wait, with Interrupted.
-    /// Windows that never committed are healthy live windows of the source
-    /// and are left alone.
+    /// that already saved. Any other window that acknowledged closing and
+    /// still holds its slot gets one SIGTERM and is waited for without a cap,
+    /// since starting beside it cannot succeed; only interrupting this worker
+    /// ends that wait, with Interrupted. Windows that never acknowledged, or
+    /// whose slot another process now holds, may be healthy live windows the
+    /// daemon admits: they are left alone and the restart proceeds.
     pub(crate) fn settle_committed_windows(&self) -> io::Result<()> {
         // Only a signal to this worker ends the wait: a daemon started beside
         // a window that holds its slot can only be refused.
@@ -1690,20 +1709,32 @@ impl UiUpdateGuard {
             match self.saved_window(slot, &flushed) {
                 Ok(Some(window)) => saved.push((slot.as_str(), window)),
                 Ok(None) => {}
-                Err(Unproven { reason, owner }) => {
+                Err(Unproven {
+                    reason,
+                    closing: Some(closing),
+                }) => {
                     eprintln!(
                         "Window {slot} is still closing after {}s and {reason}.",
                         timeout.as_secs()
                     );
-                    unsaved.push((slot.as_str(), owner));
+                    unsaved.push((slot.as_str(), closing));
                 }
+                Err(Unproven {
+                    reason,
+                    closing: None,
+                }) => eprintln!(
+                    "Window {slot} is still open after {}s and {reason}; it keeps running beside the restarted terminal service.",
+                    timeout.as_secs()
+                ),
             }
         }
         end_saved_windows(&saved, timeout, grace)?;
         // It saved when it acknowledged closing; SIGTERM lets it exit cleanly.
         // Without a later save report it is never killed.
-        for (slot, owner) in &unsaved {
-            let Some(window) = owner else { continue };
+        for (slot, Closing { window, owns_slot }) in &unsaved {
+            if !owns_slot {
+                continue;
+            }
             match window.signal(libc::SIGTERM) {
                 Ok(true) => eprintln!("Window {slot} (pid {}): sent SIGTERM.", window.pid),
                 Ok(false) => {}
@@ -1716,10 +1747,14 @@ impl UiUpdateGuard {
         let mut next_progress = std::time::Instant::now();
         loop {
             let live = running_window_slots(&self.runtime)?;
+            // Once its pinned process is gone, whatever holds the slot is a
+            // different window that the restarted daemon can admit.
             let waiting: Vec<_> = unsaved
                 .iter()
-                .filter(|(slot, _)| live.iter().any(|live| live == slot))
-                .map(|(slot, owner)| (*slot, owner.map(|window| window.pid)))
+                .filter(|(slot, closing)| {
+                    closing.window.is_alive() && live.iter().any(|live| live == slot)
+                })
+                .map(|(slot, closing)| (*slot, closing.owns_slot.then_some(closing.window.pid)))
                 .collect();
             if waiting.is_empty() {
                 return Ok(());
@@ -3569,30 +3604,26 @@ mod tests {
     }
 
     #[test]
-    fn rollback_never_signals_a_window_without_a_commit_acknowledgement() {
+    fn rollback_restarts_beside_a_window_that_never_acknowledged_closing() {
         let runtime = tempdir().unwrap();
         let mut guard = guard_in(runtime.path());
         let mut window = LingeringWindow::spawn(runtime.path(), "second", false);
         pin_committed(&mut guard, "second");
-        // A commit the window never acknowledged leaves a healthy source
-        // window, even when a save report exists: it is waited for only.
+        // Its slot was marked closed before update-commit, but the window
+        // never acknowledged it: it may be healthy and never exit. Even a
+        // save report must not get it signalled or awaited.
         guard.close.committed.clear();
-        let error = guard
+        guard
             .settle_committed_windows_with(
                 Duration::from_millis(100),
                 |_, _| Ok(true),
                 Duration::ZERO,
-                || true,
+                || panic!("a healthy window must not be waited for"),
                 UNPROVEN_WINDOW_PROGRESS,
             )
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
-        // Its process is not verified as the slot owner: no kill hint.
-        assert_eq!(
-            error.to_string(),
-            "Window second is still closing, so the terminal service was not restarted. Once it exits, run: cagents daemon start"
-        );
+            .unwrap();
         assert_eq!(window.exit_signal(), None);
+        assert_eq!(running_window_slots(runtime.path()).unwrap(), ["second"]);
         // A window that never received a commit is not awaited at all.
         guard.closed.clear();
         guard
@@ -3600,11 +3631,33 @@ mod tests {
                 Duration::from_secs(30),
                 |_, _| Ok(true),
                 Duration::ZERO,
-                || true,
+                || panic!("nothing is closing"),
                 UNPROVEN_WINDOW_PROGRESS,
             )
             .unwrap();
         assert_eq!(window.exit_signal(), None);
+    }
+
+    #[test]
+    fn rollback_restarts_beside_a_slot_another_process_now_holds() {
+        let runtime = tempdir().unwrap();
+        let mut guard = guard_in(runtime.path());
+        let mut first = LingeringWindow::spawn(runtime.path(), "second", false);
+        pin_committed(&mut guard, "second");
+        // The committed window exits and the user reopens that slot.
+        first.0.kill().unwrap();
+        first.0.wait().unwrap();
+        let mut reopened = LingeringWindow::spawn(runtime.path(), "second", false);
+        guard
+            .settle_committed_windows_with(
+                Duration::from_millis(100),
+                |_, _| Ok(false),
+                Duration::ZERO,
+                || panic!("a reopened window must not be waited for"),
+                UNPROVEN_WINDOW_PROGRESS,
+            )
+            .unwrap();
+        assert_eq!(reopened.exit_signal(), None);
     }
 
     #[test]
