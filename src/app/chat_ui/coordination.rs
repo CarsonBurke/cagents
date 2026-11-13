@@ -742,6 +742,55 @@ struct Row {
     copy: &'static str,
 }
 
+/// What a row that opens no agent does when pressed, said where the
+/// tooltip and a screen reader can tell it apart from one that does.
+const OPENS_TOOL_CALL: &str = "No agent to open; pressing shows the tool call.";
+
+impl Row {
+    /// What the tooltip and a screen reader give whole, for a row that
+    /// draws its agent as `shown`: the agent's whole name where the row cut
+    /// it, the outcome's reason, what pressing does where it opens no agent,
+    /// and then the message or prompt.
+    fn described(&self, shown: &str) -> (String, String) {
+        let reason = self
+            .state
+            .detail
+            .as_deref()
+            .map(|detail| match self.state.tone {
+                Tone::Error => format!("{}: {detail}", self.state.text),
+                _ => detail.to_owned(),
+            });
+        let opens = self.open.is_some();
+        let mut tip = Vec::new();
+        if shown != self.label {
+            tip.push(format!("{} {}", self.verb, self.label));
+        }
+        tip.extend(reason);
+        if !opens {
+            tip.push(OPENS_TOOL_CALL.to_owned());
+        }
+        if !self.full.is_empty() {
+            tip.push(bounded(&self.full));
+        }
+        let name = [
+            format!("{} {}", self.verb, self.label),
+            self.state.text.to_owned(),
+            self.state.detail.clone().unwrap_or_default(),
+            if opens {
+                String::new()
+            } else {
+                OPENS_TOOL_CALL.to_owned()
+            },
+            self.preview.clone(),
+        ]
+        .into_iter()
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ");
+        (tip.join("\n\n"), name)
+    }
+}
+
 /// A row's trailing status: a word or two, with the whole account of it in
 /// the tooltip.
 struct RowStatus {
@@ -1199,6 +1248,7 @@ impl Runtime {
         };
         // A long name is cut so the start of the message keeps its place.
         let label = Self::short_description(&row.label, LABEL_CHARS);
+        let (tip, name) = row.described(&label);
         let mut line: Vec<Element<'static, Message>> = vec![
             lead,
             design::body(row.verb)
@@ -1229,29 +1279,6 @@ impl Runtime {
             }
             .into(),
         );
-        // What the tooltip and a screen reader give whole: the outcome's
-        // reason first, then the message or prompt.
-        let mut tip = Vec::new();
-        if let Some(detail) = &row.state.detail {
-            tip.push(match row.state.tone {
-                Tone::Error => format!("{}: {detail}", row.state.text),
-                _ => detail.clone(),
-            });
-        }
-        if !row.full.is_empty() {
-            tip.push(bounded(&row.full));
-        }
-        let tip = tip.join("\n\n");
-        let name = [
-            format!("{} {}", row.verb, row.label),
-            row.state.text.to_owned(),
-            row.state.detail.clone().unwrap_or_default(),
-            row.preview,
-        ]
-        .into_iter()
-        .filter(|part| !part.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join(" · ");
         let content = widget::row::with_children(line)
             .spacing(step::GAP_S)
             .align_y(Alignment::Center)
@@ -1655,6 +1682,61 @@ mod identity_tests {
         assert_eq!(
             spawn_details(&reading, &spawn, None),
             "cagents agent · codex · gpt-reported · low · Worktree view /repo/tree · in /repo"
+        );
+    }
+
+    #[test]
+    fn a_rows_tooltip_names_a_cut_agent_whole_and_says_what_a_row_without_one_does() {
+        let row = |label: &str, open: Option<Action>, state: RowStatus| Row {
+            glyph: Icon::Send,
+            verb: "Message to",
+            label: label.to_owned(),
+            preview: "The repo is now at /srv".to_owned(),
+            full: "The repo is now at /srv/repos/t3code.".to_owned(),
+            state,
+            open,
+            copy: "Copy message",
+        };
+        let long = "Relocate the t3code checkout and every worktree";
+        let shown = Runtime::short_description(long, LABEL_CHARS);
+        let opens = row(
+            long,
+            Some(Action::OpenSession("95fcd1b9".into())),
+            RowStatus::plain("Queued"),
+        );
+        let (tip, name) = opens.described(&shown);
+        assert_eq!(
+            tip,
+            format!("Message to {long}\n\nThe repo is now at /srv/repos/t3code.")
+        );
+        assert_eq!(
+            name,
+            format!("Message to {long} · Queued · The repo is now at /srv")
+        );
+        // A name the row draws whole is not repeated.
+        let (tip, _) =
+            row("reviewer", opens.open.clone(), RowStatus::plain("Queued")).described("reviewer");
+        assert_eq!(tip, "The repo is now at /srv/repos/t3code.");
+
+        // A row with no agent to open says so, after the outcome's reason.
+        let refused = RowStatus {
+            detail: Some("No agent named 'release-notes' is reachable.".into()),
+            ..RowStatus::error("Not sent")
+        };
+        let (tip, name) = row("release-notes", None, refused).described("release-notes");
+        assert_eq!(
+            tip,
+            format!(
+                "Not sent: No agent named 'release-notes' is reachable.\n\n{OPENS_TOOL_CALL}\n\n\
+                 The repo is now at /srv/repos/t3code."
+            )
+        );
+        assert_eq!(
+            name,
+            format!(
+                "Message to release-notes · Not sent · No agent named 'release-notes' is \
+                 reachable. · {OPENS_TOOL_CALL} · The repo is now at /srv"
+            )
         );
     }
 }
