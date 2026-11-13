@@ -36,12 +36,16 @@
 #           agent)
 #   narrow  narrow-message-cards and narrow-message-failed, for a session
 #           started at --width 900, the narrowest window the app allows
+#   long    long-message-cards and long-message-failed: the agent named by a
+#           task longer than a row shows and a message that never confirmed,
+#           for a session at --width 1200, whose side panels leave the chat
+#           its narrowest
 #
 # A state that does not appear within 30 seconds is logged and the scene goes
 # on, so a missing state is visible in the log and the shot.
 set -u
 
-scene=${1:?usage: message-card-scene.sh cards|narrow}
+scene=${1:?usage: message-card-scene.sh cards|narrow|long}
 here=$(cd "$(dirname "$0")" && pwd)
 ne=$here/../../scripts/native-evidence
 : "${CAGENTS_EVIDENCE_TASK:?name the native-evidence task}"
@@ -79,7 +83,15 @@ scroll() {
 }
 
 mkdir -p "$config"
-cp "$here/message-card-scene/frames.jsonl" "$config/fixture-frames.jsonl"
+if [ "$scene" = long ]; then
+    # The agent goes by a task longer than a row shows, and the first message
+    # to it never hears back, so its row says it was not confirmed.
+    sed -e 's/"Relocate the repo"/"Relocate the t3code checkout and every worktree"/g' \
+        -e '/fixture-moved-@TURN@-result/d' \
+        "$here/message-card-scene/frames.jsonl" >"$config/fixture-frames.jsonl"
+else
+    cp "$here/message-card-scene/frames.jsonl" "$config/fixture-frames.jsonl"
+fi
 printf '%s\n' 'I told the relocation agent where the repo went.' >"$config/fixture-reply.md"
 # The reply as the screen reading finds it: it splits a line into runs at
 # whichever spaces it likes, so any of the reply's distinctive runs will do.
@@ -117,8 +129,9 @@ fi
 
 prefix=
 [ "$scene" = narrow ] && prefix=narrow-
+[ "$scene" = long ] && prefix=long-
 case $scene in
-    cards | narrow) ;;
+    cards | narrow | long) ;;
     *) log "unknown scene"; exit 2 ;;
 esac
 # The transcript opens at its end; the first message is above it.

@@ -1018,10 +1018,22 @@ impl Runtime {
         // open one, the answer is the tooltip's to give.
         let mut full = full;
         if open.is_none() {
-            for answer in &reading.outcome.messages {
-                let body = plain(&answer.body);
+            for (heading, body) in reading
+                .outcome
+                .messages
+                .iter()
+                .map(|answer| (format!("From {}", answer.from), answer.body.as_str()))
+                .chain(
+                    reading
+                        .outcome
+                        .run
+                        .iter()
+                        .map(|run| ("Result".to_owned(), run.result.as_str())),
+                )
+            {
+                let body = plain(body);
                 if !body.is_empty() {
-                    full.push_str(&format!("\n\nFrom {}:\n{body}", answer.from));
+                    full.push_str(&format!("\n\n{heading}:\n{body}"));
                 }
             }
         }
@@ -1033,7 +1045,11 @@ impl Runtime {
             full: full.trim().to_owned(),
             state,
             open,
-            copy: "Copy message",
+            // Without the text inline, copying takes the raw call.
+            copy: match message.body.inline() {
+                Some(_) => "Copy message",
+                None => "Copy tool call",
+            },
         }
     }
 
@@ -1116,6 +1132,23 @@ impl Runtime {
                 _ => run.map_or_else(|| RowStatus::plain("Finished"), run_status),
             },
         };
+        let open = listed.map(|agent| Action::SelectSubagent(self.target, Some(agent.id.clone())));
+        // The agent's transcript holds what it reported; where the row cannot
+        // open one, the result is the tooltip's to give.
+        if open.is_none() {
+            full.extend(
+                reading
+                    .outcome
+                    .messages
+                    .iter()
+                    .map(|answer| (format!("From {}", answer.from), answer.body.as_str()))
+                    .chain(run.map(|run| ("Result".to_owned(), run.result.as_str())))
+                    .filter_map(|(heading, body)| {
+                        let body = plain(body);
+                        (!body.is_empty()).then(|| format!("{heading}:\n{body}"))
+                    }),
+            );
+        }
         Row {
             glyph,
             verb: "Started",
@@ -1123,8 +1156,16 @@ impl Runtime {
             preview,
             full: full.join("\n\n"),
             state,
-            open: listed.map(|agent| Action::SelectSubagent(self.target, Some(agent.id.clone()))),
-            copy: "Copy prompt",
+            open,
+            copy: if spawn
+                .agents
+                .iter()
+                .any(|agent| agent.prompt.inline().is_some())
+            {
+                "Copy prompt"
+            } else {
+                "Copy tool call"
+            },
         }
     }
 
@@ -1239,36 +1280,35 @@ impl Runtime {
             left: step::GAP_S,
             right: step::GAP_S + ARROW_ROOM,
         };
-        let row: Element<'static, Message> = match row.open {
-            Some(open) => {
-                let button = widget::button::custom(content)
-                    .name(name)
-                    .class(crate::ui_controls::control_style(false, None))
-                    .padding(padding)
-                    .width(Length::Fill)
-                    .on_press(action(open));
-                // The way in, drawn inside the row's highlight where the
-                // pointer is. It only marks the row as one that opens: the row
-                // is the control, so a click on the arrow is a click on the
-                // row, and keyboard traversal and screen readers meet it once.
-                let arrow = widget::container(muted_glyph(Icon::Open))
-                    .padding(iced::Padding {
-                        right: step::GAP_S,
-                        ..iced::Padding::ZERO
-                    })
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .align_x(iced::alignment::Horizontal::Right)
-                    .align_y(iced::alignment::Vertical::Center);
-                hover::over(tipped(button.into()), arrow)
-            }
-            // An agent this conversation cannot open is only described.
-            None => tipped(
-                widget::container(content)
-                    .padding(padding)
-                    .width(Length::Fill)
-                    .into(),
-            ),
+        // A row that cannot open an agent opens its tool call instead, so the
+        // keyboard reaches it, its menu and its outcome all the same.
+        let opens = row.open.is_some();
+        let pressed = row
+            .open
+            .unwrap_or_else(|| Action::Toggle(self.target, item.id.clone()));
+        let button = widget::button::custom(content)
+            .name(name)
+            .class(crate::ui_controls::control_style(false, None))
+            .padding(padding)
+            .width(Length::Fill)
+            .on_press(action(pressed));
+        let row: Element<'static, Message> = if opens {
+            // The way in, drawn inside the row's highlight where the
+            // pointer is. It only marks the row as one that opens: the row
+            // is the control, so a click on the arrow is a click on the
+            // row, and keyboard traversal and screen readers meet it once.
+            let arrow = widget::container(muted_glyph(Icon::Open))
+                .padding(iced::Padding {
+                    right: step::GAP_S,
+                    ..iced::Padding::ZERO
+                })
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(iced::alignment::Horizontal::Right)
+                .align_y(iced::alignment::Vertical::Center);
+            hover::over(tipped(button.into()), arrow)
+        } else {
+            tipped(button.into())
         };
         crate::interaction::context_menu_lazy(row, menu)
     }

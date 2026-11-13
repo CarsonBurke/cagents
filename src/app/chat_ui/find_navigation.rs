@@ -1206,8 +1206,10 @@ fn raw_scan_inner(
             }
             charge(item.id.len().checked_add(128)?)?;
             let mut parts = Vec::new();
-            let mut said = false;
-            if let Some(reading) = &coordinated {
+            // A step drawn as one row folds nothing: what it said is drawn
+            // whole only in its tool call, as that call's escaped text, so
+            // only a match there, found above, opens it.
+            if let Some(reading) = coordinated.as_ref().filter(|reading| !reading.is_card()) {
                 use chat::coordination::Kind;
                 let mut texts = Vec::new();
                 match &reading.kind {
@@ -1241,19 +1243,11 @@ fn raw_scan_inner(
                 );
                 for (part, text) in texts {
                     if matches_checked(text, &pattern, current)? || labelled(text)? {
-                        // A step drawn as one row folds nothing: what it said
-                        // is drawn whole only in its tool call, which the
-                        // match opens instead.
-                        if reading.is_card() {
-                            said = true;
-                            break;
-                        }
                         charge(item.id.len().checked_add(part.len())?.checked_add(128)?)?;
                         parts.push(format!("{}#{part}", item.id));
                     }
                 }
             }
-            let matched = matched || said;
             for (identity, text) in &raw.tools {
                 if matches_checked(text, &pattern, current)? {
                     charge(item.id.len().checked_add(128)?)?;
@@ -2566,53 +2560,51 @@ mod tests {
         assert_eq!(semaphore.available_permits(), 1);
     }
     #[test]
-    fn raw_plan_discovers_unquoted_parts_and_exact_prepared_readers_in_order() {
-        let query = "say \"NEEDLE λ\"";
+    fn a_one_row_step_is_found_only_in_the_tool_call_it_draws() {
+        let prompt = "say \"NEEDLE λ\"";
         let item = Arc::new(chat::Item {
             id: "agent".into(),
             role: chat::Role::Assistant,
             content: ItemContent::Tool {
                 name: "Agent".into(),
-                input: serde_json::json!({"prompt":query,"run_in_background":true}).to_string(),
+                input: serde_json::json!({"prompt":prompt,"run_in_background":true}).to_string(),
                 output: "Background task launched".into(),
                 status: chat::ToolStatus::Succeeded,
             },
             at: None,
             started_at: None,
         });
-        assert!(!find::contains(
-            match &item.content {
-                ItemContent::Tool { input, .. } => input,
-                _ => unreachable!(),
-            },
-            query
-        ));
-        let input = RawInput {
-            query: query.into(),
-            provider: Provider::Claude,
-            labels: Arc::default(),
-            metadata: metadata_capacity(),
-            groups: vec![(
-                "group".into(),
-                vec![RawItem {
-                    item: item.clone(),
-                    raw_disclosure: true,
-                    tools: vec![(1, Arc::from("absent")), (2, Arc::from(query))],
-                }],
-            )],
+        let scan = |query: &str| {
+            let input = RawInput {
+                query: query.into(),
+                provider: Provider::Claude,
+                labels: Arc::default(),
+                metadata: metadata_capacity(),
+                groups: vec![(
+                    "group".into(),
+                    vec![RawItem {
+                        item: item.clone(),
+                        raw_disclosure: true,
+                        tools: vec![(1, Arc::from("absent")), (2, Arc::from(prompt))],
+                    }],
+                )],
+            };
+            let (groups, tools, _, _) = raw_scan(&input, query, &|| true).unwrap();
+            let tools = tools.iter().map(|(id, _, _, _)| *id).collect::<Vec<_>>();
+            (groups, tools)
         };
-        let (groups, tools, _, _) = raw_scan(&input, query, &|| true).unwrap();
+        // The call draws the prompt as JSON, escaped: a match only in the
+        // unescaped prompt has nothing to highlight, so it claims no step.
+        let (groups, tools) = scan(prompt);
+        assert!(groups.is_empty());
+        assert_eq!(tools, vec![2]);
+        // A match in the drawn call opens it, and folds nothing open.
+        let (groups, tools) = scan("NEEDLE λ");
         assert_eq!(groups.len(), 1);
         assert!(groups[0].1[0].parts.is_empty());
-        assert!(
-            groups[0].1[0].expand,
-            "a match in what a one-row step said opens its tool call, where it is drawn whole"
-        );
-        assert_eq!(
-            tools.iter().map(|(id, _, _, _)| *id).collect::<Vec<_>>(),
-            vec![2]
-        );
+        assert!(groups[0].1[0].expand);
         assert_eq!(groups[0].1[0].source.as_ptr(), Arc::as_ptr(&item));
+        assert_eq!(tools, vec![2]);
     }
     #[test]
     fn find_reaches_a_message_through_the_labels_of_its_pull_request_links() {
