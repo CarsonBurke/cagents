@@ -1,3 +1,5 @@
+use crate::work::CheckState;
+
 use super::*;
 use crate::{
     model::WorktreeId,

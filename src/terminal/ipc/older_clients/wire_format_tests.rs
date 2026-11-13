@@ -493,6 +493,10 @@ fn every_older_client_is_proven_against_its_recorded_format() {
                     .then_some((AUTOMATION_RESPONSE, FIRING_REPLIES)),
                 (client.protocol < MODEL_EDGES_WITH_EFFECTS)
                     .then_some((SERVER_MESSAGE, MODEL_EDGES)),
+                (client.protocol < WORK_CHECK_COUNTS)
+                    .then_some((WORK_RESPONSE, WORK_CHECK_REPLIES)),
+                (client.protocol < WORK_CHECK_COUNTS)
+                    .then_some((SERVER_MESSAGE, WORK_BOARD_MESSAGES)),
             ]
             .into_iter()
             .flatten()

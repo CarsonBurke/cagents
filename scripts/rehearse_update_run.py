@@ -1524,6 +1524,9 @@ class Rehearsal:
                     if matching:
                         _, status = self.cli('agent','status',matching[0]['agent']['id'],check=False)
                         entry['verified_status'] = status
+        # After the Codex startup check: seeding takes minutes, longer than its turn.
+        if args.scale_chats:
+            self.seed_scale(args, seed)
         # Verify each spawn against OLD's actual inventories, including chat titles.
         _, session_list = self.cli('sessions','--all',check=False)
         _, agent_list = self.cli('agent','list',check=False)
@@ -1583,6 +1586,91 @@ class Rehearsal:
         print(f'Seed evidence: {self.root}/seeds.json')
         return bool(self.errors or any(e.get('exit') for e in evidence if e['state'] != 'old-prepare-refusal'))
 
+    def wait_agent_slot(self, deadline):
+        """Wait until the daemon will accept another agent started by the person.
+
+        It runs at most MAX_PARENT_RUNNING (8) such agents at once
+        (src/agent_execution.rs); the seed's own chats hold some slots for good.
+        """
+        while True:
+            _, listing = self.cli('agent','list',check=False)
+            active = sum(row.get('agent',{}).get('origin') == 'User'
+                         and (state in ('accepted','running','waiting')
+                              or state == 'interrupted' and not row.get('agent',{}).get('closed'))
+                         for row in listing.get('data',{}).get('agents',[])
+                         for state in [str(row.get('state','')).lower()])
+            if active < 8:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(.5)
+
+    def seed_scale(self, args, seed):
+        """Open many long, idle conversations, as a daemon left running for days holds.
+
+        Every third is Codex. Each first turn replays the requested history,
+        then settles, so the update sees idle chats with long pages rather
+        than working agents. The fixture switches apply only to conversations
+        started here: they are removed once every scale chat is idle.
+        """
+        claude = self.root/'home/.claude'
+        switches = {claude/'fixture-long-history': f'{args.scale_entries} {args.scale_bytes}\n',
+                    claude/'fixture-first-turn-seconds': '1\n'}
+        codex = self.root/'codex-fixture.json'
+        original = codex.read_text() if codex.exists() else None
+        names = [f'scale-{index+1}' for index in range(args.scale_chats)]
+        started = time.monotonic()
+        try:
+            for path, text in switches.items():
+                path.write_text(text)
+            settings = json.loads(original) if original else {}
+            codex.write_text(json.dumps({**settings, 'history': [args.scale_entries, args.scale_bytes]},
+                                        sort_keys=True)+'\n')
+            # One channel per project keeps the seeded channels on screen,
+            # where the native chat capture finds them by their labels.
+            channels = []
+            for project in ('alpha','beta'):
+                entry = seed(f'scale-channel-{project}', ['channel','spawn','--repository',
+                                                          str(self.root/'home/src'/project),
+                                                          '--title',f'Scale {project}'])
+                channels.append(entry['response']['data']['channel']['id'])
+            for index, name in enumerate(names):
+                provider = 'codex' if index % 3 == 0 else 'claude'
+                if not self.wait_agent_slot(deadline=time.monotonic()+120):
+                    self.errors.append(f'no agent slot freed within 120s; opened {index} of {len(names)} scale chats')
+                    names = names[:index]
+                    break
+                seed(f'scale-chat-{index+1}', ['agent','spawn','--provider',provider,'--surface','chat',
+                                               '--name',name,'--channel',channels[index % 2],
+                                               f'Scale conversation {index+1}'],
+                     ('alpha','beta')[index % 2])
+            deadline = time.monotonic()+120+2*len(names)
+            while True:
+                _, listing = self.cli('agent','list',check=False)
+                states = {row['agent'].get('name'): str(row.get('state','')).lower()
+                          for row in listing.get('data',{}).get('agents',[])}
+                # A chat's run is its first turn: Succeeded once that settles.
+                pending = [name for name in names if states.get(name) != 'succeeded']
+                if not pending:
+                    break
+                if time.monotonic() >= deadline or any(states.get(name) in ('failed','cancelled','interrupted')
+                                                       for name in pending):
+                    self.errors.append(f'{len(pending)} scale chats did not finish their first turn, such as '
+                                       + ', '.join(f'{name} ({states.get(name)})' for name in pending[:5]))
+                    break
+                time.sleep(2)
+        finally:
+            for path in switches:
+                path.unlink(missing_ok=True)
+            if original is None:
+                codex.unlink(missing_ok=True)
+            else:
+                codex.write_text(original)
+        (self.root/'scale-seed.json').write_text(json.dumps({
+            'chats': len(names), 'codex': len(names[::3]), 'entries': args.scale_entries,
+            'entry_bytes': args.scale_bytes, 'seconds': round(time.monotonic()-started, 1)},
+            indent=2, sort_keys=True)+'\n')
+
     def run(self, args):
         import signal
         def interrupted(signum, frame):
@@ -1641,7 +1729,7 @@ class Rehearsal:
             self.call('launch','main')
             self.call('launch','second')
             self.wait_windows(['main','second'])
-            code, _ = self.call('seed', *seed_flags(args), timeout=180, check=False)
+            code, _ = self.call('seed', *seed_flags(args), timeout=180+6*args.scale_chats, check=False)
             if code:
                 self.errors.append('seed verification failed; see seeds.json')
             if args.natural_idle:
@@ -1844,10 +1932,19 @@ def seed_options(parser):
     parser.add_argument('--no-child',action='store_true')
     for flag in ('ignore-term','no-init','exit-mid-turn','uncarryable','unreachable'):
         parser.add_argument('--'+flag,action='store_true')
+    parser.add_argument('--scale-chats',type=int,default=0,metavar='N',
+                        help='also open N idle chats with long transcripts, every third Codex, as a long-running daemon holds')
+    parser.add_argument('--scale-entries',type=int,default=400,metavar='COUNT',
+                        help='earlier messages each scale chat replays (default 400)')
+    parser.add_argument('--scale-bytes',type=int,default=1536,metavar='BYTES',
+                        help='approximate size of each replayed message (default 1536)')
 
 
 def seed_flags(args):
     flags = ['--untitled',str(args.untitled)]
+    if args.scale_chats:
+        flags += ['--scale-chats',str(args.scale_chats),'--scale-entries',str(args.scale_entries),
+                  '--scale-bytes',str(args.scale_bytes)]
     for flag in ('no_codex','no_console','no_child','ignore_term','no_init','exit_mid_turn','uncarryable','unreachable'):
         if getattr(args,flag):
             flags.append('--'+flag.replace('_','-'))
@@ -1910,6 +2007,10 @@ def main():
     if args.command == 'run' and requires_working(args) and (args.yes or any(
             flag=='--yes' or flag.startswith('--yes=') for flag in args.upgrade_arg)):
         parser.error('working cases forbid --yes because the actual working choice must be observed')
+    if args.command in ('run','seed') and (args.scale_chats < 0 or args.scale_entries < 0 or args.scale_bytes < 0):
+        parser.error('--scale-chats, --scale-entries and --scale-bytes must not be negative')
+    if args.command == 'run' and args.scale_chats and (requires_working(args) or args.natural_idle):
+        parser.error('--scale-chats takes minutes to seed, longer than the Codex turn a working or natural-idle case observes')
     if args.command == 'run' and not 0 < args.codex_pause <= 300:
         parser.error('--codex-pause must be between 0 and 300 seconds')
     if args.command=='run' and args.stall_window_after_flush is None and (

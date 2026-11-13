@@ -10,8 +10,9 @@ use crate::{
     agent::{ActivityState, Provider},
     model::TerminalId,
     work::{
-        Activity, ActivitySource, Board, Checks, Column, Forge, Head, Item, ItemKey, LinearTicket,
-        Project, PullRequest, PullRequestState, Review, Session, TicketSource, Worktree,
+        Activity, ActivitySource, Board, CheckState, Checks, Column, Forge, Head, Item, ItemKey,
+        LinearTicket, Project, PullRequest, PullRequestState, Review, Session, TicketSource,
+        Worktree,
     },
 };
 
@@ -320,11 +321,13 @@ pub(super) fn convert(
     let checks = pull_request.status_check_rollup.as_ref().map(|_| {
         let mut checks = Checks::default();
         for check in pull_request.check_summaries() {
-            match check.bucket.0.as_str() {
-                "pass" => checks.passed += 1,
-                "fail" => checks.failed += 1,
-                "pending" => checks.pending += 1,
-                _ => {}
+            match check.work_state() {
+                Some(CheckState::Passed) => checks.passed += 1,
+                Some(CheckState::Failed) => checks.failed += 1,
+                Some(CheckState::Pending) => checks.pending += 1,
+                Some(CheckState::Cancelled) => checks.cancelled += 1,
+                Some(CheckState::Skipped) => checks.skipped += 1,
+                None => {}
             }
         }
         checks
@@ -711,6 +714,76 @@ mod tests {
             board.items[0].last_activity.unwrap().source,
             ActivitySource::Session
         );
+    }
+
+    #[test]
+    fn rollup_counts_actual_states_including_cancellation_and_skips() {
+        let states = [
+            ("SUCCESS", "COMPLETED"),
+            ("NEUTRAL", "COMPLETED"),
+            ("SKIPPED", "COMPLETED"),
+            ("CANCELLED", "COMPLETED"),
+            ("FAILURE", "COMPLETED"),
+            ("TIMED_OUT", "COMPLETED"),
+            ("ACTION_REQUIRED", "COMPLETED"),
+            ("STARTUP_FAILURE", "COMPLETED"),
+            ("STALE", "COMPLETED"),
+            ("SUCCESS", "IN_PROGRESS"),
+            ("", "QUEUED"),
+            ("", "UNKNOWN"),
+        ];
+        let mut pr = pull_request("feature", "oid", "OPEN", false);
+        pr.status_check_rollup = Some(
+            states
+                .into_iter()
+                .map(|(conclusion, status)| {
+                    serde_json::from_value(serde_json::json!({
+                        "__typename": "CheckRun", "name": conclusion,
+                        "status": status, "conclusion": conclusion,
+                    }))
+                    .unwrap()
+                })
+                .chain([serde_json::from_value(serde_json::json!({
+                    "__typename": "StatusContext", "context": "legacy", "state": "ERROR",
+                }))
+                .unwrap()])
+                .collect(),
+        );
+        assert_eq!(
+            convert(&pr, true).checks,
+            Some(Checks {
+                passed: 2,
+                failed: 6,
+                pending: 2,
+                cancelled: 1,
+                skipped: 1,
+            })
+        );
+        for (conclusion, expected) in [
+            (
+                "CANCELLED",
+                Checks {
+                    cancelled: 1,
+                    ..Default::default()
+                },
+            ),
+            (
+                "SKIPPED",
+                Checks {
+                    skipped: 1,
+                    ..Default::default()
+                },
+            ),
+        ] {
+            pr.status_check_rollup = Some(vec![
+                serde_json::from_value(serde_json::json!({
+                    "__typename": "CheckRun", "name": "ci", "status": "COMPLETED",
+                    "conclusion": conclusion,
+                }))
+                .unwrap(),
+            ]);
+            assert_eq!(convert(&pr, true).checks, Some(expected));
+        }
     }
 
     #[test]
