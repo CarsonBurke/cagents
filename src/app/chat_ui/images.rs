@@ -1110,7 +1110,6 @@ impl Runtime {
             design::caption(format!("{label} · Click to enlarge")).into(),
         ])
         .spacing(step::GAP_XS)
-        .width(Length::Fill)
         .into()
     }
 }
