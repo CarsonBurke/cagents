@@ -304,8 +304,8 @@ scripts/native-evidence stop
 
 `wide` prepares the conversation and captures its active empty, expanded, and
 updated live reasoning. `narrow` reuses that conversation, opens an unsent
-blank thread with Ctrl+T, then uses Alt+1/Alt+2 to focus each pane and Alt+R
-to select one-third width preferences (three cycles on the existing chat,
+blank thread with Ctrl+T, focuses each pane through its native tab, and uses
+Alt+R to select one-third width preferences (three cycles on the existing chat,
 one on the new draft). They share the workspace into roughly 270px
 panes, with the inspector still docked. It captures the first conversation
 collapsed and expanded; the blank thread sends no prompt and starts no

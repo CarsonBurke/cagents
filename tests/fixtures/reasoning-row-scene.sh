@@ -59,13 +59,13 @@ expanded_shot() {
     local row
     row=$(first_reasoning_row)
     evidence drive click "$row" >/dev/null
-    evidence drive wait 'new setting' --timeout 15 >/dev/null
+    evidence drive wait afterward --timeout 15 >/dev/null
     shot "$1"
     # Expanding in a narrow pane can move the header as its scroll anchor
     # settles. Locate it again rather than clicking the old body position.
     row=$(first_reasoning_row)
     evidence drive click "$row" >/dev/null
-    evidence drive wait 'new setting' --gone --timeout 15 >/dev/null
+    evidence drive wait afterward --gone --timeout 15 >/dev/null
 }
 
 if [ "$scene" = narrow ]; then
@@ -77,19 +77,24 @@ if [ "$scene" = narrow ]; then
     # width; a new draft in this compact workspace stores a full-width choice.
     evidence drive key ctrl+t >/dev/null
     sleep 2
+    # This scene fixes the window at 1200x900. Focus its native tabs directly
+    # so nested-compositor shortcuts cannot type into the empty draft.
     # While its neighbour stays full, cycling the first pane advances its
     # stored preference: half -> two thirds -> full -> one third. The second
     # pane then needs one cycle from full to one third; the pair fits and the
     # strip expands their spare space equally.
-    evidence drive key alt+1 >/dev/null
+    evidence drive click 390,22 >/dev/null
+    sleep 1
     for _ in 1 2 3; do
         evidence drive key alt+r >/dev/null
         sleep 1
     done
-    evidence drive key alt+2 >/dev/null
+    evidence drive click 650,22 >/dev/null
+    sleep 1
     evidence drive key alt+r >/dev/null
     sleep 1
-    evidence drive key alt+1 >/dev/null
+    evidence drive click 390,22 >/dev/null
+    sleep 1
     sleep 1
     shot reasoning-narrow-working
     expanded_shot reasoning-narrow-expanded
