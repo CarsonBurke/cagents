@@ -2466,6 +2466,10 @@ impl Actor {
             .stderr
             .take()
             .ok_or("Provider stderr unavailable")?;
+        // Every stdout read and stdin write below pokes the scope.
+        if let Some(scope) = self.child.as_ref().and_then(|c| c.scope.as_ref()) {
+            scope.reports_activity();
+        }
         nonblocking(&stdin)?;
         nonblocking(&stdout)?;
         nonblocking(&stderr)?;
@@ -2729,6 +2733,9 @@ impl Actor {
                     match stdin.write(&line[self.offset..]) {
                         Ok(0) => return Err("Provider closed stdin".into()),
                         Ok(n) => {
+                            // Input can start a command before any output,
+                            // such as a hook run on a submitted prompt.
+                            self.poke_scope();
                             self.offset += n;
                             self.queued -= n;
                             if self.offset == line.len() {
@@ -2760,9 +2767,7 @@ impl Actor {
                         reserve_frame(&mut self.output, n)?;
                         self.output.extend_from_slice(&buffer[..n]);
                         // Output often announces a command: move it soon.
-                        if let Some(scope) = self.child.as_ref().and_then(|c| c.scope.as_ref()) {
-                            scope.poke();
-                        }
+                        self.poke_scope();
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(e) => return Err(format!("Provider stdout: {e}")),
@@ -2785,6 +2790,14 @@ impl Actor {
             }
         }
     }
+    /// The provider read input or wrote output, so it may be about to start
+    /// a command: move it to a leaf of its own soon.
+    fn poke_scope(&self) {
+        if let Some(scope) = self.child.as_ref().and_then(|c| c.scope.as_ref()) {
+            scope.poke();
+        }
+    }
+
     /// Say so when the system stopped one of the provider's commands
     /// because memory ran out. The provider is still running.
     fn report_command_stops(&mut self) {
