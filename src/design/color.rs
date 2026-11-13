@@ -78,6 +78,14 @@ pub fn component_base(theme: &Theme) -> Color {
     theme.current_container().component.base.into()
 }
 
+/// The fill of a pane on COSMIC's Primary layer, such as the docked
+/// navigation pane: [`docked_primary`] and `Container::Primary`.
+///
+/// [`docked_primary`]: crate::design::docked_primary
+pub fn primary_base(theme: &Theme) -> Color {
+    theme.cosmic().primary(theme.transparent).base.into()
+}
+
 /// The fill of a `Dialog` container.
 pub fn dialog_base(theme: &Theme) -> Color {
     theme.cosmic().primary(theme.transparent).base.into()
