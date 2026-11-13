@@ -1353,6 +1353,66 @@ fn bounded_allocation() {
         self.assertIn("applied fixes to 1 file", result.stderr)
         self.assertFalse((self.root / "local-build").exists())
 
+    def test_what_a_test_writes_in_the_checkout_there_comes_back(self):
+        # As a recording test writes its fixture into the checkout it ran in.
+        # The test also stands in for edits here while it runs: this host is
+        # the stand-in build host, so it can write the checkout here directly.
+        here = json.dumps(str(self.crate))
+        (self.crate / "src/main.rs").write_text(textwrap.dedent("""
+            fn main() {}
+            #[test]
+            fn records() {
+                if std::env::var_os("CAGENTS_PROBE_RECORD").is_none() {
+                    return;
+                }
+                let there = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+                let here = std::path::Path::new(HERE);
+                std::fs::create_dir_all(there.join("fixtures/wire")).unwrap();
+                std::fs::write(there.join("fixtures/wire/129.json"), "recorded\\n").unwrap();
+                std::fs::write(there.join("notes.txt"), "updated\\n").unwrap();
+                std::fs::write(there.join("scratch.log"), "ignored\\n").unwrap();
+                std::fs::write(there.join("edited.txt"), "there\\n").unwrap();
+                std::fs::write(here.join("edited.txt"), "edited here\\n").unwrap();
+                std::fs::write(there.join("raced.txt"), "there\\n").unwrap();
+                std::fs::write(here.join("raced.txt"), "made here\\n").unwrap();
+                assert!(std::env::var_os("CAGENTS_PROBE_FAIL").is_none(), "failing as asked");
+            }
+        """).replace("HERE", here))
+        (self.crate / ".gitignore").write_text("/target\n*.log\n")
+        (self.crate / "notes.txt").write_text("original\n")
+        (self.crate / "edited.txt").write_text("original\n")
+        result = self.gate_run("test", env=self.remote_env())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("took back", result.stderr)
+        self.assertFalse((self.crate / "fixtures").exists())
+        self.assertEqual((self.crate / "notes.txt").read_text(), "original\n")
+
+        for failing in (False, True):
+            with self.subTest(failing=failing):
+                for name in ("fixtures", "scratch.log", "raced.txt"):
+                    shutil.rmtree(self.crate / name, ignore_errors=True)
+                    with contextlib.suppress(FileNotFoundError):
+                        (self.crate / name).unlink()
+                (self.crate / "notes.txt").write_text("original\n")
+                (self.crate / "edited.txt").write_text("original\n")
+                env = self.remote_env() | {"CAGENTS_PROBE_RECORD": "1"}
+                if failing:
+                    env["CAGENTS_PROBE_FAIL"] = "1"
+                result = self.gate_run("test", env=env)
+                self.assertEqual(result.returncode, 101 if failing else 0,
+                                 result.stdout + result.stderr)
+                self.assertEqual((self.crate / "fixtures/wire/129.json").read_text(), "recorded\n")
+                self.assertEqual((self.crate / "notes.txt").read_text(), "updated\n")
+                self.assertIn("took back what the command wrote here", result.stderr)
+                # Ignored here, so left there.
+                self.assertFalse((self.crate / "scratch.log").exists())
+                # What changed or appeared here meanwhile is newer.
+                self.assertEqual((self.crate / "edited.txt").read_text(), "edited here\n")
+                self.assertEqual((self.crate / "raced.txt").read_text(), "made here\n")
+                self.assertIn("not taking edited.txt", result.stderr)
+                self.assertIn("not taking raced.txt", result.stderr)
+                self.assertFalse((self.root / "local-build").exists())
+
     def test_commands_that_compile_nothing_run_here_and_others_are_refused(self):
         result = self.gate_run("metadata", "--format-version", "1", "--no-deps", env=self.remote_env())
         self.assertEqual(result.returncode, 0, result.stderr)
