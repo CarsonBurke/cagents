@@ -1889,6 +1889,7 @@ fn execute(shared: Arc<Shared>, permit: impl Into<Permit>) -> Result<Prepared, S
             request,
             parsed: Parsed::default(),
             document: prose_document::Data::snapshot(&markdown::Content::default()),
+            reasoning: None,
             prompt: Some(prompt),
             literal: None,
             links: Box::default(),

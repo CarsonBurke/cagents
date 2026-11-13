@@ -5575,10 +5575,8 @@ impl Runtime {
                         .class(cosmic::theme::Text::Custom(design::muted_text))
                         .wrapping(iced::widget::text::Wrapping::None),
                 )
-                .direction(widget::scrollable::Direction::Horizontal(
-                    widget::scrollable::Scrollbar::new()
-                        .width(0)
-                        .scroller_width(0),
+                .direction(iced::widget::scrollable::Direction::Horizontal(
+                    iced::widget::scrollable::Scrollbar::hidden(),
                 ))
                 .width(Length::Fill)
                 .height(design::LINE_BODY),
