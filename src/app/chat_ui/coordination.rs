@@ -622,9 +622,9 @@ fn spawn_details(reading: &Coordination, spawn: &Spawn, observed_model: Option<&
 
 /// How many characters of an agent's name a row shows.
 const LABEL_CHARS: usize = 40;
-/// The width an openable row's arrow takes beside it: the glyph, its
-/// padding and the gap before it.
-const ARROW_ROOM: f32 = 14.0 + 3.0 * step::GAP_XS;
+/// The room a row keeps at its trailing edge for the open arrow: the glyph
+/// and the gap before it.
+const ARROW_ROOM: f32 = 14.0 + step::GAP_S;
 /// How much of a message a row's tooltip shows.
 const TIP_CHARS: usize = 600;
 const TIP_LINES: usize = 12;
@@ -1169,35 +1169,41 @@ impl Runtime {
                 crate::interaction::tooltip(content, tip.clone())
             }
         };
+        // Every row keeps room for the open arrow at its trailing edge, so
+        // the statuses end in line whether or not a row opens.
+        let padding = iced::Padding {
+            top: step::GAP_XS,
+            bottom: step::GAP_XS,
+            left: step::GAP_S,
+            right: step::GAP_S + ARROW_ROOM,
+        };
         let row: Element<'static, Message> = match row.open {
             Some(open) => {
-                let open = action(open);
                 let button = widget::button::custom(content)
                     .name(name)
                     .class(crate::ui_controls::control_style(false, None))
-                    .padding([step::GAP_XS as u16, step::GAP_S as u16])
+                    .padding(padding)
                     .width(Length::Fill)
-                    .on_press(open.clone());
-                // The way in, shown where the pointer or focus is. It only
-                // marks the row as one that opens: the row is the control, so
-                // keyboard traversal and screen readers meet it once.
-                let arrow = iced::widget::mouse_area(
-                    widget::container(muted_glyph(Icon::Jump)).padding(step::GAP_XS as u16),
-                )
-                .interaction(iced::mouse::Interaction::Pointer)
-                .on_press(open);
-                hover::view(tipped(button.into()), arrow, step::GAP_XS)
+                    .on_press(action(open));
+                // The way in, drawn inside the row's highlight where the
+                // pointer is. It only marks the row as one that opens: the row
+                // is the control, so a click on the arrow is a click on the
+                // row, and keyboard traversal and screen readers meet it once.
+                let arrow = widget::container(muted_glyph(Icon::Jump))
+                    .padding(iced::Padding {
+                        right: step::GAP_S,
+                        ..iced::Padding::ZERO
+                    })
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .align_x(iced::alignment::Horizontal::Right)
+                    .align_y(iced::alignment::Vertical::Center);
+                hover::over(tipped(button.into()), arrow)
             }
-            // An agent this conversation cannot open is only described. It
-            // keeps the arrow's room, so every row's status ends in line.
+            // An agent this conversation cannot open is only described.
             None => tipped(
                 widget::container(content)
-                    .padding(iced::Padding {
-                        top: step::GAP_XS,
-                        bottom: step::GAP_XS,
-                        left: step::GAP_S,
-                        right: step::GAP_S + ARROW_ROOM,
-                    })
+                    .padding(padding)
                     .width(Length::Fill)
                     .into(),
             ),
