@@ -213,6 +213,51 @@ class Comparison(unittest.TestCase):
                 mutate(before, after)
                 self.assertTrue(any(row["regression"] for row in records.compare(before, after)))
 
+    @staticmethod
+    def strip(snapshot: dict, store: str, ordinals: dict) -> None:
+        rows = snapshot["stores"].setdefault(store, {"rows": {"cards": []}})["rows"]
+        rows["cards"] = [{"card_id": card, "workspace_id": "workspace", "ordinal": ordinal,
+                          "kind_tag": "chat", "title": card, "existence": "open"}
+                         for card, ordinal in ordinals.items()]
+
+    def pane_changes(self, before: dict, after: dict) -> list:
+        return [(row["id"].rpartition(":")[2], row["change"], row["regression"])
+                for row in records.compare(before, after) if row["kind"] == "panes"]
+
+    def test_a_window_closing_a_hole_in_its_pane_ordinals_keeps_their_order(self):
+        before, after = snapshot(), snapshot()
+        store = "windows/second/sessions.sqlite3"
+        self.strip(before, store, {"a": 0, "b": 1, "c": 3, "d": 4})
+        self.strip(after, store, {"a": 0, "b": 1, "c": 2, "d": 3})
+        self.assertEqual(self.pane_changes(before, after), [])
+
+    def test_a_reordered_pane_strip_is_a_regression(self):
+        before, after = snapshot(), snapshot()
+        store = "windows/second/sessions.sqlite3"
+        self.strip(before, store, {"a": 0, "b": 1, "c": 2})
+        self.strip(after, store, {"a": 0, "b": 2, "c": 1})
+        self.assertEqual(self.pane_changes(before, after),
+                         [("b", "position", True), ("c", "position", True)])
+
+    def test_a_lost_or_added_pane_does_not_shift_the_panes_after_it(self):
+        before, after = snapshot(), snapshot()
+        store = "windows/second/sessions.sqlite3"
+        self.strip(before, store, {"a": 0, "lost": 1, "b": 2, "c": 3})
+        self.strip(after, store, {"a": 0, "b": 1, "added": 2, "c": 3})
+        self.assertEqual(self.pane_changes(before, after),
+                         [("lost", "disappeared", True), ("added", "added", False)])
+
+    def test_each_window_store_orders_its_own_panes(self):
+        before, after = snapshot(), snapshot()
+        # The main store keeps its shell at ordinal 0; the second store's panes
+        # sort after it numerically but are ranked only among themselves.
+        self.strip(before, "windows/second/sessions.sqlite3", {"a": 5, "b": 7})
+        self.strip(after, "windows/second/sessions.sqlite3", {"a": 0, "b": 1})
+        self.assertEqual(self.pane_changes(before, after), [])
+        self.strip(after, "windows/second/sessions.sqlite3", {"a": 1, "b": 0})
+        self.assertEqual(self.pane_changes(before, after),
+                         [("a", "position", True), ("b", "position", True)])
+
     def test_verified_pause_still_requires_saved_pane_and_original_terminal_child(self):
         before, after = self.paused_replacement()
         after["stores"]["windows/main/sessions.sqlite3"]["rows"]["cards"].pop()

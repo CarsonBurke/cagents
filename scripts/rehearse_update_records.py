@@ -911,7 +911,7 @@ def project(row: dict, name: str) -> dict:
         "sessions": ("id", "surface", "provider", "title", "channel", "state", "failure", "directory"),
         "channels": ("title", "name", "repository", "state", "closed"),
         "projects": ("name", "repository", "state", "closed"),
-        "panes": ("workspace_id", "ordinal", "title", "kind_tag", "existence", "terminal_id", "session_id"),
+        "panes": ("workspace_id", "position", "title", "kind_tag", "existence", "terminal_id", "session_id"),
     }[name]
     return {field: row[field] for field in fields if field in row}
 
@@ -933,6 +933,32 @@ def panes(snapshot: dict) -> dict:
                 card["session_id"] = content.get("id")
             result[f"{database}:{card['card_id']}"] = card
     return result
+
+
+def positioned(before: dict, after: dict) -> tuple[dict, dict]:
+    """Rank the panes both sides hold within their own window store and workspace.
+
+    A stored ordinal is a sort key, not a position: a window may leave holes in
+    it and closes them when it next saves its strip. What the user sees is the
+    order, so each pane is compared by its rank among the panes present on both
+    sides. A pane that appears or disappears is reported in its own right and
+    does not shift every pane after it.
+    """
+    shared = before.keys() & after.keys()
+    ranked = []
+    for side in (before, after):
+        groups: dict[tuple, list] = {}
+        for key in shared:
+            card = side[key]
+            database = key.rpartition(":")[0]
+            groups.setdefault((database, card.get("workspace_id")), []).append(key)
+        result = {key: dict(card) for key, card in side.items()}
+        for keys in groups.values():
+            keys.sort(key=lambda key: (side[key].get("ordinal", 0), side[key].get("card_id", key)))
+            for position, key in enumerate(keys):
+                result[key]["position"] = position
+        ranked.append(result)
+    return ranked[0], ranked[1]
 
 
 def verified_recovery(before: dict, after: dict) -> dict | None:
@@ -1166,8 +1192,10 @@ def compare(before: dict, after: dict) -> list[dict]:
         for error in snapshot["errors"]:
             changes.append({"kind": "evidence", "id": side, "change": str(error), "regression": True})
     for name in (*COLLECTIONS, "windows", "panes"):
-        left = panes(before) if name == "panes" else before[name]
-        right = panes(after) if name == "panes" else after[name]
+        if name == "panes":
+            left, right = positioned(panes(before), panes(after))
+        else:
+            left, right = before[name], after[name]
         for key, original in sorted(left.items()):
             session = original.get("agent", {}).get("session") if name == "agents" else None
             chat = session.get("Chat") if isinstance(session, dict) else None
