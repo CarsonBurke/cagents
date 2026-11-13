@@ -2195,5 +2195,55 @@ class FailedInitialization(unittest.TestCase):
                 call.assert_not_called()
 
 
+class WindowStallUnderLock(unittest.TestCase):
+    """The lock-held stall stops a real writer inside its final_flush append."""
+
+    WRITER = r"""
+import fcntl, json, os, sys, time
+log, lock = sys.argv[1:]
+descriptor = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+sys.stdin.read(1)
+fcntl.flock(descriptor, fcntl.LOCK_EX)
+with open(log, 'a') as stream:
+    stream.write(json.dumps({'pid': os.getpid(), 'at_unix_ms': 1,
+                             'event': {'kind': 'final_flush', 'complete': True}}) + '\n')
+time.sleep(.05)  # the append's sync_data and directory sync
+fcntl.flock(descriptor, fcntl.LOCK_UN)
+time.sleep(30)
+"""
+
+    def test_stop_lands_while_the_window_holds_its_diagnostics_lock(self):
+        with tempfile.TemporaryDirectory(prefix='ru-lock-', dir='/var/tmp') as directory:
+            root = Path(directory)
+            diagnostics = root/'home/.local/state/cagents/diagnostics'
+            diagnostics.mkdir(parents=True)
+            log, lock = diagnostics/'cagents-ui.0.jsonl', diagnostics/'cagents-ui.lock'
+            log.write_text('')
+            writer = subprocess.Popen([sys.executable, '-I', '-c', self.WRITER, str(log), str(lock)],
+                                      stdin=subprocess.PIPE, text=True)
+            self.addCleanup(writer.wait)
+            self.addCleanup(writer.kill)
+            descriptor = os.pidfd_open(writer.pid)
+            self.addCleanup(os.close, descriptor)
+            monitor = records.WindowCloseMonitor(root, 'main', under_lock=True)
+            monitor.pinned, monitor.pidfds = [{'pid': writer.pid}], [descriptor]
+            monitor.originals_by_pin = [{'argv': ['cagents-ui']}]
+            events = []
+            monitor.write = events.append
+            stall = threading.Thread(target=monitor.stall_after_flush)
+            stall.start()
+            time.sleep(.1)
+            writer.stdin.write('x')
+            writer.stdin.flush()
+            stall.join(10)
+            self.assertFalse(stall.is_alive())
+            [event] = events
+            self.assertEqual(event['event'], 'stalled_window_after_flush')
+            self.assertTrue(event['diagnostics_lock_held_before_stop'])
+            self.assertTrue(event['stopped_under_lock'], event)
+            self.assertEqual(records.WindowCloseMonitor.flock_holder(lock), writer.pid)
+            self.assertFalse(records.WindowCloseMonitor.diagnostics_unlocked(lock))
+
+
 if __name__ == "__main__":
     unittest.main()

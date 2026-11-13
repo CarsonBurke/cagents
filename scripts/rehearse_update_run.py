@@ -750,7 +750,8 @@ class Rehearsal:
         records=importlib.util.module_from_spec(spec)
         spec.loader.exec_module(records)
         with records.WindowCloseMonitor(self.root, getattr(self, 'stall_window_after_flush', None),
-                getattr(self, 'stall_suppress_flush', False), getattr(self, 'stall_resume_after', None)) as monitor:
+                getattr(self, 'stall_suppress_flush', False), getattr(self, 'stall_resume_after', None),
+                getattr(self, 'stall_under_lock', False)) as monitor:
             result=self.call('update',*args,timeout=300,check=False)
             monitor.command_exit=result[0]
             if any(flag in args for flag in ('--require-working','--require-idle')) and (
@@ -1660,6 +1661,7 @@ class Rehearsal:
             self.stall_window_after_flush = args.stall_window_after_flush
             self.stall_suppress_flush = args.stall_suppress_flush
             self.stall_resume_after = args.stall_resume_after
+            self.stall_under_lock = args.stall_under_lock
             code, _ = self.observed_update(args.new_dir,args.new_version,args.new_installer,*update_args)
             self.finish_checkpoint_watch()
             if args.natural_idle:
@@ -1868,6 +1870,7 @@ def main():
     run.add_argument('--codex-pause',type=float,default=6,help='offline Codex turn pause in seconds (maximum 300)')
     run.add_argument('--stall-window-after-flush',metavar='SLOT',help='injected fault: SIGSTOP that source window (main or a --window slot) once it records final_flush complete=true, so it lingers holding its slot as a1 did')
     run.add_argument('--stall-suppress-flush',action='store_true',help='injected fault, with --stall-window-after-flush: also remove that final_flush record, so the update cannot prove the save')
+    run.add_argument('--stall-under-lock',action='store_true',help='injected fault, with --stall-window-after-flush: SIGSTOP the window while its final_flush append still holds the diagnostics lock; the trace records whether the stop landed under it')
     run.add_argument('--stall-resume-after',type=float,metavar='SECONDS',help='injected fault, with --stall-window-after-flush: SIGCONT the stalled window after this long')
     run.add_argument('--codex-never-confirm-interrupt',action='store_true',help='offline peer acknowledges interrupt without settling the turn')
     run.add_argument('--codex-never-confirm-close',action='store_true',help='offline peer retains its connection to force Prepared recovery')
@@ -1896,6 +1899,9 @@ def main():
         parser.error('working cases forbid --yes because the actual working choice must be observed')
     if args.command == 'run' and not 0 < args.codex_pause <= 300:
         parser.error('--codex-pause must be between 0 and 300 seconds')
+    if args.command=='run' and args.stall_window_after_flush is None and (
+            args.stall_suppress_flush or args.stall_under_lock or args.stall_resume_after is not None):
+        parser.error('--stall-suppress-flush, --stall-under-lock and --stall-resume-after require --stall-window-after-flush')
     if args.command == 'run' and args.plain_restart and (args.expect_refusal or args.fail_new_daemon):
         parser.error('--plain-restart requires a successful recovery scenario')
     if args.command == 'run' and args.expect_console_refusal and (not args.fail_new_daemon or args.no_console):

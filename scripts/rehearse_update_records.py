@@ -229,8 +229,12 @@ def window_slot(row):
 
 class WindowCloseMonitor:
     """Bounded diagnostic observer; phase samples never assert a commit ACK."""
-    def __init__(self, root: Path, stall_slot=None, suppress_flush=False, resume_after=None):
+    def __init__(self, root: Path, stall_slot=None, suppress_flush=False, resume_after=None,
+                 under_lock=False):
         self.root = root
+        # With under_lock the window is stopped between its final_flush write
+        # and the release of its diagnostics lock, so it keeps holding that lock.
+        self.under_lock = under_lock
         # With suppress_flush the stalled window's final_flush record is also
         # removed, as if it were never written or had rotated away; with
         # resume_after it is continued that many seconds after stopping.
@@ -387,14 +391,26 @@ class WindowCloseMonitor:
                 event = record.get('event') or {}
                 if record.get('pid') == row['pid'] and event.get('kind') == 'final_flush' \
                         and event.get('complete') is True:
-                    # Stop it after its append released the diagnostics lock:
-                    # the fault is a window that stalled once its save finished.
-                    lock_free = self.wait_diagnostics_unlocked(log.with_name('cagents-ui.lock'))
+                    lock = log.with_name('cagents-ui.lock')
+                    if self.under_lock:
+                        # The record is visible while the append still syncs it
+                        # under the lock: stop the window only if the lock is held.
+                        held = not self.diagnostics_unlocked(lock)
+                        result = {'diagnostics_lock_held_before_stop': held}
+                    else:
+                        # Stop it after its append released the diagnostics lock:
+                        # the fault is a window that stalled once its save finished.
+                        result = {'diagnostics_lock_free_before_stop':
+                                  self.wait_diagnostics_unlocked(lock)}
                     try:
                         signal.pidfd_send_signal(descriptor, signal.SIGSTOP)
-                        result = {'stopped': True, 'diagnostics_lock_free_before_stop': lock_free}
+                        result['stopped'] = True
                     except OSError as error:
-                        result = {'stopped': False, 'error': str(error)}
+                        result.update(stopped=False, error=str(error))
+                    if self.under_lock and result['stopped']:
+                        # Only the stopped window's own lock proves the stop landed under it.
+                        result['stopped_under_lock'] = self.stopped(row['pid']) \
+                            and self.flock_holder(lock) == row['pid']
                     if self.suppress_flush:
                         result['suppressed_flush_record'] = self.remove_record(log, line)
                     self.write({'event': 'stalled_window_after_flush', 'injected_fault': True,
@@ -412,26 +428,66 @@ class WindowCloseMonitor:
                                     'slot': self.stall_slot, 'pid': row['pid'],
                                     'monotonic': time.monotonic(), 'wall_time': time.time(), **resumed})
                     return
-            time.sleep(.002)
+            # Waiting for a lock-held stop must not miss the append's sync window.
+            time.sleep(.0002 if self.under_lock else .002)
 
     @staticmethod
-    def wait_diagnostics_unlocked(lock, bound=1.0):
+    def diagnostics_unlocked(lock):
+        """One LOCK_SH|LOCK_NB probe: False while any writer holds the lock."""
+        try:
+            descriptor = os.open(lock, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except FileNotFoundError:
+            return True
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            return True
+        except BlockingIOError:
+            return False
+        finally:
+            os.close(descriptor)
+
+    @classmethod
+    def wait_diagnostics_unlocked(cls, lock, bound=1.0):
+        deadline = time.monotonic() + bound
+        while time.monotonic() < deadline:
+            if cls.diagnostics_unlocked(lock):
+                return True
+            time.sleep(.001)
+        return False
+
+    @staticmethod
+    def stopped(pid, bound=1.0):
+        """Wait until SIGSTOP has taken effect, so a held lock stays held."""
         deadline = time.monotonic() + bound
         while time.monotonic() < deadline:
             try:
-                descriptor = os.open(lock, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
-            except FileNotFoundError:
+                stat_line = Path(f'/proc/{pid}/stat').read_text()
+            except OSError:
+                return False
+            if stat_line.rpartition(')')[2].split()[0] in ('T', 't'):
                 return True
-            try:
-                fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
-                return True
-            except BlockingIOError:
-                pass
-            finally:
-                os.close(descriptor)
             time.sleep(.001)
         return False
+
+    @staticmethod
+    def flock_holder(lock, locks=Path('/proc/locks')):
+        """The pid holding an exclusive flock on LOCK's inode, from /proc/locks."""
+        try:
+            info = lock.stat()
+        except FileNotFoundError:
+            return None
+        # /proc/locks names the superblock device, which differs from st_dev on
+        # btrfs subvolumes; callers compare the holder with their own pid.
+        inode = f':{info.st_ino}'
+        holders = set()
+        for line in locks.read_text().splitlines():
+            fields = line.split()
+            # '1: FLOCK  ADVISORY  WRITE 1234 00:1e:5678 0 EOF'; blocked waiters carry '->'.
+            if '->' not in fields and len(fields) >= 6 and fields[1] == 'FLOCK' \
+                    and fields[3] == 'WRITE' and fields[5].endswith(inode):
+                holders.add(int(fields[4]))
+        return holders.pop() if len(holders) == 1 else None
 
     def remove_record(self, log, line):
         """Rewrite the private log without one record, keeping its mode."""
