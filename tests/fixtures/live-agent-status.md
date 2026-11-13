@@ -13,16 +13,20 @@ workers, a Planner paused on a rate limit, a Soak agent waiting on background
 work, a fresh failed rollback check, and an agent explicitly killed by its lead.
 Worker 1 launches a nested helper in its own transcript.
 
-`live-agent-status-multiple.jsonl` is a follow-up turn adding two failed agents
-with the same unnamed `general-purpose` kind and different task descriptions.
-One task description is long enough to exercise clipping in a narrow view.
-The previous rollback failure remains current, making three failures to choose
-from. Neither task fabricates child prose: the diagnostic comes only from the
+`live-agent-status-multiple.jsonl` is a follow-up turn that retries rollback
+with the same provider agent ID and a new tool call, then reports a fresh
+failure. It adds two more failed agents with the same unnamed
+`general-purpose` kind and different task descriptions. One task description
+is long enough to exercise clipping in a narrow view. These three fresh
+failures are current after the actual user prompt retired the preceding turn's
+failure. None fabricates child prose: the diagnostic comes only from the
 realistic task-notification result.
 
 `live-agent-status-long.jsonl` then resumes and completes the rollback and
-signature checks. Only the long recovery task remains failed, so the status
-row itself must fade its full single-failure description within one line.
+signature checks. It resumes the recovery audit with its same provider ID and
+a new tool call, and reports a fresh failure in this turn. Only that long
+recovery task is currently failed, so the status row itself must fade its full
+single-failure description within one line.
 
 After loading history, no agent has evidence of current work. After the live
 phase, the direct conversation depends on three working agents, one paused
@@ -44,6 +48,16 @@ through the native Resume picker before sending the live prompt. A repeated
 seed refuses to overwrite the existing transcript. Native-evidence starts each
 side from a fresh fixture unless a seed was explicitly saved.
 
+The scene reads its JSONL and seed script from beside itself. Set
+`CAGENTS_EVIDENCE_COMMAND` to an executable `native-evidence` path to run a
+prepared copy of the scene outside the repository tool checkout. The default
+is `../../scripts/native-evidence` relative to the scene. For example:
+
+```sh
+CAGENTS_EVIDENCE_COMMAND="$tool/scripts/native-evidence" \
+CAGENTS_EVIDENCE_TASK="$task" "$task/scene/live-agent-status-scene.sh"
+```
+
 A remote pair steps file can contain:
 
 ```sh
@@ -57,7 +71,8 @@ and the result of clicking the failure, including expansion of its notification
 diagnostic. The follow-up captures three failures, their tooltip, the Failed
 chooser with task descriptions, and selection and expanded diagnostics of the
 long recovery task. A final shot leaves that long task as the only failure
-to exercise the status row's horizontal fade. The shared agent name must not make the tasks ambiguous. On Before, hovering and clicking the
+to exercise the status row's horizontal fade. The shared agent name must not
+make the tasks ambiguous. On Before, hovering and clicking the
 passive status row shows no failure details and leaves the conversation selected;
 on After, the failure control identifies the task and selects its transcript.
 The comparison exercises the native UI and Claude adapter against offline

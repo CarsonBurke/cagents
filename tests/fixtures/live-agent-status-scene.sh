@@ -6,7 +6,7 @@
 # Use a fresh fixture on each side, and --width 1200 (or 900 for narrow).
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
-ne=$here/../../scripts/native-evidence
+ne=${CAGENTS_EVIDENCE_COMMAND:-$here/../../scripts/native-evidence}
 : "${CAGENTS_EVIDENCE_TASK:?name the native-evidence task}"
 fixture=$CAGENTS_EVIDENCE_TASK/fixture
 prefix=${1:-}
@@ -67,7 +67,8 @@ else
     shot agent-failure-expanded
 fi
 
-# Add two tasks that share a generic agent name, so their descriptions must
+# A new prompt retires earlier failures. Retry rollback and fail it afresh,
+# then add two tasks sharing a generic agent name. Their descriptions must
 # distinguish the choices. The long task also exercises the narrow fade.
 if [ "${SIDE:-}" != before ]; then
     "$ne" drive click 'Conversation'
@@ -106,8 +107,9 @@ else
     shot agent-multiple-expanded
 fi
 
-# Leave the long task as the single failure so its full status label must
-# fade within one line at the narrow viewport instead of using an ellipsis.
+# Retry the other checks successfully and fail the recovery audit afresh
+# in this turn. Its full single-failure label must fade within one line at
+# the narrow viewport instead of using an ellipsis.
 if [ "${SIDE:-}" != before ]; then
     "$ne" drive click 'Conversation'
 fi
