@@ -12862,7 +12862,9 @@ mod tests {
     #[test]
     fn peer_xml_attributes_decode_but_peer_json_and_message_bodies_stay_literal() {
         let text = "Literal &lt;input&gt; && echo > file";
-        let xml = format!("<agent-message from=\"Build &#38; inspect\">\n{text}\n</agent-message>");
+        let xml = format!(
+            "<cross-session-message from=\"session-1\" from-name=\"Build &#38; inspect\">\n{text}\n</cross-session-message>"
+        );
         assert!(
             matches!(peer_envelope(&xml).unwrap().finish(false), ItemContent::Delivery { from, body, .. } if from == "Build & inspect" && body == text)
         );
@@ -13982,24 +13984,27 @@ mod tests {
     /// notice of that notification also tells the reader.
     #[test]
     fn a_background_command_runs_until_its_notification_settles_its_call() {
-        for (status, summary, ended, code) in [
+        for (status, summary, ended, code, heading) in [
             (
                 "completed",
                 "Background command \"Run tests\" completed (exit code 0)",
                 ToolStatus::Succeeded,
                 Some(0),
+                "Run tests · finished",
             ),
             (
                 "failed",
                 "Background command \"Run tests\" failed with exit code 101",
                 ToolStatus::Failed,
                 Some(101),
+                "Run tests · failed (exit 101)",
             ),
             (
                 "killed",
                 "Background command \"Run tests\" was stopped",
                 ToolStatus::Stopped,
                 None,
+                "Run tests · stopped",
             ),
         ] {
             let mut adapter = Claude::default();
@@ -14021,7 +14026,11 @@ mod tests {
                 ),
                 "{status}"
             );
-            assert_eq!(notice_summaries(&notified), [summary], "{status}");
+            assert_eq!(notice_summaries(&notified), [heading], "{status}");
+            assert!(notified.events.iter().any(|event| matches!(event,
+                Event::Item(Item { content: ItemContent::Delivery { kind: DeliveryKind::Notice, summary, body, .. }, .. })
+                    if summary == heading && body == "cargo test"
+            )), "the delivery keeps the original command once behind its outcome heading");
         }
     }
 
