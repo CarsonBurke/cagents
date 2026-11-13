@@ -1523,7 +1523,7 @@ impl Cagents {
             Element::from(
                 widget::row::with_children(vec![
                     list,
-                    widget::container(
+                    widget::container(crate::interaction::overflow_fade_y(
                         widget::scrollable(
                             widget::container(preview)
                                 .padding(design::with_vertical_rail(Padding::ZERO))
@@ -1532,7 +1532,8 @@ impl Cagents {
                         .direction(
                             iced::widget::scrollable::Direction::Vertical(design::scrollbar()),
                         ),
-                    )
+                        design::dialog_base,
+                    ))
                     .width(Length::Fixed(PREVIEW_WIDTH))
                     .height(Length::Fill)
                     .into(),
@@ -1646,18 +1647,20 @@ impl Cagents {
         if rows.is_empty() {
             rows.push(self.resume_empty());
         }
-        widget::scrollable(
-            widget::column::with_children(rows)
-                .spacing(ROW_SPACING)
-                .padding(design::with_vertical_rail(Padding::ZERO)),
+        crate::interaction::overflow_fade_y(
+            widget::scrollable(
+                widget::column::with_children(rows)
+                    .spacing(ROW_SPACING)
+                    .padding(design::with_vertical_rail(Padding::ZERO)),
+            )
+            .direction(iced::widget::scrollable::Direction::Vertical(
+                design::scrollbar(),
+            ))
+            .id(widget::Id::new("conversation-resume.results"))
+            .width(Length::Fill)
+            .height(Length::Fill),
+            design::dialog_base,
         )
-        .direction(iced::widget::scrollable::Direction::Vertical(
-            design::scrollbar(),
-        ))
-        .id(widget::Id::new("conversation-resume.results"))
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
     }
 
     /// Why nothing is listed, and where else to look.

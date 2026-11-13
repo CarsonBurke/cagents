@@ -401,8 +401,36 @@ pub fn parent_wheel<'a, Message: 'a>(
 pub fn overflow_fade_x<'a, Message: 'a>(
     content: impl Into<Element<'a, Message>>,
 ) -> Element<'a, Message> {
-    Element::new(OverflowFadeX {
+    Element::new(OverflowFade {
         content: content.into(),
+        axis: Axis::Horizontal,
+        fill: crate::design::base,
+    })
+}
+
+/// Fade the top and bottom edges of a vertical scrollable while content
+/// continues past them.
+///
+/// A scroll viewport clips its content wherever its bounds happen to end.
+/// Where that edge meets a rule or the pane's own edge, the cut reads as
+/// content passing out of view; where it ends in open space, such as the gap
+/// above a composer or below a heading, it slices a line of text in half
+/// at a boundary nothing on screen explains. The fade turns that slice into
+/// content receding at the edge, and grows from nothing over the last stretch
+/// of travel, so it never pops in or out at either end.
+///
+/// `content` must be the scrollable itself, or wrap it without other
+/// scrollables in between: the outermost scrollable inside decides the fade.
+/// `fill` is the surface the scrollable is drawn on, which the fade dissolves
+/// into; the scrollbar's rail at the trailing edge is left unfaded.
+pub fn overflow_fade_y<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    fill: fn(&Theme) -> cosmic::iced::Color,
+) -> Element<'a, Message> {
+    Element::new(OverflowFade {
+        content: content.into(),
+        axis: Axis::Vertical,
+        fill,
     })
 }
 
@@ -1202,31 +1230,55 @@ impl<Message> Widget<Message, Theme, Renderer> for WheelInput<'_, Message> {
     }
 }
 
-const OVERFLOW_FADE_WIDTH: f32 = 24.0;
+/// How far an overflow fade reaches into a scrolling strip: about one line
+/// of body text, or the end of a tab label.
+const OVERFLOW_FADE: f32 = 24.0;
 
-fn overflow_edges(offset: f32, viewport: f32, content: f32) -> (bool, bool) {
-    (offset > 0.5, content - offset > viewport + 0.5)
+/// How far each edge's fade reaches, given how far the content has scrolled
+/// from its start and how much of it lies past the viewport's end.
+///
+/// The fade is as deep as the content still hidden beyond that edge, up to
+/// [`OVERFLOW_FADE`], so it shrinks to nothing as the content's own end comes
+/// into view rather than vanishing over whatever row last reached the edge.
+fn overflow_fades(offset: f32, viewport: f32, content: f32) -> (f32, f32) {
+    let fade = |hidden: f32| {
+        if hidden > 0.5 {
+            hidden.min(OVERFLOW_FADE)
+        } else {
+            0.0
+        }
+    };
+    (fade(offset), fade(content - offset - viewport))
 }
 
-struct OverflowFadeX<'a, Message> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Axis {
+    Horizontal,
+    Vertical,
+}
+
+struct OverflowFade<'a, Message> {
     content: Element<'a, Message>,
+    axis: Axis,
+    fill: fn(&Theme) -> Color,
 }
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+/// How far the fade reaches at the start and the end of the strip.
+#[derive(Clone, Copy, Default, PartialEq)]
 struct OverflowState {
-    start: bool,
-    end: bool,
+    start: f32,
+    end: f32,
 }
 
 struct OverflowProbe {
-    start: bool,
-    end: bool,
+    axis: Axis,
+    state: OverflowState,
     found: bool,
 }
 
 impl<T> Operation<T> for OverflowProbe {
     fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation<T>)) {
-        // The strip is found near the root; every tab beneath it would
+        // The strip is found near the root; every row beneath it would
         // otherwise be walked on each event and layout for nothing.
         if !self.found {
             operate(self);
@@ -1241,37 +1293,40 @@ impl<T> Operation<T> for OverflowProbe {
         translation: Vector,
         _state: &mut dyn operation::Scrollable,
     ) {
-        // The tab strip is the outermost scrollable. Nested ones (editor
-        // panes, menus) would otherwise overwrite the fade with their offset.
+        // The strip is the outermost scrollable. Nested ones (editor
+        // panes, menus, code blocks) would otherwise overwrite the fade with
+        // their offset.
         if self.found {
             return;
         }
         self.found = true;
-        (self.start, self.end) = overflow_edges(translation.x, bounds.width, content_bounds.width);
+        let (start, end) = match self.axis {
+            Axis::Horizontal => overflow_fades(translation.x, bounds.width, content_bounds.width),
+            Axis::Vertical => overflow_fades(translation.y, bounds.height, content_bounds.height),
+        };
+        self.state = OverflowState { start, end };
     }
 }
 
 fn read_overflow<Message>(
+    axis: Axis,
     content: &mut Element<'_, Message>,
     tree: &mut Tree,
     layout: Layout<'_>,
     renderer: &Renderer,
 ) -> OverflowState {
     let mut probe = OverflowProbe {
-        start: false,
-        end: false,
+        axis,
+        state: OverflowState::default(),
         found: false,
     };
     content
         .as_widget_mut()
         .operate(tree, layout, renderer, &mut probe);
-    OverflowState {
-        start: probe.start,
-        end: probe.end,
-    }
+    probe.state
 }
 
-impl<Message> Widget<Message, Theme, Renderer> for OverflowFadeX<'_, Message> {
+impl<Message> Widget<Message, Theme, Renderer> for OverflowFade<'_, Message> {
     fn tag(&self) -> tree::Tag {
         tree::Tag::of::<OverflowState>()
     }
@@ -1287,6 +1342,15 @@ impl<Message> Widget<Message, Theme, Renderer> for OverflowFadeX<'_, Message> {
     fn size(&self) -> Size<Length> {
         self.content.as_widget().size()
     }
+    fn size_hint(&self) -> Size<Length> {
+        self.content.as_widget().size_hint()
+    }
+    fn id(&self) -> Option<Id> {
+        self.content.as_widget().id()
+    }
+    fn set_id(&mut self, id: Id) {
+        self.content.as_widget_mut().set_id(id);
+    }
     fn layout(
         &mut self,
         tree: &mut Tree,
@@ -1298,6 +1362,7 @@ impl<Message> Widget<Message, Theme, Renderer> for OverflowFadeX<'_, Message> {
             .as_widget_mut()
             .layout(&mut tree.children[0], renderer, limits);
         let overflow = read_overflow(
+            self.axis,
             &mut self.content,
             &mut tree.children[0],
             Layout::new(&node),
@@ -1343,6 +1408,7 @@ impl<Message> Widget<Message, Theme, Renderer> for OverflowFadeX<'_, Message> {
             viewport,
         );
         let overflow = read_overflow(
+            self.axis,
             &mut self.content,
             &mut tree.children[0],
             child_layout,
@@ -1389,46 +1455,64 @@ impl<Message> Widget<Message, Theme, Renderer> for OverflowFadeX<'_, Message> {
             cursor,
             viewport,
         );
-        let state = tree.state.downcast_ref::<OverflowState>();
-        if !state.start && !state.end {
+        let state = *tree.state.downcast_ref::<OverflowState>();
+        if state.start <= 0.0 && state.end <= 0.0 {
             return;
         }
         let bounds = layout.bounds();
         let Some(clip) = bounds.intersection(viewport) else {
             return;
         };
-        // Match the chrome behind the tabs, not the component fill sitting on it.
-        let mut color: Color = theme.current_container().base.into();
-        color.a = 1.0;
-        let mut clear = color;
-        clear.a = 0.0;
-        renderer.with_layer(clip, |renderer| {
-            if state.start {
-                fill_overflow_fade(
-                    renderer,
-                    Rectangle {
-                        x: bounds.x,
-                        y: bounds.y,
-                        width: OVERFLOW_FADE_WIDTH.min(bounds.width),
-                        height: bounds.height,
-                    },
-                    color,
-                    clear,
-                );
-            }
-            if state.end {
-                let width = OVERFLOW_FADE_WIDTH.min(bounds.width);
-                fill_overflow_fade(
-                    renderer,
-                    Rectangle {
+        // The fill keeps its own alpha: on a translucent theme the fade
+        // matches the composited surface instead of painting an opaque band.
+        let color = (self.fill)(theme);
+        let clear = Color { a: 0.0, ..color };
+        renderer.with_layer(clip, |renderer| match self.axis {
+            Axis::Horizontal => {
+                // π/2 runs the gradient from left to right.
+                let angle = Radians(std::f32::consts::FRAC_PI_2);
+                if state.start > 0.0 {
+                    let fade = Rectangle {
+                        width: state.start.min(bounds.width),
+                        ..bounds
+                    };
+                    fill_overflow_fade(renderer, fade, angle, color, clear);
+                }
+                if state.end > 0.0 {
+                    let width = state.end.min(bounds.width);
+                    let fade = Rectangle {
                         x: bounds.x + bounds.width - width,
-                        y: bounds.y,
                         width,
-                        height: bounds.height,
-                    },
-                    clear,
-                    color,
-                );
+                        ..bounds
+                    };
+                    fill_overflow_fade(renderer, fade, angle, clear, color);
+                }
+            }
+            Axis::Vertical => {
+                // π runs the gradient from top to bottom. The scrollbar's
+                // rail keeps full strength: the thumb is the position
+                // indicator, and every vertical scrollable keeps its content
+                // out of the rail.
+                let angle = Radians(std::f32::consts::PI);
+                let width = (bounds.width - crate::design::SCROLLBAR_GUTTER).max(0.0);
+                if state.start > 0.0 {
+                    let fade = Rectangle {
+                        width,
+                        height: state.start.min(bounds.height),
+                        ..bounds
+                    };
+                    fill_overflow_fade(renderer, fade, angle, color, clear);
+                }
+                if state.end > 0.0 {
+                    let height = state.end.min(bounds.height);
+                    let fade = Rectangle {
+                        y: bounds.y + bounds.height - height,
+                        width,
+                        height,
+                        ..bounds
+                    };
+                    fill_overflow_fade(renderer, fade, angle, clear, color);
+                }
             }
         });
     }
@@ -1476,7 +1560,13 @@ impl<Message> Widget<Message, Theme, Renderer> for OverflowFadeX<'_, Message> {
     }
 }
 
-fn fill_overflow_fade(renderer: &mut Renderer, bounds: Rectangle, from: Color, to: Color) {
+fn fill_overflow_fade(
+    renderer: &mut Renderer,
+    bounds: Rectangle,
+    angle: Radians,
+    from: Color,
+    to: Color,
+) {
     renderer.fill_quad(
         renderer::Quad {
             bounds,
@@ -1484,11 +1574,10 @@ fn fill_overflow_fade(renderer: &mut Renderer, bounds: Rectangle, from: Color, t
             shadow: Shadow::default(),
             snap: true,
         },
-        // iced treats 0 rad as upward (CSS 0deg). π/2 is left-to-right.
+        // iced treats 0 rad as upward (CSS 0deg); the first stop sits where
+        // the gradient starts.
         Background::Gradient(Gradient::Linear(
-            Linear::new(Radians(std::f32::consts::FRAC_PI_2))
-                .add_stop(0.0, from)
-                .add_stop(1.0, to),
+            Linear::new(angle).add_stop(0.0, from).add_stop(1.0, to),
         )),
     );
 }
@@ -3142,17 +3231,83 @@ mod tests {
     }
 
     #[test]
-    fn overflow_edges_are_clear_when_content_fits() {
-        assert_eq!(overflow_edges(0.0, 200.0, 180.0), (false, false));
-        assert_eq!(overflow_edges(0.0, 200.0, 200.0), (false, false));
-        assert_eq!(overflow_edges(0.25, 200.0, 200.4), (false, false));
+    fn overflow_fades_are_clear_when_content_fits() {
+        assert_eq!(overflow_fades(0.0, 200.0, 180.0), (0.0, 0.0));
+        assert_eq!(overflow_fades(0.0, 200.0, 200.0), (0.0, 0.0));
+        assert_eq!(overflow_fades(0.25, 200.0, 200.4), (0.0, 0.0));
     }
 
     #[test]
-    fn overflow_edges_mark_whichever_side_can_still_scroll() {
-        assert_eq!(overflow_edges(0.0, 200.0, 400.0), (false, true));
-        assert_eq!(overflow_edges(12.0, 200.0, 400.0), (true, true));
-        assert_eq!(overflow_edges(200.0, 200.0, 400.0), (true, false));
+    fn overflow_fades_mark_whichever_side_can_still_scroll() {
+        assert_eq!(overflow_fades(0.0, 200.0, 400.0), (0.0, OVERFLOW_FADE));
+        assert_eq!(
+            overflow_fades(120.0, 200.0, 400.0),
+            (OVERFLOW_FADE, OVERFLOW_FADE)
+        );
+        assert_eq!(overflow_fades(200.0, 200.0, 400.0), (OVERFLOW_FADE, 0.0));
+    }
+
+    /// A vertical fade reads the scrollable it wraps along the vertical
+    /// axis: none over content that fits, the far edge only at the start,
+    /// and both edges once a wheel has moved the content partway.
+    #[test]
+    fn vertical_fade_follows_the_scrollable_it_wraps() {
+        use cosmic::iced::advanced::clipboard;
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let limits = layout::Limits::new(Size::ZERO, Size::new(300.0, 200.0));
+        let faded = |content: f32| -> Element<'static, ()> {
+            overflow_fade_y(
+                widget::scrollable(widget::Space::new().width(300).height(content))
+                    .height(Length::Fill),
+                crate::design::base,
+            )
+        };
+        let mut fits = faded(180.0);
+        let mut tree = Tree::new(&fits);
+        fits.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        assert!(*tree.state.downcast_ref::<OverflowState>() == OverflowState::default());
+
+        let mut tall = faded(1000.0);
+        let mut tree = Tree::new(&tall);
+        let node = tall.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        assert!(
+            *tree.state.downcast_ref::<OverflowState>()
+                == OverflowState {
+                    start: 0.0,
+                    end: OVERFLOW_FADE,
+                }
+        );
+        let bounds = node.bounds();
+        let mut messages = Vec::new();
+        let mut shell = Shell::new(&mut messages);
+        tall.as_widget_mut().update(
+            &mut tree,
+            &Event::Mouse(mouse::Event::WheelScrolled {
+                delta: mouse::ScrollDelta::Pixels { x: 0.0, y: -300.0 },
+            }),
+            Layout::new(&node),
+            mouse::Cursor::Available(bounds.center()),
+            &renderer,
+            &mut clipboard::Null,
+            &mut shell,
+            &bounds,
+        );
+        assert!(
+            *tree.state.downcast_ref::<OverflowState>()
+                == OverflowState {
+                    start: OVERFLOW_FADE,
+                    end: OVERFLOW_FADE,
+                }
+        );
+    }
+
+    /// The fade recedes with the content still hidden past an edge, so the
+    /// last stretch of travel ends at no fade instead of dropping a full one
+    /// over the rows that just arrived.
+    #[test]
+    fn overflow_fades_shrink_over_the_last_stretch_of_travel() {
+        assert_eq!(overflow_fades(190.0, 200.0, 400.0), (OVERFLOW_FADE, 10.0));
+        assert_eq!(overflow_fades(6.0, 200.0, 400.0), (6.0, OVERFLOW_FADE));
     }
 
     /// Whole frames of a real context menu, driven the way the runtime drives

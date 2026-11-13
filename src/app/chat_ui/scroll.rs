@@ -373,8 +373,14 @@ fn transcript_impl<'a>(
     .anchor_bottom()
     .height(Length::Fill)
     .width(Length::Fill);
+    // The viewport ends in the open gap above the composer, and below the
+    // title or the pane's top, so a line crossing either edge fades into the
+    // pane rather than being sliced at a boundary nothing on screen draws.
+    // The fade wraps the scrollable alone: the reader's anchoring sees the
+    // scrollable's own layout through it.
+    let content = crate::interaction::overflow_fade_y(content, design::base);
     Element::new(Anchored {
-        content: content.into(),
+        content,
         captured: Some(captured),
         target: Some(target),
         subagent,

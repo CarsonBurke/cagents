@@ -645,22 +645,28 @@ impl State {
             .width(Length::Fill)
             .into()
         } else {
-            crate::ui_controls::keep_in_place(
-                widget::scrollable(
-                    widget::container(
-                        crate::ui_controls::culled_column(card_keys(&items), move |index| {
-                            self.card(items[index])
-                        })
-                        .spacing(space::S)
-                        .estimate(CARD_ESTIMATE)
-                        .keep_built(self.open_menu_key()),
+            // Cards scroll in the open lane below its heading, so a card
+            // crossing either edge fades into the lane rather than being
+            // sliced there.
+            crate::interaction::overflow_fade_y(
+                crate::ui_controls::keep_in_place(
+                    widget::scrollable(
+                        widget::container(
+                            crate::ui_controls::culled_column(card_keys(&items), move |index| {
+                                self.card(items[index])
+                            })
+                            .spacing(space::S)
+                            .estimate(CARD_ESTIMATE)
+                            .keep_built(self.open_menu_key()),
+                        )
+                        .padding(design::with_vertical_rail(Padding::from([0.0, space::XS]))),
                     )
-                    .padding(design::with_vertical_rail(Padding::from([0.0, space::XS]))),
-                )
-                .direction(iced::widget::scrollable::Direction::Vertical(
-                    design::scrollbar(),
-                ))
-                .height(Length::Fill),
+                    .direction(iced::widget::scrollable::Direction::Vertical(
+                        design::scrollbar(),
+                    ))
+                    .height(Length::Fill),
+                ),
+                lane_fill,
             )
         };
         widget::container(

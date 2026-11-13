@@ -2788,20 +2788,22 @@ impl State {
                 widget::container(search)
                     .padding([space::S, space::S, 0.0, space::S])
                     .into(),
-                widget::scrollable(
-                    widget::column::with_children(listing)
-                        .spacing(space::XS)
-                        .padding(crate::design::with_vertical_rail(
-                            cosmic::iced::Padding::from([0.0, space::S, space::S, space::S]),
-                        )),
-                )
-                .direction(vertical())
-                .height(if side_by_side {
-                    Length::Fill
-                } else {
-                    Length::Shrink
-                })
-                .into(),
+                crate::interaction::overflow_fade_y(
+                    widget::scrollable(
+                        widget::column::with_children(listing)
+                            .spacing(space::XS)
+                            .padding(crate::design::with_vertical_rail(
+                                cosmic::iced::Padding::from([0.0, space::S, space::S, space::S]),
+                            )),
+                    )
+                    .direction(vertical())
+                    .height(if side_by_side {
+                        Length::Fill
+                    } else {
+                        Length::Shrink
+                    }),
+                    crate::design::base,
+                ),
             ])
             .spacing(space::XS);
             if side_by_side {

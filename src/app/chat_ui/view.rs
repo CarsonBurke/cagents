@@ -2754,7 +2754,7 @@ impl Runtime {
         // typing would cost more than the question being missable.
         if !snapshot.requests.is_empty() {
             content.push(
-                widget::container(
+                widget::container(crate::interaction::overflow_fade_y(
                     widget::scrollable(
                         widget::column::with_children(
                             snapshot
@@ -2786,7 +2786,8 @@ impl Runtime {
                         design::scrollbar(),
                     ))
                     .height(Length::Shrink),
-                )
+                    design::base,
+                ))
                 .max_height(REQUEST_CEILING)
                 .into(),
             );
@@ -3834,11 +3835,15 @@ impl Runtime {
             })
             .collect();
         let empty = rows.is_empty();
-        let list = widget::scrollable(
-            widget::column::with_children(rows)
-                .padding(design::with_vertical_rail(iced::Padding::ZERO)),
-        )
-        .height(Length::Shrink);
+        // The rows scroll beneath the search field inside the popover.
+        let list = crate::interaction::overflow_fade_y(
+            widget::scrollable(
+                widget::column::with_children(rows)
+                    .padding(design::with_vertical_rail(iced::Padding::ZERO)),
+            )
+            .height(Length::Shrink),
+            design::component_base,
+        );
         let mut content: Vec<Element<'_, Message>> = Vec::new();
         if self.composer_menu_searchable() {
             content.push(

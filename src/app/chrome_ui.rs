@@ -2473,16 +2473,18 @@ impl Cagents {
                 widget::row::with_children(navigation)
                     .spacing(space::S)
                     .into(),
-                widget::scrollable(
-                    widget::column::with_children(entries)
-                        .spacing(space::XS)
-                        .padding(design::with_vertical_rail(iced::Padding::new(0.0))),
-                )
-                .direction(iced::widget::scrollable::Direction::Vertical(
-                    design::scrollbar(),
-                ))
-                .height(Length::Shrink)
-                .into(),
+                crate::interaction::overflow_fade_y(
+                    widget::scrollable(
+                        widget::column::with_children(entries)
+                            .spacing(space::XS)
+                            .padding(design::with_vertical_rail(iced::Padding::new(0.0))),
+                    )
+                    .direction(iced::widget::scrollable::Direction::Vertical(
+                        design::scrollbar(),
+                    ))
+                    .height(Length::Shrink),
+                    design::component_base,
+                ),
             ])
             .spacing(space::S),
         )
@@ -2585,21 +2587,23 @@ impl Cagents {
                         widget::container(heading)
                             .padding(iced::Padding::new(6.0).bottom(0.0))
                             .into(),
-                        widget::scrollable(
-                            widget::column::with_children(notices)
-                                .spacing(space::M)
-                                // Each notice ends in a Dismiss control on its
-                                // right edge, which the floating thumb would
-                                // otherwise cover.
-                                .padding(design::with_vertical_rail(
-                                    iced::Padding::new(6.0).top(0.0),
-                                )),
-                        )
-                        .direction(iced::widget::scrollable::Direction::Vertical(
-                            design::scrollbar(),
-                        ))
-                        .height(Length::Shrink)
-                        .into(),
+                        crate::interaction::overflow_fade_y(
+                            widget::scrollable(
+                                widget::column::with_children(notices)
+                                    .spacing(space::M)
+                                    // Each notice ends in a Dismiss control on
+                                    // its right edge, which the floating thumb
+                                    // would otherwise cover.
+                                    .padding(design::with_vertical_rail(
+                                        iced::Padding::new(6.0).top(0.0),
+                                    )),
+                            )
+                            .direction(iced::widget::scrollable::Direction::Vertical(
+                                design::scrollbar(),
+                            ))
+                            .height(Length::Shrink),
+                            design::component_base,
+                        ),
                     ])
                     .spacing(space::S),
                 )

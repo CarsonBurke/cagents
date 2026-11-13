@@ -1070,6 +1070,8 @@ fn settings_layout<'a>(
         .class(cosmic::style::iced::Scrollable::Minimal)
         .width(Length::Fill)
         .height(Length::Fill);
+        // The rows scroll in the open gap below the search field.
+        let categories = crate::interaction::overflow_fade_y(categories, design::base);
         widget::column::with_children(vec![
             widget::container(search)
                 .padding(design::list::edge_padding(space::M, 0.0))

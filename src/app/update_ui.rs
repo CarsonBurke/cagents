@@ -369,10 +369,13 @@ impl Cagents {
         }
         if !rows.is_empty() {
             body.push(
-                widget::container(widget::scrollable(
-                    widget::column::with_children(rows)
-                        .spacing(space::M)
-                        .padding(design::with_vertical_rail(iced::Padding::ZERO)),
+                widget::container(crate::interaction::overflow_fade_y(
+                    widget::scrollable(
+                        widget::column::with_children(rows)
+                            .spacing(space::M)
+                            .padding(design::with_vertical_rail(iced::Padding::ZERO)),
+                    ),
+                    design::dialog_base,
                 ))
                 .max_height(320)
                 .into(),

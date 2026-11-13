@@ -548,9 +548,10 @@ impl Cagents {
             .spacing(space::S),
         );
         let surface = widget::column::with_children(vec![
-            widget::scrollable(content)
-                .height(Length::Fixed(440.0))
-                .into(),
+            crate::interaction::overflow_fade_y(
+                widget::scrollable(content).height(Length::Fixed(440.0)),
+                design::dialog_base,
+            ),
             controls,
         ])
         .spacing(space::M);

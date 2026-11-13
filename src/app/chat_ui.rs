@@ -7759,14 +7759,15 @@ impl Cagents {
                 .into(),
         );
         Some(
-            widget::container(
+            widget::container(crate::interaction::overflow_fade_y(
                 widget::scrollable(
                     widget::column::with_children(content)
                         .spacing(6)
                         .padding(space::S),
                 )
                 .height(Length::Shrink),
-            )
+                design::base,
+            ))
             .max_height(180)
             .into(),
         )

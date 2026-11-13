@@ -66,8 +66,21 @@ pub fn mix(under: Color, over: Color, amount: f32) -> Color {
 }
 
 /// The surface a pane draws on.
-fn base(theme: &Theme) -> Color {
+pub fn base(theme: &Theme) -> Color {
     theme.current_container().base.into()
+}
+
+/// The fill of a component surface on the pane: an [`elevated`] popover or a
+/// `Card` container.
+///
+/// [`elevated`]: crate::design::elevated
+pub fn component_base(theme: &Theme) -> Color {
+    theme.current_container().component.base.into()
+}
+
+/// The fill of a `Dialog` container.
+pub fn dialog_base(theme: &Theme) -> Color {
+    theme.cosmic().primary(theme.transparent).base.into()
 }
 
 /// A separator that reads as an edge rather than as a frame.
