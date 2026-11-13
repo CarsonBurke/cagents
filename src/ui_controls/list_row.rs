@@ -50,13 +50,7 @@ pub fn list_row<'a, Message: Clone + 'a>(
 
 /// The label a [`list_row`] draws: body text on one line in its line box.
 pub fn row_label<'a, Message: 'a>(label: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Message> {
-    design::body(label)
-        .wrapping(cosmic::iced::widget::text::Wrapping::None)
-        .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-            cosmic::iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-        ))
-        .width(Length::Fill)
-        .into()
+    super::fade_text(label).width(Length::Fill).into()
 }
 
 impl<'a, Message: Clone + 'a> ListRow<'a, Message> {
@@ -79,13 +73,9 @@ impl<'a, Message: Clone + 'a> ListRow<'a, Message> {
     /// centred; a dense row stays dense only while it has one line.
     pub fn caption(mut self, caption: impl Into<Cow<'a, str>> + 'a) -> Self {
         self.caption = Some(
-            design::caption(caption)
+            super::FadeText::caption(caption)
                 .line_height(cosmic::iced::widget::text::LineHeight::Absolute(
                     list::CAPTION_LINE.into(),
-                ))
-                .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                    cosmic::iced::advanced::text::EllipsizeHeightLimit::Lines(1),
                 ))
                 .width(Length::Fill)
                 .into(),
