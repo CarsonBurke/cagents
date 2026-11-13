@@ -2256,7 +2256,7 @@ fn validate_terminal_upgrade_environment(
     })?;
     let mut restored = crate::model::agent_recovery::fresh_native_environment(provider, false);
     restored.extend(recipe.environment.clone());
-    recipe.remove_unset_environment(&mut restored);
+    recipe.withhold_environment(&mut restored);
     if execution.0 != restored {
         return Err(upgrade_error(
             "Terminal execution environment cannot survive daemon upgrade without losing selected credentials or account settings. The updater can restore this terminal stopped after confirmation; no source was stopped",
@@ -4334,7 +4334,7 @@ fn start_terminal_view_owned_reserved(
         execution_recipe
             .as_ref()
             .unwrap_or(&session.launch)
-            .remove_unset_environment(&mut environment.0);
+            .withhold_environment(&mut environment.0);
     }
     if adoption.is_some() {
         super::account_lifecycle::ensure_terminal_adoption(
