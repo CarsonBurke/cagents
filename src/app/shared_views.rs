@@ -4930,6 +4930,11 @@ mod tests {
                     },
                 })),
             );
+            // The issue's burst is one rename per 100 ms. A deferred save
+            // falls due once a second and costs what an immediate one did.
+            if index % 10 == 9 && app.navigation_save_pending {
+                drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
+            }
             cpu.push(thread_cpu() - started_cpu);
             wall.push(started.elapsed());
             assert_eq!(app.durable.channels[0].title, title);
@@ -4961,6 +4966,8 @@ mod tests {
         let before = app.durable.clone();
         let channel = before.channels[3].id;
         let generation = app.navigation_save_generation;
+        let persists = super::super::terminal_output_tests::persists;
+        let saved = persists();
         let rename = |app: &mut Cagents, edit: ModelEdit| {
             app.shared_views.local_projection_count.set(0);
             let sequence = app.workspace_model.sequence + 1;
@@ -4999,6 +5006,10 @@ mod tests {
             generation.wrapping_add(1),
             "the burst arms one save"
         );
+        assert_eq!(persists(), saved, "no rename saves at once");
+        drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
+        assert_eq!(persists(), saved + 1, "the burst is saved once, after it");
+        assert!(!app.navigation_save_pending);
         // A suggestion cannot replace the manual name, so nothing changes and
         // nothing more is saved.
         app.navigation_save_pending = false;
@@ -5012,6 +5023,30 @@ mod tests {
         );
         assert_eq!(app.durable.channels[3].title, "Renamed 4");
         assert!(!app.navigation_save_pending);
+        // A conversation naming a channel that has no name yet is absorbed
+        // the same way.
+        let unnamed = before.channels[4].id;
+        rename(
+            &mut app,
+            ModelEdit::RetitleChannel {
+                id: unnamed,
+                title: String::new(),
+            },
+        );
+        rename(
+            &mut app,
+            ModelEdit::SuggestChannelTitle {
+                id: unnamed,
+                title: "Inferred".into(),
+                source: crate::model::ChannelTitleSource::Provider,
+            },
+        );
+        assert_eq!(app.durable.channels[4].title, "Inferred");
+        assert_eq!(
+            app.durable.channels[4].title_source,
+            crate::model::ChannelTitleSource::Provider
+        );
+        assert!(app.navigation_save_pending);
         assert_eq!(app.durable.cards, before.cards);
         assert_eq!(app.durable.card_scopes, before.card_scopes);
         for (after, before) in app.durable.channels.iter().zip(&before.channels) {
