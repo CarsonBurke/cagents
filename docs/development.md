@@ -2039,6 +2039,15 @@ Cancellation additionally needs the typed interruption choice and its matching
 accepted parent-turn receipt. Raw changes remain in the report alongside each
 qualified disposition.
 
+`--stall-window-after-flush SLOT` injects a window that stalls after saving: it
+SIGSTOPs that source window once its `final_flush complete=true` record appears
+and its diagnostics append has released the lock. `--stall-suppress-flush` also
+removes that record, so the update cannot prove the save, and
+`--stall-resume-after SECONDS` continues the window later. `--stall-under-lock`
+instead stops the window while that append still holds the diagnostics lock.
+`window-close-trace.jsonl` labels each injection and records whether the stop
+landed under the lock, attributed to the window's own pid in `/proc/locks`.
+
 Optional problem states each have their own switch:
 
 - `--no-init`: a Claude peer that accepts work without reporting a session ID.
