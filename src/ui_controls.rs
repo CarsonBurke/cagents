@@ -8,6 +8,8 @@ mod culled_column;
 pub use culled_column::{CulledColumn, culled_column, keep_in_place};
 mod display;
 mod editable;
+mod fade_text;
+pub use fade_text::{FadeEdge, FadeText, fade_overflow, fade_text};
 pub mod field;
 mod find_options;
 pub use find_options::{FindOption, find_options};
