@@ -5436,7 +5436,11 @@ impl Runtime {
         };
         let mut rows = vec![crate::interaction::tooltip(heading_row, heading.clone()).into()];
         if (expanded || monitor) && has_body {
-            if expanded && !sender.is_empty() && !heading.contains(sender) {
+            if expanded
+                && *kind != chat::DeliveryKind::Notice
+                && !sender.is_empty()
+                && !heading.contains(sender)
+            {
                 rows.push(selectable_prose::plain(
                     format!("Sender: {sender}"),
                     design::TEXT_CAPTION,
@@ -12742,7 +12746,7 @@ mod tests {
         delivery.content = ItemContent::Delivery {
             kind: chat::DeliveryKind::Notice,
             from: String::new(),
-            sender: String::new(),
+            sender: "notice-task".into(),
             summary: "Provider report".into(),
             body: "Delivered warning".into(),
         };
