@@ -3885,6 +3885,7 @@ mod tests {
             name: name.into(),
             fetch_url: Some(fetch_url.into()),
             push_url: None,
+            gh_resolved: None,
         }
     }
 
@@ -4005,6 +4006,7 @@ mod tests {
                     name: "origin".into(),
                     fetch_url: None,
                     push_url: None,
+                    gh_resolved: None,
                 }],
                 &key,
             ),
@@ -4044,6 +4046,7 @@ mod tests {
             name: "origin".into(),
             fetch_url: Some(url.into()),
             push_url: None,
+            gh_resolved: None,
         };
         let service = GitHubService::new("gh", Arc::new(FakeExecutor::default()));
         assert!(

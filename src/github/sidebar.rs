@@ -142,11 +142,13 @@ impl<E: ProcessExecutor> GitHubService<E> {
         limit: u16,
         cancellation: &CancellationToken,
     ) -> Result<Vec<PullRequest>, GitHubError> {
+        let at = Instant::now();
         let mut pull_requests = self.sidebar_open(repository, limit, cancellation)?;
         let settling = checks_settling(&pull_requests);
         // Closed history must not consume the open-PR page. Its failure also
         // must not discard successfully refreshed open conversation authority,
-        // but leaves nothing to keep.
+        // but leaves nothing new to keep: what was kept before is still older
+        // than its validator, so the next probe still sees what changed since.
         let history = self.recent_history(repository, limit, cancellation);
         // Read as another account than it would be kept for.
         let switched = crate::github_status::credential_fingerprint().ok() != validator.key.0;
@@ -155,22 +157,18 @@ impl<E: ProcessExecutor> GitHubService<E> {
             .read
             .retain(|_, listing| listing.at.elapsed() < REPOSITORY_FOR);
         listings.refused.retain(|_, at| at.elapsed() < REFUSED_FOR);
-        match history {
-            Ok(history) if !switched => {
-                append_recent_history(&mut pull_requests, history);
+        if let Ok(history) = history {
+            append_recent_history(&mut pull_requests, history);
+            if !switched {
                 listings.read.insert(
                     validator.key,
                     Listing {
-                        at: Instant::now(),
+                        at,
                         etag: validator.etag,
                         settling,
                         pull_requests: pull_requests.clone(),
                     },
                 );
-            }
-            Ok(history) => append_recent_history(&mut pull_requests, history),
-            Err(_) => {
-                listings.read.remove(&validator.key);
             }
         }
         Ok(pull_requests)
@@ -278,7 +276,20 @@ mod tests {
         checks: Mutex<&'static str>,
         /// How the probe fails, if it does: a status line.
         fails: Mutex<Option<&'static str>>,
+        history_fails: Mutex<bool>,
         calls: Mutex<Vec<&'static str>>,
+    }
+
+    impl Forge {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                etag: Mutex::new("W/\"1\""),
+                checks: Mutex::new("SUCCESS"),
+                fails: Mutex::default(),
+                history_fails: Mutex::default(),
+                calls: Mutex::default(),
+            })
+        }
     }
 
     impl ProcessExecutor for Forge {
@@ -301,6 +312,14 @@ mod tests {
                     stderr: vec![],
                 })
             };
+            if arguments.iter().any(|argument| argument == "view") {
+                self.calls.lock().unwrap().push("resolve");
+                return output(
+                    true,
+                    r#"{"nameWithOwner":"sidebar-probe/repo","url":"https://github.com/sidebar-probe/repo"}"#
+                        .into(),
+                );
+            }
             if arguments.iter().any(|argument| argument == "graphql") {
                 let history = arguments
                     .iter()
@@ -309,6 +328,9 @@ mod tests {
                     .lock()
                     .unwrap()
                     .push(if history { "history" } else { "open" });
+                if history && *self.history_fails.lock().unwrap() {
+                    return output(false, String::new());
+                }
                 let nodes = if history {
                     serde_json::json!([])
                 } else {
@@ -345,12 +367,7 @@ mod tests {
 
     #[test]
     fn an_unchanged_sidebar_listing_costs_a_free_probe_until_its_checks_or_age_say_otherwise() {
-        let forge = Arc::new(Forge {
-            etag: Mutex::new("W/\"1\""),
-            checks: Mutex::new("SUCCESS"),
-            fails: Mutex::default(),
-            calls: Mutex::default(),
-        });
+        let forge = Forge::new();
         let service = GitHubService::new("gh", forge.clone());
         let repository = GitHubRepoKey::new("github.com", None, "sidebar-probe", "repo").unwrap();
         let cancellation = CancellationToken::new();
@@ -396,6 +413,67 @@ mod tests {
         *forge.fails.lock().unwrap() = Some("410 Gone");
         assert_eq!(read(true), ["probe", "open", "history"]);
         assert_eq!(read(true), ["open", "history"]);
+        *forge.fails.lock().unwrap() = None;
+        let refused_at = lock(&LISTINGS).refused.get(&key).copied().unwrap();
+        lock(&LISTINGS)
+            .refused
+            .insert(key.clone(), refused_at - REFUSED_FOR);
+        assert_eq!(read(true), ["probe", "open", "history"]);
+        assert_eq!(read(true), ["probe"]);
+
+        // A failed history read still shows the open page, and keeps what
+        // was kept before, whose validator still sees the change.
+        *forge.history_fails.lock().unwrap() = true;
+        *forge.etag.lock().unwrap() = "W/\"3\"";
+        assert_eq!(read(true), ["probe", "open", "history"]);
+        *forge.history_fails.lock().unwrap() = false;
+        assert_eq!(read(true), ["probe", "open", "history"]);
+        assert_eq!(read(true), ["probe"]);
+
+        // A listing read after the account changed is not kept for the
+        // account it started as.
+        let other = (Some("another account".to_owned()), repository.clone());
+        let validator = SidebarValidator {
+            key: other.clone(),
+            etag: Some("W/\"3\"".into()),
+        };
+        service
+            .sidebar_listing(&repository, validator, 50, &cancellation)
+            .unwrap();
+        assert!(!lock(&LISTINGS).read.contains_key(&other));
+    }
+
+    #[test]
+    fn a_checkout_resolves_again_when_its_remotes_or_gh_default_change() {
+        let forge = Forge::new();
+        let service = GitHubService::new("gh", forge.clone());
+        let cancellation = CancellationToken::new();
+        let checkout = Path::new("/sidebar-probe/resolution");
+        let origin = crate::repository::RemoteRecord {
+            name: "origin".into(),
+            fetch_url: Some("https://github.com/sidebar-probe/repo.git".into()),
+            push_url: None,
+            gh_resolved: None,
+        };
+        let resolve = |remotes: &[_], reuse| {
+            let key = service
+                .resolve_repository_cached(checkout, remotes, reuse, &cancellation)
+                .unwrap();
+            assert_eq!(key.name, "repo");
+            std::mem::take(&mut *forge.calls.lock().unwrap()).len()
+        };
+        let remotes = [origin.clone()];
+        assert_eq!(resolve(&remotes, false), 1);
+        assert_eq!(resolve(&remotes, true), 0);
+        // `gh repo set-default` changes what gh resolves, but no URL.
+        let defaulted = [crate::repository::RemoteRecord {
+            gh_resolved: Some("base".into()),
+            ..origin
+        }];
+        assert_eq!(resolve(&defaulted, true), 1);
+        assert_eq!(resolve(&defaulted, true), 0);
+        // Opening or retrying the project always resolves.
+        assert_eq!(resolve(&defaulted, false), 1);
     }
 
     #[test]
