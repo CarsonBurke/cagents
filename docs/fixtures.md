@@ -76,6 +76,7 @@ no pull requests and no review requests:
 | `gh pr view N` | a seeded pull request, or gh's error for an unknown number |
 | `gh pr checks N` | gh's `no checks reported` for a seeded pull request, which the app reads as no checks |
 | `gh api graphql` | empty pages for the review-request poll, the pull request browser and its search; not found for a pull request's own queries |
+| `gh api repos/OWNER/NAME/issues?creator=LOGIN&...` | the creator's most recently updated seeded pull request, with an `Etag` that changes when that row does, and gh's `HTTP 304` failure when `If-None-Match` still matches it |
 | `gh api repos/OWNER/NAME/releases` | `[]`; any other REST endpoint is `404 Not Found` |
 
 Anything else, including every write, fails and names the command. A project
@@ -83,16 +84,26 @@ shows as connected to GitHub only when its checkout has a github.com remote,
 so add one: `git remote add origin https://github.com/OWNER/NAME`. The fixture
 sets `GIT_ALLOW_PROTOCOL=file`, so Git never fetches from or pushes to it.
 
-The named `SidebarPullRequests` and `SidebarHistory` GraphQL queries use seeded
-rows too. The open query computes the aggregate check state from the seed's
+The named `SidebarPullRequests` and `SidebarHistory` GraphQL queries, and the
+Work board's `CagentsAuthoredPullRequests`, use seeded rows too; the board's
+lists `fixture`'s seeds, newest `updatedAt` first, and moves each check run's
+`workflowName` to `checkSuite.workflowRun.workflow.name`, where GraphQL keeps
+it. The open query computes the aggregate check state from the seed's
 `statusCheckRollup`; history omits checks. This exercises the native sidebar's
 actual query and decoder without a GitHub account.
 
 For polling evidence, create `home/.config/fixture-forge-trace`. The forge then
 appends epoch time, parent PID and operation label to
-`home/.config/fixture-forge-requests.tsv`. Authored listing labels include their
-author and repository, so daemon Work polling can be counted separately from
-sidebar and branch lookups. No query bodies or variables are recorded.
+`home/.config/fixture-forge-requests.tsv` for every command it answers. GraphQL
+labels name the operation and repository, and REST labels the method and path,
+so daemon Work polling can be counted separately from sidebar and branch
+lookups. No query bodies or variables are recorded.
+
+Like GitHub, the issues probe moves only with a pull request's `updatedAt` and
+the fields of the rows it returns (`per_page` of them, newest first): to make
+the Work board or sidebar notice a seeded
+change, such as new checks, change that seed's `updatedAt` too, or wait for the
+board's five-minute reread.
 
 Whether or not the switch is on, the fixture's `curl` always fails and Git
 reaches only local paths, so a step cannot download a file or clone over https;
