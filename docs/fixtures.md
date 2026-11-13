@@ -39,8 +39,10 @@ directories, so nothing reaches the real desktop, daemon or provider config:
 2. **Fixture** (`TASK/fixture`): the app's HOME and XDG directories, a
    project repository, and `bin/` with the synthetic `claude`, a `gh` that
    fails until [switched on](#an-offline-github), a `curl` that always
-   fails and, for a session started with `--codex`, an
-   [offline `codex`](#an-offline-codex), or an explicitly selected
+   fails, an `xdg-open` that records each link the app opens in
+   `state/opened-urls` rather than starting a browser and, for a session
+   started with `--codex`, an [offline `codex`](#an-offline-codex), or an
+   explicitly selected
    [real executable](#a-real-codex-in-the-fixture). The fixture is mode 0700. `save-seed` keeps it as the data every later start restores,
    so both sides open the same workspace.
 3. **Compositor**: KWin's virtual backend, with its own HOME, hosting a nested
@@ -108,6 +110,12 @@ reread.
 Whether or not the switch is on, the fixture's `curl` always fails and Git
 reaches only local paths, so a step cannot download a file or clone over https;
 copy what it needs from the host's disk instead.
+
+Without `--portal`, a link the app opens, such as a Work card's pull request,
+goes to the fixture's `xdg-open`. It appends the link to
+`$CAGENTS_EVIDENCE_FIXTURE/state/opened-urls` and succeeds, so a click on a
+card neither starts the host's browser nor reaches github.com, and a step can
+check what was opened.
 
 Avatars never come from the network. Put an
 image at `$CAGENTS_EVIDENCE_FIXTURE/avatars/OWNER.image`, PNG, JPEG, GIF or

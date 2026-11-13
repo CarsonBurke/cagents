@@ -424,6 +424,8 @@ prepare_fixture() {
     # Avatars come only from the seeds the forge copies into the app's cache.
     printf '#!/bin/sh\necho "curl: (7) the fixture has no network access" >&2\nexit 7\n' >"$fixture/bin/curl"
     chmod 755 "$fixture/bin/curl"
+    # Links the app opens are recorded in state/opened-urls, not shown in a browser.
+    install -m 755 "$tool_root/tests/fixtures/fixture-xdg-open.sh" "$fixture/bin/xdg-open"
     install_codex
     if [ ! -e "$fixture/project/.git" ]; then
         (

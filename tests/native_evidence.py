@@ -1577,6 +1577,10 @@ exec(compile(code, "native-evidence copy helper", "exec"))
         offline = self.fixture_shell("curl -q --url https://avatars.githubusercontent.com/octo", check=False)
         self.assertEqual(offline.returncode, 7)
         self.assertIn("no network access", offline.stderr)
+        # A link the app opens is recorded rather than shown in a browser.
+        self.fixture_shell("xdg-open https://github.com/octo-org/app/pull/7")
+        self.assertEqual(self.fixture_shell('cat "$CAGENTS_EVIDENCE_FIXTURE/state/opened-urls"').stdout,
+                         "https://github.com/octo-org/app/pull/7\n")
         # Nor can git: a project's github.com remote is only for the forge to name.
         fetch = self.fixture_shell("git ls-remote https://github.com/octo-org/app", check=False)
         self.assertNotEqual(fetch.returncode, 0)
