@@ -1078,7 +1078,9 @@ fn final_flush_complete_at(path: &Path, pid: u32, since_unix_ms: u64) -> io::Res
             } => complete = flushed,
             Event::PersistenceStarted
             | Event::PersistenceFailed { .. }
-            | Event::WriterUnavailable => complete = false,
+            | Event::WriterUnavailable
+            // Its dropped events may have restarted persistence.
+            | Event::EventsSkipped { .. } => complete = false,
             _ => {}
         }
     }
@@ -1104,7 +1106,7 @@ fn read_product(dir: &File, product: Product) -> io::Result<Vec<Record>> {
         return Err(unsafe_path());
     }
     let mut records = std::collections::VecDeque::new();
-    for (_, file) in generations {
+    for (_, file) in &generations {
         parse_generation(file, product, Tail::Complete, &mut records)?;
     }
     Ok(records.into())
@@ -1118,23 +1120,22 @@ fn read_product_snapshot(dir: &File, product: Product) -> io::Result<Vec<Record>
     for _ in 0..3 {
         let generations = open_generations(dir, product)?;
         let mut records = std::collections::VecDeque::new();
-        let mut identities = Vec::with_capacity(generations.len());
-        for (generation, file) in generations {
-            let metadata = file.metadata()?;
-            identities.push((generation, metadata.dev(), metadata.ino()));
-            let tail = if generation == 0 {
+        for (generation, file) in &generations {
+            let tail = if *generation == 0 {
                 Tail::Appending
             } else {
                 Tail::Complete
             };
             parse_generation(file, product, tail, &mut records)?;
         }
+        // Each file stays open, so its inode cannot be reused by another
+        // file that a rotation moved to the same name.
         let mut unmoved = true;
-        for (generation, dev, ino) in identities {
-            match private_file(dir, &product.filename(generation), libc::O_RDONLY) {
-                Ok(file) => {
-                    let metadata = file.metadata()?;
-                    unmoved &= (metadata.dev(), metadata.ino()) == (dev, ino);
+        for (generation, opened) in &generations {
+            match private_file(dir, &product.filename(*generation), libc::O_RDONLY) {
+                Ok(current) => {
+                    let (opened, current) = (opened.metadata()?, current.metadata()?);
+                    unmoved &= (opened.dev(), opened.ino()) == (current.dev(), current.ino());
                 }
                 Err(e) if e.kind() == io::ErrorKind::NotFound => unmoved = false,
                 Err(e) => return Err(e),
@@ -1161,7 +1162,7 @@ fn open_generations(dir: &File, product: Product) -> io::Result<Vec<(usize, File
 }
 
 fn parse_generation(
-    file: File,
+    file: &File,
     product: Product,
     tail: Tail,
     records: &mut std::collections::VecDeque<Record>,
@@ -1283,6 +1284,10 @@ mod tests {
         assert!(!final_flush_complete_at(&path, pid, u64::MAX).unwrap());
         // A writer that started again has unsaved state once more.
         recorder.append(Event::PersistenceStarted).unwrap();
+        assert!(!final_flush_complete_at(&path, pid, 0).unwrap());
+        // Neither is a save followed by events that were dropped unseen.
+        recorder.append(flush(true)).unwrap();
+        recorder.append(Event::EventsSkipped { count: 1 }).unwrap();
         assert!(!final_flush_complete_at(&path, pid, 0).unwrap());
     }
 
