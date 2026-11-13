@@ -2727,7 +2727,9 @@ impl State {
                 }
                 if let Some(result) = run.run.as_ref().map(|run| &run.result) {
                     content = content.push(crate::design::body(result.text.as_str()));
-                    if let Some(diagnostic) = &result.diagnostic {
+                    if let Some(diagnostic) = &result.diagnostic
+                        && run.firing.diagnostic.as_ref() != Some(diagnostic)
+                    {
                         content = content.push(crate::design::body(diagnostic));
                     }
                     if result.truncated {
@@ -4598,6 +4600,123 @@ mod tests {
             firing,
             agent: None,
             run: None,
+        }
+    }
+
+    fn diagnostic_run(
+        firing_diagnostic: Option<&str>,
+        result_diagnostic: Option<&str>,
+    ) -> RunDetail {
+        let mut detail = run_of(&automation());
+        let agent = crate::model::AgentId::new();
+        let run = crate::agent_execution::Run {
+            id: crate::model::RunId::new(),
+            agent,
+            state: crate::agent_execution::State::Failed,
+            revision: 1,
+            accepted_ms: 100,
+            started_ms: None,
+            finished_ms: Some(200),
+            provider_key: None,
+            result: crate::agent_execution::ResultSummary {
+                diagnostic: result_diagnostic.map(str::to_owned),
+                ..Default::default()
+            },
+        };
+        detail.firing.state = crate::automations::FiringState::Failed;
+        detail.firing.finished_ms = run.finished_ms;
+        detail.firing.agent = Some(agent);
+        detail.firing.run = Some(run.id);
+        detail.firing.diagnostic = firing_diagnostic.map(str::to_owned);
+        detail.run = Some(run);
+        detail
+    }
+
+    #[test]
+    fn run_details_show_identical_diagnostics_once_without_losing_result_or_notices() {
+        let diagnostic = "Cannot start claude: No such file or directory (os error 2)";
+        let mut detail = diagnostic_run(Some(diagnostic), Some(diagnostic));
+        detail.firing.release_pending = true;
+        let result = &mut detail.run.as_mut().unwrap().result;
+        result.text = "Retained partial result".into();
+        result.truncated = true;
+        let state = State {
+            run: Some(detail),
+            ..Default::default()
+        };
+        for width in [360.0, 900.0] {
+            let outline = Outline::of(&state, width, 700.0);
+            assert_eq!(
+                outline
+                    .texts
+                    .iter()
+                    .filter(|(text, _)| text == diagnostic)
+                    .count(),
+                1,
+                "one initiating diagnostic at width {width}"
+            );
+            for text in [
+                "Retained partial result",
+                "This result was shortened to keep history bounded.",
+                "Session release pending. New runs cannot start until cleanup finishes.",
+                "Cancel run",
+                "Open agent",
+                "Run history",
+            ] {
+                outline.text(text);
+            }
+        }
+    }
+
+    #[test]
+    fn run_details_preserve_distinct_diagnostics_and_result_text_even_when_it_matches() {
+        let summary = "Provider launch failed";
+        let extra = "Provider launch failed: executable is unavailable";
+        let mut detail = diagnostic_run(Some(summary), Some(extra));
+        detail.run.as_mut().unwrap().result.text = summary.into();
+        let state = State {
+            run: Some(detail),
+            ..Default::default()
+        };
+        for width in [360.0, 900.0] {
+            let outline = Outline::of(&state, width, 700.0);
+            let messages: Vec<_> = outline
+                .texts
+                .iter()
+                .map(|(text, _)| text.as_str())
+                .filter(|text| *text == summary || *text == extra)
+                .collect();
+            assert_eq!(messages, [summary, summary, extra]);
+        }
+    }
+
+    #[test]
+    fn run_details_preserve_one_sided_diagnostics_and_unbound_firing_history() {
+        let diagnostic = "The provider could not start";
+        for (firing, result, bound_run) in [
+            (Some(diagnostic), None, true),
+            (None, Some(diagnostic), true),
+            (Some(diagnostic), None, false),
+        ] {
+            let mut detail = diagnostic_run(firing, result);
+            if !bound_run {
+                detail.firing.run = None;
+                detail.run = None;
+            }
+            let state = State {
+                run: Some(detail),
+                ..Default::default()
+            };
+            let outline = Outline::of(&state, 360.0, 700.0);
+            assert_eq!(
+                outline
+                    .texts
+                    .iter()
+                    .filter(|(text, _)| text == diagnostic)
+                    .count(),
+                1,
+                "retained diagnostic with firing={firing:?}, result={result:?}, bound_run={bound_run}"
+            );
         }
     }
 
