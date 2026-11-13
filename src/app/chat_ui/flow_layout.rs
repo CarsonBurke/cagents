@@ -626,6 +626,18 @@ pub(super) fn availability_stream() -> impl iced::futures::Stream<Item = Message
         },
     )
 }
+/// Whether any of `target`'s layouts waits for a free slot, which is all a
+/// [`Action::FlowAvailable`] resumes.
+pub(super) fn has_deferred(target: Target) -> bool {
+    REQUESTS.with(|requests| {
+        requests.borrow().values().any(|entry| {
+            entry.upgrade().is_some_and(|entry| {
+                let entry = entry.borrow();
+                entry.target == Some(target) && entry.deferred.is_some()
+            })
+        })
+    })
+}
 pub(super) fn deferred_requests(target: Target) -> Vec<Request> {
     REQUESTS.with(|requests| {
         requests

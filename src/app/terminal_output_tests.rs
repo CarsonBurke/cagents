@@ -50,6 +50,10 @@ pub(super) fn record_persist() {
 pub(super) fn persists() -> usize {
     PERSISTS.get()
 }
+/// How many updates on this thread have rebuilt the whole projection.
+pub(super) fn projections() -> usize {
+    PROJECTIONS.get()
+}
 fn counts() -> (usize, usize) {
     (PROJECTIONS.get(), PROTECTIONS.get())
 }
