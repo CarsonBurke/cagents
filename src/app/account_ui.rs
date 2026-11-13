@@ -1329,10 +1329,12 @@ struct UsageFigure {
 
 fn usage_figure(used: f32, mode: AccountUsageDisplay) -> UsageFigure {
     // Round toward caution: 42.4% used is shown as 43% used or 57% left.
-    // Float noise must not turn an exact 43% into 44% used.
-    let used = (used * 100.0 - 0.001).ceil().clamp(0.0, 100.0);
+    // Float noise must not turn an exact 43% into 44% used. Providers can
+    // report over-cap consumption; only the remaining amount is capped.
+    // Gauge geometry already saturates at full for fractions above one.
+    let used = (used * 100.0 - 0.001).ceil().max(0.0);
     let (percent, suffix) = match mode {
-        AccountUsageDisplay::Left => ((100.0 - used) as u32, "left"),
+        AccountUsageDisplay::Left => ((100.0 - used).clamp(0.0, 100.0) as u32, "left"),
         AccountUsageDisplay::Used => (used as u32, "used"),
     };
     UsageFigure {
@@ -6399,7 +6401,8 @@ mod tests {
             (0.424, 57, 43),
             (0.0, 100, 0),
             (1.0, 0, 100),
-            (1.3, 0, 100),
+            (1.3, 0, 130),
+            (1.304, 0, 131),
             (-0.1, 100, 0),
             (0.001, 99, 1),
         ] {
@@ -6427,7 +6430,7 @@ mod tests {
             (0.424, 57, 43, ChipTone::Current),
             (0.001, 99, 1, ChipTone::Current),
             (0.0, 100, 0, ChipTone::Current),
-            (1.3, 0, 100, ChipTone::Exhausted),
+            (1.3, 0, 130, ChipTone::Exhausted),
         ] {
             let state = state_with(Some(snapshot(vec![window(used, None)], NOW)));
             for (mode, percent, suffix) in [
@@ -6469,9 +6472,13 @@ mod tests {
             working_directory: PathBuf::from("/w"),
             environment: BTreeMap::new(),
         };
-        for (used, left_percent, used_percent) in
-            [(1.0, 0, 100), (0.63, 37, 63), (0.01, 99, 1), (0.0, 100, 0)]
-        {
+        for (used, left_percent, used_percent) in [
+            (1.0, 0, 100),
+            (0.63, 37, 63),
+            (0.01, 99, 1),
+            (0.0, 100, 0),
+            (1.3, 0, 130),
+        ] {
             app.account_ui.account_mut(&id).unwrap().snapshot =
                 Some(snapshot(vec![window(used, None)], NOW));
             for (mode, percent, suffix) in [
