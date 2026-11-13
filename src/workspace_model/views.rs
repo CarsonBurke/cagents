@@ -873,11 +873,22 @@ mod wire_tests {
 /// A discovery observation and a shared pane can arrive in either order.
 /// They identify one actor even when an old client minted another card ID.
 pub fn same_resource(left: &CardKind, right: &CardKind) -> bool {
-    match (left, right) {
-        (CardKind::Terminal(a), CardKind::Terminal(b)) => a.id == b.id,
-        (CardKind::Chat(a), CardKind::Chat(b)) => a.id == b.id,
-        (CardKind::Browser(a), CardKind::Browser(b)) => a.id == b.id,
-        _ => false,
+    resource_identity(left).is_some_and(|resource| Some(resource) == resource_identity(right))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum ResourceIdentity {
+    Terminal(crate::model::TerminalId),
+    Chat(crate::model::TerminalId),
+    Browser(crate::model::BrowserId),
+}
+
+pub(crate) fn resource_identity(kind: &CardKind) -> Option<ResourceIdentity> {
+    match kind {
+        CardKind::Terminal(session) => Some(ResourceIdentity::Terminal(session.id)),
+        CardKind::Chat(session) => Some(ResourceIdentity::Chat(session.id)),
+        CardKind::Browser(session) => Some(ResourceIdentity::Browser(session.id)),
+        _ => None,
     }
 }
 

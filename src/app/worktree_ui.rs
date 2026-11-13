@@ -370,6 +370,32 @@ fn insertion_indices(
 }
 
 impl Cagents {
+    /// The mounted strip orders its channel; unmounted members retain their
+    /// saved order until the strip has finished restoring them.
+    pub(super) fn active_channel_order(&self) -> Option<(ChannelId, Vec<CardId>)> {
+        let id = self.durable.active_channel?;
+        let channel = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)?;
+        let members = channel.cards.iter().copied().collect::<HashSet<_>>();
+        let mut order = self
+            .workspace
+            .order()
+            .filter(|card| members.contains(card))
+            .collect::<Vec<_>>();
+        let mounted = order.iter().copied().collect::<HashSet<_>>();
+        order.extend(
+            channel
+                .cards
+                .iter()
+                .copied()
+                .filter(|card| !mounted.contains(card)),
+        );
+        Some((id, order))
+    }
+
     /// Merge navigation into the full descriptor; never snapshot the projected
     /// strip over durable cards belonging to a hidden scope.
     pub(super) fn snapshot_workspace_scope(&mut self) {
@@ -377,29 +403,7 @@ impl Cagents {
             return;
         }
         let focused = self.workspace.focused();
-        let active_order = self.durable.active_channel.and_then(|id| {
-            self.durable
-                .channels
-                .iter()
-                .find(|channel| channel.id == id)
-                .map(|channel| {
-                    let members = channel.cards.iter().copied().collect::<HashSet<_>>();
-                    let mut order = self
-                        .workspace
-                        .order()
-                        .filter(|card| members.contains(card))
-                        .collect::<Vec<_>>();
-                    let mounted = order.iter().copied().collect::<HashSet<_>>();
-                    order.extend(
-                        channel
-                            .cards
-                            .iter()
-                            .copied()
-                            .filter(|card| !mounted.contains(card)),
-                    );
-                    (id, order)
-                })
-        });
+        let active_order = self.active_channel_order();
         if let Some(id) = self.durable.active_channel {
             self.channel_offsets
                 .insert(id, self.workspace.camera().offset());
