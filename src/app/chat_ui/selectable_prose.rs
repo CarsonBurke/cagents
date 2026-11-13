@@ -87,6 +87,12 @@ impl Default for State {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Paragraphs shaped synchronously on this thread, for frame measurements.
+    pub(super) static SHAPES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The room, size and font a block's spans are laid out with.
 #[derive(Clone, Copy)]
 struct Shape {
@@ -135,6 +141,8 @@ impl State {
                     let _stage = chat_stage::scope(Stage::Shape);
                     #[cfg(test)]
                     self.paragraph_builds.set(self.paragraph_builds.get() + 1);
+                    #[cfg(test)]
+                    SHAPES.with(|shapes| shapes.set(shapes.get() + 1));
                     ParagraphBuffer::with_spans(shape.text(spans.as_ref()))
                 }
                 _ => ParagraphBuffer::default(),
@@ -1034,9 +1042,19 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
             .as_ref()
             .is_none_or(|previous| !Arc::ptr_eq(previous, &self.spans))
         {
-            state.paragraph.take();
+            // Each publication of a growing message parses into new span
+            // allocations, settled blocks included. Spans that shape alike
+            // (text, size, line height, font, colour) keep their paragraph.
+            if state
+                .spans
+                .as_deref()
+                .is_none_or(|previous| previous != &*self.spans)
+            {
+                state.paragraph.take();
+            }
             state.spans = Some(self.spans.clone());
-        } else if let Some(paragraph) = state.paragraph.get_mut() {
+        }
+        if let Some(paragraph) = state.paragraph.get_mut() {
             match paragraph.compare(shape.text(())) {
                 iced::advanced::text::Difference::None => {}
                 iced::advanced::text::Difference::Bounds => paragraph.resize(shape.bounds),
@@ -1894,6 +1912,78 @@ mod tests {
             state.paragraph_builds.get(),
             1,
             "paint/navigation reuse the same paragraph"
+        );
+    }
+
+    #[test]
+    fn a_republished_paragraph_keeps_its_shape_until_its_spans_change() {
+        let renderer = crate::app::tests::headless_renderer();
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
+        let spans = |color: Option<iced::Color>| -> Arc<[Span<'static, markdown::Uri>]> {
+            vec![
+                Span::new("A settled paragraph of a streaming answer. ".repeat(8))
+                    .color_maybe(color),
+                Span::new("linked").link(markdown::Uri::from("source.rs")),
+            ]
+            .into()
+        };
+        let limits = layout::Limits::new(Size::ZERO, Size::new(400.0, f32::INFINITY));
+        let mut element = text(
+            spans(None),
+            design::TEXT_PROSE.into(),
+            iced::Font::default(),
+            target,
+            None,
+        );
+        let mut tree = Tree::new(&element);
+        element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        assert_eq!(tree.state.downcast_ref::<State>().paragraph_builds.get(), 1);
+
+        // The next publication parses the same block into a new allocation.
+        let republished = spans(None);
+        let mut element = text(
+            republished.clone(),
+            design::TEXT_PROSE.into(),
+            iced::Font::default(),
+            target,
+            None,
+        );
+        element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        let state = tree.state.downcast_ref::<State>();
+        assert_eq!(
+            state.paragraph_builds.get(),
+            1,
+            "equal spans keep the shaped paragraph"
+        );
+        assert!(
+            state
+                .spans
+                .as_ref()
+                .is_some_and(|spans| Arc::ptr_eq(spans, &republished)),
+            "links and highlights are read from the spans now drawn"
+        );
+
+        let mut element = text(
+            spans(Some(iced::Color::from_rgb(1.0, 0.0, 0.0))),
+            design::TEXT_PROSE.into(),
+            iced::Font::default(),
+            target,
+            None,
+        );
+        element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        assert_eq!(
+            tree.state.downcast_ref::<State>().paragraph_builds.get(),
+            2,
+            "a span that shapes differently is shaped again"
         );
     }
 
