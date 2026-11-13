@@ -443,6 +443,7 @@ mod tests {
             dirty: Some(crate::work::Dirty::default()),
             link: None,
             error: None,
+            status_read_at: None,
         }
     }
 

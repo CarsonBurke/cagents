@@ -6,6 +6,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
     sync::Arc,
+    time::Instant,
 };
 
 use crate::{
@@ -43,6 +44,9 @@ pub(super) struct Worktree {
     pub link: Option<LinkedIssue>,
     /// Why this worktree's status could not be read; its siblings still were.
     pub error: Option<String>,
+    /// When `dirty` was last read from Git, so a poll can re-read only the
+    /// worktrees that are due.
+    pub status_read_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,10 +183,14 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
             dirty: None,
             link: None,
             error: None,
+            status_read_at: None,
         };
         if reread {
             match git.activity_status(&record.path, cancellation) {
-                Ok(status) => apply_status(&mut worktree, &status),
+                Ok(status) => {
+                    apply_status(&mut worktree, &status);
+                    worktree.status_read_at = Some(Instant::now());
+                }
                 // Its own removal is often what the scan was woken for, and
                 // one missing checkout must not fail its siblings.
                 Err(_) if checkout_removed(&record.path) => continue,
@@ -190,6 +198,7 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
             }
         } else if let Some(old) = old {
             worktree.dirty = old.dirty.clone();
+            worktree.status_read_at = old.status_read_at;
             if worktree.head.is_none() {
                 worktree.head = old.head.clone();
             }
