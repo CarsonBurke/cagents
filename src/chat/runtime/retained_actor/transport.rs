@@ -10,6 +10,7 @@ use crate::{
         protocol::{ExecutionContext, ProcessSpec, TransportSpec},
     },
     daemon::{
+        child_events::ChildEvents,
         holder_registry::{self as registry, Kind, Process, Record},
         owned_children::DetachedWork,
     },
@@ -3641,7 +3642,8 @@ impl Server {
             resident: self.resident()?,
         })
     }
-    fn serve(&mut self, startup: UnixStream) -> Result<(), String> {
+    /// `children` wakes the loop to reap exited orphans; see [`OrphanSweep`].
+    fn serve(&mut self, startup: UnixStream, children: Option<ChildEvents>) -> Result<(), String> {
         send(
             &startup,
             &Ok::<_, String>(self.attached()?),
@@ -3651,9 +3653,10 @@ impl Server {
             .set_nonblocking(true)
             .map_err(|error| error.to_string())?;
         let connections = connections::Connections::new()?;
-        let mut orphans = OrphanSweep::new();
+        let mut orphans = OrphanSweep::new(children);
+        let mut child_exited = false;
         'serve: loop {
-            orphans.run_if_due();
+            orphans.run_if_due(std::mem::take(&mut child_exited));
             self.finish_inputs();
             if !self.installed && disconnected(&startup)? {
                 self.actor.close()?;
@@ -3681,13 +3684,25 @@ impl Server {
                     revents: 0,
                 });
             }
+            let exits = orphans.wakeup().map(|fd| {
+                events.push(libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+                events.len() - 1
+            });
             // An admitted input's completion has no wakeup of its own, so
             // poll for it only while some are pending.
             let mut wait = orphans.until_due();
             if !self.pending.is_empty() {
-                wait = wait.min(INPUT_COMPLETION_POLL);
+                wait = Some(wait.map_or(INPUT_COMPLETION_POLL, |wait| {
+                    wait.min(INPUT_COMPLETION_POLL)
+                }));
             }
-            let millis = wait.as_millis().saturating_add(1).min(i32::MAX as u128) as i32;
+            let millis = wait.map_or(-1, |wait| {
+                wait.as_millis().saturating_add(1).min(i32::MAX as u128) as i32
+            });
             // SAFETY: `events` stays live and initialized for this finite poll.
             if unsafe { libc::poll(events.as_mut_ptr(), events.len() as libc::nfds_t, millis) } < 0
             {
@@ -3697,6 +3712,7 @@ impl Server {
                 }
                 return Err(error.to_string());
             }
+            child_exited = exits.is_some_and(|index| events[index].revents != 0);
             while accepting && connections.has_capacity() {
                 match self.listener.accept() {
                     Ok((control, _)) => connections.admit(control),
@@ -3883,40 +3899,68 @@ fn disconnected(control: &UnixStream) -> Result<bool, String> {
 /// provider and scope requests spawn through `adopted_orphans`, which reserves
 /// their statuses for their owners. Nothing here signals a live child.
 ///
-/// The helper has no log sink, so a sweep failure is retried on the next tick
-/// rather than reported here. Its durable symptom is the per-holder zombie
-/// count that `cagents diagnostics` observes from outside the process.
+/// A sweep runs when a child exits, read from [`ChildEvents`], so an idle
+/// actor does not wake. Without that descriptor, as in a process whose other
+/// threads receive SIGCHLD, it runs every [`Self::INTERVAL`] instead.
+///
+/// The helper has no log sink, so a sweep failure is retried on the next
+/// child exit or call rather than reported here. Its durable symptom is the
+/// per-holder zombie count that `cagents diagnostics` observes from outside
+/// the process.
 struct OrphanSweep {
-    due: Instant,
+    children: Option<ChildEvents>,
+    /// When the next sweep is due without a child exit.
+    due: Option<Instant>,
 }
 impl OrphanSweep {
     const INTERVAL: Duration = Duration::from_millis(250);
     /// Bounds one pass so a large backlog cannot stall the serve loop.
     const LIMIT: usize = 4096;
 
-    fn new() -> Self {
+    fn new(children: Option<ChildEvents>) -> Self {
         Self {
-            due: Instant::now(),
+            children,
+            // Children may have exited before the descriptor existed.
+            due: Some(Instant::now()),
         }
     }
 
-    fn until_due(&self) -> Duration {
-        self.due.saturating_duration_since(Instant::now())
+    /// Readable when a child has exited.
+    fn wakeup(&self) -> Option<RawFd> {
+        self.children.as_ref().map(ChildEvents::fd)
     }
 
-    fn run_if_due(&mut self) {
-        if Instant::now() >= self.due {
+    /// How long the serve loop may wait before the next sweep, if it is
+    /// waiting on [`Self::wakeup`] instead.
+    fn until_due(&self) -> Option<Duration> {
+        self.due
+            .map(|due| due.saturating_duration_since(Instant::now()))
+    }
+
+    fn run_if_due(&mut self, woken: bool) {
+        if woken
+            && let Some(children) = &self.children
+            && children.drain().is_err()
+        {
+            // An unreadable descriptor cannot be trusted to wake us again.
+            self.children = None;
+        }
+        if woken || self.due.is_some_and(|due| Instant::now() >= due) {
             self.run();
         }
     }
 
     fn run(&mut self) {
-        self.due = Instant::now() + Self::INTERVAL;
+        self.due = self
+            .children
+            .is_none()
+            .then(|| Instant::now() + Self::INTERVAL);
         if let Ok(sweep) = crate::daemon::adopted_orphans::reap_exited(Self::LIMIT)
             && sweep.truncated
         {
-            // Continue the backlog on the next serve iteration.
-            self.due = Instant::now();
+            // Continue the backlog on the next serve iteration: its exits
+            // were already read from the descriptor.
+            self.due = Some(Instant::now());
         }
     }
 }
@@ -4014,6 +4058,9 @@ pub(crate) fn run_helper_if_requested() -> Option<Result<(), String>> {
         }
         // Every child spawned from here on must register with the sweep.
         crate::daemon::adopted_orphans::become_sweeper();
+        // Before any other thread starts, so all of them inherit the blocked
+        // SIGCHLD that wakes the sweep. Without it the sweep polls instead.
+        let children = ChildEvents::new().ok();
         let mut detached = DetachedWork::Stop;
         let result = (|| {
             crate::daemon::seal_inherited_descriptors().map_err(|error| error.to_string())?;
@@ -4022,7 +4069,10 @@ pub(crate) fn run_helper_if_requested() -> Option<Result<(), String>> {
                 &control,
                 crate::daemon::process_scope::enroll_holder,
             )?;
-            let served = server.serve(control.try_clone().map_err(|error| error.to_string())?);
+            let served = server.serve(
+                control.try_clone().map_err(|error| error.to_string())?,
+                children,
+            );
             detached = server.detached;
             served
         })();
@@ -4266,7 +4316,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s"}
             parent: Some(parent),
             worker: Some(thread::spawn(move || {
                 let mut server = server;
-                server.serve(control)
+                server.serve(control, None)
             })),
         };
         let attached: Result<Attached, String> =
@@ -4280,7 +4330,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s"}
     }
 
     #[test]
-    fn serving_actor_reaps_exited_adopted_orphans_without_touching_live_ones() {
+    fn serving_actor_reaps_adopted_orphans_as_they_exit_and_sleeps_while_idle() {
         if crate::retained_fixture::run_isolated() {
             return;
         }
@@ -4288,7 +4338,17 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s"}
         if std::env::var_os(CHILD).is_none() {
             let root = tempfile::tempdir_in("/var/tmp").unwrap();
             let test = thread::current().name().unwrap().to_owned();
-            let output = ChildCommand::new(std::env::current_exe().unwrap())
+            let mut command = ChildCommand::new(std::env::current_exe().unwrap());
+            // As in the helper, every thread blocks SIGCHLD before the sweep
+            // reads it, including libtest's own.
+            // SAFETY: the hook runs only async-signal-safe sigprocmask.
+            unsafe {
+                std::os::unix::process::CommandExt::pre_exec(
+                    &mut command,
+                    crate::daemon::child_events::block_sigchld_for_exec,
+                );
+            }
+            let output = command
                 .args(["--exact", &test, "--nocapture"])
                 .env(CHILD, "1")
                 .env("XDG_RUNTIME_DIR", root.path())
@@ -4309,6 +4369,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s"}
         // This isolated process stands in for the helper: a subreaper that
         // adopts every orphan its provider's tools leave behind.
         assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
+        let children = ChildEvents::new().expect("every fixture thread blocks SIGCHLD");
         let state = |pid: i32| {
             let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
             stat[stat.rfind(')')? + 2..].chars().next()
@@ -4387,10 +4448,14 @@ while IFS= read -r frame; do :; done
         let server = Server::start_after_scope_enrollment(startup, &control, || Ok(())).unwrap();
         let provider = server.identity.record.root.clone();
         let mut parent = Some(parent);
+        let (serving, serving_thread) = std::sync::mpsc::channel();
         let worker = thread::spawn(move || {
+            // SAFETY: gettid has no preconditions.
+            serving.send(unsafe { libc::gettid() }).unwrap();
             let mut server = server;
-            server.serve(control)
+            server.serve(control, Some(children))
         });
+        let serving_thread = serving_thread.recv().unwrap();
         let attached: Result<Attached, String> =
             receive(parent.as_ref().unwrap(), TIMEOUT).unwrap();
         attached.unwrap();
@@ -4421,6 +4486,41 @@ while IFS= read -r frame; do :; done
         }
         assert!(provider.is_current(), "the provider must keep running");
         assert!(!worker.is_finished(), "the actor must keep serving");
+        // Idle, the actor sleeps until a child exits or a client calls: its
+        // serve loop and chat worker arm no timer.
+        let switches = || {
+            let mut total = 0;
+            for task in std::fs::read_dir("/proc/self/task").unwrap() {
+                let task = task.unwrap().path();
+                let name = std::fs::read_to_string(task.join("comm")).unwrap_or_default();
+                let tid: i32 = task.file_name().unwrap().to_str().unwrap().parse().unwrap();
+                if tid != serving_thread && name.trim() != "cagents-chat" {
+                    continue;
+                }
+                let status = std::fs::read_to_string(task.join("status")).unwrap();
+                total += status
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("voluntary_ctxt_switches:"))
+                    .map(|count| count.trim().parse::<u64>().unwrap())
+                    .sum::<u64>();
+            }
+            total
+        };
+        // Only the provider and the live daemon remain to exit.
+        let settle = Instant::now() + Duration::from_secs(5);
+        while crate::daemon::owned_children::direct_children()
+            .unwrap()
+            .len()
+            > 2
+        {
+            assert!(Instant::now() < settle, "short-lived tools did not finish");
+            thread::sleep(Duration::from_millis(20));
+        }
+        let before = switches();
+        thread::sleep(Duration::from_secs(2));
+        let woken = switches() - before;
+        // A 250 ms sweep timer alone woke the serve loop eight times here.
+        assert!(woken <= 1, "an idle actor woke {woken} times in 2 s");
         // The live adopted daemon is still this actor's unsignalled child.
         assert_eq!(state(live), Some('S'));
         assert!(
