@@ -6975,14 +6975,14 @@ mod tests {
             at: Some(1_700_000_000_000),
             started_at: Some(1_700_000_000_000),
             content: ItemContent::Text {
-                text: "Distinct parent reasoning".into(),
+                text: "Parent preview\nDistinct parent reasoning".into(),
                 thinking: true,
                 phase: chat::Phase::Commentary,
             },
         };
         let child = chat::Item {
             content: ItemContent::Text {
-                text: "Distinct child reasoning".into(),
+                text: "Child preview\nDistinct child reasoning".into(),
                 thinking: true,
                 phase: chat::Phase::Commentary,
             },
@@ -13427,7 +13427,7 @@ mod tests {
             .push(Arc::new(next));
         assert_eq!(
             label(&runtime),
-            "Reasoning: First thought · 24s",
+            "Reasoning: First thought · 24.0s",
             "a child's tool call finishes its previous thought while the child runs"
         );
         let child = &mut Arc::make_mut(&mut runtime.snapshot).subagents[0];
@@ -13516,7 +13516,7 @@ mod tests {
                     assert_eq!(buttons.len(), 1);
                     assert_eq!(
                         buttons[0].node().label(),
-                        Some("Reasoning: First thought · 12s")
+                        Some("Reasoning: First thought · 12.0s")
                     );
                 } else {
                     assert!(
@@ -13528,7 +13528,7 @@ mod tests {
                             .root()
                             .iter()
                             .chain(accessible.children())
-                            .any(|node| node.node().label() == Some("Thought for 12s"))
+                            .any(|node| node.node().label() == Some("Thought for 12.0s"))
                     );
                 }
             }
