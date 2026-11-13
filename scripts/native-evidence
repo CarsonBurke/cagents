@@ -1116,7 +1116,11 @@ cmd_seed() {
     rm -rf -- "$fixture"
     fixture_env "$generator" generate --profile "$profile" --seed "$number" --root "$fixture" ||
         die "generating the $profile workspace failed; the fixture is incomplete, so seed again"
-    fixture_env "$generator" apply --root "$fixture" --bin-dir "$target/dev-runtime" ||
+    # A task that selected a named instance starts that instance's stores, so
+    # the seed must write them; fixture_env keeps them inside the fixture.
+    local seed_instance=()
+    [ -z "$instance_name" ] || seed_instance=(--instance "$instance_name")
+    fixture_env "$generator" apply --root "$fixture" --bin-dir "$target/dev-runtime" "${seed_instance[@]}" ||
         die "loading the $profile workspace through $side's executables failed; the fixture is incomplete, so seed again"
     save_seed
     printf 'seeded %s with the %s workspace (seed %s) through %s at %s\n' \

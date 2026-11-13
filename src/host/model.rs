@@ -38,9 +38,9 @@ mod channel_work_integration_tests;
 pub(super) use automations::Claimed;
 pub(super) mod console_relaunch;
 mod execution;
-pub(super) mod floor;
 #[cfg(any(debug_assertions, feature = "development"))]
 pub(crate) mod fixture_seed;
+pub(super) mod floor;
 pub(super) use execution::ResidentRelease;
 mod lineage;
 mod mailbox;

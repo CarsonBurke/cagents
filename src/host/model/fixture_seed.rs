@@ -241,9 +241,7 @@ fn record_edits(
 fn recorded(registry: &Registry) -> Result<u64, String> {
     registry
         .db
-        .query_row("SELECT COUNT(*) FROM shared_view_edits", [], |row| {
-            row.get(0)
-        })
+        .query_row("SELECT COUNT(*) FROM view_operations", [], |row| row.get(0))
         .map_err(|error| error.to_string())
 }
 
@@ -339,9 +337,7 @@ mod tests {
         assert_eq!(panes, seeded.panes);
         let recorded: u64 = registry
             .db
-            .query_row("SELECT COUNT(*) FROM shared_view_edits", [], |row| {
-                row.get(0)
-            })
+            .query_row("SELECT COUNT(*) FROM view_operations", [], |row| row.get(0))
             .unwrap();
         assert_eq!(
             recorded,

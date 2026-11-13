@@ -52,7 +52,8 @@ use crate::{instance, terminal_ipc::SOCKET_FILE_NAME};
 
 #[cfg(feature = "host")]
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
-#[cfg(any(feature = "host", test))]
+// Development seeding opens the daemon lock too, outside the host build.
+#[cfg(any(feature = "host", test, debug_assertions, feature = "development"))]
 const PRIVATE_FILE_MODE: u32 = 0o600;
 const O_NOFOLLOW: c_int = libc::O_NOFOLLOW;
 // Validate the opened descriptor without blocking on an invalid special file.
@@ -475,6 +476,8 @@ impl HostLease {
         Ok(Self {
             socket_path: paths.socket.clone(),
             lock,
+            shared_handoff: false,
+            _store_maintenance: None,
         })
     }
 

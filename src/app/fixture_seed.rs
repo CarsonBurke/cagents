@@ -23,7 +23,7 @@ use crate::{
     persistence::{SnapshotBase, StateStore},
 };
 
-use super::{ContextTab, WindowView};
+use super::{WindowView, context_sections};
 
 #[derive(serde::Serialize)]
 pub(crate) struct SeededWindow {
@@ -237,7 +237,7 @@ pub(crate) fn seed_store(
             })
             .collect(),
         workspace_model_identity: identity,
-        cards,
+        cards: cards.into(),
         ..WorkspaceState::default()
     };
     state.normalize_channels();
@@ -260,7 +260,7 @@ pub(crate) fn seed_store(
         sidebar_width: crate::layout_metrics::NAVIGATION_DEFAULT_WIDTH,
         inspector_width: crate::layout_metrics::INSPECTOR_DEFAULT_WIDTH,
         context_inspector_open: false,
-        context_tab: ContextTab::default(),
+        context_sections: context_sections::Sections::default(),
         // The sidebar keeps its interaction state private; it reads back what
         // it saved, so the seed writes that shape.
         sidebar: serde_json::from_value(serde_json::json!({
