@@ -2313,10 +2313,8 @@ impl Claude {
         started: bool,
     ) -> Result<Option<String>, ()> {
         if reported.is_some_and(|tool| {
-            self.tools
-                .keys()
-                .any(|key| key.id == tool && key.parent.is_some())
-                && !self.tools.contains_key(&ScopedId::new(None, tool))
+            self.nested_agent_tool(tool)
+                && self.tools.keys().filter(|key| key.id == tool).count() == 1
         }) {
             // An unscoped lifecycle notice for a helper of a worker cannot
             // promote that helper into a direct child of the lead.
@@ -13689,7 +13687,10 @@ mod tests {
             .find(|agent| agent.id == "old-agent")
             .unwrap();
         assert_eq!(old.status, ToolStatus::Ended);
-        assert!(old.items.iter().any(|item| matches!(&item.content, ItemContent::Text { text, .. } if text.contains("Old attempt failed"))));
+        assert!(old.items.iter().any(|item| {
+            chat::failure::provider_error_text(Provider::Claude, item)
+                .is_some_and(|body| body.contains("Old attempt failed"))
+        }));
     }
 
     #[test]
@@ -16563,11 +16564,14 @@ mod tests {
         };
         let (agent, bash, agent_running) = statuses(false);
         assert_eq!(bash, Some(ToolStatus::Stopped));
-        assert!(agent_running, "the background agent may still run");
-        assert_ne!(
+        assert!(
+            !agent_running,
+            "history alone cannot establish current agent activity"
+        );
+        assert_eq!(
             agent,
             Some(ToolStatus::Stopped),
-            "and is not marked stopped"
+            "the earlier call ended with its process"
         );
         // Only reading the history starts nothing, so it is left as it was.
         assert_eq!(statuses(true).1, Some(ToolStatus::Running));
@@ -16760,7 +16764,14 @@ mod tests {
         ] {
             adapter.receive(json!({"type":"assistant","uuid":format!("{nested}-launch"),"parent_tool_use_id":"tool-agent","message":{"id":format!("{nested}-message"),"content":[{"type":"tool_use","id":nested,"name":"Agent","input":input}]}})).unwrap();
             let launched = adapter.receive(json!({"type":"user","uuid":format!("{nested}-result"),"parent_tool_use_id":"tool-agent","tool_use_result":{"status":"async_launched","agentId":"a2"},"message":{"content":[{"type":"tool_result","tool_use_id":nested,"content":"Launched"}]}})).unwrap();
-            assert!(launched.events.iter().any(|event| matches!(event, Event::Subagent { id, status: Some(ToolStatus::Succeeded), .. } if id == nested)));
+            assert!(
+                !launched
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::Subagent { id, .. } if id == nested))
+            );
+            assert!(launched.events.iter().any(|event| matches!(event, Event::SubagentItem { id, item }
+                if id == "tool-agent" && item.id == nested && item.content.status() == Some(ToolStatus::Succeeded))));
         }
         assert!(adapter.background_agents.is_empty());
         assert!(adapter.agent_calls.is_empty());
@@ -17027,17 +17038,14 @@ mod tests {
         assert_eq!(
             settled,
             [
-                ("tool-queued", ToolStatus::Failed),
+                ("tool-queued", ToolStatus::Ended),
                 ("tool-delivered", ToolStatus::Succeeded),
                 ("tool-killed", ToolStatus::Stopped),
-                ("tool-running", ToolStatus::Running),
+                ("tool-running", ToolStatus::Ended),
                 ("tool-stopped", ToolStatus::Stopped),
             ]
         );
-        assert_eq!(
-            adapter.background_agents,
-            HashSet::from(["tool-running".to_owned()])
-        );
+        assert!(adapter.background_agents.is_empty());
     }
 
     #[test]
