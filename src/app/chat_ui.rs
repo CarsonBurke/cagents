@@ -20357,6 +20357,89 @@ mod tests {
         );
     }
 
+    /// A draft is copied into the saved workspace when it changes. Saves
+    /// after that which change nothing hand the writer the workspace already
+    /// held instead of a fresh copy of every card in it.
+    #[test]
+    fn saves_after_a_draft_change_copy_the_workspace_only_when_it_changes_again() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        write(&mut app, card, "kept draft");
+        let first = app.persistent_workspace();
+        assert_eq!(first.chat_drafts[&card], "kept draft");
+        assert!(
+            Arc::ptr_eq(&first, &app.durable),
+            "durable holds the draft it saved"
+        );
+        let again = app.persistent_workspace();
+        assert!(
+            Arc::ptr_eq(&again, &first),
+            "an unchanged save copies nothing"
+        );
+
+        write(&mut app, card, " and more");
+        let changed = app.persistent_workspace();
+        assert!(!Arc::ptr_eq(&changed, &first));
+        assert_eq!(changed.chat_drafts[&card], "kept draft and more");
+        assert_eq!(
+            first.chat_drafts[&card], "kept draft",
+            "a snapshot already handed to the writer stays as it was saved"
+        );
+        assert!(Arc::ptr_eq(&app.persistent_workspace(), &changed));
+
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+            panic!("expected live chat runtime");
+        };
+        runtime.replace_draft(text_editor::Content::new());
+        let cleared = app.persistent_workspace();
+        assert!(!cleared.chat_drafts.contains_key(&card));
+        assert!(!app.durable.chat_drafts.contains_key(&card));
+        assert!(Arc::ptr_eq(&app.persistent_workspace(), &cleared));
+    }
+
+    /// Repeatable measurement for #2633: what a save that changes nothing
+    /// costs once a draft has been written, in a workspace holding as many
+    /// cards as a long-used desktop one.
+    #[test]
+    #[ignore = "measurement: run with --ignored --nocapture under --profile dev-runtime"]
+    fn measure_unchanged_saves_after_a_draft_at_desktop_inventory_scale() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        write(&mut app, card, "kept draft");
+        let durable = Arc::make_mut(&mut app.durable);
+        for index in 0..555 {
+            let mut closed = crate::app::tests::terminal_card_state();
+            closed.existence = Existence::Closed {
+                tombstone: crate::model::Tombstone {
+                    operation_id: None,
+                    closed_at_unix_ms: 1,
+                    reason: Some("closed inventory fixture".into()),
+                },
+            };
+            durable.card_scopes.insert(
+                closed.id,
+                PathBuf::from(format!("/workspace/scope-{index}")),
+            );
+            durable.cards.push(closed);
+        }
+        let mut held = app.persistent_workspace();
+        const SAVES: u32 = 200;
+        let started = std::time::Instant::now();
+        let mut copies = 0;
+        for _ in 0..SAVES {
+            let saved = app.persistent_workspace();
+            copies += usize::from(!Arc::ptr_eq(&saved, &held));
+            // The writer holds the latest snapshot until a newer one replaces it.
+            held = saved;
+        }
+        let elapsed = started.elapsed();
+        println!(
+            "unchanged saves: {SAVES} in {:.3} ms, {:.1} us each, {copies} copied the workspace",
+            elapsed.as_secs_f64() * 1e3,
+            elapsed.as_secs_f64() * 1e6 / f64::from(SAVES),
+        );
+    }
+
     #[test]
     fn default_pane_keeps_attached_files() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
