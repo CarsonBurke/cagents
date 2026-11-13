@@ -595,18 +595,20 @@ printf '%s\n' "$CAGENTS_OBSERVER_ROWS"
                 .unwrap()
                 .clone()
         };
-        let expire = |since: &dyn Fn(&mut Entry) -> &mut Option<Instant>, by: Duration| {
+        // Age the cache as if time had passed: the check, and optionally the
+        // listing beyond its backstop.
+        let expire = |listing: bool| {
             let entry = entry();
             let mut entry = entry.lock().unwrap();
-            let at = since(&mut entry);
-            *at = Some(at.unwrap() - by);
+            entry.checked = entry.checked.map(|at| at - TTL);
+            if listing {
+                entry.listed = entry.listed.map(|at| at - UNCHANGED_TTL);
+            }
         };
-        let checked = |entry: &mut Entry| &mut entry.checked;
-        let listed = |entry: &mut Entry| &mut entry.listed;
 
         // Without a status file for the process, every check lists.
         observe();
-        expire(&checked, TTL);
+        expire(false);
         observe();
         assert_eq!(queries(), 2);
 
@@ -615,35 +617,34 @@ printf '%s\n' "$CAGENTS_OBSERVER_ROWS"
         let status = sessions.join(format!("{}.json", process.pid));
         std::fs::write(&status, r#"{"status":"idle"}"#).unwrap();
         std::fs::write(sessions.join("1.json"), r#"{"status":"idle"}"#).unwrap();
-        expire(&checked, TTL);
+        expire(false);
         observe();
         assert_eq!(queries(), 3, "the first files seen are a baseline");
 
         for _ in 0..5 {
-            expire(&checked, TTL);
+            expire(false);
             observe();
         }
         assert_eq!(queries(), 3, "an idle account is not listed again");
 
         // Any session's change, arrival or departure is a change.
         std::fs::write(&status, r#"{"status":"busy"}"#).unwrap();
-        expire(&checked, TTL);
+        expire(false);
         observe();
         assert_eq!(queries(), 4);
         std::fs::write(sessions.join("2.json"), "{}").unwrap();
-        expire(&checked, TTL);
+        expire(false);
         observe();
         assert_eq!(queries(), 5);
         std::fs::remove_file(sessions.join("1.json")).unwrap();
-        expire(&checked, TTL);
+        expire(false);
         observe();
         assert_eq!(queries(), 6);
 
         // Within the TTL nothing is read at all; past the backstop it lists.
         observe();
         assert_eq!(queries(), 6);
-        expire(&checked, TTL);
-        expire(&listed, UNCHANGED_TTL);
+        expire(true);
         observe();
         assert_eq!(queries(), 7);
     }
