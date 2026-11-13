@@ -6151,6 +6151,68 @@ fn an_interrupt_withdraws_the_prompts_waiting_behind_the_run() {
     assert_eq!(prompts(root), 1, "a withdrawn prompt is never sent");
 }
 
+#[test]
+fn an_interrupt_keeps_the_messages_waiting_behind_the_run() {
+    use crate::agent_execution::{
+        Start,
+        mailbox::{Handoff, State as Delivery},
+    };
+    if isolated("an_interrupt_keeps_the_messages_waiting_behind_the_run").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap();
+    let first = busy_agent(&host, request.clone(), root);
+    let handed = deliver(&host, first.agent.id.to_string(), "From a colleague");
+    let Some(Handoff::Run {
+        run: message_run,
+        start: Start::Queued { .. },
+        ..
+    }) = handed.agent
+    else {
+        panic!("a busy agent queues the message: {handed:?}");
+    };
+    let prompt = submit(
+        &host,
+        &Authority::default(),
+        Submit {
+            destination: Destination::Existing(first.agent.id),
+            prompt: "Withdrawn".into(),
+            idempotency_key: "withdrawn-after-message".into(),
+            ..request
+        },
+    )
+    .unwrap();
+    std::fs::write(root.join("cleanup-release"), "").unwrap();
+    let _ = process(
+        &host,
+        Authority::default(),
+        Operation::Control {
+            agent: first.agent.id,
+            command: Control::Interrupt {
+                including_subagents: false,
+            },
+        },
+    );
+    // The owner's own prompt is withdrawn; the message stays a run.
+    let withdrawn = settled(&host, prompt.run.id);
+    assert_eq!(withdrawn.result.diagnostic.as_deref(), Some(WITHDRAWN));
+    settled(&host, first.run.id);
+    let courier = mailbox::Courier::start(&host).unwrap();
+    let ran = settled(&host, message_run);
+    assert_eq!(ran.state, State::Succeeded, "{ran:?}");
+    let message = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .message(handed.delivery.sent.message.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(message.state, Delivery::Delivered);
+    assert_eq!(prompts(root), 2, "the message ran once, as its run");
+    drop(courier);
+}
+
 /// Retrying a follow-up whose run the agent received and that has since
 /// ended reports how it ended, rather than that it was sent or never was.
 #[test]

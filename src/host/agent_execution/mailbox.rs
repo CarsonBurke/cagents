@@ -190,29 +190,26 @@ pub(super) fn to_agent(
     let Some(lineage) = message.to.lineage else {
         return Ok(None);
     };
-    let (agent, request, previous, interactive, unverified, ahead) = {
+    let (agent, request, previous, eligible, unverified, ahead) = {
         let store = registry.lock().unwrap_or_else(|p| p.into_inner());
         let Some(agent) = store.lineage_agent(lineage)? else {
             return Ok(None);
         };
         let request = message_run(agent.id, message, seal);
         let previous = store.previous_agent_acceptance(&agent.origin, &request)?;
-        let interactive = store.agent_is_interactive(agent.id)?;
+        // The same judgement that orders a follow-up behind this message.
+        let eligible = store.takes_messages_as_runs(&agent)?;
         let unverified = store.agent_has_unverified_run(agent.id)?;
         let ahead = store
             .unfinished_agent_runs(agent.id)?
             .first()
             .map(|run| run.id);
-        (agent, request, previous, interactive, unverified, ahead)
+        (agent, request, previous, eligible, unverified, ahead)
     };
     let Some(crate::agent_execution::HostedSession::Chat(session)) = &agent.session else {
         return Ok(None);
     };
-    if agent.closed
-        || matches!(agent.origin, Origin::Automation { .. })
-        || interactive
-        || previous.is_some()
-    {
+    if !eligible || previous.is_some() {
         return Ok(None);
     }
     if unverified {
@@ -264,10 +261,14 @@ pub(super) fn to_agent(
 /// Has every message to `agent` that waits to become one of its runs take
 /// its place, before a follow-up accepted after them. An error says why one
 /// cannot yet.
+///
+/// `limited` is whether a usage limit stops the agent's own conversation,
+/// as the caller judged it for the follow-up.
 pub(super) fn hand_earlier(
     host: &SharedHost,
     registry: &SharedRegistry,
     agent: crate::model::AgentId,
+    limited: bool,
 ) -> Result<(), String> {
     let seal = host
         .lock()
@@ -285,7 +286,7 @@ pub(super) fn hand_earlier(
         else {
             return Ok(());
         };
-        let why = match to_agent(host, registry, &seal, &message, false)? {
+        let why = match to_agent(host, registry, &seal, &message, limited)? {
             Some(Handoff::Run { .. } | Handoff::Ended { .. } | Handoff::Unknown { .. }) => continue,
             // Settled meanwhile, or not the agent's to take as a run, which
             // the follow-up's own acceptance then decides.
@@ -293,6 +294,16 @@ pub(super) fn hand_earlier(
             Some(Handoff::NoSlot { .. }) => "every agent slot is taken".to_owned(),
             Some(Handoff::Waiting { .. }) => "the agent's queue of waiting prompts is full".into(),
             Some(Handoff::Behind { .. }) => "an earlier one waits".into(),
+            // Work of unknown outcome holds back the follow-up too; say so
+            // as its own refusal would.
+            Some(Handoff::Held { .. })
+                if registry
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .agent_has_unverified_run(agent)? =>
+            {
+                return Err(crate::host::model::UNVERIFIED_REFUSAL.into());
+            }
             Some(Handoff::Held { reason, .. }) => reason,
         };
         return Err(format!(

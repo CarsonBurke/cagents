@@ -42,7 +42,7 @@ pub(super) mod floor;
 pub(super) use execution::ResidentRelease;
 mod lineage;
 mod mailbox;
-pub(super) use execution::{EARLIER_MESSAGES, UNVERIFIED_BEHIND};
+pub(super) use execution::{EARLIER_MESSAGES, UNVERIFIED_BEHIND, UNVERIFIED_REFUSAL};
 pub(super) use mailbox::{MESSAGE_RUN_KEY, MessageHandoff};
 mod native_actor;
 mod native_actor_retirement;

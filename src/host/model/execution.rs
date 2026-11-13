@@ -479,16 +479,7 @@ impl Registry {
         &self,
         id: crate::model::TerminalId,
     ) -> Result<Option<Agent>, String> {
-        self.db
-            .query_row(
-                "SELECT record FROM agents WHERE session_id = ?1 AND closed = 0",
-                [id.to_string()],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?
-            .map(|record| decode(&record))
-            .transpose()
+        agent_for_session_in(&self.db, id)
     }
 
     /// Archive a completed execution reference from a kernel boot that cannot
@@ -1211,14 +1202,13 @@ impl Registry {
                     ));
                 }
                 // A client's follow-up goes behind messages to the agent
-                // that have not reached it, as a later message would. A
-                // person's conversation takes messages, not runs, so they
-                // keep no order with its prompts.
-                if !matches!(agent.origin, Origin::Automation { .. })
-                    && !request
-                        .idempotency_key
-                        .starts_with(crate::agent_execution::MESSAGE_RUN_KEY)
-                    && !agent_is_interactive_in(tx, *id)?
+                // that have not become runs yet, as a later message would.
+                // An agent that takes messages as messages keeps no order
+                // between them and its runs.
+                if !request
+                    .idempotency_key
+                    .starts_with(crate::agent_execution::MESSAGE_RUN_KEY)
+                    && super::lineage::takes_messages_as_runs_in(tx, &agent)?
                     && super::mailbox::messages_wait_for_agent(tx, *id, now_ms)?
                 {
                     return Err(EARLIER_MESSAGES.into());
@@ -1394,6 +1384,18 @@ impl Registry {
     /// Whether `run` waits in its agent's queue, proved unsent.
     pub(crate) fn agent_run_is_queued(&self, run: RunId) -> Result<bool, String> {
         run_is_unsent(&self.db, run)
+    }
+
+    /// Whether `run` is a message its agent takes as a run, rather than a
+    /// prompt its owner gave.
+    pub(crate) fn run_is_message(&self, run: RunId) -> Result<bool, String> {
+        self.db
+            .query_row(
+                "SELECT substr(idempotency_key, 1, length(?2)) = ?2 FROM agent_runs WHERE id = ?1",
+                params![run.to_string(), crate::agent_execution::MESSAGE_RUN_KEY],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())
     }
 
     /// Whether one of the agent's runs was interrupted without proof of its
@@ -2431,8 +2433,24 @@ fn run_is_unsent(db: &Connection, run: RunId) -> Result<bool, String> {
     .map_err(|e| e.to_string())
 }
 
+/// The open agent bound to session `id`.
+pub(super) fn agent_for_session_in(
+    db: &Connection,
+    id: crate::model::TerminalId,
+) -> Result<Option<Agent>, String> {
+    db.query_row(
+        "SELECT record FROM agents WHERE session_id = ?1 AND closed = 0",
+        [id.to_string()],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(|error| error.to_string())?
+    .map(|record| decode(&record))
+    .transpose()
+}
+
 /// Whether a person has prompted `id` in its pane, taking it over.
-fn agent_is_interactive_in(db: &Connection, id: AgentId) -> Result<bool, String> {
+pub(super) fn agent_is_interactive_in(db: &Connection, id: AgentId) -> Result<bool, String> {
     db.query_row(
         "SELECT interactive FROM agent_policies WHERE agent = ?1",
         [id.to_string()],
@@ -3573,6 +3591,52 @@ mod tests {
             .collect();
         // Each starts only once every run accepted before it has ended.
         assert_eq!(order, [first.run.id, m1.run.id, m2.run.id, prompt.run.id]);
+    }
+
+    #[test]
+    fn a_follow_up_waits_only_for_messages_its_agent_takes_as_runs() {
+        let (mut registry, _directory, mut request) = fixture();
+        let (first, source) = agent_in_a_turn(&mut registry, &request);
+        // A second open agent in the same lineage: a message to it names no
+        // one agent, so it arrives as a message, never as a run.
+        request.idempotency_key = "second".into();
+        let second = registry.submit_agent(&Origin::User, &request, 2).unwrap();
+        let other = self::source();
+        registry
+            .bind_agent(second.agent.id, None, other.clone())
+            .unwrap();
+        registry
+            .db
+            .execute(
+                "INSERT INTO session_lineages(session_id, lineage) VALUES (?1, ?2)",
+                params![other.id().to_string(), source.id().to_string()],
+            )
+            .unwrap();
+        let agent = registry.agent(first.agent.id).unwrap();
+        assert!(!registry.takes_messages_as_runs(&agent).unwrap());
+        pending_message(&mut registry, &source, "For the lineage", 3);
+
+        let queued = registry
+            .submit_agent(&Origin::User, &follow_up(agent.id, "not-held"), 4)
+            .unwrap();
+        assert!(registry.agent_run_is_queued(queued.run.id).unwrap());
+
+        // Once the lineage has only that agent, the message is its run to
+        // take, and a follow-up waits for it.
+        registry
+            .db
+            .execute(
+                "UPDATE agents SET closed = 1 WHERE id = ?1",
+                [second.agent.id.to_string()],
+            )
+            .unwrap();
+        assert!(registry.takes_messages_as_runs(&agent).unwrap());
+        assert_eq!(
+            registry
+                .submit_agent(&Origin::User, &follow_up(agent.id, "held"), 5)
+                .unwrap_err(),
+            EARLIER_MESSAGES
+        );
     }
 
     #[test]

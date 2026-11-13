@@ -206,9 +206,16 @@ fn accept(
         };
         return Ok((previous, start));
     }
-    if let Destination::Existing(agent) = &request.destination {
-        refuse_limited(host, &registry, *agent)?;
-    }
+    // One reading of the agent's usage limit both refuses the follow-up and
+    // decides how the messages sent before it go.
+    let limit = match &request.destination {
+        Destination::Existing(agent) => usage_limit(host, &registry, *agent)?,
+        Destination::New(_) => None,
+    };
+    refuse_limited(limit.as_ref())?;
+    // Earlier messages are held exactly when the follow-up is refused: a
+    // limit of unknown end lets both through, in order, to test it.
+    let limited = limit.is_some_and(|limit| limit.resets_at.is_some());
     let selected = if let Destination::New(spec) = &request.destination {
         let mut selected = spec.clone();
         let model = registry.lock().unwrap_or_else(|p| p.into_inner()).model()?;
@@ -229,7 +236,7 @@ fn accept(
     let mut attempts = 0;
     let accepted = loop {
         if let Destination::Existing(agent) = &request.destination {
-            mailbox::hand_earlier(host, &registry, *agent)?;
+            mailbox::hand_earlier(host, &registry, *agent, limited)?;
         }
         match registry
             .lock()
@@ -589,22 +596,18 @@ fn interrupt_ahead(host: &SharedHost, agent: AgentId, behind: Option<RunId>) -> 
     handle.interrupt_owned(running.map(|run| run.id), false)
 }
 
-/// Refuses a follow-up run for an agent whose conversation a usage limit stops
-/// until a known reset: its provider would refuse the prompt at once, and the
-/// caller is better told now. A limit of unknown end is let through, since a
-/// new turn is what shows whether it still holds, as after the conversation's
-/// account changed.
-fn refuse_limited(
+/// The usage limit that stops `agent`'s live conversation, if one does.
+fn usage_limit(
     host: &SharedHost,
     registry: &SharedRegistry,
     agent: crate::model::AgentId,
-) -> Result<(), String> {
+) -> Result<Option<crate::agent_execution::directory::UsageLimit>, String> {
     let agent = registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .agent(agent)?;
     let Some(HostedSession::Chat(session)) = &agent.session else {
-        return Ok(());
+        return Ok(None);
     };
     let Some((provider, handle)) = host
         .lock()
@@ -614,10 +617,10 @@ fn refuse_limited(
         .filter(|record| !record.handle.is_completed())
         .map(|record| (record.session.launch.provider, record.handle.clone()))
     else {
-        return Ok(());
+        return Ok(None);
     };
     let now = now();
-    let Some(limit) = directory::chat_limit(
+    Ok(directory::chat_limit(
         provider,
         &handle,
         || {
@@ -625,8 +628,18 @@ fn refuse_limited(
                 .and_then(|accounts| accounts.of(provider, &handle.execution_environment().0))
         },
         now,
-    )
-    .filter(|limit| limit.resets_at.is_some()) else {
+    ))
+}
+
+/// Refuses a follow-up run for an agent whose conversation a usage limit stops
+/// until a known reset: its provider would refuse the prompt at once, and the
+/// caller is better told now. A limit of unknown end is let through, since a
+/// new turn is what shows whether it still holds, as after the conversation's
+/// account changed.
+fn refuse_limited(
+    limit: Option<&crate::agent_execution::directory::UsageLimit>,
+) -> Result<(), String> {
+    let Some(limit) = limit.filter(|limit| limit.resets_at.is_some()) else {
         return Ok(());
     };
     let reset = limit
@@ -1901,22 +1914,39 @@ fn control(
         Control::Interrupt {
             including_subagents,
         } => {
-            // An interrupt stops all of the agent's work, so the prompts
-            // waiting behind its current run are withdrawn unsent.
+            // An interrupt stops all of the owner's work, so the prompts
+            // they queued behind the current run are withdrawn unsent.
+            // Messages others sent stay queued as runs, in order, and still
+            // arrive once the interrupted turn ends.
             let registry = registry(host)?;
             let (unfinished, queued) = {
                 let store = registry.lock().unwrap_or_else(|p| p.into_inner());
                 let unfinished = store.unfinished_agent_runs(id)?;
                 let queued = unfinished
                     .iter()
-                    .map(|run| store.agent_run_is_queued(run.id))
-                    .collect::<Result<Vec<_>, _>>()?;
+                    .map(|run| {
+                        Ok(match store.agent_run_is_queued(run.id)? {
+                            false => Queued::No,
+                            true if store.run_is_message(run.id)? => Queued::Message,
+                            true => Queued::Prompt,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
                 (unfinished, queued)
             };
+            #[derive(PartialEq)]
+            enum Queued {
+                No,
+                Prompt,
+                Message,
+            }
             let mut active = None;
             let mut withdrawn = 0;
             for (run, queued) in unfinished.iter().zip(queued) {
-                if queued {
+                if queued == Queued::Message {
+                    continue;
+                }
+                if queued == Queued::Prompt {
                     withdrawn += usize::from(finish_failure_registry(
                         &registry,
                         run.id,
