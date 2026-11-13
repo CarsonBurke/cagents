@@ -273,3 +273,13 @@ provider home; `CAGENTS_FIXTURE_IMAGE` overrides the path when the script runs
 directly. Each turn then also returns that image as a provider-produced base64
 image block, recorded in the synthetic history like other frames. Paste an image into the composer to
 cover a user-attached image in the same transcript. Use synthetic images only.
+
+For task-delivery checks, `tests/fixtures/delivery-notices-scene.sh wide` (or
+`narrow`, with a session started at 900 pixels wide) opens an invented Claude
+transcript containing successful and failed background commands, a Monitor
+event, a background agent report and a teammate message. Its shell commands
+contain `&&`, `>` and `<`; notification XML escapes them while peer message
+bodies retain their literal text. The fixture records the same user frames
+for history replay. Capture the closed rows, then expand command details and
+the report to check literal output and disclosure. The scene uses only the
+native-evidence fixture's provider home and never calls a live model.

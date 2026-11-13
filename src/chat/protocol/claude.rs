@@ -1623,7 +1623,7 @@ impl Claude {
         // Another agent's delivery is shown as one, including the hand-backs
         // Claude marks as meta.
         let delivered = if role == Role::User && !model_only(frame) {
-            delivery(frame)
+            self.deliveries(frame)
                 .into_iter()
                 .map(|content| self.deduplicate(content))
                 .collect()
@@ -2139,6 +2139,65 @@ impl Claude {
         }
         Ok(())
     }
+    /// Enrich a notification with the original Bash description and command,
+    /// when its unambiguous tool-use identity still names that call.
+    fn command_delivery(
+        &self,
+        delivery: &mut ItemContent,
+        tool: &str,
+        status: &str,
+        summary: &str,
+    ) {
+        let Some(key) = self.task_call(tool) else {
+            return;
+        };
+        let Some(Item {
+            content:
+                ItemContent::Command {
+                    label,
+                    command,
+                    action: CommandAction::Run,
+                    ..
+                },
+            ..
+        }) = self
+            .tools
+            .get(&key)
+            .or_else(|| self.evicted_launches.get(&key))
+        else {
+            return;
+        };
+        let Some((heading, detail)) = command_notification(summary, status, label, command, true)
+        else {
+            return;
+        };
+        if let ItemContent::Delivery {
+            kind: DeliveryKind::Notice,
+            summary,
+            body,
+            ..
+        } = delivery
+        {
+            *summary = heading;
+            *body = detail;
+        }
+    }
+
+    fn deliveries(&self, frame: &Value) -> Vec<ItemContent> {
+        let mut delivered = delivery(frame);
+        if let Some(content) = recorded_notification(frame) {
+            for (delivery, head) in delivered.iter_mut().zip(notification_heads(&content)) {
+                self.command_delivery(
+                    delivery,
+                    &notification_field(head, "tool-use-id").unwrap_or_default(),
+                    &notification_field(head, "status").unwrap_or_default(),
+                    &notification_field(head, "summary").unwrap_or_default(),
+                );
+            }
+        }
+        delivered
+    }
+
     /// The one call, in any transcript, a task's `tool_use_id` names, unless
     /// that call starts or resumes a subagent. An Agent's task is its
     /// subagent, and a resumed agent's task names the `SendMessage` that
@@ -4488,14 +4547,7 @@ fn attribute(attributes: &str, name: &str) -> Option<String> {
     let pattern = format!(" {name}=\"");
     let start = attributes.find(&pattern)? + pattern.len();
     let end = attributes[start..].find('"')?;
-    Some(
-        attributes[start..start + end]
-            .replace("&quot;", "\"")
-            .replace("&apos;", "'")
-            .replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .replace("&amp;", "&"),
-    )
+    Some(decode_xml_text(&attributes[start..start + end]))
 }
 
 /// Parses an `<agent-message>` or `<cross-session-message>` element, which is
@@ -4682,7 +4734,48 @@ fn notification_field(inner: &str, name: &str) -> Option<String> {
     } else {
         inner[start..].find(&close)?
     };
-    Some(inner[start..start + end].trim().to_owned())
+    Some(decode_xml_text(inner[start..start + end].trim()))
+}
+
+/// Decode one XML text/attribute boundary. Splitting the original input once
+/// prevents a literal `&amp;lt;` from becoming `<`; malformed references survive.
+fn decode_xml_text(text: &str) -> String {
+    let mut parts = text.split('&');
+    let mut decoded = parts.next().unwrap_or_default().to_owned();
+    for part in parts {
+        let entity = part.split_once(';').and_then(|(name, rest)| {
+            let value = match name {
+                "amp" => Some('&'),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                _ => name.strip_prefix('#').and_then(|number| {
+                    let (digits, radix) = number
+                        .strip_prefix('x')
+                        .or_else(|| number.strip_prefix('X'))
+                        .map_or((number, 10), |digits| (digits, 16));
+                    (!digits.is_empty() && digits.chars().all(|c| c.is_digit(radix)))
+                        .then(|| u32::from_str_radix(digits, radix).ok())
+                        .flatten()
+                        .and_then(char::from_u32)
+                        .filter(|c| *c != '\0')
+                }),
+            }?;
+            Some((value, rest))
+        });
+        match entity {
+            Some((value, rest)) => {
+                decoded.push(value);
+                decoded.push_str(rest);
+            }
+            None => {
+                decoded.push('&');
+                decoded.push_str(part);
+            }
+        }
+    }
+    decoded
 }
 
 /// The tasks a notification's head names. A resumed session reports all its
@@ -5039,18 +5132,30 @@ fn recorded_notification(record: &Value) -> Option<String> {
 
 fn task_notification(inner: &str) -> ItemContent {
     let element = |name: &str| notification_field(inner, name);
-    let summary = element("summary")
+    let mut summary = element("summary")
         .or_else(|| element("status").map(|status| format!("Background task {status}")))
         .unwrap_or_else(|| "Background task updated".into());
     // A finished agent's result is its report: headless Claude Code hands a
     // background agent's final message back this way rather than as a peer's.
-    let (kind, body) = match element("result") {
+    let (kind, mut body) = match element("result") {
         Some(result) => match pointer(&result) {
             Some(shown) => (DeliveryKind::Notice, shown.to_owned()),
             None => (DeliveryKind::Report, result),
         },
         None => (DeliveryKind::Notice, element("event").unwrap_or_default()),
     };
+    if kind == DeliveryKind::Notice {
+        if let Some((heading, command)) = command_notification(
+            &summary,
+            &element("status").unwrap_or_default(),
+            "",
+            "",
+            false,
+        ) {
+            summary = heading;
+            body = command;
+        }
+    }
     ItemContent::Delivery {
         kind,
         from: String::new(),
@@ -5058,6 +5163,58 @@ fn task_notification(inner: &str) -> ItemContent {
         summary,
         body,
     }
+}
+
+/// A background completion's prose is a status, not a useful title or output.
+/// Keep its command available once as literal detail and use only the original
+/// Bash description as a human title. A lifecycle task's description can be the
+/// raw shell command, so it is not sufficient provenance for a title.
+fn command_notification(
+    summary: &str,
+    status: &str,
+    description: &str,
+    command: &str,
+    known_command: bool,
+) -> Option<(String, String)> {
+    let rest = summary.strip_prefix("Background command ");
+    if rest.is_none() && !known_command {
+        return None;
+    }
+    let exit = summary_exit_code(summary);
+    let outcome_text = rest.map(|text| {
+        text.rsplit_once('"')
+            .map_or(text, |(_, outcome)| outcome)
+            .trim()
+    });
+    let failed = exit.is_some_and(|exit| exit != 0)
+        || matches!(status, "failed" | "error")
+        || outcome_text.is_some_and(|outcome| {
+            outcome == "failed" || outcome.starts_with("failed with exit code ")
+        });
+    let outcome = if failed {
+        exit.map_or_else(|| "failed".into(), |exit| format!("failed (exit {exit})"))
+    } else if matches!(status, "stopped" | "killed") {
+        "stopped".into()
+    } else {
+        "finished".into()
+    };
+    let heading = if description.trim().is_empty()
+        || description.trim() == command.trim()
+        || description.contains('\n')
+    {
+        format!("Background command {outcome}")
+    } else {
+        format!("{} · {outcome}", description.trim())
+    };
+    let detail = if command.trim().is_empty() {
+        rest.and_then(|text| text.strip_prefix('"'))
+            .and_then(|text| text.rsplit_once('"').map(|(command, _)| command))
+            .unwrap_or_default()
+            .to_owned()
+    } else {
+        command.to_owned()
+    };
+    Some((heading, detail))
 }
 
 /// A streamed `task_notification` frame as the delivery its recorded turn
@@ -5069,21 +5226,29 @@ fn live_notification(frame: &Value, description: &str, kind: Option<ReportTask>)
     let status = string(frame, "status");
     let task = string(frame, "task_id").to_owned();
     let Some(task_kind) = kind else {
+        // Stream-json fields are JSON strings, not XML text. Their literal
+        // entities must survive; only the recorded wrapper is decoded.
+        let command = command_notification(summary, status, "", "", false);
         return ItemContent::Delivery {
             kind: DeliveryKind::Notice,
             from: String::new(),
             sender: task,
-            summary: match (summary.is_empty(), description.is_empty()) {
-                (false, _) => summary.into(),
-                (true, false) => format!("Background task \"{description}\" {status}"),
-                (true, true) => format!("Background task {status}"),
-            },
-            body: String::new(),
+            summary: command
+                .as_ref()
+                .map(|(heading, _)| heading.clone())
+                .unwrap_or_else(|| match (summary.is_empty(), description.is_empty()) {
+                    (false, _) => summary.into(),
+                    (true, false) => format!("Background task \"{description}\" {status}"),
+                    (true, true) => format!("Background task {status}"),
+                }),
+            body: command
+                .map(|(_, detail)| detail)
+                .unwrap_or_else(|| string(frame, "event").to_owned()),
         };
     };
     let origin = match task_kind {
-        ReportTask::Agent => "Native subagent",
-        ReportTask::Workflow => "Native workflow",
+        ReportTask::Agent => "Agent",
+        ReportTask::Workflow => "Workflow",
     };
     let subject = if description.is_empty() {
         origin.to_owned()
@@ -6276,8 +6441,14 @@ impl Claude {
                         .iter()
                         .all(|key| frame.get(key).and_then(Value::as_bool) != Some(true));
                     if recorded {
-                        let content =
-                            self.deduplicate(live_notification(frame, &description, kind));
+                        let mut content = live_notification(frame, &description, kind);
+                        self.command_delivery(
+                            &mut content,
+                            string(frame, "tool_use_id"),
+                            string(frame, "status"),
+                            string(frame, "summary"),
+                        );
+                        let content = self.deduplicate(content);
                         step.events.push(Event::Item(Item {
                             id: format!("claude-notification:{task}:{}", string(frame, "uuid")),
                             role: Role::User,
@@ -12520,6 +12691,134 @@ mod tests {
     }
 
     #[test]
+    fn xml_notification_fields_decode_once_including_numeric_references() {
+        let source = "&amp; &lt; &gt; &quot; &apos; &#38; &#x3E; &#X3c; &#128276; &amp;lt;";
+        let expected = "& < > \" ' & > < 🔔 &lt;";
+        for field in ["summary", "result", "event", "note", "status"] {
+            assert_eq!(
+                notification_field(&format!("<{field}>{source}</{field}>"), field).as_deref(),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            decode_xml_text("&unknown; &#; &#x; &#xD800; &#1114112; &#0; &#-1; &unfinished"),
+            "&unknown; &#; &#x; &#xD800; &#1114112; &#0; &#-1; &unfinished"
+        );
+        assert_eq!(
+            attribute(" summary=\"A &#38; B &amp;lt; C\"", "summary").as_deref(),
+            Some("A & B &lt; C")
+        );
+        let content = "<task-notification><task-id>a1</task-id><status>complet&#101;d</status><summary>Agent &quot;Inspect&quot; finished</summary><note>Reports may be &#105;nterim</note><result>Use &lt;input&gt; &amp;&amp; echo &quot;ready&quot; &gt; output; literal &amp;lt;</result></task-notification>";
+        let fields = notice_fields(content);
+        assert!(interim_notice(
+            &notification_field(content, "status").unwrap(),
+            &fields
+        ));
+        assert!(
+            matches!(&task_notifications(content)[..], [ItemContent::Delivery { kind: DeliveryKind::Report, body, .. }] if body == "Use <input> && echo \"ready\" > output; literal &lt;")
+        );
+    }
+
+    #[test]
+    fn command_deliveries_have_plain_outcomes_and_match_live_and_recorded_text() {
+        let command = "cd /workspace/logs && until grep -q \"^\\[rss\\]\" fast-frag1.log 2>/dev/null; do sleep 20; done; cat < fast-frag1.log > latest.log; printf '&lt;'";
+        let escaped = command
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;");
+        for (status, exit, ending) in [
+            ("completed", 0, "finished"),
+            ("completed", 1, "failed (exit 1)"),
+            ("failed", 1, "failed (exit 1)"),
+        ] {
+            let summary = format!("Background command \"{command}\" completed (exit code {exit})");
+            let xml = format!(
+                "<task-notification><task-id>task</task-id><tool-use-id>bash</tool-use-id><status>{status}</status><summary>Background command &quot;{escaped}&quot; completed (exit code {exit})</summary></task-notification>"
+            );
+            let frame =
+                json!({"type":"user","uuid":"done","message":{"role":"user","content":xml}});
+            let live =
+                json!({"task_id":"task","tool_use_id":"bash","status":status,"summary":summary});
+            assert_eq!(
+                task_notifications(&xml),
+                vec![live_notification(&live, "", None)]
+            );
+            assert!(
+                matches!(&task_notifications(&xml)[..], [ItemContent::Delivery { summary, body, .. }] if summary == &format!("Background command {ending}") && body == command)
+            );
+            let mut adapter = Claude::default();
+            adapter
+                .receive(scoped_call(
+                    None,
+                    "call",
+                    "bash",
+                    "Bash",
+                    json!({"command":command,"description":"Wait for k-gather logs"}),
+                ))
+                .unwrap();
+            let recorded = adapter.deliveries(&frame).remove(0);
+            let mut streamed = live_notification(&live, "", None);
+            adapter.command_delivery(&mut streamed, "bash", status, &summary);
+            assert_eq!(recorded, streamed);
+            assert!(
+                matches!(recorded, ItemContent::Delivery { summary, body, .. } if summary == format!("Wait for k-gather logs · {ending}") && body == command)
+            );
+        }
+        // A task's description alone can be raw shell; it is not a Bash label.
+        let live = json!({"task_id":"task","status":"completed","summary":"Background command \"echo x > y\" completed (exit code 0)"});
+        assert!(
+            matches!(live_notification(&live, "echo x > y", None), ItemContent::Delivery { summary, body, .. } if summary == "Background command finished" && body == "echo x > y")
+        );
+    }
+
+    #[test]
+    fn agent_reports_match_raw_live_json_and_escaped_history() {
+        let xml = "<task-notification><task-id>agent</task-id><status>completed</status><summary>Agent &quot;Inspect &amp; report&quot; finished</summary><result>## Findings\nUse &lt;input&gt; &amp;&amp; echo &gt; file; literal &amp;lt;</result></task-notification>";
+        let live = json!({"task_id":"agent","status":"completed","summary":"## Findings\nUse <input> && echo > file; literal &lt;"});
+        assert_eq!(
+            task_notifications(xml),
+            vec![live_notification(
+                &live,
+                "Inspect & report",
+                Some(ReportTask::Agent)
+            )]
+        );
+    }
+
+    #[test]
+    fn monitor_deliveries_use_description_and_literal_event_output() {
+        let xml = "<task-notification><task-id>monitor</task-id><summary>Monitor event: &quot;casmi GPU jobs finishing&quot;</summary><event>k-gather-1 done: 1 failed, 3 passed in 28.96s; x &lt; y &amp;&amp; y &gt; z; literal &amp;lt;</event></task-notification>";
+        let live = json!({"task_id":"monitor","summary":"Monitor event: \"casmi GPU jobs finishing\"","event":"k-gather-1 done: 1 failed, 3 passed in 28.96s; x < y && y > z; literal &lt;"});
+        assert_eq!(
+            task_notifications(xml),
+            vec![live_notification(&live, "", None)]
+        );
+        assert!(
+            matches!(&task_notifications(xml)[..], [ItemContent::Delivery { kind: DeliveryKind::Notice, summary, body, .. }] if summary == "Monitor event: \"casmi GPU jobs finishing\"" && body.contains("1 failed, 3 passed") && body.ends_with("literal &lt;"))
+        );
+    }
+
+    #[test]
+    fn peer_xml_attributes_decode_but_peer_json_and_message_bodies_stay_literal() {
+        let text = "Literal &lt;input&gt; && echo > file";
+        let xml = format!("<agent-message from=\"Build &#38; inspect\">\n{text}\n</agent-message>");
+        assert!(
+            matches!(peer_envelope(&xml).unwrap().finish(false), ItemContent::Delivery { from, body, .. } if from == "Build & inspect" && body == text)
+        );
+        let frame = json!({"origin":{"kind":"peer","name":"A &amp; B","body":text},"message":{"content":"unused"}});
+        assert!(
+            matches!(&delivery(&frame)[..], [ItemContent::Delivery { from, body, .. }] if from == "A &amp; B" && body == text)
+        );
+        let team = format!(
+            "<teammate-message teammate_id=\"tester\" summary=\"x &lt; y &#38; z\">\n{text}\n</teammate-message>"
+        );
+        assert!(
+            matches!(&teammate_messages(&team)[..], [ItemContent::Delivery { summary, body, .. }] if summary == "x < y & z" && body == text)
+        );
+    }
+
+    #[test]
     fn task_notification_reads_as_a_notice() {
         let mut adapter = Claude::default();
         let finished = adapter
@@ -12540,8 +12839,8 @@ mod tests {
                     kind: DeliveryKind::Notice,
                     from: String::new(),
                     sender: "bw86v5sk1".into(),
-                    summary: "Background command \"Rank runs\" completed (exit code 0)".into(),
-                    body: String::new(),
+                    summary: "Background command finished".into(),
+                    body: "Rank runs".into(),
                 }
             )]
         );
@@ -12707,8 +13006,8 @@ mod tests {
         assert_eq!(
             summaries,
             [
-                "Background command \"a\" completed (exit code 0)",
-                "Background command \"b\" failed with exit code 1"
+                "Background command finished",
+                "Background command failed (exit 1)"
             ]
         );
         let plain = adapter
@@ -12808,7 +13107,7 @@ mod tests {
                 content: ItemContent::Delivery { kind: DeliveryKind::Report, summary, body, .. },
                 ..
             }) if id == "claude-notification:agent1:n1"
-                && summary == "Native subagent \"Fruit report\" finished"
+                && summary == "Agent \"Fruit report\" finished"
                 && body == "## Fruit\nApples."
         )));
         let completed = adapter
@@ -12820,7 +13119,7 @@ mod tests {
                 role: Role::User,
                 content: ItemContent::Delivery { kind: DeliveryKind::Notice, summary, body, .. },
                 ..
-            }) if summary == "Background command \"Sleep then echo\" completed (exit code 0)" && body.is_empty()
+            }) if summary == "Background command finished" && body == "Sleep then echo"
         )));
         for flag in ["skip_transcript", "ambient"] {
             let quiet = adapter
@@ -12842,16 +13141,12 @@ mod tests {
     #[test]
     fn live_native_report_headings_identify_origin_and_terminal_outcome() {
         for (description, status, expected) in [
-            ("Review", "completed", "Native subagent \"Review\" finished"),
-            ("Review", "failed", "Native subagent \"Review\" failed"),
-            (
-                "Review",
-                "stopped",
-                "Native subagent \"Review\" was stopped",
-            ),
-            ("", "completed", "Native subagent finished"),
-            ("", "failed", "Native subagent failed"),
-            ("", "killed", "Native subagent was stopped"),
+            ("Review", "completed", "Agent \"Review\" finished"),
+            ("Review", "failed", "Agent \"Review\" failed"),
+            ("Review", "stopped", "Agent \"Review\" was stopped"),
+            ("", "completed", "Agent finished"),
+            ("", "failed", "Agent failed"),
+            ("", "killed", "Agent was stopped"),
         ] {
             let frame = json!({"task_id":"child", "status":status, "summary":"Findings"});
             assert!(
@@ -12868,12 +13163,8 @@ mod tests {
     #[test]
     fn native_task_reports_keep_their_explicit_origin_through_progress_frames() {
         for (kind, heading, report) in [
-            ("local_agent", "Native subagent \"Review\" finished", true),
-            (
-                "local_workflow",
-                "Native workflow \"Review\" finished",
-                true,
-            ),
+            ("local_agent", "Agent \"Review\" finished", true),
+            ("local_workflow", "Workflow \"Review\" finished", true),
             ("local_bash", "Findings", false),
             ("unknown", "Findings", false),
         ] {
@@ -13802,10 +14093,7 @@ mod tests {
         adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"b2","tool_use_id":"bash","description":"Build","is_backgrounded":false,"task_type":"local_bash"})).unwrap();
         adapter.receive(json!({"type":"user","uuid":"moved","tool_use_result":{"backgroundTaskId":"b2","timedOutAfterMs":120000},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"bash","content":"Command did not complete within its 120s timeout and was moved to the background (ID: b2)."}]}})).unwrap();
         let notified = adapter.receive(json!({"type":"system","subtype":"task_notification","task_id":"b2","tool_use_id":"bash","status":"completed","output_file":"/var/tmp/b2.output","summary":"Background command \"Build\" completed (exit code 0)"})).unwrap();
-        assert_eq!(
-            notice_summaries(&notified),
-            ["Background command \"Build\" completed (exit code 0)"]
-        );
+        assert_eq!(notice_summaries(&notified), ["Build · finished"]);
         assert!(matches!(
             shown_command(&notified, "bash"),
             Some((
