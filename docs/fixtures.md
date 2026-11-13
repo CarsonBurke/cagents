@@ -103,8 +103,9 @@ lookups. No query bodies or variables are recorded.
 
 Like GitHub, the issues probe moves only with a pull request's `updatedAt` and
 the fields of the rows it returns (`per_page` of them, newest first). To make
-the Work board or sidebar notice a seeded change, such as new checks, change
-that seed's `updatedAt` too, or wait for their five-minute reread.
+the Work board, sidebar or review-request scan notice a seeded change, such as
+new checks, change that seed's `updatedAt` too, or wait for their five-minute
+reread.
 
 Whether or not the switch is on, the fixture's `curl` always fails and Git
 reaches only local paths, so a step cannot download a file or clone over https;
