@@ -904,7 +904,7 @@ impl RemoteActor {
         {
             return Err("Retained actors require the Claude stream-json transport".into());
         }
-        spec.remove_unset_environment();
+        spec.withhold_environment();
         let proof = source
             .proof
             .clone()

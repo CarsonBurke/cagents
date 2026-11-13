@@ -415,7 +415,7 @@ impl Drop for Holder {
 
 pub(crate) fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, String> {
     std::hint::black_box(&SERVE);
-    spec.remove_unset_environment();
+    spec.withhold_environment();
     if source.native_continuity != crate::chat::NativeContinuity::ReconnectOnly {
         return Err(
             "A durable native source requires verified adoption, never another server launch"

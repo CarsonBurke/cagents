@@ -2919,7 +2919,9 @@ impl Worker {
                 command.cwd(&execution.working_directory);
                 command.env_clear();
                 for (name, value) in &environment.0 {
-                    if !execution.unset_environment.contains(name) {
+                    if !execution.unset_environment.contains(name)
+                        && !crate::agent::is_session_variable(name)
+                    {
                         command.env(name, value);
                     }
                 }
@@ -5704,7 +5706,8 @@ const INHERITED_TERMINAL_MARKERS: &[&str] = &[
     "COLORTERM",
 ];
 
-/// Drops every inherited marker from a command's environment.
+/// Drops every inherited marker from a command's environment, and the
+/// identity of any provider session the host was started from.
 ///
 /// Separate from [`command_from_recipe`] so a test can plant all of them and
 /// watch them go, rather than observing that a host which never set them does
@@ -5713,6 +5716,15 @@ fn scrub_inherited_markers(command: &mut CommandBuilder) {
     command.env_remove("CAGENTS_TERMINAL_ID");
     command.env_remove("CAGENTS_RECOVERY_ORIGIN");
     for name in INHERITED_TERMINAL_MARKERS {
+        command.env_remove(name);
+    }
+    let sessions = command
+        .iter_full_env_as_str()
+        .map(|(name, _)| name)
+        .filter(|name| crate::agent::is_session_variable(name))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    for name in sessions {
         command.env_remove(name);
     }
 }
@@ -5772,9 +5784,12 @@ fn command_from_recipe(recipe: &LaunchRecipe) -> CommandBuilder {
     command.cwd(&recipe.working_directory);
     scrub_inherited_markers(&mut command);
     terminal_environment(&mut command);
-    // Last, so an explicit per-session entry still wins over our defaults.
+    // Last, so an explicit per-session entry still wins over our defaults. A
+    // recipe saved before parent sessions were withheld may still name one.
     for (name, value) in &recipe.environment {
-        command.env(name, value);
+        if !crate::agent::is_session_variable(name) {
+            command.env(name, value);
+        }
     }
     for name in crate::account::launch_credential_overrides(recipe) {
         command.env_remove(name);
@@ -9638,6 +9653,30 @@ mod tests {
     }
 
     #[test]
+    fn a_recipe_saved_inside_another_session_does_not_hand_the_child_its_socket() {
+        let command = command_from_recipe(&env_recipe(BTreeMap::from([
+            ("CLAUDECODE".to_owned(), "1".to_owned()),
+            (
+                "CLAUDE_CODE_MESSAGING_SOCKET".to_owned(),
+                "/run/parent.sock".to_owned(),
+            ),
+            ("CLAUDE_CODE_SESSION_ID".to_owned(), "parent".to_owned()),
+            ("CLAUDE_CONFIG_DIR".to_owned(), "/home/a/.claude".to_owned()),
+        ])));
+        for name in [
+            "CLAUDECODE",
+            "CLAUDE_CODE_MESSAGING_SOCKET",
+            "CLAUDE_CODE_SESSION_ID",
+        ] {
+            assert_eq!(command.get_env(name), None, "{name} reached the child");
+        }
+        assert_eq!(
+            command.get_env("CLAUDE_CONFIG_DIR"),
+            Some(OsStr::new("/home/a/.claude"))
+        );
+    }
+
+    #[test]
     fn child_environment_advertises_our_own_terminal_identity() {
         let command = command_from_recipe(&env_recipe(BTreeMap::new()));
 
@@ -9675,12 +9714,25 @@ mod tests {
         for name in INHERITED_TERMINAL_MARKERS {
             command.env(name, "planted");
         }
+        let sessions = [
+            "CLAUDECODE",
+            "CLAUDE_CODE_MESSAGING_SOCKET",
+            "CODEX_ESCALATE_SOCKET",
+        ];
+        for name in sessions {
+            command.env(name, "planted");
+        }
+        command.env("CLAUDE_CONFIG_DIR", "/home/a/.claude");
 
         scrub_inherited_markers(&mut command);
 
-        for name in INHERITED_TERMINAL_MARKERS {
+        for name in INHERITED_TERMINAL_MARKERS.iter().chain(&sessions) {
             assert_eq!(command.get_env(name), None, "{name} survived the scrub");
         }
+        assert_eq!(
+            command.get_env("CLAUDE_CONFIG_DIR"),
+            Some(OsStr::new("/home/a/.claude"))
+        );
         // Each control channel named as well, so that shortening the list is a
         // test failure and not merely a smaller loop: these reach the user's
         // real kitty instance, multiplexer session, Konsole and editor.

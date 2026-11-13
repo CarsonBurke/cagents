@@ -2337,7 +2337,7 @@ fn start_with_execution(
     }
     // Provider-specific process fields derive from the prepared launch.
     // No environment overlay may follow constructor history/title reads.
-    spec.remove_unset_environment();
+    spec.withhold_environment();
     spec.messages = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -2558,7 +2558,7 @@ fn start_with_execution(
                 .verify_directory(&spec.working_directory)
                 .map_err(unavailable)?;
         }
-        spec.remove_unset_environment();
+        spec.withhold_environment();
         let recovery_environment = spec.environment.clone();
         let delegated_source = session.clone();
         // Capability is transient process context, never a public launch
@@ -4842,7 +4842,7 @@ fn upgrade_environment(
     )
     .map_err(|error| error.message)?;
     let (mut spec, _) = chat::protocol::create(&process_launch)?;
-    spec.remove_unset_environment();
+    spec.withhold_environment();
     Ok(spec.environment)
 }
 
@@ -6166,7 +6166,7 @@ IFS= read -r finish < finish
         let selected = BTreeMap::from([("CLAUDE_CODE_OAUTH_TOKEN".into(), "gui-fixture".into())]);
         let (mut spec, _) = chat::protocol::create(&launch).unwrap();
         spec.environment = sourceless_environment(daemon.clone(), selected, spec.environment);
-        spec.remove_unset_environment();
+        spec.withhold_environment();
         assert_eq!(
             spec.environment
                 .get("CLAUDE_CONFIG_DIR")

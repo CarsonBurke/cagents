@@ -58,6 +58,11 @@ struct ProviderAdapter {
     session_directory: &'static str,
     activity_from_title: fn(&str) -> Option<ActivityState>,
     identity_options: &'static [&'static str],
+    /// The variables the provider sets for the processes one of its sessions
+    /// starts: that session's identity, its control sockets and its process.
+    /// They describe the parent, so a process cagents starts never takes
+    /// them, wherever it was started from.
+    session_environment: fn(&str) -> bool,
     cwd_options: &'static [&'static str],
     value_options: &'static [&'static str],
     switches: &'static [&'static str],
@@ -78,6 +83,39 @@ struct ProviderAdapter {
 }
 
 const ADAPTERS: [ProviderAdapter; 3] = [omp::ADAPTER, claude::ADAPTER, codex::ADAPTER];
+
+/// Whether `name` is a variable some provider set for a process one of its
+/// sessions started (see `ProviderAdapter::session_environment`).
+///
+/// A daemon, window or CLI started from inside an agent's shell carries the
+/// parent session's identity and control channels: Claude Code's messaging
+/// socket and token, Codex's escalation socket, and so on. Every provider is
+/// asked, not only the one being launched, because a Codex conversation started
+/// from a Claude session must not find that session's socket either.
+pub fn is_session_variable(name: &str) -> bool {
+    ADAPTERS
+        .iter()
+        .any(|adapter| (adapter.session_environment)(name))
+}
+
+/// Forgets the provider session this process was started from, so that no
+/// daemon, window, terminal or conversation it starts inherits that session's
+/// identity or control channels (see [`is_session_variable`]).
+///
+/// # Safety
+///
+/// Must be called before the process starts a second thread: it changes the
+/// process environment, which another thread may be reading.
+pub unsafe fn detach_session_environment() {
+    let inherited = std::env::vars_os()
+        .map(|(name, _)| name)
+        .filter(|name| name.to_str().is_some_and(is_session_variable))
+        .collect::<Vec<_>>();
+    for name in inherited {
+        // SAFETY: the caller guarantees the process is still single-threaded.
+        unsafe { std::env::remove_var(name) };
+    }
+}
 
 impl Provider {
     fn adapter(self) -> &'static ProviderAdapter {
@@ -373,6 +411,93 @@ pub(crate) fn codex_title_without_status(title: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a Claude Code, Codex or Omp session exports to the processes it
+    /// starts, including the socket another session messages it through.
+    const PARENT_SESSION: &[(&str, &str)] = &[
+        ("CLAUDECODE", "1"),
+        ("CLAUDE_CODE_SESSION_ID", "parent-session"),
+        ("CLAUDE_CODE_CHILD_SESSION", "1"),
+        ("CLAUDE_CODE_SESSION_ATTENDED", "0"),
+        ("CLAUDE_CODE_ENTRYPOINT", "sdk-cli"),
+        (
+            "CLAUDE_CODE_MESSAGING_SOCKET",
+            "/run/user/1000/cc-socks/parent.sock",
+        ),
+        ("CLAUDE_CODE_MESSAGING_TOKEN", "parent-token"),
+        ("CLAUDE_PID", "4242"),
+        ("CLAUDE_EFFORT", "medium"),
+        ("AI_AGENT", "claude-code_agent"),
+        ("CODEX_THREAD_ID", "parent-thread"),
+        ("CODEX_ESCALATE_SOCKET", "/tmp/parent-escalate.sock"),
+        ("CODEX_SANDBOX", "seccomp"),
+        ("PI_TOOL_BRIDGE_TOKEN", "parent-bridge"),
+        ("OMP_SESSION_ID", "parent-session"),
+    ];
+
+    /// The user's own provider configuration, which may sit beside them.
+    const USER_CONFIGURATION: &[(&str, &str)] = &[
+        ("CLAUDE_CONFIG_DIR", "/home/a/.claude"),
+        ("CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION", "10"),
+        ("CLAUDE_CODE_USE_BEDROCK", "1"),
+        ("ANTHROPIC_MODEL", "claude-sonnet-4-5"),
+        ("CODEX_HOME", "/home/a/.codex"),
+        ("OMP_PROFILE", "work"),
+        ("PI_CODING_AGENT_DIR", "/home/a/.pi"),
+    ];
+
+    #[test]
+    fn a_parent_session_is_told_apart_from_the_users_configuration() {
+        for (name, _) in PARENT_SESSION {
+            assert!(is_session_variable(name), "{name} passes to children");
+        }
+        for (name, _) in USER_CONFIGURATION {
+            assert!(!is_session_variable(name), "{name} is withheld");
+        }
+    }
+
+    /// The binaries detach before anything starts, so every daemon, window,
+    /// terminal and conversation they start inherits no parent session.
+    #[test]
+    fn a_child_of_a_detached_process_inherits_no_parent_session() {
+        const CHILD: &str = "CAGENTS_TEST_DETACH_SESSION";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "agent::tests::a_child_of_a_detached_process_inherits_no_parent_session",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .envs(PARENT_SESSION.iter().chain(USER_CONFIGURATION).copied())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        // SAFETY: the harness runs this child with a single test thread, and
+        // nothing else in it reads the environment concurrently.
+        unsafe { detach_session_environment() };
+        let output = std::process::Command::new("/usr/bin/env").output().unwrap();
+        assert!(output.status.success());
+        let inherited = String::from_utf8(output.stdout).unwrap();
+        let inherited = inherited
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        for (name, _) in PARENT_SESSION {
+            assert_eq!(inherited.get(name), None, "{name} reached the child");
+        }
+        for (name, value) in USER_CONFIGURATION {
+            assert_eq!(inherited.get(name), Some(value), "{name} was lost");
+        }
+    }
 
     #[test]
     fn conversation_titles_omit_activity_and_ignore_launch_placeholders() {
