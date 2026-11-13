@@ -105,6 +105,17 @@ pub(super) fn edit_delta(
     origin: ClientId,
     edit: ModelEdit,
 ) -> Result<crate::workspace_model::delta::EditReceipt, ProtocolError> {
+    edit_then(host, origin, edit, |_| Ok(())).map(|(receipt, ())| receipt)
+}
+
+/// Commit and publish an edit, then run `then` before the writer is released,
+/// so it sees this edit and no later one.
+fn edit_then<T>(
+    host: &SharedHost,
+    origin: ClientId,
+    edit: ModelEdit,
+    then: impl FnOnce(&Registry) -> Result<T, ProtocolError>,
+) -> Result<(crate::workspace_model::delta::EditReceipt, T), ProtocolError> {
     let edit = edit
         .canonicalized()
         .map_err(|error| ProtocolError::new(ProtocolErrorCode::InvalidRequest, error, false))?;
@@ -112,14 +123,15 @@ pub(super) fn edit_delta(
     // Always acquire this mutex outside HostState. Retain it through
     // publication so concurrent layout requests publish in commit order.
     let mut registry = writer.lock().unwrap_or_else(|p| p.into_inner());
-    flush_execution_changes(host, &mut registry)?;
     {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         state.ensure_view_retention_available(&edit)?;
         if matches!(&edit, ModelEdit::SuggestConversationTitle { .. }) {
             // Inference authorizes against current resident chat metadata.
             // Preserve its original identity/SQL guard; this is not a pane edit.
-            return state.edit_model_delta(origin, edit);
+            let receipt = state.edit_model_delta(origin, edit)?;
+            drop(state);
+            return Ok((receipt, then(&registry)?));
         }
     }
     let applied = apply_delta(&mut registry, &edit)?;
@@ -142,38 +154,22 @@ pub(super) fn edit_delta(
             "Published a workspace model edit"
         );
     }
-    Ok(applied.receipt)
+    let then = then(&registry)?;
+    Ok((applied.receipt, then))
 }
 
-fn flush_execution_changes(
-    host: &SharedHost,
-    registry: &mut Registry,
-) -> Result<(), ProtocolError> {
-    // Execution mutations commit on this connection too. Publish their pending
-    // inventory before a public transaction clears its own trigger inventory.
-    let (sequence, effects) = registry.execution_delta().map_err(unavailable)?;
-    if !effects.is_empty() {
-        host.lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .announce_model_edit(
-                super::agent_execution::EXECUTION_CLIENT,
-                sequence,
-                &ModelEdit::AgentsChanged,
-                &effects,
-            );
-    }
-    Ok(())
-}
-
-/// Older CLI clients retain their original whole-model reply. Current windows
-/// use `edit_delta`, which never constructs this snapshot.
+/// Older CLI clients and windows that edit with full replies retain the
+/// whole-model reply, read before another edit can follow this one. Edits
+/// through `edit_delta` never construct it.
 pub(super) fn edit(
     host: &SharedHost,
     origin: ClientId,
     edit: ModelEdit,
 ) -> Result<WorkspaceModel, ProtocolError> {
-    edit_delta(host, origin, edit)?;
-    snapshot(host, None)
+    edit_then(host, origin, edit, |registry| {
+        registry.model().map_err(unavailable)
+    })
+    .map(|(_, model)| model)
 }
 
 /// Shared public-edit validation also serves the guarded title path.
@@ -302,10 +298,6 @@ pub(super) fn complete_terminal(
             pane,
         },
     };
-    if let Err(error) = flush_execution_changes(host, registry) {
-        tracing::warn!(%terminal_id, ?error, "could not publish pending execution changes");
-        return;
-    }
     match registry.apply_delta(&edit) {
         Ok(applied) if applied.changed => host
             .lock()

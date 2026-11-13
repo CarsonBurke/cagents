@@ -82,13 +82,17 @@ const CLEAR: &str = "DELETE FROM execution_view_changes;
     DELETE FROM execution_agent_changes;
     DELETE FROM execution_channel_changes;";
 
+/// Clear the inventory inside a public edit's own transaction, so it commits
+/// or rolls back with the edit.
+pub(crate) fn discard_execution_delta_in(db: &rusqlite::Connection) -> Result<(), String> {
+    db.execute_batch(CLEAR).map_err(|error| error.to_string())
+}
+
 impl Registry {
     /// Public model edits publish their own precise effects. Their temporary
     /// inventory must not be repeated by a later execution announcement.
     pub(crate) fn discard_execution_delta(&self) -> Result<(), String> {
-        self.db
-            .execute_batch(CLEAR)
-            .map_err(|error| error.to_string())
+        discard_execution_delta_in(&self.db)
     }
 
     /// Drain all execution changes committed through this connection, pinned

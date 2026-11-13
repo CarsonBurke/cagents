@@ -741,16 +741,14 @@ pub(super) fn publish_authenticated_source(
                 _ => registry.adopt_authenticated_agent_session(retained, &successor)?,
             }
         };
-        // The agent's record, and possibly its pane, now name the successor;
-        // watching windows learn it from the edge.
-        if adopted {
-            super::super::agent_execution::announce(host, &registry);
-        }
-    }
-    if install {
         // Promotion follows the exact helper ACK and Registry transaction and
         // precedes any ordinary HOST input record becoming visible.
         register_ownership(host, handle, &source)?;
+        // The agent's record, and possibly its pane, now name the registered
+        // successor; watching windows learn it from the edge.
+        if adopted {
+            super::super::agent_execution::announce(host, &registry);
+        }
     }
     Ok(source)
 }

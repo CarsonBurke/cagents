@@ -602,12 +602,14 @@ impl Registry {
         let identity = identity
             .parse()
             .map_err(|error: uuid::Error| error.to_string())?;
+        // The edit publishes its own effects; its trigger inventory goes with
+        // the transaction, so a committed edit cannot then report failure.
+        execution_deltas::discard_execution_delta_in(&transaction)?;
         #[cfg(test)]
         pause(Pause::BeforeCommit);
         transaction.commit().map_err(|error| error.to_string())?;
         #[cfg(test)]
         pause(Pause::AfterCommit);
-        self.discard_execution_delta()?;
         Ok(DeltaApplied {
             changed,
             receipt: crate::workspace_model::delta::EditReceipt {

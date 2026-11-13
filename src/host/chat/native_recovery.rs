@@ -468,16 +468,13 @@ fn restore_authenticated(
             &retained,
             &crate::agent_execution::HostedSession::Chat(session.clone()),
         );
-    match adopted {
-        // The agent's record, and possibly its pane, now name the successor;
-        // watching windows learn it from the edge.
-        Ok(true) => super::super::agent_execution::announce(host, &execution_registry),
-        Ok(false) => {}
+    let adopted = match adopted {
+        Ok(adopted) => adopted,
         Err(error) => {
             let _ = handle.close();
             return Err(error);
         }
-    }
+    };
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
     let pair_unchanged =
         pair_projection_is_current(&state, session.terminal.as_ref(), paired.as_ref());
@@ -554,6 +551,12 @@ fn restore_authenticated(
     state.inventory_generation += 1;
     drop(state);
     drop(retired);
+    // The agent's record, and possibly its pane, now name the successor, which
+    // is installed; watching windows learn it from the edge. A refusal above
+    // leaves the change for the next announcement.
+    if adopted {
+        super::super::agent_execution::announce(host, &execution_registry);
+    }
     Ok(response)
 }
 

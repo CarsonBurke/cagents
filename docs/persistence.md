@@ -346,10 +346,11 @@ transfer. `ReadWorkspaceSnapshot` reads the same baseline without subscribing.
 Execution writes are captured by connection-private TEMP tables and SQL
 triggers. Their inventory commits or rolls back with the rows, including
 writes made by transaction helpers used by retained actors and automations.
-Draining it reads only changed identities. Public edits publish their pending
-execution inventory before applying their own transaction, so an interleaving
-edit cannot erase an unannounced execution change. These tables do not change
-the durable schema or its downgrade contract.
+Draining it reads only changed identities. The tables belong to the
+connection that wrote the rows, so the workspace writer's public edits, which
+publish their own effects and clear their inventory inside their transaction,
+cannot erase an execution change still waiting to be announced. These tables
+do not change the durable schema or its downgrade contract.
 
 Windows still read the model after each notification and edit with
 `EditWorkspaceModel`. Applying effects to a held copy, reading only a scope
