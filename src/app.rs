@@ -1667,17 +1667,76 @@ fn card_kind_labels(kind: Option<&CardKind>) -> CardLabels {
 }
 
 fn card_kind_caption(kind: &CardKind) -> Cow<'_, str> {
-    match kind {
-        CardKind::Terminal(session) => display_path(&session.launch.working_directory),
-        CardKind::Chat(session) => display_path(&session.launch.recipe.working_directory),
-        CardKind::Browser(session) => {
-            Cow::Owned(SanitizedLocation::from(&session.current_url).into_inner())
+    CaptionSource::of_kind(kind).caption()
+}
+
+/// What a card's caption is formatted from.
+///
+/// The update projection rebuilds every card's chrome, so it compares this
+/// with the source the cached caption was built from: an unchanged caption
+/// costs no path formatting or allocation.
+#[derive(Debug, Clone, PartialEq)]
+enum CaptionSource<'a> {
+    Directory(Cow<'a, Path>),
+    /// A terminal brought back by an upgrade, in its launch directory.
+    Relaunched(Cow<'a, Path>),
+    /// The file an editor shows, relative to its worktree.
+    File {
+        worktree: Cow<'a, Path>,
+        path: Cow<'a, Path>,
+    },
+    Location(Cow<'a, Url>),
+    /// Neither pane belongs to a place: both apply to the whole application.
+    ApplicationWide,
+}
+
+impl<'a> CaptionSource<'a> {
+    fn of_kind(kind: &'a CardKind) -> Self {
+        match kind {
+            CardKind::Terminal(session) => {
+                Self::Directory(Cow::Borrowed(&session.launch.working_directory))
+            }
+            CardKind::Chat(session) => {
+                Self::Directory(Cow::Borrowed(&session.launch.recipe.working_directory))
+            }
+            CardKind::Browser(session) => Self::Location(Cow::Borrowed(&session.current_url)),
+            CardKind::PullRequests(view) => Self::Directory(Cow::Borrowed(&view.repository)),
+            CardKind::Repository(view) => Self::Directory(Cow::Borrowed(&view.worktree)),
+            CardKind::Settings | CardKind::Accounts | CardKind::Automations | CardKind::Work => {
+                Self::ApplicationWide
+            }
         }
-        CardKind::PullRequests(view) => display_path(&view.repository),
-        CardKind::Repository(view) => display_path(&view.worktree),
-        // Neither pane belongs to a place: both apply to the whole application.
-        CardKind::Settings | CardKind::Accounts | CardKind::Automations | CardKind::Work => {
-            Cow::Borrowed("Application-wide")
+    }
+
+    fn caption(&self) -> Cow<'a, str> {
+        match self {
+            Self::Directory(directory) => Cow::Owned(display_path(directory).into_owned()),
+            Self::Relaunched(directory) => Cow::Owned(format!(
+                "Relaunched after upgrade · {}",
+                display_path(directory)
+            )),
+            Self::File { worktree, path } => {
+                Cow::Owned(display_path(&worktree.join(path)).into_owned())
+            }
+            Self::Location(url) => Cow::Owned(SanitizedLocation::from(url.as_ref()).into_inner()),
+            Self::ApplicationWide => Cow::Borrowed("Application-wide"),
+        }
+    }
+
+    fn into_owned(self) -> CaptionSource<'static> {
+        match self {
+            Self::Directory(directory) => {
+                CaptionSource::Directory(Cow::Owned(directory.into_owned()))
+            }
+            Self::Relaunched(directory) => {
+                CaptionSource::Relaunched(Cow::Owned(directory.into_owned()))
+            }
+            Self::File { worktree, path } => CaptionSource::File {
+                worktree: Cow::Owned(worktree.into_owned()),
+                path: Cow::Owned(path.into_owned()),
+            },
+            Self::Location(url) => CaptionSource::Location(Cow::Owned(url.into_owned())),
+            Self::ApplicationWide => CaptionSource::ApplicationWide,
         }
     }
 }
@@ -4963,6 +5022,9 @@ struct CardChrome {
     terminal_title_source: Option<TerminalTitleSource>,
     focused_name: String,
     caption: String,
+    /// What `caption` was formatted from; `None` for chrome built from a
+    /// caption alone, which is never reused.
+    caption_source: Option<CaptionSource<'static>>,
     unfocused_name: String,
     resize_name: String,
     close_name: String,
@@ -4996,6 +5058,7 @@ impl CardChrome {
             terminal_ordinal_suffix: None,
             terminal_title_source: None,
             caption: caption.to_owned(),
+            caption_source: None,
             focused_name: card_accessible_name(type_label, title, caption, true),
             unfocused_name: card_accessible_name(type_label, title, caption, false),
             resize_name: format!("Resize {type_label} pane {title}"),
@@ -5003,8 +5066,15 @@ impl CardChrome {
         }
     }
 
-    fn describes(&self, type_label: &str, title: &str, caption: &str) -> bool {
-        self.type_label == type_label && self.title == title && self.caption == caption
+    fn with_caption_source(mut self, source: CaptionSource<'static>) -> Self {
+        self.caption_source = Some(source);
+        self
+    }
+
+    fn describes(&self, type_label: &str, title: &str, caption: &CaptionSource<'_>) -> bool {
+        self.type_label == type_label
+            && self.title == title
+            && self.caption_source.as_ref() == Some(caption)
     }
 
     fn accessible_name(&self, focused: bool) -> &str {
@@ -8386,7 +8456,7 @@ impl Cagents {
         let mut presentation_updates = Vec::new();
         for card in &self.durable.cards {
             let type_label = card_kind_labels(Some(&card.kind)).type_label;
-            let (title, file_caption) = self.repository_chrome_with(card, || {
+            let title = self.repository_chrome_with(card, || {
                 self.card_display_title_with_chat_title(card, || {
                     self.chat_channel_title(card, titled_channels.get(&card.id).copied())
                 })
@@ -8399,26 +8469,15 @@ impl Cagents {
             {
                 presentation_updates.push((card.id, title.to_string()));
             }
-            let caption = match &card.kind {
-                CardKind::Terminal(_)
-                    if self.terminal_working_directories.contains_key(&card.id) =>
-                {
-                    display_path(&self.terminal_working_directories[&card.id])
-                }
-                CardKind::Terminal(session) if self.relaunched_terminals.contains(&session.id) => {
-                    Cow::Owned(format!(
-                        "Relaunched after upgrade · {}",
-                        card_kind_caption(&card.kind)
-                    ))
-                }
-                _ => file_caption.unwrap_or_else(|| card_kind_caption(&card.kind)),
-            };
+            let caption_source = self.card_caption_source(card);
             if self
                 .card_chrome
                 .get(&card.id)
-                .is_none_or(|chrome| !chrome.describes(type_label, &title, &caption))
+                .is_none_or(|chrome| !chrome.describes(type_label, &title, &caption_source))
             {
-                let mut chrome = CardChrome::new(card.id, type_label, &title, &caption);
+                let caption = caption_source.caption();
+                let mut chrome = CardChrome::new(card.id, type_label, &title, &caption)
+                    .with_caption_source(caption_source.into_owned());
                 if matches!(card.kind, CardKind::Terminal(_))
                     && !self.chrome_ui.user_titles.contains_key(&card.id)
                     && let Some(ordinal) = self.chrome_ui.terminal_ordinals.get(&card.id)
@@ -8459,11 +8518,8 @@ impl Cagents {
     }
 
     /// Present the current editor file without overwriting a saved pane name.
-    /// The full path in the tooltip distinguishes files sharing a basename.
-    fn repository_chrome<'a>(
-        &'a self,
-        card: &'a CardState,
-    ) -> (Cow<'a, str>, Option<Cow<'a, str>>) {
+    /// The full path in the caption distinguishes files sharing a basename.
+    fn repository_chrome<'a>(&'a self, card: &'a CardState) -> Cow<'a, str> {
         self.repository_chrome_with(card, || self.card_display_title(card))
     }
 
@@ -8473,19 +8529,14 @@ impl Cagents {
         &'a self,
         card: &'a CardState,
         display_title: impl FnOnce() -> &'a str,
-    ) -> (Cow<'a, str>, Option<Cow<'a, str>>) {
+    ) -> Cow<'a, str> {
         if let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card.id)
             && let Some(path) = runtime.selected_path()
             && let Some(name) = path.file_name()
         {
-            return (
-                self.chrome_ui.user_titles.get(&card.id).map_or_else(
-                    || name.to_string_lossy(),
-                    |title| Cow::Borrowed(title.as_str()),
-                ),
-                Some(Cow::Owned(
-                    display_path(&runtime.descriptor.worktree.join(path)).into_owned(),
-                )),
+            return self.chrome_ui.user_titles.get(&card.id).map_or_else(
+                || name.to_string_lossy(),
+                |title| Cow::Borrowed(title.as_str()),
             );
         }
         let title = display_title();
@@ -8502,7 +8553,7 @@ impl Cagents {
                     source.describes(title, directory, &session.launch.program, *ordinal)
                 })
             {
-                return (Cow::Borrowed(chrome.title.as_str()), None);
+                return Cow::Borrowed(chrome.title.as_str());
             }
             let basename = directory.file_name().unwrap_or_default().to_string_lossy();
             let title = if TerminalTitleSource::fallback(title) {
@@ -8515,11 +8566,36 @@ impl Cagents {
                 Cow::Borrowed(title)
             };
             if let Some(ordinal) = self.chrome_ui.terminal_ordinals.get(&card.id) {
-                return (Cow::Owned(format!("{title} ({ordinal})")), None);
+                return Cow::Owned(format!("{title} ({ordinal})"));
             }
-            return (title, None);
+            return title;
         }
-        (Cow::Borrowed(title), None)
+        Cow::Borrowed(title)
+    }
+
+    /// What `card`'s caption is formatted from: the editor's file, a
+    /// terminal's reported directory, or what the card's kind names.
+    fn card_caption_source<'a>(&'a self, card: &'a CardState) -> CaptionSource<'a> {
+        if let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card.id)
+            && let Some(path) = runtime.selected_path()
+            && path.file_name().is_some()
+        {
+            return CaptionSource::File {
+                worktree: Cow::Borrowed(&runtime.descriptor.worktree),
+                path: Cow::Borrowed(path),
+            };
+        }
+        if matches!(card.kind, CardKind::Terminal(_))
+            && let Some(directory) = self.terminal_working_directories.get(&card.id)
+        {
+            return CaptionSource::Directory(Cow::Borrowed(directory));
+        }
+        match &card.kind {
+            CardKind::Terminal(session) if self.relaunched_terminals.contains(&session.id) => {
+                CaptionSource::Relaunched(Cow::Borrowed(&session.launch.working_directory))
+            }
+            kind => CaptionSource::of_kind(kind),
+        }
     }
 
     /// Provider activity belongs in the status icon, including restored titles.
@@ -8619,7 +8695,7 @@ impl Cagents {
                 .durable
                 .focused
                 .and_then(|id| self.card_state(id))
-                .map(|card| self.repository_chrome(card).0)
+                .map(|card| self.repository_chrome(card))
                 .unwrap_or(Cow::Borrowed(APPLICATION_NAME));
             let showing = showing.trim();
             let showing = if showing.is_empty() {
@@ -12726,7 +12802,7 @@ impl Cagents {
     /// would not say which.
     fn notice_pane_name(&self, card: CardId) -> Option<String> {
         self.card_state(card)
-            .map(|state| format!("“{}”", self.repository_chrome(state).0))
+            .map(|state| format!("“{}”", self.repository_chrome(state)))
     }
 
     /// Withdraws reports about cards that are gone. A card leaves by many
@@ -18259,7 +18335,13 @@ impl Application for Cagents {
                 self.flush_document_tone()
             }
             Message::NativeWindowAction(action) => Task::done(cosmic::Action::Cosmic(action)),
-            Message::ChatUi(action) => self.handle_chat_ui(action),
+            Message::ChatUi(action) => {
+                let (task, chat_projection) = self.update_chat_ui(action);
+                if let Some(chat_projection) = chat_projection {
+                    projection = chat_projection;
+                }
+                task
+            }
             Message::ResetSettings => {
                 if self.settings_reset_confirm {
                     return Task::none();
@@ -27744,7 +27826,7 @@ mod tests {
         app.chrome_ui = chrome_ui::State::default().with_user_titles(restored.user_titles);
         assert!(!app.apply_reported_title(source, "automatic process title".into()));
         assert_eq!(
-            app.repository_chrome(app.card_state(source).unwrap()).0,
+            app.repository_chrome(app.card_state(source).unwrap()),
             "Release review"
         );
     }
