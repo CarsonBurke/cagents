@@ -51,7 +51,7 @@ class Job:
 JOBS = (
     Job("native evidence", shards=3, suites=(
         Suite("native evidence", "tests/native_evidence.py",
-              sources=("scripts/native-evidence", "scripts/native-evidence-remote"),
+              sources=("scripts/native-evidence", "scripts/native-evidence-remote", "scripts/native_slots.py"),
               syntax=(("bash", "scripts/native-evidence"), ("bash", "scripts/native-evidence-remote"))),
     )),
     Job("build offload", shards=2, suites=(
@@ -70,6 +70,7 @@ JOBS = (
               sources=("scripts/build-disk-guard", "scripts/install-cargo-gate"),
               syntax=(("sh", "scripts/build-disk-guard"), ("sh", "scripts/install-cargo-gate"))),
         Suite("lock holders", "tests/lock_holders.py", sources=("scripts/lock-holders",)),
+        Suite("native slots", "tests/native_slots.py", sources=("scripts/native_slots.py",)),
         Suite("memory limit", "tests/memory_capped.py", sources=("scripts/memory-capped",)),
         Suite("workload time limit", "tests/bounded.py", sources=("scripts/bounded",)),
         Suite("focused lib tests", "tests/test_lib.py", sources=("scripts/test-lib",)),

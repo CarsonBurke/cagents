@@ -308,7 +308,7 @@ evidence shot channel-prs
 real file chooser, go to each side's `start`. Prepare data that both
 sides need once, then `save-seed` it, rather than repeating slow setup in each
 side's steps. `{fixture}` in a steps file means the fixture's root on the
-host. `pair` can wait 30 minutes for the native lock, so run it in the
+host. `pair` can wait 30 minutes for a native slot, so run it in the
 background rather than under a short command timeout, and run `clean` once the
 PR merges to remove the task's checkouts from the host.
 
@@ -346,7 +346,8 @@ Every refusal names its cause and the next command. The common ones:
 | `changed since its build; run: build SIDE CHECKOUT` | Evidence must show what was built. Build again. |
 | `has not been built, or its unused build was reclaimed` | `scripts/prune-build-dirs` removed an idle target. Build again; a shared slot recompiles only what changed. |
 | `refusing to compile ... while holding the native lock` | Something in the session asked Cargo for a build that `build` didn't do. Build first; keep builds out of a session. |
-| `the native lock stayed busy` | Another session is running. `scripts/lock-holders /var/tmp/cagents-fw16-native.lock` shows whose. |
+| `every native slot stayed busy` | Other sessions hold every slot. The message names the slot files; `scripts/lock-holders` given them shows whose. |
+| `a session may hold a native slot for at most 1800 seconds` | `--limit` asked for longer. Capture in one short session, or split a long measurement across sessions. |
 | `memory-capped: stopped` | The session exceeded its memory limit; the log names the process. |
 | `session: lost` in `status` | Its supervisor was killed. `stop` ends what remains. |
 | `the SIDE side is running on HOST; stop it before rebuilding` | A side's checkout can't change under its session. Run the `stop` it names, then build. |

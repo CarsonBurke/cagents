@@ -10,6 +10,10 @@ self=$(readlink -f "$0")
 tool_root=${self%/scripts/*}
 session_name=evidence
 native_lock=${CAGENTS_EVIDENCE_NATIVE_LOCK:-/var/tmp/cagents-fw16-native.lock}
+# A session holds one of the host's few native slots while it runs, so it is
+# short by default and can never run long enough to keep the others waiting.
+default_limit=900
+maximum_limit=1800
 # Builds go to the build host's shared slots, even from the build host itself:
 # a slot keeps the build output and reuses it for the next build, whichever
 # checkout that is, and only the executables come back to the task.
@@ -42,9 +46,10 @@ both use the same fixture data and selected providers.
         [--startup-timeout SECONDS]
         [--portal gtk|kde|gnome|cosmic] [--codex tool-rows|child-errors|terminal-escape]
         [--instance NAME] [--ui-trace]
-                  Take the native lock and start a headless session at the
-                  requested logical width and height (default 1500x900). The lock is
-                  released by stop, or after --limit seconds (default 2700).
+                  Take one of the host's native slots and start a headless
+                  session at the requested logical width and height (default
+                  1500x900). The slot is released by stop, or after --limit
+                  seconds (default 900, at most 1800).
                   --startup-timeout bounds the wait for the app window (default
                   180, range 1-3600 seconds); it does not extend --limit.
                   --portal runs xdg-desktop-portal with that backend inside the
@@ -70,10 +75,10 @@ both use the same fixture data and selected providers.
                   this session, keeping its daemon and providers alive. Runs in
                   the foreground; stop still ends the complete session.
                   --chat-stages records UI stage timings on normal close.
-  stop            End the session, its daemon and its processes; release the lock.
+  stop            End the session, its daemon and its processes; release its slot.
                   Also ends what remains of a session whose supervisor was killed.
   save-seed       Keep the stopped fixture as the data every later start restores.
-  status          Report the session and the native lock.
+  status          Report the session and the host's native slots.
 
 --task may also come from CAGENTS_EVIDENCE_TASK.
 USAGE
@@ -617,53 +622,64 @@ path_without_shims() {
     printf '%s\n' "$path"
 }
 
-# Gives up if asked to stop, or if the start command that wanted this session is
-# gone: nobody would drive or stop a session that began after that.
+# The slot files a session may take, slot 0 first. See scripts/native_slots.py.
+native_slot_paths() {
+    /usr/bin/python3 -I "$tool_root/scripts/native_slots.py" paths "$native_lock"
+}
+
+# Waits in arrival order for one of the host's native slots and keeps it on
+# descriptor 9; every other descriptor it opened is closed again. Gives up if
+# asked to stop, or if the start command that wanted this session is gone:
+# nobody would drive or stop a session that began after that.
 wait_for_native_lock() {
-    local wait_lock=$1 starter=$2 waited=0
-    if [ "$wait_lock" -eq 0 ]; then
-        # A zero budget still tries the idle lock. Starting a queued helper
-        # and immediately cancelling it races the helper's first scheduling.
-        if flock -n 9; then
-            :
+    local wait_lock=$1 starter=$2 path descriptor queue_descriptor slot_descriptors=() arguments=() status=0 index
+    native_slot_paths >"$state/slot-paths" || {
+        printf 'could not list the native slots; see %s\n' "$logs/session-$(cat "$state/side").log" >"$state/failed"
+        return 1
+    }
+    exec {queue_descriptor}>>"$native_lock.queue"
+    arguments+=(--queue-fd "$queue_descriptor")
+    while IFS= read -r path; do
+        exec {descriptor}>>"$path"
+        slot_descriptors+=("$descriptor")
+        arguments+=(--slot-fd "$descriptor")
+    done <"$state/slot-paths"
+    # In the background, so a signal reaches this shell's trap at once. The
+    # waiter stays in the kernel's queue the whole time: retrying with a short
+    # timeout loses to every blocked waiter.
+    /usr/bin/python3 -I "$tool_root/scripts/native_slots.py" acquire "${arguments[@]}" \
+        --wait "$wait_lock" --stop "$state/stop" --starter "$starter" --parent-pid "$BASHPID" \
+        >"$state/slot" 9>&- &
+    lock_waiter=$!
+    wait "$lock_waiter" || status=$?
+    lock_waiter=
+    index=$(cat "$state/slot" 2>/dev/null) || index=
+    if [ "$status" -eq 0 ]; then
+        if [[ $index =~ ^[0-9]+$ ]] && [ "$index" -lt "${#slot_descriptors[@]}" ]; then
+            exec 9>&"${slot_descriptors[$index]}"
         else
-            local status=$?
-            if [ "$status" -eq 1 ]; then
-                printf 'the native lock stayed busy for 0 seconds (see scripts/lock-holders %s)\n' "$native_lock" >"$state/failed"
-            else
-                printf 'could not take the native lock\n' >"$state/failed"
-            fi
-            return 1
+            status=2
         fi
-    else
-        # Stay in the kernel's queue the whole time: retrying with a short timeout
-        # loses to every blocked waiter, and could wait out the limit behind them.
-        # The child shares this descriptor, so the lock outlives it.
-        flock 9 &
-        lock_waiter=$!
-        local waiter=$lock_waiter
-        while kill -0 "$waiter" 2>/dev/null; do
-            if [ -e "$state/stop" ] || ! kill -0 "$starter" 2>/dev/null; then
-                kill -KILL "$waiter" 2>/dev/null || true
-                wait "$waiter" 2>/dev/null || true
-                printf 'stopped while waiting for the native lock\n' >"$state/failed"
-                return 1
-            fi
-            if [ "$waited" -ge "$wait_lock" ]; then
-                kill -KILL "$waiter" 2>/dev/null || true
-                wait "$waiter" 2>/dev/null || true
-                printf 'the native lock stayed busy for %s seconds (see scripts/lock-holders %s)\n' "$wait_lock" "$native_lock" >"$state/failed"
-                return 1
-            fi
-            sleep 1
-            waited=$((waited + 1))
-        done
-        wait "$waiter" || {
+    fi
+    for descriptor in "$queue_descriptor" "${slot_descriptors[@]}"; do
+        exec {descriptor}>&-
+    done
+    case $status in
+        0) ;;
+        1)
+            printf 'every native slot stayed busy for %s seconds (see scripts/lock-holders %s)\n' \
+                "$wait_lock" "$(tr '\n' ' ' <"$state/slot-paths" | sed 's/ $//')" >"$state/failed"
+            return 1
+            ;;
+        75)
+            printf 'stopped while waiting for the native lock\n' >"$state/failed"
+            return 1
+            ;;
+        *)
             printf 'could not take the native lock\n' >"$state/failed"
             return 1
-        }
-        lock_waiter=
-    fi
+            ;;
+    esac
     if [ -e "$state/stop" ] || ! kill -0 "$starter" 2>/dev/null; then
         printf 'stopped while waiting for the native lock\n' >"$state/failed"
         return 1
@@ -695,7 +711,6 @@ run_session() {
         not_built "$side" "$checkout" >"$state/failed"
         return 1
     }
-    exec 9>"$native_lock"
     compositor=
     lock_waiter=
     # A waiter left in the queue would take the lock for a moment later on.
@@ -985,7 +1000,7 @@ cmd_relaunch() {
 }
 
 cmd_start() {
-    local side=${1:-} width=1500 height=900 keep_state=false wait_lock=1800 limit=2700 startup_timeout=180 portal= codex= codex_executable= ui_trace=
+    local side=${1:-} width=1500 height=900 keep_state=false wait_lock=1800 limit=$default_limit startup_timeout=180 portal= codex= codex_executable= ui_trace=
     require_side "$side"
     shift
     while [ "$#" -gt 0 ]; do
@@ -1008,6 +1023,8 @@ cmd_start() {
     done
     [[ $width =~ ^[1-9][0-9]*$ && $height =~ ^[1-9][0-9]*$ && $wait_lock =~ ^[0-9]+$ && $limit =~ ^[1-9][0-9]*$ ]] ||
         die 'width and height must be positive pixels; lock wait and session limit must be whole numbers' 2
+    [ "$limit" -le "$maximum_limit" ] ||
+        die "a session may hold a native slot for at most $maximum_limit seconds, so one session cannot keep others waiting; --limit $limit is longer. Capture in one short session, or stop and start again for a separate measurement." 2
     require_startup_timeout "$startup_timeout"
     [[ -z $portal || $portal =~ ^(gtk|kde|gnome|cosmic)$ ]] ||
         die "unknown portal backend: $portal; use gtk, kde, gnome or cosmic" 2
@@ -1172,10 +1189,19 @@ cmd_status() {
         printf 'session: none\n'
         [ ! -e "$state/over-limit" ] || printf 'last session: %s\n' "$(cat "$state/over-limit")"
     fi
-    if (exec 9>"$native_lock" && flock -n 9); then
-        printf 'native lock: free\n'
+    local paths busy count
+    paths=$(native_slot_paths) || die 'could not list the native slots'
+    count=$(wc -l <<<"$paths")
+    busy=$(/usr/bin/python3 -I "$tool_root/scripts/native_slots.py" held "$native_lock") ||
+        die 'could not read the native slots'
+    if [ -z "$busy" ]; then
+        printf 'native slots: %s free of %s\n' "$count" "$count"
     else
-        printf 'native lock: held\n'
+        printf 'native slots: %s free of %s; held: %s (see scripts/lock-holders %s)\n' \
+            "$((count - $(wc -w <<<"$busy")))" "$count" "$busy" "$(tr '\n' ' ' <<<"$paths" | sed 's/ $//')"
+    fi
+    if live_session && [ -s "$state/slot" ]; then
+        printf 'this session: slot %s\n' "$(cat "$state/slot")"
     fi
 }
 
