@@ -2069,17 +2069,30 @@ mod tests {
         let mut app = super::super::tests::context_inspector_test_app(false);
         app.workspace_model = model_with_empty_channel(home);
         app.workspace_model.sequence = 8;
-        drop(app.apply_workspace_model_update(ModelUpdate::Edited {
-            sequence: 10,
-            edit: ModelEdit::ChannelWorkChanged { home },
-        }));
+        let (_, projection) =
+            app.apply_workspace_model_update_projection(ModelUpdate::Changed {
+                sequence: 10,
+                edit: ModelEdit::ChannelWorkChanged { home },
+                changes: Default::default(),
+            });
+        assert!(
+            matches!(projection, super::super::Projection::Unchanged),
+            "channel work is not shown, so its invalidation projects nothing"
+        );
         assert_eq!(
             app.workspace_model.sequence, 8,
             "an invalidation cannot acknowledge an unseen canonical edit"
         );
-        drop(app.apply_workspace_model_update(ModelUpdate::Edited {
+        drop(app.apply_workspace_model_update(ModelUpdate::Changed {
             sequence: 9,
             edit: ModelEdit::DeleteChannel { id: home.channel },
+            changes: super::super::workspace_model_sync::EdgeChanges {
+                effects: crate::workspace_model::delta::EditEffects {
+                    removed_channels: vec![home.channel],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
         }));
         assert!(app.workspace_model.channel(home.channel).is_none());
         assert_eq!(app.workspace_model.sequence, 9);

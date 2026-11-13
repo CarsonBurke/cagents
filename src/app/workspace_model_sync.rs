@@ -893,7 +893,17 @@ impl Cagents {
                 .is_some_and(|identity| identity != self.workspace_model.identity),
             _ => false,
         };
-        if foreign {
+        // Channel work is no longer shown, and its independent invalidation
+        // never advances the canonical model watermark: it projects nothing.
+        if foreign
+            || matches!(
+                &update,
+                ModelUpdate::Changed {
+                    edit: ModelEdit::ChannelWorkChanged { .. },
+                    ..
+                }
+            )
+        {
             return (Task::none(), Projection::Unchanged);
         }
         match self.presentation_scope_for_update(&update) {
