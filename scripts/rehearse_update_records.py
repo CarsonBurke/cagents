@@ -911,7 +911,7 @@ def project(row: dict, name: str) -> dict:
         "sessions": ("id", "surface", "provider", "title", "channel", "state", "failure", "directory"),
         "channels": ("title", "name", "repository", "state", "closed"),
         "projects": ("name", "repository", "state", "closed"),
-        "panes": ("workspace_id", "position", "title", "kind_tag", "existence", "terminal_id", "session_id"),
+        "panes": ("workspace_id", "ordinal", "position", "title", "kind_tag", "existence", "terminal_id", "session_id"),
     }[name]
     return {field: row[field] for field in fields if field in row}
 
@@ -936,25 +936,29 @@ def panes(snapshot: dict) -> dict:
 
 
 def positioned(before: dict, after: dict) -> tuple[dict, dict]:
-    """Rank the panes both sides hold within their own window store and workspace.
+    """Replace each pane's stored ordinal with its rank in the strip the user sees.
 
     A stored ordinal is a sort key, not a position: a window may leave holes in
     it and closes them when it next saves its strip. What the user sees is the
-    order, so each pane is compared by its rank among the panes present on both
-    sides. A pane that appears or disappears is reported in its own right and
-    does not shift every pane after it.
+    order, so a pane is ranked among the panes that stay in the same window
+    store and workspace on both sides. A pane that appears, disappears or moves
+    to another workspace is reported in its own right and does not shift the
+    panes around it.
     """
-    shared = before.keys() & after.keys()
+    def group(key: str, card: dict) -> tuple:
+        return key.removesuffix(":" + card["card_id"]), card.get("workspace_id")
+
+    staying = {key for key in before.keys() & after.keys()
+               if group(key, before[key]) == group(key, after[key])}
     ranked = []
     for side in (before, after):
+        result = {key: {name: value for name, value in card.items() if name != "ordinal"}
+                  for key, card in side.items()}
         groups: dict[tuple, list] = {}
-        for key in shared:
-            card = side[key]
-            database = key.rpartition(":")[0]
-            groups.setdefault((database, card.get("workspace_id")), []).append(key)
-        result = {key: dict(card) for key, card in side.items()}
+        for key in staying:
+            groups.setdefault(group(key, side[key]), []).append(key)
         for keys in groups.values():
-            keys.sort(key=lambda key: (side[key].get("ordinal", 0), side[key].get("card_id", key)))
+            keys.sort(key=lambda key: (side[key]["ordinal"], side[key]["card_id"]))
             for position, key in enumerate(keys):
                 result[key]["position"] = position
         ranked.append(result)

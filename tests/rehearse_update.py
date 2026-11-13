@@ -258,6 +258,24 @@ class Comparison(unittest.TestCase):
         self.assertEqual(self.pane_changes(before, after),
                          [("a", "position", True), ("b", "position", True)])
 
+    def test_a_pane_moved_to_another_workspace_does_not_shift_its_new_neighbours(self):
+        before, after = snapshot(), snapshot()
+        store = "windows/second/sessions.sqlite3"
+        self.strip(before, store, {"a": 0, "moved": 1, "b": 0})
+        self.strip(after, store, {"a": 0, "moved": 0, "b": 1})
+        for snapshot_value, workspaces in ((before, ("one", "one", "two")), (after, ("one", "two", "two"))):
+            for card, workspace in zip(snapshot_value["stores"][store]["rows"]["cards"], workspaces):
+                card["workspace_id"] = workspace
+        self.assertEqual(self.pane_changes(before, after), [("moved", "workspace_id", True)])
+
+    def test_card_ids_containing_a_colon_are_ranked_within_their_store(self):
+        before, after = snapshot(), snapshot()
+        store = "windows/second/sessions.sqlite3"
+        self.strip(before, store, {"p:1": 0, "q:2": 1})
+        self.strip(after, store, {"p:1": 1, "q:2": 0})
+        self.assertEqual(self.pane_changes(before, after),
+                         [("1", "position", True), ("2", "position", True)])
+
     def test_verified_pause_still_requires_saved_pane_and_original_terminal_child(self):
         before, after = self.paused_replacement()
         after["stores"]["windows/main/sessions.sqlite3"]["rows"]["cards"].pop()
@@ -693,6 +711,8 @@ class ChatViews(unittest.TestCase):
                 'extra-daemon':lambda a:a['processes'].append({'pid':60,'start_ticks':20,'state':'S','executable':daemon,'argv':[daemon]}),
                 'new-run':lambda a:a['agents']['agent'].update(run='new-run'),
                 'missing-pane':lambda a:a['stores']['windows/main/sessions.sqlite3']['rows']['cards'].clear(),
+                # A refusal leaves storage untouched, so even a closed ordinal hole is a change.
+                'moved-pane':lambda a:a['stores']['windows/main/sessions.sqlite3']['rows']['cards'][0].update(ordinal=1),
                 'unexpected-receipt':lambda a:a['fixture_events'].append({'event':'notification','method':'turn/completed','status':'interrupted','time':20}),
             }.items():
                 with self.subTest(name=name):
