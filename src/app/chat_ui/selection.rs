@@ -23,7 +23,7 @@ pub(super) use document::{
 };
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
-static ACTIVE: AtomicU64 = AtomicU64::new(0);
+application_atomic!(fn active() -> AtomicU64);
 
 pub(super) fn transcript<'a>(
     content: impl Into<Element<'a, Message>>,
@@ -189,7 +189,7 @@ impl operation::Focusable for State {
     }
     fn focus(&mut self) {
         self.focused = true;
-        ACTIVE.store(self.identity, Ordering::Relaxed);
+        active().store(self.identity, Ordering::Relaxed);
     }
     fn unfocus(&mut self) {
         self.focused = false;
@@ -241,6 +241,8 @@ impl std::ops::Deref for Ranges {
 struct Block {
     identity: u64,
     plain: Arc<str>,
+    /// What parts of `plain` copy as instead; see [`markdown::Inlines`].
+    copies: Option<Arc<markdown::Inlines>>,
     bounds: Rectangle,
     visible: Option<Rectangle>,
     hit: usize,
@@ -252,6 +254,17 @@ struct Block {
 struct LogicalText {
     identity: u64,
     plain: Arc<str>,
+    copies: Option<Arc<markdown::Inlines>>,
+}
+
+impl Block {
+    /// `plain[range]` as Copy gives it.
+    fn copied(&self, range: Range<usize>) -> String {
+        match &self.copies {
+            Some(copies) => copies.copy(&self.plain, range),
+            None => self.plain[range].to_owned(),
+        }
+    }
 }
 
 // Native row positions and clip extents can round on opposite sides of one
@@ -517,7 +530,7 @@ impl Read {
                 }
                 let indent = parents.last().map_or(0, |list| list.content_indent);
                 value.push_str(&Self::list_text(
-                    &block.plain[range.clone()],
+                    &block.copied(range.clone()),
                     lists,
                     range.start == 0,
                     indent,
@@ -615,11 +628,7 @@ impl Read {
                 }
             }
             if !range.is_empty() && block.cell.is_none() {
-                append(
-                    block.plain[range.clone()].to_owned(),
-                    &block.lists,
-                    range.start == 0,
-                );
+                append(block.copied(range.clone()), &block.lists, range.start == 0);
             }
         }
         result
@@ -792,7 +801,7 @@ impl Operation for Read {
             y: bounds.y - self.translation.y,
             ..bounds
         };
-        let (identity, plain, hit, link, mounted, empty_caret) =
+        let (identity, plain, copies, hit, link, mounted, empty_caret) =
             if let Some(prose) = state.downcast_mut::<Prose>() {
                 prose.managed = true;
                 prose.logical_active = self.catalog.is_some() && prose.logical.is_some();
@@ -801,11 +810,19 @@ impl Operation for Read {
                     .clip
                     .map_or(self.pointer, |clip| clipped_pointer(self.pointer, clip))
                     .map(|point| point - Vector::new(bounds.x, bounds.y));
+                let catalogued = logical.and_then(|logical| {
+                    let catalog = self.catalog.as_ref()?;
+                    Some((
+                        catalog.text(logical.identity)?,
+                        catalog.copies(logical.identity),
+                    ))
+                });
+                let (plain, copies) =
+                    catalogued.unwrap_or_else(|| (prose.plain.clone(), prose.inlines.clone()));
                 (
                     logical.map_or(prose.identity, |logical| logical.identity),
-                    logical
-                        .and_then(|logical| self.catalog.as_ref()?.text(logical.identity))
-                        .unwrap_or_else(|| prose.plain.clone()),
+                    plain,
+                    copies,
                     position.map_or(0, |point| {
                         self.terminal_caret_end(prose, native_bounds)
                             .unwrap_or_else(|| prose.hit(point))
@@ -821,6 +838,7 @@ impl Operation for Read {
                 (
                     logical.identity,
                     logical.plain.clone(),
+                    logical.copies.clone(),
                     0,
                     None,
                     false,
@@ -878,6 +896,7 @@ impl Operation for Read {
             lists,
             cell,
             plain,
+            copies,
             bounds,
             visible: mounted
                 .then(|| {
@@ -1209,7 +1228,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
                 modifiers,
                 ..
             }) if state.focused
-                && ACTIVE.load(Ordering::Relaxed) == state.identity
+                && active().load(Ordering::Relaxed) == state.identity
                 && modifiers.command()
                 && !shell.is_event_captured()
                 && (key.eq_ignore_ascii_case("c") || key.eq_ignore_ascii_case("a")) =>
@@ -1285,7 +1304,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
                 state.dragging = state.focused;
                 if state.focused {
                     let block = read.endpoint(true).unwrap();
-                    ACTIVE.store(state.identity, Ordering::Relaxed);
+                    active().store(state.identity, Ordering::Relaxed);
                     let point = cursor.position().unwrap();
                     state.origin = Some(point);
                     state.moved = false;
@@ -2030,7 +2049,7 @@ mod tests {
             ] {
                 let code = prose::code_text(
                     source.clone(),
-                    Arc::from([]),
+                    None,
                     14.0.into(),
                     iced::Font::MONOSPACE,
                     target,
@@ -2393,7 +2412,7 @@ mod tests {
                 mouse::Cursor::Unavailable,
             );
             let after = renderer.screenshot(Size::new(400, 120), 1.0, iced::Color::WHITE);
-            let accent = design::accent_color(&cosmic::theme::active()).into_rgba8();
+            let accent = design::selection_wash(&cosmic::theme::active()).into_rgba8();
             let painted = |pixels: &[u8], bounds: Rectangle| {
                 let y = (bounds.y + 1.0) as usize;
                 (bounds.x.ceil() as usize..(bounds.x + bounds.width).floor() as usize).any(|x| {
@@ -2504,7 +2523,7 @@ mod tests {
                 &viewport,
             );
             let pixels = renderer.screenshot(Size::new(600, 1400), 1.0, iced::Color::WHITE);
-            let selected = design::accent_color(&cosmic::theme::active()).into_rgba8();
+            let selected = design::selection_wash(&cosmic::theme::active()).into_rgba8();
             for block in &read.blocks {
                 let y = (block.bounds.y + 1.0) as usize;
                 let painted = (block.bounds.x.ceil() as usize
@@ -2666,7 +2685,7 @@ mod tests {
                 language: None,
                 code: Arc::from(content),
                 source: Arc::from(content),
-                reader_source: super::reader_source::Source::new(content),
+                reader_source: Box::new(super::reader_source::Source::new(content)),
                 lines: Vec::new(),
             }];
         });
@@ -2691,7 +2710,7 @@ mod tests {
                     language: None,
                     code: Arc::from(code),
                     source: Arc::from(code),
-                    reader_source: super::reader_source::Source::new(code),
+                    reader_source: Box::new(super::reader_source::Source::new(code)),
                     lines: Vec::new(),
                 })
                 .collect();
@@ -2778,7 +2797,7 @@ mod tests {
                 .as_widget_mut()
                 .layout(&mut tree, &renderer, &limits);
         }
-        // Focus through actual pointer input. Setting ACTIVE alone does not
+        // Focus through actual pointer input. Setting active() alone does not
         // make a transcript focused, so it never exercises the copy command.
         let mut visible = Read::new(None);
         element
@@ -2834,7 +2853,7 @@ mod tests {
             "native pointer focus must precede Ctrl+A/C"
         );
         assert_eq!(
-            ACTIVE.load(Ordering::Relaxed),
+            active().load(Ordering::Relaxed),
             tree.state.downcast_ref::<State>().identity
         );
         for key in ["a", "c"] {
@@ -2963,6 +2982,7 @@ mod tests {
                 lists: Vec::new(),
                 cell: None,
                 plain: Arc::from(plain),
+                copies: None,
                 bounds: Rectangle::default(),
                 visible: Some(Rectangle::default()),
                 hit: 0,

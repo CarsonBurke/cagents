@@ -1,3 +1,8 @@
+cagents::stamp_version!();
+
+#[cfg(test)]
+cagents::refuse_filtered_test_run!();
+
 // No panic hook or file subscriber here: `cagents` is a short-lived foreground
 // CLI whose stdout and stderr belong to the invoking terminal, so its panics
 // and errors already reach the person who typed the command. The UI and the

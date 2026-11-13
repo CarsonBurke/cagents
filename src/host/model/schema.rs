@@ -45,6 +45,18 @@ pub(super) fn open(path: &Path) -> Result<Connection, String> {
     open_existing(path)
 }
 
+/// Inspection while a previous daemon is still the writer must neither
+/// migrate its published layout nor recover an unconfirmed rollback journal.
+pub(super) fn open_readonly(path: &Path) -> Result<Connection, String> {
+    reject_unjournaled_layout(path)?;
+    connect(path, true)
+}
+
+/// The caller pins this check and its reads in the same SQLite transaction.
+pub(super) fn require_published_snapshot(db: &Connection) -> Result<(), String> {
+    require_open_layout(db, inspect(db)?.version)
+}
+
 fn prepare_file(path: &Path) -> Result<(), String> {
     // POSIX close(any descriptor for an inode) releases the process's fcntl
     // locks, even if another SQLite connection owns them. Never open/close an
@@ -181,6 +193,83 @@ fn open_existing(path: &Path) -> Result<Connection, String> {
     Ok(db)
 }
 
+/// The oldest schema this version can convert a store back to.
+pub(super) const OLDEST_DOWNGRADE: u32 = 22;
+
+/// The schema of the store at `path`, or `None` when there is no store, which
+/// includes a file whose creation never reached schema 1. Reads only; a store
+/// from a newer release is reported, not refused. The caller must hold the
+/// daemon lease, so that no daemon converts it meanwhile.
+pub(super) fn stored_version(path: &Path) -> Result<Option<u32>, String> {
+    if !path.try_exists().map_err(|e| e.to_string())? {
+        return Ok(None);
+    }
+    let db = connect(path, false)?;
+    let version: u32 = db
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    Ok((version != 0).then_some(version))
+}
+
+/// Converts the store at `path` back to schema `target`, for a daemon that
+/// predates the current schema. One transaction: a failure leaves the store as
+/// it was. Returns the schema it converted from, or `None` when the store is
+/// absent or already at or below `target`. The caller must hold the daemon
+/// lease, so that no daemon has the store open.
+pub(super) fn downgrade(path: &Path, target: u32) -> Result<Option<u32>, String> {
+    if !path.try_exists().map_err(|e| e.to_string())? {
+        return Ok(None);
+    }
+    let mut db = connect(path, false)?;
+    db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")
+        .map_err(|e| e.to_string())?;
+    let tx = db
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
+    let version = inspect(&tx)?.version;
+    if version <= target {
+        return Ok(None);
+    }
+    if target < OLDEST_DOWNGRADE {
+        return Err(format!(
+            "workspace registry schema {version} can be converted back only as far as schema \
+             {OLDEST_DOWNGRADE}, not {target}"
+        ));
+    }
+    require_open_layout(&tx, version)?;
+    for step in (target + 1..=version).rev() {
+        match step {
+            24 => {
+                let retained: bool = tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM console_relaunches)",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| error.to_string())?;
+                if retained {
+                    return Err(
+                        "Console recovery records remain; keep the new installation until its consoles are resolved".into(),
+                    );
+                }
+                tx.execute_batch("DROP TABLE console_relaunches;")
+                    .map_err(|error| error.to_string())?;
+            }
+            23 => super::views::store::downgrade(&tx)?,
+            _ => {
+                return Err(format!(
+                    "no conversion back from workspace registry schema {step}"
+                ));
+            }
+        }
+        tx.pragma_update(None, "user_version", step - 1)
+            .map_err(|e| e.to_string())?;
+    }
+    require_open_layout(&tx, target)?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(Some(version))
+}
+
 fn reject_unjournaled_layout(path: &Path) -> Result<(), String> {
     // Even a read-only WAL connection can create empty journal sidecars before
     // rejecting an unsupported layout. When no journal exists, inspect only
@@ -275,6 +364,11 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
     static SEVENTEEN: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static EIGHTEEN: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static NINETEEN: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
+    static TWENTY: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
+    static TWENTY_ONE: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
+    static TWENTY_TWO: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
+    static TWENTY_THREE: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
+    static TWENTY_FOUR: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     let published = match version {
         12 => &TWELVE,
         13 => &THIRTEEN,
@@ -284,6 +378,11 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
         17 => &SEVENTEEN,
         18 => &EIGHTEEN,
         19 => &NINETEEN,
+        20 => &TWENTY,
+        21 => &TWENTY_ONE,
+        22 => &TWENTY_TWO,
+        23 => &TWENTY_THREE,
+        24 => &TWENTY_FOUR,
         _ => return Err(format!("unsupported published registry layout {version}")),
     };
     published
@@ -485,7 +584,17 @@ mod tests {
         model::{ChannelId, ChannelTitleSource, ProjectKind},
         workspace_model::ModelEdit,
     };
+    use rusqlite::OptionalExtension;
     use std::{cell::Cell, rc::Rc, time::Duration};
+
+    fn fixture_dir() -> tempfile::TempDir {
+        // Normalize only the ambient parent. Paths created inside the fixture
+        // remain unchanged so admission still checks their actual spelling.
+        let parent = tempfile::env::temp_dir()
+            .canonicalize()
+            .expect("canonical schema fixture parent");
+        tempfile::tempdir_in(parent).expect("schema fixture directory")
+    }
 
     fn legacy(path: &Path, version: u32) -> (String, ChannelId) {
         let mut db = Connection::open(path).unwrap();
@@ -529,7 +638,7 @@ mod tests {
 
     fn refuse_damaged_twelve(damage: &str, object: &str) {
         let _clear = Clear;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture_dir();
         let path = dir.path().join("damaged12.sqlite3");
         legacy(&path, 12);
         let db = Connection::open(&path).unwrap();
@@ -611,7 +720,7 @@ mod tests {
     #[test]
     fn published_twelve_wal_damage_preserves_primary_wal_and_permissions() {
         let _clear = Clear;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture_dir();
         let path = dir.path().join("damaged12-wal.sqlite3");
         legacy(&path, 12);
         let writer = connect(&path, false).unwrap();
@@ -640,7 +749,7 @@ mod tests {
             TerminalSession,
         };
         use crate::workspace_model::views::{Pane, Scope};
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture_dir();
         let path = dir.path().join("nonempty12.sqlite3");
         let (identity, channel) = legacy(&path, 12);
         let scope = Scope::Channel(channel);
@@ -735,7 +844,7 @@ mod tests {
 
     #[test]
     fn published_thirteen_missing_provenance_is_not_recreated() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture_dir();
         let path = dir.path().join("damaged13.sqlite3");
         legacy(&path, 13);
         let db = Connection::open(&path).unwrap();
@@ -765,6 +874,15 @@ mod tests {
             (15, "DROP TABLE native_actor_retirements;"),
             (16, "DROP TABLE automation_lifecycle;"),
             (16, "DROP INDEX automation_lifecycle_scoped;"),
+            (22, "DROP TABLE automation_precheck_history_cleanup;"),
+            (24, "DROP TABLE console_relaunches;"),
+            (22, "DROP TABLE automation_retired_manual_requests;"),
+            (22, "DROP INDEX automation_removed_history;"),
+            (22, "DROP INDEX automation_firing_successors;"),
+            (
+                22,
+                "DROP INDEX automation_firing_successors; ALTER TABLE automation_firings DROP COLUMN previous_firing;",
+            ),
             (17, "DROP TABLE channel_work_operations;"),
             (17, "DROP TABLE channel_work_entries;"),
             (17, "DROP TABLE channel_work_homes;"),
@@ -792,12 +910,27 @@ mod tests {
                 17,
                 "ALTER TABLE channel_work_entries RENAME COLUMN bucket TO wrong_bucket;",
             ),
+            (21, "DROP TABLE automation_run_attention;"),
+            (
+                21,
+                "ALTER TABLE automation_run_attention ADD COLUMN unexpected_payload TEXT;",
+            ),
+            (
+                21,
+                "DROP TABLE automation_run_attention;
+                  CREATE TABLE automation_run_attention(ordinal INTEGER PRIMARY KEY AUTOINCREMENT,
+                      run TEXT NOT NULL,revision TEXT NOT NULL,event TEXT NOT NULL) STRICT;",
+            ),
+            (
+                21,
+                "ALTER TABLE automation_run_attention RENAME COLUMN revision TO changed_revision;",
+            ),
             (
                 15,
                 "ALTER TABLE native_actor_ownerships ADD COLUMN foreign_payload TEXT;",
             ),
         ] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = fixture_dir();
             let path = dir.path().join("damaged-native-actor.sqlite3");
             legacy(&path, version);
             Connection::open(&path)
@@ -832,8 +965,8 @@ mod tests {
 
     #[test]
     fn native_actor_schema_generations_preserve_existing_receipts_on_upgrade_and_reopen() {
-        for version in [13, 14, 15, 16, 17] {
-            let dir = tempfile::tempdir().unwrap();
+        for version in [13, 14, 15, 16, 17, 18] {
+            let dir = fixture_dir();
             let path = dir.path().join("native-actor-generations.sqlite3");
             legacy(&path, version);
             let db = Connection::open(&path).unwrap();
@@ -897,7 +1030,7 @@ mod tests {
     #[test]
     fn every_published_version_preserves_nonempty_model_identity_and_ordinals() {
         for version in 0..=SCHEMA_VERSION {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = fixture_dir();
             let path = dir.path().join("registry.sqlite3");
             let (identity, channel) = legacy(&path, version);
             let registry = Registry::at(&path).unwrap_or_else(|e| panic!("version {version}: {e}"));
@@ -926,6 +1059,144 @@ mod tests {
     }
 
     #[test]
+    fn console_schema24_preserves_published23_and_round_trips_through22() {
+        let directory = fixture_dir();
+        let path = directory.path().join("console-schema24.sqlite3");
+        let (identity, channel) = legacy(&path, 23);
+        let retired = crate::model::CardId::new();
+        let operation = uuid::Uuid::new_v4();
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        require_open_layout(&db, 23).unwrap();
+        assert!(
+            !inspect(&db)
+                .unwrap()
+                .objects
+                .iter()
+                .any(|o| o.1 == "console_relaunches")
+        );
+        assert!(inspect(&db).unwrap().objects.iter().any(|o| o.1 == "panes"));
+        db.execute(
+            "INSERT INTO view_scopes(channel,revision) VALUES(?1,19)",
+            [channel.to_string()],
+        )
+        .unwrap();
+        let scope = db.last_insert_rowid();
+        db.execute("UPDATE view_revision_clock SET last=19 WHERE id=1", [])
+            .unwrap();
+        db.execute(
+            "INSERT INTO retired_panes(scope,pane,ordinal,retired_at_unix_ms) VALUES(?1,?2,0,123)",
+            rusqlite::params![scope, retired.to_string()],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO view_operations(operation,scope,applied_at_unix_ms) VALUES(?1,?2,124)",
+            rusqlite::params![operation.to_string(), scope],
+        )
+        .unwrap();
+        let expected = super::super::views::read(&db, &channel.into()).unwrap();
+        drop(db);
+
+        let registry = Registry::at(&path).unwrap();
+        require_current(&registry.db).unwrap();
+        assert_eq!(inspect(&registry.db).unwrap().version, 24);
+        assert_eq!(registry.model().unwrap().identity.to_string(), identity);
+        assert_eq!(
+            super::super::views::read(&registry.db, &channel.into()).unwrap(),
+            expected
+        );
+        assert_eq!(
+            registry
+                .db
+                .query_row("SELECT count(*) FROM console_relaunches", [], |row| row
+                    .get::<_, u64>(0))
+                .unwrap(),
+            0
+        );
+        drop(registry);
+
+        assert_eq!(downgrade(&path, 23).unwrap(), Some(24));
+        let db = Connection::open(&path).unwrap();
+        require_open_layout(&db, 23).unwrap();
+        assert_eq!(inspect(&db).unwrap().version, 23);
+        assert_eq!(
+            super::super::views::read(&db, &channel.into()).unwrap(),
+            expected
+        );
+        assert!(
+            !inspect(&db)
+                .unwrap()
+                .objects
+                .iter()
+                .any(|o| o.1 == "console_relaunches")
+        );
+        drop(db);
+
+        assert_eq!(downgrade(&path, 22).unwrap(), Some(23));
+        let db = Connection::open(&path).unwrap();
+        require_open_layout(&db, 22).unwrap();
+        assert_eq!(
+            db.query_row(
+                "SELECT operation FROM shared_view_edits WHERE operation=?1",
+                [operation.to_string()],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            operation.to_string()
+        );
+        drop(db);
+        let registry = Registry::at(&path).unwrap();
+        require_current(&registry.db).unwrap();
+        assert_eq!(registry.model().unwrap().identity.to_string(), identity);
+        assert_eq!(
+            super::super::views::read(&registry.db, &channel.into()).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn console_recovery_records_refuse_downgrade_without_changing_evidence() {
+        for target in [22, 23] {
+            let directory = fixture_dir();
+            let path = directory.path().join("retained-console.sqlite3");
+            legacy(&path, 24);
+            let db = Connection::open(&path).unwrap();
+            // Even opaque recovery evidence must be retained, not decoded or
+            // discarded by a schema conversion. Keep its actual FK parents.
+            db.execute_batch("PRAGMA foreign_keys=ON;
+                INSERT INTO native_actor_ownerships(actor,ownership) VALUES('actor','original ownership');
+                INSERT INTO agents(id,origin,record,closed) VALUES('agent','local','{}',0);
+                INSERT INTO console_relaunches(actor,agent,record) VALUES('actor','agent','original console recovery');").unwrap();
+            let before = inspect(&db).unwrap();
+            drop(db);
+            let original = bytes(&path);
+            assert!(
+                downgrade(&path, target)
+                    .unwrap_err()
+                    .contains("Console recovery records remain")
+            );
+            assert_eq!(bytes(&path), original);
+            let db = Connection::open(&path).unwrap();
+            assert_eq!(inspect(&db).unwrap(), before);
+            assert_eq!(
+                db.query_row(
+                    "SELECT record FROM console_relaunches WHERE actor='actor'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+                "original console recovery"
+            );
+            assert_eq!(
+                db.query_row("PRAGMA foreign_key_check", [], |_| Ok(()))
+                    .optional()
+                    .unwrap(),
+                None
+            );
+        }
+    }
+
+    #[test]
     fn published_eighteen_adds_only_empty_attention_outbox_and_preserves_audit() {
         use crate::{
             agent::Provider,
@@ -935,7 +1206,7 @@ mod tests {
                 SessionMode,
             },
         };
-        let directory = tempfile::tempdir().unwrap();
+        let directory = fixture_dir();
         let path = directory.path().join("attention18.sqlite3");
         let (identity, channel) = legacy(&path, 18);
         let mut db = Connection::open(&path).unwrap();
@@ -984,7 +1255,27 @@ mod tests {
         )
         .unwrap();
         tx.commit().unwrap();
-        let old_layout = inspect(&db).unwrap().objects;
+        // Schema 23 replaces the view tables and repoints the terminal sources
+        // at `panes`; `require_current` already holds those objects to the
+        // published 23 layout. Schema 24 adds the empty console recovery ledger;
+        // this comparison covers every other predecessor object.
+        let replaced_views = [
+            "shared_view_scopes",
+            "shared_views",
+            "shared_view_panes",
+            "shared_view_edits",
+            "shared_view_terminal_sources",
+        ];
+        let normalized_views = [
+            "view_scopes",
+            "view_revision_clock",
+            "panes",
+            "retired_panes",
+            "view_operations",
+            "shared_view_terminal_sources",
+        ];
+        let mut old_layout = inspect(&db).unwrap().objects;
+        old_layout.retain(|object| !replaced_views.contains(&object.2.as_str()));
         let audit_rows = |db: &Connection| {
             db.prepare("SELECT sequence,automation,repository,record FROM automation_lifecycle ORDER BY sequence")
                 .unwrap()
@@ -1004,8 +1295,9 @@ mod tests {
         for _ in 0..2 {
             let registry = Registry::at(&path).unwrap();
             require_current(&registry.db).unwrap();
-            assert_eq!(inspect(&registry.db).unwrap().version, 19);
+            assert_eq!(inspect(&registry.db).unwrap().version, SCHEMA_VERSION);
             let mut inventory = inspect(&registry.db).unwrap().objects;
+            inventory.retain(|object| !normalized_views.contains(&object.2.as_str()));
             let outbox = inventory
                 .iter()
                 .position(|object| object.1 == "automation_notifications")
@@ -1019,7 +1311,63 @@ mod tests {
                     tokens(super::super::automation_notifications::SCHEMA_SQL).unwrap(),
                 )
             );
-            assert_eq!(inventory, old_layout, "only the outbox table may be added");
+            // This current opener also applies retention20, run-attention21,
+            // history22 and the empty console recovery ledger24.
+            // Admit only those known objects here; every predecessor object
+            // and the exact lifecycle outbox assertion stay intact.
+            let retention_names = [
+                "terminal_retention_pins",
+                "shared_terminal_retention_pins",
+                "shared_terminal_retention_by_terminal",
+                "automation_run_attention",
+                "automation_precheck_history_cleanup",
+                "automation_retired_manual_requests",
+                "automation_removed_history",
+                "automation_firing_successors",
+                "console_relaunches",
+            ];
+            for name in retention_names {
+                let index = inventory
+                    .iter()
+                    .position(|object| object.1 == name)
+                    .unwrap();
+                inventory.remove(index);
+            }
+            for table in [
+                "terminal_retention_pins",
+                "shared_terminal_retention_pins",
+                "automation_run_attention",
+                "automation_precheck_history_cleanup",
+                "automation_retired_manual_requests",
+                "console_relaunches",
+            ] {
+                assert_eq!(
+                    registry
+                        .db
+                        .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row
+                            .get::<_, u32>(0))
+                        .unwrap(),
+                    0
+                );
+            }
+            // History22 adds only this column to an existing table. SQLite writes
+            // it after the last column, ahead of the table constraints. Compare
+            // the exact original published DDL after removing those tokens.
+            let firing = inventory
+                .iter_mut()
+                .find(|object| object.1 == "automation_firings")
+                .unwrap();
+            let column = tokens(", previous_firing TEXT").unwrap();
+            let start = firing
+                .3
+                .windows(column.len())
+                .position(|tokens| tokens == column)
+                .unwrap();
+            firing.3.drain(start..start + column.len());
+            assert_eq!(
+                inventory, old_layout,
+                "only lifecycle/run outboxes, retention objects, the console ledger and the exact history column may be added"
+            );
             assert!(
                 registry
                     .pending_automation_notifications(100)
@@ -1041,7 +1389,7 @@ mod tests {
     #[test]
     fn failed_eighteen_to_nineteen_rolls_back_outbox_and_published_header() {
         let _clear = Clear;
-        let directory = tempfile::tempdir().unwrap();
+        let directory = fixture_dir();
         let path = directory.path().join("attention18-rollback.sqlite3");
         let (identity, channel) = legacy(&path, 18);
         let before = bytes(&path);
@@ -1082,7 +1430,7 @@ mod tests {
         use crate::channel_work::{Change, Home, Mutation, Origin, Page, Role, Target};
         use crate::github_identity::{GitHubRepoKey, PullRequestKey};
 
-        let directory = tempfile::tempdir().unwrap();
+        let directory = fixture_dir();
         let path = directory.path().join("channel-work16.sqlite3");
         let (identity, channel) = legacy(&path, 16);
         // A historical title mentioning a PR is metadata, never work intent.
@@ -1166,7 +1514,7 @@ mod tests {
         let _clear = Clear;
         // Synthesized compatibility fixture for the actual version-eight
         // reader; the old version-seven CREATE writer is not in Git history.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture_dir();
         let path = dir.path().join("legacy7.sqlite3");
         let (_, channel) = legacy(&path, 6);
         let db = Connection::open(&path).unwrap();
@@ -1200,39 +1548,38 @@ mod tests {
             "converted legacy rows must roll back with the failed migration"
         );
         let registry = Registry::at(&path).unwrap();
-        let scope = serde_json::json!({"Channel":channel}).to_string();
-        let view: (i64, String, String) = registry
-            .db
-            .query_row(
-                "SELECT revision,panes,retired FROM shared_views WHERE scope=?1",
-                [&scope],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .unwrap();
+        let view = super::super::views::read(
+            &registry.db,
+            &crate::workspace_model::views::Scope::Channel(channel),
+        )
+        .unwrap();
+        assert_eq!(view.revision, 9);
+        assert!(view.panes.is_empty());
         assert_eq!(
-            view,
-            (
-                9,
-                "[]".into(),
-                "[\"00000000-0000-4000-8000-000000000071\"]".into()
-            )
+            view.retired,
+            vec!["00000000-0000-4000-8000-000000000071".parse().unwrap()]
         );
-        for (table, column, value) in [
-            ("shared_view_panes", "id", "pane"),
-            ("shared_view_edits", "operation", "edit"),
-        ] {
-            assert_eq!(
-                registry
-                    .db
-                    .query_row(
-                        &format!("SELECT scope FROM {table} WHERE {column}=?1"),
-                        [value],
-                        |r| r.get::<_, String>(0)
-                    )
-                    .unwrap(),
-                scope
-            );
-        }
+        assert_eq!(
+            registry
+                .db
+                .query_row(
+                    "SELECT s.channel FROM view_operations o JOIN view_scopes s ON s.id = o.scope
+                     WHERE o.operation = 'edit'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            channel.to_string()
+        );
+        // The legacy index named a pane no view held; nothing open is lost
+        // when the converted store forgets it.
+        assert_eq!(
+            registry
+                .db
+                .query_row("SELECT count(*) FROM panes", [], |r| r.get::<_, u32>(0))
+                .unwrap(),
+            0
+        );
         assert!(
             !inspect(&registry.db)
                 .unwrap()
@@ -1259,7 +1606,7 @@ mod tests {
             "CREATE INDEX unknown_legacy_index ON workspace_views(revision);",
             "CREATE TRIGGER unknown_legacy_trigger BEFORE DELETE ON workspace_views BEGIN SELECT RAISE(ABORT, 'keep'); END;",
         ] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = fixture_dir();
             let path = dir.path().join("unknown-legacy.sqlite3");
             let (_, channel) = legacy(&path, 6);
             let db = Connection::open(&path).unwrap();
@@ -1286,12 +1633,69 @@ mod tests {
     }
 
     #[test]
+    fn published_twenty_run_attention_failure_rolls_back_before_retry() {
+        let _clear = Clear;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("attention21-rollback.sqlite3");
+        let (identity, channel) = legacy(&path, 20);
+        let before = bytes(&path);
+        FAIL_STEP.with(|step| step.set(Some(21)));
+        let error = Registry::at(&path)
+            .err()
+            .expect("injected21 failure must refuse");
+        FAIL_STEP.with(|step| step.set(None));
+        assert!(
+            error.contains("injected migration failure at 21"),
+            "{error}"
+        );
+        assert_eq!(bytes(&path), before);
+        assert!(!wal(&path).exists());
+        let db = Connection::open(&path).unwrap();
+        assert_eq!(
+            db.pragma_query_value::<u32, _>(None, "user_version", |row| row.get(0))
+                .unwrap(),
+            20
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name='automation_run_attention'",
+                [],
+                |row| row.get::<_, u64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        drop(db);
+        let registry = Registry::at(&path).unwrap();
+        assert_eq!(registry.model().unwrap().identity.to_string(), identity);
+        assert_eq!(
+            registry.model().unwrap().channel(channel).unwrap().ordinal,
+            5
+        );
+        assert!(
+            registry
+                .pending_automation_attention(100)
+                .unwrap()
+                .is_empty()
+        );
+        require_current(&registry.db).unwrap();
+        drop(registry);
+        assert!(
+            Registry::at(&path)
+                .unwrap()
+                .pending_automation_attention(100)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn each_actual_migration_failure_rolls_back_all_prior_steps_and_header() {
         let _clear = Clear;
         for step in [
-            1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+            1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
         ] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = fixture_dir();
             let path = dir.path().join("rollback.sqlite3");
             legacy(&path, 0);
             let before = bytes(&path);
@@ -1316,7 +1720,7 @@ mod tests {
 
     #[test]
     fn future_delete_and_wal_refusal_preserves_database_and_wal_bytes() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture_dir();
         let delete = dir.path().join("future-delete.sqlite3");
         legacy(&delete, 12);
         let db = Connection::open(&delete).unwrap();
@@ -1354,7 +1758,7 @@ mod tests {
     fn unjournaled_wal_refusal_preserves_absent_sidecars_and_literal_filename() {
         use std::os::unix::{ffi::OsStringExt, fs::MetadataExt};
         for future in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = fixture_dir();
             // URI metacharacters and a non-UTF8 byte are literal filename data.
             let path = dir.path().join(std::ffi::OsString::from_vec(
                 b"refusal ?#%\xff.sqlite3".to_vec(),
@@ -1402,7 +1806,7 @@ mod tests {
     fn immutable_precheck_cannot_admit_a_later_writer_or_new_wal() {
         let _clear = Clear;
         for future in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = fixture_dir();
             let path = dir.path().join("prechecked.sqlite3");
             drop(Registry::at(&path).unwrap());
             // Prepare a current WAL database without sidecars, just as after
@@ -1461,7 +1865,7 @@ mod tests {
             format!("PRAGMA user_version={};", SCHEMA_VERSION + 1),
             "ALTER TABLE projects RENAME COLUMN name TO nameifnotexists;".into(),
         ] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = fixture_dir();
             let path = dir.path().join("stale-wal.sqlite3");
             drop(Registry::at(&path).unwrap());
             let saved = Rc::new(std::cell::RefCell::new(None));
@@ -1493,7 +1897,7 @@ mod tests {
     #[test]
     fn current_delete_writer_lock_spans_commit_and_persistent_wal_conversion() {
         let _clear = Clear;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture_dir();
         let path = dir.path().join("current-delete.sqlite3");
         legacy(&path, 12);
         let observed = Rc::new(Cell::new(0));
@@ -1550,7 +1954,7 @@ mod tests {
     #[test]
     fn wal_opener_has_no_persistent_configuration_after_migration_commit() {
         let _clear = Clear;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture_dir();
         let path = dir.path().join("current-wal.sqlite3");
         drop(Registry::at(&path).unwrap());
         let saved = Rc::new(std::cell::RefCell::new(None));
@@ -1590,7 +1994,7 @@ mod tests {
             format!("PRAGMA user_version={};", SCHEMA_VERSION + 1),
             "ALTER TABLE projects RENAME COLUMN name TO nameifnotexists;".into(),
         ] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = fixture_dir();
             let path = dir.path().join("outer.sqlite3");
             let (_, channel) = legacy(&path, 12);
             let mut registry = Registry::at(&path).unwrap();
@@ -1652,7 +2056,7 @@ mod tests {
 
     #[test]
     fn current_edits_keep_cascade_sequence_and_reopen_semantics() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture_dir();
         let path = dir.path().join("current.sqlite3");
         let (_, channel) = legacy(&path, 12);
         let mut registry = Registry::at(&path).unwrap();
@@ -1681,7 +2085,7 @@ mod tests {
 
     #[test]
     fn current_header_preserves_the_unversioned_legacy_project_kind_upgrade() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture_dir();
         let path = dir.path().join("legacy-kind.sqlite3");
         legacy(&path, 12);
         let mut registry = Registry::at(&path).unwrap();

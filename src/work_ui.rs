@@ -18,9 +18,7 @@ use crate::{
     design::{self, Tone, space},
     model::TerminalId,
     ui_controls::{Icon, badge, icon_button, placeholder, popover, popover_item},
-    work::{
-        ActivitySource, Board, CheckOutcome, Column, Forge, Item, ItemKey, PullRequestState, Review,
-    },
+    work::{ActivitySource, Board, Column, Forge, Item, ItemKey, PullRequestState},
 };
 
 /// A semantic color, read from the drawing theme.
@@ -32,6 +30,29 @@ const COLUMN_MIN_WIDTH: f32 = 248.0;
 const COLUMN_WIDTH: f32 = 280.0;
 const SCOPE_MENU_WIDTH: f32 = 280.0;
 const CARD_MENU_WIDTH: f32 = 264.0;
+
+/// A board card's height before it has been measured: branch, title, facts
+/// and footer at the compact sizes.
+const CARD_ESTIMATE: f32 = 104.0;
+/// A list row's height before it has been measured: title and facts lines.
+const ROW_ESTIMATE: f32 = 54.0;
+
+/// The keys a culled column keeps each card's widget state by.
+fn card_keys(items: &[&Item]) -> Vec<u64> {
+    items
+        .iter()
+        .map(|item| card_key(&item.project, &item.key))
+        .collect()
+}
+
+/// A card's key in a culled column, from what identifies it.
+fn card_key(project: &std::path::Path, key: &ItemKey) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    project.hash(&mut hasher);
+    key.hash(&mut hasher);
+    hasher.finish()
+}
 
 /// One card on the board, by what identifies it to the daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -586,7 +607,7 @@ impl State {
         if fits {
             row.width(Length::Fill).into()
         } else {
-            crate::interaction::horizontal_wheel(
+            crate::interaction::horizontal_wheel_around_vertical(
                 widget::scrollable::horizontal(row)
                     .direction(iced::widget::scrollable::Direction::Horizontal(
                         design::scrollbar(),
@@ -624,21 +645,23 @@ impl State {
             .width(Length::Fill)
             .into()
         } else {
-            widget::scrollable(
-                widget::column::with_children(
-                    items
-                        .into_iter()
-                        .map(|item| self.card(item))
-                        .collect::<Vec<_>>(),
+            crate::ui_controls::keep_in_place(
+                widget::scrollable(
+                    widget::container(
+                        crate::ui_controls::culled_column(card_keys(&items), move |index| {
+                            self.card(items[index])
+                        })
+                        .spacing(space::S)
+                        .estimate(CARD_ESTIMATE)
+                        .keep_built(self.open_menu_key()),
+                    )
+                    .padding(design::with_vertical_rail(Padding::from([0.0, space::XS]))),
                 )
-                .spacing(space::S)
-                .padding(design::with_vertical_rail(Padding::from([0.0, space::XS]))),
+                .direction(iced::widget::scrollable::Direction::Vertical(
+                    design::scrollbar(),
+                ))
+                .height(Length::Fill),
             )
-            .direction(iced::widget::scrollable::Direction::Vertical(
-                design::scrollbar(),
-            ))
-            .height(Length::Fill)
-            .into()
         };
         widget::container(
             widget::column::with_children(vec![header.into(), body])
@@ -657,27 +680,39 @@ impl State {
     }
 
     fn list_view(&self) -> Element<'_, Action> {
-        let rows = self
-            .visible()
-            .map(|item| self.row(item))
-            .collect::<Vec<_>>();
-        if rows.is_empty() {
+        let items = self.visible().collect::<Vec<_>>();
+        if items.is_empty() {
             return self.no_match();
         }
-        widget::scrollable(
-            widget::column::with_children(rows)
-                .spacing(space::XS)
+        crate::ui_controls::keep_in_place(
+            widget::scrollable(
+                widget::container(
+                    crate::ui_controls::culled_column(card_keys(&items), move |index| {
+                        self.row(items[index])
+                    })
+                    .spacing(space::XS)
+                    .estimate(ROW_ESTIMATE)
+                    .keep_built(self.open_menu_key()),
+                )
                 .padding(design::with_vertical_rail(Padding::from([
                     space::M,
                     space::L,
                 ]))),
+            )
+            .direction(iced::widget::scrollable::Direction::Vertical(
+                design::scrollbar(),
+            ))
+            .width(Length::Fill)
+            .height(Length::Fill),
         )
-        .direction(iced::widget::scrollable::Direction::Vertical(
-            design::scrollbar(),
-        ))
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+    }
+
+    /// The card whose menu is open stays built while it scrolls away, so
+    /// its menu stays open and closes on a click elsewhere.
+    fn open_menu_key(&self) -> Option<u64> {
+        self.menu
+            .as_ref()
+            .map(|card| card_key(&card.project, &card.key))
     }
 
     fn no_match(&self) -> Element<'_, Action> {
@@ -849,49 +884,27 @@ impl State {
             ));
         }
         if let Some(pull_request) = &item.pull_request {
-            let (label, tone): (&str, Toned) = match (pull_request.state, pull_request.draft) {
-                (PullRequestState::Open, true) => ("Draft", design::muted_color),
-                (PullRequestState::Open, false) => ("Open", design::success_color),
-                (PullRequestState::Merged, _) => ("Merged", design::accent_color),
-                (PullRequestState::Closed, _) => ("Closed", design::destructive_color),
-            };
-            facts.push(badge(label, Tone::Themed(tone)));
-            if pull_request.state == PullRequestState::Open {
-                if let Some((label, tone)) = pull_request.checks.and_then(|checks| {
-                    checks.outcome().map(|outcome| -> (String, Toned) {
-                        match outcome {
-                            CheckOutcome::Passing => {
-                                (format!("✓ {}", checks.passed), design::success_color)
-                            }
-                            CheckOutcome::Pending => (
-                                format!("● {} running", checks.pending),
-                                design::warning_color,
-                            ),
-                            CheckOutcome::Failing => (
-                                format!("✕ {} failing", checks.failed),
-                                design::destructive_color,
-                            ),
-                        }
-                    })
-                }) {
-                    facts.push(badge(label, Tone::Themed(tone)));
-                }
-                if let Some(review) = pull_request.review {
-                    let (label, tone): (&str, Toned) = match review {
-                        Review::Approved => ("Approved", design::success_color),
-                        Review::ChangesRequested => {
-                            ("Changes requested", design::destructive_color)
-                        }
-                        Review::Required => ("Review required", design::muted_color),
-                    };
-                    facts.push(badge(label, Tone::Themed(tone)));
-                }
-                if !pull_request.contains_local_head && item.worktree.is_some() {
-                    facts.push(crate::interaction::tooltip(
-                        badge("Unpushed", Tone::Themed(design::warning_color)),
-                        "The worktree has commits the pull request does not",
-                    ));
-                }
+            // The leading glyph gives the state unless an agent's activity
+            // has its place; then a small glyph beside the facts says it.
+            if !status_glyph_is_pull_request(item) {
+                let state = crate::sidebar::WorktreePullRequestState::from_work(pull_request);
+                facts.push(crate::interaction::tooltip(
+                    crate::ui_controls::pull_request_state_glyph(
+                        Some(state),
+                        design::COMPACT_ICON_SIZE,
+                    ),
+                    format!("{} pull request", state.label()),
+                ));
+            }
+            facts.extend(pull_request_badges(pull_request));
+            if pull_request.state == PullRequestState::Open
+                && !pull_request.contains_local_head
+                && item.worktree.is_some()
+            {
+                facts.push(crate::interaction::tooltip(
+                    badge("Unpushed", Tone::Themed(design::warning_color)),
+                    "The worktree has commits the pull request does not",
+                ));
             }
         }
         if let Some(ticket) = &item.linear
@@ -1152,13 +1165,9 @@ fn column_tone(column: Column) -> Toned {
     }
 }
 
-/// Merged work reads as done, apart from work under review.
+/// Landed work takes the tone merged pull requests have everywhere.
 fn merged_color(theme: &Theme) -> iced::Color {
-    design::mix(
-        design::accent_color(theme),
-        design::success_color(theme),
-        0.5,
-    )
+    crate::sidebar::WorktreePullRequestState::Merged.color(theme)
 }
 
 fn empty_lane(column: Column) -> &'static str {
@@ -1186,42 +1195,86 @@ fn dot(tone: Toned) -> cosmic::theme::Container<'static> {
     })
 }
 
-/// What the card's leading glyph says at a glance: a working agent, else the
-/// pull request's state, else a branch.
+/// Whether the card's leading glyph is its pull request's state, rather than
+/// an agent's activity or a branch.
+fn status_glyph_is_pull_request(item: &Item) -> bool {
+    matches!(Leading::of(item), Leading::PullRequest(_))
+}
+
+/// What the card's leading glyph says at a glance: a working agent, else an
+/// agent waiting, else the pull request's state, else a branch.
+enum Leading<'a> {
+    Working,
+    Waiting,
+    PullRequest(&'a crate::work::PullRequest),
+    Branch,
+}
+
+impl<'a> Leading<'a> {
+    fn of(item: &'a Item) -> Self {
+        let any = |state| item.sessions.iter().any(|session| session.state == state);
+        if any(ActivityState::Working) {
+            Self::Working
+        } else if any(ActivityState::Waiting) {
+            Self::Waiting
+        } else if let Some(pull_request) = &item.pull_request {
+            Self::PullRequest(pull_request)
+        } else {
+            Self::Branch
+        }
+    }
+}
+
 fn status_glyph<'a>(item: &Item) -> Element<'a, Action> {
-    if item
-        .sessions
-        .iter()
-        .any(|session| session.state == ActivityState::Working)
-    {
-        return widget::container(crate::ui_controls::activity_spinner(
+    match Leading::of(item) {
+        Leading::Working => widget::container(crate::ui_controls::activity_spinner(
             12.0,
             design::accent_color,
         ))
         .center(Length::Fixed(f32::from(design::ROW_ICON_SIZE)))
-        .into();
-    }
-    if item
-        .sessions
-        .iter()
-        .any(|session| session.state == ActivityState::Waiting)
-    {
-        return glyph(Icon::AgentWaiting, design::warning_color);
-    }
-    match &item.pull_request {
-        Some(pull_request) => match pull_request.state {
-            PullRequestState::Merged => glyph(Icon::MergedPullRequest, merged_color),
-            PullRequestState::Closed => glyph(Icon::ClosedPullRequest, design::destructive_color),
-            PullRequestState::Open if pull_request.draft => {
-                glyph(Icon::PullRequest, design::muted_color)
-            }
-            PullRequestState::Open => glyph(Icon::PullRequest, design::success_color),
-        },
-        None => glyph(Icon::Branch, design::muted_color),
+        .into(),
+        Leading::Waiting => glyph(Icon::AgentWaiting, design::warning_color),
+        Leading::PullRequest(pull_request) => pull_request_glyph(pull_request),
+        Leading::Branch => glyph(Icon::Branch, design::muted_color),
     }
 }
 
-fn glyph<'a>(icon: Icon, tone: Toned) -> Element<'a, Action> {
+/// A pull request's state as its leading glyph: open, draft, merged or closed.
+pub(crate) fn pull_request_glyph<'a, Message: 'a>(
+    pull_request: &crate::work::PullRequest,
+) -> Element<'a, Message> {
+    crate::ui_controls::pull_request_state_glyph(
+        Some(crate::sidebar::WorktreePullRequestState::from_work(
+            pull_request,
+        )),
+        design::ROW_ICON_SIZE,
+    )
+}
+
+/// What is true of an open pull request now: its checks and review, as
+/// glyphs whose tooltips say the counts and the decision. Its state is its
+/// leading glyph's to say.
+pub(crate) fn pull_request_badges<'a, Message: 'a>(
+    pull_request: &crate::work::PullRequest,
+) -> Vec<Element<'a, Message>> {
+    if pull_request.state != PullRequestState::Open {
+        return Vec::new();
+    }
+    let size = design::COMPACT_ICON_SIZE;
+    pull_request
+        .checks
+        .and_then(crate::ui_controls::ChecksSummary::of_counts)
+        .map(|summary| crate::ui_controls::checks_glyph(&summary, size))
+        .into_iter()
+        .chain(
+            pull_request
+                .review
+                .map(|review| crate::ui_controls::pull_request_review_glyph(review, size)),
+        )
+        .collect()
+}
+
+fn glyph<'a, Message: 'a>(icon: Icon, tone: Toned) -> Element<'a, Message> {
     widget::icon(icon.handle())
         .size(design::ROW_ICON_SIZE)
         .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(move |theme| {
@@ -1528,6 +1581,341 @@ mod tests {
         // A card that comes back does not reopen its menu.
         watched(&mut state, 4, board(vec![item("feat/board", "cagents")]));
         assert_eq!(state.menu, None);
+    }
+
+    #[test]
+    fn an_open_pull_request_says_its_checks_and_review_as_named_glyphs() {
+        use cosmic::iced::advanced::{Layout, layout, mouse, widget::Tree};
+        let mut pull_request = PullRequest {
+            number: 42,
+            title: "Fix login redirect".into(),
+            url: "https://github.com/o/redact/pull/42".into(),
+            state: PullRequestState::Open,
+            draft: false,
+            head_oid: "a".into(),
+            contains_local_head: true,
+            checks: Some(crate::work::Checks {
+                passed: 10,
+                failed: 2,
+                pending: 0,
+            }),
+            review: Some(crate::work::Review::ChangesRequested),
+            updated_at: String::new(),
+        };
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let described = |pull_request: &PullRequest| {
+            let mut element: Element<'_, ()> =
+                widget::row::with_children(pull_request_badges(pull_request)).into();
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(400.0, 40.0)),
+            );
+            let mut texts = Vec::new();
+            element.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut Texts(&mut texts),
+            );
+            let nodes = element.as_widget().a11y_nodes(
+                Layout::new(&node),
+                &tree,
+                mouse::Cursor::Unavailable,
+            );
+            let names = nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .filter_map(|node| node.node().label().map(str::to_owned))
+                .collect::<Vec<_>>();
+            (names, texts, node.size().height)
+        };
+        let (names, texts, height) = described(&pull_request);
+        assert_eq!(names, ["Checks: 2 failing, 10 passed", "Changes requested"]);
+        assert!(texts.is_empty(), "no words are drawn: {texts:?}");
+        assert_eq!(height, f32::from(design::COMPACT_ICON_SIZE));
+        // A merged pull request's checks and review are history; its state
+        // glyph says all a card needs.
+        pull_request.state = PullRequestState::Merged;
+        assert!(described(&pull_request).0.is_empty());
+
+        struct Texts<'a>(&'a mut Vec<String>);
+        impl iced::advanced::widget::Operation for Texts<'_> {
+            fn traverse(
+                &mut self,
+                operate: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation<()>),
+            ) {
+                operate(self);
+            }
+            fn text(
+                &mut self,
+                _id: Option<&iced::advanced::widget::Id>,
+                _bounds: iced::Rectangle,
+                text: &str,
+            ) {
+                self.0.push(text.to_owned());
+            }
+        }
+    }
+
+    /// Frames of a Work board at a long-lived installation's scale, 600 cards
+    /// and, for headroom, 3,000, every one with an open pull request whose
+    /// checks and review are known, in the board and list layouts. A rebuilt
+    /// frame makes the view again, as every message does; a scrolled frame
+    /// delivers a wheel step and the redraw that follows it, as scrolling
+    /// does. Run it optimized:
+    ///
+    /// ```sh
+    /// scripts/cargo-gate test --locked --profile local --no-default-features --features ui \
+    ///     --lib -- --ignored --nocapture work_ui::tests::board_frame_workload
+    /// ```
+    #[test]
+    #[ignore = "timing workload; run optimized with --ignored --nocapture"]
+    fn board_frame_workload() {
+        use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+        use std::time::{Duration, Instant};
+        const FRAMES: usize = 48;
+        const WARMUP: usize = 8;
+        const SCREEN: iced::Size = iced::Size::new(1240.0, 900.0);
+        const STEP: f32 = 96.0;
+
+        /// The furthest any scrollable has been scrolled down.
+        struct Scrolled(f32);
+        impl iced::advanced::widget::Operation for Scrolled {
+            fn traverse(
+                &mut self,
+                operate: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation<()>),
+            ) {
+                operate(self);
+            }
+            fn scrollable(
+                &mut self,
+                _id: Option<&iced::advanced::widget::Id>,
+                _bounds: iced::Rectangle,
+                _content_bounds: iced::Rectangle,
+                translation: iced::Vector,
+                _state: &mut dyn iced::advanced::widget::operation::Scrollable,
+            ) {
+                self.0 = self.0.max(translation.y);
+            }
+        }
+
+        let reviews = [
+            Some(crate::work::Review::Approved),
+            Some(crate::work::Review::ChangesRequested),
+            Some(crate::work::Review::Required),
+            None,
+        ];
+        let millis = |took: Duration| took.as_secs_f64() * 1e3;
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let theme = cosmic::Theme::dark();
+        let style = iced::advanced::renderer::Style::default();
+        for cards in [600, 3000] {
+            let items = (0..cards)
+                .map(|index| {
+                    let mut item = item(&format!("feature/change-{index}"), "cagents");
+                    item.column = [Column::Active, Column::InProgress, Column::InReview][index % 3];
+                    item.pull_request = Some(PullRequest {
+                        number: index as u64 + 1,
+                        title: format!("Change number {index}"),
+                        url: format!("https://github.com/o/cagents/pull/{}", index + 1),
+                        state: PullRequestState::Open,
+                        draft: false,
+                        head_oid: "a".into(),
+                        contains_local_head: true,
+                        checks: Some(crate::work::Checks {
+                            passed: 40 + index as u32 % 7,
+                            failed: index as u32 % 3,
+                            pending: index as u32 % 2,
+                        }),
+                        review: reviews[index % reviews.len()],
+                        updated_at: String::new(),
+                    });
+                    item
+                })
+                .collect();
+            let mut state = State::default();
+            connected(&mut state, 1, board(items));
+            // Within the first lane, and within the list.
+            for (name, list, pointer) in [
+                ("board", false, iced::Point::new(120.0, 500.0)),
+                ("list", true, iced::Point::new(620.0, 500.0)),
+            ] {
+                if list {
+                    state.update(Action::Layout(Layout::List));
+                }
+                let mut cache = Cache::new();
+                // The view is built lazily inside layout, so building the
+                // interface is where the cards' widgets are made.
+                let mut stages = [Duration::ZERO; 2];
+                for frame in 0..WARMUP + FRAMES {
+                    let clock = Instant::now();
+                    let mut ui = UserInterface::build(
+                        state.view(),
+                        SCREEN,
+                        std::mem::replace(&mut cache, Cache::new()),
+                        &mut renderer,
+                    );
+                    let built = clock.elapsed();
+                    let clock = Instant::now();
+                    ui.draw(
+                        &mut renderer,
+                        &theme,
+                        &style,
+                        iced::mouse::Cursor::Unavailable,
+                    );
+                    let drawn = clock.elapsed();
+                    cache = ui.into_cache();
+                    if frame >= WARMUP {
+                        for (stage, took) in stages.iter_mut().zip([built, drawn]) {
+                            *stage += took;
+                        }
+                    }
+                }
+                let [build, draw] = stages.map(|stage| millis(stage) / FRAMES as f64);
+
+                let view = state.view();
+                let mut ui = UserInterface::build(view, SCREEN, cache, &mut renderer);
+                let cursor = iced::mouse::Cursor::Available(pointer);
+                ui.draw(&mut renderer, &theme, &style, cursor);
+                let wheel = iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                    delta: iced::mouse::ScrollDelta::Pixels { x: 0.0, y: -STEP },
+                });
+                let (mut total, mut worst) = (Duration::ZERO, Duration::ZERO);
+                for frame in 0..WARMUP + FRAMES {
+                    let redraw = iced::Event::Window(iced::window::Event::RedrawRequested(
+                        iced::time::Instant::now(),
+                    ));
+                    let clock = Instant::now();
+                    let mut messages = Vec::new();
+                    let _ = ui.update(
+                        &[wheel.clone(), redraw],
+                        cursor,
+                        &mut renderer,
+                        &mut iced::advanced::clipboard::Null,
+                        &mut messages,
+                    );
+                    ui.draw(&mut renderer, &theme, &style, cursor);
+                    let took = clock.elapsed();
+                    if frame >= WARMUP {
+                        total += took;
+                        worst = worst.max(took);
+                    }
+                }
+                let mut scrolled = Scrolled(0.0);
+                ui.operate(&renderer, &mut scrolled);
+                assert!(
+                    scrolled.0 >= STEP * (WARMUP + FRAMES) as f32 * 0.9,
+                    "the {name} scrolled only {} px",
+                    scrolled.0
+                );
+                // The first wheel of a gesture, which on a board that scrolls
+                // sideways decides where the gesture goes: a pointer motion
+                // this long after the last wheel ends the gesture before.
+                const GESTURES: usize = 8;
+                let mut started = Duration::ZERO;
+                for _ in 0..GESTURES {
+                    std::thread::sleep(Duration::from_millis(120));
+                    let moved =
+                        iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: pointer });
+                    let _ = ui.update(
+                        &[moved],
+                        cursor,
+                        &mut renderer,
+                        &mut iced::advanced::clipboard::Null,
+                        &mut Vec::new(),
+                    );
+                    let clock = Instant::now();
+                    let _ = ui.update(
+                        &[wheel.clone()],
+                        cursor,
+                        &mut renderer,
+                        &mut iced::advanced::clipboard::Null,
+                        &mut Vec::new(),
+                    );
+                    started += clock.elapsed();
+                }
+                eprintln!(
+                    "work {name}, {cards} cards: rebuilt frame {build:.3} ms view, build and \
+                     layout + {draw:.3} ms draw; scrolled frame {:.3} ms mean, {:.3} ms worst; \
+                     a gesture's first wheel {:.3} ms",
+                    millis(total) / FRAMES as f64,
+                    millis(worst),
+                    millis(started) / GESTURES as f64,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_lane_under_the_pointer_when_the_board_scrolls_sideways() {
+        use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+        struct Offsets(Vec<iced::Vector>);
+        impl iced::advanced::widget::Operation for Offsets {
+            fn traverse(
+                &mut self,
+                operate: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation<()>),
+            ) {
+                operate(self);
+            }
+            fn scrollable(
+                &mut self,
+                _id: Option<&iced::advanced::widget::Id>,
+                _bounds: iced::Rectangle,
+                _content_bounds: iced::Rectangle,
+                translation: iced::Vector,
+                _state: &mut dyn iced::advanced::widget::operation::Scrollable,
+            ) {
+                self.0.push(translation);
+            }
+        }
+        let items = (0..30)
+            .map(|index| item(&format!("feature/change-{index}"), "cagents"))
+            .collect();
+        let mut state = State::default();
+        connected(&mut state, 1, board(items));
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        // Too narrow for every lane, so the board scrolls sideways.
+        let mut ui = UserInterface::build(
+            state.view(),
+            iced::Size::new(1000.0, 700.0),
+            Cache::new(),
+            &mut renderer,
+        );
+        // The runtime redraws before any input arrives; a scrollable's first
+        // redraw records its viewport.
+        let _ = ui.update(
+            &[iced::Event::Window(iced::window::Event::RedrawRequested(
+                iced::time::Instant::now(),
+            ))],
+            iced::mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut Vec::new(),
+        );
+        // Within the second lane, In progress, where the cards are.
+        let position = iced::Point::new(440.0, 400.0);
+        let _ = ui.update(
+            &[
+                iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }),
+                iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                    delta: iced::mouse::ScrollDelta::Lines { x: 0.0, y: -2.0 },
+                }),
+            ],
+            iced::mouse::Cursor::Available(position),
+            &mut renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut Vec::new(),
+        );
+        let mut offsets = Offsets(Vec::new());
+        ui.operate(&renderer, &mut offsets);
+        // The board's own scrollable stays put, and the lane scrolls.
+        assert_eq!(
+            offsets.0,
+            [iced::Vector::new(0.0, 0.0), iced::Vector::new(0.0, 120.0)]
+        );
     }
 
     #[test]

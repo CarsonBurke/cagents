@@ -264,36 +264,129 @@ pub(crate) fn syntax_spans<'a>(
 
 use two_face::re_exports::syntect::{highlighting, parsing};
 
-/// Parsers and a preparation job share grammar/regex storage. The rendezvous
-/// keeps no strong owner after the last job or streaming parser has finished.
-#[derive(Default)]
+/// Parsers and preparation jobs share grammar and regex storage.
+///
+/// A grammar compiles its regexes as it first meets each construct, which
+/// costs a message with a Rust fence about 10 ms more than the next one, and
+/// the compiled set holds about 20 MiB. Releasing it the moment its last
+/// parser finished meant each message of a transcript prepared one after
+/// another compiled it all again. It now stays until it has gone unused for
+/// [`LINGER`], so a burst of preparation shares one and an idle application
+/// keeps none.
 struct SyntaxCache {
-    current: std::sync::Mutex<std::sync::Weak<parsing::SyntaxSet>>,
+    current: std::sync::Mutex<Retained>,
+    linger: std::time::Duration,
     #[cfg(test)]
     loads: std::sync::atomic::AtomicUsize,
 }
+
+/// How long a grammar outlives its last use.
+const LINGER: std::time::Duration = std::time::Duration::from_secs(20);
+
+#[derive(Default)]
+struct Retained {
+    /// The grammar every live lease shares, which a new lease joins rather
+    /// than loading another copy while any parser still holds it.
+    shared: std::sync::Weak<parsing::SyntaxSet>,
+    /// The cache's own hold, which keeps the grammar loaded between parsers.
+    kept: Option<Arc<parsing::SyntaxSet>>,
+    /// When `kept` is let go, unless a parser takes or returns a lease first.
+    until: Option<std::time::Instant>,
+    /// Whether a thread is already waiting to let `kept` go, so each use
+    /// moves `until` instead of starting another waiter.
+    releasing: bool,
+}
+
 impl SyntaxCache {
-    fn acquire(&self) -> SyntaxLease {
-        let mut current = self
-            .current
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if let Some(syntaxes) = current.upgrade() {
-            return SyntaxLease(syntaxes);
+    fn new(linger: std::time::Duration) -> Self {
+        Self {
+            current: std::sync::Mutex::default(),
+            linger,
+            #[cfg(test)]
+            loads: std::sync::atomic::AtomicUsize::new(0),
         }
-        let syntaxes = Arc::new(two_face::syntax::extra_no_newlines());
-        #[cfg(test)]
-        self.loads
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        *current = Arc::downgrade(&syntaxes);
-        SyntaxLease(syntaxes)
+    }
+
+    fn acquire(self: &Arc<Self>) -> SyntaxLease {
+        let mut current = self.retained();
+        let syntaxes = current.shared.upgrade().unwrap_or_else(|| {
+            let syntaxes = Arc::new(two_face::syntax::extra_no_newlines());
+            #[cfg(test)]
+            self.loads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            current.shared = Arc::downgrade(&syntaxes);
+            syntaxes
+        });
+        self.keep(&mut current, &syntaxes);
+        SyntaxLease(syntaxes, self.clone())
+    }
+
+    /// Hold `syntaxes` for the linger period from now, which a lease taken
+    /// or returned extends.
+    fn keep(self: &Arc<Self>, current: &mut Retained, syntaxes: &Arc<parsing::SyntaxSet>) {
+        if self.linger.is_zero() {
+            return;
+        }
+        current.kept = Some(syntaxes.clone());
+        current.until = Some(std::time::Instant::now() + self.linger);
+        if !current.releasing {
+            current.releasing = true;
+            let cache = self.clone();
+            let started = std::thread::Builder::new()
+                .name("syntax-linger".into())
+                .spawn(move || cache.release_when_idle());
+            if started.is_err() {
+                // Without a thread to let it go, the cache does not keep it.
+                current.releasing = false;
+                current.kept = None;
+            }
+        }
+    }
+
+    /// Wait until the grammar has gone unused for the linger period, then
+    /// drop the cache's hold. Parsers still running keep their own.
+    fn release_when_idle(&self) {
+        let mut current = self.retained();
+        loop {
+            let now = std::time::Instant::now();
+            match current.until {
+                Some(until) if until > now => {
+                    drop(current);
+                    std::thread::sleep(until - now);
+                    current = self.retained();
+                }
+                _ => break,
+            }
+        }
+        let kept = current.kept.take();
+        current.until = None;
+        current.releasing = false;
+        drop(current);
+        drop(kept);
+    }
+
+    fn retained(&self) -> std::sync::MutexGuard<'_, Retained> {
+        self.current
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
     }
 }
 
-pub(crate) struct SyntaxLease(Arc<parsing::SyntaxSet>);
+/// A parser's share of the grammar. Returning it counts as use, so the
+/// grammar lingers from when the last parser finished, however long it ran.
+pub(crate) struct SyntaxLease(Arc<parsing::SyntaxSet>, Arc<SyntaxCache>);
+
+impl Drop for SyntaxLease {
+    fn drop(&mut self) {
+        // Every return re-keeps the grammar on purpose: the linger counts
+        // from the last parser to finish, not from when it started.
+        let mut current = self.1.retained();
+        self.1.keep(&mut current, &self.0);
+    }
+}
 
 pub(crate) fn syntax_lease() -> SyntaxLease {
-    static CACHE: LazyLock<SyntaxCache> = LazyLock::new(SyntaxCache::default);
+    static CACHE: LazyLock<Arc<SyntaxCache>> = LazyLock::new(|| Arc::new(SyntaxCache::new(LINGER)));
     CACHE.acquire()
 }
 
@@ -1557,7 +1650,7 @@ mod tests {
 
     #[test]
     fn syntax_job_shares_892_real_parsers_and_releases_grammar_after_last_owner() {
-        let cache = SyntaxCache::default();
+        let cache = Arc::new(SyntaxCache::new(std::time::Duration::ZERO));
         let job = cache.acquire();
         let grammar = Arc::downgrade(&job.0);
         let source = "let answer = values.iter().map(|value| value + 1);\n";
@@ -1599,7 +1692,7 @@ mod tests {
 
     #[test]
     fn concurrent_syntax_leases_share_one_actual_grammar_until_all_parsers_finish() {
-        let cache = Arc::new(SyntaxCache::default());
+        let cache = Arc::new(SyntaxCache::new(std::time::Duration::ZERO));
         let (sender, receiver) = std::sync::mpsc::channel();
         let threads: Vec<_> = (0..4)
             .map(|_| {
@@ -1643,8 +1736,91 @@ mod tests {
     }
 
     #[test]
+    fn messages_prepared_one_after_another_share_one_grammar_until_it_idles() {
+        let linger = std::time::Duration::from_millis(500);
+        let cache = Arc::new(SyntaxCache::new(linger));
+        let loads = || cache.loads.load(std::sync::atomic::Ordering::Relaxed);
+        let parse = |line: &str| {
+            let mut parser = HighlightParser::with_syntaxes("rust", AUTO, cache.acquire());
+            parser.line(line, &CancellationToken::new()).unwrap();
+            parser
+        };
+        let grammar = Arc::downgrade(&parse("fn first() {}\n").syntaxes.0);
+        // The first message's parser has finished; the next one, moments
+        // later, finds the same compiled grammar.
+        let parser = parse("fn second() {}\n");
+        assert!(Arc::ptr_eq(&parser.syntaxes.0, &grammar.upgrade().unwrap()));
+        // A parser that runs longer than the linger keeps it lingering from
+        // when it finishes, not from when it started.
+        std::thread::sleep(linger * 2);
+        drop(parser);
+        let parser = parse("fn third() {}\n");
+        assert!(Arc::ptr_eq(&parser.syntaxes.0, &grammar.upgrade().unwrap()));
+        drop(parser);
+        assert_eq!(loads(), 1);
+        // Unused for longer than it lingers, it goes.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while grammar.upgrade().is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "an idle grammar is released"
+            );
+            std::thread::sleep(linger / 4);
+        }
+        assert!(!cache.retained().releasing);
+        let _next = cache.acquire();
+        assert_eq!(loads(), 2);
+    }
+
+    /// What keeping the grammar costs the process, and whether letting it go
+    /// gives that back: resident memory before a load, while kept after
+    /// highlighting a few languages, and once the linger has passed.
+    #[test]
+    #[ignore = "measurement; run with --ignored --nocapture"]
+    fn what_a_kept_grammar_costs_the_process() {
+        fn resident_mib() -> f64 {
+            let statm = std::fs::read_to_string("/proc/self/statm").unwrap();
+            let pages: f64 = statm.split_whitespace().nth(1).unwrap().parse().unwrap();
+            pages * 4096.0 / (1024.0 * 1024.0)
+        }
+        let linger = std::time::Duration::from_millis(300);
+        let cache = Arc::new(SyntaxCache::new(linger));
+        let before = resident_mib();
+        let grammar = {
+            let lease = cache.acquire();
+            let grammar = Arc::downgrade(&lease.0);
+            drop(lease);
+            for (language, line) in [
+                ("rust", "fn main() { let x = vec![1, 2, 3]; }\n"),
+                ("python", "def main():\n"),
+                ("ts", "const x: number = 1;\n"),
+                ("sh", "for f in *; do echo \"$f\"; done\n"),
+            ] {
+                let mut parser = HighlightParser::with_syntaxes(language, AUTO, cache.acquire());
+                parser.line(line, &CancellationToken::new()).unwrap();
+            }
+            grammar
+        };
+        let kept = resident_mib();
+        while grammar.upgrade().is_some() || cache.retained().releasing {
+            std::thread::sleep(linger / 4);
+        }
+        let released = resident_mib();
+        let clock = std::time::Instant::now();
+        // SAFETY: malloc_trim only returns free heap pages to the system.
+        unsafe { libc::malloc_trim(0) };
+        let trim = clock.elapsed();
+        let trimmed = resident_mib();
+        println!(
+            "resident {before:.1} MiB before, {kept:.1} MiB kept, {released:.1} MiB released, \
+             {trimmed:.1} MiB after a {:.1} ms malloc_trim",
+            trim.as_secs_f64() * 1e3
+        );
+    }
+
+    #[test]
     fn cancelled_and_unwound_syntax_jobs_release_their_actual_grammar() {
-        let cache = SyntaxCache::default();
+        let cache = Arc::new(SyntaxCache::new(std::time::Duration::ZERO));
         let job = cache.acquire();
         let grammar = Arc::downgrade(&job.0);
         let mut parser = HighlightParser::with_syntaxes("rust", AUTO, cache.acquire());

@@ -1,0 +1,532 @@
+#!/usr/bin/env python3
+"""Real shell/TAR checks of artifact selection, with a private Debian boundary fixture."""
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import shlex
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import unittest
+
+
+ROOT = Path(__file__).resolve().parents[1]
+NATIVE = "x86_64-unknown-linux-gnu"
+PRODUCTS = ("cagents", "cagentsd", "cagents-ui")
+VERSION = "9.9.9"
+
+
+class PackageLinuxArtifacts(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="package-linux-artifacts-")
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name)
+        self.checkout = self.directory / "checkout"
+        for leaf in ("scripts", "packaging"):
+            (self.checkout / leaf).mkdir(parents=True)
+        for name in ("package-linux.sh", "build-ceditor-product"):
+            shutil.copy2(ROOT / "scripts" / name, self.checkout / "scripts" / name)
+        for name in ("dev.cagents.Cagents.desktop", "dev.cagents.Cagents.Daemon.desktop",
+                     "dev.cagents.Cagents.svg", "dev.cagents.Cagents.png",
+                     "dev.cagents.Cagents.metainfo.xml", "cagents-package-lifecycle",
+                     "cagents-uninstall"):
+            shutil.copy2(ROOT / "packaging" / name, self.checkout / "packaging" / name)
+        for name in ("LICENSE", "install.sh"):
+            shutil.copy2(ROOT / name, self.checkout / name)
+        (self.checkout / "Cargo.toml").write_text('[package]\nversion = "9.9.9"\n')
+        (self.directory / ".cargo").mkdir()
+        self.configuration = self.directory / ".cargo/config.toml"
+        self.configuration.write_text(f'[build]\ntarget="{NATIVE}"\n')
+        self.target = self.directory / 'target with spaces "quote" \\backslash'
+        self.reported = self.directory / 'reported products "quote" \\path'
+        self.dist = self.directory / "dist"
+        self.tools = self.directory / "tools"
+        self.tools.mkdir()
+        self.calls = self.directory / "calls.jsonl"
+        self.protocol = self.directory / "protocol-calls"
+        self.prebuilt_bytes = {}
+        self.decoys = {}
+        for layout in ("release", f"{NATIVE}/release"):
+            for name in PRODUCTS:
+                path = self.target / layout / name
+                self.executable(path, f"#!/bin/sh\n# stale {layout} {name}\nexit 88\n")
+                self.decoys[path] = path.read_bytes()
+        self.tool("cargo", r'''
+import tomllib
+args = sys.argv[1:]
+if args[0] == 'tree':
+    print('fixture v1')
+    sys.exit(0)
+assert args[0] == 'build', args
+if 'MOCK_EXPECTED_BUILD_METADATA' in os.environ:
+    assert os.environ.get('CAGENTS_BUILD_METADATA') == os.environ['MOCK_EXPECTED_BUILD_METADATA']
+name = args[args.index('--bin') + 1]
+if os.environ.get('MOCK_BUILD_FAILURE') == name:
+    print('fixture compiler failure: ' + name, file=sys.stderr)
+    sys.exit(101)
+config = tomllib.loads((Path.cwd() / '.cargo/config.toml').read_text())
+triple = args[args.index('--target') + 1] if '--target' in args else config['build']['target']
+product = Path(os.environ['MOCK_PRODUCTS']) / name / triple / name
+product.parent.mkdir(parents=True, exist_ok=True)
+body = '#!/bin/sh\n# fresh:' + name + ':' + triple + '\n'
+if name == 'cagents':
+    body += '[ "$*" = "daemon protocol-version" ] || exit 92\n'
+    body += 'printf "fresh\\n" >> "$MOCK_PROTOCOL"\nprintf "127\\n"\n'
+else:
+    body += 'exit 93\n'
+product.write_text(body)
+product.chmod(0o755)
+message = {'reason': 'compiler-artifact', 'target': {'name': name, 'kind': ['bin']},
+           'executable': str(product)}
+if os.environ.get('MOCK_MISSING_ARTIFACT') != name:
+    print(json.dumps(message))
+if os.environ.get('MOCK_AMBIGUOUS_ARTIFACT') == name:
+    other = product.with_name('other-' + name)
+    other.write_bytes(product.read_bytes())
+    other.chmod(0o755)
+    print(json.dumps(dict(message, executable=str(other))))
+''')
+        self.tool("zig", "print(json.dumps({'zig_exe': str(Path(sys.argv[0]).resolve())}, indent=2))\n")
+        self.tool("strip", "pass\n")
+        self.tool("uname", "print('Linux' if sys.argv[1] == '-s' else 'x86_64')\n")
+        self.tool("getconf", "print('glibc 2.99')\n")
+        # Inspect the exact staged Debian tree/control bytes without requiring
+        # host dpkg. This fixture archive is not a Debian-format qualification.
+        self.tool("dpkg-deb", r'''
+import tarfile
+args = sys.argv[1:]
+if args[:2] == ['--root-owner-group', '--build']:
+    assert len(args) == 4, args
+    with tarfile.open(args[3], 'w') as archive:
+        archive.add(args[2], arcname='.')
+elif args[0] == '--fsys-tarfile':
+    assert len(args) == 2, args
+    sys.stdout.buffer.write(Path(args[1]).read_bytes())
+elif args[0] == '--field':
+    assert len(args) == 3, args
+    with tarfile.open(args[1], 'r:') as archive:
+        control = archive.extractfile('./DEBIAN/control').read().decode()
+    print(next(line.split(': ', 1)[1] for line in control.splitlines()
+               if line.startswith(args[2] + ': ')))
+else:
+    raise AssertionError(args)
+''')
+        self.tool("readelf", r'''
+if sys.argv[1:3] == ['--wide', '--dyn-syms']:
+    assert len(sys.argv) == 4 and Path(sys.argv[3]).name == 'cagents-ui', sys.argv
+    default = "\nSymbol table '.dynsym' contains 3 entries:\n" + \
+        "   Num: Value Size Type Bind Vis Ndx Name\n" + \
+        "     0: 0000000000000000 0 NOTYPE LOCAL DEFAULT UND\n" + \
+        "     1: 0000000000000000 0 FUNC GLOBAL DEFAULT UND FT_Init_FreeType@FREETYPE_2.0 (2)\n" + \
+        "     2: 0000000000000020 8 FUNC GLOBAL DEFAULT 15 unrelated_runtime_api\n"
+    print(os.environ.get('MOCK_UI_DYNSYM', default), end='')
+    print(os.environ.get('MOCK_UI_DYNSYM_WARNING', ''), end='', file=sys.stderr)
+    sys.exit(int(os.environ.get('MOCK_UI_DYNSYM_EXIT', '0')))
+assert sys.argv[1:3] == ['--wide', '--version-info'], sys.argv
+name = Path(sys.argv[3]).name
+version = {'cagents': '2.2.5', 'cagentsd': '2.36', 'cagents-ui': '2.39'}[name]
+print("Version definition section '.gnu.version_d' contains 1 entry:")
+print('  0x0000: Rev: 1 Flags: none Index: 2 Cnt: 1 Name: GLIBC_999.0')
+print("Version needs section '.gnu.version_r' contains 1 entry:")
+print('  0x0000: Version: 1 File: libc.so.6 Cnt: 1')
+print('  0x0010: Name: GLIBC_' + version + ' Flags: none Version: 2')
+''')
+        self.environment = os.environ.copy()
+        for key in ("CARGO_BUILD_TARGET", "CAGENTS_SKIP_BUILD", "CAGENTS_SKIP_STRIP"):
+            self.environment.pop(key, None)
+        self.environment.update(
+            PATH=str(self.tools) + os.pathsep + os.defpath,
+            HOME=str(self.directory / "home"), CARGO_TARGET_DIR=str(self.target),
+            CAGENTS_DIST_DIR=str(self.dist), CAGENTS_RELEASE_TARGET=NATIVE,
+            VERSION=VERSION, SOURCE_DATE_EPOCH="0",
+            MOCK_CALLS=str(self.calls), MOCK_PRODUCTS=str(self.reported),
+            MOCK_PROTOCOL=str(self.protocol),
+        )
+
+    @staticmethod
+    def executable(path, text):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        path.chmod(0o755)
+
+    def tool(self, name, body):
+        self.executable(self.tools / name, f"#!{sys.executable}\n" + """
+import json,os,sys
+from pathlib import Path
+with Path(os.environ['MOCK_CALLS']).open('a') as output:
+    output.write(json.dumps([Path(sys.argv[0]).name, sys.argv[1:]]) + '\\n')
+""" + body)
+
+    def reset_outputs(self):
+        self.calls.unlink(missing_ok=True)
+        self.protocol.unlink(missing_ok=True)
+        shutil.rmtree(self.dist, ignore_errors=True)
+
+    def package(self, variant, *arguments, **overrides):
+        return subprocess.run(
+            ["/bin/sh", str(self.checkout / "scripts/package-linux.sh"), "--variant", variant,
+             *arguments],
+            cwd=self.directory, env=self.environment | overrides,
+            capture_output=True, text=True, timeout=30,
+        )
+
+    def events(self, tool):
+        return [args for name, args in map(json.loads, self.calls.read_text().splitlines())
+                if name == tool]
+
+    def builds(self):
+        return [args for args in self.events("cargo") if args[0] == "build"]
+
+    def prebuilt_product(self, name, *, version=VERSION, output=None, status=0, profile="release"):
+        if output is None:
+            output = f"{name} {version}\n"
+        path = self.target / profile / name
+        version_call = shlex.quote(json.dumps(["version", [name]]))
+        source = ("#!/bin/sh\ncase \"$*\" in\n"
+                  "  --version)\n"
+                  f"    printf '%s\\n' {version_call} >> \"$MOCK_CALLS\"\n"
+                  f"    printf '%s' {shlex.quote(output)}\n    exit {status} ;;\n")
+        if name == "cagents":
+            source += ("  'daemon protocol-version')\n"
+                       "    printf 'fresh\\n' >> \"$MOCK_PROTOCOL\"\n"
+                       "    printf '127\\n' ;;\n")
+        self.executable(path, source + "  *) exit 93 ;;\nesac\n")
+        self.prebuilt_bytes[path] = path.read_bytes()
+
+    def version_probes(self):
+        return [args[0] for args in self.events("version")]
+
+    def forbid_packaging_after_version_failure(self):
+        for name in ("mktemp", "install"):
+            self.tool(name, "raise SystemExit('version rejection must precede packaging')\n")
+
+    def assert_prebuilt_failure(self, result, product, message, *, sentinel=None):
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(message, result.stderr)
+        self.assertIn(product, result.stderr)
+        self.assertEqual(self.builds(), [])
+        self.assertFalse(self.protocol.exists())
+        for tool in ("mktemp", "install", "strip", "readelf", "dpkg-deb"):
+            self.assertEqual(self.events(tool), [], tool)
+        for path, original in self.prebuilt_bytes.items():
+            self.assertEqual(path.read_bytes(), original)
+        if sentinel is None:
+            self.assertFalse(self.dist.exists())
+        else:
+            self.assertEqual(list(self.dist.iterdir()), [sentinel])
+            self.assertEqual(sentinel.read_bytes(), b"existing output\n")
+
+    def assert_build_prefix(self, count):
+        self.assertEqual([args[args.index("--bin") + 1] for args in self.builds()],
+                         list(PRODUCTS[:count]))
+
+    def assert_packages(self, variant, fresh=True, *, version=VERSION, profile="release"):
+        name = "cagents" if variant == "full" else "cagents-browserless"
+        archive = self.dist / f"{name}-{version}-{NATIVE}.tar.gz"
+        deb = self.dist / f"{name}_{version}_amd64.deb"
+        deb_payload = subprocess.check_output(["dpkg-deb", "--fsys-tarfile", str(deb)],
+                                              env=self.environment, timeout=10)
+        with tarfile.open(archive, "r:gz") as portable, \
+                tarfile.open(fileobj=io.BytesIO(deb_payload), mode="r:") as debian:
+            for product in PRODUCTS:
+                expected = ((self.reported / product / NATIVE / product).read_bytes() if fresh
+                            else (self.target / profile / product).read_bytes())
+                for payload, prefix in ((portable, f"{name}-{version}/bin/"),
+                                        (debian, f"./usr/libexec/{name}/")):
+                    with self.subTest(product=product, prefix=prefix):
+                        member = payload.getmember(prefix + product)
+                        self.assertEqual(member.mode, 0o755)
+                        self.assertEqual(payload.extractfile(member).read(), expected)
+            daemon = ((self.reported / "cagentsd" / NATIVE / "cagentsd").read_bytes() if fresh
+                      else (self.target / profile / "cagentsd").read_bytes())
+            marker = debian.extractfile(f"./usr/libexec/{name}/.cagents-daemon-protocol").read()
+            self.assertEqual(marker, f"127 {hashlib.sha256(daemon).hexdigest()}\n".encode())
+        depends = subprocess.check_output(["dpkg-deb", "--field", str(deb), "Depends"],
+                                          env=self.environment, text=True, timeout=10)
+        self.assertIn("libc6 (>= 2.39)", depends)
+        self.assertEqual("libegl1" in depends, variant == "full")
+        self.assertEqual("xdg-utils" in depends, variant == "browserless")
+        checksum = "SHA256SUMS" if variant == "full" else "SHA256SUMS-browserless"
+        entries = (self.dist / checksum).read_text().splitlines()
+        expected = {archive.name, deb.name, f"{name}-{version}-sizes.txt"}
+        if variant == "full":
+            expected.add("install.sh")
+        self.assertEqual({line.split("  ", 1)[1] for line in entries}, expected)
+        self.assertEqual(len(entries), len(expected))
+        self.assertEqual({path.name for path in self.dist.iterdir()}, expected | {checksum})
+        for line in entries:
+            digest, filename = line.split("  ", 1)
+            self.assertEqual(hashlib.sha256((self.dist / filename).read_bytes()).hexdigest(), digest)
+        self.assertEqual(self.protocol.read_text().splitlines(), ["fresh"])
+        inspections = self.events("readelf")
+        if variant == "full":
+            self.assertEqual(inspections[0][:2], ["--wide", "--dyn-syms"])
+            self.assertEqual(Path(inspections[0][2]).name, "cagents-ui")
+            inspections = inspections[1:]
+        self.assertTrue(all(args[:2] == ["--wide", "--version-info"] for args in inspections))
+        self.assertEqual([Path(args[2]).name for args in inspections],
+                         ["cagents", "cagents-ui", "cagentsd"])
+
+    def test_native_build_uses_exact_artifacts_for_both_variants_and_configured_targets(self):
+        for variant in ("full", "browserless"):
+            for configured in (NATIVE, "aarch64-unknown-linux-gnu"):
+                with self.subTest(variant=variant, configured=configured):
+                    self.reset_outputs()
+                    self.configuration.write_text(f'[build]\ntarget="{configured}"\n')
+                    result = self.package(variant)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assert_packages(variant)
+                    self.assertEqual(self.version_probes(), [])
+                    common = ["build", "--manifest-path", str(self.checkout / "Cargo.toml"),
+                              "--locked", "--profile", "release", "--target-dir", str(self.target),
+                              "--target", NATIVE]
+                    defaults = ["--no-default-features"] if variant == "browserless" else []
+                    ui = "ui" if variant == "browserless" else "integrated-browser"
+                    message = ["--message-format=json-render-diagnostics"]
+                    self.assertEqual(self.builds(), [
+                        common + defaults + ["--bin", "cagents"] + message,
+                        common + defaults + ["--features", "host", "--bin", "cagentsd"] + message,
+                        common + defaults + ["--features", ui, "--bin", "cagents-ui"] + message,
+                    ])
+                    for path, original in self.decoys.items():
+                        self.assertEqual(path.read_bytes(), original)
+
+    def test_local_profile_archive_only_builds_and_checksums_just_the_archive(self):
+        result = self.package("full", "--archive-only", CAGENTS_CARGO_PROFILE="local")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for args in self.builds():
+            self.assertEqual(args[args.index("--profile") + 1], "local")
+        self.assert_build_prefix(len(PRODUCTS))
+        self.assertEqual([args for args in self.events("cargo") if args[0] == "tree"], [])
+        archive = f"cagents-{VERSION}-{NATIVE}.tar.gz"
+        self.assertEqual({path.name for path in self.dist.iterdir()}, {archive, "SHA256SUMS"})
+        digest = hashlib.sha256((self.dist / archive).read_bytes()).hexdigest()
+        self.assertEqual((self.dist / "SHA256SUMS").read_text(), f"{digest}  {archive}\n")
+        with tarfile.open(self.dist / archive, "r:gz") as portable:
+            for product in PRODUCTS:
+                member = portable.getmember(f"cagents-{VERSION}/bin/{product}")
+                self.assertEqual(portable.extractfile(member).read(),
+                                 (self.reported / product / NATIVE / product).read_bytes())
+
+    def test_unsafe_profile_is_refused_before_building(self):
+        result = self.package("full", CAGENTS_CARGO_PROFILE="../release")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unsafe Cargo profile", result.stderr)
+        self.assertFalse(self.calls.exists() and self.builds())
+
+    def test_each_build_failure_preserves_101_before_protocol_or_package_output(self):
+        for variant in ("full", "browserless"):
+            for count, product in enumerate(PRODUCTS, 1):
+                with self.subTest(variant=variant, product=product):
+                    self.reset_outputs()
+                    result = self.package(variant, MOCK_BUILD_FAILURE=product)
+                    self.assertEqual(result.returncode, 101, result.stdout + result.stderr)
+                    self.assertIn("fixture compiler failure: " + product, result.stderr)
+                    self.assert_build_prefix(count)
+                    self.assertFalse(self.protocol.exists())
+                    self.assertEqual(self.events("readelf"), [])
+                    self.assertFalse(self.dist.exists())
+
+    def test_missing_or_ambiguous_artifact_refuses_before_protocol_or_package_output(self):
+        for variant in ("full", "browserless"):
+            for variable in ("MOCK_MISSING_ARTIFACT", "MOCK_AMBIGUOUS_ARTIFACT"):
+                for count, product in enumerate(PRODUCTS, 1):
+                    with self.subTest(variant=variant, variable=variable, product=product):
+                        self.reset_outputs()
+                        result = self.package(variant, **{variable: product})
+                        self.assertNotEqual(result.returncode, 0)
+                        found = 0 if variable == "MOCK_MISSING_ARTIFACT" else 2
+                        self.assertIn(f"exactly one executable for {product} (found {found})",
+                                      result.stderr)
+                        self.assert_build_prefix(count)
+                        self.assertFalse(self.protocol.exists())
+                        self.assertEqual(self.events("readelf"), [])
+                        self.assertFalse(self.dist.exists())
+
+    @staticmethod
+    def dynamic_symbols(name="unrelated_runtime_api", binding="GLOBAL", index="15"):
+        return (
+            "Symbol table '.dynsym' contains 3 entries:\n"
+            " Num: Value Size Type Bind Vis Ndx Name\n"
+            " 0: 0000000000000000 0 NOTYPE LOCAL DEFAULT UND\n"
+            " 1: 0000000000000000 0 FUNC GLOBAL DEFAULT UND FT_Init_FreeType\n"
+            f" 2: 0000000000000020 8 FUNC {binding} DEFAULT {index} {name}\n"
+        )
+
+    def test_full_package_refuses_bundled_definitions_in_build_and_prebuilt_modes(self):
+        # Future names, weak/versioned definitions and both families must be
+        # rejected without mistaking legitimate undefined FT imports for leaks.
+        for prebuilt in (False, True):
+            for name, binding in (("hb_new_future_api", "GLOBAL"),
+                                  ("FT_New_Face", "GLOBAL"),
+                                  ("hb_blob_destroy@@HB_1.0", "WEAK"),
+                                  ("hb_unique_object", "<OS specific>: 10")):
+                with self.subTest(prebuilt=prebuilt, name=name):
+                    self.reset_outputs()
+                    overrides = {"MOCK_UI_DYNSYM": self.dynamic_symbols(name, binding)}
+                    if prebuilt:
+                        # The original layout contains intentionally failing
+                        # stale binaries. Supply products that report the
+                        # requested version so this negative reaches the
+                        # export guard.
+                        for product in PRODUCTS:
+                            self.prebuilt_product(product)
+                        overrides.update(CAGENTS_SKIP_BUILD="1", CAGENTS_SKIP_STRIP="1")
+                    result = self.package("full", **overrides)
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn("forbidden bundled font export: " + name, result.stderr)
+                    self.assertFalse(self.dist.exists())
+                    self.assertEqual(len(self.events("readelf")), 1)
+                    self.assertEqual(self.events("readelf")[0][:2], ["--wide", "--dyn-syms"])
+
+    def test_font_inspector_errors_and_malformed_output_cannot_publish(self):
+        valid = self.dynamic_symbols()
+        faults = (
+            {"MOCK_UI_DYNSYM_EXIT": "7"},
+            {"MOCK_UI_DYNSYM_WARNING": "readelf: Warning: invalid dynamic table\n"},
+            {"MOCK_UI_DYNSYM": ""},
+            {"MOCK_UI_DYNSYM": "tool unexpectedly succeeded\n"},
+            {"MOCK_UI_DYNSYM": valid.rsplit("\n", 2)[0] + "\n"},
+            {"MOCK_UI_DYNSYM": valid.replace("3 entries:", "4 entries:")},
+            {"MOCK_UI_DYNSYM": valid.replace(" 2:", " 1:")},
+            {"MOCK_UI_DYNSYM": valid + valid},
+            {"MOCK_UI_DYNSYM": valid + "unknown trailing record\n"},
+        )
+        for fault in faults:
+            with self.subTest(fault=fault):
+                self.reset_outputs()
+                result = self.package("full", **fault)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("full UI dynamic symbol", result.stderr)
+                self.assertFalse(self.dist.exists())
+                self.assertEqual(len(self.events("readelf")), 1)
+
+    def test_font_imports_remain_valid_and_browserless_does_not_gain_full_link_policy(self):
+        self.reset_outputs()
+        result = self.package("full", MOCK_UI_DYNSYM=self.dynamic_symbols("hb_system_import", index="UND"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_packages("full")
+        # C++ GNU_UNIQUE objects are legitimate exports; readelf prints their
+        # binding as a reserved value rather than a single word.
+        self.reset_outputs()
+        result = self.package("full", MOCK_UI_DYNSYM=self.dynamic_symbols(
+            "_ZN2sh9BuiltInId17gl_MaxDrawBuffersE", binding="<OS specific>: 10"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_packages("full")
+        self.reset_outputs()
+        result = self.package("browserless", MOCK_UI_DYNSYM="not used", MOCK_UI_DYNSYM_EXIT="7")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_packages("browserless")
+
+    def test_prebuilt_layout_does_not_require_python(self):
+        for command in ("awk", "date", "gzip", "install", "mktemp", "sed",
+                        "sha256sum", "sort", "tar", "touch", "wc", "dirname", "rm",
+                        "chmod", "ln", "find", "cat"):
+            (self.tools / command).symlink_to(shutil.which(command))
+        self.assertIsNone(shutil.which("python3", path=str(self.tools)))
+        self.configuration.write_text('[build]\ntarget="aarch64-unknown-linux-gnu"\n')
+        for product in PRODUCTS:
+            self.prebuilt_product(product)
+        for variant in ("full", "browserless"):
+            with self.subTest(variant=variant):
+                self.reset_outputs()
+                result = self.package(variant, CAGENTS_SKIP_BUILD="1", PATH=str(self.tools))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.builds(), [])
+                self.assertEqual(self.version_probes(), ["cagents", "cagents-ui", "cagentsd"])
+                self.assert_packages(variant, fresh=False)
+
+    def test_matching_prebuilt_full_versions_package_exact_bytes(self):
+        for variant in ("full", "browserless"):
+            for version, newline in ((VERSION, "\n"), (VERSION + "+local.1234567", "")):
+                with self.subTest(variant=variant, version=version, newline=newline):
+                    self.reset_outputs()
+                    for product in PRODUCTS:
+                        self.prebuilt_product(product, output=f"{product} {version}" + newline)
+                    result = self.package(variant, CAGENTS_SKIP_BUILD="1", VERSION=version)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(self.builds(), [])
+                    self.assertEqual(self.version_probes(), ["cagents", "cagents-ui", "cagentsd"])
+                    self.assert_packages(variant, fresh=False, version=version)
+                    for path, original in self.prebuilt_bytes.items():
+                        self.assertEqual(path.read_bytes(), original)
+
+    def test_each_prebuilt_product_rejects_mismatched_or_malformed_versions_before_outputs(self):
+        self.forbid_packaging_after_version_failure()
+        version = VERSION + "+local.1234567"
+        for variant in ("full", "browserless"):
+            for product in PRODUCTS:
+                for output in (f"other-product {version}\n", f"{product} 9.9.8\n",
+                               f"{product} {VERSION}\n", f"{product} {VERSION}+local.other\n", "",
+                               f" {product} {version}\n", f"{product} {version} \n",
+                               f"{product} {version}\nextra output\n", f"{product} {version}\n\n"):
+                    with self.subTest(variant=variant, product=product, output=output):
+                        self.reset_outputs()
+                        for companion in PRODUCTS:
+                            self.prebuilt_product(companion, version=version)
+                        self.prebuilt_product(product, output=output)
+                        self.dist.mkdir()
+                        sentinel = self.dist / "existing-output"
+                        sentinel.write_bytes(b"existing output\n")
+                        result = self.package(variant, CAGENTS_SKIP_BUILD="1", VERSION=version)
+                        self.assert_prebuilt_failure(
+                            result, product, "does not report requested version", sentinel=sentinel)
+
+    def test_each_prebuilt_product_requires_success_even_with_matching_output(self):
+        self.forbid_packaging_after_version_failure()
+        for variant in ("full", "browserless"):
+            for product in PRODUCTS:
+                with self.subTest(variant=variant, product=product):
+                    self.reset_outputs()
+                    for companion in PRODUCTS:
+                        self.prebuilt_product(companion)
+                    self.prebuilt_product(product, status=17)
+                    result = self.package(variant, CAGENTS_SKIP_BUILD="1", CAGENTS_SKIP_STRIP="1")
+                    self.assert_prebuilt_failure(result, product, "could not verify prebuilt")
+
+    def test_local_profile_prebuilt_archive_only_validates_and_preserves_inputs(self):
+        version = VERSION + "+local.1234567"
+        for product in PRODUCTS:
+            self.prebuilt_product(product, version=version, profile="local")
+        for variant in ("full", "browserless"):
+            with self.subTest(variant=variant):
+                self.reset_outputs()
+                result = self.package(variant, "--archive-only", CAGENTS_SKIP_BUILD="1",
+                                      CAGENTS_CARGO_PROFILE="local", CAGENTS_SKIP_STRIP="1",
+                                      VERSION=version)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.builds(), [])
+                self.assertEqual(self.events("cargo"), [])
+                self.assertEqual(self.version_probes(), ["cagents", "cagents-ui", "cagentsd"])
+                name = "cagents" if variant == "full" else "cagents-browserless"
+                archive = f"{name}-{version}-{NATIVE}.tar.gz"
+                checksum = "SHA256SUMS" if variant == "full" else "SHA256SUMS-browserless"
+                self.assertEqual({path.name for path in self.dist.iterdir()}, {archive, checksum})
+                digest = hashlib.sha256((self.dist / archive).read_bytes()).hexdigest()
+                self.assertEqual((self.dist / checksum).read_text(), f"{digest}  {archive}\n")
+                with tarfile.open(self.dist / archive, "r:gz") as portable:
+                    for product in PRODUCTS:
+                        self.assertEqual(portable.extractfile(f"{name}-{version}/bin/{product}").read(),
+                                         self.prebuilt_bytes[self.target / "local" / product])
+        self.reset_outputs()
+        self.prebuilt_product("cagentsd", version=VERSION, profile="local")
+        self.forbid_packaging_after_version_failure()
+        result = self.package("full", "--archive-only", CAGENTS_SKIP_BUILD="1",
+                              CAGENTS_CARGO_PROFILE="local", CAGENTS_SKIP_STRIP="1", VERSION=version)
+        self.assert_prebuilt_failure(result, "cagentsd", "does not report requested version")
+
+    def test_normal_build_metadata_still_reaches_cargo_without_prebuilt_probes(self):
+        metadata = "local.1234567"
+        version = VERSION + "+" + metadata
+        result = self.package("full", VERSION=version, MOCK_EXPECTED_BUILD_METADATA=metadata)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.version_probes(), [])
+        self.assert_packages("full", version=version)
+
+
+if __name__ == "__main__":
+    unittest.main()

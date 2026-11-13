@@ -7,7 +7,8 @@ use crate::{
 };
 
 fn fixture() -> (Registry, tempfile::TempDir, Home, PathBuf) {
-    let directory = tempfile::tempdir().unwrap();
+    let parent = std::env::temp_dir().canonicalize().unwrap();
+    let directory = tempfile::tempdir_in(parent).unwrap();
     let mut registry = Registry::at(&directory.path().join("registry.sqlite3")).unwrap();
     let repository = directory.path().join("project");
     fs::create_dir(&repository).unwrap();

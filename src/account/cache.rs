@@ -64,6 +64,45 @@ struct Document {
     /// build that predates it reads the rest, and drops it when it writes.
     #[serde(default, deserialize_with = "readable_catalogs")]
     catalogs: BTreeMap<Provider, Catalog>,
+    /// Added after the first version, like `catalogs`: each account's
+    /// settled disagreement between two records of its login, by account
+    /// key. A build that predates it drops it when it writes, which only
+    /// shows a settled disagreement again until it is settled again. Each
+    /// is read on its own, so one this build cannot read costs only itself.
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "readable_settlements"
+    )]
+    settled: BTreeMap<String, Settled>,
+}
+
+/// How two records of one login's identity, which named different logins,
+/// were settled (see [`Identity::disputed_by`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum Settled {
+    /// A sign-in that cagents ran for the account finished at `at`, in Unix
+    /// milliseconds: the record the CLI reads is the one that sign-in wrote,
+    /// so the disagreement the probe that follows it sees is settled in its
+    /// favour (see [`super::claude::SIGN_IN_SETTLES_FOR`]).
+    SignedIn { at: u64 },
+    /// The CLI's record, naming `reported`, was written by a sign-in after
+    /// the other record, naming `other`: the disagreement between exactly
+    /// these two is settled, and any other is shown again.
+    Reported { reported: String, other: String },
+}
+
+fn readable_settlements<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, Settled>, D::Error> {
+    let serde_json::Value::Object(settled) = serde_json::Value::deserialize(deserializer)? else {
+        return Ok(BTreeMap::new());
+    };
+    Ok(settled
+        .into_iter()
+        .filter_map(|(key, settled)| Some((key, Settled::deserialize(settled).ok()?)))
+        .collect())
 }
 
 /// Each provider's list is read on its own, so one this build cannot read -
@@ -126,18 +165,26 @@ impl Cache {
             .unwrap_or_default()
     }
 
-    /// Remembers `entry`, observed just now, for `key` - unless the cache
-    /// already holds something newer for it that another window wrote
-    /// meanwhile. An entry stamped further ahead than [`CLOCK_SLACK`] is from
-    /// a clock that has since been set back, and is replaced.
+    /// Remembers `entry` for `key`, unless another writer already stored a
+    /// newer observation. Background writes may arrive long after observation;
+    /// only a stamp ahead of the current clock by more than [`CLOCK_SLACK`]
+    /// indicates a clock that has since been set back and is replaced.
     pub fn store(&self, key: &str, entry: Entry) -> io::Result<()> {
         crate::secure_file::prepare_private_directory(&self.directory)?;
         let _lock = self.lock(libc::LOCK_EX)?;
         let path = self.path();
         let mut document = read_document(&path).unwrap_or_default();
         document.version = VERSION;
+        // Read after acquiring the lock: even waiting to publish can outlast
+        // CLOCK_SLACK, without a clock rollback having occurred.
+        let now = crate::chat::now_ms()
+            .ok_or_else(|| io::Error::other("The system clock is before the Unix epoch"))?;
         if document.entries.get(key).is_some_and(|existing| {
-            supersedes(existing.snapshot.observed_at, entry.snapshot.observed_at)
+            supersedes(
+                existing.snapshot.observed_at,
+                entry.snapshot.observed_at,
+                now,
+            )
         }) {
             return Ok(());
         }
@@ -167,15 +214,60 @@ impl Cache {
         let path = self.path();
         let mut document = read_document(&path).unwrap_or_default();
         document.version = VERSION;
+        let now = crate::chat::now_ms()
+            .ok_or_else(|| io::Error::other("The system clock is before the Unix epoch"))?;
         if document
             .catalogs
             .get(&provider)
-            .is_some_and(|existing| supersedes(existing.observed_at, catalog.observed_at))
+            .is_some_and(|existing| supersedes(existing.observed_at, catalog.observed_at, now))
         {
             return Ok(());
         }
         document.catalogs.insert(provider, catalog);
         self.write(&document)
+    }
+
+    /// How the disagreement between two records of the login of the account
+    /// filed under `key` was last settled, if it was.
+    pub fn settled(&self, key: &str) -> Option<Settled> {
+        read_document(&self.path())?.settled.remove(key)
+    }
+
+    /// Records how the disagreement over `key`'s login is settled, or with
+    /// `None`, that nothing is.
+    pub fn settle(&self, key: &str, settled: Option<Settled>) -> io::Result<()> {
+        self.settle_with(key, |_, _| ((), Some(settled)))
+    }
+
+    /// Decides how the disagreement over `key`'s login is settled from the
+    /// settlement on record and the identity last cached for `key`, with no
+    /// other window settling it in between. `decide` returns its answer and
+    /// `None` to leave the settlement, or the settlement to record instead.
+    pub fn settle_with<T>(
+        &self,
+        key: &str,
+        decide: impl FnOnce(Option<&Settled>, Option<&Identity>) -> (T, Option<Option<Settled>>),
+    ) -> io::Result<T> {
+        crate::secure_file::prepare_private_directory(&self.directory)?;
+        let _lock = self.lock(libc::LOCK_EX)?;
+        let mut document = read_document(&self.path()).unwrap_or_default();
+        let previous = document
+            .entries
+            .get(key)
+            .and_then(|entry| entry.identity.as_ref());
+        let (answer, settle) = decide(document.settled.get(key), previous);
+        let changed = match settle {
+            None => false,
+            Some(Some(settled)) => {
+                document.settled.insert(key.to_owned(), settled.clone()) != Some(settled)
+            }
+            Some(None) => document.settled.remove(key).is_some(),
+        };
+        if changed {
+            document.version = VERSION;
+            self.write(&document)?;
+        }
+        Ok(answer)
     }
 
     /// Forgets the entries no account in `keep` refers to that are older
@@ -190,6 +282,10 @@ impl Cache {
                 .entries
                 .iter()
                 .any(|(key, entry)| !keep.contains(key) && !current(entry, now))
+                || document
+                    .settled
+                    .keys()
+                    .any(|key| !keep.contains(key) && !document.entries.contains_key(key))
         };
         if !read_document(&path).is_some_and(|document| orphaned(&document)) {
             return Ok(());
@@ -201,6 +297,10 @@ impl Cache {
         document
             .entries
             .retain(|key, entry| keep.contains(key) || current(entry, now));
+        let entries = &document.entries;
+        document
+            .settled
+            .retain(|key, _| keep.contains(key) || entries.contains_key(key));
         self.write(&document)
     }
 
@@ -252,10 +352,10 @@ impl Cache {
 }
 
 /// Whether something already cached at `existing` is newer than an
-/// observation at `incoming`, and stays. A stamp further ahead than
-/// [`CLOCK_SLACK`] is from a clock since set back, and is replaced.
-fn supersedes(existing: u64, incoming: u64) -> bool {
-    existing > incoming && existing <= incoming.saturating_add(CLOCK_SLACK)
+/// observation at `incoming`, and stays. Only a stamp further ahead of `now`
+/// than [`CLOCK_SLACK`] is from a clock since set back, and is replaced.
+fn supersedes(existing: u64, incoming: u64, now: u64) -> bool {
+    existing > incoming && existing <= now.saturating_add(CLOCK_SLACK)
 }
 
 /// Whether `entry` is recent enough at `now` to keep with nothing referring
@@ -296,6 +396,7 @@ mod tests {
                 email: Some("user@example.com".into()),
                 organization: None,
                 plan: Some("max".into()),
+                disputed_by: None,
             }),
             snapshot,
         }
@@ -356,13 +457,39 @@ mod tests {
         assert_eq!(directory_mode & 0o777, 0o700);
     }
 
+    #[test]
+    fn delayed_probe_write_cannot_replace_newer_live_quota_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        let now = crate::chat::now_ms().unwrap();
+        let newer_at = now - 1_000;
+        let older_at = newer_at - CLOCK_SLACK - 1;
+        // Logical observation times model a held background write without
+        // sleeping or changing the process clock. Both stamps are in the past.
+        let mut held_probe = entry(older_at, "held successful probe");
+        held_probe.identity = None;
+        held_probe.snapshot.status = UsageStatus::Ok;
+        let mut newer_live = entry(newer_at, "newer live quota rejection");
+        newer_live.snapshot.status = UsageStatus::Limited;
+        newer_live.snapshot.source = UsageSource::Live;
+        newer_live.snapshot.ordinary_usage_allowed = Some(false);
+
+        cache.store("codex:/fixture", newer_live.clone()).unwrap();
+        cache.store("codex:/fixture", held_probe).unwrap();
+        assert_eq!(
+            cache.load(now).remove("codex:/fixture"),
+            Some(newer_live),
+            "a delayed probe must preserve the newer status, identity and timestamp"
+        );
+    }
+
     /// A clock set back after a probe must not freeze the figures until it
     /// catches up with the stamp.
     #[test]
     fn entries_stamped_in_the_future_are_neither_read_nor_kept() {
         let directory = tempfile::tempdir().unwrap();
         let cache = Cache::at(directory.path());
-        let now = 1_000_000;
+        let now = crate::chat::now_ms().unwrap();
         cache
             .store("k", entry(now + 10 * CLOCK_SLACK, "ahead"))
             .unwrap();
@@ -438,6 +565,78 @@ mod tests {
         assert!(!empty.path().join("nested").exists());
     }
 
+    #[test]
+    fn a_settled_disagreement_is_kept_beside_the_figures_until_its_account_is_gone() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        assert_eq!(cache.settled("system"), None);
+        cache
+            .settle("system", Some(Settled::SignedIn { at: 5 }))
+            .unwrap();
+        cache.store("system", entry(1, "figures")).unwrap();
+        assert_eq!(cache.settled("system"), Some(Settled::SignedIn { at: 5 }));
+        let settled = Settled::Reported {
+            reported: "me@example.com".into(),
+            other: "other@example.com".into(),
+        };
+        cache.settle("system", Some(settled.clone())).unwrap();
+        cache
+            .settle("gone", Some(Settled::SignedIn { at: 5 }))
+            .unwrap();
+        assert_eq!(cache.settled("system"), Some(settled.clone()));
+        assert_eq!(cache.load(10).len(), 1);
+        // An account no one refers to takes its settlement with it.
+        cache
+            .prune(&BTreeSet::from(["system".to_owned()]), 100 * ORPHAN_AFTER)
+            .unwrap();
+        assert_eq!(cache.settled("system"), Some(settled));
+        assert_eq!(cache.settled("gone"), None);
+        cache.settle("system", None).unwrap();
+        assert_eq!(cache.settled("system"), None);
+    }
+
+    /// A settlement a later build records in a way this one cannot read
+    /// costs only itself, never the figures beside it.
+    #[test]
+    fn an_unreadable_settlement_costs_only_itself() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        cache.store("system", entry(1, "figures")).unwrap();
+        cache
+            .settle("work", Some(Settled::SignedIn { at: 5 }))
+            .unwrap();
+        let path = cache.path();
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        document["settled"]["system"] = serde_json::json!({"state": "from_a_later_build"});
+        std::fs::write(&path, document.to_string()).unwrap();
+        assert_eq!(cache.load(10).len(), 1);
+        assert_eq!(cache.settled("system"), None);
+        assert_eq!(cache.settled("work"), Some(Settled::SignedIn { at: 5 }));
+    }
+
+    /// The settlement and the identity last cached are read, and the new
+    /// settlement written, under one lock.
+    #[test]
+    fn a_settlement_is_decided_from_what_is_on_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        cache.store("system", entry(1, "figures")).unwrap();
+        let seen = cache
+            .settle_with("system", |settled, identity| {
+                assert_eq!(settled, None);
+                let email = identity.and_then(|identity| identity.email.clone());
+                (email, Some(Some(Settled::SignedIn { at: 7 })))
+            })
+            .unwrap();
+        assert_eq!(seen.as_deref(), Some("user@example.com"));
+        let kept = cache
+            .settle_with("system", |settled, _| (settled.cloned(), None))
+            .unwrap();
+        assert_eq!(kept, Some(Settled::SignedIn { at: 7 }));
+        assert_eq!(cache.settled("system"), Some(Settled::SignedIn { at: 7 }));
+    }
+
     fn catalog(observed_at: u64, id: &str) -> Catalog {
         Catalog {
             models: vec![Model {
@@ -479,6 +678,63 @@ mod tests {
             .unwrap();
         assert!(cache.catalogs(u64::MAX).contains_key(&Provider::Omp));
         assert!(!cache.catalogs(CLOCK_SLACK).contains_key(&Provider::Omp));
+    }
+
+    #[test]
+    fn delayed_catalog_write_preserves_newer_models_and_other_cached_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        let now = crate::chat::now_ms().unwrap();
+        let newer_at = now - 1_000;
+        let older_at = newer_at - CLOCK_SLACK - 1;
+        let held_catalog = catalog(older_at, "old-model");
+        let newer_catalog = catalog(newer_at, "new-model");
+        let other_catalog = catalog(newer_at, "other-provider-model");
+        let figures = entry(newer_at, "other account figures");
+        cache.store("other-account", figures.clone()).unwrap();
+        cache
+            .store_catalog(Provider::Claude, newer_catalog.clone())
+            .unwrap();
+        cache
+            .store_catalog(Provider::Codex, other_catalog.clone())
+            .unwrap();
+        cache.store_catalog(Provider::Claude, held_catalog).unwrap();
+
+        let catalogs = cache.catalogs(now);
+        assert_eq!(catalogs[&Provider::Claude], newer_catalog);
+        assert_eq!(catalogs[&Provider::Codex], other_catalog);
+        assert_eq!(cache.load(now).remove("other-account"), Some(figures));
+    }
+
+    #[test]
+    fn catalogs_stamped_in_the_future_are_neither_read_nor_kept() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        let now = crate::chat::now_ms().unwrap();
+        cache
+            .store_catalog(Provider::Claude, catalog(now + 10 * CLOCK_SLACK, "ahead"))
+            .unwrap();
+        assert!(cache.catalogs(now).is_empty());
+        cache
+            .store_catalog(Provider::Claude, catalog(now, "current"))
+            .unwrap();
+        assert_eq!(
+            cache.catalogs(now)[&Provider::Claude],
+            catalog(now, "current")
+        );
+        cache
+            .store_catalog(
+                Provider::Claude,
+                catalog(now + CLOCK_SLACK / 2, "other-window"),
+            )
+            .unwrap();
+        cache
+            .store_catalog(Provider::Claude, catalog(now, "late"))
+            .unwrap();
+        assert_eq!(
+            cache.catalogs(now)[&Provider::Claude],
+            catalog(now + CLOCK_SLACK / 2, "other-window")
+        );
     }
 
     /// A list this build cannot read - a provider added since, or a model

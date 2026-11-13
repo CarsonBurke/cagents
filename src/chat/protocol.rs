@@ -12,6 +12,32 @@ mod image_references;
 pub mod omp;
 mod terminal_output;
 
+/// Startup recovery for the same card and exact conversation. Unavailable
+/// means another attempt may succeed after an external condition changes;
+/// it promises neither immediate success nor automatic replay of uncertain
+/// writes. Existing ownership and idempotency reconciliation still run first.
+/// Invalid is reserved for known immutable identity/recipe or structural
+/// failures. An opaque operational String is not evidence of permanence:
+/// preserve retry conservatively at legacy boundaries, and classify explicit
+/// decisions here rather than inferring authority from diagnostic wording.
+#[derive(Debug)]
+pub enum SetupError {
+    Invalid(String),
+    Unavailable(String),
+}
+impl std::fmt::Display for SetupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(message) | Self::Unavailable(message) => message.fmt(f),
+        }
+    }
+}
+impl From<&str> for SetupError {
+    fn from(message: &str) -> Self {
+        Self::Invalid(message.into())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum TransportSpec {
     /// Page an exact provider transcript without starting a provider process.
@@ -38,6 +64,10 @@ pub struct ProcessSpec {
     /// transcript records, so they are shown as messages rather than as the
     /// user's own words.
     pub(crate) messages: Option<std::sync::Arc<crate::agent_execution::mailbox::Recognizer>>,
+    /// Opt-in tolerance for non-JSON lines on JSON-lines stdout. `None` keeps
+    /// such output immediately fatal. The function reports whether a skipped
+    /// line hides a protocol frame, which must never be dropped silently.
+    pub(crate) stdout_noise: Option<fn(&[u8]) -> bool>,
     pub transport: TransportSpec,
     pub program: String,
     pub arguments: Vec<String>,
@@ -62,6 +92,7 @@ impl From<&crate::model::LaunchRecipe> for ProcessSpec {
         Self {
             execution: None,
             messages: None,
+            stdout_noise: None,
             transport: TransportSpec::JsonLines,
             program: recipe.program.clone(),
             arguments: recipe.arguments.clone(),
@@ -338,6 +369,17 @@ pub trait Adapter: Send {
         None
     }
     fn initialize(&mut self) -> Result<Step, String>;
+    /// Whether the initial handshake still needs its matching provider reply.
+    /// Advisory frames do not complete it; later readiness changes are separate.
+    fn initialization_pending(&self) -> bool {
+        false
+    }
+    /// Whether a settled turn's outcome still waits on a provider reply, such
+    /// as the acknowledgement of an interrupt sent before its result arrived.
+    /// Closing keeps reading the provider until that reply decides it.
+    fn outcome_pending(&self) -> bool {
+        false
+    }
     fn command(&mut self, command: Command) -> Result<Step, String>;
     /// Whether this exact pending answer refuses work. Providers with opaque
     /// action IDs must inspect their retained decision, never its UI label.
@@ -361,6 +403,25 @@ pub trait Adapter: Send {
 }
 pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
     launch.provider.create_chat(launch)
+}
+
+/// A bounded diagnostic prefix, with terminal controls escaped. Inspect only
+/// the prefix needed for the preview, even when the provider sends a huge line.
+pub(crate) fn diagnostic_preview(bytes: &[u8], limit: usize) -> String {
+    let text = String::from_utf8_lossy(&bytes[..bytes.len().min(limit)]);
+    let mut result = String::new();
+    for ch in text.chars() {
+        let escaped = if ch.is_control() {
+            ch.escape_default().to_string()
+        } else {
+            ch.to_string()
+        };
+        if result.len() + escaped.len() > limit {
+            break;
+        }
+        result.push_str(&escaped);
+    }
+    result
 }
 
 /// Reconstruct a saved reader without granting permission to launch a provider.

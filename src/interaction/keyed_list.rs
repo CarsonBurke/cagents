@@ -1,4 +1,4 @@
-//! Stable row state with the standard Column's native accessibility tree.
+//! Stable child state with the standard layout's native accessibility tree.
 use super::*;
 
 pub(super) fn view<'a, Message: 'a>(
@@ -7,8 +7,33 @@ pub(super) fn view<'a, Message: 'a>(
     let (keys, children): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
     Element::new(KeyedList {
         keys,
+        on_focus: None,
         content: widget::column::with_children(children)
             .width(Length::Fill)
+            .into(),
+    })
+}
+
+#[cfg(test)]
+pub(super) fn horizontal<'a, Message: 'a>(
+    rows: Vec<([u8; 32], Element<'a, Message>)>,
+    spacing: f32,
+) -> Element<'a, Message> {
+    horizontal_observed(rows, spacing, None)
+}
+
+pub(super) fn horizontal_observed<'a, Message: 'a>(
+    rows: Vec<([u8; 32], Element<'a, Message>)>,
+    spacing: f32,
+    on_focus: Option<Box<dyn Fn(Option<[u8; 32]>) + 'a>>,
+) -> Element<'a, Message> {
+    let (keys, children): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
+    Element::new(KeyedList {
+        keys,
+        on_focus,
+        content: widget::row::with_children(children)
+            .spacing(spacing)
+            .align_y(cosmic::iced::Alignment::Center)
             .into(),
     })
 }
@@ -17,7 +42,49 @@ struct Keys(Vec<[u8; 32]>);
 
 struct KeyedList<'a, Message> {
     keys: Vec<[u8; 32]>,
+    on_focus: Option<Box<dyn Fn(Option<[u8; 32]>) + 'a>>,
     content: Element<'a, Message>,
+}
+
+#[derive(Default)]
+struct FocusedId(Option<Id>);
+impl Operation for FocusedId {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+        operate(self);
+    }
+    fn focusable(&mut self, id: Option<&Id>, _: Rectangle, state: &mut dyn operation::Focusable) {
+        if state.is_focused() {
+            self.0 = id.cloned();
+        }
+    }
+}
+
+impl<Message> KeyedList<'_, Message> {
+    fn observe_focus(&mut self, tree: &mut Tree, layout: Layout<'_>, renderer: &Renderer) {
+        if self.on_focus.is_none() {
+            return;
+        }
+        let mut focused = FocusedId::default();
+        self.content
+            .as_widget_mut()
+            .operate(&mut tree.children[0], layout, renderer, &mut focused);
+        fn contains(tree: &Tree, id: &Id) -> bool {
+            tree.id.as_ref() == Some(id) || tree.children.iter().any(|child| contains(child, id))
+        }
+        let key = focused
+            .0
+            .as_ref()
+            .and_then(|id| {
+                tree.children[0]
+                    .children
+                    .iter()
+                    .position(|child| contains(child, id))
+            })
+            .and_then(|index| self.keys.get(index).copied());
+        if let Some(on_focus) = &self.on_focus {
+            on_focus(key);
+        }
+    }
 }
 
 impl<Message> Widget<Message, Theme, Renderer> for KeyedList<'_, Message> {
@@ -32,24 +99,25 @@ impl<Message> Widget<Message, Theme, Renderer> for KeyedList<'_, Message> {
     }
     fn diff(&mut self, tree: &mut Tree) {
         let previous = &mut tree.state.downcast_mut::<Keys>().0;
-        // Reorder the actual Column's row trees before its ordinary diff. Each
-        // prior tree is consumed at most once, including duplicate keys. The
-        // chooser mounts at most24 rows, so a bounded linear lookup per row
-        // avoids a second map/queue ownership scheme.
-        let mut retained: Vec<_> = previous
+        // Consume each retained tree once, in original order for duplicate
+        // keys. Direct tab strips may contain many children, so index once
+        // instead of searching the previous tree for every new control.
+        let mut retained: std::collections::HashMap<_, std::collections::VecDeque<_>> =
+            std::collections::HashMap::with_capacity(previous.len());
+        for (key, child) in previous
             .iter()
             .copied()
             .zip(std::mem::take(&mut tree.children[0].children))
-            .map(|(key, row)| (key, Some(row)))
-            .collect();
+        {
+            retained.entry(key).or_default().push_back(child);
+        }
         tree.children[0].children = self
             .keys
             .iter()
             .map(|key| {
                 retained
-                    .iter_mut()
-                    .find(|(old, row)| old == key && row.is_some())
-                    .and_then(|(_, row)| row.take())
+                    .get_mut(key)
+                    .and_then(|rows| rows.pop_front())
                     .unwrap_or_else(Tree::empty)
             })
             .collect();
@@ -84,6 +152,7 @@ impl<Message> Widget<Message, Theme, Renderer> for KeyedList<'_, Message> {
             renderer,
             operation,
         );
+        self.observe_focus(tree, layout, renderer);
     }
     fn update(
         &mut self,
@@ -106,6 +175,7 @@ impl<Message> Widget<Message, Theme, Renderer> for KeyedList<'_, Message> {
             shell,
             viewport,
         );
+        self.observe_focus(tree, layout, renderer);
     }
     fn mouse_interaction(
         &self,
@@ -191,30 +261,34 @@ impl<Message> Widget<Message, Theme, Renderer> for KeyedList<'_, Message> {
 mod tests {
     use super::*;
 
-    fn rows(keys: &[u8]) -> Element<'static, &'static str> {
-        view(
-            keys.iter()
-                .map(|key| {
-                    let label = match key {
-                        1 => "One",
-                        2 => "Two",
-                        3 => "Three",
-                        4 => "Four",
-                        _ => unreachable!(),
-                    };
-                    let mut identity = [0; 32];
-                    identity[0] = *key;
-                    (
-                        identity,
-                        widget::button::text(label)
-                            .name(label)
-                            .on_press(label)
-                            .width(Length::Fill)
-                            .into(),
-                    )
-                })
-                .collect(),
-        )
+    fn rows(keys: &[u8], row: bool) -> Element<'static, &'static str> {
+        let controls = keys
+            .iter()
+            .map(|key| {
+                let label = match key {
+                    1 => "One",
+                    2 => "Two",
+                    3 => "Three",
+                    4 => "Four",
+                    _ => unreachable!(),
+                };
+                let mut identity = [0; 32];
+                identity[0] = *key;
+                (
+                    identity,
+                    widget::button::text(label)
+                        .name(label)
+                        .on_press(label)
+                        .width(Length::Fill)
+                        .into(),
+                )
+            })
+            .collect();
+        if row {
+            horizontal(controls, space::XS)
+        } else {
+            view(controls)
+        }
     }
 
     fn layout_rows(
@@ -286,9 +360,82 @@ mod tests {
 
     #[test]
     fn standard_column_accessibility_and_focused_row_follow_keys_through_reorder_and_removal() {
+        retained_focus(false);
+    }
+
+    #[test]
+    fn standard_row_accessibility_and_focused_control_follow_keys_through_reorder_and_removal() {
+        retained_focus(true);
+    }
+
+    #[test]
+    fn duplicate_keys_consume_each_focused_tree_once_in_original_order() {
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut element = rows(&[1, 2, 2, 3], true);
+        let mut tree = Tree::new(element.as_widget());
+        let node = layout_rows(&mut element, &mut tree, &renderer);
+        let second_two = tree.children[0].children[2].id.clone().unwrap();
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::focusable::focus::<()>(second_two),
+        );
+        let mut reordered = rows(&[2, 1, 3, 2], true);
+        tree.diff(reordered.as_widget_mut());
+        let node = layout_rows(&mut reordered, &mut tree, &renderer);
+        assert_eq!(focused(&mut reordered, &mut tree, &node, &renderer), [3]);
+        let mut removed = rows(&[2, 1, 3], true);
+        tree.diff(removed.as_widget_mut());
+        let node = layout_rows(&mut removed, &mut tree, &renderer);
+        assert!(focused(&mut removed, &mut tree, &node, &renderer).is_empty());
+    }
+
+    #[test]
+    fn many_controls_keep_each_native_identity_during_reverse_reorder() {
+        let controls = |reverse: bool| {
+            let mut indices: Vec<u64> = (0..512).collect();
+            if reverse {
+                indices.reverse();
+            }
+            horizontal(
+                indices
+                    .into_iter()
+                    .map(|index| {
+                        let mut key = [0; 32];
+                        key[..8].copy_from_slice(&index.to_le_bytes());
+                        (
+                            key,
+                            widget::button::text(index.to_string())
+                                .on_press(index)
+                                .into(),
+                        )
+                    })
+                    .collect(),
+                space::XS,
+            )
+        };
+        let element = controls(false);
+        let mut tree = Tree::new(element.as_widget());
+        let original: Vec<_> = tree.children[0]
+            .children
+            .iter()
+            .map(|child| child.id.clone())
+            .collect();
+        let mut reversed = controls(true);
+        tree.diff(reversed.as_widget_mut());
+        let actual: Vec<_> = tree.children[0]
+            .children
+            .iter()
+            .map(|child| child.id.clone())
+            .collect();
+        assert_eq!(actual, original.into_iter().rev().collect::<Vec<_>>());
+    }
+
+    fn retained_focus(horizontal: bool) {
         use cosmic::iced::{advanced::clipboard, keyboard};
         let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
-        let mut element = rows(&[1, 2, 3]);
+        let mut element = rows(&[1, 2, 3], horizontal);
         let mut tree = Tree::new(element.as_widget());
         let node = layout_rows(&mut element, &mut tree, &renderer);
         // Use the real focused button's generated ID, not a named ID that
@@ -315,7 +462,7 @@ mod tests {
             .id()
             .clone();
 
-        let mut reordered = rows(&[3, 1, 2]);
+        let mut reordered = rows(&[3, 1, 2], horizontal);
         tree.diff(reordered.as_widget_mut());
         let node = layout_rows(&mut reordered, &mut tree, &renderer);
         assert_eq!(
@@ -368,7 +515,7 @@ mod tests {
             "input must reach the retained focused real button"
         );
 
-        let mut replaced = rows(&[3, 1, 4]);
+        let mut replaced = rows(&[3, 1, 4], horizontal);
         tree.diff(replaced.as_widget_mut());
         let node = layout_rows(&mut replaced, &mut tree, &renderer);
         assert!(

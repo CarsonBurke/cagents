@@ -11,7 +11,6 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::os::unix::fs::OpenOptionsExt;
 use std::{
-    fs::File,
     io::{Read, Write},
     path::PathBuf,
 };
@@ -49,6 +48,11 @@ struct Receipt {
     launch_account_scope: Result<crate::account::scope::LaunchAccountScope, String>,
     confirmed_session: Option<String>,
     snapshot: Snapshot,
+    /// The snapshot was reduced after retirement and is no transcript. Older
+    /// readers ignore this field, which is safe because none of them reads a
+    /// retired receipt's snapshot.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    compacted: bool,
 }
 fn path(record: &Record) -> Result<PathBuf, String> {
     Ok(registry::directory(Kind::Native)?.join(format!(
@@ -77,6 +81,7 @@ pub(super) fn save(
         launch_account_scope: scope.cloned().map_err(str::to_owned),
         confirmed_session: confirmed_session.map(str::to_owned),
         snapshot: snapshot.clone(),
+        compacted: false,
     })
     .map_err(|error| error.to_string())?;
     if bytes.len() > MAX_FRAME - 64 * 1024 {
@@ -86,6 +91,12 @@ pub(super) fn save(
     }
     save_at(&path(&identity.record)?, &bytes)
 }
+/// Publishes a complete receipt by rename, without fsync. Receipts live in the
+/// runtime directory beside the boot-bound holder records that validate them,
+/// so only readers in the same boot exist, and the page cache serves those
+/// across any daemon crash or upgrade. The helper publishes from its single
+/// request loop, where an fsync can take seconds on a disk-backed runtime
+/// directory and expire the `close` or `retire` request (#2180).
 fn save_at(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
     let parent = path.parent().ok_or("Missing final snapshot directory")?;
     let temporary = parent.join(format!(".actor-final-{}", uuid::Uuid::new_v4()));
@@ -97,13 +108,8 @@ fn save_at(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(&temporary)
             .map_err(|error| error.to_string())?;
-        file.write_all(bytes)
-            .and_then(|()| file.sync_all())
-            .map_err(|error| error.to_string())?;
-        std::fs::rename(&temporary, &path).map_err(|error| error.to_string())?;
-        File::open(parent)
-            .and_then(|file| file.sync_all())
-            .map_err(|error| error.to_string())
+        file.write_all(bytes).map_err(|error| error.to_string())?;
+        std::fs::rename(&temporary, path).map_err(|error| error.to_string())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temporary);
@@ -117,11 +123,21 @@ pub(super) fn read(
 ) -> Result<Snapshot, String> {
     let receipt = read_receipt(&identity.record)?;
     validate_publication(&receipt, identity, proof, source)?;
+    if receipt.compacted {
+        return Err("The retired actor's final transcript was already released".into());
+    }
     Ok(receipt.snapshot)
 }
 fn read_receipt(record: &Record) -> Result<Receipt, String> {
-    let file = crate::secure_file::open_existing_private_file_readonly(&path(record)?)
-        .map_err(|error| error.to_string())?;
+    read_receipt_if_published(record)?
+        .ok_or_else(|| "The helper has not published its final retained snapshot".into())
+}
+fn read_receipt_if_published(record: &Record) -> Result<Option<Receipt>, String> {
+    let file = match crate::secure_file::open_existing_private_file_readonly(&path(record)?) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
     let mut bytes = Vec::new();
     file.take((MAX_FRAME + 1) as u64)
         .read_to_end(&mut bytes)
@@ -130,7 +146,7 @@ fn read_receipt(record: &Record) -> Result<Receipt, String> {
         return Err("Final retained snapshot is oversized".into());
     }
     let receipt: Receipt = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
-    Ok(receipt)
+    Ok(Some(receipt))
 }
 fn validate_publication(
     receipt: &Receipt,
@@ -184,7 +200,12 @@ pub(super) fn close_proved(
     if !execution_exit::identity_absent(&identity.record.root)? {
         return Ok(false);
     }
-    read(identity, proof, source).map(|_| true)
+    // The helper publishes after its provider exits. Until then, closure is
+    // unproved rather than an error that would hide why the close failed.
+    let Some(receipt) = read_receipt_if_published(&identity.record)? else {
+        return Ok(false);
+    };
+    validate_publication(&receipt, identity, proof, source).map(|()| true)
 }
 const MAX_RETIREMENT: usize = 256 * 1024;
 #[derive(Serialize, Deserialize)]
@@ -412,6 +433,71 @@ pub(super) fn retired_actor_receipt(
     }
 }
 
+/// What a committed retirement still needs from its final receipt.
+///
+/// Every reader of a retired receipt validates its identity, proof, source and
+/// account fields, and only `exited` from the snapshot. The transcript, the
+/// subagent frames and the other collections are read solely by a close whose
+/// reply was lost, which precedes retirement. They are by far the largest part
+/// of the receipt, so this keeps the snapshot's scalar description and drops
+/// the collections.
+fn retired_remnant(snapshot: &Snapshot) -> Snapshot {
+    Snapshot {
+        sampled_at: snapshot.sampled_at,
+        generation: snapshot.generation,
+        turn_generation: snapshot.turn_generation,
+        finished_at: snapshot.finished_at,
+        detail: snapshot.detail.clone(),
+        session_id: snapshot.session_id.clone(),
+        native_continuity: snapshot.native_continuity.clone(),
+        title: snapshot.title.clone(),
+        error: snapshot.error.clone(),
+        read_only_reason: snapshot.read_only_reason.clone(),
+        exited: snapshot.exited,
+        ..Default::default()
+    }
+}
+
+fn compact(receipt: &mut Receipt) -> bool {
+    if receipt.compacted {
+        return false;
+    }
+    receipt.snapshot = retired_remnant(&receipt.snapshot);
+    receipt.compacted = true;
+    true
+}
+
+/// Shrinks the final receipt of an actor whose retirement is verified to
+/// what its proof readers use, and returns how many bytes that released.
+///
+/// The receipts live in the RAM-backed runtime directory until reboot because
+/// a resume later in the same boot still authenticates the retirement through
+/// them. The caller must already hold the actor's committed retirement; an
+/// actor that is running, unproved or still pending keeps its full receipt.
+/// The rewrite is an atomic rename, so a concurrent reader sees either the full
+/// or the reduced receipt and both validate identically.
+pub(super) fn compact_retired(record: &Record, current: &HostSessionProof) -> Result<u64, String> {
+    if read_receipt(record)?.compacted
+        || !matches!(
+            inspect_retirement(record, current)?,
+            RetirementInspection::Verified(_)
+        )
+    {
+        return Ok(0);
+    }
+    let path = path(record)?;
+    let mut receipt = read_receipt(record)?;
+    if !compact(&mut receipt) {
+        return Ok(0);
+    }
+    let before = std::fs::symlink_metadata(&path)
+        .map_err(|error| error.to_string())?
+        .len();
+    let bytes = serde_json::to_vec(&receipt).map_err(|error| error.to_string())?;
+    save_at(&path, &bytes)?;
+    Ok(before.saturating_sub(bytes.len() as u64))
+}
+
 pub(crate) fn remove(record: &Record) -> Result<(), String> {
     let path = path(record)?;
     match std::fs::remove_file(retirement_path(record)?) {
@@ -420,11 +506,158 @@ pub(crate) fn remove(record: &Record) -> Result<(), String> {
         Err(error) => return Err(error.to_string()),
     }
     match std::fs::remove_file(&path) {
-        Ok(()) => File::open(path.parent().ok_or("Missing final snapshot directory")?)
-            .and_then(|file| file.sync_all())
-            .map_err(|error| error.to_string()),
+        Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Runtime receipts of actors that no helper or provider backs, for the
+/// daemon's receipt collection tests. Each is published through the same
+/// writers a helper uses, so every reader validates it as it would a real one.
+#[cfg(test)]
+pub(crate) mod fixture {
+    use super::*;
+
+    /// How far an actor got toward a retirement its receipts can prove.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Stage {
+        /// The helper is still running.
+        Running,
+        /// The helper ended, but its provider may still be running.
+        ExitedUnproved,
+        /// Both ended, but the helper's discovery record was never retired.
+        DiscoveryPending,
+        /// Both ended and the retirement is proved; the transcript is whole.
+        Verified,
+        /// As `Verified`, with the transcript already released.
+        Compacted,
+    }
+
+    /// One published actor: its exact holder record and issued conversation.
+    pub(crate) struct Actor {
+        pub(crate) record: Record,
+        pub(crate) source: chat::Session,
+        pub(crate) final_receipt: PathBuf,
+        pub(crate) retirement_receipt: PathBuf,
+    }
+
+    /// Publishes `stage`'s receipts for actor `instance` of the lease `proof`.
+    ///
+    /// `ended` is a process that has exited and been reaped; the calling
+    /// process stands in for anything `stage` says is still running.
+    pub(crate) fn publish(
+        instance: uuid::Uuid,
+        proof: &HostSessionProof,
+        ended: &registry::Process,
+        stage: Stage,
+    ) -> Actor {
+        let live = registry::Process::read(std::process::id() as i32).unwrap();
+        let (holder, root) = match stage {
+            Stage::Running => (live, ended.clone()),
+            Stage::ExitedUnproved => (ended.clone(), live),
+            Stage::DiscoveryPending | Stage::Verified | Stage::Compacted => {
+                (ended.clone(), ended.clone())
+            }
+        };
+        let mut build = registry::BuildIdentity::current(Kind::Native);
+        build
+            .capabilities
+            .push(registry::RETAINED_CLAUDE_CAPABILITY.into());
+        let terminal = crate::model::TerminalId::new();
+        let identity = ActorIdentity {
+            instance,
+            record: Record {
+                version: 4,
+                build: Some(build),
+                kind: Kind::Native,
+                application: crate::instance::APPLICATION_ID.into(),
+                boot: proof.boot_id.clone(),
+                terminal,
+                holder,
+                root,
+            },
+        };
+        let session = uuid::Uuid::new_v4().to_string();
+        let mut source = super::super::transport::fixture_source();
+        source.id = terminal;
+        source.proof = Some(proof.clone());
+        source.launch.session_id = Some(session.clone());
+        source.native_continuity =
+            chat::NativeContinuity::RetainedClaudeActor { protocol: PROTOCOL };
+        let directory = registry::directory(Kind::Native).unwrap();
+        std::fs::create_dir_all(&directory).unwrap();
+        let snapshot = Snapshot {
+            exited: true,
+            session_id: Some(session.clone()),
+            title: Some("A retired conversation".into()),
+            items: vec![std::sync::Arc::new(chat::Item {
+                started_at: None,
+                id: "answer".into(),
+                role: chat::Role::Assistant,
+                content: chat::ItemContent::Text {
+                    text: "a long final answer ".repeat(512),
+                    thinking: false,
+                    phase: Default::default(),
+                },
+                at: None,
+            })],
+            ..Default::default()
+        };
+        let scope: Result<&crate::account::scope::LaunchAccountScope, &str> =
+            Err("fixture has no account scope");
+        save(
+            true,
+            &identity,
+            proof,
+            &source,
+            &[],
+            None,
+            scope,
+            Some(&session),
+            &snapshot,
+        )
+        .unwrap();
+        publish_retirement(RetirementReceipt {
+            installed: true,
+            identity: identity.clone(),
+            proof: proof.clone(),
+            source: source.clone(),
+            previous_sources: Vec::new(),
+            launch_account_scope: scope.map(Clone::clone).map_err(str::to_owned),
+            confirmed_session: Some(session),
+            paired_holder: None,
+        })
+        .unwrap();
+        if stage == Stage::DiscoveryPending {
+            identity.record.create(&directory).unwrap();
+        }
+        let expected = match stage {
+            Stage::Running => "Running",
+            Stage::ExitedUnproved | Stage::DiscoveryPending => "ExitedUnproved",
+            Stage::Verified | Stage::Compacted => "Verified",
+        };
+        let actual = match inspect_retirement(&identity.record, proof).unwrap() {
+            RetirementInspection::Running => "Running",
+            RetirementInspection::ExitedUnproved => "ExitedUnproved",
+            RetirementInspection::Verified(_) => "Verified",
+        };
+        assert_eq!(actual, expected, "{stage:?} receipts inspect as {actual}");
+        if stage == Stage::Compacted {
+            assert!(compact_retired(&identity.record, proof).unwrap() > 0);
+        }
+        Actor {
+            final_receipt: path(&identity.record).unwrap(),
+            retirement_receipt: retirement_path(&identity.record).unwrap(),
+            record: identity.record,
+            source,
+        }
+    }
+
+    /// Whether the final receipt at `path` was compacted.
+    pub(crate) fn compacted(path: &std::path::Path) -> bool {
+        let receipt: Receipt = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        receipt.compacted
     }
 }
 
@@ -473,6 +706,7 @@ mod tests {
                 exited: true,
                 ..Default::default()
             },
+            compacted: false,
         };
         assert!(validate_publication(&live, &identity, &proof, &source).is_err());
         identity.record.root = reaped_process();
@@ -509,6 +743,18 @@ mod tests {
         );
         receipt.snapshot.exited = false;
         assert!(validate_publication(&receipt, &identity, &proof, &source).is_err());
+    }
+    #[test]
+    fn an_unpublished_final_snapshot_leaves_close_unproved() {
+        let actor = RemoteActor::fixture();
+        let mut identity = actor.identity();
+        identity.record.root = reaped_process();
+        let proof = actor.proof();
+        let mut source = super::super::transport::fixture_source();
+        source.id = identity.record.terminal;
+        source.proof = Some(proof.clone());
+        assert_eq!(close_proved(&identity, &proof, &source), Ok(false));
+        assert!(read(&identity, &proof, &source).is_err());
     }
     #[test]
     fn retirement_cross_checks_final_tuple_without_reopening_a_removed_account_home() {
@@ -548,6 +794,7 @@ mod tests {
                 exited: true,
                 ..Default::default()
             },
+            compacted: false,
         };
         let make = || RetirementReceipt {
             installed: true,
@@ -598,6 +845,86 @@ mod tests {
         changed.previous_sources.push(foreign);
         assert!(validate_retired_publication(&final_receipt, &changed).is_err());
     }
+    #[test]
+    fn a_compacted_retired_receipt_still_proves_retirement_but_is_no_transcript() {
+        let actor = RemoteActor::fixture();
+        let mut identity = actor.identity();
+        identity.record.root = reaped_process();
+        identity.record.holder = reaped_process();
+        let proof = actor.proof();
+        let mut source = super::super::transport::fixture_source();
+        source.id = identity.record.terminal;
+        source.proof = Some(proof.clone());
+        source.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        let item = std::sync::Arc::new(chat::Item {
+            started_at: None,
+            id: "answer".into(),
+            role: chat::Role::Assistant,
+            content: chat::ItemContent::Text {
+                text: "a long final answer".repeat(64),
+                thinking: false,
+                phase: Default::default(),
+            },
+            at: None,
+        });
+        let mut receipt = Receipt {
+            installed: true,
+            identity: identity.clone(),
+            proof: proof.clone(),
+            source: source.clone(),
+            previous_sources: Vec::new(),
+            paired_holder: None,
+            launch_account_scope: Err("fixture".into()),
+            confirmed_session: None,
+            snapshot: Snapshot {
+                session_id: source.launch.session_id.clone(),
+                generation: 9,
+                title: Some("final".into()),
+                exited: true,
+                items: vec![item; 64],
+                ..Default::default()
+            },
+            compacted: false,
+        };
+        let retired = RetirementReceipt {
+            installed: true,
+            identity: identity.clone(),
+            proof: proof.clone(),
+            source: source.clone(),
+            previous_sources: Vec::new(),
+            launch_account_scope: Err("fixture".into()),
+            confirmed_session: None,
+            paired_holder: None,
+        };
+        let full = serde_json::to_vec(&receipt).unwrap();
+        assert!(compact(&mut receipt));
+        assert!(!compact(&mut receipt), "compaction happens once");
+        let reduced = serde_json::to_vec(&receipt).unwrap();
+        assert!(reduced.len() < full.len());
+        assert!(receipt.snapshot.items.is_empty());
+        assert_eq!(receipt.snapshot.generation, 9);
+        assert_eq!(receipt.snapshot.title.as_deref(), Some("final"));
+        assert_eq!(receipt.snapshot.session_id, source.launch.session_id);
+
+        let reread: Receipt = serde_json::from_slice(&reduced).unwrap();
+        assert!(reread.compacted);
+        assert!(validate_publication(&reread, &identity, &proof, &source).is_ok());
+        assert!(validate_retired_publication(&reread, &retired).is_ok());
+
+        // An older daemon reads the same bytes as an ordinary exited receipt,
+        // which is all its retirement checks look at.
+        let mut older = serde_json::from_slice::<serde_json::Value>(&reduced).unwrap();
+        assert_eq!(
+            older.as_object_mut().unwrap().remove("compacted"),
+            Some(true.into())
+        );
+        let older: Receipt = serde_json::from_value(older).unwrap();
+        assert!(validate_retired_publication(&older, &retired).is_ok());
+        // A receipt written before this field existed is not compacted.
+        let legacy = serde_json::from_slice::<Receipt>(&full).unwrap();
+        assert!(!legacy.compacted);
+    }
+
     #[test]
     fn cold_retirement_validation_uses_exact_saved_record_and_proof_without_inventing_actor_id() {
         let actor = RemoteActor::fixture();
@@ -760,6 +1087,17 @@ os.waitpid(pid,0)
         let snapshot = Snapshot {
             exited: true,
             session_id: source.launch.session_id.clone(),
+            items: vec![std::sync::Arc::new(chat::Item {
+                started_at: None,
+                id: "answer".into(),
+                role: chat::Role::Assistant,
+                content: chat::ItemContent::Text {
+                    text: "a long final answer".repeat(64),
+                    thinking: false,
+                    phase: Default::default(),
+                },
+                at: None,
+            })],
             ..Default::default()
         };
         save(
@@ -789,6 +1127,16 @@ os.waitpid(pid,0)
             inspect_retirement(&identity.record, &proof).unwrap(),
             RetirementInspection::Running
         ));
+        let whole = std::fs::read(path(&identity.record).unwrap()).unwrap();
+        assert_eq!(
+            compact_retired(&identity.record, &proof).unwrap(),
+            0,
+            "a running helper's transcript is never released"
+        );
+        assert_eq!(
+            std::fs::read(path(&identity.record).unwrap()).unwrap(),
+            whole
+        );
         std::fs::write(&gate, b"exit").unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while matches!(
@@ -801,6 +1149,34 @@ os.waitpid(pid,0)
         assert!(
             helper.is_current(),
             "the external parent must still own its unreaped child's status"
+        );
+        assert!(matches!(
+            inspect_retirement(&identity.record, &proof).unwrap(),
+            RetirementInspection::Verified(_)
+        ));
+        assert!(retirement_proved(&identity, &proof).unwrap());
+        assert!(
+            retired_actor_receipt(&identity.record, &proof)
+                .unwrap()
+                .is_some()
+        );
+        let mut live_provider = identity.record.clone();
+        live_provider.root = registry::Process::read(std::process::id() as i32).unwrap();
+        assert_eq!(
+            compact_retired(&live_provider, &proof).unwrap(),
+            0,
+            "a retirement whose provider may still run is not proved"
+        );
+        assert_eq!(
+            std::fs::read(path(&identity.record).unwrap()).unwrap(),
+            whole
+        );
+        assert!(read(&identity, &proof, &source).is_ok());
+        assert!(compact_retired(&identity.record, &proof).unwrap() > 0);
+        assert_eq!(compact_retired(&identity.record, &proof).unwrap(), 0);
+        assert!(
+            read(&identity, &proof, &source).is_err(),
+            "a released transcript is never served as the actor's final state"
         );
         assert!(matches!(
             inspect_retirement(&identity.record, &proof).unwrap(),
@@ -872,8 +1248,6 @@ os.waitpid(pid,0)
         invalid_provider.root = identity.record.root.clone();
         invalid_provider.root.start = 0;
         assert!(inspect_retirement(&invalid_provider, &proof).is_err());
-        let mut live_provider = identity.record.clone();
-        live_provider.root = registry::Process::read(std::process::id() as i32).unwrap();
         assert!(matches!(
             inspect_retirement(&live_provider, &proof).unwrap(),
             RetirementInspection::ExitedUnproved
@@ -902,7 +1276,7 @@ os.waitpid(pid,0)
     }
 
     #[test]
-    fn final_publication_is_private_durable_and_bound_to_the_exact_actor() {
+    fn final_publication_is_private_and_bound_to_the_exact_actor() {
         use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
         let path = directory.path().join("final");
@@ -923,6 +1297,7 @@ os.waitpid(pid,0)
                 title: Some("final".into()),
                 ..Default::default()
             },
+            compacted: false,
         };
         save_at(&path, &serde_json::to_vec(&receipt).unwrap()).unwrap();
         assert_eq!(

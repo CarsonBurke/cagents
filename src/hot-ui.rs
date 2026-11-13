@@ -8,8 +8,10 @@ extern crate cagents as app_support;
 use app_support::runtime_state;
 extern crate self as cagents;
 include!("modules.rs");
+// The production entry point also states this executable's version.
 #[path = "bin/cagents-ui.rs"]
 mod ui_entry;
+mod version_stamp;
 
 const FRESH_ENV: &str = "CAGENTS_HOT_FRESH_DAEMON";
 
@@ -39,7 +41,7 @@ fn restart_matched_daemon() -> Result<(), Box<dyn std::error::Error>> {
     let cli = std::env::current_exe()?.with_file_name("cagents");
     let version = Command::new(&cli).arg("--version").output()?;
     if !version.status.success()
-        || String::from_utf8(version.stdout)?.trim() != format!("cagents {}", cagents::VERSION)
+        || String::from_utf8(version.stdout)?.trim() != format!("cagents {}", cagents::version())
     {
         return Err("hot bundle CLI does not match this development UI".into());
     }
@@ -55,7 +57,7 @@ fn restart_matched_daemon() -> Result<(), Box<dyn std::error::Error>> {
         return Err("matched CLI refused the development daemon restart".into());
     }
     let socket = cagents::instance::runtime_directory()?
-        .join("cagents-development")
+        .join(cagents::instance::runtime_subdirectory())
         .join("cagentsd.sock");
     let deadline = Instant::now() + Duration::from_secs(5);
     while socket.try_exists()? {

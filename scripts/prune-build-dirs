@@ -1,0 +1,587 @@
+#!/usr/bin/python3
+"""Remove Cargo build output that nothing has used for a while.
+
+Agents build in many places: worktree `target/`s, `CARGO_TARGET_DIR`s under
+~/.cache and /var/tmp, test roots under ~/.local/state, and the mirrored
+`/var/tmp/cargo-build/<workspace>/target` layout. Cargo never removes any of
+them, and together they fill the disk that every build shares. This finds
+build output by what it holds rather than by where it is: Cargo writes
+`.rustc_info.json` at the root of every target directory and a `.fingerprint`
+directory in each profile, which nothing else does. scripts/native-evidence
+marks its task directories with `.native-evidence`, and their `target-before`
+and `target-after` hold only what its builds made.
+
+A target directory is removed only when, at the time of removal:
+- no entry anywhere inside it was written or changed within --max-idle days,
+  or, for a mirrored build directory whose workspace no longer exists,
+  --orphan-hours, or, for a native-evidence task's, --evidence-hours;
+- every Cargo profile lock in it is free; and
+- no process has its working directory, root, executable, an open file or a
+  mapping inside it, and, for a native-evidence task's, no native-evidence
+  process names the task with --task.
+
+Under those locks it is renamed aside, so a build that starts later finds no
+directory rather than a partly removed one. Still under them, the renamed
+copy is put back if a process opened it meanwhile, such as a build waiting
+for those locks; after them, if anything wrote to it. An interrupted removal
+leaves only the renamed copy, which the next run removes. A directory that
+holds a `.git` or `Cargo.toml` is a checkout, never build output. A main checkout's own build, whose workspace has a `.git`
+directory, seeds new worktrees, so it waits four times as long. Never
+touched: the checkouts given with --keep-checkout, the directories given
+with --keep, ~/.local/share, the offload build slots
+(~/.cache/cagents-offload, whose leases bound them), other users' files
+and anything a symlink leads to.
+
+One run at a time per user. The checkouts given with --root, and the mirror,
+are searched first. A run that stops on its --budget, or finds another run
+pruning, exits 75 so its caller can tell it did not search everything; one
+that searched everything touches its --stamp.
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fcntl
+import math
+import os
+import pwd
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+def account_home() -> Path:
+    """The account's home from the password database, or $HOME for a user
+    it has no entry for, such as a container's arbitrary one."""
+    try:
+        return Path(pwd.getpwuid(os.geteuid()).pw_dir)
+    except KeyError:
+        return Path.home()
+
+
+# The account's home, whose build output this prunes, and $HOME: a fixture or
+# a native-evidence session runs builds, and so this, under a private HOME
+# that holds none of it, and a user may keep builds under a HOME of their own.
+HOMES = list(dict.fromkeys((account_home(), Path.home())))
+MIRROR = Path("/var/tmp/cargo-build")
+LOCK_NAMES = (".cargo-lock", ".cargo-artifact-lock", ".cargo-build-lock")
+PRUNED = re.compile(r"^\.(?P<name>.+)\.cagents-pruned-(?P<pid>\d+)$")
+# What scripts/native-evidence names a task's builds, beside this marker.
+EVIDENCE_TARGET = re.compile(r"^target-(before|after)$")
+EVIDENCE_TASK = ".native-evidence"
+
+
+def default_roots() -> list[Path]:
+    return [home / place for home in HOMES for place in (".cache", ".local/state")] + \
+        [Path("/var/tmp")]
+
+
+def never() -> list[Path]:
+    return [home / place for home in HOMES for place in (".local/share", ".cache/cagents-offload")]
+
+
+def within(path: Path, parents: list[Path]) -> bool:
+    return any(path == parent or parent in path.parents for parent in parents)
+
+
+def is_build_output(path: Path, names: set[str]) -> bool:
+    """Cargo's own markers: `.rustc_info.json` at a target directory's root,
+    or, beside the CACHEDIR.TAG Cargo writes, a profile's `.fingerprint` in a
+    separate build directory. Never a checkout, whatever it holds: a target
+    directory configured as one would take its sources with it."""
+    if {".git", "Cargo.toml"} & names:
+        return False
+    if ".rustc_info.json" in names:
+        return True
+    return "CACHEDIR.TAG" in names and any(
+        directory(path / name / ".fingerprint") for name in names if not name.startswith("."))
+
+
+def evidence_target(path: Path, names: set[str] | None = None) -> bool:
+    """A native-evidence task's build: its executables and the source they
+    came from, which its next build makes again. The task's fixtures, logs
+    and screenshots beside it are not build output, and a checkout never is."""
+    if not EVIDENCE_TARGET.match(path.name) or {".git", "Cargo.toml"} & (names or set()):
+        return False
+    try:
+        return stat.S_ISREG((path.parent / EVIDENCE_TASK).lstat().st_mode)
+    except OSError:
+        return False
+
+
+def directory(path: Path) -> bool:
+    """Whether path is a directory, not through a symlink; unreadable is not."""
+    try:
+        return stat.S_ISDIR(path.lstat().st_mode)
+    except OSError:
+        return False
+
+
+# Never build output, and often large: not worth reading.
+SKIPPED = {".git", "node_modules", "__pycache__"}
+
+
+def tracked_directories(checkout: Path) -> set[str]:
+    """A Cargo checkout's committed top-level directories: its sources, where
+    Cargo writes nothing. Its build output is in untracked ones, such as
+    target/. Empty when Git cannot say, and then everything is searched."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(checkout), "ls-tree", "-d", "--name-only", "-z", "HEAD"],
+            capture_output=True, timeout=30, env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    if result.returncode:
+        return set()
+    return {os.fsdecode(name) for name in result.stdout.split(b"\0") if name}
+
+
+def find(roots: list[Path], excluded: list[Path], depth: int, mirror: Path):
+    """Build directories at most `depth` levels under the roots, or at any
+    depth in the mirror, which holds nothing else, without descending into
+    them, into Git repositories or a checkout's committed sources, across
+    file systems or through symlinks. Yields each as it is found, so a run
+    with a budget removes what it can while it searches."""
+    seen = set()
+    for index, root in enumerate(roots):
+        try:
+            device = root.lstat().st_dev
+        except OSError:
+            continue
+        if deadline_passed():
+            break
+        # Searched already, as an earlier root or under one.
+        walked = roots[:index]
+        if within(root, walked):
+            continue
+        pending = [(root, -sys.maxsize if root == mirror else 0)]
+        while pending and not deadline_passed():
+            directory_, level = pending.pop()
+            if within(directory_, excluded) or (directory_ != root and directory_ in walked):
+                continue
+            try:
+                with os.scandir(directory_) as entries:
+                    entries = list(entries)
+            except OSError:
+                continue
+            names = {entry.name for entry in entries}
+            if directory_ != root and (PRUNED.match(directory_.name)
+                                       or is_build_output(directory_, names)
+                                       or evidence_target(directory_, names)):
+                if directory_ not in seen:
+                    seen.add(directory_)
+                    yield directory_
+                continue
+            # A bare Git repository holds no build output.
+            if level >= depth or {"HEAD", "objects", "refs"} <= names:
+                continue
+            sources = tracked_directories(directory_) \
+                if {".git", "Cargo.toml"} <= names else set()
+            for entry in entries:
+                if entry.name in SKIPPED or entry.name in sources:
+                    continue
+                with contextlib.suppress(OSError):
+                    info = entry.stat(follow_symlinks=False)
+                    if stat.S_ISDIR(info.st_mode) and info.st_dev == device \
+                            and info.st_uid == os.geteuid():
+                        child = Path(entry.path)
+                        pending.append((child, -sys.maxsize if child == mirror else level + 1))
+
+
+def survey(root: Path, cutoff: float) -> tuple[int, list[Path]] | None:
+    """Allocated bytes and profile locks, or None when anything inside was
+    written after cutoff or cannot be read, or the budget ran out: a partial
+    survey proves nothing."""
+    total, locks, pending = 0, [], [root]
+    try:
+        while pending:
+            if deadline_passed():
+                return None
+            directory = pending.pop()
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    info = entry.stat(follow_symlinks=False)
+                    # Copies keep their source's mtime; their ctime is new.
+                    if max(info.st_mtime, info.st_ctime) > cutoff:
+                        return None
+                    if stat.S_ISDIR(info.st_mode):
+                        pending.append(Path(entry.path))
+                        continue
+                    total += info.st_blocks * 512
+                    if entry.name in LOCK_NAMES and len(Path(entry.path).relative_to(root).parts) <= 3:
+                        locks.append(Path(entry.path))
+    except OSError:
+        return None
+    return total, locks
+
+
+@contextlib.contextmanager
+def held(locks: list[Path]):
+    """Hold every lock, or yield False when any is busy or cannot be opened."""
+    descriptors = []
+    try:
+        for lock in locks:
+            try:
+                descriptor = os.open(lock, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            except OSError:
+                yield False
+                return
+            descriptors.append(descriptor)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                yield False
+                return
+        yield True
+    finally:
+        for descriptor in descriptors:
+            os.close(descriptor)
+
+
+def evidence_session(arguments: list[bytes], task: Path, cwd: str = "/") -> bool:
+    """Whether a command line is native-evidence working on task.
+
+    Its session supervisor names the task. Sessions started by any version of
+    the script use both of the task's builds, including one waiting for the
+    native lock before its application has started.
+    """
+    if not any(os.fsdecode(word).endswith("/native-evidence")
+               or os.fsdecode(word) == "native-evidence" for word in arguments):
+        return False
+    for option, value in zip(arguments, arguments[1:]):
+        if option == b"--task":
+            with contextlib.suppress(OSError, ValueError):
+                # A relative one is the process's, from its working directory.
+                if (Path(cwd) / os.fsdecode(value)).resolve() == task:
+                    return True
+    return False
+
+
+def in_use(directory: Path, task: Path | None = None) -> int | None:
+    """A process with anything inside the directory, or None.
+
+    For a native-evidence build, task is its task directory, and a session of
+    that task counts as using it.
+    """
+    prefix = f"{directory}/"
+    def inside(target: str) -> bool:
+        target = target.removesuffix(" (deleted)")
+        return target == str(directory) or target.startswith(prefix)
+    if task is not None:
+        task = task.resolve()
+    for process in os.listdir("/proc"):
+        if not process.isdigit() or int(process) == os.getpid():
+            continue
+        base = f"/proc/{process}"
+        if task is not None:
+            with contextlib.suppress(OSError), open(f"{base}/cmdline", "rb") as cmdline:
+                arguments = cmdline.read().split(b"\0")
+                if b"--task" in arguments and \
+                        evidence_session(arguments, task, os.readlink(f"{base}/cwd")):
+                    return int(process)
+        links = ["cwd", "root", "exe"]
+        with contextlib.suppress(OSError):
+            links += [f"fd/{fd}" for fd in os.listdir(f"{base}/fd")]
+        for link in links:
+            with contextlib.suppress(OSError):
+                if inside(os.readlink(f"{base}/{link}")):
+                    return int(process)
+        with contextlib.suppress(OSError), open(f"{base}/maps") as maps:
+            for line in maps:
+                fields = line.split(None, 5)
+                if len(fields) == 6 and inside(fields[5].rstrip("\n")):
+                    return int(process)
+    return None
+
+
+def put_back(aside: Path, directory: Path) -> bool:
+    """Undo a removal's rename, unless directory was meanwhile created again:
+    then a later run removes the copy once nothing uses it."""
+    if aside == directory:
+        return True
+    try:
+        os.rename(aside, directory)
+    except OSError as error:
+        print(f"kept {aside}, which was in use as it was removed, but cannot "
+              f"put it back as {directory}: {error}", file=sys.stderr, flush=True)
+        return False
+    return True
+
+
+def alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def orphaned(directory: Path, mirror: Path) -> bool:
+    """A mirrored build directory whose workspace is definitely gone."""
+    try:
+        relative = directory.relative_to(mirror)
+    except ValueError:
+        return False
+    if directory.name != "target" or len(relative.parts) < 2:
+        return False
+    try:
+        Path("/", *relative.parts[:-1]).stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def workspace(directory: Path, mirror: Path) -> Path:
+    """The checkout a build directory belongs to: the one it mirrors, or the
+    one it sits in."""
+    try:
+        relative = directory.relative_to(mirror)
+    except ValueError:
+        return directory.parent
+    return Path("/", *relative.parts[:-1])
+
+
+# A main checkout's build seeds its worktrees', so it waits this many times
+# as long as other build output.
+MAIN_CHECKOUT_IDLE_FACTOR = 4
+
+
+def main_checkout(directory: Path, mirror: Path) -> bool:
+    """Whether this is a main checkout's own build: its `.git` is a
+    directory, where a worktree's is a file."""
+    return os.path.isdir(workspace(directory, mirror) / ".git")
+
+
+DEADLINE = [math.inf]
+# The exit status of a run that did not search everything: out of time, or
+# another run was pruning.
+INCOMPLETE = 75
+
+
+def deadline_passed() -> bool:
+    return time.monotonic() >= DEADLINE[0]
+
+
+def nonnegative(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number) or number < 0:
+        raise argparse.ArgumentTypeError("must be finite and nonnegative")
+    return number
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__.split("\n\n")[0],
+        epilog="Roots default to ~/.cache and ~/.local/state, of both the account's "
+               "home and HOME when they differ, and /var/tmp, or CAGENTS_BUILD_PRUNE_ROOTS "
+               "(colon-separated) when set.")
+    parser.add_argument("--apply", action="store_true", help="remove (default: only report)")
+    parser.add_argument("--max-idle", type=nonnegative, default=7.0, metavar="DAYS",
+                        help="remove build directories unwritten this long (default 7)")
+    parser.add_argument("--orphan-hours", type=nonnegative, default=6.0, metavar="HOURS",
+                        help="remove mirrored build directories of removed "
+                             "workspaces unwritten this long (default 6)")
+    parser.add_argument("--evidence-hours", type=nonnegative, default=12.0, metavar="HOURS",
+                        help="remove native-evidence tasks' builds unwritten and unused "
+                             "this long (default 12)")
+    parser.add_argument("--root", action="append", type=Path, default=[], metavar="DIR",
+                        help="also search DIR; repeatable")
+    parser.add_argument("--keep", action="append", type=Path, default=[], metavar="DIR",
+                        help="never remove DIR or anything in it; repeatable")
+    parser.add_argument("--max-depth", type=int, default=6, metavar="LEVELS",
+                        help="search at most this deep under each root (default 6)")
+    parser.add_argument("--mirror", type=Path, default=MIRROR, metavar="DIR",
+                        help="where build directories mirror their workspace's path, "
+                             "as `build-dir = \"DIR{workspace-root}/target\"` names them "
+                             "(default: %(default)s)")
+    parser.add_argument("--keep-checkout", action="append", type=Path, default=[], metavar="DIR",
+                        help="never remove the build of the checkout at DIR, in its "
+                             "target or the mirror; repeatable")
+    parser.add_argument("--log", type=Path, metavar="FILE",
+                        help="append a tab-separated line per removal to FILE")
+    parser.add_argument("--budget", type=nonnegative, metavar="SECONDS",
+                        help="start no search or removal after this long, finishing the "
+                             "removal under way (default: no limit)")
+    parser.add_argument("--wait", action="store_true",
+                        help="when another run is pruning, wait for it within --budget "
+                             "instead of leaving at once; either way search nothing")
+    parser.add_argument("--stamp", type=Path, metavar="FILE",
+                        help="touch FILE once a run has searched everything")
+    parser.add_argument("--output", type=Path, metavar="FILE",
+                        help="once this run holds the lock, write its output to FILE, "
+                             "keeping the last run's as FILE.1")
+    parser.add_argument("--verbose", action="store_true",
+                        help="also say why each build directory in use stays")
+    parser.add_argument("--lock", type=Path, default=Path(f"/var/tmp/cagents-prune-build-dirs-{os.getuid()}.lock"),
+                        metavar="FILE", help="one run at a time holds FILE (default: %(default)s)")
+    arguments = parser.parse_args()
+
+    configured = os.environ.get("CAGENTS_BUILD_PRUNE_ROOTS")
+    roots = [Path(p) for p in configured.split(":") if p] if configured is not None \
+        else default_roots()
+    # Descriptors inherited from a build must not stay open for the run.
+    os.closerange(3, 1024)
+    real = lambda path: Path(os.path.realpath(path))
+    roots = [real(root) for root in roots]
+    arguments.mirror = real(arguments.mirror)
+    # Worktrees' build output, the most there usually is to reclaim, first:
+    # a run with a budget may not reach the rest.
+    first = [real(root) for root in arguments.root]
+    if within(arguments.mirror, roots):
+        first.append(arguments.mirror)
+    roots = first + roots
+    excluded = [real(path) for path in never() + arguments.keep]
+    for checkout in arguments.keep_checkout:
+        checkout = real(checkout)
+        excluded += [checkout / "target",
+                     arguments.mirror / checkout.relative_to("/") / "target"]
+    if arguments.budget is not None:
+        DEADLINE[0] = time.monotonic() + arguments.budget
+
+    runs = open(arguments.lock, "a")
+    try:
+        fcntl.flock(runs, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        # It searches everything this run would, so this one adds nothing;
+        # a caller that needs the space can wait for what it frees.
+        print("another run is pruning; leaving the search to it", flush=True)
+        while arguments.wait and not deadline_passed():
+            time.sleep(min(1.0, max(0.0, DEADLINE[0] - time.monotonic())))
+            try:
+                fcntl.flock(runs, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                continue
+            print("the other run has finished", flush=True)
+            break
+        return INCOMPLETE
+    if arguments.output:
+        # Without it, the run still prunes; its output goes where it was.
+        with contextlib.suppress(OSError):
+            os.replace(arguments.output, f"{arguments.output}.1")
+        with contextlib.suppress(OSError):
+            output = os.open(arguments.output,
+                             os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC, 0o644)
+            os.dup2(output, 1)
+            os.dup2(output, 2)
+            os.close(output)
+
+    now = time.time()
+    idle_cutoff = now - arguments.max_idle * 86400
+    orphan_cutoff = now - arguments.orphan_hours * 3600
+    evidence_cutoff = now - arguments.evidence_hours * 3600
+    removed = kept = 0
+    freed = 0
+    failed = complete = False
+    def note(message):
+        if arguments.verbose:
+            print(message, flush=True)
+
+    for directory in find(roots, excluded, arguments.max_depth, arguments.mirror):
+        if deadline_passed():
+            break
+        leftover = PRUNED.match(directory.name)
+        task = None
+        if leftover:
+            # Another run's renamed copy, which it did not finish removing.
+            if alive(int(leftover["pid"])):
+                continue
+            reason, cutoff = "interrupted removal", now
+        elif evidence_target(directory):
+            # Its task's next build makes it again.
+            task = directory.parent
+            reason = f"native-evidence build, unwritten for {arguments.evidence_hours:g} hours"
+            cutoff = max(idle_cutoff, evidence_cutoff)
+        elif main_checkout(directory, arguments.mirror):
+            days = arguments.max_idle * MAIN_CHECKOUT_IDLE_FACTOR
+            reason, cutoff = f"main checkout's, unwritten for {days:g} days", now - days * 86400
+        elif orphaned(directory, arguments.mirror):
+            reason, cutoff = "workspace removed", max(idle_cutoff, orphan_cutoff)
+        else:
+            reason, cutoff = f"unwritten for {arguments.max_idle:g} days", idle_cutoff
+        surveyed = survey(directory, cutoff)
+        if surveyed is None:
+            kept += 1
+            continue
+        size, locks = surveyed
+        if not arguments.apply:
+            user = in_use(directory, task)
+            if user is not None:
+                note(f"keep {directory}: process {user} uses it")
+                kept += 1
+                continue
+            print(f"would remove {directory} ({size / 2**30:.1f} GiB, {reason})", flush=True)
+            freed += size
+            removed += 1
+            continue
+        aside = directory if leftover else \
+            directory.with_name(f".{directory.name}.cagents-pruned-{os.getpid()}")
+        # The locks are held only to look for users and rename: a build
+        # starting meanwhile waits for no more than that.
+        with held(locks) as free:
+            if not free:
+                note(f"keep {directory}: a build holds its lock")
+                kept += 1
+                continue
+            user = in_use(directory, task)
+            if user is not None:
+                note(f"keep {directory}: process {user} uses it")
+                kept += 1
+                continue
+            try:
+                if aside != directory:
+                    os.rename(directory, aside)
+            except OSError as error:
+                print(f"failed to remove {directory}: {error}", file=sys.stderr, flush=True)
+                failed = True
+                continue
+            # A process that opened it between the first look and the rename,
+            # such as a build waiting for one of these locks, keeps it. While
+            # the locks are held, nothing it started can have got further.
+            if in_use(aside, task) is not None:
+                kept += 1
+                if put_back(aside, directory):
+                    note(f"keep {directory}: used while it was being removed")
+                continue
+        # Anything that wrote to it since the first look keeps it too.
+        if survey(aside, cutoff) is None:
+            kept += 1
+            if put_back(aside, directory):
+                note(f"keep {directory}: written while it was being removed")
+            continue
+        try:
+            shutil.rmtree(aside)
+        except OSError as error:
+            print(f"failed to remove {aside}: {error}", file=sys.stderr, flush=True)
+            failed = True
+            continue
+        freed += size
+        removed += 1
+        print(f"removed {directory} ({size / 2**30:.1f} GiB, {reason})", flush=True)
+        if arguments.log:
+            with contextlib.suppress(OSError), open(arguments.log, "a") as log:
+                log.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')}\t{directory}\t"
+                          f"{size}\t{reason}\n")
+    else:
+        complete = True
+    if not complete or deadline_passed():
+        complete = False
+        print("out of time; the rest waits for the next run", flush=True)
+    elif arguments.stamp:
+        with contextlib.suppress(OSError):
+            arguments.stamp.touch()
+    verb = "removed" if arguments.apply else "would remove"
+    print(f"{verb} {removed} build directories ({freed / 2**30:.1f} GiB); "
+          f"kept {kept} in use or recently written", flush=True)
+    return int(failed) if complete else INCOMPLETE
+
+
+if __name__ == "__main__":
+    sys.exit(main())

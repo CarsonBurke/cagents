@@ -26,8 +26,8 @@
 //! ```
 //!
 //! and keep the allowlist entry only if all three pass. The path must name the
-//! native executable, not a Node launcher: the fixture's `PATH` holds nothing
-//! but that one program. Codex itself may still reach the network for its own
+//! native executable, not a Node launcher: the fixture prepends that program
+//! to its standard utility paths. Codex may still reach the network for its own
 //! housekeeping; the model endpoint never leaves this process.
 
 #[path = "support/hosted_agent_cleanup.rs"]
@@ -454,6 +454,16 @@ impl Fixture {
             fs::create_dir_all(root.path().join(directory)).unwrap();
         }
         fs::set_permissions(root.path().join("run"), fs::Permissions::from_mode(0o700)).unwrap();
+        // Keep project discovery inside this fixture even when TMPDIR has
+        // enclosing Git metadata. This does not qualify the provider itself.
+        let initialized = Self::command(root.path(), Path::new("/usr/bin/git"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(["init", "--quiet", "--template=", "--initial-branch=main"])
+            .arg(root.path().join("project"))
+            .output()
+            .unwrap();
+        assert!(initialized.status.success(), "{initialized:?}");
         symlink(&codex, root.path().join("bin/codex")).unwrap();
         let model = Model::start();
         // No sandbox, so a command's fate depends only on the approval policy

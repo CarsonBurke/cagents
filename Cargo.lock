@@ -1214,6 +1214,7 @@ dependencies = [
  "libcosmic",
  "libghostty-vt",
  "lsp-types",
+ "memchr",
  "mermaid-rs-renderer",
  "notify",
  "portable-pty",
@@ -1276,6 +1277,7 @@ dependencies = [
 name = "cagents-iced-contracts"
 version = "0.1.0"
 dependencies = [
+ "iced_accessibility",
  "iced_core",
 ]
 

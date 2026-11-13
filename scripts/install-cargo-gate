@@ -1,0 +1,168 @@
+#!/bin/sh
+# Install this checkout's cargo gate as the host's shared one.
+#
+# Agents in every checkout run the installed gate, so it must never be seen
+# half-updated, and a running gate must never find another installation's
+# helpers beside it. Each installation is a directory of its own under
+# DIRECTORY/cagents-cargo-gate.d, holding the gate and every helper; the gate
+# finds its helpers beside the file it really is. This checks that the new
+# directory's gate admits and runs a command, and only then points each name
+# in DIRECTORY at it, helpers before the gate, each replaced at once. It checks
+# the installed gate the same way, and records what it installed, from which
+# repository and when, by which gates later install main's newer gate.
+set -eu
+
+program=install-cargo-gate
+fail() {
+    printf '%s: %s\n' "$program" "$*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/install-cargo-gate [DIRECTORY]
+
+Installs scripts/cargo-gate as DIRECTORY/cagents-cargo-gate, with
+cargo-gate-command.py, cargo-host-test-helper.py, cargo-gate-sync.py, cargo-gate-rustc-guard,
+cargo-offload, seed-build-dir, build-disk-guard and
+prune-build-dirs beside it (default DIRECTORY: /var/tmp). Exits 3, changing
+nothing, when the installed gate's version is newer than this checkout's.
+EOF
+}
+
+case ${1:-} in
+    -h|--help) usage; exit 0 ;;
+esac
+[ "$#" -le 1 ] || { usage >&2; exit 2; }
+destination=${1:-/var/tmp}
+[ -d "$destination" ] || fail "$destination is not a directory"
+source=$(cd "$(dirname "$0")" && pwd -P)
+
+# Installed name, then this checkout's file. The gate goes last.
+files='cargo-gate-command.py:cargo-gate-command.py
+cargo-host-test-helper.py:cargo-host-test-helper.py
+cargo-gate-sync.py:cargo-gate-sync.py
+cargo-gate-rustc-guard:cargo-gate-rustc-guard
+cargo-offload:cargo-offload
+seed-build-dir:seed-build-dir
+build-disk-guard:build-disk-guard
+memory-capped:memory-capped
+prune-build-dirs:prune-build-dirs
+cagents-cargo-gate:cargo-gate'
+
+# One installation at a time, by hand or by a gate installing main's: a gate
+# that installs holds this already.
+if [ "${CAGENTS_BUILD_INSTALL_LOCK_HELD-}" != 1 ]; then
+    exec 9>>"$destination/cagents-cargo-gate.install.lock"
+    flock 9 || fail "cannot lock $destination/cagents-cargo-gate.install.lock"
+fi
+unset CAGENTS_BUILD_INSTALL_LOCK_HELD
+
+versions=$destination/cagents-cargo-gate.d
+mkdir -p -- "$versions"
+stage=$(mktemp -d "$versions/v.XXXXXX")
+chmod 755 -- "$stage"
+committed=false
+trap '[ "$committed" = true ] || rm -rf -- "$stage"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+printf '%s\n' "$files" | while IFS=: read -r installed file; do
+    [ -f "$source/$file" ] || fail "missing scripts/$file"
+    cp -- "$source/$file" "$stage/$installed"
+    chmod 755 -- "$stage/$installed"
+    case $file in
+        *.py|cargo-offload|memory-capped|prune-build-dirs) /usr/bin/python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$stage/$installed" ;;
+        *) sh -n "$stage/$installed" ;;
+    esac
+done
+cp -- "$source/install-cargo-gate" "$stage/install-cargo-gate"
+
+# Admits and runs a command through the gate at $1, on a private lock so the
+# check neither waits behind real builds nor holds a slot they need. It should
+# run outside any Cargo workspace; should a temporary directory be inside one,
+# it still neither seeds, checks free space nor starts the pruner.
+smoke() {
+    lock=$(mktemp -d "${TMPDIR:-/tmp}/cagents-gate-smoke.XXXXXX")
+    status=0
+    output=$(cd "$lock" && CAGENTS_BUILD_LOCK="$lock/lock" CAGENTS_BUILD_SLOT_HELD= \
+        CAGENTS_BUILD_FREE_FLOOR_GIB=0 CAGENTS_BUILD_SEED=0 \
+        CAGENTS_BUILD_REMOTE=local CAGENTS_BUILD_INSTALLED_GATE= \
+        "$1" exec sh -c 'printf admitted' 2>"$lock/errors") || status=$?
+    errors=$(cat -- "$lock/errors")
+    rm -rf -- "$lock"
+    [ "$status" = 0 ] && [ "$output" = admitted ] ||
+        fail "$1 did not run a command (exit $status): $output$errors"
+}
+smoke "$stage/cagents-cargo-gate"
+
+# Checkouts defer to the installed gate when it is newer than theirs, so an
+# older one installed over it would hold every checkout back.
+version() {
+    sed -n 's/^gate_version=\([0-9][0-9]*\)$/\1/p' "$1" 2>/dev/null | head -n 1
+}
+staged=$(version "$stage/cagents-cargo-gate")
+current=$(version "$destination/cagents-cargo-gate")
+# Exit 3 tells a gate installing main's that this is no failure; nothing
+# else here exits 3.
+if [ "${staged:-0}" -lt "${current:-0}" ]; then
+    printf '%s: %s\n' "$program" "the installed gate is version $current, newer than this checkout's ${staged:-0}; install from a checkout that has it" >&2
+    exit 3
+fi
+
+# What was installed, file by file, from which commit of which repository,
+# and when.
+/usr/bin/python3 - "$destination/cagents-cargo-gate.installation" "$source" "$stage" "$files" <<'PY'
+import json, os, subprocess, sys, time
+record, source, stage, files = sys.argv[1:]
+def git(*arguments):
+    result = subprocess.run(["git", "-C", source, *arguments], capture_output=True, text=True)
+    return result.stdout.strip() if result.returncode == 0 else None
+names = [line.split(":", 1) for line in files.splitlines()] + [["install-cargo-gate", "install-cargo-gate"]]
+blobs = {}
+for installed, file in names:
+    blob = git("hash-object", "--no-filters", os.path.join(stage, installed))
+    if blob is None:
+        blobs = None
+        break
+    blobs[f"scripts/{file}"] = blob
+commit = os.environ.get("CAGENTS_BUILD_INSTALL_COMMIT")
+if not commit and blobs:
+    # The checkout's commit, unless these files are not that commit's: then
+    # the installation is judged by when it was made.
+    head = git("rev-parse", "-q", "--verify", "HEAD^{commit}")
+    at_head = head and git("rev-parse", *[f"{head}:{path}" for path in blobs])
+    if at_head and at_head.split() == list(blobs.values()):
+        commit = head
+repository = os.environ.get("CAGENTS_BUILD_INSTALL_REPOSITORY") or git(
+    "rev-parse", "--path-format=absolute", "--git-common-dir")
+origin = os.environ.get("CAGENTS_BUILD_INSTALL_ORIGIN") or git("remote", "get-url", "origin")
+with open(record + ".new", "w") as file:
+    json.dump({"files": blobs, "commit": commit, "repository": repository, "origin": origin,
+               "installed_at": time.time(), "directory": os.path.basename(stage)}, file, indent=1)
+    file.write("\n")
+PY
+
+# Each name in the destination now leads into the new installation: helpers
+# first, for a gate from before installations had directories of their own,
+# which finds them by name beside it.
+retired=$(readlink -f -- "$destination/cagents-cargo-gate" 2>/dev/null) || retired=
+printf '%s\n' "$files" | while IFS=: read -r installed file; do
+    ln -s -- "cagents-cargo-gate.d/${stage##*/}/$installed" "$destination/.$installed.new"
+    mv -f -- "$destination/.$installed.new" "$destination/$installed"
+done
+committed=true
+# The replaced installation's time is when it was replaced.
+case $retired in
+    "$(readlink -f -- "$versions")"/v.*/cagents-cargo-gate) touch -c -- "${retired%/*}" ;;
+esac
+mv -f -- "$destination/cagents-cargo-gate.installation.new" "$destination/cagents-cargo-gate.installation"
+# Gates judge main afresh against this installation.
+rm -f -- "$destination/cagents-cargo-gate.checked" "$destination/cagents-cargo-gate.install-failed"
+smoke "$destination/cagents-cargo-gate"
+# Earlier installations a running build may still be using stay a week after
+# they were replaced (see above).
+find "$versions" -mindepth 1 -maxdepth 1 -type d -name 'v.*' ! -name "${stage##*/}" -mtime +7 \
+    -exec rm -rf -- {} + 2>/dev/null || true
+printf '%s: installed %s/cagents-cargo-gate from %s\n' "$program" "$destination" \
+    "$(/usr/bin/python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print((r.get("commit") or "this checkout")[:12])' "$destination/cagents-cargo-gate.installation")"

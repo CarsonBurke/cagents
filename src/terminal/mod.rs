@@ -28,6 +28,7 @@ pub use ipc::TerminalSpawnOptions;
 pub use hosted::{
     HostedTerminalHandle, HostedTerminalStartError, ensure_daemon_ready, ensure_daemon_ready_for,
 };
+pub(crate) use hosted::{ensure_daemon_ready_for_explicit_action, existing_daemon_socket_path};
 pub use snapshot::{
     CellSnapshot, CellStyle, CellText, CursorShape, CursorSnapshot, RenderSnapshot, Rgb,
     RowSnapshot, ScrollSnapshot, Underline,
@@ -47,6 +48,8 @@ pub use widget::{CellMetrics, TerminalWidget};
 pub(crate) use worker::RenderStreamFixture;
 #[cfg(feature = "host")]
 pub use worker::TerminalHandle;
+#[cfg(feature = "host")]
+pub(crate) use worker::TerminalRetirement;
 #[cfg(feature = "host")]
 pub(crate) use worker::UpgradeSnapshot;
 #[cfg(feature = "host")]

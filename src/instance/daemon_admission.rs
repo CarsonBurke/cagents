@@ -2,7 +2,11 @@
 //! Capability bytes are trusted only inside an authenticated live slot lease.
 use super::*;
 use serde::{Deserialize, Serialize};
-use std::os::unix::{fs::FileExt, process::CommandExt};
+use std::{
+    os::unix::{fs::FileExt, process::CommandExt},
+    thread,
+    time::Instant,
+};
 
 pub(crate) const DAEMON_FENCE_ENV: &str = "CAGENTS_DAEMON_LAUNCH_FENCE_FD";
 const DAEMON_FENCE_FD: i32 = 198;
@@ -147,7 +151,202 @@ impl LaunchFence {
 }
 
 fn fence_path() -> io::Result<PathBuf> {
-    Ok(runtime_directory()?.join(format!("{APPLICATION_LOCK_FILE}.update")))
+    Ok(fence_path_in(&runtime_directory()?))
+}
+
+fn fence_path_in(runtime: &Path) -> PathBuf {
+    runtime.join(format!("{APPLICATION_LOCK_FILE}.update"))
+}
+
+/// Beside the launch fence. A dot keeps it out of the window slot namespace.
+fn declaration_path_in(runtime: &Path) -> PathBuf {
+    runtime.join(format!("{APPLICATION_LOCK_FILE}.update.admission"))
+}
+
+/// How long an admission waits out starting windows' momentary probes of its
+/// declaration before it proceeds undeclared.
+const DECLARATION_PATIENCE: Duration = Duration::from_millis(250);
+/// How often a starting window checks whether an admission has finished.
+const ADMISSION_POLL: Duration = Duration::from_millis(50);
+/// A starting window waits for an admission as long as the daemon may take to
+/// start, plus this allowance for its listener to become ready.
+const ADMISSION_WAIT_ALLOWANCE: Duration = Duration::from_secs(10);
+
+/// The exclusive launch fence, held to admit a daemon or to verify windows
+/// rather than to install an update.
+///
+/// The fence alone cannot say why it is held, and a starting window used to
+/// read every exclusive holder as an update. Each admission therefore also
+/// holds a shared lock on a declaration file for as long as it holds the
+/// fence. A window that finds the fence held takes that declaration
+/// exclusively: if it can, no admission holds the fence, so the holder is an
+/// update; if it cannot, an admission does, and the window waits for it.
+/// Holders that predate the declaration still read as updates.
+pub(crate) struct AdmissionFence {
+    // Fields drop in order: the fence is released before its declaration, so
+    // a window can never find this admission's fence undeclared.
+    _fence: OwnedLock,
+    _declaration: Option<OwnedLock>,
+}
+
+impl AdmissionFence {
+    pub(crate) fn acquire() -> io::Result<Self> {
+        Self::acquire_in(&runtime_directory()?)
+    }
+
+    pub(super) fn acquire_in(runtime: &Path) -> io::Result<Self> {
+        // Declare before taking the fence: a window must never see it held by
+        // this admission without the declaration.
+        let declaration = declare_admission(runtime);
+        let fence = owned_lock(&fence_path_in(runtime), libc::LOCK_EX | libc::LOCK_NB)?;
+        Ok(Self {
+            _fence: fence,
+            _declaration: declaration,
+        })
+    }
+}
+
+/// Starting windows hold the declaration exclusively only for the moment it
+/// takes them to check the fence. A declaration that is still unavailable
+/// after that, or cannot be opened at all, is not worth refusing the admission
+/// over: undeclared, it reads as an update, which is what every holder looked
+/// like before declarations existed.
+fn declare_admission(runtime: &Path) -> Option<OwnedLock> {
+    let deadline = Instant::now() + DECLARATION_PATIENCE;
+    loop {
+        match owned_lock(&declaration_path_in(runtime), libc::LOCK_SH | libc::LOCK_NB) {
+            Ok(declaration) => return Some(declaration),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    tracing::warn!("admission proceeds undeclared: a window probe outlasted it");
+                    return None;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => {
+                tracing::warn!(%error, "admission proceeds undeclared");
+                return None;
+            }
+        }
+    }
+}
+
+/// Who holds the launch fence, as a starting window sees it.
+enum FenceHolder {
+    /// Nobody exclusive: this shared hold now admits the window.
+    Nobody(OwnedLock),
+    /// A starting daemon, or a check of the running windows.
+    Admission,
+    /// An update, or a holder too old to declare an admission.
+    Update,
+}
+
+fn fence_holder(runtime: &Path) -> io::Result<FenceHolder> {
+    let fence = fence_path_in(runtime);
+    match owned_lock(&fence, libc::LOCK_SH | libc::LOCK_NB) {
+        Ok(lock) => return Ok(FenceHolder::Nobody(lock)),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+        Err(error) => return Err(error),
+    }
+    // Every admission keeps its declaration for as long as it holds the
+    // fence. While this probe excludes them all, a held fence is an update.
+    let _probe = match owned_lock(&declaration_path_in(runtime), libc::LOCK_EX | libc::LOCK_NB) {
+        Ok(probe) => probe,
+        // An admission, or another starting window's probe: look again.
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            return Ok(FenceHolder::Admission);
+        }
+        // Evidence that cannot be read never turns an update into a wait.
+        Err(_) => return Ok(FenceHolder::Update),
+    };
+    match owned_lock(&fence, libc::LOCK_SH | libc::LOCK_NB) {
+        Ok(lock) => Ok(FenceHolder::Nobody(lock)),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(FenceHolder::Update),
+        Err(error) => Err(error),
+    }
+}
+
+/// Whether an ordinary launch at this instance's local socket would compete
+/// with an update. A daemon admission remains waitable; only authenticated
+/// inherited authority may start a daemon through an update's own fence.
+pub(crate) fn daemon_launch_is_updating(socket: &Path) -> io::Result<bool> {
+    let Some(runtime) = env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+    else {
+        return Ok(false);
+    };
+    if socket
+        != runtime
+            .join(runtime_subdirectory())
+            .join(crate::terminal_ipc::SOCKET_FILE_NAME)
+    {
+        return Ok(false);
+    }
+    let runtime = runtime_directory()?;
+    if inherited_fence()?.is_some() {
+        return Ok(false);
+    }
+    Ok(matches!(fence_holder(&runtime)?, FenceHolder::Update))
+}
+
+/// The daemon did not finish its admission within a starting window's wait.
+#[derive(Debug, Error)]
+pub struct DaemonStillStarting {
+    waited: Duration,
+}
+
+impl std::fmt::Display for DaemonStillStarting {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("the cagents daemon is still starting")?;
+        // A caller that does not wait has nothing worth counting.
+        if self.waited >= Duration::from_secs(1) {
+            write!(formatter, " after {} seconds", self.waited.as_secs())?;
+        }
+        formatter.write_str(
+            "; try again in a moment, or run `cagents daemon status` to see what it is doing",
+        )
+    }
+}
+
+/// How long a starting window waits for a daemon admission.
+pub(crate) fn admission_wait_timeout() -> Duration {
+    // A daemon restoring an upgrade checkpoint may take as long as its
+    // inventory allows. An unreadable checkpoint fails that daemon anyway.
+    crate::upgrade::handoff::startup_timeout().unwrap_or(crate::upgrade::handoff::STARTUP_BASE)
+        + ADMISSION_WAIT_ALLOWANCE
+}
+
+/// Take the launch fence shared, waiting while an admission holds it.
+///
+/// An update still ends the attempt at once with [`UpdateInProgress`]; an
+/// admission that outlasts `timeout` ends it with [`DaemonStillStarting`].
+/// `waiting` hears each check that finds an admission still holding the
+/// fence, with the time waited so far.
+pub(super) fn shared_launch_fence(
+    runtime: &Path,
+    timeout: Duration,
+    waiting: &mut dyn FnMut(Duration),
+) -> io::Result<OwnedLock> {
+    let started = Instant::now();
+    loop {
+        match fence_holder(runtime)? {
+            FenceHolder::Nobody(lock) => return Ok(lock),
+            FenceHolder::Update => {
+                return Err(io::Error::new(io::ErrorKind::WouldBlock, UpdateInProgress));
+            }
+            FenceHolder::Admission => {}
+        }
+        let waited = started.elapsed();
+        if waited >= timeout {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                DaemonStillStarting { waited },
+            ));
+        }
+        waiting(waited);
+        thread::sleep(ADMISSION_POLL.min(timeout - waited));
+    }
 }
 
 /// Read fdinfo on this exact description, not a PID-file claim or contention
@@ -238,9 +437,6 @@ fn forward_fence(
     Ok(())
 }
 
-pub(crate) fn has_inherited_daemon_fence() -> io::Result<bool> {
-    Ok(inherited_fence()?.is_some())
-}
 pub(crate) fn inherit_daemon_fence(command: &mut process::Command) -> io::Result<()> {
     if let Some((file, descriptor)) = inherited_fence()? {
         forward_fence(command, file, Some(descriptor))?;
@@ -251,11 +447,22 @@ pub(crate) fn inherit_daemon_fence(command: &mut process::Command) -> io::Result
 /// Acquire before mutable daemon ownership/socket/store operations and keep
 /// through listener readiness. No live window can publish midway through admit.
 pub(crate) struct DaemonAdmissionGuard {
-    _launch: LaunchFence,
+    _launch: DaemonLaunch,
     _legacy: OwnedLock,
 }
+
+enum DaemonLaunch {
+    /// This daemon's own fence, declared as an admission while it is held.
+    Owned(AdmissionFence),
+    /// An installer's or recovery launcher's fence. It stays held after this
+    /// daemon is ready, for that owner's own work, so it is never declared:
+    /// a window opened meanwhile reports that owner's update.
+    Inherited(LaunchFence),
+}
+
 impl DaemonAdmissionGuard {
     pub(crate) fn acquire() -> io::Result<Self> {
+        let runtime = runtime_directory()?;
         let launch = if let Some((file, descriptor)) = inherited_fence()? {
             upgrade_fence(&file)?;
             // The clone keeps the description alive. Close this process's raw
@@ -263,11 +470,10 @@ impl DaemonAdmissionGuard {
             unsafe {
                 libc::close(descriptor);
             }
-            LaunchFence::Inherited { file, descriptor }
+            DaemonLaunch::Inherited(LaunchFence::Inherited { file, descriptor })
         } else {
-            LaunchFence::Owned(owned_lock(&fence_path()?, libc::LOCK_EX | libc::LOCK_NB)?)
+            DaemonLaunch::Owned(AdmissionFence::acquire_in(&runtime)?)
         };
-        let runtime = runtime_directory()?;
         let legacy = admit_windows(&runtime)?;
         Ok(Self {
             _launch: launch,
@@ -304,6 +510,424 @@ fn admit_windows(runtime: &Path) -> io::Result<OwnedLock> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn update_launch_probe_requires_selected_socket_and_authenticated_inherited_authority() {
+        const CHILD: &str = "CAGENTS_TEST_UPDATE_LAUNCH_AUTHORITY";
+        if let Ok(mode) = env::var(CHILD) {
+            let runtime = runtime_directory().unwrap();
+            let socket = runtime
+                .join(runtime_subdirectory())
+                .join(crate::terminal_ipc::SOCKET_FILE_NAME);
+            let update = UiUpdateGuard::acquire().unwrap();
+            assert!(
+                !daemon_launch_is_updating(
+                    &runtime
+                        .join("unrelated-instance")
+                        .join(crate::terminal_ipc::SOCKET_FILE_NAME)
+                )
+                .unwrap(),
+                "another endpoint must not borrow this runtime's update state"
+            );
+            if mode == "ordinary" {
+                assert!(daemon_launch_is_updating(&socket).unwrap());
+                return;
+            }
+            let descriptor = if mode == "197" { 197 } else { 198 };
+            if mode != "invalid" {
+                // SAFETY: this exact private subprocess owns its reserved FD.
+                // It borrows the update's held open-file description and only
+                // closes the duplicate; validation must not unlock the parent.
+                unsafe {
+                    assert_eq!(
+                        libc::dup2(update.lock.as_ref().unwrap().as_raw_fd(), descriptor),
+                        descriptor
+                    );
+                }
+                assert!(!daemon_launch_is_updating(&socket).unwrap());
+                unsafe { libc::close(descriptor) };
+                assert!(
+                    owned_lock(&fence_path_in(&runtime), libc::LOCK_SH | libc::LOCK_NB).is_err(),
+                    "validating inherited authority must preserve the parent's fence"
+                );
+            } else {
+                assert!(daemon_launch_is_updating(&socket).is_err());
+            }
+            return;
+        }
+        let name = std::thread::current().name().unwrap().to_owned();
+        for mode in ["ordinary", "197", "198", "invalid"] {
+            let runtime = tempfile::tempdir().unwrap();
+            let mut command = process::Command::new(env::current_exe().unwrap());
+            command
+                .args(["--exact", &name, "--nocapture"])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", runtime.path())
+                .env("XDG_RUNTIME_DIR", runtime.path())
+                .env(CHILD, mode);
+            match mode {
+                "197" => {
+                    command.env(INSTALL_GUARD_ENV, "197");
+                }
+                "198" | "invalid" => {
+                    command.env(DAEMON_FENCE_ENV, "198");
+                }
+                _ => {}
+            }
+            if let Some(authority) = env::var_os(crate::agent_execution::AUTHORITY_ENV) {
+                command.env(crate::agent_execution::AUTHORITY_ENV, authority);
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{mode}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    fn fence_wait(runtime: &Path, timeout: Duration) -> (io::Result<OwnedLock>, usize) {
+        let mut checks = 0;
+        let result = shared_launch_fence(runtime, timeout, &mut |_| checks += 1);
+        (result, checks)
+    }
+
+    #[test]
+    fn a_window_waits_out_a_starting_daemon_instead_of_reporting_an_update() {
+        let runtime = tempfile::tempdir().unwrap();
+        let mut admission = Some(AdmissionFence::acquire_in(runtime.path()).unwrap());
+        assert!(matches!(
+            fence_holder(runtime.path()).unwrap(),
+            FenceHolder::Admission
+        ));
+        let mut checks = 0;
+        let lock = shared_launch_fence(runtime.path(), Duration::from_secs(30), &mut |_| {
+            checks += 1;
+            // The daemon's listener becomes ready while the window waits.
+            admission.take();
+        })
+        .expect("a finished admission admits the waiting window");
+        assert_eq!(checks, 1, "the window waited for the admission once");
+        // The window now holds the fence shared, as any starting window does.
+        assert!(
+            owned_lock(
+                &fence_path_in(runtime.path()),
+                libc::LOCK_EX | libc::LOCK_NB
+            )
+            .is_err()
+        );
+        drop(lock);
+    }
+
+    #[test]
+    fn an_undeclared_exclusive_holder_is_still_an_update_at_once() {
+        let runtime = tempfile::tempdir().unwrap();
+        // The reviewed update coordinator, an installer's inherited guard and
+        // admissions built before declarations all hold only the fence.
+        let update = owned_lock(
+            &fence_path_in(runtime.path()),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+        .unwrap();
+        let (result, checks) = fence_wait(runtime.path(), Duration::from_secs(30));
+        let error = result.err().expect("an update refuses the window");
+        assert!(is_update_in_progress(&error));
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(checks, 0, "an update is reported without waiting");
+        drop(update);
+        assert!(fence_wait(runtime.path(), Duration::ZERO).0.is_ok());
+    }
+
+    #[test]
+    fn windows_that_check_together_during_an_update_all_report_it() {
+        let runtime = tempfile::tempdir().unwrap();
+        let _update = owned_lock(
+            &fence_path_in(runtime.path()),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+        .unwrap();
+        // Another starting window is in the middle of its own check, so it
+        // holds the declaration this window needs to rule out an admission.
+        let mut other_window = Some(
+            owned_lock(
+                &declaration_path_in(runtime.path()),
+                libc::LOCK_EX | libc::LOCK_NB,
+            )
+            .unwrap(),
+        );
+        let mut checks = 0;
+        let result = shared_launch_fence(runtime.path(), Duration::from_secs(30), &mut |_| {
+            checks += 1;
+            other_window.take();
+        });
+        assert!(is_update_in_progress(&result.err().unwrap()));
+        assert_eq!(checks, 1, "one more look, not the whole startup wait");
+    }
+
+    #[test]
+    fn an_update_that_follows_an_admission_is_reported_as_an_update() {
+        let runtime = tempfile::tempdir().unwrap();
+        let mut admission = Some(AdmissionFence::acquire_in(runtime.path()).unwrap());
+        let mut _update = None;
+        let mut checks = 0;
+        let result = shared_launch_fence(runtime.path(), Duration::from_secs(30), &mut |_| {
+            checks += 1;
+            // The daemon becomes ready, and an update takes the fence before
+            // the waiting window looks again.
+            admission.take();
+            _update = Some(
+                owned_lock(
+                    &fence_path_in(runtime.path()),
+                    libc::LOCK_EX | libc::LOCK_NB,
+                )
+                .unwrap(),
+            );
+        });
+        assert!(is_update_in_progress(&result.err().unwrap()));
+        assert_eq!(checks, 1);
+    }
+
+    #[test]
+    fn an_admission_that_outlasts_the_wait_ends_as_a_startup_failure_not_an_update() {
+        let runtime = tempfile::tempdir().unwrap();
+        let _admission = AdmissionFence::acquire_in(runtime.path()).unwrap();
+        let (result, checks) = fence_wait(runtime.path(), Duration::from_millis(120));
+        let error = result.err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(!is_update_in_progress(&error));
+        assert!(
+            error
+                .get_ref()
+                .is_some_and(|inner| inner.is::<DaemonStillStarting>()),
+            "{error}"
+        );
+        assert!(error.to_string().contains("still starting"), "{error}");
+        assert!(checks >= 1);
+        // A caller that must not block, such as an opening editor, learns the
+        // same thing at once.
+        let (result, checks) = fence_wait(runtime.path(), Duration::ZERO);
+        let error = result.err().unwrap();
+        assert_eq!(checks, 0);
+        assert!(!is_update_in_progress(&error));
+        assert_eq!(
+            error.to_string(),
+            "the cagents daemon is still starting; try again in a moment, or run `cagents daemon status` to see what it is doing"
+        );
+    }
+
+    #[test]
+    fn a_daemon_that_dies_during_admission_releases_waiting_windows() {
+        const HOLDER: &str = "CAGENTS_TEST_DAEMON_ADMISSION_HOLDER";
+        if let Some(runtime) = env::var_os(HOLDER) {
+            let runtime = PathBuf::from(runtime);
+            let _admission = AdmissionFence::acquire_in(&runtime).unwrap();
+            fs::write(runtime.join("holder-ready"), b"").unwrap();
+            thread::sleep(Duration::from_secs(120));
+            return;
+        }
+        /// A failed assertion must not leave the holder sleeping behind.
+        struct Holder(process::Child);
+        impl Drop for Holder {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let runtime = tempfile::tempdir().unwrap();
+        let mut holder = Holder(
+            process::Command::new(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "instance::daemon_admission::tests::a_daemon_that_dies_during_admission_releases_waiting_windows",
+                    "--nocapture",
+                ])
+                .env(HOLDER, runtime.path())
+                .stdout(process::Stdio::null())
+                .stderr(process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !runtime.path().join("holder-ready").exists() {
+            if let Some(status) = holder.0.try_wait().unwrap() {
+                panic!("admission holder exited before admitting: {status}");
+            }
+            assert!(Instant::now() < deadline, "admission holder did not start");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let mut checks = 0;
+        let lock = shared_launch_fence(runtime.path(), Duration::from_secs(60), &mut |_| {
+            checks += 1;
+            if checks == 1 {
+                holder.0.kill().unwrap();
+                holder.0.wait().unwrap();
+            }
+        })
+        .expect("a dead admission leaves neither a wait nor an update behind");
+        assert_eq!(checks, 1);
+        drop(lock);
+    }
+
+    #[test]
+    fn production_guards_tell_daemon_startup_from_an_update() {
+        const CHILD: &str = "CAGENTS_TEST_PRODUCTION_LAUNCH_GUARDS";
+        if env::var_os(CHILD).is_none() {
+            // The guards locate their runtime through the environment. Give
+            // them a private one in a fresh process rather than mutating the
+            // shared test runner's environment.
+            let root = tempfile::tempdir().unwrap();
+            let runtime = root.path().join("runtime");
+            fs::create_dir(&runtime).unwrap();
+            fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+            let output = process::Command::new(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "instance::daemon_admission::tests::production_guards_tell_daemon_startup_from_an_update",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("XDG_RUNTIME_DIR", &runtime)
+                .env("XDG_STATE_HOME", root.path().join("state"))
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env_remove(DAEMON_FENCE_ENV)
+                .env_remove(INSTALL_GUARD_ENV)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated launch guard fixture failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+        // A daemon started on its own holds the fence until it is ready.
+        let mut daemon = Some(DaemonAdmissionGuard::acquire().unwrap());
+        let mut checks = 0;
+        let lease = WindowLease::acquire_waiting(false, None, &mut |_| {
+            checks += 1;
+            daemon.take();
+        })
+        .expect("a window opened during daemon startup opens once it is ready");
+        assert_eq!(checks, 1);
+        drop(lease);
+        // A daemon admitted under an installer's or recovery launcher's fence
+        // is not declared: that owner keeps the fence after the daemon is
+        // ready, so a window opened meanwhile reports its update.
+        let launcher = owned_lock(&fence_path().unwrap(), libc::LOCK_SH | libc::LOCK_NB).unwrap();
+        // SAFETY: this fresh process runs only this test, so it owns FD198
+        // and no other thread reads the environment while it changes.
+        unsafe {
+            assert_eq!(
+                libc::dup2(launcher.as_raw_fd(), DAEMON_FENCE_FD),
+                DAEMON_FENCE_FD
+            );
+            env::set_var(DAEMON_FENCE_ENV, DAEMON_FENCE_FD.to_string());
+        }
+        let daemon = DaemonAdmissionGuard::acquire().unwrap();
+        // SAFETY: as above.
+        unsafe { env::remove_var(DAEMON_FENCE_ENV) };
+        let error = WindowLease::acquire_waiting(false, None, &mut |_| {
+            panic!("a window must not wait out an inherited update fence")
+        })
+        .err()
+        .unwrap();
+        assert!(is_update_in_progress(&error), "{error}");
+        drop(daemon);
+        drop(launcher);
+        // The reviewed update coordinator holds the same fence for an update.
+        let update = UiUpdateGuard::acquire().unwrap();
+        let error = WindowLease::acquire_waiting(true, None, &mut |_| {
+            panic!("a window must not wait out an update")
+        })
+        .err()
+        .unwrap();
+        assert!(is_update_in_progress(&error), "{error}");
+        drop(update);
+
+        // Launches that wait together share one startup notice.
+        #[cfg(feature = "ui")]
+        {
+            let sleeper = || process::Command::new("sleep").arg("30").spawn();
+            show_startup_wait_notice(sleeper).unwrap();
+            show_startup_wait_notice(|| panic!("a second launch shows no second notice")).unwrap();
+            dismiss_startup_wait_notice();
+            let mut shown = false;
+            show_startup_wait_notice(|| {
+                shown = true;
+                sleeper()
+            })
+            .unwrap();
+            assert!(shown, "a dismissed notice lets the next launch show one");
+            dismiss_startup_wait_notice();
+        }
+    }
+
+    #[test]
+    fn a_window_probe_never_refuses_an_admission() {
+        let runtime = tempfile::tempdir().unwrap();
+        let declaration = declaration_path_in(runtime.path());
+        // A starting window checks the fence while holding the declaration.
+        let probe = owned_lock(&declaration, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            drop(probe);
+        });
+        let admission = AdmissionFence::acquire_in(runtime.path()).unwrap();
+        release.join().unwrap();
+        assert!(
+            admission._declaration.is_some(),
+            "the admission outwaited the probe"
+        );
+        drop(admission);
+
+        // A probe that never ends costs only the declaration, not the
+        // daemon's startup: the admission then reads as an update, as every
+        // holder did before declarations.
+        let stuck = owned_lock(&declaration, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        let admission = AdmissionFence::acquire_in(runtime.path()).unwrap();
+        assert!(admission._declaration.is_none());
+        drop(stuck);
+        assert!(matches!(
+            fence_holder(runtime.path()).unwrap(),
+            FenceHolder::Update
+        ));
+        drop(admission);
+        assert!(matches!(
+            fence_holder(runtime.path()).unwrap(),
+            FenceHolder::Nobody(_)
+        ));
+    }
+
+    #[test]
+    fn concurrent_admissions_share_one_declaration() {
+        let runtime = tempfile::tempdir().unwrap();
+        let first = AdmissionFence::acquire_in(runtime.path()).unwrap();
+        // The fence itself still admits one holder at a time, and a refused
+        // admission withdraws its declaration with its error.
+        assert_eq!(
+            AdmissionFence::acquire_in(runtime.path())
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(first);
+        assert!(matches!(
+            fence_holder(runtime.path()).unwrap(),
+            FenceHolder::Nobody(_)
+        ));
+        // A declaration alone, as when an admission has declared but not yet
+        // taken the fence, never delays a window: the fence is free.
+        let _declared = declare_admission(runtime.path()).unwrap();
+        assert!(matches!(
+            fence_holder(runtime.path()).unwrap(),
+            FenceHolder::Nobody(_)
+        ));
+    }
+
     fn replace_capability(lease: &File, capability: &WindowCapability) {
         let bytes = serde_json::to_vec(capability).unwrap();
         lease.set_len(0).unwrap();
@@ -318,7 +942,7 @@ mod tests {
             libc::LOCK_EX | libc::LOCK_NB,
         )
         .unwrap();
-        publish_capability(&mut lease.0).unwrap();
+        publish_capability(lease.file_mut()).unwrap();
         assert!(admit_windows(runtime.path()).is_ok());
         let mut capability = WindowCapability {
             format: 1,

@@ -120,49 +120,145 @@ pub(super) struct Preview {
     pub(super) text: String,
     pub(super) tail: String,
     language: Language,
-    /// The text highlighted in both palettes, drawn from on every frame.
-    block: prose::CodeBlock,
+    /// The text drawn in each palette, drawn from on every frame.
+    spans: [Arc<[iced::widget::text::Span<'static, markdown::Uri>]>; 2],
     theme: crate::settings::EditorSyntaxTheme,
 }
 
-/// A tool's short target when the input supplies one; otherwise describe
-/// the disclosure without promoting arbitrary payload text into the transcript.
-fn tool_preview(input: &str) -> String {
-    // Bound all inspection, including trimming a whitespace-only JSON prefix
-    // that Claude can publish before the rest of its streamed input arrives.
-    if input.len() > CachedItem::HIGHLIGHT_LIMIT {
-        return "Input available".into();
-    }
-    if input.trim().is_empty() {
-        return String::new();
-    }
-    let object = serde_json::from_str::<serde_json::Value>(input).ok();
-    let Some(object) = object.as_ref().and_then(serde_json::Value::as_object) else {
-        return "Input available".into();
+/// How far back from the end of a failed command's output its diagnostic is
+/// looked for. A compiler prints its first error well before the summary that
+/// ends the run, but a log that kept going for megabytes after the failure is
+/// not searched in full on the way to drawing one row.
+const DIAGNOSTIC_WINDOW: usize = 16 * 1024;
+
+/// The line of a step's output its closed row shows under what it is.
+///
+/// While a command runs, or once it has worked, that is the last line it
+/// printed: the build's progress, or the summary it ended on. When it failed,
+/// the last line is usually a summary that says only that it failed
+/// ("error: could not compile `app`") or whatever noise followed the failure,
+/// so the row shows the first line in the end of the output that reads as a
+/// diagnostic, `error[E0308]: mismatched types` rather than the summary.
+fn tail_line<'a>(content: &ItemContent, output: &'a str) -> &'a str {
+    let last = || {
+        output
+            .rsplit('\n')
+            .map(str::trim_end)
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or_default()
     };
-    for key in [
-        "file_path",
-        "path",
-        "url",
-        "query",
-        "pattern",
-        "skill",
-        "subject",
-    ] {
-        if let Some(value) = object.get(key).and_then(serde_json::Value::as_str) {
-            let value = value.trim();
-            // Long prose and multiline documents are detail, even when a
-            // provider uses a familiar target field for them.
-            if !value.is_empty() && value.chars().count() <= 120 && !value.contains(['\n', '\r']) {
-                return value.to_owned();
-            }
+    let failed = match content {
+        ItemContent::Command {
+            status, exit_code, ..
+        } => {
+            matches!(status, chat::ToolStatus::Failed | chat::ToolStatus::Stopped)
+                || exit_code.is_some_and(|code| code != 0)
         }
+        ItemContent::Tool { .. } => true,
+        _ => false,
+    };
+    if !failed {
+        return last();
     }
-    match object.len() {
-        0 => String::new(),
-        1 => "1 input field".into(),
-        count => format!("{count} input fields"),
+    let mut start = output.len().saturating_sub(DIAGNOSTIC_WINDOW);
+    while !output.is_char_boundary(start) {
+        start += 1;
     }
+    // A window that begins mid-line would offer a fragment of a line.
+    let window = if start == 0 || output[..start].ends_with('\n') {
+        &output[start..]
+    } else {
+        match output[start..].find('\n') {
+            Some(newline) => &output[start + newline + 1..],
+            None => "",
+        }
+    };
+    window
+        .lines()
+        .map(str::trim_end)
+        .find(|line| is_diagnostic(line))
+        .unwrap_or_else(last)
+}
+
+/// Whether a line of output reads as the reason a command failed.
+///
+/// The test is lexical, as a reader scanning a log would apply it, and it
+/// looks where tools put the reason rather than anywhere in the line, so a
+/// source excerpt (`12 |     error: Option<String>,`) or an application's
+/// log (`ERROR app: retrying`) printed before the failure does not stand in
+/// for it:
+///
+/// - a severity opens the message, after any `path:line:` location
+///   (`error[E0308]:`, `src/a.ts(3,5): error TS2322:`, `fatal: not a git
+///   repository`, `FAILED tests/x.py::t - AssertionError`);
+/// - a thread panicked (`thread 'main' panicked at src/lib.rs:5:9:`);
+/// - an exception was raised and not caught (`ValueError: bad`,
+///   `java.lang.IllegalStateException: closed`, `TypeError: x is undefined`).
+fn is_diagnostic(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    opens_with_severity(after_location(trimmed))
+        || trimmed.contains(" panicked at ")
+        || names_exception(line)
+}
+
+/// The message of a compiler-style line, past the location it starts with:
+/// `src/a.rs:3:5: error: …`, `src/a.ts(3,5): error TS2322: …`, or
+/// `src/a.ts:3:5 - error TS2322: …`.
+fn after_location(line: &str) -> &str {
+    let Some((token, rest)) = line.split_once(' ') else {
+        return line;
+    };
+    let located = token
+        .as_bytes()
+        .windows(2)
+        .any(|pair| matches!(pair[0], b':' | b'(') && pair[1].is_ascii_digit());
+    if !located {
+        return line;
+    }
+    if token.ends_with(':') {
+        rest.trim_start()
+    } else {
+        rest.strip_prefix("- ").unwrap_or(line)
+    }
+}
+
+fn opens_with_severity(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    let after = |word: &str| lower.strip_prefix(word);
+    if let Some(rest) = after("error") {
+        // `error:` and `error[E0308]:`, or a coded `error TS2322:`.
+        return rest.starts_with([':', '['])
+            || rest.strip_prefix(' ').is_some_and(|code| {
+                let code = code.split(|ch: char| !ch.is_ascii_alphanumeric()).next();
+                code.is_some_and(|code| {
+                    code.starts_with(|ch: char| ch.is_ascii_alphabetic())
+                        && code.ends_with(|ch: char| ch.is_ascii_digit())
+                })
+            });
+    }
+    if let Some(rest) = after("fatal") {
+        return rest.starts_with(':') || rest.starts_with(" error");
+    }
+    if let Some(rest) = after("failed").or_else(|| after("failure")) {
+        return rest.starts_with([':', ' ']);
+    }
+    if let Some(rest) = after("exception") {
+        return rest.starts_with(':') || rest.starts_with(" in thread");
+    }
+    after("panic:").is_some()
+}
+
+/// Whether the line is an uncaught exception as runtimes report it: an
+/// exception's name at the start of the line, then its message.
+fn names_exception(line: &str) -> bool {
+    let name = line.split(':').next().unwrap_or(line);
+    let last = name.rsplit('.').next().unwrap_or(name);
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '$'))
+        && (last.ends_with("Error") || last.ends_with("Exception"))
+        && (name.len() == line.len() || line[name.len()..].starts_with(": "))
 }
 
 impl Preview {
@@ -171,60 +267,60 @@ impl Preview {
             text: String::new(),
             tail: String::new(),
             language: Language::Plain,
-            block: prose::CodeBlock::new(None, "", theme),
+            spans: prose::CodeBlock::drawn(None, "", theme),
             theme,
         }
     }
 
     pub(super) fn retained_bytes(&self) -> usize {
-        self.text.capacity() + self.tail.capacity() + self.block.retained_span_bytes()
+        self.text.capacity()
+            + self.tail.capacity()
+            + self
+                .spans
+                .iter()
+                .flat_map(|spans| spans.iter())
+                .map(|span| std::mem::size_of_val(span) + span.text.len())
+                .sum::<usize>()
     }
 
+    /// `title` is what a plain tool call's row says it did, formed once with
+    /// the rest of its presentation; nothing here reads the call's input.
     pub(super) fn update(
         previous: Option<Self>,
         content: &ItemContent,
+        title: Option<&super::tool_title::Title>,
         theme: crate::settings::EditorSyntaxTheme,
     ) -> Self {
         let (source, language, output) = match content {
             // Only a shell command is shell: a read's or a search's command
             // is the path or the pattern it was given.
+            // A shell row names the command, as `turn::step_label` does; a
+            // provider's description is only drawn as prose when the command
+            // itself is missing.
             ItemContent::Command {
                 command,
-                label,
-                action: chat::CommandAction::Run,
-                output,
-                ..
-            } if label.is_empty() || label == command => (
-                Cow::Borrowed(turn::first_line(command)),
-                Language::Shell,
-                output.as_str(),
-            ),
-            ItemContent::Command {
                 action: chat::CommandAction::Run,
                 output,
                 ..
             } => (
-                Cow::Borrowed(turn::step_label(content)),
-                Language::Plain,
+                turn::step_label(content),
+                if command.trim().is_empty() {
+                    Language::Plain
+                } else {
+                    Language::Shell
+                },
                 output.as_str(),
             ),
             // The last line of a file that was read, or of a search's
             // matches, says nothing about how the step went.
-            ItemContent::Command { .. } => (
-                Cow::Borrowed(turn::step_label(content)),
-                Language::Plain,
-                "",
-            ),
+            ItemContent::Command { .. } => (turn::step_label(content), Language::Plain, ""),
             // Unknown tools can carry prompts, entire documents, and protocol
             // framing. Their raw arguments and successful output belong to
             // the explicit Input/Output disclosure, not the closed row.
-            ItemContent::Tool {
-                input,
-                output,
-                status,
-                ..
-            } => (
-                Cow::Owned(tool_preview(input)),
+            ItemContent::Tool { output, status, .. } => (
+                // A tool the row names by what it did already says what it
+                // acted on; any other keeps its input's short target here.
+                Cow::Borrowed(title.map_or("", |title| title.target.as_str())),
                 Language::Plain,
                 if matches!(
                     status,
@@ -235,11 +331,7 @@ impl Preview {
                     ""
                 },
             ),
-            _ => (
-                Cow::Borrowed(turn::step_label(content)),
-                Language::Plain,
-                "",
-            ),
+            _ => (turn::step_label(content), Language::Plain, ""),
         };
         // Bound preview work independently of the complete source kept for
         // expansion and copying. Layout also caps wrapped text at two rows.
@@ -252,13 +344,7 @@ impl Preview {
             text
         };
         let text = bounded(&source);
-        let tail = bounded(
-            output
-                .rsplit('\n')
-                .map(str::trim_end)
-                .find(|line| !line.trim().is_empty())
-                .unwrap_or_default(),
-        );
+        let tail = bounded(tail_line(content, output));
         if let Some(previous) = previous
             && previous.text == text
             && previous.language == language
@@ -266,31 +352,32 @@ impl Preview {
         {
             return Self { tail, ..previous };
         }
-        let block = prose::CodeBlock::new(language.token(), &text, theme);
+        let spans = prose::CodeBlock::drawn(language.token(), &text, theme);
         Self {
             text,
             tail,
             language,
-            block,
+            spans,
             theme,
         }
     }
 
     pub(super) fn rehighlight(&mut self, theme: crate::settings::EditorSyntaxTheme) {
         self.theme = theme;
-        self.block = prose::CodeBlock::new(self.language.token(), &self.text, theme);
+        self.spans = prose::CodeBlock::drawn(self.language.token(), &self.text, theme);
     }
 
     pub(super) fn view(&self) -> Element<'static, Message> {
-        let text = iced::widget::rich_text(self.block.spans(cosmic::theme::is_dark()).clone())
-            .font(iced::Font::MONOSPACE)
-            .size(design::TEXT_BODY)
-            .line_height(1.3)
-            .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
-            .width(Length::Fill)
-            .ellipsize(iced::advanced::text::Ellipsize::End(
-                iced::advanced::text::EllipsizeHeightLimit::Lines(2),
-            ));
+        let text =
+            iced::widget::rich_text(self.spans[usize::from(cosmic::theme::is_dark())].clone())
+                .font(iced::Font::MONOSPACE)
+                .size(design::TEXT_BODY)
+                .line_height(1.3)
+                .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                .width(Length::Fill)
+                .ellipsize(iced::advanced::text::Ellipsize::End(
+                    iced::advanced::text::EllipsizeHeightLimit::Lines(2),
+                ));
         // Rich text keeps the full paragraph's intrinsic height even with a
         // line-count ellipsis. Supply the matching layout limit as well;
         // Shrink preserves a single row for short previews.
@@ -352,7 +439,7 @@ impl ToolText {
                 .syntax
                 .borrow()
                 .as_ref()
-                .map_or(0, |(_, block)| block.retained_span_bytes())
+                .map_or(0, |(_, block)| block.retained_bytes())
     }
 
     pub(super) fn update(previous: Option<Self>, text: &str, language: Language) -> Self {
@@ -487,10 +574,9 @@ impl ToolText {
                 prose::CodeBlock::new(self.language.token(), &self.text, theme),
             ));
         }
-        let spans = syntax
+        let highlight = syntax
             .as_ref()
-            .map(|(_, block)| block.spans(cosmic::theme::is_dark()).clone())
-            .unwrap_or_else(|| Arc::from([]));
+            .map(|(_, block)| block.highlight(cosmic::theme::is_dark()).clone());
         let logical_id = logical.as_ref().map(|logical| logical.identity);
         let previous_width = reader.as_ref().map_or(0.0, |(memory, context, identity)| {
             memory.reader_width_for(
@@ -501,7 +587,7 @@ impl ToolText {
         });
         let body = widget::container(prose::code_text(
             self.text.clone(),
-            spans,
+            highlight,
             design::TEXT_BODY.into(),
             iced::Font::MONOSPACE,
             target,
@@ -590,6 +676,24 @@ impl ToolText {
 mod tests {
     use super::*;
 
+    /// A preview as a cached row forms it, its title read once beside it.
+    fn preview_of(
+        previous: Option<Preview>,
+        content: &ItemContent,
+        theme: crate::settings::EditorSyntaxTheme,
+    ) -> Preview {
+        let title = match content {
+            ItemContent::Tool {
+                name,
+                input,
+                status,
+                ..
+            } => Some(super::super::tool_title::Title::of(name, input, *status)),
+            _ => None,
+        };
+        Preview::update(previous, content, title.as_ref(), theme)
+    }
+
     // Geometry fixtures explicitly finish the same preparation stage before
     // inspecting glyphs. Timed frame/native workloads never use this helper.
     fn laid_out(
@@ -664,32 +768,34 @@ mod tests {
             .as_ref()
             .unwrap()
             .1
-            .spans(cosmic::theme::is_dark())
+            .highlight(cosmic::theme::is_dark())
             .clone();
         read(&block);
-        assert!(Arc::ptr_eq(
-            &first,
-            block
-                .syntax
-                .borrow()
-                .as_ref()
-                .unwrap()
-                .1
-                .spans(cosmic::theme::is_dark())
-        ));
+        assert!(
+            first.ptr_eq(
+                block
+                    .syntax
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .1
+                    .highlight(cosmic::theme::is_dark())
+            )
+        );
         let appended = format!("{source}next\n");
         block = ToolText::update(Some(block), &appended, Language::Shell);
         assert_eq!(read(&block).as_ref(), appended);
-        assert!(!Arc::ptr_eq(
-            &first,
-            block
-                .syntax
-                .borrow()
-                .as_ref()
-                .unwrap()
-                .1
-                .spans(cosmic::theme::is_dark())
-        ));
+        assert!(
+            !first.ptr_eq(
+                block
+                    .syntax
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .1
+                    .highlight(cosmic::theme::is_dark())
+            )
+        );
     }
 
     #[test]
@@ -1190,11 +1296,19 @@ mod tests {
                 Language::Shell,
                 "   Compiling b",
             ),
+            // A provider's description does not take the command's place.
             (
                 command("Run the tests", "cargo test", Run, "ok\n"),
+                "cargo test",
+                Language::Shell,
+                "ok",
+            ),
+            // Without a command, the description is all there is to say.
+            (
+                command("Run the tests", "", Run, ""),
                 "Run the tests",
                 Language::Plain,
-                "ok",
+                "",
             ),
             // A read's command is a path, its output is the file, and a
             // stored label loses its verb.
@@ -1212,7 +1326,7 @@ mod tests {
             ),
             (tool("{\"query\":\"x\"}"), "x", Language::Plain, ""),
         ] {
-            let preview = Preview::update(None, &content, theme);
+            let preview = preview_of(None, &content, theme);
             assert_eq!(
                 (
                     preview.text.as_str(),
@@ -1229,7 +1343,7 @@ mod tests {
             *output = "first\nlast\n".into();
         }
         // Successful generic output stays in the explicit disclosure.
-        let preview = Preview::update(None, &finished, theme);
+        let preview = preview_of(None, &finished, theme);
         assert_eq!(
             (
                 preview.text.as_str(),
@@ -1239,15 +1353,147 @@ mod tests {
             ("x", Language::Plain, "")
         );
         // New output moves the tail and leaves the highlighted command alone.
-        let before = Preview::update(None, &command("", "cargo test", Run, "one\n"), theme);
-        let spans = before.block.spans(true).clone();
-        let after = Preview::update(
+        let before = preview_of(None, &command("", "cargo test", Run, "one\n"), theme);
+        let spans = before.spans[1].clone();
+        let after = preview_of(
             Some(before),
             &command("", "cargo test", Run, "one\ntwo\n"),
             theme,
         );
         assert_eq!(after.tail, "two");
-        assert!(Arc::ptr_eq(&spans, after.block.spans(true)));
+        assert!(Arc::ptr_eq(&spans, &after.spans[1]));
+    }
+
+    /// A failed command's row shows why it failed, not the summary or noise
+    /// it ended on; a running or finished one follows its last line.
+    #[test]
+    fn a_failed_command_previews_its_diagnostic() {
+        let theme = crate::settings::EditorSyntaxTheme::Auto;
+        let cargo = "   Compiling app v0.1.0\n\
+            error[E0308]: mismatched types\n --> src/main.rs:2:18\n\
+            \x20 |\n2 |     let x: u8 = \"a\";\n\n\
+            error: could not compile `app` (bin \"app\") due to 1 previous error\n";
+        let ran = |status, exit_code, output: &str| ItemContent::Command {
+            label: "Build the app".into(),
+            command: "cargo build".into(),
+            working_directory: String::new(),
+            action: chat::CommandAction::Run,
+            status,
+            exit_code,
+            duration_ms: None,
+            output: output.into(),
+        };
+        let tail = |content: &ItemContent| preview_of(None, content, theme).tail;
+        use chat::ToolStatus::{Failed, Running, Succeeded};
+        assert_eq!(
+            tail(&ran(Failed, Some(101), cargo)),
+            "error[E0308]: mismatched types"
+        );
+        // Claude reports a failure without an exit code.
+        assert_eq!(
+            tail(&ran(Failed, None, cargo)),
+            "error[E0308]: mismatched types"
+        );
+        // A nonzero exit is a failure even where the status lags.
+        assert_eq!(
+            tail(&ran(
+                Succeeded,
+                Some(1),
+                "fatal: not a git repository\nusage: git\n"
+            )),
+            "fatal: not a git repository"
+        );
+        // Noise printed after the failure does not hide it.
+        let noisy = format!(
+            "thread 'tests::adds' panicked at src/lib.rs:5:9:\n{}\n",
+            "x".repeat(3000)
+        );
+        assert_eq!(
+            tail(&ran(Failed, Some(101), &noisy)),
+            "thread 'tests::adds' panicked at src/lib.rs:5:9:"
+        );
+        // While it runs, and once it worked, the row follows the last line.
+        assert_eq!(
+            tail(&ran(Running, None, cargo)),
+            "error: could not compile `app` (bin \"app\") due to 1 previous error"
+        );
+        assert_eq!(
+            tail(&ran(
+                Succeeded,
+                Some(0),
+                "running 3 tests\nerrors.rs ok\ntest result: ok\n"
+            )),
+            "test result: ok"
+        );
+        // A failure with nothing that reads as a diagnostic keeps its last line.
+        assert_eq!(
+            tail(&ran(
+                Failed,
+                Some(2),
+                "checked errors.rs\nno failures here\ndone\n"
+            )),
+            "done"
+        );
+        // Only the end of a long log is searched, from a whole line.
+        let early = format!(
+            "error: early\n{}\nlast line\n",
+            "ok\n".repeat(super::DIAGNOSTIC_WINDOW)
+        );
+        assert_eq!(tail(&ran(Failed, Some(1), &early)), "last line");
+        let multibyte = format!("{}\nerror: late\n", "λ".repeat(super::DIAGNOSTIC_WINDOW));
+        assert_eq!(tail(&ran(Failed, Some(1), &multibyte)), "error: late");
+        // A window that starts on a line boundary keeps that line.
+        let aligned = format!(
+            "x\nerror: aligned\n{}\n",
+            "x".repeat(super::DIAGNOSTIC_WINDOW - 16)
+        );
+        assert!(aligned[..aligned.len() - super::DIAGNOSTIC_WINDOW].ends_with('\n'));
+        assert_eq!(tail(&ran(Failed, Some(1), &aligned)), "error: aligned");
+        // Other toolchains put the reason in their own places.
+        for (output, reason) in [
+            (
+                "Traceback (most recent call last):\n  File \"a.py\", line 3, in <module>\n\
+                 \x20   raise ValueError(\"bad\")\nValueError: bad\n",
+                "ValueError: bad",
+            ),
+            (
+                "Exception in thread \"main\" java.lang.IllegalStateException: closed\n\
+                 \tat App.main(App.java:3)\n",
+                "Exception in thread \"main\" java.lang.IllegalStateException: closed",
+            ),
+            (
+                "/app/a.js:2\n  x();\n  ^\n\nTypeError: x is not a function\n    at Object.<anonymous>\n",
+                "TypeError: x is not a function",
+            ),
+            (
+                "> tsc\n\nsrc/a.ts(3,5): error TS2322: Type 'string' is not assignable.\n\
+                 npm error Lifecycle script `build` failed with error:\nnpm error code 2\n",
+                "src/a.ts(3,5): error TS2322: Type 'string' is not assignable.",
+            ),
+            (
+                "src/a.ts:3:5 - error TS2322: Type 'string' is not assignable.\n\n3 x\n\nFound 1 error.\n",
+                "src/a.ts:3:5 - error TS2322: Type 'string' is not assignable.",
+            ),
+            (
+                "a.c:1:10: fatal error: missing.h: No such file or directory\ncompilation terminated.\n",
+                "a.c:1:10: fatal error: missing.h: No such file or directory",
+            ),
+            // Source excerpts and application logs printed before the
+            // failure are not it.
+            (
+                "warning: unused field\n12 |     error: Option<String>,\n   |     ^^^^^\n\
+                 ERROR app: retrying\non_error: cb\n\
+                 thread 'tests::adds' panicked at src/lib.rs:5:9:\n",
+                "thread 'tests::adds' panicked at src/lib.rs:5:9:",
+            ),
+            (
+                "----- Captured log call -----\nERROR root:app.py:10 boom\n\
+                 FAILED tests/test_a.py::test_x - AssertionError: assert 1 == 2\n",
+                "FAILED tests/test_a.py::test_x - AssertionError: assert 1 == 2",
+            ),
+        ] {
+            assert_eq!(tail(&ran(Failed, Some(1), output)), reason, "{output}");
+        }
     }
 
     #[test]
@@ -1270,7 +1516,7 @@ mod tests {
                 *current = status;
                 *body = output.into();
             }
-            let preview = Preview::update(None, &content, theme);
+            let preview = preview_of(None, &content, theme);
             assert_eq!(preview.text, "src/app.rs");
             assert!(preview.tail.is_empty());
             let closed = CachedItem::updated(&content, theme, None, false, false, None);
@@ -1289,24 +1535,72 @@ mod tests {
         }
         // An incomplete JSON prefix never flashes its prompt onto the row.
         let prefix = tool(r#"{"prompt":"Internal framing"#);
-        assert_eq!(
-            Preview::update(None, &prefix, theme).text,
-            "Input available"
-        );
-        // Unknown fields and multiline values disclose their structure only.
+        assert_eq!(preview_of(None, &prefix, theme).text, "");
+        // Unknown fields and multiline values stay in the disclosure, and the
+        // row says nothing in their place rather than describing them.
         for (input, expected) in [
-            (
-                r#"{"prompt":"Internal framing","body":"document"}"#,
-                "2 input fields",
-            ),
-            (r#"{"query":"first\nsecond"}"#, "1 input field"),
+            (r#"{"prompt":"Internal framing","body":"document"}"#, ""),
+            (r#"{"query":"first\nsecond"}"#, ""),
             (
                 r#"{"skill":"writing-copy","args":"Internal framing"}"#,
                 "writing-copy",
             ),
         ] {
-            assert_eq!(Preview::update(None, &tool(input), theme).text, expected);
+            assert_eq!(preview_of(None, &tool(input), theme).text, expected);
         }
+    }
+
+    /// A row's trailing word is for a step that did not do what it was asked;
+    /// a step that worked says nothing there, since its group's mark already
+    /// says so, and one still running says so in its verb. A command that
+    /// ended without an exit code to show it failed still says how it ended
+    /// beside its duration.
+    #[test]
+    fn only_an_unsettled_step_names_its_status() {
+        let theme = crate::settings::EditorSyntaxTheme::Auto;
+        let detail = |content: &ItemContent| {
+            CachedItem::updated(content, theme, None, false, false, None)
+                .detail
+                .clone()
+        };
+        let mut done = tool("{}");
+        assert_eq!(detail(&done), None);
+        if let ItemContent::Tool { status, .. } = &mut done {
+            *status = chat::ToolStatus::Running;
+        }
+        assert_eq!(detail(&done), None);
+        let ran = |status, exit_code, duration_ms| {
+            let mut content = command("", "cargo test", chat::CommandAction::Run, "");
+            if let ItemContent::Command {
+                status: current,
+                exit_code: code,
+                duration_ms: elapsed,
+                ..
+            } = &mut content
+            {
+                *current = status;
+                *code = exit_code;
+                *elapsed = duration_ms;
+            }
+            detail(&content)
+        };
+        use chat::ToolStatus::{Denied, Failed, Running, Stopped, Succeeded};
+        // A running command shows how long it has run, beside "Running".
+        assert_eq!(ran(Running, None, Some(3_000)).as_deref(), Some("3.0s"));
+        assert_eq!(ran(Succeeded, Some(0), None), None);
+        assert_eq!(
+            ran(Succeeded, Some(0), Some(1_200)).as_deref(),
+            Some("1.2s")
+        );
+        assert_eq!(
+            ran(Failed, Some(2), Some(1_200)).as_deref(),
+            Some("exit 2 · 1.2s")
+        );
+        assert_eq!(
+            ran(Stopped, None, Some(1_200)).as_deref(),
+            Some("Stopped · 1.2s")
+        );
+        assert_eq!(ran(Denied, None, None).as_deref(), Some("Denied"));
     }
 
     #[test]
@@ -1322,7 +1616,7 @@ mod tests {
                 output: "Attempted read\nPermission denied\n".into(),
                 status,
             };
-            let preview = Preview::update(None, &content, crate::settings::EditorSyntaxTheme::Auto);
+            let preview = preview_of(None, &content, crate::settings::EditorSyntaxTheme::Auto);
             assert_eq!(preview.text, "src/app.rs");
             assert_eq!(preview.tail, "Permission denied");
         }
@@ -1391,7 +1685,7 @@ mod tests {
             duration_ms: None,
             output: String::new(),
         };
-        let preview = Preview::update(None, &content, crate::settings::EditorSyntaxTheme::Auto);
+        let preview = preview_of(None, &content, crate::settings::EditorSyntaxTheme::Auto);
         assert_eq!(preview.text.as_str(), "cat > tests.rs <<'EOF'");
         assert_eq!(
             copy_text(CopyPart::Input, &content).as_deref(),
@@ -1424,26 +1718,26 @@ mod tests {
         let block = ToolText::update(None, &large, Language::Json);
         assert_eq!(block.language, Language::Plain);
         assert_eq!(block.text.as_ref(), large);
-        let preview = Preview::update(
+        let preview = preview_of(
             None,
             &tool(&large),
             crate::settings::EditorSyntaxTheme::Auto,
         );
-        assert_eq!(preview.text, "Input available");
+        assert_eq!(preview.text, "");
         // A partial JSON stream can consist entirely of whitespace; it is
         // still bounded before inspecting any of those bytes.
         let whitespace = " ".repeat(CachedItem::HIGHLIGHT_LIMIT + 1);
         assert_eq!(
-            Preview::update(
+            preview_of(
                 None,
                 &tool(&whitespace),
                 crate::settings::EditorSyntaxTheme::Auto
             )
             .text,
-            "Input available"
+            ""
         );
         assert!(
-            Preview::update(
+            preview_of(
                 None,
                 &tool(" \n\t"),
                 crate::settings::EditorSyntaxTheme::Auto
@@ -1455,18 +1749,18 @@ mod tests {
 
     #[test]
     fn shell_preview_has_syntax_in_both_palettes_and_rethemes() {
-        let mut preview = Preview::update(
+        let mut preview = preview_of(
             None,
             &command("", "cargo test --locked", chat::CommandAction::Run, ""),
             crate::settings::EditorSyntaxTheme::InspiredGitHub,
         );
         assert_eq!(preview.language, Language::Shell);
         for dark in [false, true] {
-            assert!(preview.block.spans(dark).len() > 1);
+            assert!(preview.spans[usize::from(dark)].len() > 1);
         }
-        let previous = preview.block.spans(true).clone();
+        let previous = preview.spans[1].clone();
         preview.rehighlight(crate::settings::EditorSyntaxTheme::SolarizedDark);
-        assert_ne!(*preview.block.spans(true), previous);
+        assert_ne!(*preview.spans[1], *previous);
     }
 
     #[test]
@@ -1486,7 +1780,7 @@ mod tests {
             "longword".repeat(100),
             "one two three four five six seven eight nine ten".into(),
         ] {
-            let preview = Preview::update(
+            let preview = preview_of(
                 None,
                 &command("", &text, chat::CommandAction::Run, ""),
                 crate::settings::EditorSyntaxTheme::Auto,
@@ -1505,7 +1799,7 @@ mod tests {
                 node.size()
             );
         }
-        let preview = Preview::update(
+        let preview = preview_of(
             None,
             &command("", "short", chat::CommandAction::Run, ""),
             crate::settings::EditorSyntaxTheme::Auto,

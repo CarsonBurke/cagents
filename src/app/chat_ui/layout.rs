@@ -1,5 +1,9 @@
 //! One reading column, determined by available space rather than its contents.
 use super::*;
+
+/// The conversation's readable width, including its symmetric inset.
+pub(in crate::app) const READING_COLUMN: f32 = design::READABLE_MEASURE + 2.0 * step::GAP_M;
+
 use iced::advanced::{
     Clipboard, Layout, Shell, Widget, layout, mouse, overlay, renderer,
     widget::{Operation, Tree},
@@ -36,33 +40,36 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Pane<'_> {
         renderer: &cosmic::Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
-        // Both the transcript and composer are laid out at this exact width.
-        // A permission request, resumed conversation or wider status label must
+        // The footer is laid out at the reading column's exact width. A
+        // permission request, resumed conversation or wider status label must
         // never move the column. The footer's flex row wraps within that room.
-        let width = limits
-            .max()
-            .width
-            .min(design::READABLE_MEASURE + 2.0 * step::GAP_M)
-            .max(0.0);
+        //
+        // The body spans the pane so the transcript's scroll viewport, and its
+        // scrollbar, reach the pane edge. The body's own children keep
+        // everything else, including the transcript's rows, centered in the
+        // same reading column.
+        let pane = limits.max().width.max(0.0);
+        let width = pane.min(READING_COLUMN);
         let mut footer = self.children[1].as_widget_mut().layout(
             &mut tree.children[1],
             renderer,
             &layout::Limits::new(Size::ZERO, Size::new(width, limits.max().height)),
         );
         let body_height = (limits.max().height - footer.size().height - step::GAP_S).max(0.0);
-        let mut body = self.children[0].as_widget_mut().layout(
+        let body = self.children[0].as_widget_mut().layout(
             &mut tree.children[0],
             renderer,
-            &layout::Limits::new(Size::new(width, body_height), Size::new(width, body_height)),
+            &layout::Limits::new(Size::new(pane, body_height), Size::new(pane, body_height)),
         );
         let size = limits.resolve(
             Length::Fill,
             Length::Fill,
-            Size::new(width, body_height + step::GAP_S + footer.size().height),
+            Size::new(pane, body_height + step::GAP_S + footer.size().height),
         );
-        let x = (size.width - width) / 2.0;
-        body.move_to_mut(Point::new(x, 0.0));
-        footer.move_to_mut(Point::new(x, body_height + step::GAP_S));
+        footer.move_to_mut(Point::new(
+            (size.width - width) / 2.0,
+            body_height + step::GAP_S,
+        ));
         layout::Node::with_children(size, vec![body, footer])
     }
 
@@ -240,10 +247,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn contents_do_not_change_the_reading_column() {
+    fn contents_do_not_change_the_reading_column_and_the_body_spans_the_pane() {
         let renderer = crate::app::tests::headless_renderer();
         for available in [280.0_f32, 600.0, 956.0, 1440.0] {
-            let expected = available.min(design::READABLE_MEASURE + 2.0 * step::GAP_M);
+            let expected = available.min(READING_COLUMN);
             for footer_width in [0.0, 150.25, 900.0, 3000.0] {
                 let footer = widget::flex_row(vec![
                     widget::Space::new().width(footer_width).height(20).into(),
@@ -266,9 +273,9 @@ mod tests {
                 );
                 let body = &node.children()[0];
                 let footer = &node.children()[1];
-                assert_eq!(body.size().width, expected);
-                assert_eq!(body.bounds().x, (available - expected) / 2.0);
-                assert_eq!(footer.bounds().x, body.bounds().x);
+                assert_eq!(body.size().width, available);
+                assert_eq!(body.bounds().x, 0.0);
+                assert_eq!(footer.bounds().x, (available - expected) / 2.0);
                 assert!(footer.size().width <= expected);
                 assert_eq!(footer.bounds().y + footer.size().height, 600.0);
             }

@@ -438,6 +438,7 @@ mod tests {
                 name: "origin".into(),
                 fetch_url: Some(head.clone_url.clone()),
                 push_url: None,
+                gh_resolved: None,
             }],
             refs: Vec::new(),
             worktrees: Vec::new(),
@@ -481,6 +482,7 @@ mod tests {
             name: "their-fork".into(),
             fetch_url: Some(head.clone_url.clone()),
             push_url: None,
+            gh_resolved: None,
         });
         assert_eq!(
             plan(&target, &head, &git).unwrap().branch_input,
@@ -513,6 +515,7 @@ mod tests {
             name: "same-repository".into(),
             fetch_url: Some(head.clone_url.clone()),
             push_url: None,
+            gh_resolved: None,
         });
         git.refs[0].upstream =
             Some(ValidatedRefName::parse("refs/remotes/same-repository/feature/x").unwrap());

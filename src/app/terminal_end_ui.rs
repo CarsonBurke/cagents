@@ -227,7 +227,7 @@ impl Cagents {
     /// Relaunches an ended terminal from Enter on its final screen, unless the
     /// key followed the end too closely to have been meant for it.
     pub(super) fn relaunch_from_ended_screen(&mut self, card: CardId) -> Task<Message> {
-        let settled = ended_terminal(self.card_state(card)).is_some_and(|session| {
+        let settled = self.ended_terminal(card).is_some_and(|session| {
             terminal_end_report(session)
                 .at_unix_ms
                 .is_none_or(|at| enter_relaunches(at, unix_millis()))
@@ -256,7 +256,7 @@ impl Cagents {
             {
                 continue;
             }
-            let Some(session) = ended_terminal(self.card_state(card)).cloned() else {
+            let Some(session) = self.ended_terminal(card).cloned() else {
                 continue;
             };
             // A sign-in's screen can hold a pasted authorization code, which
@@ -303,7 +303,9 @@ impl Cagents {
         let current = matches!(self.cards.get(&card), Some(CardRuntime::Completed))
             && !self.terminal_close_pending(card)
             && !self.closed_terminal_cards.contains(&card)
-            && ended_terminal(self.card_state(card)).is_some_and(|session| session.id == terminal);
+            && self
+                .ended_terminal(card)
+                .is_some_and(|session| session.id == terminal);
         let outcome = match result {
             Ok(Some(surface)) if current => {
                 self.retained_outputs.remove(&terminal);
@@ -313,10 +315,7 @@ impl Cagents {
                 // no screen. Leaving it there would let one Enter reach both
                 // the button and the screen.
                 if self.workspace.focused() == Some(card) && !self.workspace_inputs_blocked() {
-                    tasks.push(
-                        iced::widget::operation::focus(self.card_keyboard_focus(card))
-                            .map(cosmic::Action::App),
-                    );
+                    tasks.push(self.focus_pane_keyboard(card));
                 }
                 return Task::batch(tasks);
             }
@@ -337,8 +336,7 @@ impl Cagents {
         // Without a screen to type into, the keyboard belongs on the
         // relaunch, so Enter still does what the footer says it does.
         if current && self.workspace.focused() == Some(card) && !self.workspace_inputs_blocked() {
-            return iced::widget::operation::focus(self.card_keyboard_focus(card))
-                .map(cosmic::Action::App);
+            return self.focus_pane_keyboard(card);
         }
         Task::none()
     }
@@ -581,8 +579,8 @@ mod tests {
     fn restored_ended_card() -> (Cagents, CardId, TerminalId) {
         let mut app = super::super::tests::context_inspector_test_app(true);
         let card = app.workspace.focused().unwrap();
+        app.set_residency(card, Residency::Hibernated);
         let state = app.card_state_mut(card).unwrap();
-        state.residency = Residency::Hibernated;
         let CardKind::Terminal(session) = &mut state.kind else {
             panic!("terminal fixture");
         };
@@ -613,7 +611,7 @@ mod tests {
         );
         // The card keeps its place and its end; nothing asks again.
         assert!(matches!(app.cards.get(&card), Some(CardRuntime::Completed)));
-        assert!(ended_terminal(app.card_state(card)).is_some());
+        assert!(app.ended_terminal(card).is_some());
         drop(app.attach_retained_outputs([card]));
         assert_eq!(
             app.retained_outputs.get(&terminal),

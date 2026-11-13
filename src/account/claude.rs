@@ -42,7 +42,115 @@ pub fn parse_auth_status(status: &Value) -> Result<Identity, UsageStatus> {
         email: text("email"),
         organization: text("orgName"),
         plan: text("subscriptionType"),
+        disputed_by: None,
     })
+}
+
+/// What a Claude Code configuration records of who its login is, as
+/// `claude auth status` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordedLogin {
+    /// It records no login.
+    Nobody,
+    /// It names the login with this address.
+    Login(String),
+    /// The CLI could not say - it failed, or did not answer in time - so it
+    /// may name anyone.
+    Unknown,
+}
+
+impl RecordedLogin {
+    /// What the record `claude auth status --json` reported from names.
+    pub fn reported(status: &Value) -> Self {
+        parse_auth_status(status)
+            .ok()
+            .and_then(|identity| identity.email)
+            .map_or(Self::Nobody, Self::Login)
+    }
+}
+
+/// How long, in milliseconds, a sign-in that cagents ran settles the next
+/// disagreement a probe sees: the probe that follows it runs at once, so a
+/// sign-in older than this is not the one that wrote the CLI's record.
+#[cfg(any(feature = "ui", feature = "host"))]
+pub const SIGN_IN_SETTLES_FOR: u64 = 10 * 60 * 1000;
+
+/// What a probe reports of the system login's two records, and how the
+/// settlement recorded for them changes: `reported` is the record the CLI
+/// read, `other` what the second record names, `previous` the identity the
+/// last probe reported, `settled` the settlement on record and `now` the
+/// time in Unix milliseconds.
+///
+/// A disagreement is reported until it is settled, and settled in favour of
+/// the CLI's record when that record is known to be newer than the other:
+/// when a sign-in that cagents ran has just finished, or when the CLI's
+/// record has changed login since the last probe while the other stayed as
+/// it was. Only signing in rewrites the login a record names. A record that
+/// cannot be read settles nothing, and leaves what the last probe reported.
+///
+/// The second element is `None` to leave the settlement as it is, or the
+/// settlement to record in its place.
+#[cfg(any(feature = "ui", feature = "host"))]
+pub fn settle_dispute(
+    reported: &Identity,
+    other: RecordedLogin,
+    previous: Option<&Identity>,
+    settled: Option<&super::cache::Settled>,
+    now: u64,
+) -> (Option<String>, Option<Option<super::cache::Settled>>) {
+    use super::cache::Settled;
+    let same = |a: &str, b: &str| a.trim().eq_ignore_ascii_case(b.trim());
+    // A probe that names no login has nothing to compare.
+    let Some(email) = reported.email.as_deref() else {
+        return (None, None);
+    };
+    let previous_email = previous.and_then(|previous| previous.email.as_deref());
+    let other = match other {
+        RecordedLogin::Login(other) if !same(&other, email) => other,
+        RecordedLogin::Unknown => {
+            let shown = previous
+                .filter(|_| previous_email.is_some_and(|before| same(before, email)))
+                .and_then(|previous| previous.disputed_by.clone());
+            return (shown, None);
+        }
+        // The records agree: nothing is left to settle.
+        RecordedLogin::Login(_) | RecordedLogin::Nobody => {
+            return (None, settled.is_some().then_some(None));
+        }
+    };
+    let settle = Some(Some(Settled::Reported {
+        reported: email.trim().to_owned(),
+        other: other.clone(),
+    }));
+    let (known_other, expired) = match settled {
+        Some(Settled::SignedIn { at }) => {
+            if *at <= now.saturating_add(super::schedule::CLOCK_SLACK)
+                && now.saturating_sub(*at) <= SIGN_IN_SETTLES_FOR
+            {
+                return (None, settle);
+            }
+            (None, true)
+        }
+        Some(Settled::Reported {
+            reported: settled_reported,
+            other: settled_other,
+        }) => {
+            if same(settled_reported, email) && same(settled_other, &other) {
+                return (None, None);
+            }
+            (Some(settled_other.as_str()), false)
+        }
+        None => (None, false),
+    };
+    let rewritten = previous_email.is_some_and(|before| !same(before, email))
+        && previous
+            .and_then(|previous| previous.disputed_by.as_deref())
+            .or(known_other)
+            .is_some_and(|before| same(before, &other));
+    if rewritten {
+        return (None, settle);
+    }
+    (Some(other), expired.then_some(None))
 }
 
 /// The snapshot a `get_usage` control response describes.
@@ -84,7 +192,16 @@ pub fn parse_usage(response: &Value, observed_at: u64) -> UsageSnapshot {
         None => keyed_windows(limits),
     };
     let credits = credits(limits);
-    let status = status_for(&windows, false, provider_warning);
+    // An object (or metadata about credits/plan) is not positive quota.
+    // Missing or malformed windows must not authorize automatic routing.
+    let (status, detail) = if windows.is_empty() {
+        (
+            UsageStatus::Unavailable,
+            Some("Claude did not report usable usage limits".into()),
+        )
+    } else {
+        (status_for(&windows, false, provider_warning), None)
+    };
     UsageSnapshot {
         windows,
         credits,
@@ -93,7 +210,29 @@ pub fn parse_usage(response: &Value, observed_at: u64) -> UsageSnapshot {
         observed_at,
         source: UsageSource::Probe,
         plan,
-        detail: None,
+        detail,
+    }
+}
+
+/// A probe must distinguish a transient missing reading from the provider
+/// explicitly saying that this account does not support usage reporting.
+/// Scoped-only windows are display data, not an ordinary-usage observation.
+/// Returning an error keeps the prior snapshot and identity under the existing
+/// probe failure policy; no replacement quota or catalog is published.
+#[cfg(any(feature = "host", feature = "ui"))]
+pub(super) fn probe_usage(
+    response: &Value,
+    observed_at: u64,
+) -> Result<UsageSnapshot, &'static str> {
+    let snapshot = parse_usage(response, observed_at);
+    let ordinary_quota = snapshot
+        .windows
+        .iter()
+        .any(|window| window.kind != WindowKind::Scoped && window.used.is_finite());
+    if !ordinary_quota && response["rate_limits_available"].as_bool() != Some(false) {
+        Err("Claude Code could not read usage just now")
+    } else {
+        Ok(snapshot)
     }
 }
 
@@ -139,7 +278,9 @@ fn normalized_window(limit: &Value) -> Option<UsageWindow> {
     if !percent.is_finite() {
         return None;
     }
-    let kind_name = limit["kind"].as_str().unwrap_or_default();
+    let kind_name = limit["kind"]
+        .as_str()
+        .filter(|kind| !kind.trim().is_empty())?;
     let group = limit["group"].as_str().unwrap_or_default();
     let scope = scope_label(&limit["scope"]);
     let (kind, label, key, span) = match kind_name {
@@ -198,6 +339,13 @@ fn normalized_window(limit: &Value) -> Option<UsageWindow> {
         span_secs: span,
         binding: limit["is_active"].as_bool() == Some(true),
     })
+}
+
+/// The model or surface a window applies to, where Claude scoped it. A
+/// scoped window's key is `{kind}:{scope}`; an account-wide one's has no
+/// colon, whatever its label shows.
+pub fn window_scope(window: &UsageWindow) -> Option<&str> {
+    window.key.split_once(':').map(|(_, scope)| scope)
 }
 
 /// What a scoped limit applies to: a model's display name, else a surface.
@@ -337,8 +485,66 @@ pub struct LiveUpdate {
     pub windows: Vec<UsageWindow>,
     /// The status the event states, which is Claude's own reading of the
     /// account: a window run past one while Claude still says `allowed` is
-    /// overage being allowed, not a limit.
+    /// overage being allowed, not a limit. `None` when the event's status
+    /// is about one model's allowance rather than the account.
     pub status: Option<UsageStatus>,
+}
+
+/// A rate-limit type Claude Code names in a live event, and the window it is.
+struct LiveWindow {
+    name: &'static str,
+    key: &'static str,
+    kind: WindowKind,
+    label: &'static str,
+    span_secs: u64,
+}
+
+/// The windows a live event can carry. `seven_day_overage_included` is the
+/// weekly allowance of the models that run on extra usage, which Claude
+/// Code calls the "Fable limit" and shows as the `get_usage` limit scoped to
+/// Fable, so it is that window rather than another one beside it.
+const LIVE_WINDOWS: [LiveWindow; 3] = [
+    LiveWindow {
+        name: "five_hour",
+        key: SESSION,
+        kind: WindowKind::Session,
+        label: "Session",
+        span_secs: FIVE_HOURS,
+    },
+    LiveWindow {
+        name: "seven_day",
+        key: WEEKLY,
+        kind: WindowKind::Weekly,
+        label: "Weekly",
+        span_secs: SEVEN_DAYS,
+    },
+    LiveWindow {
+        name: "seven_day_overage_included",
+        key: FABLE,
+        kind: WindowKind::Scoped,
+        label: "Weekly · Fable",
+        span_secs: SEVEN_DAYS,
+    },
+];
+
+/// The probe's key for the Fable weekly window, which a live event's
+/// `seven_day_overage_included` updates.
+const FABLE: &str = "weekly_scoped:Fable";
+
+/// The key builds before this one gave the live Fable window, under the label
+/// "Weekly incl. extra usage". A cached reading may still hold it.
+const RETIRED_FABLE: &str = "weekly_overage";
+
+/// Whether a scoped window is Fable's, under any name Claude has given it:
+/// `Fable`, or a version of it such as `Fable 5.1`.
+fn is_fable(window: &UsageWindow) -> bool {
+    window.kind == WindowKind::Scoped
+        && window_scope(window).is_some_and(|scope| {
+            scope
+                .split_whitespace()
+                .next()
+                .is_some_and(|family| family.eq_ignore_ascii_case("fable"))
+        })
 }
 
 /// The windows a conversation's `rate_limit_event` reports.
@@ -348,83 +554,60 @@ pub struct LiveUpdate {
 /// Vertex sessions and until the first response carrying the headers.
 /// A rejection still carries authoritative exhaustion evidence when the
 /// optional windows are absent. An empty allowed event cannot refresh quota.
+///
+/// The event's status describes the window its `rateLimitType` names. Only
+/// when that is an account-wide limit, or unnamed, does it describe the
+/// account: a rejection for one model's allowance leaves the others usable.
 pub fn parse_rate_limit_event(info: &Value) -> Option<LiveUpdate> {
     let unified = &info["unifiedWindows"];
-    let mut windows = Vec::new();
-    for (name, key, kind, label) in [
-        ("five_hour", SESSION, WindowKind::Session, "Session"),
-        ("seven_day", WEEKLY, WindowKind::Weekly, "Weekly"),
-        (
-            "seven_day_overage_included",
-            "weekly_overage",
-            WindowKind::Other,
-            "Weekly incl. extra usage",
-        ),
-    ] {
-        let window = &unified[name];
-        let Some(used) = window["utilization"]
+    let window =
+        |live: &LiveWindow, used: f64, resets_at: Option<i64>, binding: bool| UsageWindow {
+            key: live.key.to_owned(),
+            kind: live.kind,
+            label: live.label.to_owned(),
+            used: super::fraction(used),
+            resets_at,
+            span_secs: Some(live.span_secs),
+            binding,
+        };
+    let mut windows: Vec<UsageWindow> = LIVE_WINDOWS
+        .iter()
+        .filter_map(|live| {
+            let reported = &unified[live.name];
+            let used = reported["utilization"]
+                .as_f64()
+                .filter(|value| value.is_finite())?;
+            Some(window(live, used, reported["resetsAt"].as_i64(), false))
+        })
+        .collect();
+    let named = info["rateLimitType"]
+        .as_str()
+        .filter(|kind| !kind.is_empty());
+    let live = named.and_then(|kind| LIVE_WINDOWS.iter().find(|live| live.name == kind));
+    if windows.is_empty()
+        && let Some(used) = info["utilization"]
             .as_f64()
             .filter(|value| value.is_finite())
-        else {
-            continue;
-        };
-        windows.push(UsageWindow {
-            key: key.to_owned(),
-            kind,
-            label: label.to_owned(),
-            used: super::fraction(used),
-            resets_at: window["resetsAt"].as_i64(),
-            span_secs: Some(if kind == WindowKind::Session {
-                FIVE_HOURS
-            } else {
-                SEVEN_DAYS
-            }),
-            binding: false,
-        });
+        && let Some(live) = live
+    {
+        windows.push(window(live, used, info["resetsAt"].as_i64(), true));
     }
+    // A report names the limit its status is about; only the account's own
+    // windows decide the account's status.
+    let account_wide = match named {
+        None => true,
+        Some(_) => live.is_some_and(|live| live.kind != WindowKind::Scoped),
+    };
     let status = match info["status"].as_str() {
+        _ if !account_wide => None,
         Some("rejected") => Some(UsageStatus::Limited),
         Some("allowed_warning") => Some(UsageStatus::Warning),
         Some("allowed") => Some(UsageStatus::Ok),
         _ => None,
     };
-    if windows.is_empty()
-        && let Some(used) = info["utilization"]
-            .as_f64()
-            .filter(|value| value.is_finite())
-        && let Some((key, kind, label, span_secs)) = match info["rateLimitType"].as_str() {
-            Some("five_hour") => Some((SESSION, WindowKind::Session, "Session", FIVE_HOURS)),
-            Some("seven_day") => Some((WEEKLY, WindowKind::Weekly, "Weekly", SEVEN_DAYS)),
-            Some("seven_day_overage_included") => Some((
-                "weekly_overage",
-                WindowKind::Other,
-                "Weekly incl. extra usage",
-                SEVEN_DAYS,
-            )),
-            _ => None,
-        }
-    {
-        windows.push(UsageWindow {
-            key: key.to_owned(),
-            kind,
-            label: label.to_owned(),
-            used: super::fraction(used),
-            resets_at: info["resetsAt"].as_i64(),
-            span_secs: Some(span_secs),
-            binding: true,
-        });
-    }
-    // A model-specific rejection does not exhaust the whole account. When
-    // only that scope is reported, wait for an account-wide quota report.
-    if windows.is_empty()
-        && info["rateLimitType"].as_str().is_some_and(|kind| {
-            !kind.is_empty()
-                && !matches!(
-                    kind,
-                    "five_hour" | "seven_day" | "seven_day_overage_included"
-                )
-        })
-    {
+    // A model-specific report with no figures says nothing about the
+    // account; wait for an account-wide quota report.
+    if windows.is_empty() && !account_wide {
         return None;
     }
     if windows.is_empty() && status != Some(UsageStatus::Limited) {
@@ -435,16 +618,22 @@ pub fn parse_rate_limit_event(info: &Value) -> Option<LiveUpdate> {
 
 /// Folds a live update into the snapshot a probe produced.
 ///
-/// A live event reports only the account-wide windows, so every window it
-/// does not mention - a model's weekly allowance, most of all - keeps its
-/// probed figure. The binding mark is dropped because the event does not say
-/// which window binds; the fullest window stands in until the next probe.
+/// A live event reports only the account-wide windows and Fable's, so every
+/// window it does not mention - another model's weekly allowance, most of
+/// all - keeps its probed figure. Fable's window is the probe's, whatever
+/// version of the name Claude scoped it to. The binding mark is dropped
+/// because the event does not say which window binds; the fullest window
+/// stands in until the next probe.
 pub fn merge_live(snapshot: &mut UsageSnapshot, update: LiveUpdate, observed_at: u64) {
+    snapshot
+        .windows
+        .retain(|window| window.key != RETIRED_FABLE);
     for window in update.windows {
+        let fable = window.key == FABLE;
         match snapshot
             .windows
             .iter_mut()
-            .find(|existing| existing.key == window.key)
+            .find(|existing| existing.key == window.key || (fable && is_fable(existing)))
         {
             Some(existing) => {
                 existing.used = window.used;
@@ -472,6 +661,147 @@ pub fn merge_live(snapshot: &mut UsageSnapshot, update: LiveUpdate, observed_at:
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn login(email: &str, disputed_by: Option<&str>) -> Identity {
+        Identity {
+            email: Some(email.into()),
+            disputed_by: disputed_by.map(str::to_owned),
+            ..Identity::default()
+        }
+    }
+
+    #[test]
+    fn a_record_names_the_login_its_status_reports() {
+        assert_eq!(
+            RecordedLogin::reported(&json!({
+                "loggedIn": true,
+                "email": " other@example.com ",
+                "subscriptionType": "max",
+            })),
+            RecordedLogin::Login("other@example.com".into())
+        );
+        assert_eq!(
+            RecordedLogin::reported(&json!({"loggedIn": true})),
+            RecordedLogin::Nobody
+        );
+        assert_eq!(
+            RecordedLogin::reported(&json!({"loggedIn": false, "email": "x@example.com"})),
+            RecordedLogin::Nobody
+        );
+    }
+
+    #[test]
+    #[cfg(any(feature = "ui", feature = "host"))]
+    fn a_disagreement_is_reported_until_a_sign_in_is_known_to_have_settled_it() {
+        use super::super::cache::Settled;
+        const NOW: u64 = 1_000_000_000;
+        let decide = |reported: &Identity,
+                      other: RecordedLogin,
+                      previous: Option<&Identity>,
+                      settled: Option<&Settled>| {
+            settle_dispute(reported, other, previous, settled, NOW)
+        };
+        let me = login("me@example.com", None);
+        let other = || RecordedLogin::Login("other@example.com".to_owned());
+        let shown = || Some("other@example.com".to_owned());
+        let settled = Settled::Reported {
+            reported: "me@example.com".into(),
+            other: "other@example.com".into(),
+        };
+        // First seen: reported, and nothing recorded.
+        assert_eq!(decide(&me, other(), None, None), (shown(), None));
+        assert_eq!(
+            decide(&me, other(), Some(&login("me@example.com", None)), None),
+            (shown(), None)
+        );
+        // The same login, however it is spelled, is no disagreement.
+        assert_eq!(
+            decide(&login("Other@Example.com ", None), other(), None, None),
+            (None, None)
+        );
+        // Seen again with neither record changed: still reported.
+        let seen = login("me@example.com", Some("other@example.com"));
+        assert_eq!(decide(&me, other(), Some(&seen), None), (shown(), None));
+        // A sign-in cagents ran has just finished: its record wins.
+        let signed_in = Settled::SignedIn { at: NOW - 30_000 };
+        assert_eq!(
+            decide(&me, other(), Some(&seen), Some(&signed_in)),
+            (None, Some(Some(settled.clone())))
+        );
+        // One that finished long ago, whose probe never answered, settles
+        // nothing now, and is forgotten.
+        let long_ago = Settled::SignedIn {
+            at: NOW - SIGN_IN_SETTLES_FOR - 1,
+        };
+        assert_eq!(
+            decide(&me, other(), Some(&seen), Some(&long_ago)),
+            (shown(), Some(None))
+        );
+        // Once settled, exactly that disagreement stays settled.
+        assert_eq!(
+            decide(&me, other(), Some(&me), Some(&settled)),
+            (None, None)
+        );
+        // The CLI's record changed login while the other stayed: a sign-in
+        // outside cagents rewrote it, so it is the newer one.
+        let before = login("old@example.com", Some("other@example.com"));
+        assert_eq!(
+            decide(&me, other(), Some(&before), None),
+            (None, Some(Some(settled.clone())))
+        );
+        let after_settling = Settled::Reported {
+            reported: "old@example.com".into(),
+            other: "other@example.com".into(),
+        };
+        assert_eq!(
+            decide(
+                &me,
+                other(),
+                Some(&login("old@example.com", None)),
+                Some(&after_settling)
+            ),
+            (None, Some(Some(settled.clone())))
+        );
+        // The other record changed instead: it may be the newer one, and the
+        // disagreement is shown again.
+        assert_eq!(
+            decide(
+                &me,
+                RecordedLogin::Login("third@example.com".into()),
+                Some(&me),
+                Some(&settled)
+            ),
+            (Some("third@example.com".into()), None)
+        );
+        // A record that cannot be read, or a probe naming no login, changes
+        // nothing: the last report stands, and so does the settlement.
+        assert_eq!(
+            decide(&me, RecordedLogin::Unknown, Some(&seen), Some(&settled)),
+            (shown(), None)
+        );
+        assert_eq!(
+            decide(&me, RecordedLogin::Unknown, Some(&before), None),
+            (None, None)
+        );
+        assert_eq!(
+            decide(&Identity::default(), other(), Some(&seen), Some(&settled)),
+            (None, None)
+        );
+        // Records that agree leave nothing to settle.
+        assert_eq!(
+            decide(&me, RecordedLogin::Nobody, Some(&seen), Some(&settled)),
+            (None, Some(None))
+        );
+        assert_eq!(
+            decide(
+                &me,
+                RecordedLogin::Login("me@example.com".into()),
+                None,
+                None
+            ),
+            (None, None)
+        );
+    }
 
     fn fixture(name: &str) -> Value {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -533,6 +863,8 @@ mod tests {
             .map(|window| window.key.as_str())
             .collect();
         assert_eq!(keys, ["session", "weekly_all", "weekly_scoped:Opus"]);
+        let scopes: Vec<_> = usage.windows.iter().map(window_scope).collect();
+        assert_eq!(scopes, [None, None, Some("Opus")]);
         assert_eq!(usage.status, UsageStatus::Limited);
         assert_eq!(usage.windows[1].resets_at, None);
         assert!(usage.credits.is_none());
@@ -559,6 +891,9 @@ mod tests {
             labels,
             ["Session · Daily burst", "Weekly · Cowork", "Monthly pool"]
         );
+        // Only what Claude scoped is scoped, whatever the label shows.
+        let scopes: Vec<_> = usage.windows.iter().map(window_scope).collect();
+        assert_eq!(scopes, [None, Some("Cowork"), None]);
         assert_eq!(usage.windows[2].kind, WindowKind::Other);
     }
 
@@ -716,5 +1051,239 @@ mod tests {
                 .unwrap();
         merge_live(&mut usage, update, 30);
         assert_eq!(usage.status, UsageStatus::Warning);
+    }
+
+    /// As Claude Code 2.1.296 reported a Fable 5.2 turn: the weekly window
+    /// and `seven_day_overage_included`, which is Fable's weekly allowance.
+    /// It moves the probed Fable window, as a used Fable reset does, rather
+    /// than adding a second window that contradicts it.
+    #[test]
+    fn a_fable_turn_moves_the_probed_fable_window() {
+        let update = parse_rate_limit_event(
+            &fixture("claude-rate-limit-event-fable.json")["rate_limit_info"],
+        )
+        .expect("the event reports windows");
+        let keys: Vec<_> = update.windows.iter().map(|w| w.key.as_str()).collect();
+        assert_eq!(keys, [WEEKLY, FABLE]);
+        assert_eq!(update.windows[1].kind, WindowKind::Scoped);
+        assert_eq!(update.windows[1].label, "Weekly · Fable");
+        assert_eq!(update.status, Some(UsageStatus::Ok));
+
+        let mut usage = parse_usage(&fixture("claude-get-usage.json"), 10);
+        assert!(
+            (usage.windows[2].used - 1.0).abs() < 1e-6,
+            "Fable was spent"
+        );
+        merge_live(&mut usage, update, 20);
+        let keys: Vec<_> = usage.windows.iter().map(|w| w.key.as_str()).collect();
+        assert_eq!(keys, [SESSION, WEEKLY, FABLE]);
+        let fable = &usage.windows[2];
+        assert_eq!(fable.used, 0.0, "the reset's figure replaces the spent one");
+        assert_eq!(fable.resets_at, Some(1_794_758_400));
+        assert!((usage.windows[1].used - 0.45).abs() < 1e-6);
+        assert_eq!(usage.status, UsageStatus::Ok);
+    }
+
+    /// Claude has scoped the window to versions of the name, such as
+    /// `Fable 5.1`; the live figure is still that window's.
+    #[test]
+    fn a_live_fable_figure_finds_a_versioned_fable_window() {
+        let mut usage = parse_usage(
+            &json!({"rate_limits": {"limits": [
+                {"kind": "weekly_all", "group": "weekly", "percent": 40},
+                {"kind": "weekly_scoped", "group": "weekly", "percent": 70,
+                    "scope": {"model": {"display_name": "Fable 5.1", "id": null}}},
+                {"kind": "weekly_scoped", "group": "weekly", "percent": 30,
+                    "scope": {"model": {"display_name": "Opus", "id": null}}},
+            ]}}),
+            10,
+        );
+        let update = parse_rate_limit_event(&json!({
+            "status": "allowed",
+            "unifiedWindows": {"seven_day_overage_included": {"utilization": 0.1, "resetsAt": 50}},
+        }))
+        .unwrap();
+        merge_live(&mut usage, update, 20);
+        let figures: Vec<_> = usage
+            .windows
+            .iter()
+            .map(|w| (w.key.as_str(), (w.used * 100.0).round() as u32))
+            .collect();
+        assert_eq!(
+            figures,
+            [
+                ("weekly_all", 40),
+                ("weekly_scoped:Fable 5.1", 10),
+                ("weekly_scoped:Opus", 30)
+            ]
+        );
+    }
+
+    /// A reading cached by an earlier build holds the live Fable window under
+    /// its retired key and label. The next live report retires it, so an
+    /// exhausted Fable allowance stops reading as an exhausted account.
+    #[test]
+    fn a_live_report_retires_the_old_fable_window() {
+        let mut usage = parse_usage(&fixture("claude-get-usage.json"), 10);
+        usage.windows.push(UsageWindow {
+            key: RETIRED_FABLE.into(),
+            kind: WindowKind::Other,
+            label: "Weekly incl. extra usage".into(),
+            used: 1.0,
+            resets_at: Some(1_790_186_400),
+            span_secs: Some(SEVEN_DAYS),
+            binding: false,
+        });
+        let update = parse_rate_limit_event(&json!({
+            "status": "allowed",
+            "unifiedWindows": {"five_hour": {"utilization": 0.3, "resetsAt": 1_790_119_800_i64}},
+        }))
+        .unwrap();
+        merge_live(&mut usage, update, 20);
+        assert!(usage.windows.iter().all(|w| w.key != RETIRED_FABLE));
+        assert_ne!(usage.status, UsageStatus::Limited);
+    }
+
+    /// Reaching the Fable limit leaves every other model usable: the window
+    /// is full and binds, but the account is neither limited nor rotated
+    /// away from, whatever the rejection says about the Fable request.
+    #[test]
+    fn a_fable_rejection_spends_fable_but_not_the_account() {
+        let now = 10_000;
+        let update = parse_rate_limit_event(&json!({
+            "status": "rejected",
+            "rateLimitType": "seven_day_overage_included",
+            "utilization": 1.0,
+            "resetsAt": 1_794_758_400_i64,
+        }))
+        .expect("the rejection reports Fable's window");
+        assert_eq!(update.status, None);
+        assert_eq!(update.windows.len(), 1);
+        assert_eq!(update.windows[0].key, FABLE);
+        assert!(update.windows[0].binding);
+        let mut usage = parse_usage(
+            &json!({"rate_limits": {"limits": [
+                {"kind": "weekly_all", "group": "weekly", "percent": 40},
+                {"kind": "weekly_scoped", "group": "weekly", "percent": 90,
+                    "scope": {"model": {"display_name": "Fable", "id": null}}},
+            ]}}),
+            now,
+        );
+        merge_live(&mut usage, update, now);
+        assert_eq!(usage.windows.len(), 2);
+        assert_eq!(usage.windows[1].used, 1.0);
+        assert_eq!(usage.status, UsageStatus::Warning);
+        assert!(super::super::routing::available(&usage, now));
+        assert!(!super::super::routing::needs_alternate(&usage, now));
+
+        // The same holds for any model's rejection that arrives with the
+        // account's own windows: those decide the account's status.
+        let opus = parse_rate_limit_event(&json!({
+            "status": "rejected",
+            "rateLimitType": "seven_day_opus",
+            "unifiedWindows": {"five_hour": {"utilization": 0.2, "resetsAt": 50}},
+        }))
+        .unwrap();
+        assert_eq!(opus.status, None);
+        // An account-wide rejection still limits the account.
+        let weekly = parse_rate_limit_event(&json!({
+            "status": "rejected",
+            "rateLimitType": "seven_day",
+            "unifiedWindows": {"seven_day": {"utilization": 1.0, "resetsAt": 50}},
+        }))
+        .unwrap();
+        assert_eq!(weekly.status, Some(UsageStatus::Limited));
+        // A rejection of a limit with no figures here, such as extra usage,
+        // waits for an account-wide report, as it did before.
+        assert!(
+            parse_rate_limit_event(&json!({"status": "rejected", "rateLimitType": "overage"}))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn sparse_or_malformed_probe_limits_do_not_authorize_routing() {
+        let now = 1_000;
+        for response in [
+            json!(null),
+            json!({}),
+            json!({"rate_limits": null}),
+            json!({"rate_limits": []}),
+            json!({"rate_limits": {}}),
+            json!({"rate_limits": {"limits": []}}),
+            json!({"rate_limits": {"limits": "unavailable"}}),
+            json!({"rate_limits": {"limits": [null, {},
+                {"kind": "session", "percent": null},
+                {"kind": "session", "percent": "0"},
+                {"kind": "session", "percent": false},
+                {"kind": "session", "percent": []},
+                {"kind": "session", "percent": {}},
+            ]}}),
+            json!({"rate_limits": {"limits": [
+                {"percent": 0}, {"kind": null, "percent": 0},
+                {"kind": 1, "percent": 0}, {"kind": "", "percent": 0},
+                {"kind": "  ", "percent": 0},
+            ]}}),
+            json!({"rate_limits": {
+                "five_hour": {"utilization": null},
+                "seven_day": {"utilization": "0"},
+                "model_scoped": [{"display_name": "Opus", "utilization": false}],
+            }}),
+            json!({"rate_limits": {"future_internal_name": {"utilization": 0}}}),
+        ] {
+            let usage = parse_usage(&response, now);
+            assert_eq!(usage.status, UsageStatus::Unavailable, "{response}");
+            assert!(usage.windows.is_empty(), "{response}");
+            assert!(usage.detail.is_some(), "{response}");
+            assert_eq!(usage.observed_at, now);
+            assert_eq!(usage.source, UsageSource::Probe);
+            assert!(!super::super::routing::available(&usage, now), "{response}");
+            assert!(
+                !super::super::routing::needs_alternate(&usage, now),
+                "unknown quota is not an exhaustion or sign-in rejection: {response}"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_metadata_is_retained_without_inventing_quota_permission() {
+        let mut response = json!({"subscription_type": "max", "rate_limits": {
+            "limits": [],
+            "spend": {"enabled": true, "percent": 25,
+                "used": {"amount_minor": 125, "currency": "USD", "exponent": 2},
+                "limit": {"amount_minor": 500, "currency": "USD", "exponent": 2}},
+        }});
+        let unknown = parse_usage(&response, 1_000);
+        assert_eq!(unknown.plan.as_deref(), Some("max"));
+        assert_eq!(
+            unknown.credits.as_ref().unwrap().summary(),
+            "$1.25 of $5.00 used"
+        );
+        assert_eq!(unknown.status, UsageStatus::Unavailable);
+        assert!(!super::super::routing::available(&unknown, 1_000));
+        for (percent, status, available) in [
+            (0, UsageStatus::Ok, true),
+            (81, UsageStatus::Warning, true),
+            (100, UsageStatus::Limited, false),
+        ] {
+            response["rate_limits"]["limits"] = json!([
+                {"kind": "session", "percent": percent},
+            ]);
+            let reported = parse_usage(&response, 1_001);
+            assert_eq!(reported.status, status);
+            assert_eq!(reported.windows.len(), 1);
+            assert_eq!(reported.plan, unknown.plan);
+            assert_eq!(reported.credits, unknown.credits);
+            assert_eq!(
+                super::super::routing::available(&reported, 1_001),
+                available
+            );
+        }
+        response["rate_limits"]["limits"] = json!([
+            {"kind": "future_daily_burst", "group": "session", "percent": 5},
+        ]);
+        let future = parse_usage(&response, 1_002);
+        assert_eq!(future.windows[0].key, "future_daily_burst");
+        assert!(super::super::routing::available(&future, 1_002));
     }
 }

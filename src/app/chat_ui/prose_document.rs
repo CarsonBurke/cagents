@@ -367,6 +367,11 @@ impl Document {
         }
         Some(metadata)
     }
+    /// Text bytes, nodes and code rows under the root.
+    pub(super) fn census(&self) -> [usize; 3] {
+        let stats = self.stats(&[]);
+        [stats.bytes, stats.nodes, stats.code_rows]
+    }
     pub(super) fn stats(&self, path: &[u32]) -> Stats {
         self.metadata(path)
             .map_or_else(Stats::default, |metadata| metadata.stats)

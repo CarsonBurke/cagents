@@ -1,0 +1,1392 @@
+#!/bin/sh
+# Run a Cargo command in one of a few shared build slots.
+#
+# Checkouts on one host share its memory, not a build directory: each worktree
+# has its own. One global lock idles most of the CPU while a single slow crate
+# compiles, and while tests run. This admits several builds at once, each when
+# the memory it is expected to need is free, and runs tests and programs after
+# their build has left its slot. Another build starts only while the CPUs have
+# room for it, as the kernel's CPU pressure shows: on a saturated host a
+# further build only slows the running ones and every other workload.
+set -eu
+
+# A mise shim finds its target on PATH, passing over its own directory only if
+# that is the shims directory of mise's data directory. With HOME or XDG_DATA_HOME
+# moved, as in a fixture, the shim finds itself and re-executes without end. Naming
+# the directory here covers this gate's helpers and whatever moves HOME below it.
+# mise treats an empty value as unset.
+if [ -z "${MISE_DATA_DIR-}" ]; then
+    rest=$PATH:
+    while [ -n "$rest" ]; do
+        entry=${rest%%:*}
+        rest=${rest#*:}
+        case $entry in
+        /*/mise/shims)
+            MISE_DATA_DIR=${entry%/shims}
+            export MISE_DATA_DIR
+            break
+            ;;
+        esac
+    done
+fi
+
+# Raise this whenever the gate or a helper beside it changes what it does. A
+# checkout whose gate is older than the installed one runs the installed one,
+# so a worktree that has fallen behind main does not keep main's fixes from its
+# builds.
+gate_version=28
+installed=${CAGENTS_BUILD_INSTALLED_GATE-/var/tmp/cagents-cargo-gate}
+# The helpers this gate runs are the ones beside the file it is, so an
+# installed gate keeps its own while a newer installation takes its name.
+here=$(dirname -- "$(readlink -f -- "$0")")
+synced=${CAGENTS_BUILD_SYNCED-}
+unset CAGENTS_BUILD_SYNCED
+
+# A gate change merged into main is live without anyone installing it. When
+# this checkout's origin/main differs from the last one judged, the sync
+# helper installs main's gate if main changed it since the installed one, and
+# then the new one runs. An installation main has not reached, such as a
+# branch's under test, stays until main changes the gate again.
+if [ -z "$synced" ] && [ "${CAGENTS_BUILD_INSTALL_SYNC-1}" != 0 ] &&
+    case $installed in /*/cagents-cargo-gate) true ;; *) false ;; esac &&
+    [ -w "$(dirname -- "$installed")" ] && [ -f "$here/cargo-gate-sync.py" ] &&
+    main=$(git rev-parse -q --verify 'refs/remotes/origin/main^{commit}' 2>/dev/null) &&
+    [ "$(cat -- "$installed.checked" 2>/dev/null)" != "$main" ]; then
+    was=$(readlink -f -- "$installed" 2>/dev/null) || was=
+    if /usr/bin/python3 "$here/cargo-gate-sync.py" "$installed" "$main"; then
+        # This gate was the installed one, so main's runs in its place.
+        case $here/ in
+            "$(readlink -f -- "$(dirname -- "$installed")")/cagents-cargo-gate.d/"*)
+                CAGENTS_BUILD_SYNCED=1 exec "$installed" "$@" ;;
+        esac
+        if [ "$was" = "$(readlink -f -- "$0")" ]; then
+            CAGENTS_BUILD_SYNCED=1 exec "$installed" "$@"
+        fi
+    fi
+fi
+
+if [ -n "$installed" ] && [ -x "$installed" ] &&
+    [ "$(readlink -f -- "$installed")" != "$(readlink -f -- "$0")" ]; then
+    theirs=$(sed -n 's/^gate_version=\([0-9][0-9]*\)$/\1/p' "$installed" 2>/dev/null | head -n 1)
+    if [ "${theirs:-0}" -gt "$gate_version" ]; then
+        exec "$installed" "$@"
+    fi
+fi
+
+program=cargo-gate
+fail() {
+    printf '%s: %s\n' "$program" "$*" >&2
+    exit 2
+}
+
+# Urgency changes only which already-overdue room waiter gets the next ramp.
+build_priority=${CAGENTS_BUILD_PRIORITY-normal}
+case $build_priority in
+    normal|urgent) ;;
+    *) fail 'CAGENTS_BUILD_PRIORITY must be normal or urgent' ;;
+esac
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/cargo-gate [cargo] SUBCOMMAND [ARGS...]
+       scripts/cargo-gate exec [--hold] COMMAND [ARGS...]
+
+CAGENTS_BUILD_PRIORITY=urgent ranks an already-overdue room waiter ahead of
+ordinary overdue waiters (default: normal). It bypasses neither the slot FIFO,
+ordinary resource admission, the overdue age nor the single-overdue ramp.
+
+Rust compiles only on the build host in CAGENTS_BUILD_REMOTE, through
+scripts/cargo-offload: in one of its build slots, with this checkout's
+sources, streaming the output. What callers here use comes back: executables,
+documentation, timing reports and fixes, and Cargo's messages name this
+host's paths. `run` builds there and runs the program here. While that host is
+unreachable, does not answer or is low on disk, the command waits for it,
+saying so once a minute, within the admission budget; then it fails. It never
+builds here instead. Subcommands that compile nothing, such as `metadata`, run
+here at once; one that compiles but cannot run there faithfully is refused,
+with the reason.
+
+`exec` runs any command, such as a script of several Cargo builds, with a
+`cargo` first on PATH that leads back to this gate, so every Cargo command in
+it builds on that host, each admitted there on its own. With --hold, for a
+script that only builds, one slot there is leased first, priced as a UI
+build, and held until COMMAND exits: its Cargo commands build in that slot one
+at a time, with no wait for admission of their own.
+
+With CAGENTS_BUILD_REMOTE=local, or on the build host itself, commands build
+here, each once a build slot is free. For `test`, `bench` and `run`, only the
+build (`--no-run`, or `build`) holds the slot; the tests or program run
+afterwards without it, tests and benchmarks under a memory limit
+(scripts/memory-capped, CAGENTS_MEMORY_MAX). `exec`, with or without --hold,
+holds one slot until COMMAND exits: a drop-in
+for `flock /var/tmp/cagents-cargo.lock COMMAND`, whose gated commands run in
+that slot without waiting.
+
+A checkout's gate defers to the installed one, /var/tmp/cagents-cargo-gate,
+when that is newer. Run inside a checkout whose origin/main has changed the
+gate since the installed one's commit, the gate first installs main's.
+
+A checkout whose Cargo build directory has never been built is first seeded
+from the main checkout's with scripts/seed-build-dir. Every few hours, and
+at once when the file system holding build directories runs low,
+scripts/build-disk-guard runs scripts/prune-build-dirs, which removes Cargo
+build output nothing has used for a week, and native-evidence builds unused
+for 12 hours, and has scripts/cargo-offload bound the offload build slots
+here that no lease holds, as their leases do. Below a floor it refuses the
+build.
+
+Environment:
+  CAGENTS_BUILD_REMOTE   Host that compiles (default fw16); `local` builds here
+  CAGENTS_BUILD_REMOTE_SLOTS, CAGENTS_BUILD_REMOTE_JOBS,
+  CAGENTS_BUILD_REMOTE_FREE_FLOOR_GIB
+                         Most slots on that host (default 8; further ones
+                         are made while disk allows, and builds start as
+                         memory and CPU allow), Cargo jobs for each (default:
+                         its CPUs shared among the running builds), and the
+                         free space below which it builds nothing (40 GiB)
+  CAGENTS_BUILD_REMOTE_INCREMENTAL_GIB
+                         Most incremental compilation state each slot there
+                         keeps, its builds' latest first (default 20; a
+                         quarter of it below twice the floor)
+  CAGENTS_BUILD_REMOTE_LOOPBACK=1
+                         On the build host itself, build in its shared
+                         slots, as another host would, rather than here
+  CAGENTS_BUILD_INSTALLED_GATE
+                         The installed gate a checkout's older gate defers
+                         to (default /var/tmp/cagents-cargo-gate); empty
+                         runs this checkout's gate always
+  CAGENTS_BUILD_INSTALL_SYNC=0
+                         Do not install origin/main's newer gate
+  CAGENTS_BUILD_SEED=0   Do not seed a new build directory
+  CAGENTS_BUILD_FREE_FLOOR_GIB
+                         Free space below which builds are refused; default
+                         5% of the file system, at most 64; 0 disables
+  CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS
+                         Optional positive integer budget for preflight and
+                         admission waits, including the wait for the build
+                         host; expiry exits 124 after cleanup. Admitted
+                         builds are not timed out; default unbounded
+  CAGENTS_BUILD_SLOTS    Concurrent builds; default: one per 4 GiB of RAM
+                         after an 8 GiB reserve, at most one per 4 CPUs
+                         and at most 4
+  CAGENTS_BUILD_CPU_PRESSURE
+                         Percentage of time some task waited for a CPU over
+                         the last 10 s (`some avg10` in /proc/pressure/cpu)
+                         at or above which no further build starts beside a
+                         running one; default 60; 0 disables this and the
+                         settling time
+  CAGENTS_BUILD_CPU_SETTLE_SECS
+                         Seconds after a build starts before the pressure,
+                         a 10 s average, can show it; no further build
+                         starts until then; default 10
+  CAGENTS_BUILD_MEMORY_PRESSURE
+                         Percentage of time some task stalled on memory over
+                         the last 10 s (`some avg10` in /proc/pressure/memory)
+                         at or above which no further build starts beside a
+                         running one; default 10; 0 disables
+  CAGENTS_BUILD_REGISTRY Directory where builds in every shared slot family
+                         and the build host's offloaded slots record
+                         themselves, so each family counts the others' builds;
+                         default /var/tmp/cagents-builds-UID for a lock named
+                         /var/tmp/cagents-*.lock, otherwise none; empty
+                         disables
+  CAGENTS_BUILD_WAIT_PRIORITY_SECS
+                         Seconds refused room with a free slot after which
+                         the build refused longest on the host starts beside
+                         the running builds whatever their memory, while no
+                         other build admitted so is ramping up; default 120;
+                         0 disables
+  CAGENTS_BUILD_COST_GIB Memory this build is expected to need at its peak;
+                         default by kind, from 3 GiB for the CLI lane to
+                         9 GiB for a UI build
+  CAGENTS_BUILD_LOCK     First slot's lock file; the others add .1, .2, ...
+                         (default /var/tmp/cagents-cargo.lock)
+  CARGO_BUILD_JOBS       With several slots, set or capped to the CPUs divided
+                         by the builds running once this one starts, between
+                         4 and 8
+
+Slot 0 is the plain lock file, so a command still run under
+`flock --close /var/tmp/cagents-cargo.lock` occupies exactly one slot. Without
+--close, a daemon the command leaves behind keeps the slot until it exits. With
+it, gated commands under that flock run in its slot, and killing the flock frees
+the slot even if its command keeps running.
+EOF
+}
+
+[ "$#" -gt 0 ] || { usage >&2; exit 2; }
+# Entered from an `exec` command's `cargo` shim: what this gate runs finds
+# this host's Cargo on PATH as it would without the shim. A wrapper such as
+# mise's shim looks for the next `cargo` on PATH, which would otherwise be
+# the shim again, leading back here without end.
+if [ -n "${CAGENTS_BUILD_EXEC_SHIMS-}" ]; then
+    rest=$PATH:
+    PATH=
+    separator=
+    while [ -n "$rest" ]; do
+        entry=${rest%%:*}
+        rest=${rest#*:}
+        if [ "$entry" != "$CAGENTS_BUILD_EXEC_SHIMS" ]; then
+            PATH=$PATH$separator$entry
+            separator=:
+        fi
+    done
+    export PATH
+    # The guard against compiling here, below, is for Cargo that bypassed
+    # the shim; this gate's own Cargo gets the wrapper the caller had, from
+    # whichever gate's exec set it.
+    case ${RUSTC_WRAPPER-} in
+    */cargo-gate-rustc-guard)
+        if [ -n "${CAGENTS_BUILD_EXEC_RUSTC_WRAPPER-}" ]; then
+            RUSTC_WRAPPER=$CAGENTS_BUILD_EXEC_RUSTC_WRAPPER
+        else
+            unset RUSTC_WRAPPER
+        fi
+        ;;
+    esac
+fi
+named=false
+case $1 in
+    -h|--help) usage; exit 0 ;;
+    cargo) shift; named=true ;;
+esac
+[ "$#" -gt 0 ] || fail 'missing Cargo subcommand'
+hold=false
+if [ "$1" = exec ] && [ "$named" = false ]; then
+    shift
+    if [ "${1-}" = --hold ]; then
+        hold=true
+        shift
+    fi
+    [ "$#" -gt 0 ] || fail 'missing command for exec'
+    mode=exec
+else
+    mode=cargo
+fi
+
+# The machine's CPUs, not this process's share: nproc follows affinity and
+# OMP_NUM_THREADS, and a narrow caller would otherwise think it was alone.
+cpus=$(getconf _NPROCESSORS_ONLN)
+memory_kib=$(sed -n 's/^MemTotal:[[:space:]]*\([0-9]*\) kB$/\1/p' /proc/meminfo)
+[ -n "$memory_kib" ] || fail 'cannot read MemTotal from /proc/meminfo'
+# Builds spend most of their time in a few crates that compile or link on one
+# CPU: measured gated builds averaged 1.4 busy CPUs each with 8 jobs. Slots are
+# therefore narrower than their jobs, and admission is by memory, not count.
+gib=$((1024 * 1024))
+if [ -n "${CAGENTS_BUILD_SLOTS:-}" ]; then
+    slots=$CAGENTS_BUILD_SLOTS
+    case $slots in ''|*[!0-9]*|0*) fail 'CAGENTS_BUILD_SLOTS must be a positive integer' ;; esac
+else
+    slots=$(((memory_kib - 8 * gib) / (4 * gib)))
+    [ "$slots" -le $((cpus / 4)) ] || slots=$((cpus / 4))
+    # More builds than this ran slower in all, on a host whose CPUs other work
+    # also uses: each spends most of its time in one crate's compile or link.
+    [ "$slots" -le 4 ] || slots=4
+    [ "$slots" -ge 1 ] || slots=1
+fi
+
+case ${CAGENTS_BUILD_COST_GIB-1} in
+    ''|*[!0-9]*|0*) fail 'CAGENTS_BUILD_COST_GIB must be a positive integer' ;;
+esac
+pressure_limit=${CAGENTS_BUILD_CPU_PRESSURE-60}
+case $pressure_limit in
+    0) ;;
+    ''|*[!0-9]*|0*) fail 'CAGENTS_BUILD_CPU_PRESSURE must be a percentage' ;;
+    *) [ "$pressure_limit" -le 100 ] || fail 'CAGENTS_BUILD_CPU_PRESSURE must be a percentage' ;;
+esac
+settle=${CAGENTS_BUILD_CPU_SETTLE_SECS-10}
+case $settle in
+    0) ;;
+    ''|*[!0-9]*|0*) fail 'CAGENTS_BUILD_CPU_SETTLE_SECS must be a whole number of seconds' ;;
+esac
+pressure_file=${CAGENTS_BUILD_CPU_PRESSURE_FILE:-/proc/pressure/cpu}
+memory_limit=${CAGENTS_BUILD_MEMORY_PRESSURE-10}
+case $memory_limit in
+    0) ;;
+    ''|*[!0-9]*|0*) fail 'CAGENTS_BUILD_MEMORY_PRESSURE must be a percentage' ;;
+    *) [ "$memory_limit" -le 100 ] || fail 'CAGENTS_BUILD_MEMORY_PRESSURE must be a percentage' ;;
+esac
+memory_pressure_file=${CAGENTS_BUILD_MEMORY_PRESSURE_FILE:-/proc/pressure/memory}
+lock=${CAGENTS_BUILD_LOCK:-/var/tmp/cagents-cargo.lock}
+# Every shared slot family on this host, and the build host's offloaded
+# slots, record their running builds in one registry, so each prices the
+# others' builds beside its own: separate families would otherwise each fill
+# the same memory. A private family, such as a test's or a native session's,
+# stays out of it unless CAGENTS_BUILD_REGISTRY names one; empty disables it.
+if [ -n "${CAGENTS_BUILD_REGISTRY+set}" ]; then
+    registry=$CAGENTS_BUILD_REGISTRY
+else
+    # Only locks directly in /var/tmp: a pattern's `*` matches `/` too, and a
+    # private family's lock may lie in a directory named like a shared one.
+    case $lock in
+        /var/tmp/cagents-*.lock)
+            case ${lock#/var/tmp/cagents-} in
+                */*) registry= ;;
+                *) registry=/var/tmp/cagents-builds-$(id -u) ;;
+            esac
+            ;;
+        *) registry= ;;
+    esac
+fi
+priority_secs=${CAGENTS_BUILD_WAIT_PRIORITY_SECS-120}
+case $priority_secs in
+    0) ;;
+    ''|*[!0-9]*|0*) fail 'CAGENTS_BUILD_WAIT_PRIORITY_SECS must be a whole number of seconds' ;;
+esac
+# How recently a waiting build must have been refused room to keep its place,
+# and how long a build admitted as overdue keeps the next one waiting.
+wait_fresh=10
+overdue_ramp=600
+
+# The memory a build is expected to need at its peak, in KiB: the whole
+# process tree's resident memory, measured on this repository's builds with 8
+# jobs (p90 rounded up). A UI build links the libcosmic, Servo and iced
+# graphs; a host build, Ghostty; a check generates no code. A held script
+# of builds, such as the development runner's, may build any lane in its
+# slot, so it is costed as the largest, a UI build.
+expected_cost() {
+    if [ -n "${CAGENTS_BUILD_COST_GIB:-}" ]; then
+        printf '%s' $((CAGENTS_BUILD_COST_GIB * gib))
+        return
+    fi
+    if [ "$mode" != cargo ]; then
+        if [ "$hold" = true ]; then
+            printf '%s' $((9 * gib))
+        else
+            printf '%s' $((8 * gib))
+        fi
+        return
+    fi
+    # The lane is in the selected features and executables.
+    lane=cli
+    selection=false
+    for argument do
+        names=
+        if [ "$selection" = true ]; then
+            names=$argument
+        else
+            case $argument in
+                --) break ;;
+                --all-features) names=ui ;;
+                --features=*|--bin=*) names=${argument#*=} ;;
+                -F?*) names=${argument#-F} ;;
+            esac
+        fi
+        selection=false
+        case $argument in
+            --features|-F|--bin) selection=true ;;
+        esac
+        case ,$names, in
+            *[,\ ]ui[,\ ]*|*integrated-browser*|*cagents-ui*) lane=ui ;;
+            *[,\ ]host[,\ ]*|*cagentsd*) [ "$lane" = ui ] || lane=host ;;
+        esac
+    done
+    case $1:$lane in
+        check:cli|clippy:cli|doc:cli|metadata:*|tree:*) printf '%s' $((3 * gib)) ;;
+        check:*|clippy:*|doc:*) printf '%s' $((4 * gib)) ;;
+        *:cli) printf '%s' $((3 * gib)) ;;
+        *:host) printf '%s' $((7 * gib)) ;;
+        *) printf '%s' $((9 * gib)) ;;
+    esac
+}
+
+available_kib() {
+    available=$(sed -n 's/^MemAvailable:[[:space:]]*\([0-9]*\) kB$/\1/p' /proc/meminfo)
+    printf '%s' "${available:-0}"
+}
+
+announce() {
+    if [ "$announced" = false ]; then
+        printf '%s: waiting for one of %s build slots\n' "$program" "$slots" >&2
+        announced=true
+    fi
+}
+
+slot_path() {
+    if [ "$1" -eq 0 ]; then printf '%s' "$lock"; else printf '%s.%s' "$lock" "$1"; fi
+}
+
+# Seconds since boot: unlike the wall clock, never set back.
+uptime_seconds() {
+    read -r up _ </proc/uptime
+    printf '%s' "${up%%.*}"
+}
+
+# Whether the CPUs have room for one more build beside running ones: no build
+# started too recently for the pressure to show it (the newest start is in
+# `newest`), and the pressure is below the limit. A host that does not report
+# pressure has room.
+cpu_allows() {
+    [ "$pressure_limit" -gt 0 ] || return 0
+    # A start after now is from before a reboot, whose holder's PID was reused.
+    if [ -n "$newest" ]; then
+        age=$(($(uptime_seconds) - newest))
+        [ "$age" -lt 0 ] || [ "$age" -ge "$settle" ] || return 1
+    fi
+    some=$(sed -n 's/^some avg10=\([0-9]*\)[.[:space:]].*/\1/p' "$pressure_file" 2>/dev/null) || some=
+    [ -n "$some" ] || return 0
+    [ "$some" -ge "$pressure_limit" ] || return 0
+    if [ "$pressure_announced" = false ]; then
+        printf '%s: CPUs busy (%s%% pressure, limit %s%%); waiting to start beside the running builds\n' \
+            "$program" "$some" "$pressure_limit" >&2
+        # What else holds them is named once the decision is released.
+        culprits_due=yes
+        culprit_holders=$claims
+        pressure_announced=true
+    fi
+    return 1
+}
+
+# Names what holds the CPUs besides the running builds, once a CPU wait has
+# been announced: a runaway loop otherwise looks like builds. Sampling takes a
+# second, so it runs once per wait, with the host's decision and the slot
+# released, so no other family's build waits it out, and the helper holds no
+# lock descriptor. This gate keeps its place at the head of its family's
+# queue meanwhile, as it does throughout its wait. The running
+# builds are their holders in `culprit_holders` and whatever holds this
+# family's slots, such as a plain `flock`.
+name_culprits() {
+    [ -n "$culprits_due" ] || return 0
+    culprits_due=
+    [ -x "$here/cargo-offload" ] || return 0
+    set --
+    for claim in $culprit_holders; do
+        holder=${claim%%:*}
+        [ "$holder" = 0 ] || set -- "$@" "$holder"
+    done
+    other=0
+    while [ "$other" -lt "$slots" ]; do
+        set -- "$@" "$(slot_path "$other")"
+        other=$((other + 1))
+    done
+    # Where a workload left running can be bounded to its session: beside
+    # this gate, or in the checkout it runs for, when that is this project's.
+    bounded=$here/bounded
+    if [ ! -x "$bounded" ]; then
+        top=$(exec 6>&- 7>&- 8>&- 9>&- </dev/null 2>/dev/null; git rev-parse --show-toplevel) || top=
+        bounded=
+        [ -z "$top" ] || [ ! -f "$top/scripts/cargo-gate" ] || bounded=$top/scripts/bounded
+    fi
+    if [ -x "$bounded" ]; then
+        set -- --bounded "$bounded" "$@"
+    fi
+    # Reading a process stuck on a hung mount can block, so the sample has a
+    # limit, where the host has timeout(1).
+    if command -v timeout >/dev/null 2>&1; then
+        set -- timeout 10 "$here/cargo-offload" --busiest "$@"
+    else
+        set -- "$here/cargo-offload" --busiest "$@"
+    fi
+    culprits=$(exec 6>&- 7>&- 8>&- 9>&- </dev/null 2>/dev/null; exec "$@") || culprits=
+    [ -z "$culprits" ] || printf '%s: %s\n' "$program" "$culprits" >&2
+}
+
+# Whether memory has room for one more build beside running ones: tasks are
+# not already stalling on reclaim (`some avg10` in /proc/pressure/memory below
+# the limit). A host that does not report pressure has room.
+memory_allows() {
+    [ "$memory_limit" -gt 0 ] || return 0
+    some=$(sed -n 's/^some avg10=\([0-9]*\)[.[:space:]].*/\1/p' "$memory_pressure_file" 2>/dev/null) || some=
+    [ -n "$some" ] || return 0
+    [ "$some" -ge "$memory_limit" ] || return 0
+    if [ "$memory_announced" = false ]; then
+        printf '%s: memory under pressure (%s%%, limit %s%%); waiting to start beside the running builds\n' \
+            "$program" "$some" "$memory_limit" >&2
+        memory_announced=true
+    fi
+    return 1
+}
+
+# Counts a running build whose record, read from standard input, is its
+# holder's PID and expected cost, then its start in seconds since boot. A
+# record whose holder has exited is priced as unknown: the largest cost. PID
+# 0 is an offloaded build whose command has not started: its cost, with
+# nothing held yet.
+count_running() {
+    running=$((running + 1))
+    claim= holder= claimed= since=
+    { read -r holder claimed; read -r since; } 2>/dev/null || :
+    case $holder:$claimed in
+        *[!0-9:]*|:*|*:) ;;
+        *)
+            if [ "$holder" -eq 0 ] || [ -d "/proc/$holder" ]; then
+                claim="$holder:$claimed"
+            fi
+            [ -n "$claim" ] || since=
+            case $since in
+                ''|*[!0-9]*) ;;
+                *)
+                    # Discard pre-reboot dates before choosing
+                    # the newest, so they cannot hide a fresh start.
+                    if [ "$since" -le "$(uptime_seconds)" ]; then
+                        [ -n "$newest" ] && [ "$since" -le "$newest" ] || newest=$since
+                    fi
+                    ;;
+            esac
+            ;;
+    esac
+    claims="$claims ${claim:-0:$((9 * gib))}"
+}
+
+# Whether `$1` is one of this family's slot locks.
+own_slot() {
+    case $1 in
+        "$lock") return 0 ;;
+        "$lock".*) case ${1#"$lock".} in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac ;;
+    esac
+    return 1
+}
+
+# Whether something holds the lock file `$1`. A child probes it, as the
+# admission decision holds descriptor 7.
+locked() {
+    if flock -n -E 75 "$1" true 2>/dev/null; then
+        return 1
+    else
+        [ "$?" -eq 75 ]
+    fi
+}
+
+# The lock named by the registry record `$1` while a build holds it: a record
+# of a free lock is stale. Only regular files are probed, as opening anything
+# else could fail or block.
+running_lock() {
+    case $1 in *.new) return 1 ;; esac
+    [ -f "$1" ] || return 1
+    held_lock=$(sed -n 3p "$1" 2>/dev/null) || return 1
+    [ -n "$held_lock" ] && [ -f "$held_lock" ] && locked "$held_lock"
+}
+
+# Counts the registry's builds in other families: each record names its slot's
+# lock, which its build holds while it runs.
+count_registered() {
+    [ -n "$registry" ] || return 0
+    for entry in "$registry"/gate-* "$registry"/offload-*; do
+        running_lock "$entry" || continue
+        own_slot "$held_lock" || count_running <"$entry"
+    done
+}
+
+# Families decide one at a time: from pricing the running builds until this
+# one's record is written, on descriptor 7, so two families cannot each admit
+# a build into the same free memory. A registry this gate cannot write leaves
+# it pricing its own family alone, as a failed redirection on `exec` would end
+# the shell.
+decide() {
+    deciding=
+    [ -n "$registry" ] || return 0
+    mkdir -p -m 0700 "$registry" 2>/dev/null || :
+    if [ -d "$registry" ] && [ -w "$registry" ] && {
+        [ ! -e "$registry/.decision" ] || { [ -f "$registry/.decision" ] && [ -w "$registry/.decision" ]; }
+    }; then
+        exec 7>>"$registry/.decision"
+        flock 7
+        deciding=yes
+    else
+        printf '%s: cannot use the build registry %s; pricing this slot family alone\n' \
+            "$program" "$registry" >&2
+        registry=
+    fi
+}
+
+decided() {
+    [ -z "$deciding" ] || exec 7>&-
+    deciding=
+}
+
+# The registry record of this family's slot `$1`.
+registry_entry() {
+    printf '%s/gate-%s' "$registry" "$(printf '%s' "$1" | cksum | cut -d ' ' -f 1)"
+}
+
+# This family's record of the build waiting at the head of its queue.
+wait_entry() {
+    printf '%s/wait-gate-%s' "$registry" "$(printf '%s' "$lock" | cksum | cut -d ' ' -f 1)"
+}
+
+# When process `$1` started, in clock ticks since boot, to tell it from a
+# later process given its PID.
+start_time() {
+    sed 's/^.*) //' "/proc/$1/stat" 2>/dev/null | cut -d ' ' -f 20
+}
+
+# Records this build as refused room while it holds a free slot, refreshed
+# every couple of seconds while that lasts, so another family's build can tell
+# which of them has been refused longest. A build refused again within
+# `wait_fresh` seconds keeps its place; one waiting for a slot of its own
+# family is not refused room, and its record goes stale. Times are seconds
+# since boot, which the wall clock's steps cannot reorder.
+record_refusal() {
+    [ -n "$registry" ] || return 0
+    now=$(uptime_seconds)
+    if [ -z "$refused_since" ] || [ $((now - refused_last)) -gt "$wait_fresh" ]; then
+        refused_since=$now
+    fi
+    refused_last=$now
+    [ -z "$refused_written" ] || [ $((now - refused_written)) -ge 2 ] || return 0
+    refused_written=$now
+    entry=$(wait_entry)
+    # This family still owns the queue lock. Establish cleanup ownership
+    # before publishing: a signal trap can run as soon as mv returns.
+    wait_recorded=yes
+    { printf '%s %s %s %s\n%s\n' "$$" "$(start_time "$$")" "$refused_since" "$now" "$build_priority" >"$entry.new" &&
+        mv -f -- "$entry.new" "$entry"; } 2>/dev/null || :
+}
+
+forget_wait() {
+    [ -z "$wait_recorded" ] || rm -f -- "$(wait_entry)" "$(wait_entry).new" 2>/dev/null || :
+    wait_recorded=
+}
+
+# Whether the registry record `$1` is of a build admitted as overdue that may
+# still be ramping up at second `$2` since boot: its holder lives, it started
+# less than `overdue_ramp` seconds before, and it holds its lock. After that,
+# what it has yet to take is priced as any running build's is.
+ramping() {
+    [ "$(sed -n 4p "$1" 2>/dev/null)" = overdue ] || return 1
+    holder= claimed= started=
+    { read -r holder claimed; read -r started; } 2>/dev/null <"$1" || return 1
+    case $holder:$started in *[!0-9:]*|:*|*:) return 1 ;; esac
+    [ $(($2 - started)) -lt "$overdue_ramp" ] || return 1
+    [ "$holder" -eq 0 ] || [ -d "/proc/$holder" ] || return 1
+    running_lock "$1"
+}
+
+# Whether this build, refused room, is overdue: it has been refused for the
+# priority time, longer than every other build refused on the host now, and
+# no build admitted that way is still ramping up. It then starts whatever the
+# memory, so a large build cannot wait forever behind smaller ones that keep
+# fitting, nor several such builds fill memory at once.
+overdue() {
+    [ -n "$registry" ] && [ "$priority_secs" -gt 0 ] && [ -n "$refused_since" ] || return 1
+    now=$(uptime_seconds)
+    # Refusals that stopped, while it waited for a slot, start again.
+    [ $((now - refused_last)) -le "$wait_fresh" ] || return 1
+    [ $((now - refused_since)) -ge "$priority_secs" ] || return 1
+    mine=$(wait_entry)
+    for entry in "$registry"/wait-*; do
+        case $entry in "$mine"|*.new) continue ;; esac
+        [ -f "$entry" ] || continue
+        pid= started= since= last=
+        read -r pid started since last <"$entry" 2>/dev/null || continue
+        case $pid:$started:$since:$last in *[!0-9:]*|*::*|:*|*:) continue ;; esac
+        [ $((now - last)) -le "$wait_fresh" ] || continue
+        [ $((now - since)) -ge "$priority_secs" ] || continue
+        other_priority=$(sed -n 2p "$entry" 2>/dev/null) || other_priority=normal
+        case $other_priority in normal|urgent) ;; *) other_priority=normal ;; esac
+        if [ "$other_priority" != "$build_priority" ]; then
+            [ "$other_priority" = urgent ] || continue
+        else
+            [ "$since" -lt "$refused_since" ] ||
+                { [ "$since" -eq "$refused_since" ] && [ "$pid" -lt "$$" ]; } || continue
+        fi
+        [ "$(start_time "$pid")" = "$started" ] || continue
+        return 1
+    done
+    for entry in "$registry"/gate-* "$registry"/offload-*; do
+        ! ramping "$entry" "$now" || return 1
+    done
+}
+
+# Whether this build fits beside the builds in the slots other than $1: the
+# CPUs have room for it, and the memory free now, less what those builds are expected to take beyond what
+# they already hold, covers this build's expected cost. A lone build always
+# fits. A slot held without a cost, as by a plain `flock`, is assumed to
+# need the largest cost and to hold none of it yet. Sets `running` to the
+# number of other builds. Only gated waiters take the extra slots, and they
+# hold the queue lock while choosing one.
+fits() {
+    room_notice=
+    running=0
+    claims=
+    newest=
+    late=
+    other=0
+    while [ "$other" -lt "$slots" ]; do
+        if [ "$other" -ne "$1" ]; then
+            path=$(slot_path "$other")
+            if locked "$path"; then
+                if [ -r "$path.cost" ]; then
+                    count_running <"$path.cost"
+                else
+                    count_running </dev/null
+                fi
+            fi
+        fi
+        other=$((other + 1))
+    done
+    count_registered
+    [ "$running" -gt 0 ] || return 0
+    if cpu_allows && memory_allows && memory_fits; then
+        return 0
+    fi
+    overdue || return 1
+    late=yes
+}
+
+# Whether the memory free now, less what the running builds in `claims` are
+# expected to take beyond what they already hold, covers this build's cost.
+memory_fits() {
+    # One process listing prices every running build: its expected cost less
+    # the resident memory of its process tree so far.
+    outstanding=$(ps -e -o pid= -o ppid= -o rss= 2>/dev/null | awk -v claims="$claims" '
+        { parent[$1] = $2; rss[$1] = $3 }
+        END {
+            count = split(claims, list, " ")
+            for (i = 1; i <= count; i++) {
+                split(list[i], pair, ":")
+                root[pair[1]] = i
+                cost[i] = pair[2]
+            }
+            for (pid in rss) {
+                for (node = pid; node in parent && !(node in root) && node > 1; node = parent[node]) {}
+                if (node in root) held[root[node]] += rss[pid]
+            }
+            total = 0
+            for (i = 1; i <= count; i++) if (cost[i] > held[i]) total += cost[i] - held[i]
+            print total
+        }') || outstanding=
+    [ -n "$outstanding" ] || outstanding=$((running * 9 * gib))
+    room_available=$(available_kib)
+    [ $((room_available - outstanding)) -lt "$cost" ] || return 0
+    room_notice="$room_available $outstanding $cost"
+    return 1
+}
+
+name_memory_wait() {
+    if [ -n "${room_notice:-}" ]; then
+        if [ "${room_announced:-}" != yes ]; then
+            printf '%s\n' "$room_notice" | awk -v host="$(hostname)" -v program="$program" '
+                { printf "%s: waiting for memory on %s: %.1f GiB available, running builds reserve %.1f GiB, this build expects %.1f GiB\n", program, host, $1/1048576, $2/1048576, $3/1048576 }' >&2
+            room_announced=yes
+        fi
+    else
+        room_announced=
+    fi
+}
+
+# Holds a slot on descriptor 9 until release. Gated waiters line up on a
+# queue lock, and the one at its head takes the first slot that frees. Plain
+# `flock` callers take only slot 0 and wait for it in the kernel, which
+# admits waiters in arrival order; the head waiter queues there too, through
+# a background lock waiter on a descriptor it shares, so it keeps its place
+# instead of losing every release of slot 0. Meanwhile it polls the slots
+# that only gated builds use.
+acquire() {
+    announced=false
+    pressure_announced=false
+    culprits_due=
+    memory_announced=false
+    waited_since=$(date +%s)
+    waiter=
+    wait_recorded=
+    refused_since=
+    refused_last=
+    refused_written=
+    # Both queue and slot requests are private lock waiters, bound to this
+    # gate's lifetime. The admitted command alone inherits caller descriptors.
+    trap 'withdraw; exit 130' INT
+    trap 'withdraw; exit 143' TERM
+    trap 'withdraw; exit 129' HUP
+    trap 'withdraw; exit 131' QUIT
+    exec 6>>"$lock.queue"
+    if ! flock -n 6; then
+        announce
+        /usr/bin/python3 "$here/cargo-gate-command.py" --wait-lock "$$" 6 "${admission_deadline:-}" \
+            8>&- 9>&- </dev/null >/dev/null &
+        waiter=$!
+        status=0
+        wait "$waiter" || status=$?
+        waiter=
+        [ "$status" -eq 0 ] || exit "$status"
+    fi
+    exec 8>&6 6>&-
+    while :; do
+        check_admission
+        if [ -z "$waiter" ]; then
+            exec 6>>"$lock"
+            # A killed gate must leave neither an abandoned slot request nor
+            # any helper holding its caller's pipes, locks or queue descriptor.
+            # This loop enforces the deadline itself, so the waiter needs none.
+            /usr/bin/python3 "$here/cargo-gate-command.py" --wait-lock "$$" 6 "" \
+                8>&- 9>&- </dev/null >/dev/null &
+            waiter=$!
+        fi
+        # The shared descriptor locks only once the queued request is granted:
+        # the kernel never leaves slot 0 free while a request waits for it.
+        if flock -n 6; then
+            # `2>/dev/null`: dash reports "Terminated" for a job it kills and then waits for.
+            kill "$waiter" 2>/dev/null || :
+            wait "$waiter" 2>/dev/null || :
+            waiter=
+            exec 9>&6 6>&-
+            decide
+            if fits 0; then
+                index=0
+                admitted
+                return
+            fi
+            record_refusal
+            decided
+            name_memory_wait
+            flock -u 9
+            exec 9>&-
+            name_culprits
+            sleep 0.5
+            continue
+        fi
+        # Queue again if the request itself was killed; a waiter that failed
+        # on its own would fail again, so stop rather than respawn it forever.
+        if waiter_gone; then
+            status=0
+            wait "$waiter" 2>/dev/null || status=$?
+            waiter=
+            exec 6>&-
+            if [ "$status" -gt 0 ] && [ "$status" -lt 128 ]; then
+                exit "$status"
+            fi
+            continue
+        fi
+        # Every free slot sees the same other builds, so price them once.
+        fit=
+        decide
+        index=$slots
+        while [ "$index" -gt 1 ]; do
+            index=$((index - 1))
+            exec 9>>"$(slot_path "$index")"
+            if flock -n 9; then
+                # Start beside other builds only when the memory this build
+                # needs is free; a lone build always starts.
+                if [ -z "$fit" ]; then
+                    if fits "$index"; then fit=yes; else fit=no; fi
+                fi
+                if [ "$fit" = yes ]; then
+                    withdraw
+                    admitted
+                    return
+                fi
+                flock -u 9
+            fi
+            exec 9>&-
+        done
+        [ "$fit" != no ] || record_refusal
+        decided
+        name_memory_wait
+        name_culprits
+        announce
+        sleep 0.2
+    done
+}
+
+check_admission() {
+    [ -n "$admission_deadline" ] || return 0
+    admission_status=0
+    /usr/bin/python3 "$here/cargo-gate-command.py" \
+        --admission-check "$admission_deadline" 6>&- 8>&- 9>&- || admission_status=$?
+    if [ "$admission_status" -ne 0 ]; then
+        withdraw
+        # Exiting closes queue/candidate descriptors, without removing a cost
+        # record belonging to an already admitted build.
+        exit "$admission_status"
+    fi
+}
+
+# Withdraws the queued request for slot 0. Closing the last descriptor on it
+# also gives the slot back if the request was granted meanwhile.
+withdraw() {
+    if [ -n "$waiter" ]; then
+        kill "$waiter" 2>/dev/null || :
+        wait "$waiter" 2>/dev/null || :
+    fi
+    exec 6>&-
+    waiter=
+    forget_wait
+}
+
+# Whether the queued request has exited; an unreaped one is a zombie.
+waiter_gone() {
+    state=$(sed -n 's/^[0-9]* (.*) \(.\) .*/\1/p' /proc/"$waiter"/stat 2>/dev/null) || return 0
+    [ -z "$state" ] || [ "$state" = Z ]
+}
+
+admitted() {
+    # Commit while both the queue and candidate slot are still held. No
+    # admission deadline remains when the build or its nested commands start.
+    check_admission
+    admission_deadline=
+    trap - INT TERM HUP QUIT
+    # Prices this build for the builds that start after it, and dates its
+    # start in seconds since boot, before the next waiter can look. The date
+    # is a line of its own, which gates that only price builds do not read.
+    since=$(uptime_seconds)
+    printf '%s %s\n%s\n' "$$" "$cost" "$since" >"$(slot_path "$index").cost" 2>/dev/null || :
+    if [ -n "$registry" ]; then
+        # The fourth line marks a build admitted as overdue.
+        printf '%s %s\n%s\n%s\n%s\n' "$$" "$cost" "$since" "$(slot_path "$index")" "${late:+overdue}" \
+            >"$(registry_entry "$(slot_path "$index")")" 2>/dev/null || :
+        forget_wait
+    fi
+    decided
+    if [ -n "$late" ]; then
+        if [ "$build_priority" = urgent ]; then
+            printf '%s: urgent build is overdue; starting beside the running builds\n' "$program" >&2
+        else
+            printf '%s: refused room longest on this host; starting beside the running builds\n' "$program" >&2
+        fi
+    fi
+    exec 8>&-
+    # Each build gets a share of the CPUs among the builds running once it
+    # starts, replacing the repository's two-job default and capping a larger
+    # CARGO_BUILD_JOBS. A lone slot keeps Cargo's configured jobs. `-j` on the
+    # command still wins.
+    if [ "$slots" -gt 1 ]; then
+        # At most 8, the jobs the expected costs were measured with.
+        share=$((cpus / (running + 1)))
+        [ "$share" -le $((cpus / 2)) ] || share=$((cpus / 2))
+        [ "$share" -le 8 ] || share=8
+        [ "$share" -ge 4 ] || share=4
+        case ${CARGO_BUILD_JOBS:-} in
+            ''|*[!0-9]*|0*) CARGO_BUILD_JOBS=$share ;;
+            *) [ "$CARGO_BUILD_JOBS" -le "$share" ] || CARGO_BUILD_JOBS=$share ;;
+        esac
+        export CARGO_BUILD_JOBS
+    fi
+    waited=$(($(date +%s) - waited_since))
+    if [ "$waited" -gt 1 ]; then
+        printf '%s: admitted to slot %s after %ss\n' "$program" "$index" "$waited" >&2
+    fi
+}
+
+release() {
+    # While the slot is still held, so no later holder is priced as this one.
+    rm -f -- "$(slot_path "$index").cost"
+    [ -z "$registry" ] || rm -f -- "$(registry_entry "$(slot_path "$index")")"
+    exec 9>&-
+}
+
+# Runs one owned command, either before admission (empty marker) or in this
+# gate's slot. Descriptors 8 and 9 stay here, so a lingering child cannot keep
+# the slot. On cancellation the supervisor drains the command's descendants
+# before returning. A private receipt forwards signals without signalling a
+# helper PID that wait might just have reaped; the helper also handles direct
+# signals.
+supervised() {
+    slot_marker=$1
+    shift
+    command_state=$(mktemp -d "${TMPDIR:-/tmp}/cagents-cargo-command.XXXXXXXX") || return "$?"
+    cancelled=0
+    interrupted=false
+    trap 'interrupt 2' INT
+    trap 'interrupt 15' TERM
+    trap 'interrupt 1' HUP
+    trap 'interrupt 3' QUIT
+    # POSIX shells may replace async stdin with /dev/null before applying
+    # redirections. Save the caller's stdin on the now-free queue descriptor.
+    exec 8<&0
+    set -- "$command_state/cancelled" "$@"
+    if [ -z "$slot_marker" ] && [ -n "${admission_deadline:-}" ]; then
+        set -- --admission-until "$admission_deadline" "$@"
+    fi
+    CAGENTS_BUILD_SLOT_HELD=$slot_marker /usr/bin/python3 "$here/cargo-gate-command.py" \
+        "$@" 0<&8 8>&- 9>&- &
+    child=$!
+    exec 8<&-
+    status=0
+    while :; do
+        interrupted=false
+        status=0
+        wait "$child" || status=$?
+        [ "$interrupted" = true ] || break
+    done
+    trap - INT TERM HUP QUIT
+    rm -rf "$command_state"
+    [ "$cancelled" -eq 0 ] || status=$((128 + cancelled))
+    return "$status"
+}
+
+# Nested commands use this gate's slot only after it has been acquired.
+held() {
+    supervised "$$" "$@"
+}
+
+interrupt() {
+    interrupted=true
+    if [ "$cancelled" -eq 0 ]; then
+        cancelled=$1
+        printf '%s\n' "$cancelled" >"$command_state/cancelled"
+    fi
+}
+
+# The build half of `test`, `bench` or `run`. Arguments after `--` belong to
+# the tests or program, not Cargo.
+build_phase() {
+    ended=false
+    for argument do
+        shift
+        [ "$argument" != -- ] || ended=true
+        [ "$ended" = true ] || set -- "$@" "$argument"
+    done
+    if [ "$subcommand" = run ]; then
+        held "$cargo" build "$@"
+    else
+        held "$cargo" "$subcommand" --no-run "$@"
+    fi
+}
+
+# Library tests cannot use Cargo's integration-only CARGO_BIN_EXE_* variables.
+# Build their real daemon in the same admitted slot and pass its reported path.
+prepare_test_helper() {
+    case ${1-} in test|t|+*) ;; *) return 0 ;; esac
+    [ -z "${CAGENTS_TEST_RETAINED_ACTOR_HELPER-}" ] || return 0
+    [ -f "$here/cargo-host-test-helper.py" ] || return 0
+    helper_output=$(mktemp "${TMPDIR:-/tmp}/cagents-test-helper.XXXXXX") || return "$?"
+    helper_status=0
+    # Keep supervision in this shell: a command-substitution subshell would
+    # own the cancellation traps while the gate that holds the slot has none.
+    held /usr/bin/python3 "$here/cargo-host-test-helper.py" "$cargo" "$@" >"$helper_output" || helper_status=$?
+    test_helper=$(cat -- "$helper_output") || helper_status=$?
+    rm -f -- "$helper_output"
+    [ "$helper_status" -eq 0 ] || return "$helper_status"
+    if [ -n "$test_helper" ]; then
+        CAGENTS_TEST_RETAINED_ACTOR_HELPER=$test_helper
+        export CAGENTS_TEST_RETAINED_ACTOR_HELPER
+    fi
+}
+
+# Tests have no slot, but a runaway must not take the host with it.
+run_tests() {
+    [ ! -x "$here/memory-capped" ] || exec "$here/memory-capped" "$@"
+}
+
+# Whether a gate that is still running admitted this command, which inherits
+# its slot. The marker can outlive that gate in a long-lived child.
+inside_gate() {
+    case ${CAGENTS_BUILD_SLOT_HELD:-} in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    # The gate runs as `sh PATH/cargo-gate ...`; its script is the second
+    # argument.
+    script=$(tr '\0' '\n' 2>/dev/null </proc/"$CAGENTS_BUILD_SLOT_HELD"/cmdline | sed -n 2p) ||
+        return 1
+    case $script in
+        cargo-gate|*/cargo-gate|*/cagents-cargo-gate) return 0 ;;
+    esac
+    return 1
+}
+
+# Whether this process inherited a descriptor holding a slot lock, as under
+# `flock /var/tmp/cagents-cargo.lock scripts/run-development`. Its holder is an
+# ancestor, so waiting for another slot could wait on itself. The slot counts
+# only if another descriptor cannot take it while the inherited one can: the
+# lock belongs to the inherited descriptor, not to an unrelated build.
+inherits_slot() {
+    held=$(readlink -f "$lock")
+    for descriptor in /proc/$$/fd/*; do
+        path=$(readlink "$descriptor") || continue
+        case $path in
+            "$held"|"$held".[0-9]|"$held".[0-9][0-9])
+                inherited=${descriptor##*/}
+                # Probe on a descriptor this process does not already use.
+                probe=3
+                while [ -e /proc/$$/fd/$probe ]; do probe=$((probe + 1)); done
+                [ "$probe" -le 9 ] || continue
+                eval "exec $probe>>\"\$path\""
+                if flock -n "$probe"; then
+                    eval "exec $probe>&-"
+                    continue
+                fi
+                eval "exec $probe>&-"
+                if flock -n "$inherited"; then
+                    return 0
+                fi
+                ;;
+        esac
+    done
+    return 1
+}
+
+# Whether `path` is one of this gate's slots, given the resolved first slot.
+is_slot() {
+    case $1 in
+        "$held") return 0 ;;
+        "$held".*)
+            number=${1#"$held".}
+            case $number in ''|*[!0-9]*|0*|??????????*) return 1 ;; esac
+            [ "$number" -lt "$slots" ]
+            ;;
+        *) return 1 ;;
+    esac
+}
+# Whether a `flock` command started this one, as under
+# `flock --close /var/tmp/cagents-cargo.lock scripts/run-development`, and holds
+# a slot it did not pass down. Among ancestors, only a running `flock` counts: it
+# holds the slot for exactly as long as its command runs. Any other ancestor
+# holding a slot may be a leftover, and everything it starts would skip admission.
+# (A process that itself inherited the slot is inherits_slot's case.)
+started_by_flock() {
+    held=$(readlink -f "$lock")
+    ancestor=$PPID
+    while [ "$ancestor" -gt 1 ]; do
+        { read -r name </proc/"$ancestor"/comm; } 2>/dev/null || return 1
+        if [ "$name" = flock ]; then
+            for descriptor in /proc/"$ancestor"/fd/*; do
+                path=$(readlink "$descriptor" 2>/dev/null) || continue
+                is_slot "$path" || continue
+                if grep -q '^lock:.*FLOCK' /proc/"$ancestor"/fdinfo/"${descriptor##*/}" 2>/dev/null; then
+                    return 0
+                fi
+            done
+        fi
+        ancestor=$(sed -n 's/^PPid:[[:space:]]*//p' /proc/"$ancestor"/status 2>/dev/null) || return 1
+        [ -n "$ancestor" ] || return 1
+    done
+    return 1
+}
+# Puts a `cargo` first on PATH that leads back to this gate, for an `exec`
+# command's Cargo commands. The shim reaches this gate by its own path,
+# naming Cargo so that `cargo --help` is Cargo's; the gate takes the shim off
+# PATH again, so it reaches this host's Cargo. The caller removes $shims.
+cargo_shim() {
+    self=$(readlink -f -- "$0")
+    shims=$(mktemp -d "${TMPDIR:-/tmp}/cagents-cargo-shim.XXXXXX")
+    quoted=$(printf '%s' "$self" | sed "s/'/'\\\\''/g")
+    printf "#!/bin/sh\nexec '%s' cargo \"\$@\"\n" "$quoted" >"$shims/cargo"
+    chmod 755 "$shims/cargo"
+    CAGENTS_BUILD_EXEC_SHIMS=$shims
+    PATH=$shims:$PATH
+    export CAGENTS_BUILD_EXEC_SHIMS PATH
+}
+
+# Rust compiles on the build host when there is one, whether or not this
+# command is inside a slot here. `scripts/cargo-offload --host` exits 0 when
+# there is one, and 75 when this is the build host or CAGENTS_BUILD_REMOTE is
+# `local`; anything else is a failure, never a reason to build here. Its wait
+# for that host spends the admission budget; the build there does not.
+cargo=${CAGENTS_BUILD_CARGO:-cargo}
+offload=$here/cargo-offload
+if [ -x "$offload" ]; then
+    where=0
+    build_host=$("$offload" --host) || where=$?
+elif [ "${CAGENTS_BUILD_REMOTE-}" = local ]; then
+    where=75
+else
+    fail "$offload is missing, and Rust compiles only on the build host; reinstall the gate, or set CAGENTS_BUILD_REMOTE=local to build here instead"
+fi
+case $where in
+    0) ;;
+    75) ;;
+    *) fail "$offload could not tell where Rust compiles (status $where)" ;;
+esac
+if [ "$where" -eq 0 ]; then
+    deadline=
+    if [ "${CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS+x}" = x ]; then
+        deadline=$(/usr/bin/python3 "$here/cargo-gate-command.py" \
+            --admission-deadline "$CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS") || exit "$?"
+    fi
+    admission_deadline=
+    if [ "$mode" = cargo ]; then
+        # Its status is the command's, whatever it is: `cargo run` exits
+        # with the program's.
+        status=0
+        # The build host admits the build by the memory it is expected to
+        # need, as this host would.
+        supervised '' env CAGENTS_BUILD_ADMISSION_DEADLINE="$deadline" \
+            CAGENTS_BUILD_EXPECTED_KIB="$(expected_cost "$@")" \
+            CAGENTS_BUILD_OFFLOAD_HOST="$build_host" "$offload" "$@" || status=$?
+        exit "$status"
+    fi
+    # Each Cargo command in COMMAND goes through this gate, with its own
+    # admission budget: nothing here holds a slot while they build there.
+    # With --hold, the offload holds one slot there for all of them.
+    # Cargo reached some other way would compile here; see the guard.
+    CAGENTS_BUILD_EXEC_RUSTC_WRAPPER=${RUSTC_WRAPPER-}
+    cargo_shim
+    RUSTC_WRAPPER=$here/cargo-gate-rustc-guard
+    export CAGENTS_BUILD_EXEC_RUSTC_WRAPPER RUSTC_WRAPPER
+    status=0
+    if [ "$hold" = true ]; then
+        supervised '' env CAGENTS_BUILD_ADMISSION_DEADLINE="$deadline" \
+            CAGENTS_BUILD_EXPECTED_KIB="$(expected_cost "$@")" \
+            CAGENTS_BUILD_OFFLOAD_HOST="$build_host" "$offload" --hold "$@" || status=$?
+    else
+        supervised '' "$@" || status=$?
+    fi
+    rm -rf -- "$shims"
+    exit "$status"
+fi
+
+# Building here, with the version stamp a build host's offload would pass.
+# Without it, build.rs reads this checkout's Git state and reruns at each
+# commit, which recompiles the whole library; with it, a new stamp relinks
+# only the executables. Each Cargo command works it out afresh once it has its
+# slot, as one offloaded would, so a commit made while it waited is included.
+# A stamp marked as a gate's was inherited, as by a program that `cargo run`
+# started, and may be another build's.
+if [ "${CAGENTS_BUILD_METADATA_SUPPLIED-}" = 1 ]; then
+    unset CAGENTS_BUILD_METADATA CAGENTS_BUILD_METADATA_SUPPLIED
+fi
+
+# Whether Cargo already has a runner for the programs it starts. Two
+# `cfg(..)` runners are an error and a target's own overrides one, so the
+# gate's would fail the command or do nothing.
+has_runner() {
+    setting=false
+    for argument do
+        if [ "$setting" = true ]; then
+            case $argument in
+                *runner*) return 0 ;;
+            esac
+            grep -qs runner "$argument" && return 0
+        fi
+        setting=false
+        case $argument in
+            --) break ;;
+            --config) setting=true ;;
+            --config=*runner*) return 0 ;;
+        esac
+    done
+    env | grep -q '^CARGO_TARGET_[A-Z0-9_]*_RUNNER=' && return 0
+    for config in "${CARGO_HOME:-$HOME/.cargo}/config" "${CARGO_HOME:-$HOME/.cargo}/config.toml"; do
+        grep -qs runner "$config" && return 0
+    done
+    directory=$PWD
+    while :; do
+        for config in "$directory/.cargo/config" "$directory/.cargo/config.toml"; do
+            grep -qs runner "$config" && return 0
+        done
+        [ "$directory" != / ] || return 1
+        directory=$(dirname -- "$directory")
+    done
+}
+
+# Stamps this Cargo command, given its arguments, and sets `unstamped_runner`
+# to the Cargo setting that gives a program `run` or `test` starts the
+# caller's environment back, so a bare Cargo it runs later reads its own
+# checkout rather than this stamp.
+unstamped_runner=
+stamp_command() {
+    [ -x "$offload" ] || return 0
+    stamp=$(CAGENTS_BUILD_CARGO=$cargo "$offload" --stamp "$@") || return 0
+    if ! has_runner "$@"; then
+        unstamped_runner='["env", "-u", "CAGENTS_BUILD_METADATA_SUPPLIED", "-u", "CAGENTS_BUILD_METADATA"'
+        case ${CAGENTS_BUILD_METADATA-} in
+            '') ;;
+            *[!A-Za-z0-9.-]*) ;;
+            *) unstamped_runner="$unstamped_runner, \"CAGENTS_BUILD_METADATA=$CAGENTS_BUILD_METADATA\"" ;;
+        esac
+        unstamped_runner="target.'cfg(all())'.runner=$unstamped_runner]"
+    fi
+    CAGENTS_BUILD_METADATA=$stamp
+    CAGENTS_BUILD_METADATA_SUPPLIED=1
+    export CAGENTS_BUILD_METADATA CAGENTS_BUILD_METADATA_SUPPLIED
+}
+
+# Already inside a slot: a gated command running Cargo again, or a caller
+# that took the lock itself. An `exec` command there keeps the shim of the
+# gate that admitted it, which the start of this gate took off PATH.
+if inside_gate || inherits_slot || started_by_flock; then
+    if [ "$mode" = exec ] && [ -d "${CAGENTS_BUILD_EXEC_SHIMS-}" ]; then
+        PATH=$CAGENTS_BUILD_EXEC_SHIMS:$PATH
+    fi
+    if [ "$mode" = cargo ]; then
+        stamp_command "$@"
+        prepare_test_helper "$@" || exit "$?"
+        subcommand=$1
+        case $subcommand in
+            run|test|bench)
+                if [ -n "$unstamped_runner" ]; then
+                    shift
+                    set -- "$subcommand" --config "$unstamped_runner" "$@"
+                fi
+                ;;
+        esac
+        set -- "$cargo" "$@"
+        case $subcommand in
+            test|bench) run_tests "$@" ;;
+        esac
+    fi
+    exec "$@"
+fi
+
+admission_deadline=
+if [ "${CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS+x}" = x ]; then
+    admission_deadline=$(/usr/bin/python3 "$here/cargo-gate-command.py" \
+        --admission-deadline "$CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS") || exit "$?"
+fi
+
+# A new worktree's build directory starts from the main checkout's compiled
+# dependencies instead of empty, so it neither builds them all again nor
+# shares a build directory with another worktree. Copying needs no slot.
+# Before either, the disk guard prunes unused build output on its schedule,
+# and a file system running out of room for build directories prunes at once
+# or refuses the build.
+guard=$here/build-disk-guard
+seed=$here/seed-build-dir
+if [ -x "$guard" ] || [ -x "$seed" ]; then
+    # Keep ownership in the original gate shell: supervising only the metadata
+    # command substitution would leave the outer gate unable to cancel it.
+    # Preflight has no slot, even when an obsolete marker was inherited.
+    supervised '' /bin/sh -c '
+        guard=$1
+        seed=$2
+        metadata=$("${CAGENTS_BUILD_CARGO:-cargo}" metadata --format-version 1 --no-deps 2>/dev/null) || metadata=
+        build_dir=$(printf "%s\n" "$metadata" |
+            sed -n '\''s/.*"build_directory":"\([^"]*\)".*/\1/p'\'')
+        # A Cargo that reports no build directory builds in the target.
+        [ -n "$build_dir" ] || build_dir=$(printf "%s\n" "$metadata" |
+            sed -n '\''s/.*"target_directory":"\([^"]*\)".*/\1/p'\'')
+        if [ -n "$build_dir" ]; then
+            [ ! -x "$guard" ] || "$guard" "$build_dir" || exit "$?"
+            [ ! -x "$seed" ] || "$seed" --to "$build_dir" || :
+        fi
+    ' cargo-gate-preflight "$guard" "$seed" || exit "$?"
+fi
+
+if [ "$mode" = exec ]; then
+    cost=$(expected_cost "$@")
+    # Each Cargo command in COMMAND comes back through this gate, in the
+    # slot this holds, and gets the stamp a gated command would.
+    cargo_shim
+    acquire
+    status=0
+    held "$@" || status=$?
+    release
+    rm -rf -- "$shims"
+    exit "$status"
+fi
+
+subcommand=$1
+shift
+
+# Cargo cannot build doctests without running them, so a doctest command
+# keeps its slot throughout. A command that only builds needs no split.
+runs_separately=false
+case $subcommand in
+    test|bench|run) runs_separately=true ;;
+esac
+for argument do
+    case $argument in
+        --) break ;;
+        --doc|--no-run) runs_separately=false ;;
+    esac
+done
+
+cost=$(expected_cost "$subcommand" "$@")
+acquire
+stamp_command "$subcommand" "$@"
+status=0
+if [ "$runs_separately" = true ]; then
+    prepare_test_helper "$subcommand" "$@" || status=$?
+    if [ "$status" -ne 0 ]; then
+        release
+        exit "$status"
+    fi
+    build_phase "$@" || status=$?
+    release
+    [ "$status" -eq 0 ] || exit "$status"
+    [ -z "$unstamped_runner" ] || set -- --config "$unstamped_runner" "$@"
+    [ "$subcommand" = run ] || run_tests "$cargo" "$subcommand" "$@"
+    exec "$cargo" "$subcommand" "$@"
+fi
+held "$cargo" "$subcommand" "$@" || status=$?
+release
+exit "$status"

@@ -57,8 +57,9 @@ mod tests {
             listener.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
         );
-        drop(listener);
-        assert!(check_port(port).is_ok());
+        // A free port probes clear. Port 0 asks for any free port: after
+        // closing `listener`, its port may already belong to another socket.
+        assert_eq!(check_port(0), Ok(()));
     }
 
     #[test]

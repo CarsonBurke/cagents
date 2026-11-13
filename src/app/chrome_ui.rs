@@ -67,6 +67,22 @@ pub(super) struct State {
 
 #[cfg(test)]
 mod tests {
+    /// A close that starts under a rename would have its message dropped, so the
+    /// pane stays queued until the rename ends.
+    #[test]
+    fn a_rename_holds_the_close_queue_until_it_ends() {
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        app.queue_card_close(card, false);
+        app.chrome_ui.rename = Some((RenameTarget::Pane(card), String::new()));
+        drop(app.next_queued_card_close());
+        assert_eq!(app.queued_card_closes.len(), 1);
+
+        app.chrome_ui.rename = None;
+        drop(app.next_queued_card_close());
+        assert!(app.queued_card_closes.is_empty());
+    }
+
     #[test]
     fn attention_popup_pages_unique_incidents_and_survives_an_empty_project_list() {
         let mut app = super::super::tests::context_inspector_test_app(false);
@@ -214,7 +230,7 @@ mod tests {
             .collect();
         let durable = Arc::make_mut(&mut app.durable);
         durable.focused = cards.first().map(|card| card.id);
-        durable.cards = cards;
+        durable.cards = cards.into();
         app.workspace = Cagents::rebuild_workspace(&app.durable);
         app.workspace.resize_viewport(width);
         drop(app.sync_chrome());
@@ -337,6 +353,32 @@ mod tests {
     }
     use super::*;
 
+    #[test]
+    fn pane_menu_hints_follow_configured_focused_target_only() {
+        use widget::menu::Action as _;
+        let id = CardId::new();
+        let mut shortcuts = crate::settings::KeyboardShortcuts::default();
+        shortcuts.close_focused_column = vec!["Ctrl+Alt+F5".into()];
+        let bindings = pane_menu_bindings(id, true, &shortcuts);
+        let (key, action) = bindings
+            .iter()
+            .find(|(_, action)| matches!(action.1, PaneMenuCommand::Close))
+            .unwrap();
+        assert!(key.matches(
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT,
+            &keyboard::Key::Named(keyboard::key::Named::F5),
+            None
+        ));
+        assert!(matches!(action.message(), Message::CloseCard(target) if target == id));
+        assert!(pane_menu_bindings(id, false, &shortcuts).is_empty());
+        shortcuts.close_focused_column.clear();
+        assert!(
+            !pane_menu_bindings(id, true, &shortcuts)
+                .values()
+                .any(|action| matches!(action.1, PaneMenuCommand::Close))
+        );
+    }
+
     /// Retain the actual Settings pane while rename and palette modals change.
     /// Apply runtime operations to every real control in this same tree.
     fn rename_fixture_view(app: &Cagents) -> Element<'_, Message> {
@@ -454,7 +496,7 @@ mod tests {
                 .map(cosmic::Action::App);
             let before = rename_fixture_step(&app, &mut tree, &renderer, focus, true);
             assert!(before.iter().any(|message| matches!(
-                message, Message::UtilityPaneUi(inner) if matches!(inner.as_ref(), Message::SettingsSearchChanged(value) if value == "x")
+                message, Message::SettingsSearchChanged(value) if value == "x"
             )));
 
             let open = app.update_chrome(Action::Rename(card));
@@ -465,7 +507,7 @@ mod tests {
             assert!(
                 !during
                     .iter()
-                    .any(|message| matches!(message, Message::UtilityPaneUi(inner) if matches!(inner.as_ref(), Message::SettingsSearchChanged(_))))
+                    .any(|message| matches!(message, Message::SettingsSearchChanged(_)))
             );
             let _ = app.update_chrome(Action::RenameChanged(" New name ".into()));
             let close = match dismissal {
@@ -494,7 +536,7 @@ mod tests {
             );
             let after = rename_fixture_step(&app, &mut tree, &renderer, close, true);
             assert!(after.iter().any(|message| matches!(
-                message, Message::UtilityPaneUi(inner) if matches!(inner.as_ref(), Message::SettingsSearchChanged(value) if value == "x")
+                message, Message::SettingsSearchChanged(value) if value == "x"
             )));
         }
     }
@@ -540,7 +582,7 @@ mod tests {
         assert_eq!(state.title_source, ChannelTitleSource::Manual);
         let after = rename_fixture_step(&app, &mut tree, &renderer, submit, true);
         assert!(after.iter().any(|message| matches!(
-            message, Message::UtilityPaneUi(inner) if matches!(inner.as_ref(), Message::SettingsSearchChanged(value) if value == "x")
+            message, Message::SettingsSearchChanged(value) if value == "x"
         )));
     }
 
@@ -564,7 +606,7 @@ mod tests {
         assert!(
             !after
                 .iter()
-                .any(|message| matches!(message, Message::UtilityPaneUi(inner) if matches!(inner.as_ref(), Message::SettingsSearchChanged(_))))
+                .any(|message| matches!(message, Message::SettingsSearchChanged(_)))
         );
     }
 
@@ -585,7 +627,7 @@ mod tests {
         assert!(
             !after
                 .iter()
-                .any(|message| matches!(message, Message::UtilityPaneUi(inner) if matches!(inner.as_ref(), Message::SettingsSearchChanged(_))))
+                .any(|message| matches!(message, Message::SettingsSearchChanged(_)))
         );
     }
 
@@ -1370,7 +1412,7 @@ const NEW_TAB_CHOICES: [(&str, &str, NewTab, &str); 4] = [
     ),
     (
         "Resume conversation",
-        "Search saved conversations across projects and accounts",
+        "Pick up an earlier conversation in this project or another",
         NewTab::Resume,
         "chrome.new-tab.resume",
     ),
@@ -1436,6 +1478,32 @@ enum PaneMenuCommand {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct PaneMenu(CardId, PaneMenuCommand);
+
+// These shortcuts act on the focused pane. Do not advertise them on an
+// unrelated tab's context menu as if they targeted that tab.
+fn pane_menu_bindings(
+    id: CardId,
+    focused: bool,
+    shortcuts: &crate::settings::KeyboardShortcuts,
+) -> HashMap<widget::menu::KeyBind, PaneMenu> {
+    if !focused {
+        return HashMap::new();
+    }
+    crate::interaction::menu_shortcuts([
+        (
+            shortcuts.rename_pane.as_slice(),
+            PaneMenu(id, PaneMenuCommand::Rename),
+        ),
+        (
+            shortcuts.clone_pane.as_slice(),
+            PaneMenu(id, PaneMenuCommand::Clone),
+        ),
+        (
+            shortcuts.close_focused_column.as_slice(),
+            PaneMenu(id, PaneMenuCommand::Close),
+        ),
+    ])
+}
 
 impl widget::menu::Action for PaneMenu {
     type Message = Message;
@@ -1643,9 +1711,9 @@ impl Cagents {
         if self.chrome_ui.rename.take().is_none() {
             return Task::none();
         }
-        self.workspace.focused().map_or_else(Task::none, |card| {
-            iced::widget::operation::focus(self.card_keyboard_focus(card)).map(cosmic::Action::App)
-        })
+        self.workspace
+            .focused()
+            .map_or_else(Task::none, |card| self.focus_pane_keyboard(card))
     }
 
     /// Keep Tab traversal and global shortcuts inside the open popup.
@@ -1769,7 +1837,11 @@ impl Cagents {
     /// Gives an open popup sole ownership of Tab, and hands it back to the
     /// shell's traversal once the popup is gone or a dialog has taken over.
     pub(super) fn sync_popup_keyboard_nav(&mut self) {
-        let owned = (self.chrome_ui.popup.is_some() || self.chat_picker_owns_keyboard())
+        // Recording a shortcut owns every key, Tab included: the recorder
+        // moves focus itself, or the key is the chord being recorded.
+        let owned = (self.chrome_ui.popup.is_some()
+            || self.chat_picker_owns_keyboard()
+            || self.palette_records_keys())
             && !self.modal_is_open();
         match (owned, self.chrome_ui.restore_keyboard_nav) {
             (true, None) => {
@@ -1782,9 +1854,11 @@ impl Cagents {
                 // popup's suppressed traversal as its own restore point, and
                 // it owns Tab now: hand it the reader's real choice instead.
                 if !self.adopt_terminal_close_keyboard_nav(restore)
+                    && !self.adopt_chat_close_keyboard_nav(restore)
                     && !self.adopt_daemon_health_keyboard_nav(restore)
                     && !self.adopt_automation_approval_keyboard_nav(restore)
                     && !self.adopt_session_recovery_keyboard_nav(restore)
+                    && !self.adopt_resume_keyboard_nav(restore)
                 {
                     self.core.set_keyboard_nav(restore);
                 }
@@ -2596,8 +2670,17 @@ impl Cagents {
                     header.on_minimize(Message::NativeWindowAction(cosmic::app::Action::Minimize));
             }
         }
+        // The header holding the window controls is the rightmost one: its
+        // fill runs to the window edge and the controls stay out of the
+        // resize border.
+        let inset = if window_controls {
+            self.trailing_edge_inset()
+        } else {
+            0.0
+        };
         widget::container(header)
             .center_y(design::HEADER_CONTENT_HEIGHT)
+            .padding(Padding::ZERO.right(inset))
             .width(Length::Fill)
             .class(cosmic::theme::Container::Background)
             .into()
@@ -2617,11 +2700,6 @@ impl Cagents {
     }
 
     fn workspace_header_width(&self) -> f32 {
-        let navigator = if should_show_card_navigator(self.workspace.cards().len()) {
-            design::PANE_NAVIGATOR_RESERVED_WIDTH
-        } else {
-            0.0
-        };
         let controls = if self.context_inspector_open {
             0.0
         } else {
@@ -2656,7 +2734,7 @@ impl Cagents {
         } else {
             0.0
         };
-        let width = navigator + controls + update + notice + attention + 16.0;
+        let width = controls + update + notice + attention + 16.0;
         if self.workspace.viewport_width() > 0.0 {
             width.min(self.workspace.viewport_width())
         } else {
@@ -2756,185 +2834,58 @@ impl Cagents {
         &'a self,
         content: Element<'a, Message>,
     ) -> Element<'a, Message> {
-        let header = if self.channel_work_is_main() {
-            let actions = widget::row::with_children(self.workflow_header()).spacing(space::XXS);
-            self.native_header(
-                iced::widget::Space::new().into(),
-                Some(actions.into()),
-                true,
-            )
-        } else {
-            let (_, tab_width) = self.tab_strip_geometry();
-            let tabs = self
-                .workspace
-                .order()
-                .map(|id| self.column_header(id, self.workspace.focused() == Some(id), tab_width))
-                .chain(std::iter::once(self.new_tab_control()))
-                .collect();
-            let generation = self.workspace_view_generation;
-            let tabs = crate::tab_strip::reorderable(
-                widget::Id::new("workspace.tabs"),
-                tabs,
-                design::PRIMARY_CONTROL_SIZE,
-                design::HEADER_HEIGHT,
-                Some(Box::new(|viewport| {
-                    Message::ChromeUi(Action::TabsScrolled(viewport.absolute_offset().x))
-                })),
-                crate::tab_strip::Reordering {
-                    order: self.workspace.order().collect(),
-                    tab_width,
-                    enabled: !self.workspace_inputs_blocked(),
-                    select: Box::new(Message::FocusCard),
-                    dropped: Box::new(move |card, before| Message::Viewport {
-                        generation,
-                        event: WorkspaceViewportEvent::Reordered { card, before },
-                    }),
-                },
-            );
-            let actions = widget::row::with_children(self.workflow_header())
-                .spacing(space::XXS)
-                .align_y(Alignment::Center);
-            self.native_header(
-                tabs.into(),
-                Some(actions.into()),
-                !self.context_inspector_open,
-            )
-        };
-        let mut rows = vec![header];
-        if let Some(channel) = self.channel_home_bar() {
-            rows.push(channel);
-        }
-        rows.push(crate::design::horizontal_rule().into());
-        rows.push(content);
-        widget::column::with_children(rows)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
-    }
-
-    fn channel_home_bar(&self) -> Option<Element<'_, Message>> {
-        let (home, title) = self.channel_home()?;
-        let generation = self.channel_home_generation();
-        let workspace = self.workspace_view_generation;
-        let work = self.channel_work_is_main();
-        let compact = self.window_width < 800.0;
-        let mut navigation = Vec::new();
-        for (label, surface, selected) in [
-            ("Conversations", channel_work::Surface::Conversations, !work),
-            ("Work", channel_work::Surface::Work, work),
-        ] {
-            let action = Message::ChannelWorkNavigation(channel_work::Navigation {
-                home,
-                generation,
-                workspace,
-                surface,
-            });
-            navigation.push(crate::ui_controls::owned(
-                (home, generation, workspace, surface),
-                crate::ui_controls::view_tab(
-                    crate::ui_controls::ViewTab {
-                        label: label.into(),
-                        description: format!("{label} for channel {title}").into(),
-                        count: None,
-                        selected,
-                        id: None,
-                        on_press: (!self.modal_is_open()).then_some(action),
-                    },
-                    compact,
-                    None,
-                ),
-            ));
-        }
-        let navigation = widget::row::with_children(navigation)
+        let (_, tab_width) = self.tab_strip_geometry();
+        let tabs = self
+            .workspace
+            .order()
+            .map(|id| self.column_header(id, self.workspace.focused() == Some(id), tab_width))
+            .chain(std::iter::once(self.new_tab_control()))
+            .collect();
+        let generation = self.workspace_view_generation;
+        let tabs = crate::tab_strip::reorderable(
+            widget::Id::new("workspace.tabs"),
+            tabs,
+            design::PRIMARY_CONTROL_SIZE,
+            design::HEADER_HEIGHT,
+            Some(Box::new(|viewport| {
+                Message::ChromeUi(Action::TabsScrolled(viewport.absolute_offset().x))
+            })),
+            crate::tab_strip::Reordering {
+                order: self.workspace.order().collect(),
+                tab_width,
+                enabled: !self.workspace_inputs_blocked(),
+                select: Box::new(Message::FocusCard),
+                dropped: Box::new(move |card, before| Message::Viewport {
+                    generation,
+                    event: WorkspaceViewportEvent::Reordered { card, before },
+                }),
+            },
+        );
+        let actions = widget::row::with_children(self.workflow_header())
             .spacing(space::XXS)
             .align_y(Alignment::Center);
-        let identity = widget::column::with_children(vec![
-            design::caption("CHANNEL").into(),
-            design::heading(if title.is_empty() {
-                "Untitled channel".to_owned()
-            } else {
-                title
-            })
-            .width(Length::Fill)
-            .into(),
+        let header = self.native_header(
+            tabs.into(),
+            Some(actions.into()),
+            !self.context_inspector_open,
+        );
+        widget::column::with_children(vec![
+            header,
+            crate::design::horizontal_rule().into(),
+            content,
         ])
-        .spacing(space::XXS)
-        .width(Length::Fill);
-        let content: Element<'_, Message> = if work {
-            // Work's fixed leaf header already displays the captured channel
-            // title. Do not repeat it or narrow it beside the navigation.
-            navigation.into()
-        } else if compact {
-            widget::column::with_children(vec![identity.into(), navigation.into()])
-                .spacing(space::XS)
-                .into()
-        } else {
-            widget::row::with_children(vec![identity.into(), navigation.into()])
-                .spacing(space::S)
-                .align_y(Alignment::Center)
-                .into()
-        };
-        Some(
-            widget::container(content)
-                .padding([space::XS, space::S])
-                .width(Length::Fill)
-                .into(),
-        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
     }
 
     pub(super) fn workflow_header(&self) -> Vec<Element<'_, Message>> {
         if self.context_inspector_is_overlay() {
             return Vec::new();
         }
-        let mut actions = Vec::with_capacity(8);
-        let total = if self.channel_work_is_main() {
-            0
-        } else {
-            self.workspace.cards().len()
-        };
-        if should_show_card_navigator(total) {
-            let current = self
-                .workspace
-                .focused()
-                .and_then(|id| self.workspace.order().position(|candidate| candidate == id))
-                .map_or(0, |index| index + 1);
-            actions.push(command(
-                Icon::ChevronLeft,
-                workspace_widget::shortcut_tooltip(
-                    workspace_widget::GlobalShortcut::FocusAdjacent(
-                        crate::workspace::FocusDirection::Left,
-                    ),
-                    &self.settings.keyboard_shortcuts,
-                ),
-                widget::Id::new("command.previous-column"),
-                (current > 1).then_some(Message::FocusAdjacent(
-                    crate::workspace::FocusDirection::Left,
-                )),
-            ));
-            actions.push(
-                iced::widget::container(crate::design::caption(format!("{current} / {total}")))
-                    .center_y(ICON_CONTROL_SIZE)
-                    .align_x(Alignment::Center)
-                    .width(
-                        (format!("{current} / {total}").len() as f32 * 7.0 + 16.0)
-                            .max(design::PANE_NAVIGATOR_MIN_WIDTH),
-                    )
-                    .into(),
-            );
-            actions.push(command(
-                Icon::ChevronRight,
-                workspace_widget::shortcut_tooltip(
-                    workspace_widget::GlobalShortcut::FocusAdjacent(
-                        crate::workspace::FocusDirection::Right,
-                    ),
-                    &self.settings.keyboard_shortcuts,
-                ),
-                widget::Id::new("command.next-column"),
-                (current > 0 && current < total).then_some(Message::FocusAdjacent(
-                    crate::workspace::FocusDirection::Right,
-                )),
-            ));
-        }
+        // The tab strip already names every pane and marks the focused one,
+        // and the pane shortcuts move between them, so the header carries no
+        // separate "1 / 2" pager.
         // The inspector panel's own header mounts the notice control, the update
         // control and the inspector toggle, and the two headers must never
         // mount the same one at once: a custom `widget::Id` may name only one
@@ -2955,10 +2906,6 @@ impl Cagents {
         // put the two icons on opposite ends of the window.
         let panel_owns_shared_controls = self.context_inspector_visible();
         vec![
-            widget::row::with_children(actions)
-                .spacing(space::XXS)
-                .align_y(Alignment::Center)
-                .into(),
             widget::row::with_children(
                 (!panel_owns_shared_controls).then(|| self.attention_and_notice_controls()),
             )
@@ -2970,8 +2917,7 @@ impl Cagents {
             )
             .into(),
             widget::row::with_children(
-                (!panel_owns_shared_controls && !self.channel_work_is_main())
-                    .then(|| self.sidebar_toggle()),
+                (!panel_owns_shared_controls).then(|| self.sidebar_toggle()),
             )
             .into(),
         ]
@@ -3140,8 +3086,13 @@ impl Cagents {
         };
         let mut children = vec![tooltip(crate::reorder::handle(title_control, id), tip)];
         let status = match self.cards.get(&id) {
+            _ if self.terminal_close_in_progress(id) => Some(("Checking before closing", true)),
             _ if self.pane_transfer_pending(id) => Some(("Moving to channel", true)),
             _ if self.chat_start_pending(id) => Some(("Updating conversation", true)),
+            _ if self.saved_terminal_current(id).is_some() => self.saved_terminal_status(id),
+            Some(CardRuntime::Loading) if self.startup_terminal_tab_status(id).is_some() => {
+                self.startup_terminal_tab_status(id).flatten()
+            }
             None | Some(CardRuntime::Loading) => Some((labels.starting, true)),
             Some(CardRuntime::Failed(_)) => Some(("Unavailable", false)),
             #[cfg(feature = "integrated-browser")]
@@ -3171,7 +3122,7 @@ impl Cagents {
             };
             children.push(tooltip(indicator, label));
         }
-        if let Some(indicator) = sidebar::attention_indicator(attention, false) {
+        if let Some(indicator) = sidebar::attention_indicator(attention) {
             children.push(indicator);
         }
         if focused && self.chat_switch_available(id) {
@@ -3210,7 +3161,7 @@ impl Cagents {
                     || card_control_id(id, "close"),
                     |chrome| chrome.close_id.clone(),
                 ),
-                Some(Message::CloseCard(id)),
+                (!self.terminal_close_in_progress(id)).then_some(Message::CloseCard(id)),
             ));
         }
         let tab = crate::tab_strip::middle_click_close(
@@ -3240,38 +3191,24 @@ impl Cagents {
             let mut entries: Vec<widget::menu::Item<PaneMenu, String>> = vec![
                 widget::menu::Item::Button(
                     "Rename…".into(),
-                    None,
+                    Some(Icon::Rename.handle()),
                     PaneMenu(id, PaneMenuCommand::Rename),
                 ),
                 widget::menu::Item::Button(
                     "Clone pane".into(),
-                    None,
+                    Some(Icon::Duplicate.handle()),
                     PaneMenu(id, PaneMenuCommand::Clone),
                 ),
+                widget::menu::Item::Divider,
                 widget::menu::Item::Button(
                     "Copy path".into(),
-                    None,
+                    Some(Icon::CopyPath.handle()),
                     PaneMenu(id, PaneMenuCommand::CopyPath),
                 ),
                 widget::menu::Item::Button(
                     "Reveal in Projects".into(),
-                    None,
+                    Some(Icon::OpenFolder.handle()),
                     PaneMenu(id, PaneMenuCommand::Reveal),
-                ),
-                widget::menu::Item::Button(
-                    "Close other panes".into(),
-                    None,
-                    PaneMenu(id, PaneMenuCommand::CloseOthers),
-                ),
-                widget::menu::Item::Button(
-                    "Close panes to the right".into(),
-                    None,
-                    PaneMenu(id, PaneMenuCommand::CloseToRight),
-                ),
-                widget::menu::Item::Button(
-                    "Close pane".into(),
-                    None,
-                    PaneMenu(id, PaneMenuCommand::Close),
                 ),
             ];
             if self.chat_switch_available(id) && self.chat_switch_ready(id) {
@@ -3314,7 +3251,28 @@ impl Cagents {
                     PaneMenu(id, PaneMenuCommand::MoveToChannel),
                 ));
             }
-            widget::menu::items(&HashMap::new(), entries)
+            entries.push(widget::menu::Item::Divider);
+            entries.extend([
+                widget::menu::Item::Button(
+                    "Close other panes".into(),
+                    Some(Icon::Close.handle()),
+                    PaneMenu(id, PaneMenuCommand::CloseOthers),
+                ),
+                widget::menu::Item::Button(
+                    "Close panes to the right".into(),
+                    Some(Icon::Close.handle()),
+                    PaneMenu(id, PaneMenuCommand::CloseToRight),
+                ),
+                widget::menu::Item::Button(
+                    "Close pane".into(),
+                    Some(Icon::Close.handle()),
+                    PaneMenu(id, PaneMenuCommand::Close),
+                ),
+            ]);
+            widget::menu::items(
+                &pane_menu_bindings(id, focused, &self.settings.keyboard_shortcuts),
+                entries,
+            )
         })
     }
 
@@ -3338,99 +3296,7 @@ impl Cagents {
             .unwrap_or_default()
     }
 
-    pub(super) fn context_panel(
-        &self,
-        model: Option<inspector::InspectorModel>,
-        width: f32,
-    ) -> Element<'_, Message> {
-        if !self.channel_work_is_main() && self.channel_work.view.is_open() {
-            let end = widget::row::with_children(vec![
-                self.attention_and_notice_controls(),
-                widget::row::with_children(self.update_control()).into(),
-            ])
-            .spacing(space::XXS)
-            .align_y(Alignment::Center)
-            .into();
-            let heading = self.native_header(self.sidebar_toggle(), Some(end), true);
-            return widget::column::with_children(vec![
-                heading,
-                crate::interaction::focused_escape(
-                    self.channel_work
-                        .view
-                        .view(
-                            width,
-                            (self.window_height - design::HEADER_CONTENT_HEIGHT).max(0.0),
-                        )
-                        .map(Message::ChannelWork),
-                    || Message::ChannelWorkEscape,
-                ),
-            ])
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into();
-        }
-        let indicators = self.context_rail_indicators();
-        let tabs = widget::row::with_children(
-            ContextTab::ALL
-                .into_iter()
-                .filter(|tab| {
-                    !self.active_folder_scope()
-                        || !matches!(tab, ContextTab::Changes | ContextTab::PullRequest)
-                })
-                .map(|tab| {
-                    let selected = self.context_tab == tab;
-                    let enabled = !self.modal_is_open()
-                        && (tab != ContextTab::PullRequest || self.active_workspace.is_some());
-                    let icon = match tab {
-                        ContextTab::Files => Icon::Folder,
-                        ContextTab::Changes => Icon::Changes,
-                        ContextTab::PullRequest => Icon::PullRequest,
-                        ContextTab::Details => Icon::Info,
-                    };
-                    let visual = (tab == ContextTab::PullRequest)
-                        .then_some(indicators.pull_request)
-                        .flatten()
-                        .map(sidebar::pull_request_visual);
-                    let dirty = (tab == ContextTab::Changes)
-                        .then_some(indicators.dirty)
-                        .flatten();
-                    // The tab's one icon carries the worktree's state: the pull
-                    // request's own glyph and tone, the changes tab tinted while the
-                    // tree is dirty. What the tint means is said by the tab's name,
-                    // which is the tooltip and the accessible name; a second icon
-                    // beside the tab was the same fact drawn twice.
-                    let mut name = format!("{} panel tab", tab.label());
-                    match tab {
-                        ContextTab::Changes => {
-                            if let Some(label) = dirty {
-                                name.push_str(": ");
-                                name.push_str(label);
-                            }
-                        }
-                        ContextTab::PullRequest if indicators.pending_checks => {
-                            name.push_str(": checks pending");
-                        }
-                        _ => {}
-                    }
-                    let control = crate::ui_controls::icon_button(
-                        visual
-                            .as_ref()
-                            .map_or_else(|| icon.handle(), |(icon, _)| icon.clone()),
-                        name,
-                    )
-                    .selected(selected)
-                    .on_press_maybe(enabled.then_some(Message::SelectContextTab(tab)));
-                    match (&visual, dirty) {
-                        (Some((_, color)), _) => control.tone(*color).into(),
-                        (None, Some(_)) => control
-                            .tone(design::Tone::Themed(design::warning_color))
-                            .into(),
-                        (None, None) => control.into(),
-                    }
-                }),
-        )
-        .spacing(space::XXS)
-        .align_y(Alignment::Center);
+    pub(super) fn context_panel(&self, width: f32) -> Element<'_, Message> {
         // Keep named controls in fixed slots as notices and updates come and go.
         // Alerts and updates remain beside the window controls; the toggle
         // belongs at the leading edge of the inspector it controls.
@@ -3445,131 +3311,24 @@ impl Cagents {
         .align_y(Alignment::Center)
         .into();
         let heading = self.native_header(self.sidebar_toggle(), Some(end), true);
-        let tabs = widget::row::with_children(vec![
-            tabs.into(),
-            crate::ui_controls::button::secondary("Channel work")
-                .name("Open current channel work")
-                .on_press_maybe(
-                    self.durable
-                        .active_channel
-                        .filter(|_| !self.modal_is_open())
-                        .map(Message::OpenChannelWork),
-                )
-                .into(),
-        ])
-        .align_y(Alignment::Center)
-        .spacing(space::XS);
-        let tabs = widget::container(tabs)
-            .padding([0.0, space::S])
-            .center_y(design::HEADER_CONTENT_HEIGHT)
-            .width(Length::Fill);
-        let body = match self.context_tab {
-            ContextTab::Files | ContextTab::Changes if crate::device::is_remote() => {
-                let changes = self.context_tab == ContextTab::Changes;
-                let panel = if changes {
-                    device_ui::Panel::Changes
-                } else {
-                    device_ui::Panel::Files
-                };
-                let path = self.active_workspace.as_ref();
-                widget::container(
-                    widget::column::with_children(vec![
-                        crate::interaction::tooltip(
-                            design::caption(
-                                path.and_then(|path| path.file_name())
-                                    .map(|name| name.to_string_lossy().into_owned())
-                                    .unwrap_or_else(|| "Device".into()),
-                            )
-                            .width(Length::Fill),
-                            path.map(|path| path.display().to_string())
-                                .unwrap_or_else(|| {
-                                    crate::device::selected()
-                                        .map(|device| device.name.clone())
-                                        .unwrap_or_default()
-                                }),
-                        ),
-                        crate::ui_controls::button::secondary(if changes {
-                            "Open changes"
-                        } else {
-                            "Open files"
-                        })
-                        .icon(if changes {
-                            Icon::Diff
-                        } else {
-                            Icon::OpenFolder
-                        })
-                        .name(if changes {
-                            "Open device changes"
-                        } else {
-                            "Open device files"
-                        })
-                        .on_press_maybe((!self.modal_is_open()).then_some(Message::Device(
-                            device_ui::Action::OpenIn {
-                                path: path.cloned(),
-                                panel,
-                            },
-                        )))
-                        .into(),
-                    ])
-                    .spacing(space::M),
-                )
-                .padding(space::L)
-                .width(Length::Fill)
-                .into()
-            }
-            ContextTab::Files => sidebar::file_panel(
-                &self.sidebar_model,
-                &self.sidebar_state,
-                width,
-                self.modal_is_open(),
-            )
-            .map(Message::Sidebar),
-            ContextTab::Changes => sidebar::git_panel(
-                &self.sidebar_model,
-                &self.sidebar_state,
-                width,
-                self.modal_is_open(),
-            )
-            .map(Message::Sidebar),
-            ContextTab::PullRequest => self.pull_request_panel(width),
-            ContextTab::Details => model.map_or_else(
-                || {
-                    widget::container(
-                        widget::column::with_children(vec![
-                            design::caption("No pane selected")
-                                .width(Length::Fill)
-                                .into(),
-                            crate::ui_controls::icon_button(Icon::OpenFolder, "Browse files")
-                                .on_press(Message::SelectContextTab(ContextTab::Files))
-                                .into(),
-                        ])
-                        .spacing(space::S),
-                    )
-                    .padding(space::M)
-                    .width(Length::Fill)
-                    .into()
-                },
-                |model| {
-                    let diagnostics_open = self.inspector_diagnostics_card == Some(model.card_id);
-                    let icon = self.card_icon(model.card_id);
-                    inspector::view(model, icon, width, diagnostics_open)
-                        .map(Message::ContextInspector)
-                },
-            ),
-        };
+        // The panel, its header and the rule under it run to the window edge.
+        // The sections keep their scrollbar out of the resize border.
+        let inset = self.trailing_edge_inset();
         widget::container(
             widget::column::with_children(vec![
                 heading.into(),
                 crate::design::horizontal_rule().into(),
-                tabs.into(),
-                crate::design::horizontal_rule().into(),
-                body,
+                widget::container(self.context_sections_view(width))
+                    .padding(Padding::ZERO.right(inset))
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into(),
             ])
             .width(Length::Fill)
             .height(Length::Fill),
         )
         .class(cosmic::theme::Container::Background)
-        .width(width)
+        .width(width + inset)
         .height(Length::Fill)
         .into()
     }

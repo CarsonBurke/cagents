@@ -1,0 +1,247 @@
+#!/usr/bin/python3
+"""Show who holds a shared lock and whether it is doing anything. Read-only."""
+import glob
+import os
+import sys
+import time
+
+# A recognized holder has one of these among it and its descendants. Wrapper scripts
+# and whatever they start vary too much to list, so another holder is not thereby a
+# leftover. Names only say what a process looks like.
+LEGITIMATE = {"cargo", "cargo-gate", "flock", "kwin_wayland", "native-evidence", "niri", "rustc"}
+# Run as `sh PATH`, or longer than a kernel process name.
+SCRIPTS = {
+    "build-disk-guard", "cagents-cargo-gate", "cargo-gate", "cargo-gate-command.py",
+    "native-evidence", "prune-build-dirs",
+}
+SAMPLE_SECONDS = 1.0
+
+
+def default_locks():
+    named = os.environ.get("CAGENTS_BUILD_LOCK")
+    found = set(glob.glob("/var/tmp/cagents-*.lock*"))
+    if named:
+        found.update(glob.glob(glob.escape(named) + "*"))
+    # A gate records each slot's expected cost beside it; nothing locks that file.
+    return sorted(path for path in found if not path.endswith(".cost"))
+
+
+def read(path):
+    try:
+        with open(path, "rb") as handle:
+            return handle.read().decode(errors="replace")
+    except OSError:
+        return None
+
+
+def processes():
+    return [int(name) for name in os.listdir("/proc") if name.isdigit()]
+
+
+def stat_fields(pid):
+    text = read(f"/proc/{pid}/stat")
+    if text is None:
+        return None
+    # The command name may contain spaces and parentheses.
+    name = text[text.index("(") + 1:text.rindex(")")]
+    return name, text[text.rindex(")") + 2:].split()
+
+
+def scan(paths):
+    """Who holds or awaits these files, from every process's descriptors and /proc/locks."""
+    blocked = {(pid, inode) for pid, inode, waiting in lock_records() if waiting}
+    holders, waiters, takers = {}, {}, {}
+    for pid in processes():
+        directory = f"/proc/{pid}/fd"
+        try:
+            descriptors = os.listdir(directory)
+        except OSError:
+            continue
+        for descriptor in descriptors:
+            try:
+                target = os.readlink(f"{directory}/{descriptor}")
+                # Only after the path matches: another descriptor may be on a stuck mount.
+                if target not in paths:
+                    continue
+                inode = os.stat(f"{directory}/{descriptor}").st_ino
+            except OSError:
+                continue
+            info = read(f"/proc/{pid}/fdinfo/{descriptor}") or ""
+            # The kernel lists a lock under each descriptor sharing it, so this
+            # finds a holder that inherited the lock from one long gone.
+            locks = [l.split() for l in info.splitlines() if l.startswith("lock:") and "FLOCK" in l]
+            if locks:
+                holders.setdefault(target, set()).add(pid)
+                # Each line names the process that took the lock.
+                if any(len(fields) > 5 and fields[5] == str(pid) for fields in locks):
+                    takers.setdefault(target, set()).add(pid)
+            # A stopped waiter gives up its request until it continues.
+            elif (pid, inode) in blocked or read(f"/proc/{pid}/wchan") == "do_signal_stop":
+                waiters.setdefault(target, set()).add(pid)
+    return holders, waiters, takers
+
+
+def lock_records():
+    """(pid, inode, waiting) from /proc/locks. Its device differs from stat's on btrfs."""
+    records = []
+    for line in (read("/proc/locks") or "").splitlines():
+        fields = line.split()
+        waiting = fields[1:2] == ["->"]
+        if waiting:
+            fields = fields[1:]
+        if len(fields) >= 6 and fields[1] == "FLOCK":
+            records.append((int(fields[4]), int(fields[5].rsplit(":", 1)[1]), waiting))
+    return records
+
+
+def hidden_lockers():
+    """Lockers by inode, for a holder whose descriptors this user can't read. An
+    inode number alone can match another file, but a locker whose descriptors can
+    be read has already been checked against this one."""
+    lockers = {}
+    for pid, inode, waiting in lock_records():
+        if waiting:
+            continue
+        try:
+            os.listdir(f"/proc/{pid}/fd")
+        except PermissionError:
+            lockers.setdefault(inode, pid)
+        except OSError:
+            pass
+    return lockers
+
+
+def cpu_ticks():
+    totals, parents = {}, {}
+    for pid in processes():
+        fields = stat_fields(pid)
+        if fields:
+            parents[pid] = int(fields[1][1])
+            totals[pid] = int(fields[1][11]) + int(fields[1][12])
+    return totals, parents
+
+
+def subtree(pid, parents):
+    members = {pid}
+    grew = True
+    while grew:
+        added = {child for child, parent in parents.items() if parent in members} - members
+        members |= added
+        grew = bool(added)
+    return members
+
+
+def age(pid):
+    fields = stat_fields(pid)
+    if not fields:
+        return "?"
+    started = int(fields[1][19]) / os.sysconf("SC_CLK_TCK")
+    seconds = int(float(read("/proc/uptime").split()[0]) - started)
+    return f"{seconds // 3600}:{seconds // 60 % 60:02}:{seconds % 60:02}"
+
+
+def describe(pid, before, after, parents, took_lock):
+    fields = stat_fields(pid)
+    if not fields:
+        return f"{pid} has exited"
+    members = subtree(pid, parents)
+    used = sum(after.get(m, 0) - before.get(m, 0) for m in members)
+    activity = "busy" if used > 0 else "idle"
+    command = (read(f"/proc/{pid}/cmdline") or "").replace("\0", " ").strip()
+    try:
+        directory = os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        directory = "?"
+    bound = ", so it took this lock at most that long ago" if took_lock else ""
+    return (
+        f"{pid} {fields[0]}, {activity} with {len(members) - 1} descendants, "
+        f"process age {age(pid)}{bound}, in {directory}\n      {command[:200]}"
+    )
+
+
+def looks_legitimate(pid):
+    fields = stat_fields(pid)
+    if not fields:
+        return False
+    if fields[0] in LEGITIMATE:
+        return True
+    arguments = (read(f"/proc/{pid}/cmdline") or "").split("\0")[:2]
+    return any(os.path.basename(argument) in SCRIPTS for argument in arguments)
+
+
+def main(arguments):
+    # A path need not be valid in the output's encoding.
+    sys.stdout.reconfigure(errors="backslashreplace")
+    if arguments[:1] in (["-h"], ["--help"]):
+        print(__doc__)
+        print("Usage: scripts/lock-holders [LOCK...]  (default: /var/tmp/cagents-*.lock*)")
+        print("Process age isn't hold time: a process can start long before it takes a lock,")
+        print("or after the lock was taken if it inherited it. The kernel doesn't record when")
+        print("a lock was taken.")
+        return 0
+    locks = arguments or default_locks()
+    # Others too: a holder waiting behind one of them looks idle here.
+    holders, waiters, takers = scan({os.path.realpath(lock) for lock in [*locks, *default_locks()]})
+    recorded = hidden_lockers()
+    before, _ = cpu_ticks()
+    time.sleep(SAMPLE_SECONDS)
+    after, parents = cpu_ticks()
+    for lock in locks:
+        path = os.path.realpath(lock)
+        held = {pid for pid in holders.get(path, set()) if stat_fields(pid)}
+        waiting = waiters.get(path, set())
+        try:
+            hidden = recorded.get(os.stat(path).st_ino) if not held else None
+        except OSError:
+            print(f"{lock}: does not exist")
+            continue
+        if not held and not waiting and not hidden:
+            print(f"{lock}: free")
+            continue
+        print(f"{lock}:")
+        took_it = held & takers.get(path, set())
+        for pid in sorted(held):
+            print(f"  holder {describe(pid, before, after, parents, pid in took_it)}")
+        if hidden:
+            print(f"  holder {hidden}, recorded by /proc/locks for this inode; its descriptors aren't readable here")
+        family = set().union(*(subtree(pid, parents) for pid in held)) if held else set()
+        idle = not any(after.get(p, 0) > before.get(p, 0) for p in family)
+        behind = sorted(other for other, pids in waiters.items() if other != path and pids & family)
+        # The head of a gate's queue waits for a slot by design.
+        if behind and not lock.endswith(".queue"):
+            print(f"  note: this holder is waiting for {' and '.join(behind)}, keeping this lock meanwhile.")
+        if held and not any(looks_legitimate(p) for p in family):
+            # A taker that has gone proves nothing: `exec 9>LOCK; flock 9` leaves a
+            # healthy shell holding the lock of a process that has exited.
+            origins = []
+            if took_it:
+                # Not that nothing else holds it: a holder may not be readable here.
+                origins.append(
+                    f"{' and '.join(map(str, sorted(took_it)))} took this lock; any process that "
+                    "inherited it keeps it after the taker exits."
+                )
+            if held - took_it:
+                origins.append(
+                    "A holder could be a script working through its own steps, or could have "
+                    "inherited the lock from another process; this can't tell which."
+                )
+            origin = " ".join(origins)
+            print(
+                f"  note: no holder is a recognized build or session, and they were "
+                f"{'idle' if idle else 'busy'} during the sample. {origin} Everyone queued "
+                "waits until every holder releases it. The commands and directories above show "
+                "whose it may be; ask the owner before acting on it."
+            )
+        # The head of a gate's queue is idle by design while it waits for a slot.
+        elif held and idle and not behind and not lock.endswith(".queue"):
+            print(
+                "  note: nothing holding this used CPU during the one-second sample. Run this "
+                "again to see whether that lasts."
+            )
+        if waiting:
+            print(f"  {len(waiting)} waiting: {' '.join(map(str, sorted(waiting)))}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

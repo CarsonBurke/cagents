@@ -24,6 +24,8 @@ COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
 IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 */
+use super::pull_request_links;
+use crate::ui_controls::WorktreePullRequestState;
 use cosmic::iced::widget::{span, text};
 use cosmic::iced::{Font, font};
 pub use cosmic::widget::markdown::{HeadingLevel, Settings, Style};
@@ -96,9 +98,26 @@ impl Content {
 
     /// Creates some new [`Content`] by parsing the given Markdown.
     pub fn parse(markdown: &str) -> Self {
+        Self::parse_labelled(markdown, Arc::default())
+    }
+
+    /// Parses `markdown` with its pull request links read as `labels` say.
+    pub(super) fn parse_labelled(markdown: &str, labels: Arc<pull_request_links::Labels>) -> Self {
         let mut content = Self::new();
+        content.state.labels = labels;
         content.push_str(markdown);
         content
+    }
+
+    /// How text parsed from now on reads its pull request links. What was
+    /// parsed already keeps its labels; a caller whose labels changed for
+    /// what it holds parses it again.
+    pub(super) fn set_labels(&mut self, labels: Arc<pull_request_links::Labels>) {
+        self.state.labels = labels;
+    }
+
+    pub(super) fn labels(&self) -> &Arc<pull_request_links::Labels> {
+        &self.state.labels
     }
 
     /// Append source while retaining completed parsed blocks. The unfinished
@@ -113,8 +132,11 @@ impl Content {
         // A syntax-free single-line paragraph cannot change interpretation
         // while more ordinary text arrives. Delimiters/newlines return to the
         // CommonMark path, including markers split across provider deltas.
+        // A colon can make the word being written a bare reference that
+        // `linked` turns into a link, so that word is parsed again.
         if self.open_plain
             && markdown.chars().all(plain_character)
+            && !markdown.contains(':')
             && let Some(Item::Paragraph(text)) = self.items.last_mut()
         {
             let suffix = visible_suffix(markdown, &mut self.pending_spaces);
@@ -240,6 +262,12 @@ impl Content {
             .next()
             .is_some_and(char::is_alphabetic)
             && self.state.leftover.chars().all(plain_character)
+            && !self
+                .state
+                .leftover
+                .rsplit(' ')
+                .next()
+                .is_some_and(|word| word.contains(':'))
             && matches!(self.items.last(), Some(Item::Paragraph(text)) if text.is_plain_source(rendered_source));
 
         // A reference destination/title may grow, disappear, or be shadowed
@@ -280,6 +308,7 @@ impl Content {
                     }
                     let mut state = State {
                         references: self.state.references.clone(),
+                        labels: self.state.labels.clone(),
                         ..State::default()
                     };
                     let before = rebuilt.len();
@@ -335,7 +364,7 @@ impl Content {
                         ..
                     },
                 ) if old_language == language => {
-                    *reader_source = super::reader_source::Source::updated(previous, old, code);
+                    **reader_source = super::reader_source::Source::updated(previous, old, code);
                 }
                 _ => {}
             }
@@ -515,7 +544,7 @@ pub enum Item {
         /// The styled lines of text in the code block.
         lines: Vec<Text>,
         /// Stable source digest and bounded append proof for nested reader geometry.
-        reader_source: super::reader_source::Source,
+        reader_source: Box<super::reader_source::Source>,
     },
     /// A list.
     List {
@@ -531,9 +560,9 @@ pub enum Item {
         /// The title of the image.
         title: String,
         /// Literal title text prepared alongside the image, never parsed as Markdown.
-        title_text: Text,
+        title_text: Box<Text>,
         /// The alternative text of the image.
-        alt: Text,
+        alt: Box<Text>,
     },
     /// A quote.
     Quote(Vec<Item>),
@@ -627,9 +656,8 @@ pub(super) fn materialized_bytes() -> usize {
 #[derive(Debug, Clone)]
 pub struct Text {
     spans: Arc<Spans>,
-    starts: Arc<[usize]>,
     plain: std::cell::OnceCell<Arc<str>>,
-    plain_source: std::cell::OnceCell<super::reader_source::Source>,
+    plain_source: std::cell::OnceCell<Box<super::reader_source::Source>>,
     // Most parsed nodes are never styled. Keep the large Style and empty
     // Arc allocation out of every cold Text (and therefore every Item).
     styled_cache: RefCell<Option<Box<StyledCache>>>,
@@ -646,43 +674,203 @@ struct StyledLineage {
     edges: std::collections::VecDeque<(std::sync::Weak<Spans>, std::sync::Weak<Spans>)>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Attributes {
+    strikethrough: bool,
+    strong: bool,
+    emphasis: bool,
+    code: bool,
+}
+#[derive(Debug, Clone)]
+struct Run {
+    end: usize,
+    link: Option<Uri>,
+    attributes: Attributes,
+    /// What this run is of a pull request link shown by its label.
+    inline: Option<Inline>,
+}
+
+/// The parts of a pull request link that its label replaces the address
+/// with. See [`super::pull_request_links`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Inline {
+    /// The room the link's state glyph is drawn in, when its state is known.
+    Glyph(WorktreePullRequestState),
+    /// The reference and title that stand for the address.
+    Label,
+}
+
+/// Where a paragraph's pull request links put their glyphs, and what Copy
+/// gives for the text that stands in for their addresses.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct Inlines {
+    /// The span each glyph is drawn over, in span order.
+    pub(super) glyphs: Box<[(usize, WorktreePullRequestState)]>,
+    /// Shown text that copies as something else, in text order: a label
+    /// copies as its address, and a glyph's room as nothing.
+    pub(super) copies: Box<[(Range<usize>, Uri)]>,
+    /// The spans of each link and what hovering it says, in span order.
+    pub(super) tips: Box<[(Range<usize>, Arc<str>)]>,
+}
+
+impl Inlines {
+    /// What hovering the link drawn by span `index` says.
+    pub(super) fn tip(&self, index: usize) -> Option<&Arc<str>> {
+        let at = self.tips.partition_point(|(spans, _)| spans.end <= index);
+        self.tips
+            .get(at)
+            .filter(|(spans, _)| spans.contains(&index))
+            .map(|(_, tip)| tip)
+    }
+    /// `plain[range]` as Copy gives it. A label any part of which is
+    /// selected copies whole, as its address, since a part of it names no
+    /// pull request.
+    pub(super) fn copy(&self, plain: &str, range: Range<usize>) -> String {
+        let first = self.copies.partition_point(|(at, _)| at.end <= range.start);
+        let mut copied = String::with_capacity(range.len());
+        let mut from = range.start;
+        for (at, copy) in self.copies[first..]
+            .iter()
+            .take_while(|(at, _)| at.start < range.end)
+        {
+            if from < at.start {
+                copied.push_str(&plain[from..at.start]);
+            }
+            copied.push_str(copy);
+            from = at.end;
+        }
+        if from < range.end {
+            copied.push_str(&plain[from..range.end]);
+        }
+        copied
+    }
+}
+
 #[derive(Debug)]
 struct Spans {
-    values: Vec<Span>,
+    // Keep this growable: syntax-free streaming appends to this buffer.
+    text: String,
+    runs: Box<[Run]>,
+    /// Present when a pull request link is shown by its label.
+    inlines: Option<Arc<Inlines>>,
     #[cfg(test)]
     disposed: Option<std::sync::mpsc::Sender<(std::thread::ThreadId, usize)>>,
 }
 impl Clone for Spans {
     fn clone(&self) -> Self {
         Self {
-            values: self.values.clone(),
+            text: self.text.clone(),
+            runs: self.runs.clone(),
+            inlines: self.inlines.clone(),
             #[cfg(test)]
             disposed: None,
         }
     }
 }
-impl std::ops::Deref for Spans {
-    type Target = Vec<Span>;
-    fn deref(&self) -> &Self::Target {
-        &self.values
+impl Spans {
+    fn new(spans: Vec<Span>) -> Self {
+        let bytes = spans.iter().map(|span| span.text().len()).sum::<usize>();
+        let mut runs = Vec::with_capacity(spans.len());
+        let mut spans = spans.into_iter();
+        let mut text = String::new();
+        if let Some(Span::Standard {
+            text: first,
+            strikethrough,
+            link,
+            strong,
+            emphasis,
+            code,
+        }) = spans.next()
+        {
+            text = first;
+            text.reserve_exact(bytes - text.len());
+            runs.push(Run {
+                end: text.len(),
+                link,
+                attributes: Attributes {
+                    strikethrough,
+                    strong,
+                    emphasis,
+                    code,
+                },
+                inline: None,
+            });
+        }
+        for Span::Standard {
+            text: next,
+            strikethrough,
+            link,
+            strong,
+            emphasis,
+            code,
+        } in spans
+        {
+            text.push_str(&next);
+            runs.push(Run {
+                end: text.len(),
+                link,
+                attributes: Attributes {
+                    strikethrough,
+                    strong,
+                    emphasis,
+                    code,
+                },
+                inline: None,
+            });
+        }
+        Self {
+            text,
+            runs: runs.into_boxed_slice(),
+            inlines: None,
+            #[cfg(test)]
+            disposed: None,
+        }
     }
-}
-impl std::ops::DerefMut for Spans {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.values
+    fn len(&self) -> usize {
+        self.runs.len()
+    }
+    fn span(&self, index: usize) -> SpanRef<'_> {
+        let start = if index == 0 {
+            0
+        } else {
+            self.runs[index - 1].end
+        };
+        let run = &self.runs[index];
+        SpanRef {
+            text: &self.text[start..run.end],
+            run,
+        }
+    }
+    fn iter(&self) -> impl ExactSizeIterator<Item = SpanRef<'_>> {
+        (0..self.runs.len()).map(|index| self.span(index))
     }
 }
 #[cfg(test)]
 impl Drop for Spans {
     fn drop(&mut self) {
-        let values = std::mem::take(&mut self.values);
-        let bytes = values.iter().map(|span| span.text().len()).sum();
-        // Observe the real raw span Vec and its owned Strings after disposal,
-        // not an unrelated token whose lifetime might end before the source.
-        drop(values);
+        let bytes = self.text.len();
+        // Observe disposal of the actual text and run owners.
+        drop(std::mem::take(&mut self.text));
+        drop(std::mem::take(&mut self.runs));
         if let Some(disposed) = self.disposed.take() {
             let _ = disposed.send((std::thread::current().id(), bytes));
         }
+    }
+}
+struct SpanRef<'a> {
+    text: &'a str,
+    run: &'a Run,
+}
+impl std::fmt::Debug for SpanRef<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Standard")
+            .field("text", &self.text)
+            .field("strikethrough", &self.run.attributes.strikethrough)
+            .field("link", &self.run.link)
+            .field("strong", &self.run.attributes.strong)
+            .field("emphasis", &self.run.attributes.emphasis)
+            .field("code", &self.run.attributes.code)
+            .finish()
     }
 }
 
@@ -690,18 +878,23 @@ impl Drop for Spans {
 /// this boundary. Capture only existing backing, without plain/style work.
 pub(super) struct FlowText {
     spans: Arc<Spans>,
-    starts: Arc<[usize]>,
     plain: std::sync::OnceLock<Arc<str>>,
     // Retain every source/cache owner until raw Flow retirement, including
     // already-primed proof state and a cached style captured from the Text.
-    _plain_source: Option<super::reader_source::Source>,
-    style: Option<Style>,
-    styled: Arc<[text::Span<'static, Uri>]>,
+    captured: Option<Box<FlowCaches>>,
     lineage: Arc<std::sync::Mutex<StyledLineage>>,
 }
+struct FlowCaches {
+    _plain_source: Option<super::reader_source::Source>,
+    styled: Option<StyledCache>,
+}
+
 impl FlowText {
     pub(super) fn len(&self) -> usize {
-        self.starts.last().copied().unwrap_or_default()
+        self.spans.text.len()
+    }
+    pub(super) fn inlines(&self) -> Option<Arc<Inlines>> {
+        self.spans.inlines.clone()
     }
     pub(super) fn append_proven(&self, previous: &Self) -> bool {
         append_proven(
@@ -716,13 +909,18 @@ impl FlowText {
             .get_or_init(|| {
                 #[cfg(test)]
                 MATERIALIZED_BYTES.with(|bytes| bytes.set(bytes.get() + self.len()));
-                self.spans.iter().map(Span::text).collect::<String>().into()
+                Arc::from(self.spans.text.as_str())
             })
             .clone()
     }
     pub(super) fn spans(&self, style: Style) -> Arc<[text::Span<'static, Uri>]> {
-        if self.style == Some(style) {
-            self.styled.clone()
+        if let Some(cached) = self
+            .captured
+            .as_ref()
+            .and_then(|capture| capture.styled.as_ref())
+            && cached.style == style
+        {
+            cached.spans.clone()
         } else {
             #[cfg(test)]
             MATERIALIZED_BYTES.with(|bytes| bytes.set(bytes.get() + self.len()));
@@ -780,21 +978,15 @@ impl Text {
     /// append-proof lineage. Tests retain every raw span attribute and link.
     #[cfg(test)]
     pub(super) fn semantic_spans(&self) -> impl std::fmt::Debug + '_ {
-        &self.spans.values
+        self.spans.iter().collect::<Vec<_>>()
     }
     fn new(spans: Vec<Span>) -> Self {
-        let mut starts = Vec::with_capacity(spans.len() + 1);
-        starts.push(0);
-        for span in &spans {
-            starts.push(starts.last().copied().unwrap() + span.text().len());
-        }
+        Self::from_spans(Spans::new(spans))
+    }
+
+    fn from_spans(spans: Spans) -> Self {
         Self {
-            spans: Arc::new(Spans {
-                values: spans,
-                #[cfg(test)]
-                disposed: None,
-            }),
-            starts: starts.into(),
+            spans: Arc::new(spans),
             plain: std::cell::OnceCell::new(),
             plain_source: std::cell::OnceCell::new(),
             styled_cache: RefCell::default(),
@@ -803,25 +995,21 @@ impl Text {
     }
 
     fn is_plain_source(&self, source: &str) -> bool {
-        matches!(self.spans.as_slice(), [Span::Standard { text, strikethrough: false,
-            link: None, strong: false, emphasis: false, code: false }] if text == source)
+        matches!(self.spans.runs.as_ref(), [Run { link: None,
+            attributes: Attributes { strikethrough: false, strong: false, emphasis: false, code: false }, .. }]
+            if self.spans.text == source)
     }
     fn append_plain(&mut self, suffix: &str) {
         let previous = Arc::downgrade(&self.spans);
         if let Some(source) = self.plain_source.get_mut() {
-            // Primed parser outputs share the old plain backing; update only
-            // the suffix hash state before invalidating that display string.
-            let [Span::Standard { text, .. }] = self.spans.as_slice() else {
-                unreachable!("plain append has one source span")
-            };
-            source.append(text, suffix);
+            source.append(&self.spans.text, suffix);
         }
-        let [Span::Standard { text, .. }] = Arc::make_mut(&mut self.spans).as_mut_slice() else {
+        let spans = Arc::make_mut(&mut self.spans);
+        let [run] = spans.runs.as_mut() else {
             unreachable!("plain append requires one plain span")
         };
-        text.push_str(suffix);
-        let length = self.starts.last().copied().unwrap_or_default() + suffix.len();
-        self.starts = Arc::from([0, length]);
+        spans.text.push_str(suffix);
+        run.end = spans.text.len();
         self.plain.take();
         *self.styled_cache.get_mut() = None;
         self.record_edge(previous);
@@ -848,7 +1036,7 @@ impl Text {
             .iter()
             .zip(self.spans.iter())
             .enumerate()
-            .all(|(index, (old, new))| old.prefix_of(new, index + 1 == previous.spans.len()))
+            .all(|(index, (old, new))| old.prefix_of(&new, index + 1 == previous.spans.len()))
         {
             return;
         }
@@ -873,17 +1061,21 @@ impl Text {
         if let Some(ready) = self.plain.get() {
             let _ = plain.set(ready.clone());
         }
-        let (style, styled) = match self.styled_cache.borrow().as_ref() {
-            Some(cached) => (Some(cached.style), cached.spans.clone()),
-            None => (None, Arc::from([])),
-        };
+        let source = self
+            .plain_source
+            .get()
+            .map(|source| source.as_ref().clone());
+        let styled = self.styled_cache.borrow().as_deref().cloned();
+        let captured = (source.is_some() || styled.is_some()).then(|| {
+            Box::new(FlowCaches {
+                _plain_source: source,
+                styled,
+            })
+        });
         FlowText {
             spans: self.spans.clone(),
-            starts: self.starts.clone(),
             plain,
-            _plain_source: self.plain_source.get().cloned(),
-            style,
-            styled,
+            captured,
             lineage: self.lineage.clone(),
         }
     }
@@ -907,17 +1099,23 @@ impl Text {
             .get_or_init(|| {
                 #[cfg(test)]
                 MATERIALIZED_BYTES.with(|bytes| bytes.set(bytes.get() + self.len()));
-                self.spans.iter().map(Span::text).collect::<String>().into()
+                Arc::from(self.spans.text.as_str())
             })
             .clone()
     }
     pub fn plain_prefixes(&self) -> Arc<Vec<[u8; 32]>> {
         self.plain_source
-            .get_or_init(|| super::reader_source::Source::new(&self.plain()))
+            .get_or_init(|| Box::new(super::reader_source::Source::new(&self.plain())))
             .prefixes()
     }
     pub fn len(&self) -> usize {
-        self.starts.last().copied().unwrap_or_default()
+        self.spans.text.len()
+    }
+
+    /// Where this text's pull request links draw their glyphs, and what
+    /// their labels copy as; `None` when it shows none.
+    pub(super) fn inlines(&self) -> Option<Arc<Inlines>> {
+        self.spans.inlines.clone()
     }
 
     /// Style just a bounded rendered byte range; hidden chunks never populate
@@ -928,20 +1126,20 @@ impl Text {
         range: Range<usize>,
     ) -> Arc<[text::Span<'static, Uri>]> {
         let first = self
-            .starts
-            .partition_point(|start| *start <= range.start)
-            .saturating_sub(1);
-        self.spans
-            .iter()
-            .enumerate()
-            .skip(first)
-            .take_while(|(index, _)| self.starts[*index] < range.end)
+            .spans
+            .runs
+            .partition_point(|run| run.end <= range.start);
+        (first..self.spans.len())
+            .map(|index| (index, self.spans.span(index)))
+            .take_while(|(index, _)| *index == 0 || self.spans.runs[*index - 1].end < range.end)
             .filter_map(|(index, span)| {
-                let start = range.start.saturating_sub(self.starts[index]);
-                let end = range
-                    .end
-                    .saturating_sub(self.starts[index])
-                    .min(span.text().len());
+                let offset = if index == 0 {
+                    0
+                } else {
+                    self.spans.runs[index - 1].end
+                };
+                let start = range.start.saturating_sub(offset);
+                let end = range.end.saturating_sub(offset).min(span.text.len());
                 (start < end).then(|| span.view_part(&style, start..end))
             })
             .collect()
@@ -983,80 +1181,64 @@ enum Span {
 }
 
 impl Span {
-    fn prefix_of(&self, new: &Self, last: bool) -> bool {
-        let Self::Standard {
-            text: old,
-            strikethrough: a,
-            link: b,
-            strong: c,
-            emphasis: d,
-            code: e,
-        } = self;
-        let Self::Standard {
-            text: new,
-            strikethrough: f,
-            link: g,
-            strong: h,
-            emphasis: i,
-            code: j,
-        } = new;
-        (a, b, c, d, e) == (f, g, h, i, j)
-            && if last {
-                new.starts_with(old)
-            } else {
-                new == old
-            }
-    }
     fn text(&self) -> &str {
-        match self {
-            Self::Standard { text, .. } => text,
-        }
+        let Self::Standard { text, .. } = self;
+        text
+    }
+}
+impl SpanRef<'_> {
+    fn prefix_of(&self, new: &Self, last: bool) -> bool {
+        self.run.attributes == new.run.attributes
+            && self.run.link == new.run.link
+            && self.run.inline == new.run.inline
+            && if last {
+                new.text.starts_with(self.text)
+            } else {
+                new.text == self.text
+            }
     }
     fn view(&self, style: &Style) -> text::Span<'static, Uri> {
-        self.view_part(style, 0..self.text().len())
+        self.view_part(style, 0..self.text.len())
     }
     fn view_part(&self, style: &Style, range: Range<usize>) -> text::Span<'static, Uri> {
-        match self {
-            Span::Standard {
-                text,
-                strikethrough,
-                link,
-                strong,
-                emphasis,
-                code,
-            } => {
-                let span = span(text[range].to_owned()).strikethrough(*strikethrough);
+        let text = self.text;
+        let Attributes {
+            strikethrough,
+            strong,
+            emphasis,
+            code,
+        } = &self.run.attributes;
+        let link = &self.run.link;
+        let span = span(text[range].to_owned()).strikethrough(*strikethrough);
 
-                let span = if *code {
-                    span.font(style.inline_code_font)
-                        .color(style.inline_code_color)
-                        .background(style.inline_code_highlight.background)
-                        .border(style.inline_code_highlight.border)
-                        .padding(style.inline_code_padding)
-                } else if *strong || *emphasis {
-                    span.font(Font {
-                        weight: if *strong {
-                            font::Weight::Bold
-                        } else {
-                            font::Weight::Normal
-                        },
-                        style: if *emphasis {
-                            font::Style::Italic
-                        } else {
-                            font::Style::Normal
-                        },
-                        ..style.font
-                    })
+        let span = if *code {
+            span.font(style.inline_code_font)
+                .color(style.inline_code_color)
+                .background(style.inline_code_highlight.background)
+                .border(style.inline_code_highlight.border)
+                .padding(style.inline_code_padding)
+        } else if *strong || *emphasis {
+            span.font(Font {
+                weight: if *strong {
+                    font::Weight::Bold
                 } else {
-                    span.font(style.font)
-                };
+                    font::Weight::Normal
+                },
+                style: if *emphasis {
+                    font::Style::Italic
+                } else {
+                    font::Style::Normal
+                },
+                ..style.font
+            })
+        } else {
+            span.font(style.font)
+        };
 
-                if let Some(link) = link.as_ref() {
-                    span.color(style.link_color).link(link.clone())
-                } else {
-                    span
-                }
-            }
+        if let Some(link) = link.as_ref() {
+            span.color(style.link_color).link(link.clone())
+        } else {
+            span
         }
     }
 }
@@ -1105,6 +1287,8 @@ struct State {
     leftover_origin: usize,
     references: Arc<HashMap<ReferenceLabel, Reference>>,
     images: HashSet<Uri>,
+    /// How pull request links read; see [`super::pull_request_links`].
+    labels: Arc<pull_request_links::Labels>,
 }
 
 fn collect_images(items: &[Item], images: &mut HashSet<Uri>) {
@@ -1134,6 +1318,240 @@ fn collect_images(items: &[Item], images: &mut HashSet<Uri>) {
     }
 }
 
+/// Parser-local text and ranges. Text fragments enter their final backing
+/// directly; publication never builds and then rejoins owned span Strings.
+#[derive(Default)]
+struct SpanBuffer {
+    text: String,
+    runs: Vec<Run>,
+    labels: Arc<pull_request_links::Labels>,
+}
+
+impl SpanBuffer {
+    fn is_empty(&self) -> bool {
+        self.runs.is_empty()
+    }
+
+    fn push(
+        &mut self,
+        text: pulldown_cmark::CowStr<'_>,
+        attributes: Attributes,
+        link: Option<Uri>,
+    ) {
+        if self.text.is_empty() {
+            self.text = text.into_string();
+        } else {
+            self.text.push_str(&text);
+        }
+        self.runs.push(Run {
+            end: self.text.len(),
+            link,
+            attributes,
+            inline: None,
+        });
+    }
+
+    fn finish(&mut self, linkify: bool) -> Text {
+        let text = mem::take(&mut self.text);
+        let mut runs = mem::take(&mut self.runs);
+        if linkify {
+            // Match the existing bare-reference rule: only adjacent unlinked,
+            // non-code fragments in the same style can form one reference.
+            runs.dedup_by(|next, previous| {
+                if next.link.is_none()
+                    && previous.link.is_none()
+                    && !next.attributes.code
+                    && next.attributes == previous.attributes
+                {
+                    previous.end = next.end;
+                    true
+                } else {
+                    false
+                }
+            });
+            let mut start = 0;
+            let first_split = runs.iter_mut().enumerate().find_map(|(index, run)| {
+                let fragment = &text[start..run.end];
+                start = run.end;
+                if run.link.is_none() && run.attributes.code {
+                    run.link = destination(fragment);
+                    None
+                } else if run.link.is_none() && references(fragment).next().is_some() {
+                    Some(index)
+                } else {
+                    None
+                }
+            });
+            if let Some(first_split) = first_split {
+                let mut linked = Vec::with_capacity(runs.len());
+                linked.extend(runs.drain(..first_split));
+                let mut start = linked.last().map_or(0, |run| run.end);
+                for mut run in runs {
+                    let end = run.end;
+                    let fragment = &text[start..end];
+                    if run.link.is_none() && run.attributes.code {
+                        run.link = destination(fragment);
+                        linked.push(run);
+                    } else if run.link.is_none() {
+                        let mut copied = 0;
+                        for (from, to, destination) in references(fragment) {
+                            if copied < from {
+                                linked.push(Run {
+                                    end: start + from,
+                                    link: None,
+                                    attributes: run.attributes,
+                                    inline: None,
+                                });
+                            }
+                            linked.push(Run {
+                                end: start + to,
+                                link: Some(destination),
+                                attributes: run.attributes,
+                                inline: None,
+                            });
+                            copied = to;
+                        }
+                        if copied == 0 || copied < fragment.len() {
+                            linked.push(Run {
+                                end,
+                                link: None,
+                                attributes: run.attributes,
+                                inline: None,
+                            });
+                        }
+                    } else {
+                        linked.push(run);
+                    }
+                    start = end;
+                }
+                runs = linked;
+            }
+        }
+        let (text, runs, inlines) = if linkify {
+            labelled(text, runs, &self.labels)
+        } else {
+            (text, runs, None)
+        };
+        Text::from_spans(Spans {
+            text,
+            runs: runs.into_boxed_slice(),
+            inlines,
+            #[cfg(test)]
+            disposed: None,
+        })
+    }
+}
+
+/// A paragraph's pull request links as their labels show them.
+///
+/// A link whose text is its own address, which is how a bare address, an
+/// autolink and `[address](address)` all arrive, is shown by its pull
+/// request's glyph and label instead. A link with words of its own keeps
+/// them and gains the glyph before them, which says what it opens and in
+/// what state without rewording the author's sentence. A pull request
+/// address set in code is the author's literal text and stays as written.
+fn labelled(
+    text: String,
+    runs: Vec<Run>,
+    labels: &pull_request_links::Labels,
+) -> (String, Vec<Run>, Option<Arc<Inlines>>) {
+    // A link's own words need not name the pull request it opens, so its
+    // destination is what is looked at.
+    if !runs.iter().any(|run| {
+        !run.attributes.code
+            && run
+                .link
+                .as_deref()
+                .and_then(pull_request_links::pull_request)
+                .is_some()
+    }) {
+        return (text, runs, None);
+    }
+    let mut shown = String::with_capacity(text.len());
+    let mut out: Vec<Run> = Vec::with_capacity(runs.len() + 2);
+    let mut glyphs = Vec::new();
+    let mut copies = Vec::new();
+    let mut tips = Vec::new();
+    let mut start = 0;
+    let mut index = 0;
+    while index < runs.len() {
+        let run = &runs[index];
+        // The link's runs: one per style its words change through.
+        let last = index
+            + runs[index + 1..]
+                .iter()
+                .take_while(|next| next.link.is_some() && next.link == run.link)
+                .count();
+        // A link set wholly in code is the author's literal text.
+        let key = run
+            .link
+            .as_deref()
+            .filter(|_| runs[index..=last].iter().any(|run| !run.attributes.code))
+            .and_then(pull_request_links::pull_request);
+        let Some(key) = key else {
+            shown.push_str(&text[start..run.end]);
+            out.push(Run {
+                end: shown.len(),
+                ..run.clone()
+            });
+            start = run.end;
+            index += 1;
+            continue;
+        };
+        let end = runs[last].end;
+        let destination = run.link.clone().expect("a pull request link");
+        let label = labels.label(&key);
+        let first = out.len();
+        let glyph_start = shown.len();
+        // A pull request whose state is unknown has no glyph: a neutral one
+        // would look like a state of its own.
+        if let Some(state) = label.glyph {
+            shown.push_str(pull_request_links::GLYPH_SPACE);
+            glyphs.push((out.len(), state));
+            out.push(Run {
+                end: shown.len(),
+                link: Some(destination.clone()),
+                // The glyph takes the link's color, not its words' decoration.
+                attributes: Attributes {
+                    strikethrough: false,
+                    code: false,
+                    ..run.attributes
+                },
+                inline: Some(Inline::Glyph(state)),
+            });
+        }
+        if text[start..end].trim_end_matches('/') == destination.trim_end_matches('/') {
+            shown.push_str(&label.text);
+            out.push(Run {
+                end: shown.len(),
+                link: Some(destination.clone()),
+                attributes: run.attributes,
+                inline: Some(Inline::Label),
+            });
+            copies.push((glyph_start..shown.len(), destination.clone()));
+        } else {
+            copies.push((glyph_start..shown.len(), Uri::from("")));
+            for run in &runs[index..=last] {
+                shown.push_str(&text[start..run.end]);
+                out.push(Run {
+                    end: shown.len(),
+                    ..run.clone()
+                });
+                start = run.end;
+            }
+        }
+        tips.push((first..out.len(), Arc::from(label.tip(&destination))));
+        start = end;
+        index = last + 1;
+    }
+    let inlines = Inlines {
+        glyphs: glyphs.into_boxed_slice(),
+        copies: copies.into_boxed_slice(),
+        tips: tips.into_boxed_slice(),
+    };
+    (shown, out, Some(Arc::new(inlines)))
+}
+
 fn parse_with<'a>(
     mut state: impl BorrowMut<State> + 'a,
     markdown: &'a str,
@@ -1157,7 +1575,10 @@ fn parse_with<'a>(
 
     let reference_labels = Rc::new(RefCell::new(HashSet::new()));
 
-    let mut spans = Vec::new();
+    let mut spans = SpanBuffer {
+        labels: state.borrow().labels.clone(),
+        ..SpanBuffer::default()
+    };
     let mut code = String::new();
     let mut code_language = None;
     let mut code_lines = Vec::new();
@@ -1272,8 +1693,6 @@ fn parse_with<'a>(
 
     let parser = parser.into_offset_iter();
 
-    // We want to keep the `spans` capacity
-    #[allow(clippy::drain_collect)]
     parser.filter_map(move |(event, source)| match event {
         pulldown_cmark::Event::Start(tag) => match tag {
             pulldown_cmark::Tag::Heading { level, .. } if !metadata => {
@@ -1317,7 +1736,7 @@ fn parse_with<'a>(
                 ..
             } if !metadata => {
                 if !spans.is_empty() {
-                    let text = Text::new(spans.drain(..).collect());
+                    let text = spans.finish(true);
                     RefCell::borrow_mut(&inline_items).push(match inline_heading {
                         Some(level) => Item::Heading(level, text),
                         None => Item::Paragraph(text),
@@ -1343,7 +1762,7 @@ fn parse_with<'a>(
                     produce(
                         state.borrow_mut(),
                         &mut stack,
-                        Item::Paragraph(Text::new(spans.drain(..).collect())),
+                        Item::Paragraph(spans.finish(true)),
                         source,
                     )
                 };
@@ -1369,7 +1788,7 @@ fn parse_with<'a>(
                     produce(
                         state.borrow_mut(),
                         &mut stack,
-                        Item::Paragraph(Text::new(spans.drain(..).collect())),
+                        Item::Paragraph(spans.finish(true)),
                         source,
                     )
                 };
@@ -1390,7 +1809,7 @@ fn parse_with<'a>(
                     produce(
                         state.borrow_mut(),
                         &mut stack,
-                        Item::Paragraph(Text::new(spans.drain(..).collect())),
+                        Item::Paragraph(spans.finish(true)),
                         source,
                     )
                 }
@@ -1432,7 +1851,7 @@ fn parse_with<'a>(
                     produce(
                         state.borrow_mut(),
                         &mut stack,
-                        Item::Heading(level, Text::new(spans.drain(..).collect())),
+                        Item::Heading(level, spans.finish(true)),
                         source,
                     )
                 }
@@ -1460,7 +1879,7 @@ fn parse_with<'a>(
                     produce(
                         state.borrow_mut(),
                         &mut stack,
-                        Item::Paragraph(Text::new(spans.drain(..).collect())),
+                        Item::Paragraph(spans.finish(true)),
                         source,
                     )
                 }
@@ -1472,7 +1891,7 @@ fn parse_with<'a>(
                     produce(
                         state.borrow_mut(),
                         &mut stack,
-                        Item::Paragraph(Text::new(spans.drain(..).collect())),
+                        Item::Paragraph(spans.finish(true)),
                         source,
                     )
                 }
@@ -1505,7 +1924,7 @@ fn parse_with<'a>(
             }
             pulldown_cmark::TagEnd::Image if !metadata => {
                 let (url, title) = image.take()?;
-                let alt = Text::new(spans.drain(..).collect());
+                let alt = spans.finish(false);
 
                 let state = state.borrow_mut();
                 let _ = state.images.insert(url.clone());
@@ -1521,8 +1940,8 @@ fn parse_with<'a>(
                 RefCell::borrow_mut(&inline_items).push(Item::Image {
                     url,
                     title,
-                    title_text,
-                    alt,
+                    title_text: Box::new(title_text),
+                    alt: Box::new(alt),
                 });
                 None
             }
@@ -1536,7 +1955,7 @@ fn parse_with<'a>(
                     Item::CodeBlock {
                         language: code_language.take(),
                         source: display.clone(),
-                        reader_source: super::reader_source::Source::new(&display),
+                        reader_source: Box::new(super::reader_source::Source::new(&display)),
                         code: display,
                         lines: code_lines.drain(..).collect(),
                     },
@@ -1570,7 +1989,7 @@ fn parse_with<'a>(
                     let _ = produce(
                         state.borrow_mut(),
                         &mut stack,
-                        Item::Paragraph(Text::new(spans.drain(..).collect())),
+                        Item::Paragraph(spans.finish(true)),
                         source.clone(),
                     );
                 }
@@ -1606,67 +2025,70 @@ fn parse_with<'a>(
         pulldown_cmark::Event::Text(text) if !metadata => {
             if code_block {
                 code.push_str(&text);
-
                 return None;
             }
-
-            let span = Span::Standard {
-                text: text.into_string(),
-                strong,
-                emphasis,
-                strikethrough,
-                link: link.clone(),
-                code: false,
-            };
-
-            spans.push(span);
-
+            spans.push(
+                text,
+                Attributes {
+                    strong,
+                    emphasis,
+                    strikethrough,
+                    code: false,
+                },
+                link.clone(),
+            );
             None
         }
         pulldown_cmark::Event::Code(code) if !metadata => {
-            let span = Span::Standard {
-                text: code.into_string(),
-                strong,
-                emphasis,
-                strikethrough,
-                link: link.clone(),
-                code: true,
-            };
-
-            spans.push(span);
+            spans.push(
+                code,
+                Attributes {
+                    strong,
+                    emphasis,
+                    strikethrough,
+                    code: true,
+                },
+                link.clone(),
+            );
             None
         }
         pulldown_cmark::Event::SoftBreak if !metadata => {
-            spans.push(Span::Standard {
-                text: String::from(" "),
-                strikethrough,
-                strong,
-                emphasis,
-                link: link.clone(),
-                code: false,
-            });
+            spans.push(
+                " ".into(),
+                Attributes {
+                    strong,
+                    emphasis,
+                    strikethrough,
+                    code: false,
+                },
+                link.clone(),
+            );
             None
         }
         pulldown_cmark::Event::HardBreak if !metadata => {
-            spans.push(Span::Standard {
-                text: String::from("\n"),
-                strikethrough,
-                strong,
-                emphasis,
-                link: link.clone(),
-                code: false,
-            });
+            spans.push(
+                "\n".into(),
+                Attributes {
+                    strong,
+                    emphasis,
+                    strikethrough,
+                    code: false,
+                },
+                link.clone(),
+            );
             None
         }
         pulldown_cmark::Event::InlineHtml(h) if !metadata && h.eq_ignore_ascii_case("<br>") => {
-            spans.push(Span::Standard {
-                text: String::from("\n"),
-                strikethrough,
-                strong,
-                emphasis,
-                link: link.clone(),
-                code: false,
-            });
+            spans.push(
+                "\n".into(),
+                Attributes {
+                    strong,
+                    emphasis,
+                    strikethrough,
+                    code: false,
+                },
+                link.clone(),
+            );
             None
         }
         pulldown_cmark::Event::Rule => produce(state.borrow_mut(), &mut stack, Item::Rule, source),
@@ -1685,6 +2107,217 @@ fn parse_with<'a>(
         }
         _ => None,
     })
+}
+
+/// A paragraph's spans with its bare web addresses and file positions made
+/// into links.
+///
+/// Agents write `https://example.com/docs` and `src/app.rs:42` in prose far
+/// more often than they write Markdown links, and a reader expects both to
+/// open, as a terminal would. Only plain text is read: code spans and text
+/// already inside a link keep what the author wrote. The text itself is never
+/// changed, so selection, Find and Copy see exactly the answer.
+///
+/// The parser can hand over one run of text as several pieces, so neighbours
+/// set in the same style are joined first: an address cut in two would
+/// otherwise link neither half.
+#[cfg(test)]
+fn linked(spans: impl Iterator<Item = Span>) -> Vec<Span> {
+    let mut joined: Vec<Span> = Vec::new();
+    for span in spans {
+        if let (
+            Some(Span::Standard {
+                text: previous,
+                strikethrough: a,
+                link: None,
+                strong: b,
+                emphasis: c,
+                code: false,
+            }),
+            Span::Standard {
+                text,
+                strikethrough: d,
+                link: None,
+                strong: e,
+                emphasis: f,
+                code: false,
+            },
+        ) = (joined.last_mut(), &span)
+            && (*a, *b, *c) == (*d, *e, *f)
+        {
+            previous.push_str(text);
+            continue;
+        }
+        joined.push(span);
+    }
+    let mut out = Vec::with_capacity(joined.len());
+    for mut span in joined {
+        // Agents set positions in code (`src/lib.rs:12`) as often as in
+        // prose; a code span that is exactly one keeps its face and opens.
+        if let Span::Standard {
+            text,
+            link: link @ None,
+            code: true,
+            ..
+        } = &mut span
+        {
+            *link = destination(text);
+            out.push(span);
+            continue;
+        }
+        let Span::Standard {
+            text,
+            strikethrough,
+            link: None,
+            strong,
+            emphasis,
+            code: false,
+        } = span
+        else {
+            out.push(span);
+            continue;
+        };
+        let piece = |text: &str, link: Option<Uri>| Span::Standard {
+            text: text.to_owned(),
+            strikethrough,
+            link,
+            strong,
+            emphasis,
+            code: false,
+        };
+        let mut copied = 0;
+        for (start, end, destination) in references(&text) {
+            if copied < start {
+                out.push(piece(&text[copied..start], None));
+            }
+            out.push(piece(&text[start..end], Some(destination)));
+            copied = end;
+        }
+        match copied {
+            0 => out.push(piece(&text, None)),
+            copied if copied < text.len() => out.push(piece(&text[copied..], None)),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Where in `text` a bare reference sits, and what it opens.
+fn references(text: &str) -> impl Iterator<Item = (usize, usize, Uri)> + '_ {
+    text.split_inclusive(char::is_whitespace)
+        .scan(0, |offset, word| {
+            let start = *offset;
+            *offset += word.len();
+            Some((start, word.trim_end()))
+        })
+        .filter_map(|(start, word)| {
+            // Brackets and quotes around a reference are the sentence's, as
+            // is the punctuation after it, except a closing bracket that
+            // the reference itself opened, as in a wiki address.
+            let inner = word.trim_start_matches(['(', '[', '{', '<', '"', '\'', '`', '*', '_']);
+            let start = start + word.len() - inner.len();
+            let mut end = inner.len();
+            while let Some(last) = inner[..end].chars().next_back() {
+                let unbalanced = |open: char, close: char| {
+                    last == close
+                        && inner[..end].matches(close).count() > inner[..end].matches(open).count()
+                };
+                if matches!(
+                    last,
+                    '.' | ',' | ';' | ':' | '!' | '?' | '"' | '\'' | '>' | '`' | '*' | '_'
+                ) || unbalanced('(', ')')
+                    || unbalanced('[', ']')
+                    || unbalanced('{', '}')
+                {
+                    end -= last.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            let reference = &inner[..end];
+            destination(reference).map(|destination| (start, start + end, destination))
+        })
+}
+
+/// Domain suffixes that end a host name far more often than a file name.
+const HOST_SUFFIXES: [&str; 17] = [
+    "com",
+    "net",
+    "org",
+    "io",
+    "co",
+    "dev",
+    "app",
+    "ai",
+    "edu",
+    "gov",
+    "test",
+    "localhost",
+    "internal",
+    "local",
+    "lan",
+    "cloud",
+    "svc",
+];
+
+/// File names that are conventionally written without an extension.
+const EXTENSIONLESS_FILES: [&str; 12] = [
+    "Makefile",
+    "GNUmakefile",
+    "makefile",
+    "Dockerfile",
+    "Containerfile",
+    "Justfile",
+    "justfile",
+    "Rakefile",
+    "Gemfile",
+    "Procfile",
+    "Vagrantfile",
+    "Jenkinsfile",
+];
+
+/// What a bare reference opens: a web address, or a file at a line.
+///
+/// A file position needs a line and a file name that reads as one: an
+/// extension that starts with a letter, a dotfile, or a conventional
+/// extensionless name in a directory, such as `docker/Dockerfile`. So a time
+/// such as `12:30`, `issue:42`, and an image tag such as `bitnami/redis:7`
+/// stay text.
+fn destination(reference: &str) -> Option<Uri> {
+    // A code span holding a command (`cargo test src/a.rs:3`) is not a link.
+    if reference.is_empty() || reference.contains(char::is_whitespace) {
+        return None;
+    }
+    let lower = reference.get(..8).unwrap_or(reference).to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        let url = url::Url::parse(reference).ok()?;
+        return url
+            .host_str()
+            .is_some_and(|host| !host.is_empty())
+            .then(|| Arc::from(reference));
+    }
+    if reference.contains("://") {
+        return None;
+    }
+    let (path, position) = crate::document_link::file_position(reference);
+    position?;
+    // `api.example.com:5432` and `ghcr.io/org/app:2` name a host's port or an
+    // image's tag, not a line of a file.
+    // No host starts with a dot, and dotfiles such as `.env.local` end in one.
+    let first = path.split('/').next().unwrap_or(path);
+    if !first.starts_with('.')
+        && first.rsplit_once('.').is_some_and(|(_, suffix)| {
+            HOST_SUFFIXES.contains(&suffix.to_ascii_lowercase().as_str())
+        })
+    {
+        return None;
+    }
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let file = EXTENSIONLESS_FILES.contains(&name)
+        || name.rsplit_once('.').is_some_and(|(_, extension)| {
+            extension.starts_with(|ch: char| ch.is_ascii_alphabetic())
+        });
+    (file && !path.contains(':')).then(|| Arc::from(reference))
 }
 
 #[cfg(test)]
@@ -1775,6 +2408,83 @@ mod tests {
     }
 
     #[test]
+    fn direct_parser_runs_match_owned_span_linking_and_image_text() {
+        let span = |text: &str, strong, code, link: Option<Uri>| Span::Standard {
+            text: text.into(),
+            strikethrough: false,
+            link,
+            strong,
+            emphasis: false,
+            code,
+        };
+        let cases = [
+            vec![
+                span("ordinary prefix ", false, false, None),
+                span("src/first.rs:12", false, true, None),
+                span(" then https://example.test/λ ", false, false, None),
+                span("src/last.rs:8", false, true, None),
+                span("", true, false, None),
+            ],
+            vec![
+                span("https://exa", false, false, None),
+                span("mple.test/λ", false, false, None),
+            ],
+            vec![
+                span("", false, false, None),
+                span("λ café ", true, false, None),
+                span("src/lib.rs:12", false, true, None),
+                span("", true, false, None),
+            ],
+            vec![
+                span(
+                    "https://example.test",
+                    false,
+                    false,
+                    Some("app://explicit".into()),
+                ),
+                span(" /tmp/λ.rs:8", false, false, None),
+            ],
+        ];
+        for spans in cases {
+            for linkify in [false, true] {
+                let expected = Text::new(if linkify {
+                    linked(spans.clone().into_iter())
+                } else {
+                    spans.clone()
+                });
+                let mut builder = SpanBuffer::default();
+                for Span::Standard {
+                    text,
+                    strikethrough,
+                    link,
+                    strong,
+                    emphasis,
+                    code,
+                } in spans.clone()
+                {
+                    builder.push(
+                        text.into(),
+                        Attributes {
+                            strikethrough,
+                            strong,
+                            emphasis,
+                            code,
+                        },
+                        link,
+                    );
+                }
+                let actual = builder.finish(linkify);
+                assert_eq!(
+                    format!("{:?}", actual.semantic_spans()),
+                    format!("{:?}", expected.semantic_spans())
+                );
+                assert_eq!(actual.plain(), expected.plain());
+                assert!(builder.is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn cold_parsed_graph_and_document_clone_keep_compact_unstyled_text() {
         let source = "paragraph **λ linked [text](https://example.test)**\n\n![alt](image.png \"title\")\n\n".repeat(1024);
         let content = Content::parse(&source);
@@ -1811,18 +2521,137 @@ mod tests {
                 "cold clone has no styled allocation"
             );
         }
-        // Item's largest variant embeds two Text nodes. Bound the cold graph
-        // representation independently of whether a particular theme is used.
+        // Bound the per-node cold storage, including the raw Flow capture,
+        // independently of theme or whether caches were materialized.
         assert!(
-            std::mem::size_of::<Text>() <= 192,
+            std::mem::size_of::<Text>() <= 96,
             "cold Text bytes: {}",
             std::mem::size_of::<Text>()
         );
         assert!(
-            std::mem::size_of::<Item>() <= 448,
+            std::mem::size_of::<Item>() <= 128,
             "cold Item bytes: {}",
             std::mem::size_of::<Item>()
         );
+        assert!(
+            std::mem::size_of::<FlowText>() <= 96,
+            "cold Flow text bytes: {}",
+            std::mem::size_of::<FlowText>()
+        );
+    }
+
+    /// The links a paragraph's text carries, with the text each covers.
+    fn links(content: &Content) -> Vec<(String, String)> {
+        let style = crate::design::markdown_settings(&cosmic::Theme::dark(), 14.0).style;
+        content
+            .items()
+            .iter()
+            .filter_map(|item| match item {
+                Item::Paragraph(text) | Item::Heading(_, text) => Some(text.spans(style)),
+                _ => None,
+            })
+            .flat_map(|spans| {
+                spans
+                    .iter()
+                    .filter_map(|span| {
+                        span.link
+                            .as_ref()
+                            .map(|link| (span.text.to_string(), link.to_string()))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Bare addresses and file positions in prose open like Markdown links,
+    /// and the text a reader selects or copies is unchanged.
+    #[test]
+    fn bare_addresses_and_file_positions_are_links() {
+        let answer = "See (https://example.com/a_(b)), src/main.rs:42:7. Then \
+            docs/guide.md:9, *lib.rs:3*, docker/Dockerfile:4, .env:2, .env.local:3 and <https://kept.example>.";
+        let content = Content::parse(answer);
+        let pairs = |list: &[(&str, &str)]| -> Vec<(String, String)> {
+            list.iter()
+                .map(|(text, link)| (text.to_string(), link.to_string()))
+                .collect()
+        };
+        assert_eq!(
+            links(&content),
+            pairs(&[
+                ("https://example.com/a_(b)", "https://example.com/a_(b)"),
+                ("src/main.rs:42:7", "src/main.rs:42:7"),
+                ("docs/guide.md:9", "docs/guide.md:9"),
+                ("lib.rs:3", "lib.rs:3"),
+                ("docker/Dockerfile:4", "docker/Dockerfile:4"),
+                (".env:2", ".env:2"),
+                (".env.local:3", ".env.local:3"),
+                ("https://kept.example", "https://kept.example"),
+            ])
+        );
+        let Item::Paragraph(text) = &content.items()[0] else {
+            panic!("paragraph")
+        };
+        assert_eq!(
+            text.plain().as_ref(),
+            "See (https://example.com/a_(b)), src/main.rs:42:7. Then docs/guide.md:9, \
+             lib.rs:3, docker/Dockerfile:4, .env:2, .env.local:3 and https://kept.example."
+        );
+        // A code span that is exactly a position opens too, still as code.
+        let content = Content::parse("Open `src/code.rs:22` or `cargo test src/a.rs:3`.");
+        assert_eq!(
+            links(&content),
+            pairs(&[("src/code.rs:22", "src/code.rs:22")])
+        );
+        let Item::Paragraph(text) = &content.items()[0] else {
+            panic!("paragraph")
+        };
+        let style = crate::design::markdown_settings(&cosmic::Theme::dark(), 14.0).style;
+        assert!(
+            text.spans(style)
+                .iter()
+                .any(|span| { span.link.is_some() && span.font == Some(style.inline_code_font) })
+        );
+        // An author's own link, hosts, image tags, and colons that are not
+        // positions stay as written.
+        let content = Content::parse(
+            "[the docs](https://display.example) at 12:30, issue:42, v1.2:3, \
+             ftp://host/x, https:// alone, api.example.com:5432, db.internal:6379, \
+             ghcr.io/org/app:2, docker.io/library/node:20, bitnami/redis:7, \
+             app.localhost:3000, api.example.dev:8443, src/bin:3 and std::fmt.",
+        );
+        assert_eq!(
+            links(&content),
+            pairs(&[("the docs", "https://display.example")])
+        );
+    }
+
+    /// An answer that arrives a few bytes at a time links what the whole
+    /// answer links, including a position whose line arrives last.
+    #[test]
+    fn a_streamed_reference_is_linked_when_it_completes() {
+        let answer = "Open src/lib.rs:12 and see https://example.com/docs now";
+        for cut in [
+            "Open src/lib.rs:".len(),
+            "Open src/lib.rs:1".len(),
+            "Open src/lib.rs:12 and see https".len(),
+            "Open src/lib.rs:12 and see https://example.com/do".len(),
+        ] {
+            let mut streamed = Content::new();
+            for piece in [&answer[..cut], &answer[cut..]] {
+                streamed.push_str(piece);
+            }
+            assert_eq!(
+                links(&streamed),
+                links(&Content::parse(answer)),
+                "cut at {cut}"
+            );
+            assert_eq!(links(&streamed).len(), 2, "cut at {cut}");
+        }
+        let mut streamed = Content::new();
+        for ch in answer.chars() {
+            streamed.push_str(&ch.to_string());
+        }
+        assert_eq!(links(&streamed), links(&Content::parse(answer)));
     }
 
     #[test]
@@ -2019,10 +2848,14 @@ mod tests {
         let mut output = Vec::new();
         for item in items {
             match item {
-                Item::Paragraph(text) | Item::Heading(_, text) | Item::Image { alt: text, .. } => {
+                Item::Paragraph(text) | Item::Heading(_, text) => {
                     for span in text.spans.iter() {
-                        let Span::Standard { text, link, .. } = span;
-                        output.extend(text.chars().map(|ch| (ch, link.clone())));
+                        output.extend(span.text.chars().map(|ch| (ch, span.run.link.clone())));
+                    }
+                }
+                Item::Image { alt: text, .. } => {
+                    for span in text.spans.iter() {
+                        output.extend(span.text.chars().map(|ch| (ch, span.run.link.clone())));
                     }
                 }
                 Item::Quote(items) => output.extend(reference_text(items)),
@@ -2309,3 +3142,9 @@ fn completed_source_discards_parser_scratch_without_discarding_rendered_content(
     assert_eq!(format!("{:?}", content.items()), before);
     assert_eq!(content.images(), &images);
 }
+
+#[cfg(all(test, not(feature = "integrated-browser")))]
+mod heap_cost;
+
+#[cfg(test)]
+mod storage_cost;

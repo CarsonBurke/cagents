@@ -158,6 +158,20 @@ pub fn accent_wash(theme: &Theme) -> Color {
     mix(base(theme), theme.cosmic().accent.base.into(), 0.14)
 }
 
+/// The ground selected text sits on. Text keeps its own color over it, so it
+/// is a tint rather than the accent itself: a link, drawn in the accent,
+/// would otherwise vanish into its own selection.
+pub fn selection_wash(theme: &Theme) -> Color {
+    mix(base(theme), theme.cosmic().accent.base.into(), 0.4)
+}
+
+/// The tray a project's rows share in the navigation rail: one step off the
+/// Primary layer the rail is drawn on, enough to group without boxing.
+pub fn rail_tray(theme: &Theme) -> Color {
+    let primary = theme.cosmic().primary(theme.transparent);
+    mix(primary.base.into(), primary.on.into(), 0.06)
+}
+
 pub fn accent_color(theme: &Theme) -> Color {
     theme.cosmic().accent.base.into()
 }
@@ -187,6 +201,21 @@ pub fn muted_color(theme: &Theme) -> Color {
     color
 }
 
+/// What a person has typed into a field: the surface's full-strength ink, so
+/// their own words never read as secondary to anything around them.
+pub fn field_text_color(theme: &Theme) -> Color {
+    theme.current_container().on.into()
+}
+
+/// A field's placeholder: halfway to the surface, clearly weaker than
+/// [`field_text_color`] so an empty field never looks filled in. A muted
+/// label is too strong for this; beside a field's own text it read as the
+/// stronger of the two.
+pub fn field_placeholder_color(theme: &Theme) -> Color {
+    let container = theme.current_container();
+    mix(container.base.into(), container.on.into(), 0.5)
+}
+
 /// The ink of a control that cannot be used now: mixed toward its surface
 /// rather than faded, so it stays legible yet reads apart from muted labels.
 pub fn disabled_color(theme: &Theme) -> Color {
@@ -213,6 +242,11 @@ pub fn warning_text(theme: &Theme) -> text::Style {
 /// Text that reports an error the reader has to correct.
 pub fn destructive_text(theme: &Theme) -> text::Style {
     ink(destructive_color(theme))
+}
+
+/// Text that reports something finished well, such as passing checks.
+pub fn success_text(theme: &Theme) -> text::Style {
+    ink(success_color(theme))
 }
 
 /// The gutter marker on an added or removed patch line.
@@ -293,6 +327,35 @@ pub fn budget_tone(used: f32) -> fn(&Theme) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A selected link is drawn in the accent over the selection, so the two
+    /// must stay apart in both themes.
+    #[test]
+    fn a_selected_link_stays_legible() {
+        let luminance = |color: Color| {
+            let channel = |c: f32| {
+                if c <= 0.039_28 {
+                    c / 12.92
+                } else {
+                    ((c + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * channel(color.r) + 0.7152 * channel(color.g) + 0.0722 * channel(color.b)
+        };
+        let contrast = |a: Color, b: Color| {
+            let (a, b) = (luminance(a), luminance(b));
+            (a.max(b) + 0.05) / (a.min(b) + 0.05)
+        };
+        // Links keep the 3:1 of large or non-text UI, and body text the 4.5:1
+        // of ordinary text, on the selection.
+        for theme in [Theme::dark(), Theme::light()] {
+            let wash = selection_wash(&theme);
+            let link = contrast(accent_color(&theme), wash);
+            assert!(link >= 3.0, "{link}");
+            let text = contrast(theme.cosmic().on_bg_color().into(), wash);
+            assert!(text >= 4.5, "{text}");
+        }
+    }
 
     #[test]
     fn rules_sit_a_fifth_closer_to_their_surface_and_stay_opaque() {

@@ -15,12 +15,29 @@ use cosmic::iced::{
 use cosmic::{Element, Renderer, Theme, widget};
 use serde::Deserialize;
 
+mod composer_popover;
+pub use composer_popover::composer_popover;
 mod context_menu;
 mod keyed_list;
 mod list_navigation;
 pub use list_navigation::reveal_list_selection;
 
 use crate::design::space;
+
+/// Native menu hints come from the same grammar as shortcut dispatch.
+pub(crate) fn menu_shortcuts<'a, A: Clone + 'a>(
+    bindings: impl IntoIterator<Item = (&'a [String], A)>,
+) -> std::collections::HashMap<widget::menu::KeyBind, A> {
+    bindings
+        .into_iter()
+        .filter_map(|(chords, action)| {
+            chords
+                .iter()
+                .find_map(|chord| crate::workspace_widget::menu_keybind(chord))
+                .map(|key| (key, action))
+        })
+        .collect()
+}
 
 /// How far a tooltip sits from the control it names, and how wide it may
 /// grow before its label wraps.
@@ -54,6 +71,23 @@ pub fn focused_key<'a, Message: 'a>(
     Effect {
         content: content.into(),
         kind: Kind::FocusedKey,
+        tip: None,
+        on_focused_key: Some(Box::new(on_key)),
+    }
+    .into()
+}
+
+/// Answer a key that nothing inside `content` claimed, wherever focus is. An
+/// open context menu claims the Escape that closes it, for example, so only a
+/// second Escape reaches the surface around it. Unlike an application-wide key
+/// subscription, nothing outside `content` can claim the key first.
+pub fn unclaimed_key<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    on_key: impl Fn(&cosmic::iced::keyboard::Event) -> Option<Message> + 'a,
+) -> Element<'a, Message> {
+    Effect {
+        content: content.into(),
+        kind: Kind::UnclaimedKey,
         tip: None,
         on_focused_key: Some(Box::new(on_key)),
     }
@@ -108,6 +142,15 @@ pub fn keyed_list_rows<'a, Message: 'a>(
     rows: Vec<([u8; 32], Element<'a, Message>)>,
 ) -> Element<'a, Message> {
     keyed_list::view(rows)
+}
+
+/// Keyed horizontal controls retain native focus when their order changes.
+pub fn keyed_control_row<'a, Message: 'a>(
+    controls: Vec<([u8; 32], Element<'a, Message>)>,
+    spacing: f32,
+    on_focus: impl Fn(Option<[u8; 32]>) + 'a,
+) -> Element<'a, Message> {
+    keyed_list::horizontal_observed(controls, spacing, Some(Box::new(on_focus)))
 }
 
 /// A filter field at the head of a keyboard list. Down enters its first
@@ -264,9 +307,23 @@ pub fn reserve_tab_history<'a, Message: 'a>(
 /// Soft full-bounds hover feedback, including when a child captures the event.
 /// The native animation clock requests frames only until its target is reached.
 pub fn hover<'a, Message: 'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    hover_with_radius(content, false)
+}
+
+/// Hover feedback matching the theme radius used by sidebar row controls.
+pub fn hover_with_theme_radius<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    hover_with_radius(content, true)
+}
+
+fn hover_with_radius<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    themed_radius: bool,
+) -> Element<'a, Message> {
     Effect {
         content: content.into(),
-        kind: Kind::Hover,
+        kind: Kind::Hover { themed_radius },
         tip: None,
         on_focused_key: None,
     }
@@ -305,7 +362,24 @@ pub fn horizontal_wheel<'a, Message: 'a>(
 ) -> Element<'a, Message> {
     Element::new(WheelInput {
         content: content.into(),
-        pass_to_parent: false,
+        route: WheelRoute::Horizontal,
+    })
+}
+
+/// Treat a vertical mouse wheel as horizontal motion, except over a nested
+/// scrollable that moves vertically, which keeps it.
+///
+/// A row of vertically scrolling lanes inside a horizontal scrollable wants
+/// both: the wheel scrolls the lane under the pointer, and over the headings
+/// and gaps between lanes it moves the row sideways. A lane already at its
+/// end keeps the wheel too, so the row never slides out from under a pointer
+/// that is scrolling a lane; a sideways trackpad swipe still moves the row.
+pub fn horizontal_wheel_around_vertical<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    Element::new(WheelInput {
+        content: content.into(),
+        route: WheelRoute::AroundVertical,
     })
 }
 
@@ -316,7 +390,7 @@ pub fn parent_wheel<'a, Message: 'a>(
 ) -> Element<'a, Message> {
     Element::new(WheelInput {
         content: content.into(),
-        pass_to_parent: true,
+        route: WheelRoute::Parent,
     })
 }
 
@@ -332,16 +406,19 @@ pub fn overflow_fade_x<'a, Message: 'a>(
     })
 }
 
-/// Projects a wheel gesture onto the horizontal axis.
+/// Projects a wheel gesture onto the horizontal axis, taking the axis it
+/// mostly moves along.
 ///
 /// Summing the two components cancels a diagonal trackpad gesture exactly - a
 /// gesture reporting `x = -d, y = +d` sums to zero - and [`WheelInput`]
 /// has already replaced the original event by then, so the motion is discarded
-/// rather than forwarded. A real horizontal delta therefore wins outright, and
-/// only a purely vertical one is remapped.
+/// rather than forwarded. Only one axis is taken, by magnitude rather than by
+/// `x == 0`: a trackpad reports a small nonzero `x` on a two-finger drag that
+/// is plainly vertical, and testing for exact zero would hand the gesture to
+/// that jitter. A tie goes to the horizontal axis.
 fn wheel_as_horizontal(delta: mouse::ScrollDelta) -> Event {
     fn horizontal(x: f32, y: f32) -> f32 {
-        if x == 0.0 { y } else { x }
+        if mostly_vertical(x, y) { y } else { x }
     }
     let x = match delta {
         mouse::ScrollDelta::Lines { x, y } => horizontal(x, y) * 60.0,
@@ -508,8 +585,10 @@ pub fn layer<'a, Message: 'a>(
     })
 }
 
-/// Retain the base tree while a pane-local chooser owns input and accessibility.
-/// A stable second slot prevents opening/closing it from replacing the transcript.
+/// Retain the base tree while a pane-local chooser owns input, accessibility
+/// and drawing. A stable second slot prevents opening/closing it from replacing
+/// the transcript, and nothing of the base, such as a scrollbar beside a
+/// narrower chooser, shows or answers the pointer while it is covered.
 pub fn exclusive_layer<'a, Message: 'a>(
     base: Element<'a, Message>,
     front: Option<Element<'a, Message>>,
@@ -653,6 +732,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Layers<'_, Message> {
                     .rev()
                     .map(|child| child.with_virtual_offset(layout.virtual_offset())),
             )
+            .take(if self.front_exclusive { 1 } else { 2 })
             .map(|((child, tree), layout)| {
                 child
                     .as_widget()
@@ -679,26 +759,28 @@ impl<Message> Widget<Message, Theme, Renderer> for Layers<'_, Message> {
             .map(|child| child.with_virtual_offset(layout.virtual_offset()));
         let base = layouts.next().expect("base layer");
         let front = layouts.next().expect("front layer");
-        let front_active = self.children[1].as_widget().mouse_interaction(
-            &tree.children[1],
-            front,
-            cursor,
-            viewport,
-            renderer,
-        ) != mouse::Interaction::None;
-        self.children[0].as_widget().draw(
-            &tree.children[0],
-            renderer,
-            theme,
-            style,
-            base,
-            if front_active {
-                mouse::Cursor::Unavailable
-            } else {
-                cursor
-            },
-            viewport,
-        );
+        if !self.front_exclusive {
+            let front_active = self.children[1].as_widget().mouse_interaction(
+                &tree.children[1],
+                front,
+                cursor,
+                viewport,
+                renderer,
+            ) != mouse::Interaction::None;
+            self.children[0].as_widget().draw(
+                &tree.children[0],
+                renderer,
+                theme,
+                style,
+                base,
+                if front_active {
+                    mouse::Cursor::Unavailable
+                } else {
+                    cursor
+                },
+                viewport,
+            );
+        }
         let front_viewport = if self.front_exclusive {
             layout.bounds().intersection(viewport).unwrap_or_default()
         } else {
@@ -793,10 +875,164 @@ impl<Message> Widget<Message, Theme, Renderer> for Layers<'_, Message> {
 
 struct WheelInput<'a, Message> {
     content: Element<'a, Message>,
-    pass_to_parent: bool,
+    route: WheelRoute,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WheelRoute {
+    /// Every wheel moves the content sideways.
+    Horizontal,
+    /// A wheel moving mostly vertically stays as it is over a scrollable
+    /// that moves vertically, even one already at its end; any other wheel
+    /// moves the content sideways.
+    AroundVertical,
+    /// The wheel skips the content for the enclosing scrollable.
+    Parent,
+}
+
+/// The wheel gesture in progress, and whether it keeps its vertical motion.
+///
+/// iced's scrollable keeps a gesture on the scrollable it started on until
+/// the pointer moves well after the last wheel, a button changes, or the
+/// wheel rests; ending ours by the same rules keeps the two agreeing. A
+/// gesture that moved the content sideways therefore goes on doing so when
+/// that motion brings a lane under the pointer.
+#[derive(Default)]
+struct WheelGesture {
+    current: Option<(bool, Instant)>,
+    /// Shift asks iced's scrollables for sideways motion, so a wheel with it
+    /// held never keeps its vertical motion.
+    shift: bool,
+}
+
+impl WheelGesture {
+    /// iced's scrollable: a pointer motion this soon after a wheel belongs
+    /// to the gesture.
+    const MOTION_GRACE: Duration = Duration::from_millis(100);
+    /// iced's scrollable: a wheel at rest this long has ended its gesture.
+    const REST: Duration = Duration::from_millis(1500);
+
+    fn observe(&mut self, event: &Event) {
+        let ended = match event {
+            Event::Keyboard(cosmic::iced::keyboard::Event::ModifiersChanged(modifiers)) => {
+                let changed = modifiers.shift() != self.shift;
+                self.shift = modifiers.shift();
+                changed
+            }
+            Event::Mouse(
+                mouse::Event::ButtonPressed(_)
+                | mouse::Event::ButtonReleased(_)
+                | mouse::Event::CursorLeft,
+            ) => true,
+            Event::Mouse(mouse::Event::CursorMoved { .. }) => self
+                .current
+                .is_some_and(|(_, at)| at.elapsed() > Self::MOTION_GRACE),
+            _ => false,
+        };
+        if ended {
+            self.current = None;
+        }
+    }
+
+    /// Whether this wheel keeps its vertical motion: as the gesture decided
+    /// if one is in progress, otherwise as `decide` says. Only the first
+    /// wheel of a gesture pays for deciding.
+    fn keeps_vertical(&mut self, decide: impl FnOnce() -> bool) -> bool {
+        let keep = match self.current {
+            Some((keep, at)) if at.elapsed() <= Self::REST => keep,
+            _ => !self.shift && decide(),
+        };
+        self.current = Some((keep, Instant::now()));
+        keep
+    }
+}
+
+/// Finds whether a scrollable taller than its bounds - one that moves
+/// vertically - lies under a point given in the operated layout's
+/// coordinates.
+///
+/// Only the content of a scrollable under the point is visited, so a
+/// scrollable scrolled out of its parent's sight is never found, and the
+/// search costs about one visit per scrollable on the way to the point
+/// rather than one per widget: on a board, the lanes, not their cards.
+struct VerticalScrollableAt {
+    point: Point,
+    /// Scrolled distance of the content being visited.
+    offset: Vector,
+    /// What the next traversal, a just visited scrollable's content, does.
+    next: Enter,
+    found: bool,
+}
+
+enum Enter {
+    /// Not a scrollable's content: visited as it is.
+    Plain,
+    /// The content of a scrollable under the point, scrolled this far.
+    Scrolled(Vector),
+    /// The content of a scrollable away from the point.
+    Skip,
+}
+
+impl VerticalScrollableAt {
+    fn new(point: Point) -> Self {
+        Self {
+            point,
+            offset: Vector::ZERO,
+            next: Enter::Plain,
+            found: false,
+        }
+    }
+}
+
+impl Operation for VerticalScrollableAt {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+        let outer = self.offset;
+        match std::mem::replace(&mut self.next, Enter::Plain) {
+            _ if self.found => return,
+            Enter::Skip => return,
+            Enter::Scrolled(translation) => self.offset = outer + translation,
+            Enter::Plain => {}
+        }
+        operate(self);
+        self.offset = outer;
+    }
+
+    fn container(&mut self, _id: Option<&Id>, _bounds: Rectangle) {
+        self.next = Enter::Plain;
+    }
+
+    fn scrollable(
+        &mut self,
+        _id: Option<&Id>,
+        bounds: Rectangle,
+        content_bounds: Rectangle,
+        translation: Vector,
+        _state: &mut dyn operation::Scrollable,
+    ) {
+        if self.found {
+            return;
+        }
+        if bounds.contains(self.point + self.offset) {
+            self.found = content_bounds.height > bounds.height;
+            self.next = Enter::Scrolled(translation);
+        } else {
+            self.next = Enter::Skip;
+        }
+    }
+}
+
+/// Whether a wheel moves more vertically than horizontally.
+fn mostly_vertical(x: f32, y: f32) -> bool {
+    y.abs() > x.abs()
 }
 
 impl<Message> Widget<Message, Theme, Renderer> for WheelInput<'_, Message> {
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<WheelGesture>()
+    }
+    fn state(&self) -> tree::State {
+        tree::State::new(WheelGesture::default())
+    }
     fn children(&self) -> Vec<Tree> {
         vec![Tree::new(&self.content)]
     }
@@ -841,19 +1077,39 @@ impl<Message> Widget<Message, Theme, Renderer> for WheelInput<'_, Message> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
-        if self.pass_to_parent && matches!(event, Event::Mouse(mouse::Event::WheelScrolled { .. }))
+        if self.route == WheelRoute::Parent
+            && matches!(event, Event::Mouse(mouse::Event::WheelScrolled { .. }))
         {
             return;
         }
+        let gesture = tree.state.downcast_mut::<WheelGesture>();
+        gesture.observe(event);
         let remapped;
-        let event = match event {
-            Event::Mouse(mouse::Event::WheelScrolled { delta })
-                if cursor.is_over(layout.bounds()) =>
-            {
-                remapped = wheel_as_horizontal(*delta);
-                &remapped
+        let event = match (event, cursor.position_over(layout.bounds())) {
+            (Event::Mouse(mouse::Event::WheelScrolled { delta }), Some(point)) => {
+                let keep = self.route == WheelRoute::AroundVertical
+                    && gesture.keeps_vertical(|| {
+                        let mut under = VerticalScrollableAt::new(point);
+                        let (mouse::ScrollDelta::Lines { x, y }
+                        | mouse::ScrollDelta::Pixels { x, y }) = *delta;
+                        mostly_vertical(x, y) && {
+                            self.content.as_widget_mut().operate(
+                                &mut tree.children[0],
+                                layout.with_virtual_offset(layout.virtual_offset()),
+                                renderer,
+                                &mut under,
+                            );
+                            under.found
+                        }
+                    });
+                if keep {
+                    event
+                } else {
+                    remapped = wheel_as_horizontal(*delta);
+                    &remapped
+                }
             }
-            other => other,
+            (other, _) => other,
         };
         self.content.as_widget_mut().update(
             &mut tree.children[0],
@@ -1244,7 +1500,9 @@ enum Kind {
     ListRow,
     ListEntry,
     TabHistory(bool),
-    Hover,
+    Hover {
+        themed_radius: bool,
+    },
     ContextMenu,
     Fade(f32),
     Tooltip,
@@ -1256,6 +1514,7 @@ enum Kind {
     },
     Opaque,
     KeyboardModal,
+    UnclaimedKey,
 }
 
 struct Effect<'a, Message> {
@@ -1276,18 +1535,74 @@ struct Tip<'a, Message> {
 
 impl<'a, Message: 'a> Tip<'a, Message> {
     fn content(&mut self) -> &mut Element<'a, Message> {
-        self.content.get_or_insert_with(|| {
-            // The shell's type scale owns this size. Tooltip text is the
-            // whole content of its surface rather than secondary metadata
-            // beside something else, so it takes the body role;
-            // `design::caption` also mutes its color, which an overlay with
-            // its own background must not do.
-            cosmic::widget::container(crate::design::body(self.label.clone()))
-                .class(crate::design::transparent())
-                .padding([space::XS, space::S])
-                .max_width(TIP_MAX_WIDTH)
-                .into()
-        })
+        self.content
+            .get_or_insert_with(|| tip_surface(self.label.clone()))
+    }
+}
+
+/// What a tooltip's surface holds: its label, padded and wrapped.
+fn tip_surface<'a, Message: 'a>(label: Cow<'a, str>) -> Element<'a, Message> {
+    // The shell's type scale owns this size. Tooltip text is the whole
+    // content of its surface rather than secondary metadata beside something
+    // else, so it takes the body role; `design::caption` also mutes its
+    // color, which an overlay with its own background must not do.
+    cosmic::widget::container(crate::design::body(label))
+        .class(crate::design::transparent())
+        .padding([space::XS, space::S])
+        .max_width(TIP_MAX_WIDTH)
+        .into()
+}
+
+/// A tooltip for part of a widget rather than a whole control, such as one
+/// link among a paragraph's words, with the surface, delay and fade of
+/// [`tooltip`]. Its owner keeps it while the pointer stays on that part and
+/// drops it when the pointer leaves, and asks for frames until it
+/// [settles](Self::settles_at).
+pub(crate) struct PartTip<Message> {
+    label: Arc<str>,
+    content: Element<'static, Message>,
+    tree: Tree,
+    hovered: Instant,
+}
+
+impl<Message: 'static> PartTip<Message> {
+    pub(crate) fn new(label: Arc<str>, hovered: Instant) -> Self {
+        let content = tip_surface(Cow::Owned(label.to_string()));
+        let tree = Tree::new(&content);
+        Self {
+            label,
+            content,
+            tree,
+            hovered,
+        }
+    }
+    pub(crate) fn label(&self) -> &Arc<str> {
+        &self.label
+    }
+    /// When the tip starts to fade in.
+    pub(crate) fn opens_at(&self) -> Instant {
+        self.hovered + TOOLTIP_DELAY
+    }
+    /// When the tip has finished fading in.
+    pub(crate) fn settles_at(&self) -> Instant {
+        self.hovered + TOOLTIP_DELAY + HOVER_DURATION
+    }
+    /// The tip beside `anchor`, the part's bounds in the overlay's frame,
+    /// once the pointer has rested there long enough.
+    pub(crate) fn overlay(
+        &mut self,
+        anchor: Rectangle,
+        now: Instant,
+    ) -> Option<overlay::Element<'_, Message, Theme, Renderer>> {
+        let shown = now.checked_duration_since(self.hovered + TOOLTIP_DELAY)?;
+        let progress = (shown.as_secs_f32() / HOVER_DURATION.as_secs_f32()).min(1.0);
+        Some(overlay::Element::new(Box::new(TipOverlay {
+            content: &mut self.content,
+            tree: &mut self.tree,
+            anchor,
+            progress,
+            prefer_above: false,
+        })))
     }
 }
 
@@ -1297,6 +1612,7 @@ struct HoverTag;
 struct TabHistoryTag;
 struct KeyboardListTag;
 struct FocusedKeyTag;
+struct UnclaimedKeyTag;
 struct ListRowTag;
 struct FadeTag;
 struct TooltipTag;
@@ -1318,11 +1634,46 @@ fn effect_layout(kind: Kind, layout: Layout<'_>) -> Layout<'_> {
     }
 }
 
+/// Where the pointer last was on a control whose press hid its tooltip, and
+/// whether the pointer has since been
+/// hidden from the control. A menu the press opened, or an ancestor gating
+/// the cursor to its own region, reports no position without saying where
+/// the pointer went; seeing it again anywhere but the press point means it
+/// moved away and came back.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PressSuppression {
+    at: Option<Point>,
+    obscured: bool,
+}
+
+impl PressSuppression {
+    /// Whether this cursor shows the pointer has left the control.
+    fn released_by(&mut self, cursor: mouse::Cursor, bounds: Option<Rectangle>) -> bool {
+        match cursor.position() {
+            None => {
+                self.obscured = true;
+                false
+            }
+            Some(position) if !bounds.is_some_and(|bounds| bounds.contains(position)) => true,
+            Some(position) if self.obscured => self.at != Some(position),
+            // Follow the pointer until it is hidden: a context menu opens on
+            // the release, which may land a pixel away from the press.
+            Some(position) => {
+                self.at = Some(position);
+                false
+            }
+        }
+    }
+}
+
 struct State {
     hover: Animation<bool>,
     tooltip: Animation<bool>,
     entered: Option<Instant>,
     tip_open: bool,
+    /// Set by a press on the control; its tooltip stays hidden until the
+    /// pointer really leaves.
+    tip_suppressed: Option<PressSuppression>,
     inspect_control: bool,
     disabled: bool,
     focused: bool,
@@ -1337,6 +1688,7 @@ impl Default for State {
             tooltip: Animation::new(false).duration(HOVER_DURATION),
             entered: None,
             tip_open: false,
+            tip_suppressed: None,
             inspect_control: true,
             disabled: false,
             focused: true,
@@ -1351,9 +1703,10 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
         match self.kind {
             Kind::KeyboardList(_) => tree::Tag::of::<KeyboardListTag>(),
             Kind::FocusedKey => tree::Tag::of::<FocusedKeyTag>(),
+            Kind::UnclaimedKey => tree::Tag::of::<UnclaimedKeyTag>(),
             Kind::ListRow | Kind::ListEntry => tree::Tag::of::<ListRowTag>(),
             Kind::TabHistory(_) => tree::Tag::of::<TabHistoryTag>(),
-            Kind::Hover => tree::Tag::of::<HoverTag>(),
+            Kind::Hover { .. } => tree::Tag::of::<HoverTag>(),
             Kind::Fade(_) => tree::Tag::of::<FadeTag>(),
             Kind::Tooltip => tree::Tag::of::<TooltipTag>(),
             Kind::DriveAnimation(_) => tree::Tag::of::<AnimationDriverTag>(),
@@ -1461,7 +1814,8 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
-        if let Some(on_key) = &self.on_focused_key
+        if matches!(self.kind, Kind::FocusedKey)
+            && let Some(on_key) = &self.on_focused_key
             && let Event::Keyboard(event) = event
         {
             if shell.is_event_captured() {
@@ -1588,6 +1942,18 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
             shell,
             viewport,
         );
+        if matches!(self.kind, Kind::UnclaimedKey)
+            && !shell.is_event_captured()
+            && let Event::Keyboard(event) = event
+            && let Some(message) = self
+                .on_focused_key
+                .as_ref()
+                .and_then(|on_key| on_key(event))
+        {
+            shell.publish(message);
+            shell.capture_event();
+            return;
+        }
         if matches!(self.kind, Kind::TabHistory(_)) {
             return;
         }
@@ -1639,6 +2005,20 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
         if !inside {
             state.inspect_control = true;
         }
+        // A press keeps the tooltip hidden until the pointer leaves the
+        // control or the window, or the window loses focus. An unavailable
+        // cursor alone is not a leave: a menu the press opened hides the
+        // pointer from this layer without it moving.
+        let window_left = matches!(
+            event,
+            Event::Mouse(mouse::Event::CursorLeft) | Event::Window(window::Event::Unfocused)
+        );
+        let bounds = layout.bounds().intersection(viewport);
+        if let Some(suppression) = &mut state.tip_suppressed
+            && (window_left || suppression.released_by(cursor, bounds))
+        {
+            state.tip_suppressed = None;
+        }
         if matches!(self.kind, Kind::Tooltip) && inside && state.inspect_control {
             // The Widget API has no enabled query. COSMIC buttons expose this
             // through their root a11y node. Inspect on entry/rebuild, not every
@@ -1651,16 +2031,38 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
             state.inspect_control = false;
         }
         inside &= !state.disabled;
+        if matches!(self.kind, Kind::Tooltip)
+            && inside
+            && matches!(
+                event,
+                Event::Mouse(mouse::Event::ButtonPressed(_))
+                    | Event::Touch(cosmic::iced::touch::Event::FingerPressed { .. })
+            )
+        {
+            state.tip_suppressed = Some(PressSuppression {
+                at: cursor.position(),
+                obscured: false,
+            });
+            state.entered = None;
+            state.tip_open = false;
+            state.tooltip = Animation::new(false).duration(HOVER_DURATION);
+            shell.invalidate_layout();
+            shell.request_redraw();
+        }
+
         if state.hover.value() != inside {
             state.hover.go_mut(inside, now);
             state.entered = inside.then_some(now);
             shell.request_redraw();
         }
         match self.kind {
-            Kind::Hover if state.hover.is_animating(now) => shell.request_redraw(),
+            Kind::Hover { .. } if state.hover.is_animating(now) => shell.request_redraw(),
             Kind::Tooltip => {
                 let mut visible = false;
-                if let Some(entered) = state.entered.filter(|_| inside) {
+                if let Some(entered) = state
+                    .entered
+                    .filter(|_| inside && state.tip_suppressed.is_none())
+                {
                     let deadline = entered + TOOLTIP_DELAY;
                     visible = now >= deadline;
                     if !visible {
@@ -1779,7 +2181,7 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
             cursor,
             viewport,
         );
-        if matches!(self.kind, Kind::Hover) {
+        if let Kind::Hover { themed_radius } = self.kind {
             // Keep low-emphasis rows legible against neutral surfaces without
             // turning hover feedback into a selected-state fill.
             let alpha = state.hover.interpolate(0.0, 0.10, state.now);
@@ -1794,7 +2196,11 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
                             renderer::Quad {
                                 bounds: layout.bounds(),
                                 border: cosmic::iced::Border {
-                                    radius: crate::design::RADIUS_S.into(),
+                                    radius: if themed_radius {
+                                        theme.cosmic().corner_radii.radius_s.into()
+                                    } else {
+                                        crate::design::RADIUS_S.into()
+                                    },
                                     ..Default::default()
                                 },
                                 ..Default::default()
@@ -1890,7 +2296,360 @@ impl<'a, Message: 'a> From<Effect<'a, Message>> for Element<'a, Message> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_menu_hints_use_effective_shortcut_configuration() {
+        use cosmic::iced::keyboard::{Key, Modifiers};
+        let chords = vec!["Ctrl+Alt+F5".to_owned(), "Ctrl+N".to_owned()];
+        let bindings = menu_shortcuts([(chords.as_slice(), 7u8)]);
+        assert_eq!(bindings.len(), 1);
+        let (key, action) = bindings.iter().next().unwrap();
+        assert_eq!(*action, 7);
+        assert!(key.matches(
+            Modifiers::CTRL | Modifiers::ALT,
+            &Key::Named(cosmic::iced::keyboard::key::Named::F5),
+            None
+        ));
+        assert!(!key.to_string().is_empty());
+    }
+
+    #[test]
+    fn pressed_tooltip_stays_hidden_until_pointer_leaves() {
+        use cosmic::iced::advanced::{clipboard, renderer::Headless};
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Renderer::new(
+                cosmic::iced::Font::default(),
+                cosmic::iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        let mut element = tooltip(
+            cosmic::widget::button::text("Settings").on_press(1u8),
+            "Open settings",
+        );
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(300.0, 100.0)),
+        );
+        let bounds = Rectangle::with_size(Size::new(300.0, 100.0));
+        let pointer = mouse::Cursor::Available(node.bounds().center());
+        let state = tree.state.downcast_mut::<State>();
+        state.tip_open = true;
+        state.tooltip = Animation::new(true).duration(HOVER_DURATION);
+        state.entered = Some(Instant::now() - TOOLTIP_DELAY);
+        let mut messages = Vec::new();
+        for event in [
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            Event::Window(window::Event::RedrawRequested(
+                Instant::now() + TOOLTIP_DELAY,
+            )),
+        ] {
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                pointer,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &bounds,
+            );
+            assert!(!tree.state.downcast_ref::<State>().tip_open);
+            assert!(tree.state.downcast_ref::<State>().tip_suppressed.is_some());
+        }
+        // A context menu the press opened covers the control: the runtime
+        // hands this layer an unavailable cursor while the pointer stays put.
+        // Closing the menu returns the same position, which is not a re-entry.
+        for (event, cursor) in [
+            (
+                Event::Mouse(mouse::Event::CursorMoved {
+                    position: node.bounds().center(),
+                }),
+                mouse::Cursor::Unavailable,
+            ),
+            (
+                Event::Window(window::Event::RedrawRequested(
+                    Instant::now() + TOOLTIP_DELAY,
+                )),
+                mouse::Cursor::Unavailable,
+            ),
+            (
+                Event::Window(window::Event::RedrawRequested(
+                    Instant::now() + TOOLTIP_DELAY * 2,
+                )),
+                pointer,
+            ),
+        ] {
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                cursor,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &bounds,
+            );
+            assert!(
+                !tree.state.downcast_ref::<State>().tip_open,
+                "a menu over the pressed control must not re-arm its tooltip"
+            );
+            assert!(tree.state.downcast_ref::<State>().tip_suppressed.is_some());
+        }
+        element.as_widget_mut().update(
+            &mut tree,
+            &Event::Mouse(mouse::Event::CursorLeft),
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &bounds,
+        );
+        assert!(tree.state.downcast_ref::<State>().tip_suppressed.is_none());
+        for event in [
+            Event::Mouse(mouse::Event::CursorMoved {
+                position: node.bounds().center(),
+            }),
+            Event::Window(window::Event::RedrawRequested(
+                Instant::now() + TOOLTIP_DELAY + Duration::from_millis(1),
+            )),
+        ] {
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                pointer,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &bounds,
+            );
+        }
+        assert!(
+            tree.state.downcast_ref::<State>().tip_open,
+            "a fresh hover can show the tooltip again"
+        );
+    }
+
+    #[test]
+    fn press_suppression_compares_against_the_last_position_before_it_was_hidden() {
+        let control = Rectangle::new(Point::new(10.0, 10.0), Size::new(100.0, 20.0));
+        let pressed = Point::new(20.0, 20.0);
+        let released = Point::new(21.0, 20.0);
+        let mut suppression = PressSuppression {
+            at: Some(pressed),
+            obscured: false,
+        };
+        // The right button is released a pixel away, then its menu opens.
+        assert!(!suppression.released_by(mouse::Cursor::Available(released), Some(control)));
+        assert!(!suppression.released_by(mouse::Cursor::Unavailable, Some(control)));
+        assert!(
+            !suppression.released_by(mouse::Cursor::Available(released), Some(control)),
+            "a menu closing under the unmoved pointer keeps the tooltip hidden"
+        );
+        assert!(!suppression.released_by(mouse::Cursor::Unavailable, Some(control)));
+        assert!(
+            suppression.released_by(
+                mouse::Cursor::Available(Point::new(90.0, 20.0)),
+                Some(control)
+            ),
+            "returning elsewhere on the control after being hidden is a re-entry"
+        );
+    }
+
+    #[test]
+    fn pressed_tooltip_returns_after_leaving_through_a_cursor_gate() {
+        use cosmic::iced::advanced::clipboard;
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut element = tooltip(
+            cosmic::widget::button::text("Settings").on_press(1u8),
+            "Open settings",
+        );
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(300.0, 100.0)),
+        );
+        let bounds = Rectangle::with_size(Size::new(300.0, 100.0));
+        let control = node.bounds();
+        let pressed = Point::new(control.x + 2.0, control.center_y());
+        let returned = Point::new(control.x + control.width - 2.0, control.center_y());
+        let start = Instant::now();
+        let mut messages = Vec::new();
+        // An ancestor that gates the cursor to its own region (a sidebar row
+        // list, a scrollable) reports no position once the pointer leaves it,
+        // so the control never sees a position outside itself.
+        for (event, cursor) in [
+            (
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                mouse::Cursor::Available(pressed),
+            ),
+            (
+                Event::Mouse(mouse::Event::CursorMoved {
+                    position: Point::new(900.0, 900.0),
+                }),
+                mouse::Cursor::Unavailable,
+            ),
+            (
+                Event::Mouse(mouse::Event::CursorMoved { position: returned }),
+                mouse::Cursor::Available(returned),
+            ),
+            (
+                Event::Window(window::Event::RedrawRequested(start + TOOLTIP_DELAY * 2)),
+                mouse::Cursor::Available(returned),
+            ),
+        ] {
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                cursor,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &bounds,
+            );
+        }
+        let state = tree.state.downcast_ref::<State>();
+        assert!(state.tip_suppressed.is_none());
+        assert!(
+            state.tip_open,
+            "returning to the control after leaving its region shows the tooltip"
+        );
+    }
+
+    /// A Work list row is a `button::custom` holding tooltip-bearing
+    /// controls; the tooltip must open at the control, with the camera
+    /// translation of an enclosing workspace card applied once.
+    #[test]
+    fn tooltips_inside_an_offset_button_anchor_to_their_control() {
+        use cosmic::iced::advanced::clipboard;
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let screen = Size::new(600.0, 400.0);
+        let control = Size::new(24.0, 24.0);
+        let mut element: Element<'_, u8> = widget::container(
+            widget::button::custom(
+                widget::row::with_children(vec![
+                    cosmic::iced::widget::Space::new()
+                        .width(100)
+                        .height(24)
+                        .into(),
+                    tooltip(
+                        cosmic::iced::widget::Space::new()
+                            .width(control.width)
+                            .height(control.height),
+                        "Card actions",
+                    ),
+                ])
+                .spacing(8),
+            )
+            .padding(10)
+            .on_press(1),
+        )
+        .padding(cosmic::iced::Padding {
+            left: 140.0,
+            top: 90.0,
+            ..cosmic::iced::Padding::ZERO
+        })
+        .into();
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, screen),
+        );
+        let anchor = Rectangle::new(Point::new(140.0 + 10.0 + 100.0 + 8.0, 90.0 + 10.0), control);
+        let start = Instant::now();
+        let viewport = Rectangle::with_size(screen);
+        for event in [
+            Event::Mouse(mouse::Event::CursorMoved {
+                position: anchor.center(),
+            }),
+            Event::Window(window::Event::RedrawRequested(start + TOOLTIP_DELAY * 2)),
+        ] {
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Available(anchor.center()),
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut Vec::new()),
+                &viewport,
+            );
+        }
+        for camera in [Vector::ZERO, Vector::new(-60.0, 35.0)] {
+            let mut overlay = element
+                .as_widget_mut()
+                .overlay(&mut tree, Layout::new(&node), &renderer, &viewport, camera)
+                .expect("hovering past the delay opens the tooltip");
+            // An overlay group spans the screen; the surface is its child.
+            let tip = overlay
+                .as_overlay_mut()
+                .layout(&renderer, screen)
+                .children()[0]
+                .bounds();
+            let anchor = anchor + camera;
+            assert!(
+                (tip.center_x() - anchor.center_x()).abs() < 0.5
+                    && (tip.y - (anchor.y + anchor.height + TIP_GAP)).abs() < 0.5,
+                "tooltip {tip:?} is not beneath its control {anchor:?}"
+            );
+        }
+    }
+
     use super::*;
+    #[test]
+    fn an_exclusive_chooser_narrower_than_its_base_hides_the_base_from_the_pointer() {
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let bounds = Rectangle::with_size(Size::new(400.0, 200.0));
+        // Only the gutter beside the narrower chooser lies over the base.
+        let gutter = mouse::Cursor::Available(Point::new(390.0, 100.0));
+        for (front, expected) in [
+            (None, mouse::Interaction::Pointer),
+            (
+                Some(
+                    widget::container(cosmic::iced::widget::Space::new())
+                        .width(300)
+                        .height(Length::Fill)
+                        .into(),
+                ),
+                mouse::Interaction::None,
+            ),
+        ] {
+            let mut element: Element<'_, u8> = exclusive_layer(
+                widget::button::custom(cosmic::iced::widget::Space::new())
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .on_press(1)
+                    .into(),
+                front,
+            );
+            let mut tree = Tree::new(&element);
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, bounds.size()),
+            );
+            assert_eq!(
+                element.as_widget().mouse_interaction(
+                    &tree,
+                    Layout::new(&node),
+                    gutter,
+                    &bounds,
+                    &renderer,
+                ),
+                expected
+            );
+        }
+    }
+
     #[test]
     fn font_zoom_accepts_layout_variants_without_claiming_typing() {
         use cosmic::iced::keyboard::{
@@ -2186,6 +2945,174 @@ mod tests {
             panic!("expected a wheel event");
         };
         assert_eq!(delta, mouse::ScrollDelta::Pixels { x: 60.0, y: 0.0 });
+    }
+
+    #[test]
+    fn a_wheel_scrolls_the_lane_under_the_pointer_and_moves_the_row_between_lanes() {
+        use cosmic::iced::advanced::clipboard;
+        use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+
+        /// Two 200-wide lanes, each a 40-high heading over a scrollable of
+        /// 2000, in a 300-wide row that scrolls sideways by up to 120.
+        fn view() -> Element<'static, ()> {
+            let lane = || -> Element<'static, ()> {
+                widget::column::with_children(vec![
+                    widget::Space::new().width(Length::Fill).height(40).into(),
+                    widget::scrollable(widget::Space::new().width(Length::Fill).height(2000))
+                        .height(Length::Fill)
+                        .into(),
+                ])
+                .width(200)
+                .into()
+            };
+            horizontal_wheel_around_vertical(
+                widget::scrollable::horizontal(
+                    widget::row::with_children(vec![lane(), lane()])
+                        .spacing(20)
+                        .height(Length::Fill),
+                )
+                .width(Length::Fill)
+                .height(Length::Fill),
+            )
+        }
+        /// The row's sideways offset and each lane's offset.
+        struct Offsets(Vec<Vector>);
+        impl Operation for Offsets {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+            fn scrollable(
+                &mut self,
+                _id: Option<&Id>,
+                _bounds: Rectangle,
+                _content_bounds: Rectangle,
+                translation: Vector,
+                _state: &mut dyn operation::Scrollable,
+            ) {
+                self.0.push(translation);
+            }
+        }
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        // Built and drawn once, as the runtime does before any input arrives:
+        // a scrollable's first redraw records its viewport, and until then
+        // iced takes the first wheel it sees as news and keeps it.
+        let mut ui = || {
+            let mut ui =
+                UserInterface::build(view(), Size::new(300.0, 400.0), Cache::new(), &mut renderer);
+            let _ = ui.update(
+                &[Event::Window(
+                    window::Event::RedrawRequested(Instant::now()),
+                )],
+                mouse::Cursor::Unavailable,
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut Vec::new(),
+            );
+            ui
+        };
+        let wheel = |ui: &mut UserInterface<'_, (), Theme, Renderer>,
+                     x: f32,
+                     y: f32,
+                     delta: mouse::ScrollDelta| {
+            let position = Point::new(x, y);
+            let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+            let _ = ui.update(
+                &[
+                    Event::Mouse(mouse::Event::CursorMoved { position }),
+                    Event::Mouse(mouse::Event::WheelScrolled { delta }),
+                ],
+                mouse::Cursor::Available(position),
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut Vec::new(),
+            );
+            let mut offsets = Offsets(Vec::new());
+            ui.operate(&renderer, &mut offsets);
+            let [row, first, second] = offsets.0[..] else {
+                panic!("expected a row and two lanes: {:?}", offsets.0);
+            };
+            (row.x, first.y, second.y)
+        };
+        let notch = mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 };
+        let pixels = |x, y| mouse::ScrollDelta::Pixels { x, y };
+
+        // Over a lane the wheel scrolls that lane, and the row stays put.
+        let mut over_lane = ui();
+        assert_eq!(wheel(&mut over_lane, 100.0, 200.0, notch), (0.0, 60.0, 0.0));
+        assert_eq!(
+            wheel(&mut over_lane, 100.0, 200.0, notch),
+            (0.0, 120.0, 0.0)
+        );
+        // So does a trackpad's vertical drag, whose small sideways jitter
+        // must not hand the gesture to the row.
+        assert_eq!(
+            wheel(&mut over_lane, 100.0, 200.0, pixels(-1.5, -30.0)),
+            (0.0, 150.0, 0.0)
+        );
+        // At the lane's end the wheel stays with the lane: the row does not
+        // slide out from under the pointer. The lane scrolls 1640 at most.
+        assert_eq!(
+            wheel(&mut over_lane, 100.0, 200.0, pixels(0.0, -5000.0)),
+            (0.0, 1640.0, 0.0)
+        );
+        assert_eq!(
+            wheel(&mut over_lane, 100.0, 200.0, notch),
+            (0.0, 1640.0, 0.0)
+        );
+
+        // A trackpad swipe that is mostly sideways moves the row, even over a
+        // lane, and that lane keeps its place.
+        let mut swiped = ui();
+        assert_eq!(
+            wheel(&mut swiped, 100.0, 200.0, pixels(-40.0, -10.0)),
+            (40.0, 0.0, 0.0)
+        );
+
+        // Shift asks for sideways motion, as it does of iced's scrollables,
+        // even over a lane.
+        let mut shifted = ui();
+        let shift = |ui: &mut UserInterface<'_, (), Theme, Renderer>, held: bool| {
+            let modifiers = if held {
+                cosmic::iced::keyboard::Modifiers::SHIFT
+            } else {
+                cosmic::iced::keyboard::Modifiers::empty()
+            };
+            let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+            let _ = ui.update(
+                &[Event::Keyboard(
+                    cosmic::iced::keyboard::Event::ModifiersChanged(modifiers),
+                )],
+                mouse::Cursor::Available(Point::new(100.0, 200.0)),
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut Vec::new(),
+            );
+        };
+        shift(&mut shifted, true);
+        assert_eq!(wheel(&mut shifted, 100.0, 200.0, notch), (60.0, 0.0, 0.0));
+        assert_eq!(wheel(&mut shifted, 100.0, 200.0, notch), (120.0, 0.0, 0.0));
+
+        // Over a heading the wheel moves the row sideways, and goes on doing
+        // so when that brings a lane under the pointer mid-gesture.
+        let mut over_heading = ui();
+        assert_eq!(
+            wheel(&mut over_heading, 100.0, 20.0, notch),
+            (60.0, 0.0, 0.0)
+        );
+        assert_eq!(
+            wheel(&mut over_heading, 100.0, 200.0, notch),
+            (120.0, 0.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn a_trackpad_drag_goes_sideways_along_the_axis_it_mostly_moves() {
+        let Event::Mouse(mouse::Event::WheelScrolled { delta }) =
+            wheel_as_horizontal(mouse::ScrollDelta::Pixels { x: 0.5, y: 12.0 })
+        else {
+            panic!("expected a wheel event");
+        };
+        assert_eq!(delta, mouse::ScrollDelta::Pixels { x: 12.0, y: 0.0 });
     }
 
     #[test]

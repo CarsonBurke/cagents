@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Bounded AT-SPI smoke for one explicitly owned application process.
 
 This never sends keyboard input. Optional actions address only the terminal's

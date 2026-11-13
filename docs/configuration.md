@@ -67,7 +67,7 @@ list applies (see [Language servers](#language-servers)).
 schema_version = 3
 max_hot_cards = 6
 hibernation_delay_ms = 30000
-focus_follows_mouse = false
+focus_follows_mouse = true
 app_theme = "system"
 ui_scale = 1.0
 terminal_line_height = 1.286
@@ -96,7 +96,8 @@ show_status_bar = true
 relaunch_agents_on_upgrade = true
 check_for_updates = true
 work_stale_after_days = 7
-shortcut_defaults_revision = 4
+shortcut_defaults_revision = 5
+preference_defaults_revision = 2
 
 [keyboard_shortcuts]
 new_terminal = ["Ctrl+Shift+T"]
@@ -142,7 +143,7 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `schema_version` | integer | `3` | Exactly `3`. Required |
 | `max_hot_cards` | integer | `6` | `1` through `9223372036854775807`. The number of panes kept live; extra background panes can hibernate |
 | `hibernation_delay_ms` | integer | `30000` | `0` through `9223372036854775807` milliseconds before a background pane hibernates |
-| `focus_follows_mouse` | boolean | `false` | Activates a pane after the pointer crosses into it and stays for 300 ms. Typing cancels the pending activation |
+| `focus_follows_mouse` | boolean | `true` | Activates a pane, and puts the keyboard in its message input, terminal or editor, after the pointer crosses into it and stays for 300 ms. Typing, clicking or dragging cancels the pending activation, and an open chat menu or picker, dialog or palette suppresses it. `false` activates panes only on click or keyboard navigation |
 | `app_theme` | string | `"system"` | `"system"`, `"dark"`, `"light"`, `"catppuccin_mocha"`, `"catppuccin_latte"`, `"dracula"`, `"nord"`, `"tokyo_night"`, `"gruvbox_dark"`, or `"solarized_light"`. Colors the application; terminal and syntax colors are set separately |
 | `ui_scale` | float | `1.0` | `0.8` through `1.5`. Multiplies display scaling |
 | `terminal_line_height` | float | `1.286` | `1.0` through `2.0`, relative to the font size |
@@ -183,7 +184,8 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `lsp_idle_timeout_seconds` | integer | `600` | Idle language-server lifetime after its final document closes (1 second to 7 days) |
 | `lsp_max_sessions` | integer | `8` | Global language-server limit (1–64); idle servers are evicted in least recently used order, active documents are preserved |
 | `language_servers` | array of tables | built-in list | See [Language servers](#language-servers). An empty list turns off language servers |
-| `shortcut_defaults_revision` | integer | `4` | The revision of the built-in shortcut defaults the file's `[keyboard_shortcuts]` has been upgraded to. Written by cagents; a file without it is treated as revision `1`. See [Upgrading older settings files](#upgrading-older-settings-files) |
+| `shortcut_defaults_revision` | integer | `5` | The revision of the built-in shortcut defaults the file's `[keyboard_shortcuts]` has been upgraded to. Written by cagents; a file without it is treated as revision `1`. See [Upgrading older settings files](#upgrading-older-settings-files) |
+| `preference_defaults_revision` | integer | `2` | The revision of the built-in preference defaults the file has been upgraded to. Written by cagents; a file without it is treated as revision `1`. See [Upgrading older settings files](#upgrading-older-settings-files) |
 | `keyboard_shortcuts.*` | array of strings | shown above | See [Keyboard shortcuts](#keyboard-shortcuts) |
 | `notifications.enabled` | boolean | `true` | Enables desktop agent alerts |
 | `notifications.success` | boolean | `true` | Alerts for explicit successful turn completion |
@@ -376,8 +378,13 @@ them back as version 3 the next time it saves.
   changed, extended, or emptied keeps your chords. A new chord
   another action already uses is not taken from it; if that leaves an action
   with no new chord, it keeps its old default. The next save records
-  `shortcut_defaults_revision = 4`, after which an old default you choose
+  `shortcut_defaults_revision = 5`, after which an old default you choose
   again is kept.
+- **New preference defaults:** a file without `preference_defaults_revision`
+  wrote every preference out, so a value matching an old default does not say
+  whether you chose it. `focus_follows_mouse = false`, the default before
+  revision 2, becomes `true`. The next save records
+  `preference_defaults_revision = 2`, after which `false` chosen again is kept.
 - **Newer shortcuts:** a `[keyboard_shortcuts]` table that lacks a newer action
   gets its default chord. These actions are `new_channel` (Ctrl+Shift+G),
   `clone_pane` (Ctrl+Shift+D), `cycle_pane_width` (Alt+R),
@@ -429,3 +436,38 @@ that is an absolute path to an executable file:
 This lookup applies only when cagents creates a new default terminal.
 Explicit CLI commands and launch recipes restored from saved sessions run
 unchanged.
+
+## Merged worktree notices and ignored files
+
+Settings → General → **Merged worktrees** shows a notice when a GitHub
+worktree's exact current commit is merged, including while chats, terminals or
+editors are open in it. The notice names what deleting the worktree would
+discard: uncommitted changes and ignored user files such as `.env`. When the
+ignored-file check cannot finish, the notice says so instead of reporting
+nothing. Each merged worktree is noticed once per app launch.
+
+Merged worktrees are never deleted automatically, including when they contain
+only build files: another program could write new user data after any
+inventory. To remove one, choose **Delete worktree** from its menu in Projects
+and confirm; the branch is retained. The saved option keeps its existing
+`auto_delete_merged_worktrees` key for compatibility.
+
+The notice's ignored-file inventory skips the default disposable-directory names
+`node_modules`, `target`, `dist`, `build`, `.venv`, `__pycache__`,
+`.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `.tox`, `.gradle`, `.next`,
+`.nuxt`, `.svelte-kit`, `.turbo`, `.parcel-cache` and `coverage`. A directory
+name matches at any depth, including its nested contents; a regular file with
+the same name is still reported. Other ignored content, including `.env`, is
+reported as user data. This list only shapes the notice; it never authorizes
+deletion.
+
+There is no settings control for this list. To change it for one clone, set its
+clone-local Git configuration, which its linked worktrees share:
+
+```sh
+git config --local cagents.cleanupDisposableDirectories '["node_modules","target"]'
+```
+
+An empty array treats every ignored directory as user data. Values must be
+simple directory names, with no slashes, traversal components or control
+characters.

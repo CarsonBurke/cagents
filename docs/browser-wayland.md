@@ -13,7 +13,7 @@ Parent teardown joins all browser workers and reapers, retires the probe generat
 Run the isolated CLI, host, browserless UI, and integrated UI checks sequentially. The optional `browser-protocol-fixture` feature enables a real owned socket/registry test server; it is not a general development dependency and must not enter CLI/host dependency graphs:
 
 ```sh
-cargo test --locked --no-default-features --lib capability::wayland_requirement_tests
+cargo test --locked --no-default-features --features ui --lib capability::wayland_requirement_tests
 cargo test --locked --no-default-features --features browser-protocol-fixture --lib browser::fallback::protocol_fixture
 cargo test --locked --features integrated-browser --lib app::browser_backend
 ```

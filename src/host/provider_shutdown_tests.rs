@@ -70,6 +70,7 @@ fn private_runtime(test: &str, retained_actor: bool) -> Option<PathBuf> {
     for (name, _) in std::env::vars_os() {
         if name != std::ffi::OsStr::new(crate::agent_execution::AUTHORITY_ENV)
             && name != std::ffi::OsStr::new(RETAINED_HELPER)
+            && name != std::ffi::OsStr::new(crate::retained_fixture::OWNER_ENV)
         {
             command = command.env_remove(name);
         }
@@ -210,6 +211,7 @@ fn quiet_chat(root: &Path) -> Handle {
         }
     }
     let spec = ProcessSpec {
+        stdout_noise: None,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -504,6 +506,7 @@ fn cleanup_refusal_is_reported_and_healthy_owners_still_stop() {
     // Genuine execed helper and owned root; this is not a Codex conversation fixture.
     let holder = chat::native_holder::spawn(
         ProcessSpec {
+            stdout_noise: None,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -616,21 +619,52 @@ fn cleanup_refusal_is_reported_and_healthy_owners_still_stop() {
 
 #[test]
 fn ordinary_shutdown_commits_final_outcomes_and_retires_completed_retained_actor() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     ordinary_retained_shutdown(
         "host::provider_shutdown_tests::ordinary_shutdown_commits_final_outcomes_and_retires_completed_retained_actor",
-        false,
+        FinalCommit::Healthy,
     );
 }
 
 #[test]
 fn ordinary_shutdown_retains_uncommitted_actor_and_still_closes_healthy_owners() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     ordinary_retained_shutdown(
         "host::provider_shutdown_tests::ordinary_shutdown_retains_uncommitted_actor_and_still_closes_healthy_owners",
-        true,
+        FinalCommit::RetriedInPlace,
     );
 }
 
-fn ordinary_retained_shutdown(test: &str, fail_commit: bool) {
+/// The daemon exits between closing the provider and retiring its helper, as
+/// when a final commit or attention wait outlasts it. The next daemon must
+/// finish that exit before any client connects, not adopt the closed helper
+/// as a live conversation that blocks its own resume.
+#[test]
+fn next_daemon_finishes_an_exit_interrupted_between_close_and_retirement() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
+    ordinary_retained_shutdown(
+        "host::provider_shutdown_tests::next_daemon_finishes_an_exit_interrupted_between_close_and_retirement",
+        FinalCommit::LeftToNextDaemon,
+    );
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FinalCommit {
+    Healthy,
+    /// The final Store commit fails once; the same daemon retries it.
+    RetriedInPlace,
+    /// The final Store commit fails and that daemon exits with it unfinished.
+    LeftToNextDaemon,
+}
+
+fn ordinary_retained_shutdown(test: &str, final_commit: FinalCommit) {
+    let fail_commit = final_commit != FinalCommit::Healthy;
     use crate::{agent::Provider, model::ProjectKind, workspace_model::ModelEdit};
 
     let Some(root) = private_runtime(test, true) else {
@@ -679,7 +713,7 @@ for line in sys.stdin:
         host_incarnation: HostIncarnation::new("ordinary-retained-shutdown"),
     };
     let paths = daemon::RuntimePaths::discover().unwrap();
-    let _lease = daemon::HostLease::acquire(&paths, &proof).unwrap();
+    let lease = daemon::HostLease::acquire(&paths, &proof).unwrap();
     let registry_path = root.join("registry.sqlite3");
     let mut registry = model::Registry::at(&registry_path).unwrap();
     registry
@@ -714,7 +748,7 @@ for line in sys.stdin:
     // private Store fault. The external guardian still owns failure-family
     // settlement; this never treats a pidfd kill as a successful retirement.
     struct Cleanup {
-        host: SharedHost,
+        host: Option<SharedHost>,
         root: PathBuf,
     }
     impl Drop for Cleanup {
@@ -723,15 +757,17 @@ for line in sys.stdin:
             if let Ok(db) = rusqlite::Connection::open(self.root.join("registry.sqlite3")) {
                 let _ = db.execute_batch("DROP TRIGGER IF EXISTS fail_shutdown_commit;");
             }
-            let _ = finish_chat_shutdown(&self.host);
+            if let Some(host) = &self.host {
+                let _ = finish_chat_shutdown(host);
+            }
         }
     }
     let handle = host.lock().unwrap().chats[&id].handle.clone();
     let identity = handle.actor_identity().expect("real retained actor");
     let helper_pin = ProcessPin::capture(identity.record.holder.clone());
     let provider_pin = ProcessPin::capture(identity.record.root.clone());
-    let cleanup = Cleanup {
-        host: host.clone(),
+    let mut cleanup = Cleanup {
+        host: Some(host.clone()),
         root: root.clone(),
     };
     assert!(helper_pin.live() && provider_pin.live());
@@ -838,6 +874,94 @@ for line in sys.stdin:
             .execute_batch("DROP TRIGGER fail_shutdown_commit;")
             .unwrap();
     }
+    if final_commit == FinalCommit::LeftToNextDaemon {
+        // The pane keeps the descriptor it last saw.
+        let saved = host.lock().unwrap().chats[&id].session.clone();
+        // That daemon exits now, with its provider closed and helper unretired.
+        let old_host = Arc::downgrade(&host);
+        let old_proxy_alive = handle.resource_lifetime();
+        cleanup.host = None;
+        drop((handle, healthy, notifications, registry, host, lease));
+        wait(
+            &mut || old_host.strong_count() == 0 && !old_proxy_alive(),
+            "the exiting daemon did not detach from its helper",
+        );
+        assert!(
+            helper_pin.live(),
+            "an unfinished exit must retain the helper"
+        );
+        let next = HostSessionProof {
+            host_session_id: HostSessionId::new("next-daemon"),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: HostIncarnation::new("next-daemon"),
+        };
+        let _next_lease = daemon::HostLease::acquire(&paths, &next).unwrap();
+        let mut state = HostState::new(next);
+        state.enable_holder_recovery();
+        state.install_model(model::Registry::at(&registry_path).unwrap());
+        let successor = Arc::new(state::HostLock::new(state));
+        let notifications =
+            notifications::Broker::start(&successor, crate::notifications::Application::Cagents)
+                .unwrap();
+        successor.lock().unwrap().notifications = Some(notifications.handle());
+        cleanup.host = Some(successor.clone());
+        // The reconciliation a daemon runs before its listener admits a client.
+        super::chat::retained_actor::reconcile_previous_boot_history(&successor).unwrap();
+        super::chat::restore_orphaned_native(&successor, &[]).unwrap();
+        super::chat::retained_actor::reconcile_retired_actors(&successor).unwrap();
+        assert!(
+            successor.lock().unwrap().chats.is_empty(),
+            "a closed helper must not be adopted as a live conversation"
+        );
+        let registry = agent_execution::registry(&successor).unwrap();
+        assert!(
+            registry
+                .lock()
+                .unwrap()
+                .native_actor_committed_through(identity.instance, &identity.record)
+                .unwrap()
+                >= final_sequence,
+            "the next daemon must commit the final outcomes the exit left"
+        );
+        let retired = registry
+            .lock()
+            .unwrap()
+            .native_actor_retirement(identity.instance)
+            .unwrap()
+            .expect("the next daemon must durably retire the exact actor");
+        assert_eq!(retired.owner(), &identity.record);
+        let confirmed = retired
+            .confirmed_session()
+            .expect("retirement names the conversation")
+            .to_owned();
+        wait(
+            &mut || !helper_pin.live() && !identity.record.holder.is_current(),
+            "the finished helper did not exit",
+        );
+        helper_pin.assert_reaped();
+        // The pane reopens its saved conversation instead of waiting on an
+        // owner that will never answer.
+        let crate::terminal_ipc::ServerResponse::ChatResumePrepared { session } =
+            super::chat::process(
+                &successor,
+                0,
+                crate::terminal_ipc::ClientRequest::ChatPrepareResume {
+                    source: saved.clone(),
+                },
+            )
+            .unwrap()
+        else {
+            panic!("expected a prepared resume");
+        };
+        assert_ne!(session.id, saved.id, "a resume starts a successor");
+        assert_eq!(
+            session.launch.session_id.as_deref(),
+            Some(confirmed.as_str())
+        );
+        assert!(session.proof.is_none());
+        drop(cleanup);
+        return;
+    }
     finish_chat_shutdown(&host).unwrap();
     assert!(healthy.is_completed());
     let registry = registry.lock().unwrap();
@@ -868,4 +992,207 @@ for line in sys.stdin:
             .is_empty()
     );
     drop(cleanup);
+}
+
+/// An ordinary daemon stop ends a managed agent's provider and its turn but
+/// keeps the agent, its pane and its channel, so the next daemon reopens the
+/// card in place instead of tombstoning it. Uses a ReconnectOnly provider (the
+/// Codex-style card that a stop used to close); no private runtime is needed.
+#[test]
+fn ordinary_shutdown_keeps_managed_agents_with_their_panes_and_channels() {
+    use crate::{
+        agent_execution::{
+            Destination, HostedSession, Origin, Spec, State, Submit, Surface, Target, Update,
+        },
+        model::{CardId, CardKind, ProjectKind},
+        workspace_model::{ModelEdit, views::Scope},
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let repository = directory.path().canonicalize().unwrap();
+    let mut registry = model::Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+    registry
+        .apply(&ModelEdit::OpenProject {
+            repository: repository.clone(),
+            name: "Stop fixture".into(),
+            kind: ProjectKind::Folder,
+        })
+        .unwrap();
+    let accepted = registry
+        .submit_agent(
+            &Origin::User,
+            &Submit {
+                name: None,
+                destination: Destination::New(Spec {
+                    provider: crate::agent::Provider::Codex,
+                    account: None,
+                    target: Target {
+                        repository: repository.clone(),
+                        directory: repository.clone(),
+                        placement: None,
+                    },
+                    surface: Surface::Chat,
+                    model: None,
+                    permission_mode: None,
+                    reasoning_effort: None,
+                }),
+                prompt: "Mid-turn when the daemon stops".into(),
+                idempotency_key: "ordinary-stop".into(),
+            },
+            1,
+        )
+        .unwrap();
+    let proof = HostSessionProof {
+        host_session_id: HostSessionId::new("ordinary-stop"),
+        boot_id: crate::model::BootId::new("boot"),
+        host_incarnation: HostIncarnation::new("ordinary-stop"),
+    };
+    let session = chat::Session {
+        id: TerminalId::new(),
+        launch: chat::Launch {
+            provider: crate::agent::Provider::Codex,
+            recipe: LaunchRecipe {
+                program: "/bin/cat".into(),
+                arguments: Vec::new(),
+                working_directory: repository.clone(),
+                environment: Default::default(),
+                unset_environment: Default::default(),
+            },
+            session_id: Some(Uuid::new_v4().to_string()),
+        },
+        native_continuity: Default::default(),
+        owned_codex_listener: None,
+        proof: Some(proof.clone()),
+        terminal: None,
+    };
+    let source = HostedSession::Chat(session.clone());
+    registry
+        .bind_agent(accepted.agent.id, None, source.clone())
+        .unwrap();
+    registry.register_agent_authority(&source).unwrap();
+    registry
+        .update_agent_run(
+            accepted.run.id,
+            accepted.run.revision,
+            Update::Started {
+                provider_key: "turn".into(),
+            },
+            2,
+        )
+        .unwrap();
+    let channel = accepted.agent.channel().unwrap();
+    let scope = Scope::Channel(channel);
+    let pane = crate::workspace_model::views::Pane {
+        id: CardId::from_uuid(accepted.agent.id.as_uuid()),
+        title: "Codex".into(),
+        user_title: None,
+        pending_terminal_start: false,
+        width_fraction: 1.0,
+        kind: CardKind::Chat(session.clone()),
+        scope: None,
+    };
+    registry
+        .apply(&ModelEdit::SeedView {
+            scope: scope.clone(),
+            panes: vec![pane.clone()],
+            closed: vec![],
+        })
+        .unwrap();
+    let mut state = HostState::new(proof);
+    state.install_model(registry);
+    let handle = quiet_chat(&repository);
+    state
+        .chats
+        .insert(session.id, record(session.clone(), handle.clone()));
+    let host = Arc::new(state::HostLock::new(state));
+
+    finish_chat_shutdown(&host).unwrap();
+
+    assert!(handle.is_completed(), "the provider itself still stops");
+    let registry = agent_execution::registry(&host).unwrap();
+    let registry = registry.lock().unwrap();
+    let agent = registry.agent(accepted.agent.id).unwrap();
+    assert!(!agent.closed, "a daemon stop must not close the agent");
+    assert_eq!(agent.session, Some(source));
+    assert!(registry.retained_agent_authority(session.id).is_err());
+    assert_eq!(
+        registry.agent_run(accepted.run.id).unwrap().state,
+        State::Cancelled
+    );
+    let model = registry.model().unwrap();
+    assert!(model.channel(channel).is_some(), "the channel stays");
+    let view = model.views.iter().find(|view| view.scope == scope).unwrap();
+    assert_eq!(view.panes, vec![pane.clone()], "the pane stays in place");
+    assert!(view.retired.is_empty());
+    drop(registry);
+
+    // Resuming the conversation records its successor in the stopped
+    // session's lineage; once that successor runs, it takes the agent over.
+    let proof = host.lock().unwrap().proof().clone();
+    let successor = chat::Session {
+        id: TerminalId::new(),
+        proof: Some(proof),
+        ..session.clone()
+    };
+    let unrelated = chat::Session {
+        id: TerminalId::new(),
+        ..successor.clone()
+    };
+    let registry = agent_execution::registry(&host).unwrap();
+    registry
+        .lock()
+        .unwrap()
+        .succeed(successor.id, session.id, None, |_| false)
+        .unwrap();
+    assert!(
+        !agent_execution::adopt_resumed(&host, &unrelated).unwrap(),
+        "a session outside the lineage adopts nothing"
+    );
+    assert!(agent_execution::adopt_resumed(&host, &successor).unwrap());
+    let registry = registry.lock().unwrap();
+    let agent = registry.agent(accepted.agent.id).unwrap();
+    assert!(!agent.closed);
+    assert_eq!(agent.session, Some(HostedSession::Chat(successor.clone())));
+    assert!(registry.agent_for_session(session.id).unwrap().is_none());
+    let model = registry.model().unwrap();
+    let view = model.views.iter().find(|view| view.scope == scope).unwrap();
+    assert_eq!(
+        view.panes,
+        vec![crate::workspace_model::views::Pane {
+            kind: CardKind::Chat(successor.clone()),
+            ..pane
+        }],
+        "the pane follows the agent to its successor"
+    );
+    drop(registry);
+    let registry = agent_execution::registry(&host).unwrap();
+
+    // A successor given no work is only a reopening its card may give up:
+    // ending it leaves the agent stopped, for the next resume to take over.
+    host.lock().unwrap().idle_adoptions.insert(successor.id);
+    agent_execution::retired(&host, &successor).unwrap();
+    let agent = registry.lock().unwrap().agent(accepted.agent.id).unwrap();
+    assert!(!agent.closed, "giving up a reopening keeps the agent");
+    let again = chat::Session {
+        id: TerminalId::new(),
+        ..successor.clone()
+    };
+    registry
+        .lock()
+        .unwrap()
+        .succeed(again.id, successor.id, None, |_| false)
+        .unwrap();
+    assert!(agent_execution::adopt_resumed(&host, &again).unwrap());
+
+    // Once given work, ending it ends the agent's process and the agent.
+    host.lock().unwrap().idle_adoptions.insert(again.id);
+    agent_execution::given_work(&host, again.id);
+    agent_execution::retired(&host, &again).unwrap();
+    assert!(
+        registry
+            .lock()
+            .unwrap()
+            .agent(accepted.agent.id)
+            .unwrap()
+            .closed
+    );
 }
