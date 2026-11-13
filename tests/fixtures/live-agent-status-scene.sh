@@ -169,3 +169,15 @@ composer=$(locate 'Message')
 "$ne" drive wait 'long recovery audit still needs attention' --timeout 45
 sleep 3
 shot agent-long-failure
+
+# End only the current workers. Earlier failures remain historical reports;
+# this new accepted prompt must not imply that their checks were repaired.
+"$ne" env /bin/cp "$here/live-agent-status-settled.jsonl" "$fixture/home/.claude/fixture-frames.jsonl"
+composer=$(locate 'Message')
+[ -n "$composer" ] || { printf '%s\n' 'Could not find the native chat composer' >&2; exit 1; }
+"$ne" drive click "$composer"
+"$ne" drive type 'Finish the current worker checks'
+"$ne" drive key Return
+"$ne" drive wait 'no current workers remain' --timeout 45
+sleep 3
+shot agent-settled

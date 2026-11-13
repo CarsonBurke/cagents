@@ -28,6 +28,13 @@ a new tool call, and reports a fresh failure in this turn. Only that long
 recovery task is currently failed, so the status row itself must fade its full
 single-failure description within one line.
 
+`live-agent-status-settled.jsonl` sends final successful notifications for the
+three current workers, Planner, and Soak. Its new accepted prompt retires prior
+failures from current status while preserving their reports. The final
+`agent-settled` screenshots should show a finished stamp with no live activity
+row on After; Before still counts unresolved historical launches and the nested
+helper. This does not claim that the earlier failed checks were repaired.
+
 After loading history, no agent has evidence of current work. After the live
 phase, the direct conversation depends on three working agents, one paused
 agent, and one agent waiting on background work. Only **Check installer rollback**
