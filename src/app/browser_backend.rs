@@ -528,13 +528,14 @@ mod action_tests {
         ]);
         let _ = app.browser_factory_unavailable(BrowserUnavailable::MissingProtocols(missing));
         let saved = app.card_state(card).unwrap().clone();
+        let residency = app.residency(card).clone();
         let focus = app.workspace.focused();
         for _ in 0..3 {
             let _ = app.retry_card(card);
             let _ = app.browser_factory_task();
         }
         assert_eq!(app.card_state(card).unwrap().kind, saved.kind);
-        assert_eq!(app.card_state(card).unwrap().residency, saved.residency);
+        assert_eq!(*app.residency(card), residency);
         assert_eq!(app.workspace.focused(), focus);
         assert!(app.browser_factory.is_none());
         assert!(matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))));

@@ -604,10 +604,7 @@ pub(super) fn availability_stream() -> impl iced::futures::Stream<Item = Message
     )
 }
 fn admit() -> Option<Slot> {
-    static WORKER: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
-    WORKER
-        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
-        .clone()
+    application_capacity!(1)
         .try_acquire_owned()
         .ok()
         .map(|permit| Slot(Some(permit)))
@@ -677,6 +674,8 @@ struct RawStamp {
     provider: Provider,
     handle: Option<SourceProof<ClientHandle>>,
     session: Option<String>,
+    // New pull request labels change what a message reads as.
+    labels: SourceProof<pull_request_links::Labels>,
     query: (u64, usize, usize),
     groups: Vec<(
         String,
@@ -711,6 +710,9 @@ struct RawInput {
     query: String,
     groups: Vec<(String, Vec<RawItem>)>,
     provider: Provider,
+    labels: Arc<pull_request_links::Labels>,
+    // Captured on the UI thread; the scan charges it from a worker.
+    metadata: MetadataCapacity,
 }
 struct RawItem {
     item: Arc<chat::Item>,
@@ -886,6 +888,7 @@ fn raw_stamp(runtime: &Runtime) -> RawStamp {
             .handle()
             .map(|handle| SourceProof(Arc::downgrade(handle))),
         session: runtime.snapshot.session_id.clone(),
+        labels: SourceProof(Arc::downgrade(&runtime.pull_request_labels)),
         query: runtime.find.as_ref().map_or(
             (runtime.find_navigation.search.load(Ordering::Acquire), 0, 0),
             |query| {
@@ -1173,7 +1176,23 @@ fn raw_scan_inner(
                 return None;
             }
             let item = &raw.item;
-            let matched = contains_checked(&item.content, &pattern, current)?;
+            // A message reads its pull request addresses as their labels.
+            let labelled = |text: &str| match pull_request_links::rendition(text, &input.labels) {
+                Some(read) => matches_checked(&read, &pattern, current),
+                None => Some(false),
+            };
+            let matched = contains_checked(&item.content, &pattern, current)?
+                || match &item.content {
+                    ItemContent::Text { text, .. } => labelled(text)?,
+                    // A notice's body is drawn verbatim; other deliveries
+                    // are prose with labelled links.
+                    ItemContent::Delivery { kind, body, .. }
+                        if *kind != chat::DeliveryKind::Notice =>
+                    {
+                        labelled(body)?
+                    }
+                    _ => false,
+                };
             let coordinated = chat::coordination::recognize(item, input.provider);
             if !current() {
                 return None;
@@ -1213,7 +1232,7 @@ fn raw_scan_inner(
                         .map(|run| ("result".into(), run.result.as_str())),
                 );
                 for (part, text) in texts {
-                    if matches_checked(text, &pattern, current)? {
+                    if matches_checked(text, &pattern, current)? || labelled(text)? {
                         charge(item.id.len().checked_add(part.len())?.checked_add(128)?)?;
                         parts.push(format!("{}#{part}", item.id));
                     }
@@ -1243,7 +1262,21 @@ fn raw_scan_inner(
                     kind: chat::DeliveryKind::Report,
                     ..
                 } => matched,
-                ItemContent::Delivery { body, .. } => matches_checked(body, &pattern, current)?,
+                // A long notice heading leads the body it folds into, so a
+                // match there must open the body too.
+                ItemContent::Delivery {
+                    kind: chat::DeliveryKind::Notice,
+                    summary,
+                    body,
+                    ..
+                } => matches_checked(
+                    &literal_content::notice_parts(summary, body).1,
+                    &pattern,
+                    current,
+                )?,
+                ItemContent::Delivery { body, .. } => {
+                    matches_checked(body, &pattern, current)? || labelled(body)?
+                }
                 _ => false,
             };
             if matched || !parts.is_empty() {
@@ -1259,8 +1292,10 @@ fn raw_scan_inner(
             groups.push((key.clone(), plans.into()));
         }
     }
-    let attempt = metadata_epoch();
-    let metadata = metadata_capacity()
+    let attempt = input.metadata.epoch.load(Ordering::Acquire);
+    let metadata = input
+        .metadata
+        .permits
         .clone()
         .try_acquire_many_owned(cost.max(1) as u32)
         .ok()
@@ -1268,7 +1303,15 @@ fn raw_scan_inner(
             failure.set(RawFailure::Pressure(attempt));
             None
         })?;
-    Some((groups, uncap, MetadataBudget(Some(metadata)), pattern))
+    Some((
+        groups,
+        uncap,
+        MetadataBudget {
+            permit: Some(metadata),
+            epoch: input.metadata.epoch,
+        },
+        pattern,
+    ))
 }
 fn matches_checked(
     text: &str,
@@ -1623,11 +1666,7 @@ impl Cagents {
         if !entry.borrow_mut().needs_find_highlights(target) {
             return Task::none();
         }
-        static BUDGET: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
-            std::sync::OnceLock::new();
-        let budget = BUDGET
-            .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(16 * 1024 * 1024)))
-            .clone();
+        let budget = application_capacity!(16 * 1024 * 1024);
         let bytes = entry
             .borrow()
             .prepared()
@@ -1816,6 +1855,8 @@ fn capture_raw(runtime: &Runtime) -> RawInput {
         query: runtime.find.clone().unwrap_or_default(),
         groups,
         provider: runtime.session.launch.provider,
+        labels: runtime.pull_request_labels.clone(),
+        metadata: metadata_capacity(),
     }
 }
 /// Aggregate source AND repeated query work, decided from lengths and bounded
@@ -1978,11 +2019,15 @@ fn plan_in_group(runtime: &Runtime, key: &str, plan: &ItemPlan) -> bool {
         })
 }
 
-struct MetadataBudget(Option<tokio::sync::OwnedSemaphorePermit>);
+struct MetadataBudget {
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    // The release count of the permit's own capacity, wherever this drops.
+    epoch: &'static AtomicU64,
+}
 impl Drop for MetadataBudget {
     fn drop(&mut self) {
-        drop(self.0.take());
-        METADATA_EPOCH.fetch_add(1, Ordering::AcqRel);
+        drop(self.permit.take());
+        self.epoch.fetch_add(1, Ordering::AcqRel);
         available().send_modify(|epoch| *epoch = epoch.wrapping_add(1));
     }
 }
@@ -2535,6 +2580,8 @@ mod tests {
         let input = RawInput {
             query: query.into(),
             provider: Provider::Claude,
+            labels: Arc::default(),
+            metadata: metadata_capacity(),
             groups: vec![(
                 "group".into(),
                 vec![RawItem {
@@ -2556,6 +2603,92 @@ mod tests {
             vec![2]
         );
         assert_eq!(groups[0].1[0].source.as_ptr(), Arc::as_ptr(&item));
+    }
+    #[test]
+    fn find_reaches_a_message_through_the_labels_of_its_pull_request_links() {
+        let item = Arc::new(chat::Item {
+            id: "answer".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Text {
+                text: "Opened https://github.com/acme/tools/pull/4 today.".into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+            at: None,
+            started_at: None,
+        });
+        let scan = |labels: Arc<pull_request_links::Labels>, query: &str| {
+            let input = RawInput {
+                query: query.into(),
+                provider: Provider::Claude,
+                labels,
+                metadata: metadata_capacity(),
+                groups: vec![(
+                    "group".into(),
+                    vec![RawItem {
+                        item: item.clone(),
+                        raw_disclosure: false,
+                        tools: Vec::new(),
+                    }],
+                )],
+            };
+            raw_scan(&input, query, &|| true).unwrap().0.len()
+        };
+        let labels = Arc::new(pull_request_links::fixture::fixture());
+        assert_eq!(scan(labels.clone(), "acme/tools#4 old sidebar"), 1);
+        // The address itself is still what the message says.
+        assert_eq!(scan(labels.clone(), "github.com/acme/tools/pull/4"), 1);
+        // Without a title the label is the reference alone.
+        assert_eq!(scan(Arc::default(), "old sidebar"), 0);
+        assert_eq!(scan(Arc::default(), "acme/tools#4 today"), 1);
+    }
+    #[test]
+    fn find_opens_a_notice_whose_match_folded_from_its_heading_into_its_body() {
+        let notice = |summary: String| {
+            Arc::new(chat::Item {
+                id: "notice".into(),
+                role: chat::Role::User,
+                content: ItemContent::Delivery {
+                    kind: chat::DeliveryKind::Notice,
+                    from: String::new(),
+                    sender: "b1".into(),
+                    summary,
+                    body: String::new(),
+                },
+                at: None,
+                started_at: None,
+            })
+        };
+        let heredoc = format!(
+            "cat > sampler.py <<'EOF'\n{}NEEDLE = 1\nEOF",
+            "x = 0\n".repeat(40)
+        );
+        for (summary, expand) in [
+            (heredoc, true),
+            (format!("{}NEEDLE", "word ".repeat(40)), true),
+            ("Background command \"NEEDLE\" completed".into(), false),
+        ] {
+            let item = notice(summary);
+            let input = RawInput {
+                query: "NEEDLE".into(),
+                provider: Provider::Claude,
+                labels: Arc::default(),
+                metadata: metadata_capacity(),
+                groups: vec![(
+                    "group".into(),
+                    vec![RawItem {
+                        item,
+                        raw_disclosure: false,
+                        tools: Vec::new(),
+                    }],
+                )],
+            };
+            let (groups, _, _, _) = raw_scan(&input, "NEEDLE", &|| true).unwrap();
+            assert_eq!(
+                groups[0].1[0].expand, expand,
+                "a match shown only in the folded body opens it"
+            );
+        }
     }
     #[test]
     fn retained_flow_draw_paints_late_async_find_marks_without_element_rebuild() {
@@ -3030,17 +3163,22 @@ mod tests {
             .as_ref()
             .unwrap()
             ._metadata
-            .0
+            .permit
             .as_ref()
             .unwrap()
             .num_permits();
-        let before = metadata_capacity().available_permits();
-        let blocker = MetadataBudget(Some(
-            metadata_capacity()
-                .clone()
-                .try_acquire_many_owned(before as u32)
-                .unwrap(),
-        ));
+        let capacity = metadata_capacity();
+        let before = capacity.permits.available_permits();
+        let blocker = MetadataBudget {
+            permit: Some(
+                capacity
+                    .permits
+                    .clone()
+                    .try_acquire_many_owned(before as u32)
+                    .unwrap(),
+            ),
+            epoch: capacity.epoch,
+        };
         let mut snapshot = (*handle.snapshot()).clone();
         snapshot.generation += 1;
         let old = snapshot.items[0].clone();
@@ -3077,7 +3215,7 @@ mod tests {
         assert!(runtime.find_navigation.raw.failed.is_none());
         assert!(runtime.find_searching());
         assert_eq!(
-            metadata_capacity().available_permits(),
+            metadata_capacity().permits.available_permits(),
             before,
             "old actual plan remains reserved behind stalled FIFO"
         );
@@ -3107,7 +3245,7 @@ mod tests {
         held.send(()).unwrap();
         preparation::retirement_barrier();
         assert_eq!(
-            metadata_capacity().available_permits(),
+            metadata_capacity().permits.available_permits(),
             before + own,
             "own metadata capacity returns only after real old plan destruction"
         );
@@ -3264,13 +3402,22 @@ fn finish_raw_find_for_test(
     panic!("Find group preparation did not settle")
 }
 
-static METADATA_EPOCH: AtomicU64 = AtomicU64::new(0);
-fn metadata_epoch() -> u64 {
-    METADATA_EPOCH.load(Ordering::Acquire)
+// Find's metadata allowance, and how many times any of it has been released:
+// a search deferred for pressure retries only after a release.
+#[derive(Clone)]
+struct MetadataCapacity {
+    permits: Arc<tokio::sync::Semaphore>,
+    epoch: &'static AtomicU64,
 }
-fn metadata_capacity() -> &'static Arc<tokio::sync::Semaphore> {
-    static METADATA: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
-    METADATA.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(32 * 1024 * 1024)))
+application_atomic!(fn metadata_releases() -> AtomicU64);
+fn metadata_epoch() -> u64 {
+    metadata_releases().load(Ordering::Acquire)
+}
+fn metadata_capacity() -> MetadataCapacity {
+    MetadataCapacity {
+        permits: application_capacity!(32 * 1024 * 1024),
+        epoch: metadata_releases(),
+    }
 }
 impl Runtime {
     fn fail_find(&mut self, failure: RawFailure) {

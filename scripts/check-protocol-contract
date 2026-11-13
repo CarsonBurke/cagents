@@ -1,0 +1,197 @@
+#!/usr/bin/python3
+"""Check the selected IPC source contract; this is not a wire fingerprint."""
+
+import argparse
+import importlib.util
+import json
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+
+
+sys.dont_write_bytecode = True
+ROOT = Path(__file__).resolve().parent.parent
+FIXTURES = "tests/fixtures/protocol-contract"
+SELECTION = {
+    "src/terminal/ipc.rs": ("ClientRequest", "ServerMessage", "ServerResponse"),
+    "src/agent.rs": ("Provider",),
+    "src/agent_execution.rs": ("Run", "Summary", "Reply"),
+}
+MAX_BYTES = 8 * 1024 * 1024
+
+
+class ContractError(Exception):
+    pass
+
+
+def regular_file(root, relative):
+    current = root
+    parts = Path(relative).parts
+    for index, part in enumerate(parts):
+        current /= part
+        mode = current.lstat().st_mode
+        expected = stat.S_ISREG if index == len(parts) - 1 else stat.S_ISDIR
+        if not expected(mode):
+            raise ContractError(f"{current}: expected a real directory or regular file, never a symlink")
+    if current.stat().st_size > MAX_BYTES:
+        raise ContractError(f"{current}: contract input is too large")
+    return current
+
+
+def source_module():
+    path = regular_file(ROOT, "scripts/protocol_contract_source.py")
+    spec = importlib.util.spec_from_file_location("protocol_contract_source", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+SOURCE = None
+
+
+def contract(read):
+    items = {}
+    version = None
+    for path, names in SELECTION.items():
+        text = read(path)
+        if path == "src/terminal/ipc.rs":
+            version = SOURCE.protocol_version(text)
+        for name, tokens in SOURCE.selected_items(text, names).items():
+            items[f"{path}::{name}"] = tokens
+    return {"format": 1, "protocol": version, "items": dict(sorted(items.items()))}
+
+
+def encoded(snapshot):
+    lines = ["{", '  "format": 1,', f'  "protocol": {snapshot["protocol"]},', '  "items": {']
+    entries = list(snapshot["items"].items())
+    for index, (key, tokens) in enumerate(entries):
+        suffix = "," if index + 1 < len(entries) else ""
+        lines.append(f"    {json.dumps(key)}: {json.dumps(tokens, ensure_ascii=False)}{suffix}")
+    return "\n".join([*lines, "  }", "}", ""])
+
+
+def changed_items(before, after):
+    return ", ".join(key for key in sorted(before.keys() | after.keys()) if before.get(key) != after.get(key))
+
+
+def snapshot_files(root):
+    directory = root / FIXTURES
+    real_directory(root, "tests/fixtures")
+    if not directory.exists():
+        return {}
+    real_directory(root, FIXTURES)
+    files = {}
+    for path in directory.iterdir():
+        if not re.fullmatch(r"[1-9][0-9]*\.json", path.name):
+            raise ContractError(f"Unexpected protocol snapshot: {path}")
+        relative = path.relative_to(root).as_posix()
+        regular_file(root, relative)
+        snapshot = json.loads(path.read_text())
+        version = int(path.stem)
+        if (
+            not isinstance(snapshot, dict)
+            or set(snapshot) != {"format", "protocol", "items"}
+            or type(snapshot["format"]) is not int
+            or snapshot["format"] != 1
+            or type(snapshot["protocol"]) is not int
+            or snapshot["protocol"] != version
+            or not 0 < version <= 65535
+            or not isinstance(snapshot["items"], dict)
+            or not snapshot["items"]
+            or not all(isinstance(key, str) and isinstance(tokens, list) and tokens
+                       and all(isinstance(token, str) for token in tokens)
+                       for key, tokens in snapshot["items"].items())
+        ):
+            raise ContractError(f"Malformed protocol snapshot: {path}")
+        files[version] = (path, snapshot)
+    return files
+
+
+def real_directory(root, relative):
+    current = root
+    for part in Path(relative).parts:
+        current /= part
+        if not stat.S_ISDIR(current.lstat().st_mode):
+            raise ContractError(f"{current}: expected a real directory, never a symlink")
+
+
+def git(root, *arguments):
+    result = subprocess.run(["git", "-C", str(root), *arguments], capture_output=True)
+    if result.returncode:
+        raise ContractError(f"Cannot read trusted comparison base: {result.stderr.decode(errors='replace').strip()}")
+    return result.stdout
+
+
+def compare_base(root, base, current):
+    resolved = git(root, "rev-parse", "--verify", "--end-of-options", f"{base}^{{commit}}").decode().strip()
+    names = {raw.decode() for raw in git(root, "ls-tree", "-rz", "--name-only", resolved, "--", f"{FIXTURES}/").split(b"\0") if raw}
+    for path in sorted(names):
+        try:
+            actual = regular_file(root, path).read_bytes()
+        except FileNotFoundError as error:
+            raise ContractError(f"Recorded protocol snapshots are immutable; restore {path}") from error
+        if actual != git(root, "show", f"{resolved}:{path}"):
+            raise ContractError(f"Recorded protocol snapshots are immutable; restore {path} and choose a new protocol number")
+    # This also protects the first adoption of the guard, when the base has
+    # no snapshot yet. The base is supplied by CI, not read from a head file.
+    previous_version = SOURCE.protocol_version(git(root, "show", f"{resolved}:src/terminal/ipc.rs").decode())
+    if current["protocol"] < previous_version:
+        raise ContractError("The protocol number cannot move backwards from the comparison base")
+    if current["protocol"] == previous_version:
+        previous_path = f"{FIXTURES}/{previous_version}.json"
+        previous = (
+            json.loads(git(root, "show", f"{resolved}:{previous_path}"))
+            if previous_path in names
+            else contract(lambda path: git(root, "show", f"{resolved}:{path}").decode())
+        )
+        if current["items"] != previous["items"]:
+            raise ContractError(f"Selected IPC declarations changed without a new protocol number relative to the comparison base: {changed_items(previous['items'], current['items'])}. Choose an unused higher PROTOCOL_VERSION and run scripts/check-protocol-contract --record")
+    print(f"Trusted comparison base: {resolved}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, default=ROOT, help="source checkout (default: this repository)")
+    parser.add_argument("--record", action="store_true", help="add the current version's new immutable snapshot")
+    parser.add_argument("--base-ref", help="independent Git comparison base; missing/unreadable bases fail")
+    args = parser.parse_args()
+    global SOURCE
+    root = args.root.resolve()
+    try:
+        SOURCE = source_module()
+        current = contract(lambda path: regular_file(root, path).read_text())
+        files = snapshot_files(root)
+        version = current["protocol"]
+        if not 0 < version <= 65535:
+            raise ContractError("The protocol snapshot requires a nonzero u16 version")
+        if files and version < max(files):
+            raise ContractError("The current protocol is older than a recorded snapshot")
+        if args.base_ref:
+            compare_base(root, args.base_ref, current)
+        existing = files.get(version)
+        if existing:
+            if existing[1] != current:
+                changes = changed_items(existing[1]["items"], current["items"])
+                raise ContractError(f"Protocol {version} already has a different selected source contract: {changes}. Choose an unused higher PROTOCOL_VERSION and run scripts/check-protocol-contract --record; preserve {FIXTURES}/{version}.json")
+        elif args.record:
+            directory = root / FIXTURES
+            directory.mkdir(exist_ok=True)
+            real_directory(root, FIXTURES)
+            path = directory / f"{version}.json"
+            with path.open("x") as output:
+                output.write(encoded(current))
+            print(f"Recorded {path.relative_to(root)}")
+        else:
+            raise ContractError(f"Missing protocol {version} snapshot; run scripts/check-protocol-contract --record after choosing a fresh protocol number")
+        print(f"Protocol {version}: {len(current['items'])} selected declarations match (partial source contract, not a wire fingerprint)")
+        return 0
+    except (ContractError, OSError, ValueError) as error:
+        print(f"Protocol contract refused: {error}", file=sys.stderr)
+        print("Coverage is limited to seven selected declarations; review transitive DTO, custom Serde and dependency semantics separately.", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

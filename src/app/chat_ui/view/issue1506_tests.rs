@@ -459,7 +459,7 @@ fn one_working_child_remains_in_the_footer_while_the_parent_waits_or_is_blocked(
     snapshot.waiting = true;
     let parent_and_child = (
         Some(Icon::AgentWorking),
-        "Waiting for you · 1 working".to_owned(),
+        "Waiting for you · 1 subagent working".to_owned(),
     );
     assert_eq!(publish(&mut snapshot), parent_and_child);
     snapshot.detail = "Background command completed".into();
@@ -482,7 +482,7 @@ fn one_working_child_remains_in_the_footer_while_the_parent_waits_or_is_blocked(
         publish(&mut snapshot),
         (
             Some(Icon::AgentWorking),
-            "Account limit reached · 1 working".into(),
+            "Account limit reached · 1 subagent working".into(),
         )
     );
     snapshot.subagents[0].waiting = true;
@@ -490,7 +490,7 @@ fn one_working_child_remains_in_the_footer_while_the_parent_waits_or_is_blocked(
         publish(&mut snapshot),
         (
             Some(Icon::Warning),
-            "Account limit reached · 1 waiting".into(),
+            "Account limit reached · 1 subagent waiting".into(),
         )
     );
     snapshot.subagents[0].status = ToolStatus::Succeeded;
@@ -541,9 +541,9 @@ fn mixed_blocked_waiting_and_working_children_do_not_hide_real_work_or_clear_par
     assert_eq!(icon, Some(Icon::AgentWorking));
     for text in [
         "Account limit reached",
-        "1 working",
-        "1 waiting",
-        "1 failed",
+        "1 subagent working",
+        "1 subagent waiting",
+        "1 subagent failed",
     ] {
         assert!(status.contains(text), "{status}");
     }
@@ -585,7 +585,10 @@ fn generic_local_error_does_not_mask_an_active_provider_failure_in_the_footer() 
         runtime.refresh();
         assert_eq!(
             runtime.conversation_status(false),
-            (Some(Icon::AgentWorking), format!("{label} · 1 working"))
+            (
+                Some(Icon::AgentWorking),
+                format!("{label} · 1 subagent working")
+            )
         );
         let details: Vec<_> = runtime
             .failure_ui
@@ -604,7 +607,7 @@ fn generic_local_error_does_not_mask_an_active_provider_failure_in_the_footer() 
             runtime.conversation_status(false),
             (
                 Some(Icon::AgentWorking),
-                "Provider at capacity · 1 working".into(),
+                "Provider at capacity · 1 subagent working".into(),
             )
         );
         assert!(runtime.failure_ui.incidents.iter().any(|incident| {
@@ -614,7 +617,10 @@ fn generic_local_error_does_not_mask_an_active_provider_failure_in_the_footer() 
         runtime.reconcile_failure_ui();
         assert_eq!(
             runtime.conversation_status(false),
-            (Some(Icon::AgentWorking), format!("{label} · 1 working"))
+            (
+                Some(Icon::AgentWorking),
+                format!("{label} · 1 subagent working")
+            )
         );
 
         // Clearing provider state must not promote a historical failure into
@@ -752,8 +758,8 @@ fn waiting_child_quota_detail_without_items_is_projected_and_does_not_hide_other
     assert!(runtime.snapshot.subagents[0].items.is_empty());
     let (icon, status) = runtime.conversation_status(false);
     assert_eq!(icon, Some(Icon::AgentWorking));
-    assert!(status.contains("1 working"), "{status}");
-    assert!(status.contains("1 waiting"), "{status}");
+    assert!(status.contains("1 subagent working"), "{status}");
+    assert!(status.contains("1 subagent waiting"), "{status}");
     assert!(runtime.error.is_none());
 }
 
@@ -766,26 +772,26 @@ fn child_picker_filters_full_names_and_keeps_order_during_status_changes() {
     ];
     let mut picker = child_navigation::Picker::new(&children);
     let order: Vec<_> = picker
-        .rows(&children)
+        .rows(&children, &Default::default())
         .iter()
         .map(|child| child.id.clone())
         .collect();
     children[1].status = ToolStatus::Failed;
     assert_eq!(
         picker
-            .rows(&children)
+            .rows(&children, &Default::default())
             .iter()
             .map(|child| child.id.clone())
             .collect::<Vec<_>>(),
         order
     );
     picker.query = "working".into();
-    assert_eq!(picker.rows(&children).len(), 1);
+    assert_eq!(picker.rows(&children, &Default::default()).len(), 1);
     picker.query.clear();
     picker.filter = child_navigation::Filter::Attention;
-    assert_eq!(picker.rows(&children).len(), 2);
+    assert_eq!(picker.rows(&children, &Default::default()).len(), 2);
     picker.filter = child_navigation::Filter::Working;
-    assert!(picker.rows(&children).is_empty());
+    assert!(picker.rows(&children, &Default::default()).is_empty());
 }
 
 #[test]
@@ -866,16 +872,11 @@ fn narrow_child_navigation_stays_bounded_with_a_thousand_long_names() {
                         .child_picker
                         .as_ref()
                         .unwrap()
-                        .rows(&runtime.snapshot.subagents)
+                        .rows(&runtime.snapshot.subagents, &runtime.child_ordinals)
                         .into_iter()
                         .take(24)
                         .map(|child| {
-                            format!(
-                                "{} · {} · {}",
-                                Runtime::native_child_name(child),
-                                Runtime::native_child_status(child),
-                                child.id
-                            )
+                            Runtime::child_choice_name(child, &runtime.child_label(child, 80))
                         })
                         .collect::<Vec<_>>();
                     actual.sort();
@@ -1013,16 +1014,9 @@ fn child_chooser_actions_preserve_reader_and_cover_transcript_until_closed() {
                 "covered transcript actions must be absent from AX"
             );
             let expected: Vec<_> = picker
-                .rows(&live.snapshot.subagents)
+                .rows(&live.snapshot.subagents, &live.child_ordinals)
                 .into_iter()
-                .map(|child| {
-                    format!(
-                        "{} · {} · {}",
-                        Runtime::native_child_name(child),
-                        Runtime::native_child_status(child),
-                        child.id
-                    )
-                })
+                .map(|child| Runtime::child_choice_name(child, &live.child_label(child, 80)))
                 .collect();
             let actual: Vec<_> = current
                 .iter()
@@ -1054,7 +1048,7 @@ fn child_chooser_actions_preserve_reader_and_cover_transcript_until_closed() {
     assert!(
         !empty
             .iter()
-            .any(|label| label.starts_with("Choose subagent:"))
+            .any(|label| label.starts_with("Search and filter subagents:"))
     );
     drop(app.handle_chat_ui(Action::SubagentPicker(target, false)));
     assert!(runtime(&app, target).child_picker.is_none());
@@ -1205,8 +1199,8 @@ fn expanded_diagnostic_preview_and_copy_follow_changed_sources_with_the_same_key
             // refresh archives each distinct provider error via note(). The
             // current source is new, while both original diagnostics remain.
             assert_eq!(runtime.snapshot.error.as_deref(), Some(raw_after.as_str()));
-            assert!(runtime.failures.iter().any(|(_, text)| text == &raw_before));
-            assert!(runtime.failures.iter().any(|(_, text)| text == &raw_after));
+            assert!(runtime.failures.iter().any(|note| note.text == *raw_before));
+            assert!(runtime.failures.iter().any(|note| note.text == *raw_after));
             assert!(preview.contains(&raw_before));
             assert!(
                 preview.contains(&raw_after),
@@ -1707,8 +1701,14 @@ fn busy_report_ready_and_collapse_release_actual_worker_canonical_and_palette() 
             assert!(live.item_expanded("busy-report"));
             let cached = &live.presentation_cache()["busy-report"];
             assert!(!cached.placeholder && !cached.markdown.items().is_empty());
-            let palette = Arc::downgrade(cached.blocks.values().next().unwrap().spans(false));
-            assert!(palette.upgrade().is_some());
+            let palette = cached
+                .blocks
+                .values()
+                .next()
+                .unwrap()
+                .highlight(false)
+                .watch();
+            assert!(palette());
             assert!(
                 !live.preparation.contains("busy-report"),
                 "a finite Report Ready removes the Shared/canonical owner even while busy"
@@ -1728,8 +1728,8 @@ fn busy_report_ready_and_collapse_release_actual_worker_canonical_and_palette() 
         assert!(live.presentation_cache()["busy-report"].blocks.is_empty());
         assert!(!live.preparation.contains("busy-report"));
         assert!(
-            palette.upgrade().is_none(),
-            "actual shared syntax spans must be released"
+            !palette(),
+            "actual shared syntax highlighting must be released"
         );
         assert_eq!(
             copy_text(CopyPart::Text, &report.content),
@@ -1908,10 +1908,17 @@ fn hidden_diagnostic_metadata_releases_exact_source_and_restores_disclosure_on_r
     assert!(runtime.failure_preview(&key).is_some());
     drop(original);
     runtime.set_visible(false).unwrap();
+    runtime.cool();
     preparation::retirement_barrier();
     assert!(runtime.failure_ui.incidents.is_empty());
     assert!(runtime.failure_preview(&key).is_none());
     assert!(runtime.failure_ui.expanded.contains(&key));
+    // The client's publication retires the item on its own worker, which the
+    // presentation barrier does not cover.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while weak.upgrade().is_some() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
     assert!(
         weak.upgrade().is_none(),
         "diagnostic metadata must not retain the hidden original item"

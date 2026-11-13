@@ -22,7 +22,8 @@ use std::{
 use crate::instance::UiUpdateGuard;
 
 mod companions;
-pub(crate) use companions::{preflight_editor_companions, trusted_executable_owner};
+pub use companions::EditorCompanion;
+pub(crate) use companions::{editor_companions, trusted_executable_owner};
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -30,13 +31,15 @@ pub(crate) struct SourceInspectionRequest {
     pub(crate) protocol: u16,
     pub(crate) proof: Option<crate::model::HostSessionProof>,
     pub(crate) require_resumable: bool,
+    #[serde(default)]
+    pub(crate) reconcile_retained: bool,
 }
 
 pub(crate) fn preflight_source_panes(
     guard: &UiUpdateGuard,
     proof: Option<crate::model::HostSessionProof>,
     require_resumable: bool,
-) -> io::Result<()> {
+) -> io::Result<crate::update::source_inspection::SourceInspection> {
     crate::update::inspect_source_panes(guard, proof, require_resumable).map_err(io::Error::other)
 }
 
@@ -134,7 +137,11 @@ pub(crate) fn sanitize_child_environment(command: &mut Command) {
     for name in [
         crate::instance::INSTALL_GUARD_ENV,
         crate::instance::DAEMON_FENCE_ENV,
+        crate::daemon::lease_handoff::DAEMON_LEASE_ENV,
+        crate::upgrade::recovery::RECOVERY_FD_ENV,
         RESULT_FD_ENV,
+        crate::update::recovery::CENSUS_ENV,
+        crate::update::recovery::OUTCOME_ENV,
         OWNER_CLI_ENV,
         "CAGENTS_ARCHIVE",
         "CAGENTS_CHECKSUMS",
@@ -225,12 +232,6 @@ pub(crate) fn run(
     let slots = if stage_only {
         Vec::new()
     } else {
-        if arguments
-            .iter()
-            .any(|argument| argument == "--restart-daemon")
-        {
-            preflight_editor_companions(None)?;
-        }
         guard.prepare_and_close_windows_with_preflight(Duration::from_secs(45), |guard| {
             preflight_source_panes(
                 guard,
@@ -239,6 +240,7 @@ pub(crate) fn run(
                     .iter()
                     .any(|argument| argument == "--restart-daemon"),
             )
+            .map(|_| ())
         })?
     };
     let fd = script.as_raw_fd();
@@ -428,6 +430,12 @@ pub(crate) fn staged_owner_bin(
     executable: &Path,
     recover: bool,
 ) -> io::Result<Option<std::path::PathBuf>> {
+    // This is the confirmed successor, holding the exact runtime lease. The
+    // old PID in its metadata is expected until HostLease adopts it; routing
+    // back through that stopped source would prevent the handoff itself.
+    if crate::daemon::lease_handoff::has_inherited_lease()? {
+        return Ok(None);
+    }
     use std::os::unix::fs::OpenOptionsExt;
     // Sealed update probes execute from anonymous FDs. Their kernel exe path
     // has no filesystem entry to canonicalize and carries no install routing.
@@ -652,6 +660,7 @@ pub(crate) fn wait_daemon_start(
 
 /// Reports once when the startup budget is crossed with the original child
 /// still running. Reporting failure cannot unwind child or caller-fence custody.
+/// The caller chooses where the command's stdout and stderr go.
 pub(crate) fn wait_daemon_start_with_progress(
     command: &mut Command,
     timeout: Duration,
@@ -660,7 +669,6 @@ pub(crate) fn wait_daemon_start_with_progress(
     let deadline = Instant::now() + timeout;
     let mut child = command
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
         .process_group(0)
         .spawn()
         .map_err(|error| DaemonStartError {
@@ -685,7 +693,9 @@ pub(crate) fn wait_daemon_start_with_progress(
                     Ok(())
                 } else {
                     Err(DaemonStartError {
-                        error: io::Error::other("The matched daemon startup command failed"),
+                        error: io::Error::other(format!(
+                            "The matched daemon startup command failed ({status})"
+                        )),
                         spawned: true,
                     })
                 };
@@ -776,6 +786,44 @@ fn running_owner_bin(prefix: &Path, executable: &Path) -> io::Result<std::path::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lease_handoff_ordinary_child_receives_no_recovery_authority() {
+        if !crate::daemon::isolated_handoff_coordinator() {
+            return;
+        }
+        let file = tempfile::tempfile().unwrap();
+        let descriptor = file.as_raw_fd();
+        let mut child = Command::new("/bin/sh");
+        child
+            .args([
+                "-c",
+                r#"
+            test -z "${CAGENTS_UPDATE_RECOVERY_FD+x}" || exit 91
+            for fd in 189 193 194 195 196; do
+                test ! -e "/proc/self/fd/$fd" || exit 92
+            done
+        "#,
+            ])
+            .env("CAGENTS_UPDATE_RECOVERY_FD", "193");
+        sanitize_child_environment(&mut child);
+        // Model authority slots before the ordinary-child sealing hook. No
+        // parent descriptor is remapped, and the isolated coordinator has no
+        // concurrent fork that could retain a copied description.
+        unsafe {
+            child.pre_exec(move || {
+                for target in [189, 193, 194, 195, 196] {
+                    if libc::dup2(descriptor, target) == -1
+                        || libc::fcntl(target, libc::F_SETFD, 0) == -1
+                    {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                crate::daemon::seal_inherited_descriptors()
+            });
+        }
+        assert!(child.status().unwrap().success());
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -922,7 +970,7 @@ mod tests {
         assert_eq!(error.error.kind(), io::ErrorKind::Other);
         assert_eq!(
             error.error.to_string(),
-            "The matched daemon startup command failed"
+            "The matched daemon startup command failed (exit status: 1)"
         );
         let root = tempfile::tempdir().unwrap();
         let error = wait_daemon_start(

@@ -5,6 +5,8 @@ mod hosted_agent_cleanup;
 
 #[path = "support/private_cli_capture.rs"]
 mod private_cli_capture;
+#[path = "support/retained_fixture.rs"]
+mod retained_fixture;
 
 use serde_json::{Value, json};
 use std::{
@@ -79,6 +81,10 @@ impl Fixture {
     }
 
     fn with_soft_limit(soft_limit: Option<libc::rlim_t>) -> Self {
+        Self::with_soft_limit_and_branch(soft_limit, "main")
+    }
+
+    fn with_soft_limit_and_branch(soft_limit: Option<libc::rlim_t>, branch: &str) -> Self {
         let root = tempfile::tempdir().unwrap();
         for name in [
             "home", "run", "data", "config", "cache", "tmp", "project", "bin",
@@ -86,6 +92,17 @@ impl Fixture {
             fs::create_dir(root.path().join(name)).unwrap();
         }
         fs::set_permissions(root.path().join("run"), fs::Permissions::from_mode(0o700)).unwrap();
+        // Own the repository identity even when TMPDIR has enclosing Git
+        // metadata. Plain-folder discovery must not select another checkout.
+        let initialized = Self::command(root.path(), "/usr/bin/git")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(["init", "--quiet", "--template="])
+            .arg(format!("--initial-branch={branch}"))
+            .arg(root.path().join("project"))
+            .output()
+            .unwrap();
+        assert!(initialized.status.success(), "{initialized:?}");
         let daemon = Self::start_with_soft_limit(root.path(), soft_limit);
         let mut fixture = Self {
             root,
@@ -180,6 +197,9 @@ fn a_live_process_without_a_control_reply_is_not_ready() {
 
 #[test]
 fn enabled_automation_dispatches_without_a_window_and_restart_does_not_repeat_it() {
+    if retained_fixture::run_isolated() {
+        return;
+    }
     let mut fixture = Fixture::new();
     let project = fixture.root.path().join("project");
     fixture.cli(&["project", "open", project.to_str().unwrap()]);
@@ -506,7 +526,188 @@ fn precheck_shell_keeps_incoming_limits_while_daemon_retains_raised_limit() {
 }
 
 #[test]
+fn run_attention_rejected_by_the_journal_survives_a_killed_daemon() {
+    let mut fixture = Fixture::new();
+    let project = fixture.root.path().join("project");
+    fixture.cli(&["project", "open", project.to_str().unwrap()]);
+    let provider = fixture.root.path().join("bin/claude");
+    fs::write(&provider, include_str!("fixtures/automation-claude.sh")).unwrap();
+    fs::set_permissions(&provider, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::create_dir(fixture.root.path().join("home/.claude")).unwrap();
+    let now = jiff::Timestamp::now().to_zoned(jiff::tz::TimeZone::UTC);
+    let definition = json!({
+        "name": "Attention fixture", "prompt": "Return a fixture result",
+        "agent": {"provider": "Claude", "account": null,
+            "target": {"repository": project, "directory": project, "channel": null},
+            "surface": "Chat", "model": null, "permission_mode": null},
+        "schedule": {"pattern": {"daily": {"hour": now.hour(), "minute": now.minute()}}, "timezone": "UTC"},
+        "session_mode": "fresh", "precheck": null
+    });
+    let path = fixture.root.path().join("attention.json");
+    fs::write(&path, serde_json::to_vec(&definition).unwrap()).unwrap();
+    let created = fixture.cli(&[
+        "automation",
+        "create",
+        "--definition",
+        path.to_str().unwrap(),
+    ]);
+    let id = created["automation"]["id"].as_str().unwrap().to_owned();
+    let revision = created["automation"]["execution_revision"]
+        .as_u64()
+        .unwrap()
+        .to_string();
+    let data = fixture
+        .root
+        .path()
+        .join("data")
+        .join(cagents::instance::STORAGE_NAME);
+    let journal = data.join("agent-attention.sqlite3");
+    let source = data.join("workspace-model.sqlite3");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !rusqlite::Connection::open(&journal).is_ok_and(|db| {
+        db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='seen')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap_or(false)
+    }) {
+        assert!(
+            Instant::now() < deadline,
+            "notification journal did not initialize"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    rusqlite::Connection::open(&journal)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_attention BEFORE INSERT ON seen BEGIN
+                 SELECT RAISE(ABORT, 'injected journal failure');
+             END;",
+        )
+        .unwrap();
+    let accepted = fixture.cli(&[
+        "automation",
+        "run-now",
+        &id,
+        "--execution-revision",
+        &revision,
+        "--request-id",
+        &uuid::Uuid::new_v4().to_string(),
+        "--confirm",
+    ]);
+    let firing = accepted["firing"]["id"].as_str().unwrap().to_owned();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let run = loop {
+        let detail = fixture.cli(&["automation", "run", &firing]);
+        let shown = fixture.cli(&["automation", "show", &id]);
+        if detail["run"]["firing"]["state"] == "succeeded"
+            && shown["automation"]["active_firing"].is_null()
+        {
+            break detail["run"]["run"]["id"].as_str().unwrap().to_owned();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "run did not settle: {detail} {shown}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    };
+    let pending = |run: &str| {
+        rusqlite::Connection::open(&source)
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM automation_run_attention WHERE run=?1",
+                [run],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+    };
+    let notices = || {
+        rusqlite::Connection::open(&journal)
+            .unwrap()
+            .query_row("SELECT count(*) FROM notices", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap()
+    };
+    assert_eq!(pending(&run), 1, "the run's commit owns its attention");
+    assert_eq!(notices(), 0, "the journal rejected this attention");
+
+    // SIGKILL leaves no chance to flush: only the committed edge can recover it.
+    fixture.daemon.kill().unwrap();
+    fixture.daemon.wait().unwrap();
+    assert_eq!(pending(&run), 1);
+    rusqlite::Connection::open(&journal)
+        .unwrap()
+        .execute_batch("DROP TRIGGER reject_attention;")
+        .unwrap();
+    fixture.daemon = Fixture::start(fixture.root.path());
+    fixture.ready();
+
+    let target = cagents::notifications::Target::AgentRun(run.parse().unwrap());
+    let socket = fixture
+        .root
+        .path()
+        .join("run")
+        .join(cagents::instance::RUNTIME_SUBDIRECTORY)
+        .join(cagents::terminal_ipc::SOCKET_FILE_NAME);
+    let mut client = cagents::control::ControlClient::connect(&socket).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let notice = loop {
+        let snapshot = client.read_notifications().unwrap();
+        if let Some(notice) = snapshot
+            .notices
+            .iter()
+            .find(|notice| notice.event.target() == target)
+        {
+            assert_eq!(snapshot.notices.len(), 1);
+            break notice.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "run attention was not recovered: {snapshot:?}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    };
+    let deadline = Instant::now() + Duration::from_secs(45);
+    while pending(&run) != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the committed handoff was not acknowledged"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    drop(client);
+
+    // Once acknowledged, another restart has nothing left to hand off.
+    fixture.restart();
+    let mut client = cagents::control::ControlClient::connect(&socket).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let snapshot = loop {
+        let snapshot = client.read_notifications().unwrap();
+        if snapshot
+            .notices
+            .iter()
+            .any(|current| current.id == notice.id)
+        {
+            break snapshot;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "run attention was not restored: {snapshot:?}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(snapshot.notices.len(), 1, "{snapshot:?}");
+    assert_eq!(notices(), 1);
+    assert_eq!(pending(&run), 0);
+}
+
+#[test]
 fn automation_cli_runs_headless_precheck_once_and_keeps_history_after_restart_and_removal() {
+    if retained_fixture::run_isolated() {
+        return;
+    }
     let mut fixture = Fixture::new();
     let project = fixture.root.path().join("project");
     fixture.cli(&["project", "open", project.to_str().unwrap()]);
@@ -618,7 +819,7 @@ fn automation_cli_runs_headless_precheck_once_and_keeps_history_after_restart_an
 
 #[test]
 fn automation_cli_lifecycle_audit_pages_durable_receipts_without_running_a_provider() {
-    let mut fixture = Fixture::new();
+    let mut fixture = Fixture::with_soft_limit_and_branch(None, "lifecycle-fixture");
     let project = fixture.root.path().join("project");
     // This case owns lifecycle receipts, not discovery of a plain folder.
     // Bind its project explicitly even when TMPDIR is inside another checkout.

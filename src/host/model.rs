@@ -24,7 +24,11 @@ use crate::{
     workspace_model::{ModelChannel, ModelEdit, ModelProject, WorkspaceModel},
 };
 
+mod archived_history;
+mod automation_attention;
 mod automation_audit;
+pub(super) use archived_history::ArchivedHistory;
+pub(super) use automation_attention::{AutomationAttentionReceipt, PendingAutomationAttention};
 pub(super) mod automation_notifications;
 mod automation_proposals;
 mod automations;
@@ -32,20 +36,32 @@ pub(super) mod channel_work;
 #[cfg(test)]
 mod channel_work_integration_tests;
 pub(super) use automations::Claimed;
+pub(super) mod console_relaunch;
 mod execution;
+mod execution_deltas;
+pub(super) mod floor;
 pub(super) use execution::ResidentRelease;
 mod lineage;
 mod mailbox;
+pub(super) use execution::{EARLIER_MESSAGES, UNVERIFIED_BEHIND, UNVERIFIED_REFUSAL};
+pub(super) use mailbox::{MESSAGE_RUN_KEY, MessageHandoff};
 mod native_actor;
 mod native_actor_retirement;
 pub(super) use native_actor::NativeActorEvent;
 pub(super) use native_actor_retirement::{NativeActorOwnership, NativeActorRetirement};
 mod navigation;
+#[cfg(test)]
+mod public_delta_tests;
 mod schema;
 mod terminal_owners;
+mod terminal_retention;
+#[cfg(test)]
+mod view_cost_bench;
 mod views;
+#[cfg(test)]
+mod workspace_snapshot_tests;
 
-const SCHEMA_VERSION: u32 = 19;
+const SCHEMA_VERSION: u32 = 24;
 
 /// A writer that loses a race waits rather than failing. Only the daemon writes
 /// this store, so contention is between its own client threads and is measured
@@ -55,15 +71,59 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const DIRECTORY_MODE: u32 = 0o700;
 const FILE_MODE: u32 = 0o600;
 
+/// Test pause points for interleaving another writer with `apply`/`model`.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum Pause {
+    SequenceRead,
+    BeforeCommit,
+    AfterCommit,
+}
+
+#[cfg(test)]
+thread_local! {
+    static PAUSE: std::cell::RefCell<Option<(Pause, Box<dyn FnOnce()>)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `hook` once, the next time this thread reaches `at`.
+#[cfg(test)]
+pub(super) fn pause_at(at: Pause, hook: impl FnOnce() + 'static) {
+    PAUSE.with(|slot| *slot.borrow_mut() = Some((at, Box::new(hook))));
+}
+
+#[cfg(test)]
+fn pause(at: Pause) {
+    let hook = PAUSE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        slot.take_if(|(point, _)| *point == at)
+    });
+    if let Some((_, hook)) = hook {
+        hook();
+    }
+}
+
 /// The outcome of one edit.
 #[derive(Debug)]
 pub(crate) struct Applied {
     pub(crate) model: WorkspaceModel,
+    /// This transaction's sequence, even if another writer commits before the
+    /// response snapshot is read. Only this sequence labels the edit's edge.
+    pub(crate) sequence: u64,
     /// Whether the edit changed anything. A retitle to the same title, or a
     /// delete of a channel that is already gone, must neither bump `sequence`
     /// nor wake a watcher: a window that reacted to it would redraw for nothing
     /// and, worse, could not tell the no-op apart from a real edge.
     pub(crate) changed: bool,
+    /// What the edit changed beyond what it says, for its subscribers' edge.
+    /// No-op receipts may still supply canonical metadata for the request key.
+    pub(crate) effects: crate::workspace_model::delta::EditEffects,
+}
+
+/// A committed transaction without a whole-model read.
+#[derive(Debug)]
+pub(crate) struct DeltaApplied {
+    pub(crate) changed: bool,
+    pub(crate) receipt: crate::workspace_model::delta::EditReceipt,
 }
 
 pub(crate) struct Registry {
@@ -82,10 +142,39 @@ impl Registry {
     /// Opens or creates the registry at `path`.
     pub(crate) fn at(path: &Path) -> Result<Self, String> {
         let db = schema::open(path)?;
+        execution_deltas::install(&db)?;
         Ok(Self {
             db,
             path: path.to_owned(),
         })
+    }
+
+    fn installed_path() -> Result<std::path::PathBuf, String> {
+        let dirs = crate::instance::project_dirs()
+            .ok_or_else(|| "the data directory is unavailable".to_owned())?;
+        Ok(dirs.data_dir().join("workspace-model.sqlite3"))
+    }
+
+    /// The schema of this installation's store, or `None` if it has none; see
+    /// [`schema::stored_version`].
+    pub(crate) fn stored_schema() -> Result<Option<u32>, String> {
+        schema::stored_version(&Self::installed_path()?)
+    }
+
+    /// Converts this installation's store back to schema `target`; see
+    /// [`schema::downgrade`].
+    pub(crate) fn downgrade(target: u32) -> Result<Option<u32>, String> {
+        schema::downgrade(&Self::installed_path()?, target)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stored_schema_at(path: &Path) -> Result<Option<u32>, String> {
+        schema::stored_version(path)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn downgrade_at(path: &Path, target: u32) -> Result<Option<u32>, String> {
+        schema::downgrade(path, target)
     }
 
     /// Independent WAL connection for low-rate execution transactions. The
@@ -97,6 +186,89 @@ impl Registry {
 
     /// The whole model, ordered by the ranks the registry assigned.
     pub(crate) fn model(&self) -> Result<WorkspaceModel, String> {
+        // Independent execution and workspace writers can commit between SQL
+        // statements. Pin one WAL snapshot for metadata and every model table.
+        let snapshot = self.db.unchecked_transaction().map_err(|e| e.to_string())?;
+        let model = self.model_snapshot()?;
+        snapshot.commit().map_err(|e| e.to_string())?;
+        Ok(model)
+    }
+
+    /// The authoritative owner of one pane, without inspecting unrelated descriptors.
+    pub(crate) fn pane_view(
+        &self,
+        pane: crate::model::CardId,
+    ) -> Result<Option<crate::workspace_model::views::View>, String> {
+        let snapshot = self
+            .db
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        let view = views::store::owner(&self.db, pane)?
+            .map(|scope| views::store::read_stored(&self.db, &scope))
+            .transpose()?
+            .flatten();
+        snapshot.commit().map_err(|error| error.to_string())?;
+        Ok(view)
+    }
+
+    /// Metadata-only queries pin the same coherent WAL snapshot as full reads.
+    pub(crate) fn metadata(
+        &self,
+        query: crate::workspace_model::metadata::Query,
+    ) -> Result<crate::workspace_model::metadata::Reply, String> {
+        use crate::workspace_model::metadata::{Query, Reply};
+        let snapshot = self
+            .db
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        let identity: String = self
+            .db
+            .query_row("SELECT identity FROM metadata WHERE key = 0", [], |row| {
+                row.get(0)
+            })
+            .map_err(|error| error.to_string())?;
+        let identity = identity
+            .parse()
+            .map_err(|error: uuid::Error| error.to_string())?;
+        let reply = match query {
+            Query::Identity => Reply::Identity(identity),
+            Query::Projects => Reply::Projects {
+                identity,
+                projects: project_rows(&self.db)?,
+            },
+            Query::Agents => Reply::Agents {
+                identity,
+                agents: self.agents(None)?,
+            },
+        };
+        snapshot.commit().map_err(|error| error.to_string())?;
+        Ok(reply)
+    }
+
+    /// One coherent initial subscriber snapshot, including retained closed identities.
+    pub(crate) fn subscriber_snapshot(
+        &self,
+    ) -> Result<(WorkspaceModel, Vec<crate::model::CardId>), String> {
+        let snapshot = self
+            .db
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        let model = self.model_snapshot()?;
+        let closed = self
+            .db
+            .prepare_cached("SELECT DISTINCT pane FROM retired_panes WHERE pane NOT IN (SELECT id FROM panes) ORDER BY pane")
+            .map_err(|error| error.to_string())?
+            .query_map([], |row| row.get::<_, String>(0))
+            .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|id| id.parse().map_err(|error: uuid::Error| error.to_string()))
+            .collect::<Result<Vec<_>, _>>()?;
+        snapshot.commit().map_err(|error| error.to_string())?;
+        Ok((model, closed))
+    }
+
+    fn model_snapshot(&self) -> Result<WorkspaceModel, String> {
         let (identity, sequence) = self
             .db
             .query_row(
@@ -105,66 +277,23 @@ impl Registry {
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
             )
             .map_err(|error| error.to_string())?;
+        #[cfg(test)]
+        pause(Pause::SequenceRead);
         let identity = identity.parse::<Uuid>().map_err(|error| {
             format!("stored registry identity `{identity}` is unreadable: {error}")
         })?;
-        let mut projects = self
+        let projects = project_rows(&self.db)?;
+        let channels = self
             .db
-            .prepare("SELECT repository, name, ordinal, kind FROM projects ORDER BY ordinal")
-            .map_err(|error| error.to_string())?;
-        let projects = projects
-            .query_map([], |row| {
-                Ok(ModelProject {
-                    repository: PathBuf::from(row.get::<_, String>(0)?),
-                    name: row.get(1)?,
-                    ordinal: row.get::<_, i64>(2)? as u32,
-                    kind: match row.get::<_, String>(3)?.as_str() {
-                        "git" => ProjectKind::Git,
-                        "folder" => ProjectKind::Folder,
-                        value => {
-                            return Err(rusqlite::Error::FromSqlConversionFailure(
-                                3,
-                                rusqlite::types::Type::Text,
-                                format!("unknown project kind {value}").into(),
-                            ));
-                        }
-                    },
-                })
-            })
+            .prepare(&format!(
+                "SELECT {CHANNEL_COLUMNS} FROM channels ORDER BY ordinal"
+            ))
+            .map_err(|error| error.to_string())?
+            .query_map([], channel_columns)
             .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
-            .map_err(|error| error.to_string())?;
-        let mut channels = self
-            .db
-            .prepare("SELECT id, repository, title, ordinal, title_source FROM channels ORDER BY ordinal")
-            .map_err(|error| error.to_string())?;
-        let rows = channels
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, i64>(4)?,
-                ))
-            })
-            .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
-            .map_err(|error| error.to_string())?;
-        let channels = rows
+            .map_err(|error| error.to_string())?
             .into_iter()
-            .map(|(id, repository, title, ordinal, source)| {
-                Ok(ModelChannel {
-                    title_source: match source {
-                        0 => ChannelTitleSource::Prompt,
-                        1 => ChannelTitleSource::Provider,
-                        2 => ChannelTitleSource::Manual,
-                        _ => return Err("invalid stored channel title source".into()),
-                    },
-                    id: parse_channel_id(&id)?,
-                    repository: PathBuf::from(repository),
-                    title,
-                    ordinal: ordinal as u32,
-                })
-            })
+            .map(ChannelColumns::channel)
             .collect::<Result<Vec<_>, String>>()?;
         let closed_projects = self
             .db
@@ -211,13 +340,25 @@ impl Registry {
     /// The caller has already resolved the edit's repository key; this never
     /// touches the filesystem, so an edit is decided entirely from the store.
     pub(crate) fn apply(&mut self, edit: &ModelEdit) -> Result<Applied, String> {
+        let applied = self.apply_delta(edit)?;
+        Ok(Applied {
+            model: self.model()?,
+            sequence: applied.receipt.sequence,
+            changed: applied.changed,
+            effects: applied.receipt.effects,
+        })
+    }
+
+    pub(crate) fn apply_delta(&mut self, edit: &ModelEdit) -> Result<DeltaApplied, String> {
         let transaction = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         schema::require_current(&transaction)?;
+        let mut recorder = views::Recorder::default();
+        let mut removed_channels = Vec::new();
         let changed = match edit {
-            ModelEdit::SeedView { .. } | ModelEdit::ChangeView { .. } => views::apply(&transaction, edit)?,
+            ModelEdit::SeedView { .. } | ModelEdit::ChangeView { .. } => views::apply_recorded(&transaction, edit, &mut recorder)?,
             ModelEdit::ResetNavigation { .. } | ModelEdit::ReorderNavigation { .. } => navigation::apply(&transaction, edit)?,
             ModelEdit::AgentsChanged | ModelEdit::ChannelWorkChanged { .. } => {
                 return Err("Agent model changes are committed by the execution service".into());
@@ -306,7 +447,8 @@ impl Registry {
                     statement.query_map(params![key], |row| row.get::<_, String>(0)).map_err(|e| e.to_string())?
                         .collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())?
                 };
-                views::retire_project_placements(&transaction, repository)?;
+                views::retire_project_placements(&transaction, repository, &mut recorder)?;
+                removed_channels.extend(channels.iter().map(|id| parse_channel_id(id)).collect::<Result<Vec<_>, _>>()?);
                 for channel in channels {
                     channel_work::deleted_in(&transaction, channel.parse().map_err(|_| "The channel identity is unreadable")?)?;
                 }
@@ -402,20 +544,24 @@ impl Registry {
                 if view.revision != *expected_revision || view.primary_chat() != Some(*card) {
                     return Err("The channel's primary conversation changed; title suggestion refused".into());
                 }
-                transaction.execute(
+                let retitled = transaction.execute(
                     "UPDATE channels SET title = ?2, title_source = ?3 WHERE id = ?1 AND (title = '' OR title_source <= ?3) AND (title <> ?2 OR title_source <> ?3)",
                     params![id.to_string(), title, *source as i64],
-                ).map_err(|error| error.to_string())? > 0
+                ).map_err(|error| error.to_string())? > 0;
+                if retitled {
+                    recorder.retitled(*id);
+                }
+                retitled
             }
             ModelEdit::RetireEmptyChannel { home, expected_view_revision } => {
                 if channel_work::may_auto_retire_in(&transaction, home, *expected_view_revision)? {
-                    views::retire_channel_placements(&transaction, home.channel)?;
+                    views::retire_channel_placements(&transaction, home.channel, &mut recorder)?;
                     channel_work::deleted_in(&transaction, home.channel)?;
                     transaction.execute("DELETE FROM channels WHERE id=?1", params![home.channel.to_string()]).map_err(|e| e.to_string())? > 0
                 } else { false }
             }
             ModelEdit::DeleteChannel { id } => {
-                views::retire_channel_placements(&transaction, *id)?;
+                views::retire_channel_placements(&transaction, *id, &mut recorder)?;
                 channel_work::deleted_in(&transaction, *id)?;
                 transaction
                     .execute(
@@ -442,12 +588,205 @@ impl Registry {
                 )
                 .map_err(|error| error.to_string())?;
         }
+        let sequence = transaction
+            .query_row("SELECT sequence FROM metadata WHERE key = 0", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(|error| error.to_string())? as u64;
+        let mut effects = recorder.finish(&transaction)?;
+        public_effects(&transaction, edit, &mut effects)?;
+        effects.removed_channels.extend(removed_channels);
+        let identity: String = transaction
+            .query_row("SELECT identity FROM metadata WHERE key = 0", [], |row| {
+                row.get(0)
+            })
+            .map_err(|error| error.to_string())?;
+        let identity = identity
+            .parse()
+            .map_err(|error: uuid::Error| error.to_string())?;
+        // The edit publishes its own effects; its trigger inventory goes with
+        // the transaction, so a committed edit cannot then report failure.
+        execution_deltas::discard_execution_delta_in(&transaction)?;
+        #[cfg(test)]
+        pause(Pause::BeforeCommit);
         transaction.commit().map_err(|error| error.to_string())?;
-        Ok(Applied {
-            model: self.model()?,
+        #[cfg(test)]
+        pause(Pause::AfterCommit);
+        Ok(DeltaApplied {
             changed,
+            receipt: crate::workspace_model::delta::EditReceipt {
+                identity,
+                sequence,
+                effects,
+            },
         })
     }
+}
+
+fn project_rows(db: &Connection) -> Result<Vec<ModelProject>, String> {
+    db.prepare("SELECT repository, name, ordinal, kind FROM projects ORDER BY ordinal")
+        .map_err(|error| error.to_string())?
+        .query_map([], |row| {
+            Ok(ModelProject {
+                repository: PathBuf::from(row.get::<_, String>(0)?),
+                name: row.get(1)?,
+                ordinal: row.get::<_, i64>(2)? as u32,
+                kind: match row.get::<_, String>(3)?.as_str() {
+                    "git" => ProjectKind::Git,
+                    "folder" => ProjectKind::Folder,
+                    value => {
+                        return Err(rusqlite::Error::FromSqlConversionFailure(
+                            3,
+                            rusqlite::types::Type::Text,
+                            format!("unknown project kind {value}").into(),
+                        ));
+                    }
+                },
+            })
+        })
+        .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
+        .map_err(|error| error.to_string())
+}
+
+/// Canonical rows for a request's keys, including no-op receipts. A stale
+/// client's optimistic value is not evidence of what the transaction kept.
+fn public_effects(
+    db: &Connection,
+    edit: &ModelEdit,
+    effects: &mut crate::workspace_model::delta::EditEffects,
+) -> Result<(), String> {
+    use crate::workspace_model::NavigationOrder;
+    match edit {
+        ModelEdit::OpenProject { repository, .. } | ModelEdit::ReopenProject { repository, .. } => {
+            let row = db
+                .query_row(
+                    "SELECT name, ordinal, kind FROM projects WHERE repository = ?1",
+                    [repository_key(repository)?],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            match row {
+                Some((name, ordinal, kind)) => effects.projects.push(ModelProject {
+                    repository: repository.clone(),
+                    name,
+                    ordinal: ordinal as u32,
+                    kind: match kind.as_str() {
+                        "git" => ProjectKind::Git,
+                        "folder" => ProjectKind::Folder,
+                        _ => return Err(format!("unknown project kind {kind}")),
+                    },
+                }),
+                None => effects.removed_projects.push(repository.clone()),
+            }
+        }
+        ModelEdit::CloseProject { repository } => effects.removed_projects.push(repository.clone()),
+        ModelEdit::CreateChannel { id, .. }
+        | ModelEdit::RetitleChannel { id, .. }
+        | ModelEdit::SuggestChannelTitle { id, .. }
+        | ModelEdit::SuggestConversationTitle { id, .. }
+        | ModelEdit::DeleteChannel { id } => record_channel(db, *id, effects)?,
+        ModelEdit::RetireEmptyChannel { home, .. } => record_channel(db, home.channel, effects)?,
+        ModelEdit::ResetNavigation { repository }
+        | ModelEdit::ReorderNavigation { repository, .. } => {
+            let encoded: Option<String> = db
+                .query_row(
+                    "SELECT items FROM navigation_orders WHERE repository = ?1",
+                    [repository_key(repository)?],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            let items = encoded
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .map_err(|error| error.to_string())?
+                .unwrap_or_default();
+            effects.navigation_orders.push(NavigationOrder {
+                repository: repository.clone(),
+                items,
+            });
+        }
+        ModelEdit::SeedView { .. }
+        | ModelEdit::ChangeView { .. }
+        | ModelEdit::AgentsChanged
+        | ModelEdit::ChannelWorkChanged { .. } => {}
+    }
+    Ok(())
+}
+
+fn record_channel(
+    db: &Connection,
+    id: ChannelId,
+    effects: &mut crate::workspace_model::delta::EditEffects,
+) -> Result<(), String> {
+    effects.channels.retain(|channel| channel.id != id);
+    if let Some(channel) = channel_row(db, id)? {
+        effects.channels.push(channel);
+    } else {
+        effects.removed_channels.push(id);
+    }
+    Ok(())
+}
+
+const CHANNEL_COLUMNS: &str = "id, repository, title, ordinal, title_source";
+
+/// A `channels` row as [`CHANNEL_COLUMNS`] selects it.
+struct ChannelColumns {
+    id: String,
+    repository: String,
+    title: String,
+    ordinal: i64,
+    title_source: i64,
+}
+
+fn channel_columns(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChannelColumns> {
+    Ok(ChannelColumns {
+        id: row.get(0)?,
+        repository: row.get(1)?,
+        title: row.get(2)?,
+        ordinal: row.get(3)?,
+        title_source: row.get(4)?,
+    })
+}
+
+impl ChannelColumns {
+    fn channel(self) -> Result<ModelChannel, String> {
+        Ok(ModelChannel {
+            title_source: match self.title_source {
+                0 => ChannelTitleSource::Prompt,
+                1 => ChannelTitleSource::Provider,
+                2 => ChannelTitleSource::Manual,
+                _ => return Err("invalid stored channel title source".into()),
+            },
+            id: parse_channel_id(&self.id)?,
+            repository: PathBuf::from(self.repository),
+            title: self.title,
+            ordinal: self.ordinal as u32,
+        })
+    }
+}
+
+/// One channel as the model lists it, or `None` once it is gone.
+fn channel_row(db: &Connection, id: ChannelId) -> Result<Option<ModelChannel>, String> {
+    db.prepare_cached(&format!(
+        "SELECT {CHANNEL_COLUMNS} FROM channels WHERE id = ?1"
+    ))
+    .and_then(|mut statement| {
+        statement
+            .query_row([id.to_string()], channel_columns)
+            .optional()
+    })
+    .map_err(|error| error.to_string())?
+    .map(ChannelColumns::channel)
+    .transpose()
 }
 
 /// Reserves the next rank of `column` and returns it.
@@ -635,6 +974,26 @@ fn migrate_through(
     if version < 19 && target >= 19 {
         automation_notifications::migrate(tx)?;
         schema::migration_checkpoint(19)?;
+    }
+    if version < 20 && target >= 20 {
+        terminal_retention::migrate(tx)?;
+        schema::migration_checkpoint(20)?;
+    }
+    if version < 21 && target >= 21 {
+        automation_attention::migrate(tx)?;
+        schema::migration_checkpoint(21)?;
+    }
+    if version < 22 && target >= 22 {
+        automations::migrate_history(tx)?;
+        schema::migration_checkpoint(22)?;
+    }
+    if version < 23 && target >= 23 {
+        views::store::migrate(tx)?;
+        schema::migration_checkpoint(23)?;
+    }
+    if version < 24 && target >= 24 {
+        console_relaunch::migrate(tx)?;
+        schema::migration_checkpoint(24)?;
     }
     Ok(())
 }
@@ -834,6 +1193,94 @@ mod tests {
             })
             .unwrap();
         assert!(registry.model().unwrap().navigation_orders.is_empty());
+    }
+
+    #[test]
+    fn a_noop_drag_keeps_new_channels_above_saved_order_in_fold_peers_and_restart() {
+        use crate::workspace_model::NavigationItem;
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("navigation.sqlite3");
+        let mut registry = Registry::at(&database).unwrap();
+        registry.apply(&open("/repo")).unwrap();
+        let old = ChannelId::new();
+        registry
+            .apply(&create(old, "/repo", "Saved conversation"))
+            .unwrap();
+        let worktree = NavigationItem::Worktree("/repo".into());
+        let old = NavigationItem::Channel(old);
+        let manual = ModelEdit::ReorderNavigation {
+            repository: "/repo".into(),
+            source: worktree.clone(),
+            before: Some(old.clone()),
+            fallback: vec![old.clone(), worktree.clone()],
+        };
+        let saved = registry.apply(&manual).unwrap().model;
+        assert_eq!(
+            saved.navigation_orders[0].items,
+            vec![worktree.clone(), old.clone()]
+        );
+        let newest = ChannelId::new();
+        let create = create(newest, "/repo", "New conversation");
+        let created = registry.apply(&create).unwrap().model;
+        let newest = NavigationItem::Channel(newest);
+        let added_worktree = NavigationItem::Worktree("/repo/.worktrees/new".into());
+        // This is precisely the visible list after creation. Dropping W before
+        // its existing next sibling O is visually unchanged, including N above.
+        let visible = vec![
+            newest.clone(),
+            worktree.clone(),
+            old.clone(),
+            added_worktree.clone(),
+        ];
+        let drag = ModelEdit::ReorderNavigation {
+            repository: "/repo".into(),
+            source: worktree.clone(),
+            before: Some(old.clone()),
+            fallback: visible.clone(),
+        };
+        let applied = registry.apply(&drag).unwrap();
+        assert_eq!(applied.model.navigation_orders[0].items, visible);
+        assert_eq!(
+            applied.model.channels, created.channels,
+            "drag changes no channel identity, title or rank"
+        );
+        let mut folded = saved;
+        folded.fold(created.sequence, &create);
+        folded.fold(applied.model.sequence, &drag);
+        assert_eq!(folded.navigation_orders, applied.model.navigation_orders);
+        let repeated = registry.apply(&drag).unwrap();
+        assert!(!repeated.changed);
+        assert_eq!(repeated.model.sequence, applied.model.sequence);
+        let mut peer = Registry::at(&database).unwrap();
+        assert_eq!(
+            peer.model().unwrap().navigation_orders,
+            applied.model.navigation_orders
+        );
+        drop(registry);
+        let mut registry = Registry::at(&database).unwrap();
+        assert_eq!(
+            registry.model().unwrap().navigation_orders,
+            applied.model.navigation_orders
+        );
+        // An intentional later move of N is still authoritative.
+        let move_newest = ModelEdit::ReorderNavigation {
+            repository: "/repo".into(),
+            source: newest.clone(),
+            before: None,
+            fallback: visible,
+        };
+        let moved = registry.apply(&move_newest).unwrap();
+        assert!(moved.changed);
+        assert_eq!(
+            moved.model.navigation_orders[0].items,
+            vec![worktree, old, added_worktree, newest]
+        );
+        folded.fold(moved.model.sequence, &move_newest);
+        assert_eq!(folded.navigation_orders, moved.model.navigation_orders);
+        assert_eq!(
+            peer.model().unwrap().navigation_orders,
+            moved.model.navigation_orders
+        );
     }
 
     #[test]
@@ -1082,10 +1529,29 @@ mod tests {
                 title_source: Default::default(),
             })
             .unwrap();
-        registry
-            .db
+        // Build the legacy store with no live Registry connection: its TEMP
+        // execution triggers describe the current schema, not the old one.
+        drop(registry);
+        let path = directory.path().join("model.sqlite3");
+        let legacy = Connection::open(&path).unwrap();
+        legacy
             .execute_batch(
-                "DROP TABLE automation_notifications;
+                "DROP TABLE console_relaunches;
+                 DROP TABLE automation_precheck_history_cleanup;
+                 DROP TABLE automation_retired_manual_requests;
+                 DROP INDEX automation_removed_history;
+                 DROP INDEX automation_firing_successors;
+                 ALTER TABLE automation_firings DROP COLUMN previous_firing;
+                 DROP TABLE automation_run_attention;
+                 DROP TABLE shared_terminal_retention_pins;
+                 DROP TABLE terminal_retention_pins;
+                 DROP TABLE shared_view_terminal_sources;
+                 DROP TABLE view_operations;
+                 DROP TABLE retired_panes;
+                 DROP TABLE panes;
+                 DROP TABLE view_scopes;
+                 DROP TABLE view_revision_clock;
+                 DROP TABLE automation_notifications;
                  DROP TABLE channel_work_placement_epochs;
                  DROP TABLE channel_work_placement_clock;
                  DROP TABLE channel_work_operations;
@@ -1095,8 +1561,8 @@ mod tests {
                  ALTER TABLE channels DROP COLUMN title_source; PRAGMA user_version = 2;",
             )
             .unwrap();
-        drop(registry);
-        let mut restored = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        drop(legacy);
+        let mut restored = Registry::at(&path).unwrap();
         assert!(
             !restored
                 .apply(&ModelEdit::SuggestChannelTitle {

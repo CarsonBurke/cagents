@@ -1,5 +1,5 @@
 //! Authenticated retained Claude helper and bounded attachment transport.
-use super::super::{LocalHandle, Rejection, Update};
+use super::super::{LocalHandle, QueueRefusal, Rejection, Update};
 pub(crate) use super::final_snapshot::{RetirementInspection, VerifiedRetirement};
 use super::journal::Journal;
 use super::journal::{ContinuityLoss, InputIdentity, InputReceipt, InputState};
@@ -9,7 +9,10 @@ use crate::{
         self, Command, Snapshot,
         protocol::{ExecutionContext, ProcessSpec, TransportSpec},
     },
-    daemon::holder_registry::{self as registry, Kind, Process, Record},
+    daemon::{
+        holder_registry::{self as registry, Kind, Process, Record},
+        owned_children::DetachedWork,
+    },
     model::HostSessionProof,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -18,7 +21,7 @@ use std::{
     collections::BTreeMap,
     fs::File,
     os::{
-        fd::{AsFd, AsRawFd, FromRawFd, RawFd},
+        fd::{AsRawFd, FromRawFd, RawFd},
         unix::{
             fs::MetadataExt,
             net::{UnixListener, UnixStream},
@@ -38,6 +41,53 @@ const ARGUMENT: &str = "--cagents-native-actor";
 pub(super) const PROTOCOL: u32 = 2;
 const CAPABILITY: &str = registry::RETAINED_CLAUDE_CAPABILITY;
 const TIMEOUT: Duration = Duration::from_secs(5);
+/// How often the serve loop checks admitted inputs for completion.
+const INPUT_COMPLETION_POLL: Duration = Duration::from_millis(20);
+/// How long a caller waits for an input's acknowledgement before reporting
+/// its outcome as unknown.
+const ACKNOWLEDGEMENT_WAIT: Duration = Duration::from_secs(10);
+/// Delay before the second retransmission of an input whose `input` call
+/// failed. Later delays double, up to `TIMEOUT`.
+const RETRANSMIT_DELAY: Duration = Duration::from_millis(100);
+/// How long before its caller stops waiting an unconfirmed input is settled,
+/// so a caller still waiting hears the outcome.
+const SETTLE_MARGIN: Duration = Duration::from_secs(1);
+/// How many times the helper is asked to settle an unconfirmed input before
+/// the proxy stops asking. Until the input is overdue, retries back off to
+/// `TIMEOUT`, so this spans up to about a minute: long enough for a busy journal to clear, and bounded for a
+/// helper that keeps refusing, such as one that already retired the input.
+const SETTLE_ATTEMPTS: u32 = 12;
+/// How long new input waits on a helper that does not answer requests to
+/// settle an unconfirmed input. Missed answers are not counted toward
+/// `SETTLE_ATTEMPTS`, as the helper may return and settle it, but a helper
+/// that is alive and never answers in time, such as one wedged on its
+/// journal, would otherwise fence input for good. After this, new input is
+/// refused at once while the helper is still asked, backing off to
+/// `OVERDUE_RETRY` between requests.
+const SETTLE_LIMIT: Duration = Duration::from_secs(120);
+/// The longest wait between requests to settle an input once new input no
+/// longer waits for it. Each request can occupy the helper, and this pump, for up to
+/// `TIMEOUT`, so a slow helper is not kept from serving state meanwhile.
+const OVERDUE_RETRY: Duration = Duration::from_secs(60);
+// These reach the person through the chat pane, attached to a message, a
+// model choice or a stop. They say what happened to it and what to do; the
+// helper's own reasons stay in the logs.
+use crate::chat::failure::delivery::{
+    CLOSING_INPUT, CROWDED_INPUT, DAMAGED_INPUT, DISCONTINUOUS_INPUT, HANDOVER_INPUT,
+    OVERSIZED_INPUT, RECONNECTING_INPUT, RETIRING_INPUT, STOPPED_INPUT, UNACKNOWLEDGED_ANSWER,
+    UNACKNOWLEDGED_INPUT, UNACKNOWLEDGED_STOP, UNAVAILABLE_INPUT, UNCONFIRMED_INPUT,
+    UNSETTLEABLE_INPUT, UNSETTLED_INPUT, UNSUPPORTED_INPUT,
+};
+/// The outcome of an admitted input the actor's queue would not take.
+fn unrun_input_outcome(refusal: QueueRefusal) -> &'static str {
+    match refusal {
+        QueueRefusal::Closed => CLOSING_INPUT,
+        QueueRefusal::Full => CROWDED_INPUT,
+    }
+}
+/// A helper's answer to a request it does not implement, such as an older
+/// helper asked to settle an input.
+const UNKNOWN_METHOD: &str = "Unknown retained actor method/version";
 fn payload_digest(bytes: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     Sha256::digest(bytes).into()
@@ -119,10 +169,22 @@ pub(crate) struct Resident {
     pub close: CloseObservation,
     pub idle: bool,
     pub failure: Option<String>,
+    /// When the latest turn finished, in Unix milliseconds. A helper that
+    /// predates it reports none.
+    #[serde(default)]
+    pub finished_at: Option<u64>,
     pub confirmed_session: Option<String>,
     pub background_subagents: Vec<String>,
     pub interrupt_subagents: Vec<String>,
+    /// What holds the conversation, by name. A helper that predates it
+    /// reports none; see [`Resident::work_hold`].
+    #[serde(default)]
+    work_hold: Option<chat::WorkHold>,
     pub account_reports: Vec<Update>,
+    /// How the provider addresses the conversation's subagents. A helper
+    /// that predates them reports none.
+    #[serde(default)]
+    pub agent_addresses: Vec<chat::AgentAddress>,
     next_input: u64,
     acknowledged_input_count: usize,
     pub continuity_loss: Option<ContinuityLoss>,
@@ -130,6 +192,24 @@ pub(crate) struct Resident {
     pub outbox_ack: u64,
     pub outbox_latest: u64,
     changed: u64,
+}
+impl Resident {
+    /// What holds the conversation. A helper that predates names reports its
+    /// background subagents only as running ones it cannot name; it never
+    /// reports one waiting.
+    pub(crate) fn work_hold(&self) -> chat::WorkHold {
+        self.work_hold.clone().unwrap_or_else(|| chat::WorkHold {
+            turn: self.busy || self.waiting || !self.requests.is_empty(),
+            subagents: self
+                .background_subagents
+                .iter()
+                .map(|_| chat::HeldSubagent {
+                    name: String::new(),
+                    waiting: false,
+                })
+                .collect(),
+        })
+    }
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct ActorInspection {
@@ -197,6 +277,38 @@ struct Pending {
     bytes: usize,
     reply: Option<crossbeam_channel::Sender<Result<(), Rejection>>>,
 }
+/// The newest input whose delivery is unconfirmed. It fences admission until
+/// a helper receipt resolves it.
+struct UncertainInput {
+    identity: InputIdentity,
+    /// When its caller stops waiting and reports the outcome as unknown.
+    acknowledgement_deadline: Instant,
+    /// Set once the original `input` call has failed.
+    retransmit: Option<Retransmit>,
+    /// The helper's latest refusal of the input, given without a receipt.
+    refusal: Option<String>,
+    /// How many requests to settle the input the helper has refused.
+    settle_failures: u32,
+    /// When the helper was first asked to settle the input.
+    settling_since: Option<Instant>,
+    /// New input is refused at once rather than waiting for this one: the
+    /// helper cannot settle it, or has not answered for `SETTLE_LIMIT`. A
+    /// receipt for it still lifts the fence.
+    unsettleable: bool,
+}
+impl UncertainInput {
+    /// When the helper is asked to settle the input rather than receive it
+    /// again.
+    fn settle_at(&self) -> Instant {
+        self.acknowledgement_deadline
+            .checked_sub(SETTLE_MARGIN)
+            .unwrap_or(self.acknowledgement_deadline)
+    }
+}
+struct Retransmit {
+    next: Instant,
+    delay: Duration,
+}
 struct Remote {
     close_only: bool,
     source: chat::Session,
@@ -211,10 +323,14 @@ struct Remote {
     launch_account_scope: Result<crate::account::scope::LaunchAccountScope, String>,
     recovery_environment: BTreeMap<String, String>,
     desired_visible: Mutex<Option<bool>>,
+    wake: Arc<push::Wake>,
+    binary_codec: std::sync::OnceLock<bool>,
     desired_observe: AtomicBool,
     notified_prompt_revision: std::sync::atomic::AtomicU64,
     input_sequence: Mutex<u64>,
-    uncertain_input: Mutex<Option<InputIdentity>>,
+    uncertain_input: Mutex<Option<UncertainInput>>,
+    /// Signalled when the uncertain input is settled.
+    input_settled: std::sync::Condvar,
     pending: Mutex<Vec<Pending>>,
     retiring_inputs: Mutex<Vec<InputIdentity>>,
     recovering_inputs: AtomicBool,
@@ -222,6 +338,9 @@ struct Remote {
     stop: AtomicBool,
     installed: AtomicBool,
     preserved: AtomicBool,
+    /// Whether `close` asks the helper to spare the work the provider
+    /// already detached. See [`DetachedWork`].
+    spare_detached: AtomicBool,
     worker: Mutex<Option<thread::JoinHandle<()>>>,
     startup: Mutex<Option<UnixStream>>,
 }
@@ -279,6 +398,18 @@ impl chat::protocol::LaunchCleanup for StartupOwner {
     }
 }
 #[cfg(test)]
+fn fixture_preserve_and_join(actor: &RemoteActor) {
+    actor.preserve().unwrap();
+    // Model the old daemon's exit before rotating its lease. Preserve stops
+    // the observer asynchronously; its last authentication request can still
+    // briefly probe the lease after it drops. Join only that fixture observer,
+    // retaining the actual helper/provider and the old proxy's epoch checks.
+    let worker = actor.0.worker.lock().unwrap().take();
+    if let Some(worker) = worker {
+        worker.join().expect("preserved fixture observer panicked");
+    }
+}
+#[cfg(test)]
 pub(super) fn fixture_source() -> chat::Session {
     let id = crate::model::TerminalId::new();
     chat::Session {
@@ -307,6 +438,12 @@ pub(super) fn fixture_source() -> chat::Session {
 impl RemoteActor {
     #[cfg(test)]
     pub(in crate::chat::runtime) fn fixture() -> Self {
+        Self::fixture_at(PathBuf::from("/nonexistent/cagents-actor-fixture"))
+    }
+    /// A fixture proxy whose helper socket is `socket`. The in-process peer
+    /// authenticates, because the fixture names this process as its holder.
+    #[cfg(test)]
+    fn fixture_at(socket: PathBuf) -> Self {
         use crate::model::{BootId, HostIncarnation, HostSessionId, TerminalId};
         let process = Process::read(std::process::id() as i32).unwrap();
         let boot = BootId::new("fixture-boot");
@@ -341,10 +478,13 @@ impl RemoteActor {
             },
             idle: true,
             failure: None,
+            finished_at: None,
             confirmed_session: None,
             background_subagents: Vec::new(),
             interrupt_subagents: Vec::new(),
+            work_hold: None,
             account_reports: Vec::new(),
+            agent_addresses: Vec::new(),
             next_input: 1,
             acknowledged_input_count: 0,
             continuity_loss: None,
@@ -375,7 +515,7 @@ impl RemoteActor {
                 host_session_id: HostSessionId::new("fixture"),
                 host_incarnation: HostIncarnation::new("fixture"),
             },
-            socket: PathBuf::from("/nonexistent/cagents-actor-fixture"),
+            socket,
             state: Mutex::new(Arc::new(resident)),
             publication: Mutex::new(()),
             final_snapshot: Mutex::new(None),
@@ -385,10 +525,13 @@ impl RemoteActor {
             launch_account_scope: Err("fixture has no account scope".into()),
             recovery_environment: Default::default(),
             desired_visible: Mutex::new(None),
+            binary_codec: std::sync::OnceLock::new(),
+            wake: Arc::new(push::Wake::new().unwrap()),
             desired_observe: AtomicBool::new(false),
             notified_prompt_revision: std::sync::atomic::AtomicU64::new(0),
             input_sequence: Mutex::new(1),
             uncertain_input: Mutex::new(None),
+            input_settled: std::sync::Condvar::new(),
             pending: Mutex::new(Vec::new()),
             retiring_inputs: Mutex::new(Vec::new()),
             recovering_inputs: AtomicBool::new(false),
@@ -396,6 +539,7 @@ impl RemoteActor {
             stop: AtomicBool::new(false),
             installed: AtomicBool::new(true),
             preserved: AtomicBool::new(false),
+            spare_detached: AtomicBool::new(false),
 
             worker: Mutex::new(None),
             startup: Mutex::new(None),
@@ -491,6 +635,24 @@ impl RemoteActor {
         validate_evidence_record(record, proof)?;
         final_snapshot::inspect_retirement(record, proof)
     }
+    /// The exact helper and provider in this record ended without retirement
+    /// and left no process in the provider's group or the helper's session.
+    /// This proves no writer survives; it is never retirement evidence.
+    pub fn inspect_abandoned(record: &Record, proof: &HostSessionProof) -> Result<bool, String> {
+        authorize_reader(proof)?;
+        validate_evidence_record(record, proof)?;
+        super::execution_exit::abandoned(&record.holder, &record.root)
+    }
+    /// Release the transcript a verified retirement's final receipt no longer
+    /// needs. Returns the bytes released; anything not yet retired is kept.
+    pub fn compact_retired_receipt(
+        record: &Record,
+        proof: &HostSessionProof,
+    ) -> Result<u64, String> {
+        authorize_reader(proof)?;
+        validate_evidence_record(record, proof)?;
+        final_snapshot::compact_retired(record, proof)
+    }
     pub fn retired_actor_receipt(
         record: &Record,
         proof: &HostSessionProof,
@@ -547,11 +709,9 @@ impl RemoteActor {
         if self.0.close_only {
             return Err(close_only_refusal());
         }
-        let control =
-            registry::connect_until(&self.0.socket, deadline).map_err(|error| error.to_string())?;
-        verify_peer(&control, &self.0.identity.record)?;
-        deadline_io::send_until(
-            &control,
+        let resolved: Result<chat::Session, String> = exchange(
+            &self.0.socket,
+            &self.0.identity.record,
             &Invocation {
                 proof: self.0.proof.clone(),
                 epoch: Some(self.0.epoch),
@@ -560,8 +720,6 @@ impl RemoteActor {
             },
             deadline,
         )?;
-        let resolved: Result<chat::Session, String> =
-            deadline_io::receive_until(&control, deadline)?;
         let resolved = resolved?;
         if resolved.id != self.0.identity.record.terminal
             || resolved.proof.as_ref() != Some(&self.0.proof)
@@ -618,8 +776,17 @@ impl RemoteActor {
                 resident.ready = false;
                 resident.idle = false;
                 resident.busy = false;
+                let (changed, generation) = (resident.changed, resident.generation);
                 if !self.publish_resident_inner(resident, true) {
-                    return Err("Closed actor metadata was superseded during refresh".into());
+                    // Another refresh, such as the outcome broker's while a
+                    // close drains the outbox, can publish a newer closed
+                    // reply first. This older one is then only stale.
+                    let current = self.state();
+                    if !(current.completed
+                        && (current.changed > changed || current.generation > generation))
+                    {
+                        return Err("Closed actor metadata was superseded during refresh".into());
+                    }
                 }
             } else if !self.publish_resident(resident) && self.0.stop.load(Ordering::Acquire) {
                 return Err("Retained actor attachment closed during refresh".into());
@@ -658,9 +825,11 @@ impl RemoteActor {
             .desired_visible
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = Some(visible);
+        self.0.wake.notify();
     }
     pub fn observe_next_update(&self) -> u64 {
         self.0.desired_observe.store(true, Ordering::Release);
+        self.0.wake.notify();
         self.state().generation
     }
     pub fn attachment_snapshot(&self) -> Snapshot {
@@ -885,14 +1054,12 @@ impl RemoteActor {
         deadline: Instant,
     ) -> Result<ActorInspection, String> {
         if Instant::now() >= deadline {
-            return Err("Retained actor inspection deadline expired".into());
+            return Err("Retained actor deadline expired before the `inspect` request".into());
         }
         validate_record(record)?;
-        let control =
-            registry::connect_until(socket, deadline).map_err(|error| error.to_string())?;
-        verify_peer(&control, record)?;
-        deadline_io::send_until(
-            &control,
+        let response: Result<ActorInspection, String> = exchange(
+            socket,
+            record,
             &Invocation {
                 proof,
                 epoch: None,
@@ -901,8 +1068,6 @@ impl RemoteActor {
             },
             deadline,
         )?;
-        let response: Result<ActorInspection, String> =
-            deadline_io::receive_until(&control, deadline)?;
         let response = response?;
         if response.identity.record != *record || response.source.id != record.terminal {
             return Err("Retained actor inspection returned another exact holder identity".into());
@@ -953,11 +1118,9 @@ impl RemoteActor {
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         validate_record(record)?;
-        let control =
-            registry::connect_until(socket, deadline).map_err(|error| error.to_string())?;
-        verify_peer(&control, record)?;
-        deadline_io::send_until(
-            &control,
+        let attached: Result<Attached, String> = exchange(
+            socket,
+            record,
             &Invocation {
                 proof: proof.clone(),
                 epoch: None,
@@ -966,7 +1129,6 @@ impl RemoteActor {
             },
             deadline,
         )?;
-        let attached: Result<Attached, String> = deadline_io::receive_until(&control, deadline)?;
         let attached = attached?;
         if &attached.identity.record != record || attached.close_only != close_only {
             return Err("Retained actor changed identity during attachment".into());
@@ -1007,10 +1169,13 @@ impl RemoteActor {
             proof,
             socket,
             desired_visible: Mutex::new(None),
+            binary_codec: std::sync::OnceLock::new(),
+            wake: Arc::new(push::Wake::new()?),
             desired_observe: AtomicBool::new(false),
             notified_prompt_revision: std::sync::atomic::AtomicU64::new(0),
             input_sequence: Mutex::new(attached.resident.next_input),
             uncertain_input: Mutex::new(None),
+            input_settled: std::sync::Condvar::new(),
             state: Mutex::new(Arc::new(attached.resident)),
             publication: Mutex::new(()),
             final_snapshot: Mutex::new(None),
@@ -1024,10 +1189,13 @@ impl RemoteActor {
             stop: AtomicBool::new(false),
             installed: AtomicBool::new(false),
             preserved: AtomicBool::new(false),
+            spare_detached: AtomicBool::new(false),
 
             worker: Mutex::new(None),
             startup: Mutex::new(startup),
         }));
+        let watch = remote.watch()?;
+        let wake = remote.0.wake.clone();
         let weak = Arc::downgrade(&remote.0);
         let worker = thread::Builder::new()
             .name("cagents-actor-proxy".into())
@@ -1063,6 +1231,7 @@ impl RemoteActor {
                     }
                     let old = actor.state();
                     let response = actor.call::<Option<Resident>>("state", json!([old.changed]));
+                    let mut retry_housekeeping = response.is_err();
                     if actor.0.stop.load(Ordering::Acquire) {
                         break;
                     }
@@ -1077,7 +1246,7 @@ impl RemoteActor {
                             break;
                         }
                     }
-                    let _ = actor.reconcile_acknowledged_inputs();
+                    retry_housekeeping |= actor.reconcile_acknowledged_inputs().is_err();
                     let identities: Vec<_> = actor
                         .0
                         .pending
@@ -1087,20 +1256,99 @@ impl RemoteActor {
                         .filter(|pending| pending.reply.is_some())
                         .map(|pending| pending.identity.clone())
                         .collect();
-                    if !identities.is_empty()
-                        && let Ok(receipts) =
-                            actor.call::<Vec<InputReceipt>>("input_receipts", json!([identities]))
-                    {
-                        actor.apply_receipts(&receipts);
+                    if !identities.is_empty() {
+                        match actor.call::<Vec<InputReceipt>>("input_receipts", json!([identities]))
+                        {
+                            Ok(receipts) => actor.apply_receipts(&receipts),
+                            Err(_) => retry_housekeeping = true,
+                        }
                     }
-                    let _ = actor.flush_input_retirements();
+                    actor.resolve_uncertain_input();
+                    retry_housekeeping |= actor.flush_input_retirements().is_err();
+                    let retry = if watch.is_none() {
+                        Some(Duration::from_millis(50))
+                    } else {
+                        actor.retry_after(retry_housekeeping)
+                    };
                     drop(actor);
-                    thread::sleep(Duration::from_millis(50));
+                    if let Err(error) = wake.wait(watch.as_ref(), retry) {
+                        if let Some(inner) = weak.upgrade() {
+                            Self(inner).publish_unavailable(&error);
+                        }
+                        break;
+                    }
                 }
             })
             .map_err(|error| error.to_string())?;
         *remote.0.worker.lock().unwrap_or_else(|p| p.into_inner()) = Some(worker);
         Ok(remote)
+    }
+    fn retry_after(&self, failed: bool) -> Option<Duration> {
+        // Accepted inputs finish through helper publication. Only work that
+        // failed, or has a scheduled retransmission, needs a timer.
+        if failed
+            || self.0.recovering_inputs.load(Ordering::Acquire)
+            || self.state().acknowledged_input_count > 0
+            || self.0.desired_observe.load(Ordering::Acquire)
+            || self
+                .0
+                .desired_visible
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_some()
+            || !self
+                .0
+                .retiring_inputs
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty()
+        {
+            return Some(Duration::from_millis(50));
+        }
+        self.0
+            .uncertain_input
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .and_then(|input| input.retransmit.as_ref())
+            .map(|retry| retry.next.saturating_duration_since(Instant::now()))
+    }
+    fn watch(&self) -> Result<Option<UnixStream>, String> {
+        let deadline = Instant::now() + TIMEOUT;
+        let control =
+            registry::connect_until(&self.0.socket, deadline).map_err(|e| e.to_string())?;
+        verify_peer(&control, &self.0.identity.record)?;
+        deadline_io::send_until(
+            &control,
+            &Invocation {
+                proof: self.0.proof.clone(),
+                epoch: Some(self.0.epoch),
+                method: "watch".into(),
+                args: Value::Null,
+            },
+            deadline,
+        )?;
+        let (result, mut fds) =
+            crate::descriptor_frame::receive_json_with_fds_until::<Result<(), String>>(
+                &control,
+                deadline,
+                MAX_FRAME,
+                1,
+                crate::descriptor_frame::FrameByteOrder::LittleEndian,
+            )?;
+        verify_peer(&control, &self.0.identity.record)?;
+        match result {
+            Err(error) if error == UNKNOWN_METHOD => Ok(None),
+            Err(error) => Err(error),
+            Ok(()) => {
+                if fds.len() != 1 {
+                    return Err("Retained watcher did not transfer exactly one descriptor".into());
+                }
+                let watch = UnixStream::from(fds.remove(0));
+                watch.set_nonblocking(true).map_err(|e| e.to_string())?;
+                Ok(Some(watch))
+            }
+        }
     }
     fn publish_resident(&self, resident: Resident) -> bool {
         self.publish_resident_inner(resident, false)
@@ -1119,6 +1367,13 @@ impl RemoteActor {
                     && resident.close.completed))
                 || resident.changed < state.changed
                 || resident.generation < state.generation
+                // Installation is acknowledged independently of observer
+                // revisions. A state RPC issued before commit can arrive
+                // after its ACK with equal changed/generation values.
+                || (state.installed && !resident.installed)
+                || (matches!(state.native_continuity,
+                    chat::NativeContinuity::RetainedClaudeActor { protocol: PROTOCOL })
+                    && resident.native_continuity != state.native_continuity)
             {
                 return false;
             }
@@ -1167,6 +1422,9 @@ impl RemoteActor {
                     .filter(|report| !state.account_reports.contains(report))
                     .cloned(),
             );
+            if resident.agent_addresses != state.agent_addresses {
+                updates.push(Update::AgentAddresses(resident.agent_addresses.clone()));
+            }
             *state = Arc::new(resident);
             updates
         };
@@ -1186,8 +1444,16 @@ impl RemoteActor {
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(snapshot));
         self.0.stop.store(true, Ordering::Release);
+        self.0.wake.notify();
         let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(resident) = resident {
+        if let Some(mut resident) = resident {
+            // A close response may also have been issued before installation
+            // was acknowledged. Keep that actor-scoped fact monotonic while
+            // retaining the exact final snapshot/receipt above unchanged.
+            if state.installed {
+                resident.installed = true;
+                resident.native_continuity = state.native_continuity.clone();
+            }
             *state = Arc::new(resident);
         }
         let state = Arc::make_mut(&mut state);
@@ -1230,10 +1496,12 @@ impl RemoteActor {
         }
         for pending in &mut *self.0.pending.lock().unwrap_or_else(|p| p.into_inner()) {
             if let Some(reply) = pending.reply.take() {
-                let _ = reply.send(Err(Rejection::Unacknowledged(format!(
-                    "{reason}; input {} sequence {} remains unknown and must not be regenerated",
-                    pending.identity.id, pending.identity.sequence
-                ))));
+                tracing::warn!(
+                    sequence = pending.identity.sequence,
+                    %reason,
+                    "a retained input's outcome is unknown; it must not be regenerated"
+                );
+                let _ = reply.send(Err(Rejection::Unacknowledged(STOPPED_INPUT.into())));
             }
         }
         (self.0.notify)(Update::Activity {
@@ -1243,6 +1511,7 @@ impl RemoteActor {
         (self.0.notify)(Update::Observed { generation });
         (self.0.notify)(Update::Presentation);
         self.0.stop.store(true, Ordering::Release);
+        self.0.wake.notify();
     }
     pub(in crate::chat::runtime) fn pinned_launch_directory(
         &self,
@@ -1251,29 +1520,33 @@ impl RemoteActor {
             return Err(close_only_refusal());
         }
         let deadline = Instant::now() + TIMEOUT;
-        let control =
-            registry::connect_until(&self.0.socket, deadline).map_err(|error| error.to_string())?;
-        verify_peer(&control, &self.0.identity.record)?;
-        deadline_io::send_until(
-            &control,
-            &Invocation {
-                proof: self.0.proof.clone(),
-                epoch: Some(self.0.epoch),
-                method: "pinned_directory".into(),
-                args: Value::Null,
-            },
-            deadline,
-        )?;
-        let (response, mut descriptors) = crate::descriptor_frame::receive_json_with_fds_until::<
-            Result<crate::agent_execution::DirectoryIdentity, String>,
-        >(
-            &control,
-            deadline,
-            MAX_FRAME,
-            1,
-            crate::descriptor_frame::FrameByteOrder::LittleEndian,
-        )?;
-        verify_peer(&control, &self.0.identity.record)?;
+        let (response, mut descriptors) = (|| {
+            let control = registry::connect_until(&self.0.socket, deadline)
+                .map_err(|error| error.to_string())?;
+            verify_peer(&control, &self.0.identity.record)?;
+            deadline_io::send_until(
+                &control,
+                &Invocation {
+                    proof: self.0.proof.clone(),
+                    epoch: Some(self.0.epoch),
+                    method: "pinned_directory".into(),
+                    args: Value::Null,
+                },
+                deadline,
+            )?;
+            let received = crate::descriptor_frame::receive_json_with_fds_until::<
+                Result<crate::agent_execution::DirectoryIdentity, String>,
+            >(
+                &control,
+                deadline,
+                MAX_FRAME,
+                1,
+                crate::descriptor_frame::FrameByteOrder::LittleEndian,
+            )?;
+            verify_peer(&control, &self.0.identity.record)?;
+            Ok::<_, String>(received)
+        })()
+        .map_err(|error| interrupted_request("pinned_directory", error))?;
         match response {
             Err(error) => Err(error),
             Ok(identity) => {
@@ -1298,14 +1571,30 @@ impl RemoteActor {
         args: Value,
         deadline: Instant,
     ) -> Result<T, String> {
+        self.answer_until(method, args, deadline)?
+    }
+    fn answer<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        args: Value,
+    ) -> Result<Result<T, String>, String> {
+        self.answer_until(method, args, Instant::now() + TIMEOUT)
+    }
+    /// One request, keeping the helper's own refusal apart from a failed
+    /// exchange. The outer error means the request may or may not have
+    /// reached the helper; the inner one is the helper's answer.
+    fn answer_until<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        args: Value,
+        deadline: Instant,
+    ) -> Result<Result<T, String>, String> {
         if self.0.close_only && !close_only_method(method) {
-            return Err(close_only_refusal());
+            return Ok(Err(close_only_refusal()));
         }
-        let control =
-            registry::connect_until(&self.0.socket, deadline).map_err(|error| error.to_string())?;
-        verify_peer(&control, &self.0.identity.record)?;
-        deadline_io::send_until(
-            &control,
+        let response: Result<Value, String> = exchange(
+            &self.0.socket,
+            &self.0.identity.record,
             &Invocation {
                 proof: self.0.proof.clone(),
                 epoch: Some(self.0.epoch),
@@ -1314,8 +1603,12 @@ impl RemoteActor {
             },
             deadline,
         )?;
-        let response: Result<Value, String> = deadline_io::receive_until(&control, deadline)?;
-        serde_json::from_value(response?).map_err(|error| error.to_string())
+        match response {
+            Ok(value) => serde_json::from_value(value)
+                .map(Ok)
+                .map_err(|error| error.to_string()),
+            Err(refusal) => Ok(Err(refusal)),
+        }
     }
     pub fn enqueue(
         &self,
@@ -1335,12 +1628,24 @@ impl RemoteActor {
             command,
             decline_only: true,
         })?
-        .recv_timeout(Duration::from_secs(10))
-        .map_err(|_| {
-            "Retained refusal acknowledgement remains unknown; never resend automatically"
-                .to_owned()
-        })?
+        .recv_timeout(ACKNOWLEDGEMENT_WAIT)
+        .map_err(|_| UNACKNOWLEDGED_ANSWER.to_owned())?
         .map_err(String::from)
+    }
+    /// Admit one command input without waiting behind an unconfirmed one.
+    #[cfg(test)]
+    fn enqueue_now(
+        &self,
+        command: Command,
+    ) -> Result<crossbeam_channel::Receiver<Result<(), Rejection>>, String> {
+        self.enqueue_payload_within(
+            InputPayload::Command {
+                run: None,
+                command,
+                decline_only: false,
+            },
+            Duration::ZERO,
+        )
     }
     pub fn pending_inputs(&self) -> Vec<InputIdentity> {
         self.0
@@ -1355,23 +1660,34 @@ impl RemoteActor {
         &self,
         payload: InputPayload,
     ) -> Result<crossbeam_channel::Receiver<Result<(), Rejection>>, String> {
+        self.enqueue_payload_within(payload, ACKNOWLEDGEMENT_WAIT)
+    }
+    /// Admit one input, waiting up to `settle` for an earlier unconfirmed
+    /// input to be settled first.
+    fn enqueue_payload_within(
+        &self,
+        payload: InputPayload,
+        settle: Duration,
+    ) -> Result<crossbeam_channel::Receiver<Result<(), Rejection>>, String> {
         if self.0.close_only {
             return Err(close_only_refusal());
         }
         if self.0.stop.load(Ordering::Acquire) {
-            return Err("Retained actor proxy is unavailable; no new input was admitted".into());
+            return Err(UNAVAILABLE_INPUT.into());
         }
         if self.0.recovering_inputs.load(Ordering::Acquire) {
-            return Err("Previous command receipts are settling after reattachment; no new command was admitted".into());
+            return Err(RECONNECTING_INPUT.into());
         }
         let payload = serde_json::to_value(payload).map_err(|error| error.to_string())?;
         let bytes = serde_json::to_vec(&payload).map_err(|error| error.to_string())?;
+        let settle_deadline = Instant::now() + settle;
         let identity;
         let response;
-        {
+        loop {
+            self.await_settled_input(settle_deadline)?;
             let mut pending = self.0.pending.lock().unwrap_or_else(|p| p.into_inner());
             if pending.len() >= 65 {
-                return Err("Remote actor pending input capacity reached".into());
+                return Err(CROWDED_INPUT.into());
             }
             if pending.len().saturating_add(
                 self.0
@@ -1381,20 +1697,16 @@ impl RemoteActor {
                     .len(),
             ) >= journal::MAX_INPUTS
             {
-                return Err(
-                    "Input outcome retirement is pending; no new command was admitted".into(),
-                );
+                return Err(RETIRING_INPUT.into());
             }
-            if let Some(identity) = &*self
+            let mut uncertain = self
                 .0
                 .uncertain_input
                 .lock()
-                .unwrap_or_else(|p| p.into_inner())
-            {
-                return Err(format!(
-                    "Resolve retained input {} sequence {} before admitting another input",
-                    identity.id, identity.sequence
-                ));
+                .unwrap_or_else(|p| p.into_inner());
+            if uncertain.is_some() {
+                // Another caller was admitted first; wait for that input too.
+                continue;
             }
             let retained: usize = pending
                 .iter()
@@ -1402,7 +1714,7 @@ impl RemoteActor {
                 .try_fold(0usize, usize::checked_add)
                 .unwrap_or(usize::MAX);
             if retained.saturating_add(bytes.len()) > 64 * 1024 * 1024 {
-                return Err("Remote actor pending input byte budget reached".into());
+                return Err(CROWDED_INPUT.into());
             }
             let mut sequence = self
                 .0
@@ -1422,44 +1734,273 @@ impl RemoteActor {
             })
             .map_err(|error| error.to_string())?;
             if wire.len() > MAX_FRAME {
-                return Err(
-                    "Retained input exceeds the bounded wire capacity; no input was admitted"
-                        .into(),
-                );
+                return Err(OVERSIZED_INPUT.into());
             }
             *sequence = sequence
                 .checked_add(1)
                 .ok_or("Remote actor input sequence exhausted")?;
             let (reply, receiver) = crossbeam_channel::bounded(1);
             response = receiver;
-            *self
-                .0
-                .uncertain_input
-                .lock()
-                .unwrap_or_else(|p| p.into_inner()) = Some(identity.clone());
+            *uncertain = Some(UncertainInput {
+                identity: identity.clone(),
+                acknowledgement_deadline: Instant::now() + ACKNOWLEDGEMENT_WAIT,
+                retransmit: None,
+                refusal: None,
+                settle_failures: 0,
+                settling_since: None,
+                unsettleable: false,
+            });
             pending.push(Pending {
                 identity: identity.clone(),
                 payload: payload.clone(),
                 bytes: bytes.len(),
                 reply: Some(reply),
             });
+            break;
         }
+        self.0.wake.notify();
         // Preserve the exact identity and envelope before crossing the socket.
-        // An ambiguous write keeps the receipt pending and fences new input.
-        if let Ok(receipt) = self.call::<InputReceipt>("input", json!([identity, payload])) {
-            self.apply_receipts(&[receipt]);
+        // An ambiguous write keeps the receipt pending and fences new input
+        // until the metadata pump observes, retransmits or settles it.
+        let refusal = match self.answer::<InputReceipt>("input", json!([identity, payload])) {
+            Ok(Ok(receipt)) => {
+                self.apply_receipts(&[receipt]);
+                return Ok(response);
+            }
+            Ok(Err(refusal)) => {
+                tracing::warn!(
+                    sequence = identity.sequence,
+                    %refusal,
+                    "the retained actor refused an input without a receipt"
+                );
+                Some(refusal)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    sequence = identity.sequence,
+                    %error,
+                    "a retained input call failed; its delivery is unknown"
+                );
+                None
+            }
+        };
+        if let Some(uncertain) = self
+            .0
+            .uncertain_input
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_mut()
+            .filter(|uncertain| uncertain.identity == identity)
+        {
+            // The caller's wait for the outcome starts now.
+            uncertain.acknowledgement_deadline = Instant::now() + ACKNOWLEDGEMENT_WAIT;
+            uncertain.retransmit = Some(Retransmit {
+                next: Instant::now(),
+                delay: RETRANSMIT_DELAY,
+            });
+            uncertain.refusal = refusal;
         }
+        self.0.wake.notify();
         Ok(response)
     }
-    /// Explicit retransmission of the exact protocol envelope. Existing helper
-    /// receipts return the original outcome without invoking the adapter again.
-    /// This never replays stdin or generates a replacement prompt UUID.
-    pub fn retry_input(&self, identity: &InputIdentity) -> Result<InputReceipt, String> {
-        if self.0.stop.load(Ordering::Acquire) {
-            return Err(
-                "Retained actor proxy is unavailable; original input was not replayed".into(),
-            );
+    /// Inputs reach the helper one at a time, so a caller who arrives while
+    /// an earlier input is unconfirmed waits for it to be settled rather
+    /// than being refused for the other input's delay.
+    fn await_settled_input(&self, deadline: Instant) -> Result<(), String> {
+        let mut uncertain = self
+            .0
+            .uncertain_input
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut waited = false;
+        while let Some(outstanding) = &*uncertain {
+            if self.0.stop.load(Ordering::Acquire) {
+                return Err(UNAVAILABLE_INPUT.into());
+            }
+            if outstanding.unsettleable {
+                return Err(UNSETTLEABLE_INPUT.into());
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                // A caller that does not wait retries on its own schedule.
+                if waited {
+                    tracing::warn!(
+                        sequence = outstanding.identity.sequence,
+                        "a retained input is still unconfirmed; the next input was refused"
+                    );
+                }
+                return Err(UNSETTLED_INPUT.into());
+            }
+            waited = true;
+            // Stopping does not signal this condition; recheck it regularly.
+            uncertain = self
+                .0
+                .input_settled
+                .wait_timeout(uncertain, (deadline - now).min(RETRANSMIT_DELAY))
+                .unwrap_or_else(|p| p.into_inner())
+                .0;
         }
+        Ok(())
+    }
+    /// A failed `input` call may never have reached the helper, and a refused
+    /// one has no receipt, so no receipt would resolve either fence. While its
+    /// caller waits, the exact envelope is retransmitted, backing off while the
+    /// helper stays unreachable or refuses it. The helper admits each identity
+    /// once and otherwise returns its existing receipt, so this never executes
+    /// an input twice.
+    ///
+    /// Shortly before the caller stops waiting, the helper is asked to settle
+    /// the input instead: it returns the receipt of an input it admitted, and
+    /// otherwise records the input as refused, so it never starts after its
+    /// caller was told its outcome is unknown. Either answer lifts the fence,
+    /// and a caller still waiting hears it.
+    fn resolve_uncertain_input(&self) {
+        let (identity, settle_at, settle, last_refusal) = {
+            let mut uncertain = self
+                .0
+                .uncertain_input
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let Some(uncertain) = uncertain.as_mut() else {
+                return;
+            };
+            let now = Instant::now();
+            let settle_at = uncertain.settle_at();
+            match &uncertain.retransmit {
+                Some(retransmit) if retransmit.next <= now => {}
+                _ => return,
+            }
+            let settle = now >= settle_at;
+            if settle {
+                uncertain.settling_since.get_or_insert(now);
+            }
+            (
+                uncertain.identity.clone(),
+                settle_at,
+                settle,
+                uncertain.refusal.clone(),
+            )
+        };
+        let answer = if settle {
+            self.answer("abandon_input", json!([identity, UNCONFIRMED_INPUT]))
+        } else {
+            self.answer_input(&identity)
+        };
+        let refused = matches!(answer, Ok(Err(_)));
+        let refusal = match answer {
+            Ok(Ok(receipt)) => {
+                if settle && matches!(&receipt.state, InputState::Acknowledged(Err(_))) {
+                    tracing::warn!(
+                        sequence = identity.sequence,
+                        refusal = last_refusal.as_deref().unwrap_or("no answer"),
+                        "an unconfirmed retained input was settled as not sent"
+                    );
+                }
+                self.apply_receipts(&[receipt]);
+                return;
+            }
+            Ok(Err(refusal)) if settle && refusal == UNKNOWN_METHOD => {
+                // An older helper cannot settle it.
+                self.stop_settling(&identity, "the retained actor cannot settle inputs");
+                return;
+            }
+            Ok(Err(_)) | Err(_) if settle => {
+                // The helper refused to settle it for now, such as on a busy
+                // journal, or did not answer; it is asked again after the
+                // backoff. After a bounded number of refusals it is no longer
+                // asked. A helper that does not answer is asked without
+                // limit, as it may return and settle the input, but new input
+                // stops waiting on it after `SETTLE_LIMIT`.
+                let (exhausted, overdue) = self
+                    .0
+                    .uncertain_input
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .as_mut()
+                    .filter(|uncertain| uncertain.identity == identity)
+                    .map_or((false, false), |uncertain| {
+                        if refused {
+                            uncertain.settle_failures += 1;
+                        }
+                        let overdue = !uncertain.unsettleable
+                            && uncertain
+                                .settling_since
+                                .is_some_and(|since| since.elapsed() >= SETTLE_LIMIT);
+                        uncertain.unsettleable |= overdue;
+                        (uncertain.settle_failures >= SETTLE_ATTEMPTS, overdue)
+                    });
+                if exhausted {
+                    self.stop_settling(&identity, "the retained actor kept failing to settle it");
+                    return;
+                }
+                if overdue {
+                    tracing::warn!(
+                        sequence = identity.sequence,
+                        "the retained actor has not settled an unconfirmed input in time; new input is refused"
+                    );
+                    self.0.input_settled.notify_all();
+                }
+                None
+            }
+            Ok(Err(refusal)) => Some(refusal),
+            Err(_) => None,
+        };
+        if let Some(UncertainInput {
+            identity: current,
+            retransmit: Some(retransmit),
+            refusal: recorded,
+            unsettleable,
+            ..
+        }) = &mut *self
+            .0
+            .uncertain_input
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            && *current == identity
+        {
+            let now = Instant::now();
+            retransmit.next = now + retransmit.delay;
+            if now < settle_at {
+                // Settle on time even while backing off.
+                retransmit.next = retransmit.next.min(settle_at);
+            }
+            let longest = if *unsettleable {
+                OVERDUE_RETRY
+            } else {
+                TIMEOUT
+            };
+            retransmit.delay = retransmit.delay.saturating_mul(2).min(longest);
+            if refusal.is_some() {
+                *recorded = refusal;
+            }
+        }
+    }
+    /// Stop asking the helper to settle `identity`, which then fences new
+    /// input until the helper reports a receipt for it on its own.
+    fn stop_settling(&self, identity: &InputIdentity, why: &'static str) {
+        tracing::warn!(
+            sequence = identity.sequence,
+            why,
+            "an unconfirmed retained input cannot be settled; new input is refused"
+        );
+        if let Some(uncertain) = self
+            .0
+            .uncertain_input
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_mut()
+            .filter(|uncertain| &uncertain.identity == identity)
+        {
+            uncertain.unsettleable = true;
+            uncertain.retransmit = None;
+        }
+        self.0.input_settled.notify_all();
+    }
+    /// Send the exact original envelope of a pending input again.
+    fn answer_input(
+        &self,
+        identity: &InputIdentity,
+    ) -> Result<Result<InputReceipt, String>, String> {
         let payload = self
             .0
             .pending
@@ -1469,7 +2010,16 @@ impl RemoteActor {
             .find(|pending| &pending.identity == identity)
             .map(|pending| pending.payload.clone())
             .ok_or("The original input envelope is unavailable; never reconstruct it")?;
-        let receipt = self.call("input", json!([identity, payload]))?;
+        self.answer("input", json!([identity, payload]))
+    }
+    /// Explicit retransmission of the exact protocol envelope. Existing helper
+    /// receipts return the original outcome without invoking the adapter again.
+    /// This never replays stdin or generates a replacement prompt UUID.
+    pub fn retry_input(&self, identity: &InputIdentity) -> Result<InputReceipt, String> {
+        if self.0.stop.load(Ordering::Acquire) {
+            return Err(UNAVAILABLE_INPUT.into());
+        }
+        let receipt = self.answer_input(identity)??;
         self.apply_receipts(std::slice::from_ref(&receipt));
         Ok(receipt)
     }
@@ -1488,7 +2038,10 @@ impl RemoteActor {
             else {
                 return true;
             };
-            if uncertain.as_ref() == Some(&receipt.identity) {
+            if uncertain
+                .as_ref()
+                .is_some_and(|uncertain| uncertain.identity == receipt.identity)
+            {
                 *uncertain = None;
             }
             match &receipt.state {
@@ -1508,11 +2061,18 @@ impl RemoteActor {
                 InputState::Accepted => true,
             }
         });
+        if uncertain.is_none() {
+            self.0.input_settled.notify_all();
+        }
+        drop(uncertain);
         let mut retiring = self
             .0
             .retiring_inputs
             .lock()
             .unwrap_or_else(|p| p.into_inner());
+        if !completed.is_empty() {
+            self.0.wake.notify();
+        }
         for identity in completed {
             if !retiring.contains(&identity) {
                 retiring.push(identity);
@@ -1584,14 +2144,19 @@ impl RemoteActor {
         command: Command,
     ) -> Result<(), Rejection> {
         let receiver = self.enqueue(run, command).map_err(Rejection::Refused)?;
-        receiver.recv_timeout(Duration::from_secs(10)).map_err(|_|Rejection::Unacknowledged("Retained actor input acknowledgement is pending; use its stable receipt, never resend blindly".into()))?
+        receiver
+            .recv_timeout(ACKNOWLEDGEMENT_WAIT)
+            .map_err(|_| Rejection::Unacknowledged(UNACKNOWLEDGED_INPUT.into()))?
     }
+    /// The courier tries again later on its own, so it does not wait behind
+    /// an unconfirmed input; one waiting courier would hold every delivery.
     pub fn try_idle_prompt(&self, text: String) -> Result<(), Rejection> {
         let receiver = self
-            .enqueue_payload(InputPayload::IdlePrompt { text })
+            .enqueue_payload_within(InputPayload::IdlePrompt { text }, Duration::ZERO)
             .map_err(Rejection::Refused)?;
-        receiver.recv_timeout(Duration::from_secs(10))
-            .map_err(|_| Rejection::Unacknowledged("Retained idle prompt acknowledgement is pending; use its stable receipt, never resend blindly".into()))?
+        receiver
+            .recv_timeout(ACKNOWLEDGEMENT_WAIT)
+            .map_err(|_| Rejection::Unacknowledged(UNACKNOWLEDGED_INPUT.into()))?
     }
     pub fn interrupt(
         &self,
@@ -1603,11 +2168,8 @@ impl RemoteActor {
             including_subagents,
         })?;
         receiver
-            .recv_timeout(Duration::from_secs(10))
-            .map_err(|_| {
-                "Retained interrupt acknowledgement remains unknown; never resend automatically"
-                    .to_owned()
-            })?
+            .recv_timeout(ACKNOWLEDGEMENT_WAIT)
+            .map_err(|_| UNACKNOWLEDGED_STOP.to_owned())?
             .map_err(String::from)
     }
 
@@ -1625,8 +2187,11 @@ impl RemoteActor {
     }
     pub fn commit_installation(&self) -> Result<(), String> {
         self.call::<()>("commit", Value::Null)?;
-        self.0.installed.store(true, Ordering::Release);
+        // Use the same publication fence as the observer. No local revision
+        // is invented: the next authentic helper publication owns its clocks.
         {
+            let _publication = self.0.publication.lock().unwrap_or_else(|p| p.into_inner());
+            self.0.installed.store(true, Ordering::Release);
             let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
             let state = Arc::make_mut(&mut state);
             state.installed = true;
@@ -1644,6 +2209,7 @@ impl RemoteActor {
         self.call::<()>("preserve", Value::Null)?;
         self.0.preserved.store(true, Ordering::Release);
         self.0.stop.store(true, Ordering::Release);
+        self.0.wake.notify();
         Ok(())
     }
     pub fn close_method(&self, method: &str, args: Value) -> Result<(), String> {
@@ -1694,8 +2260,15 @@ impl RemoteActor {
             thread::sleep(Duration::from_millis(10));
         }
     }
+    pub(crate) fn decide_detached_work(&self, detached: DetachedWork) {
+        self.0
+            .spare_detached
+            .store(detached == DetachedWork::Spare, Ordering::Release);
+    }
+    /// A helper from before sparing ignores the decision and stops it all.
     pub fn close(&self) -> Result<(), String> {
-        self.close_method("close", Value::Null)
+        let spare = self.0.spare_detached.load(Ordering::Acquire);
+        self.close_method("close", json!([spare]))
     }
 }
 impl chat::protocol::LaunchCleanup for RemoteActor {
@@ -1708,6 +2281,7 @@ impl chat::protocol::LaunchCleanup for RemoteActor {
 impl Drop for Remote {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        self.wake.notify();
         if let Some(worker) = self
             .worker
             .get_mut()
@@ -1753,10 +2327,13 @@ fn close_only_method(method: &str) -> bool {
     matches!(
         method,
         "state"
+            | "watch"
             | "execution_environment"
             | "recognize_sources"
             | "snapshot"
             | "presentation"
+            | "presentation_codec"
+            | "presentation_binary"
             | "visible"
             | "observe"
             | "readiness"
@@ -1848,10 +2425,15 @@ struct Server {
     installed: bool,
     journal: Arc<Mutex<Journal>>,
     changed: Arc<std::sync::atomic::AtomicU64>,
+    watcher: Arc<push::Watcher>,
+    #[cfg(test)]
+    state_reads: Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(test)]
+    fail_state_reads: Arc<std::sync::atomic::AtomicU64>,
     prompt_revision: Arc<std::sync::atomic::AtomicU64>,
     pending: Vec<(
         InputIdentity,
-        crossbeam_channel::Receiver<Result<(), String>>,
+        crossbeam_channel::Receiver<Result<(), Rejection>>,
         Option<(crate::model::RunId, Arc<std::sync::atomic::AtomicU8>)>,
     )>,
     account_reports: Arc<Mutex<Vec<Update>>>,
@@ -1867,6 +2449,9 @@ struct Server {
     // attachment. A newly authenticated attach may own the still-live actor.
     attachment_preserved: bool,
     close_only: bool,
+    /// Whether teardown stops what the provider leaves running, or leaves it
+    /// as quitting the provider's own CLI does. Decided by a close.
+    detached: DetachedWork,
 }
 impl Server {
     fn start_after_scope_enrollment(
@@ -1933,6 +2518,10 @@ impl Server {
         let journal = Arc::new(Mutex::new(Journal::open(store.directory())?));
         let changed = Arc::new(std::sync::atomic::AtomicU64::new(1));
         let published = changed.clone();
+        let watcher = Arc::new(push::Watcher::default());
+        let published_watcher = watcher.clone();
+        let metadata_changed = changed.clone();
+        let metadata_watcher = watcher.clone();
         let prompt_revision = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let available = prompt_revision.clone();
         let outcomes = journal.clone();
@@ -1966,6 +2555,11 @@ impl Server {
                     }
                 }
                 published.fetch_add(1, Ordering::Release);
+                published_watcher.notify();
+            },
+            move || {
+                metadata_changed.fetch_add(1, Ordering::Release);
+                metadata_watcher.notify();
             },
         )?;
         let provider = actor
@@ -2013,6 +2607,11 @@ impl Server {
             installed: false,
             journal,
             changed,
+            watcher,
+            #[cfg(test)]
+            state_reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            fail_state_reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             prompt_revision,
             pending: Vec::new(),
             account_reports,
@@ -2026,13 +2625,50 @@ impl Server {
             session_stopping: false,
             attachment_preserved: false,
             close_only: false,
+            detached: DetachedWork::Stop,
         })
+    }
+    fn presentation_response(
+        &mut self,
+        id: crate::model::TerminalId,
+        after: Option<u64>,
+    ) -> Result<Option<crate::terminal_ipc::ServerResponse>, String> {
+        if id != self.source.id {
+            return Err("Retained presentation names another chat".into());
+        }
+        // Loss is outside the reducer's transcript generation. Refuse
+        // even an unchanged-generation read instead of hiding it as
+        // an empty publication or inventing a transcript revision.
+        if let Some(loss) = self
+            .journal
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .continuity_loss()?
+        {
+            return Err(loss.reason);
+        }
+        let response = self.actor.presentation(id, after);
+        let snapshot = match &response {
+            Some(crate::terminal_ipc::ServerResponse::ChatSnapshot {
+                snapshot: Some(snapshot),
+                ..
+            }) => Some(snapshot),
+            Some(crate::terminal_ipc::ServerResponse::ChatUpdate { update, .. }) => {
+                Some(&update.metadata)
+            }
+            _ => None,
+        };
+        if let Some(snapshot) = snapshot {
+            self.remember_publication(snapshot.session_id.as_deref(), &snapshot.native_continuity)?;
+        }
+        Ok(response)
     }
     fn notifier(&self) -> impl Fn(Update) + Send + Sync + 'static {
         let outcomes = self.journal.clone();
         let changed = self.changed.clone();
         let available = self.prompt_revision.clone();
         let reports = self.account_reports.clone();
+        let watcher = self.watcher.clone();
         move |update| {
             if matches!(update, Update::PromptAvailable) {
                 available.fetch_add(1, Ordering::Release);
@@ -2052,6 +2688,7 @@ impl Server {
                 }
             }
             changed.fetch_add(1, Ordering::Release);
+            watcher.notify();
         }
     }
     fn revision(&self) -> u64 {
@@ -2080,6 +2717,7 @@ impl Server {
         let usage = state.usage.clone();
         let requests = state.requests.clone();
         let sampled_activity = state.activity();
+        let work_hold = state.work_hold();
         let prompt_eligible =
             super::super::accepts_prompt(&state) && !self.actor.0.draining.load(Ordering::Acquire);
         use crate::notifications::Kind;
@@ -2165,10 +2803,13 @@ impl Server {
             completed,
             idle,
             failure,
+            finished_at: self.actor.finished_at(),
             confirmed_session,
             background_subagents,
             interrupt_subagents,
+            work_hold: Some(work_hold),
             account_reports,
+            agent_addresses: self.actor.agent_addresses(),
             next_input: journal.next_input()?,
             acknowledged_input_count: journal.acknowledged_input_count(),
             continuity_loss,
@@ -2267,20 +2908,43 @@ impl Server {
         let journal = self.journal.clone();
         let completed = self.actor.is_completed();
         let changed = self.changed.clone();
-        self.pending.retain(|(identity,response,effects)| {
-            if !completed && effects.as_ref().is_some_and(|(_,state)|state.load(Ordering::Acquire)==0) {return true;}
-            let result=match response.try_recv() {Ok(result)=>Some(InputState::Acknowledged(result)),Err(crossbeam_channel::TryRecvError::Disconnected)=>Some(InputState::Unknown("The retained actor stopped before acknowledging this input; never replay it automatically".into())),Err(crossbeam_channel::TryRecvError::Empty)=>None};
-            if let Some(state)=result {
-                let mut journal=journal.lock().unwrap_or_else(|p|p.into_inner());
-                if matches!(&state,InputState::Acknowledged(Err(_))) && let Some((run,effects))=effects && effects.load(Ordering::Acquire)==1 {
-                    if let Err(error)=journal.refuse_unexecuted_run(*run) {let _=journal.record_loss(&error);}
-                }
-                if let Err(error)=journal.finish(identity,state) {let _=journal.record_loss(&format!("Cannot persist retained input outcome: {error}"));}
-                changed.fetch_add(1,Ordering::Release);
-                false
-            } else {true}
+        let revision = self.revision();
+        self.pending.retain(|(identity, response, effects)| {
+            if !completed
+                && effects
+                    .as_ref()
+                    .is_some_and(|(_, state)| state.load(Ordering::Acquire) == 0)
+            {
+                return true;
+            }
+            let state = match response.try_recv() {
+                Ok(Ok(())) => InputState::Acknowledged(Ok(())),
+                Ok(Err(Rejection::Refused(error))) => InputState::Acknowledged(Err(error)),
+                Ok(Err(Rejection::Unacknowledged(error))) => InputState::Unknown(error),
+                Err(crossbeam_channel::TryRecvError::Disconnected) => InputState::Unknown(
+                    "The retained actor stopped before acknowledging this input; never replay it automatically".into(),
+                ),
+                Err(crossbeam_channel::TryRecvError::Empty) => return true,
+            };
+            let mut journal = journal.lock().unwrap_or_else(|p| p.into_inner());
+            if matches!(&state, InputState::Acknowledged(Err(_)))
+                && let Some((run, effects)) = effects
+                && effects.load(Ordering::Acquire) == 1
+                && let Err(error) = journal.refuse_unexecuted_run(*run)
+            {
+                let _ = journal.record_loss(&error);
+            }
+            if let Err(error) = journal.finish(identity, state) {
+                let _ = journal.record_loss(&format!("Cannot persist retained input outcome: {error}"));
+            }
+            changed.fetch_add(1, Ordering::Release);
+            false
         });
+        if self.revision() != revision {
+            self.watcher.notify();
+        }
     }
+
     fn pinned_launch_directory(
         &self,
         request: &Invocation,
@@ -2345,6 +3009,7 @@ impl Server {
                     "Retained actor source/account identity does not match this chat".into(),
                 );
             }
+            self.watcher.clear();
             self.epoch = uuid::Uuid::new_v4();
             self.close_only = close_only;
             self.attachment_preserved = false;
@@ -2389,6 +3054,11 @@ impl Server {
             return Err("This attachment preserved provider ownership; authenticate a new attachment before changing it".into());
         }
         match request.method.as_str() {
+            "watch" => Ok(Value::Null),
+            "presentation_codec" => {
+                let (version,) = decode!((u16,));
+                value!(version == crate::terminal_ipc::PROTOCOL_VERSION)
+            }
             "account_switch_generation"
             | "completed_account_options"
             | "account_switch_notice"
@@ -2442,6 +3112,17 @@ impl Server {
             }
             "execution_environment" => value!(self.environment.clone()),
             "state" => {
+                #[cfg(test)]
+                {
+                    self.state_reads.fetch_add(1, Ordering::Release);
+                    if self
+                        .fail_state_reads
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                        .is_ok()
+                    {
+                        return Err("Temporary fixture observation failure".into());
+                    }
+                }
                 let (after,) = decode!((u64,));
                 if after == self.revision() {
                     Ok(Value::Null)
@@ -2528,6 +3209,9 @@ impl Server {
                 Ok(Value::Null)
             }
             "input" => {
+                // Installation is confirmed shortly after startup, so this
+                // refusal clears: the proxy retransmits until it does or the
+                // proxy settles the input.
                 if !self.installed {
                     return Err(
                         "Retained actor installation is not confirmed; provider input is refused"
@@ -2535,29 +3219,55 @@ impl Server {
                     );
                 }
                 let (identity, payload) = decode!((InputIdentity, Value));
-                if payload_digest(&serde_json::to_vec(&payload).map_err(|error| error.to_string())?)
-                    != identity.hash
-                {
-                    return Err("Retained input hash differs from its envelope".into());
-                }
+                let intact = payload_digest(
+                    &serde_json::to_vec(&payload).map_err(|error| error.to_string())?,
+                ) == identity.hash;
                 let mut journal = self.journal.lock().unwrap_or_else(|p| p.into_inner());
                 if let Some(receipt) = journal.input(&identity)? {
                     return value!(receipt);
                 }
+                // A refusal that waiting cannot change becomes the input's
+                // receipt, so its caller hears it at once and no later copy
+                // of the frame is admitted. Refusals that can clear, such as
+                // a busy journal or a full completion queue, are answered
+                // without a receipt and the proxy retransmits.
+                macro_rules! refuse {
+                    ($reason:expr, $detail:expr) => {{
+                        tracing::warn!(
+                            sequence = identity.sequence,
+                            detail = %$detail,
+                            "the retained actor refused an input"
+                        );
+                        let receipt = journal.refuse_unadmitted(&identity, $reason.into())?;
+                        self.changed.fetch_add(1, Ordering::Release);
+                        return value!(receipt);
+                    }};
+                }
+                if !intact {
+                    refuse!(DAMAGED_INPUT, "the input hash differs from its envelope");
+                }
                 if self.session_stopping {
-                    return Err(
-                        "This actor lifetime is stopping; new provider input is refused".into(),
-                    );
+                    refuse!(CLOSING_INPUT, "this actor lifetime is stopping");
                 }
                 if self.attachment_preserved {
-                    return Err("This attachment preserved provider ownership; new provider input is refused".into());
+                    refuse!(
+                        HANDOVER_INPUT,
+                        "this attachment preserved provider ownership for a successor"
+                    );
+                }
+                if let Some(loss) = journal.loss()? {
+                    refuse!(DISCONTINUOUS_INPUT, loss);
                 }
                 if self.pending.len() >= 65 {
                     return Err("Retained actor input completion capacity reached".into());
                 }
-                let (command, run, effects) = match serde_json::from_value::<InputPayload>(payload)
-                    .map_err(|error| error.to_string())?
-                {
+                let payload = match serde_json::from_value::<InputPayload>(payload) {
+                    Ok(payload) => payload,
+                    // The frame is intact, so its sender speaks a protocol
+                    // this helper does not.
+                    Err(error) => refuse!(UNSUPPORTED_INPUT, error),
+                };
+                let (command, run, effects) = match payload {
                     InputPayload::IdlePrompt { text } => {
                         (super::super::ActorCommand::IdlePrompt(text), None, None)
                     }
@@ -2594,13 +3304,33 @@ impl Server {
                 self.changed.fetch_add(1, Ordering::Release);
                 match self.actor.enqueue_actor(command) {
                     Ok(reply) => self.pending.push((identity, reply, effects)),
-                    Err(error) => {
-                        journal.finish(&identity, InputState::Acknowledged(Err(error)))?;
+                    Err(refusal) => {
+                        tracing::warn!(
+                            sequence = identity.sequence,
+                            ?refusal,
+                            "the retained actor admitted an input it could not run"
+                        );
+                        let reason = unrun_input_outcome(refusal);
+                        journal.finish(&identity, InputState::Acknowledged(Err(reason.into())))?;
                         if let Some(run) = run {
                             journal.refuse_unexecuted_run(run)?;
                         }
                     }
                 }
+                value!(receipt)
+            }
+            "abandon_input" => {
+                // The proxy gives up on an input whose delivery it could not
+                // confirm. This helper decides its outcome once: the receipt
+                // of an admitted input, or else a refusal that no later copy
+                // of the frame can turn into an admission.
+                let (identity, reason) = decode!((InputIdentity, String));
+                let receipt = self
+                    .journal
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .refuse_unadmitted(&identity, reason)?;
+                self.changed.fetch_add(1, Ordering::Release);
                 value!(receipt)
             }
             "snapshot" => {
@@ -2626,37 +3356,7 @@ impl Server {
             }
             "presentation" => {
                 let (id, after) = decode!((crate::model::TerminalId, Option<u64>));
-                if id != self.source.id {
-                    return Err("Retained presentation names another chat".into());
-                }
-                // Loss is outside the reducer's transcript generation. Refuse
-                // even an unchanged-generation read instead of hiding it as
-                // an empty publication or inventing a transcript revision.
-                if let Some(loss) = self
-                    .journal
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .continuity_loss()?
-                {
-                    return Err(loss.reason);
-                }
-                let response = self.actor.presentation(id, after);
-                let snapshot = match &response {
-                    Some(crate::terminal_ipc::ServerResponse::ChatSnapshot {
-                        snapshot: Some(snapshot),
-                        ..
-                    }) => Some(snapshot),
-                    Some(crate::terminal_ipc::ServerResponse::ChatUpdate { update, .. }) => {
-                        Some(&update.metadata)
-                    }
-                    _ => None,
-                };
-                if let Some(snapshot) = snapshot {
-                    self.remember_publication(
-                        snapshot.session_id.as_deref(),
-                        &snapshot.native_continuity,
-                    )?;
-                }
+                let response = self.presentation_response(id, after)?;
                 value!(response)
             }
             "text_copy" => {
@@ -2785,9 +3485,29 @@ impl Server {
                 value!(self.try_close_if_idle(generation)?)
             }
             "close" => {
+                // `[true]` leaves what the provider leaves running when it
+                // quits. A daemon that sends no decision stops everything, as
+                // before.
                 if self.closed_snapshot.is_none() {
+                    let mut detached = if request.args.get(0).and_then(Value::as_bool) == Some(true)
+                    {
+                        DetachedWork::Spare
+                    } else {
+                        DetachedWork::Stop
+                    };
+                    // The provider's scope holds what it detached, too.
+                    self.actor.decide_detached_work(detached);
                     self.actor.close()?;
-                    reap_orphans()?;
+                    // A provider something else killed, such as the system
+                    // for memory, leaves nothing running: what it left would
+                    // hold the memory it needed.
+                    if self.actor.provider_was_force_stopped() {
+                        detached = DetachedWork::Stop;
+                    }
+                    // Only once the provider is gone: until then, the helper's
+                    // exit must prove it is by stopping everything.
+                    self.detached = detached;
+                    reap_orphans(self.detached)?;
                     self.finish_inputs();
                 }
                 value!(self.publish_close()?)
@@ -2846,7 +3566,7 @@ impl Server {
                 }
                 Ok(Value::Null)
             }
-            _ => Err("Unknown retained actor method/version".into()),
+            _ => Err(UNKNOWN_METHOD.into()),
         }
     }
     fn check_retirement(&self) -> Result<(), String> {
@@ -2875,7 +3595,7 @@ impl Server {
             if !self.actor.try_close_if_idle(generation)? {
                 return Ok(ConditionalClosePublication::Changed);
             }
-            reap_orphans()?;
+            reap_orphans(self.detached)?;
             self.finish_inputs();
         }
         self.publish_close()
@@ -2921,70 +3641,115 @@ impl Server {
             resident: self.resident()?,
         })
     }
-    fn serve(mut self, startup: UnixStream) -> Result<(), String> {
+    fn serve(&mut self, startup: UnixStream) -> Result<(), String> {
         send(
             &startup,
             &Ok::<_, String>(self.attached()?),
             Duration::from_secs(30),
         )?;
-        loop {
+        self.listener
+            .set_nonblocking(true)
+            .map_err(|error| error.to_string())?;
+        let connections = connections::Connections::new()?;
+        let mut orphans = OrphanSweep::new();
+        'serve: loop {
+            orphans.run_if_due();
             self.finish_inputs();
             if !self.installed && disconnected(&startup)? {
                 self.actor.close()?;
-                reap_orphans()?;
+                reap_orphans(self.detached)?;
                 break;
             }
-            match self.listener.accept() {
-                Ok((control, _)) => {
-                    let request = (|| {
-                        let request: Invocation = receive(&control, TIMEOUT)?;
-                        authorize(&control, &request.proof)?;
-                        Ok::<_, String>(request)
-                    })();
-                    if let Ok(request) = &request
-                        && request.method == "pinned_directory"
-                    {
-                        let pin = self.pinned_launch_directory(request);
-                        let response = pin
-                            .as_ref()
-                            .map(|(identity, _)| *identity)
-                            .map_err(Clone::clone);
-                        let descriptors: Vec<_> = pin
-                            .as_ref()
-                            .ok()
-                            .map(|(_, file)| vec![file.as_fd()])
-                            .unwrap_or_default();
-                        let _ = crate::descriptor_frame::send_json_with_fds_until(
-                            &control,
-                            &response,
-                            &descriptors,
-                            Instant::now() + TIMEOUT,
-                            MAX_FRAME,
-                            1,
-                            crate::descriptor_frame::FrameByteOrder::LittleEndian,
-                        );
-                        continue;
-                    }
-                    let mut finished = false;
-                    let response = request.and_then(|request| {
-                        let close = request.method == "retire";
-                        let result = self.invoke(request);
-                        finished = close && result.is_ok();
-                        result
-                    });
-                    // Authentication failures use the same result boundary. Only an
-                    // explicit retirement after durable semantic ACK exits the
-                    // helper; a lost provider-close reply retains its journal.
-                    let _ = send(&control, &response, TIMEOUT);
-                    if finished {
-                        break;
-                    }
+            let accepting = connections.has_capacity();
+            let mut events = vec![libc::pollfd {
+                fd: connections.wakeup(),
+                events: libc::POLLIN,
+                revents: 0,
+            }];
+            if accepting {
+                events.push(libc::pollfd {
+                    fd: self.listener.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+            }
+            if !self.installed {
+                // Hangup is always reported; no other startup event matters.
+                events.push(libc::pollfd {
+                    fd: startup.as_raw_fd(),
+                    events: 0,
+                    revents: 0,
+                });
+            }
+            // An admitted input's completion has no wakeup of its own, so
+            // poll for it only while some are pending.
+            let mut wait = orphans.until_due();
+            if !self.pending.is_empty() {
+                wait = wait.min(INPUT_COMPLETION_POLL);
+            }
+            let millis = wait.as_millis().saturating_add(1).min(i32::MAX as u128) as i32;
+            // SAFETY: `events` stays live and initialized for this finite poll.
+            if unsafe { libc::poll(events.as_mut_ptr(), events.len() as libc::nfds_t, millis) } < 0
+            {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(20))
+                return Err(error.to_string());
+            }
+            while accepting && connections.has_capacity() {
+                match self.listener.accept() {
+                    Ok((control, _)) => connections.admit(control),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) => return Err(error.to_string()),
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error.to_string()),
+            }
+            while let Some(call) = connections.next() {
+                // As before each accept: a hung-up uninstalled helper serves
+                // nothing more, so a queued `install` cannot outlive it.
+                if !self.installed && disconnected(&startup)? {
+                    continue 'serve;
+                }
+                self.finish_inputs();
+                if call.method() == "pinned_directory" {
+                    let (request, reply) = call.into_parts();
+                    reply.send(connections::Answer::Directory(
+                        self.pinned_launch_directory(&request),
+                    ));
+                    orphans.run();
+                    continue;
+                }
+                let (request, reply) = call.into_parts();
+                let close = request.method == "retire";
+                if request.method == "presentation_binary" {
+                    let response = self.binary_presentation(request);
+                    reply.send(connections::Answer::Binary(response));
+                    orphans.run();
+                    continue;
+                }
+                if request.method == "watch" {
+                    let watch = self.invoke(request).and_then(|_| self.watcher.subscribe());
+                    reply.send(connections::Answer::Watch(watch));
+                    orphans.run();
+                    continue;
+                }
+                let revision = self.revision();
+                let response = self.invoke(request);
+                if self.revision() != revision {
+                    self.watcher.notify();
+                }
+                // Only an explicit retirement after durable semantic ACK exits
+                // the helper; a lost provider-close reply retains its journal.
+                let finished = close && response.is_ok();
+                let delivery = reply.send(connections::Answer::Value(response));
+                if finished {
+                    // The client hears that retirement succeeded before the
+                    // helper removes its socket and record.
+                    delivery.wait();
+                    break 'serve;
+                }
+                orphans.run();
             }
         }
         if std::fs::symlink_metadata(&self.socket)
@@ -3015,6 +3780,29 @@ fn validate_record(record: &Record) -> Result<(), String> {
         return Err("Native holder is incompatible with retained Claude actor protocol; no input was replayed".into());
     }
     Ok(())
+}
+/// One request to the exact helper behind `socket`, within one absolute
+/// deadline. A transport failure names the request it interrupted; the
+/// helper's own result is returned unchanged in the decoded frame, so callers
+/// can still match the helper's refusals.
+fn exchange<T: DeserializeOwned>(
+    socket: &std::path::Path,
+    record: &Record,
+    invocation: &Invocation,
+    deadline: Instant,
+) -> Result<T, String> {
+    (|| {
+        let control =
+            registry::connect_until(socket, deadline).map_err(|error| error.to_string())?;
+        verify_peer(&control, record)?;
+        deadline_io::send_until(&control, invocation, deadline)?;
+        deadline_io::receive_until(&control, deadline)
+    })()
+    .map_err(|error| interrupted_request(&invocation.method, error))
+}
+/// Name the request a transport failure interrupted.
+fn interrupted_request(method: &str, error: String) -> String {
+    format!("{error} during the `{method}` request")
 }
 fn verify_peer(control: &UnixStream, record: &Record) -> Result<(), String> {
     let credentials = peer(control)?;
@@ -3090,9 +3878,61 @@ fn disconnected(control: &UnixStream) -> Result<bool, String> {
     }
     Ok(event.revents & (libc::POLLHUP | libc::POLLERR) != 0)
 }
+/// This actor is a subreaper, so every orphaned tool descendant of its
+/// provider becomes its child. Reap the exited ones while it serves; the
+/// provider and scope requests spawn through `adopted_orphans`, which reserves
+/// their statuses for their owners. Nothing here signals a live child.
+///
+/// The helper has no log sink, so a sweep failure is retried on the next tick
+/// rather than reported here. Its durable symptom is the per-holder zombie
+/// count that `cagents diagnostics` observes from outside the process.
+struct OrphanSweep {
+    due: Instant,
+}
+impl OrphanSweep {
+    const INTERVAL: Duration = Duration::from_millis(250);
+    /// Bounds one pass so a large backlog cannot stall the serve loop.
+    const LIMIT: usize = 4096;
+
+    fn new() -> Self {
+        Self {
+            due: Instant::now(),
+        }
+    }
+
+    fn until_due(&self) -> Duration {
+        self.due.saturating_duration_since(Instant::now())
+    }
+
+    fn run_if_due(&mut self) {
+        if Instant::now() >= self.due {
+            self.run();
+        }
+    }
+
+    fn run(&mut self) {
+        self.due = Instant::now() + Self::INTERVAL;
+        if let Ok(sweep) = crate::daemon::adopted_orphans::reap_exited(Self::LIMIT)
+            && sweep.truncated
+        {
+            // Continue the backlog on the next serve iteration.
+            self.due = Instant::now();
+        }
+    }
+}
 /// Only after the actor's ChildGuard has joined: no competing provider reaper
 /// remains. A child PID cannot be recycled until this sole reaper consumes it.
-fn reap_orphans() -> Result<(), String> {
+/// Ends what the provider left under this helper as `detached` decides:
+/// - `Stop` stops every child and returns once none remain;
+/// - `Spare` reaps the children that have exited and signals none, as a
+///   terminal leaves what an exited CLI left running. The provider itself is
+///   gone: the actor's ChildGuard has stopped and reaped it.
+fn reap_orphans(detached: DetachedWork) -> Result<(), String> {
+    if detached == DetachedWork::Spare {
+        return crate::daemon::adopted_orphans::reap_exited(usize::MAX)
+            .map(drop)
+            .map_err(|error| error.to_string());
+    }
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let children =
@@ -3172,21 +4012,28 @@ pub(crate) fn run_helper_if_requested() -> Option<Result<(), String>> {
         if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) } != 0 {
             return Err(std::io::Error::last_os_error().to_string());
         }
+        // Every child spawned from here on must register with the sweep.
+        crate::daemon::adopted_orphans::become_sweeper();
+        let mut detached = DetachedWork::Stop;
         let result = (|| {
             crate::daemon::seal_inherited_descriptors().map_err(|error| error.to_string())?;
-            let server = Server::start_after_scope_enrollment(
+            let mut server = Server::start_after_scope_enrollment(
                 startup,
                 &control,
                 crate::daemon::process_scope::enroll_holder,
             )?;
-            server.serve(control.try_clone().map_err(|error| error.to_string())?)
+            let served = server.serve(control.try_clone().map_err(|error| error.to_string())?);
+            detached = server.detached;
+            served
         })();
         if let Err(error) = result {
             let _ = send(&control, &Err::<Attached, _>(error), TIMEOUT);
         }
         // Exit status 73 means cleanup is proved, even when startup itself was
         // refused. Failure to reap cannot be reported as successful teardown.
-        reap_orphans()
+        // What the provider left running when a close let it quit as its CLI
+        // does is the user's, not the provider's.
+        reap_orphans(detached)
     })())
 }
 fn validate_control_descriptor(fd: RawFd) -> Result<(), String> {
@@ -3262,6 +4109,9 @@ mod tests {
 
     #[test]
     fn rejected_scope_request_still_starts_and_retires_a_real_retained_server() {
+        if crate::retained_fixture::run_isolated() {
+            return;
+        }
         const CHILD: &str = "CAGENTS_RETAINED_SCOPE_FALLBACK_TEST";
         if std::env::var_os(CHILD).is_none() {
             let root = tempfile::tempdir_in("/var/tmp").unwrap();
@@ -3374,8 +4224,10 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s"}
             .join(format!("{}.json", record.terminal));
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let snapshot = server.actor.snapshot(None).unwrap();
+            // Completion is published after the exit is applied, so a snapshot
+            // taken once completion is seen includes it; one taken before may not.
             if server.actor.is_completed() {
+                let snapshot = server.actor.snapshot(None).unwrap();
                 assert!(snapshot.exited);
                 assert!(snapshot.error.is_none(), "{:?}", snapshot.error);
                 assert!(snapshot.items.iter().any(|item| matches!(
@@ -3412,7 +4264,10 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s"}
         }
         let mut serving = Serving {
             parent: Some(parent),
-            worker: Some(thread::spawn(move || server.serve(control))),
+            worker: Some(thread::spawn(move || {
+                let mut server = server;
+                server.serve(control)
+            })),
         };
         let attached: Result<Attached, String> =
             receive(serving.parent.as_ref().unwrap(), TIMEOUT).unwrap();
@@ -3422,6 +4277,200 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s"}
         serving.parent.take();
         serving.worker.take().unwrap().join().unwrap().unwrap();
         assert!(!socket.exists() && !record_path.exists());
+    }
+
+    #[test]
+    fn serving_actor_reaps_exited_adopted_orphans_without_touching_live_ones() {
+        if crate::retained_fixture::run_isolated() {
+            return;
+        }
+        const CHILD: &str = "CAGENTS_RETAINED_ORPHAN_SWEEP_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let root = tempfile::tempdir_in("/var/tmp").unwrap();
+            let test = thread::current().name().unwrap().to_owned();
+            let output = ChildCommand::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test, "--nocapture"])
+                .env(CHILD, "1")
+                .env("XDG_RUNTIME_DIR", root.path())
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("XDG_CACHE_HOME", root.path().join("cache"))
+                .env("HOME", root.path().join("home"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        // This isolated process stands in for the helper: a subreaper that
+        // adopts every orphan its provider's tools leave behind.
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
+        let state = |pid: i32| {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            stat[stat.rfind(')')? + 2..].chars().next()
+        };
+        let zombies = || {
+            crate::daemon::owned_children::direct_children()
+                .unwrap()
+                .into_iter()
+                .filter(|pid| state(*pid) == Some('Z'))
+                .count()
+        };
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let cwd = root.path().join("cwd");
+        let home = root.path().join("claude");
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::create_dir(&home).unwrap();
+        let orphaned = root.path().join("orphaned");
+        let mut source = fixture_source();
+        source.launch.recipe.working_directory = cwd.clone();
+        source.launch.recipe.environment = BTreeMap::from([
+            ("HOME".into(), root.path().to_string_lossy().into_owned()),
+            (
+                "CLAUDE_CONFIG_DIR".into(),
+                home.to_string_lossy().into_owned(),
+            ),
+        ]);
+        source.proof.as_mut().unwrap().boot_id = crate::daemon::read_boot_id().unwrap();
+        let proof = source.proof.clone().unwrap();
+        let paths = crate::daemon::RuntimePaths::discover().unwrap();
+        let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+        let (control, parent) = UnixStream::pair().unwrap();
+        let (spec, adapter) = chat::protocol::create(&source.launch).unwrap();
+        let session_id = spec
+            .arguments
+            .iter()
+            .find_map(|argument| argument.strip_prefix("--session-id="))
+            .unwrap()
+            .to_owned();
+        // After initializing, the provider's tools orphan 600 grandchildren in
+        // bursts that exit together after their parents, so their SIGCHLDs
+        // coalesce. One more orphaned daemon shares the provider's stdin, so
+        // both stay alive until the actor, or this process, closes it.
+        let startup = Startup {
+            protocol: PROTOCOL,
+            source: source.clone(),
+            program: "/bin/sh".into(),
+            arguments: vec![
+                "-c".into(),
+                r#"IFS= read -r frame || exit 2
+id=${frame#*\"request_id\":\"}
+id=${id%%\"*}
+printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"current_permission_mode":"default"}}}\n' "$id"
+printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$1"
+exec 3<&0
+for burst in 1 2 3 4 5 6; do
+  i=0
+  while [ $i -lt 100 ]; do (/bin/sleep 0.2 &); i=$((i + 1)); done
+done
+(/bin/cat <&3 >/dev/null & echo $! > "$2")
+while IFS= read -r frame; do :; done
+"#
+                .into(),
+                "orphan-fixture".into(),
+                session_id,
+                orphaned.to_string_lossy().into_owned(),
+            ],
+            prepared_identity: adapter.prepared_launch_identity().unwrap(),
+            environment: source.launch.recipe.environment.clone(),
+            working_directory: cwd.clone(),
+            directory_fd: None,
+            directory_identity: None,
+            mailbox_recognition: None,
+            provider_directory_observed: false,
+            recovery_environment: BTreeMap::new(),
+        };
+        let server = Server::start_after_scope_enrollment(startup, &control, || Ok(())).unwrap();
+        let provider = server.identity.record.root.clone();
+        let mut parent = Some(parent);
+        let worker = thread::spawn(move || {
+            let mut server = server;
+            server.serve(control)
+        });
+        let attached: Result<Attached, String> =
+            receive(parent.as_ref().unwrap(), TIMEOUT).unwrap();
+        attached.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let live: i32 = loop {
+            if let Some(pid) = std::fs::read_to_string(&orphaned)
+                .ok()
+                .and_then(|pid| pid.trim().parse().ok())
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "provider tools did not finish");
+            thread::sleep(Duration::from_millis(10));
+        };
+        // Every exited orphan is reaped within a bound while both the actor
+        // and its provider keep running.
+        let bound = Instant::now() + Duration::from_secs(5);
+        loop {
+            let remaining = zombies();
+            if remaining == 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < bound,
+                "{remaining} exited adopted orphans were not reaped while serving"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(provider.is_current(), "the provider must keep running");
+        assert!(!worker.is_finished(), "the actor must keep serving");
+        // The live adopted daemon is still this actor's unsignalled child.
+        assert_eq!(state(live), Some('S'));
+        assert!(
+            crate::daemon::owned_children::direct_children()
+                .unwrap()
+                .contains(&live)
+        );
+        // Startup EOF retires the actor through its existing cleanup.
+        parent.take();
+        worker.join().unwrap().unwrap();
+        assert!(!provider.is_current(), "original provider must be reaped");
+    }
+
+    #[test]
+    fn an_ordinary_close_leaves_what_the_provider_leaves() {
+        if crate::retained_fixture::run_isolated() {
+            return;
+        }
+        use crate::daemon::owned_children::tests as children;
+        // This isolated process stands in for the helper, which owns its
+        // provider through a registration and adopts what the provider's
+        // commands detach.
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let (mut provider, registration) = crate::daemon::adopted_orphans::spawn_owned(
+            &mut children::provider_with_detached_work(root.path()),
+        )
+        .unwrap();
+        let work = children::detached_work(root.path());
+        // As the actor's ChildGuard ends the provider, then the close's reap.
+        unsafe { libc::kill(-(provider.id() as i32), libc::SIGTERM) };
+        provider.wait().unwrap();
+        drop(registration);
+        reap_orphans(DetachedWork::Spare).unwrap();
+        assert!(
+            children::ends(work.running, || {
+                reap_orphans(DetachedWork::Spare).unwrap();
+            }),
+            "the provider stopped its own command as it quit, and it is reaped"
+        );
+        for pid in [work.detached, work.left] {
+            assert!(
+                children::alive(pid) && children::parent(pid) == Some(std::process::id() as i32),
+                "what the provider leaves running keeps running"
+            );
+        }
+        // A close that stops everything, as for an unattended agent, reaps
+        // them too.
+        reap_orphans(DetachedWork::Stop).unwrap();
+        assert!(!children::exists(work.detached) && !children::exists(work.left));
     }
 
     thread_local! {
@@ -3447,6 +4496,15 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s"}
         resident_fixture_with_body(None)
     }
     fn resident_fixture_with_body(body: Option<String>) -> Fixture {
+        let (server, root) = resident_server(body);
+        Fixture {
+            server,
+            _root: root,
+        }
+    }
+    /// A resident fixture's parts, for a test that moves the server into
+    /// [`Server::serve`], which closes its actor on the way out.
+    pub(super) fn resident_server(body: Option<String>) -> (Server, tempfile::TempDir) {
         use crate::chat::protocol::{Adapter, Step};
         struct Idle;
         impl Adapter for Idle {
@@ -3520,8 +4578,8 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s"}
         let socket = root.path().join("fixture.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let metadata = std::fs::symlink_metadata(&socket).unwrap();
-        Fixture {
-            server: Server {
+        (
+            Server {
                 actor,
                 identity,
                 source,
@@ -3533,6 +4591,10 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s"}
                 installed: true,
                 journal: Arc::new(Mutex::new(Journal::open(&journal_directory).unwrap())),
                 changed: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+                watcher: Arc::new(push::Watcher::default()),
+                state_reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                #[cfg(test)]
+                fail_state_reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 prompt_revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 pending: Vec::new(),
                 account_reports: Arc::new(Mutex::new(Vec::new())),
@@ -3546,9 +4608,10 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s"}
                 session_stopping: false,
                 attachment_preserved: false,
                 close_only: false,
+                detached: DetachedWork::Stop,
             },
-            _root: root,
-        }
+            root,
+        )
     }
     #[test]
     fn continuity_loss_refuses_unchanged_presentation_without_mutating_source_or_copy() {
@@ -3624,6 +4687,9 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s"}
     }
     #[test]
     fn removed_or_replaced_home_can_only_adopt_the_exact_helper_for_close() {
+        if crate::retained_fixture::run_isolated() {
+            return;
+        }
         const CHILD: &str = "CAGENTS_RETAINED_CLOSE_ONLY_TEST";
         if std::env::var_os(CHILD).is_none() {
             let root = tempfile::tempdir_in("/var/tmp").unwrap();
@@ -3835,7 +4901,9 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s"}
                 close.0.finish_close().unwrap();
             }
             assert!(!identity.record.root.is_current());
-            assert!(!identity.record.holder.is_current());
+            // The retirement proof sees the helper exit before its reaper
+            // collects it.
+            assert!(identity.record.holder.reaped());
             let retired = RemoteActor::retired_actor_receipt(&identity.record, &proof)
                 .unwrap()
                 .unwrap();
@@ -3846,6 +4914,9 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s"}
     }
     #[test]
     fn authenticated_directory_pin_keeps_original_after_replacement_and_epoch_change() {
+        if crate::retained_fixture::run_isolated() {
+            return;
+        }
         const CHILD: &str = "CAGENTS_RETAINED_DIRECTORY_PIN_TEST";
         if std::env::var_os(CHILD).is_none() {
             let root = tempfile::tempdir().unwrap();
@@ -4044,6 +5115,9 @@ exec /bin/sleep 60
     }
     #[test]
     fn helper_restores_descriptor_seal_before_any_provider_exec() {
+        if crate::retained_fixture::run_isolated() {
+            return;
+        }
         const CHILD: &str = "CAGENTS_ACTOR_DESCRIPTOR_SEAL_TEST";
         if std::env::var_os(CHILD).is_none() {
             let isolated = tempfile::tempdir_in("/var/tmp").unwrap();
@@ -4201,6 +5275,80 @@ exec /bin/sleep 60
         }
     }
     #[test]
+    fn courier_input_completion_persists_uncertainty_and_retains_affected_runs() {
+        for uncertain in [false, true] {
+            let mut fixture = resident_fixture();
+            let server = &mut fixture.server;
+            let identity = InputIdentity {
+                sequence: 1,
+                id: uuid::Uuid::new_v4(),
+                hash: [8; 32],
+            };
+            let run = crate::model::RunId::new();
+            server
+                .journal
+                .lock()
+                .unwrap()
+                .admit_with_run(&identity, Some(run))
+                .unwrap();
+            let (reply, response) = crossbeam_channel::bounded(1);
+            let error = "fixture input failure".to_owned();
+            reply
+                .send(Err(if uncertain {
+                    Rejection::Unacknowledged(error.clone())
+                } else {
+                    Rejection::Refused(error.clone())
+                }))
+                .unwrap();
+            server.pending.push((
+                identity.clone(),
+                response,
+                Some((
+                    run,
+                    Arc::new(std::sync::atomic::AtomicU8::new(if uncertain {
+                        2
+                    } else {
+                        1
+                    })),
+                )),
+            ));
+            server.finish_inputs();
+            assert!(server.pending.is_empty());
+            let journal = server.journal.lock().unwrap();
+            let receipt = journal.input(&identity).unwrap().unwrap();
+            assert_eq!(
+                receipt.state,
+                if uncertain {
+                    InputState::Unknown(error)
+                } else {
+                    InputState::Acknowledged(Err(error))
+                }
+            );
+            assert_eq!(
+                journal.retained_runs().unwrap(),
+                if uncertain { vec![run] } else { vec![] }
+            );
+            // Helpers keep their Journal for one lifetime. An independent
+            // read-only database connection checks the committed receipt;
+            // reopening the actor Journal itself is intentionally refused.
+            let persisted = rusqlite::Connection::open_with_flags(
+                fixture._root.path().join("journal/actor-journal.sqlite"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let bytes: Vec<u8> = persisted
+                .query_row(
+                    "SELECT state FROM inputs WHERE sequence=?1",
+                    [identity.sequence],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let state: InputState = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(state, receipt.state);
+        }
+    }
+
+    #[test]
     fn input_refusal_and_storage_failure_publish_new_resident_revisions() {
         for storage_failure in [false, true] {
             let mut fixture = resident_fixture();
@@ -4221,7 +5369,9 @@ exec /bin/sleep 60
             let before = server.resident().unwrap();
             assert_eq!(before.retained_runs, vec![run]);
             let (reply, response) = crossbeam_channel::bounded(1);
-            reply.send(Err("fixture refusal".to_owned())).unwrap();
+            reply
+                .send(Err(Rejection::Refused("fixture refusal".to_owned())))
+                .unwrap();
             server.pending.push((
                 identity,
                 response,
@@ -4297,6 +5447,27 @@ exec /bin/sleep 60
         let before = next.prompt_revision;
         notify(Update::Presentation);
         assert_eq!(fixture.server.resident().unwrap().prompt_revision, before);
+    }
+    #[test]
+    fn a_helper_that_predates_named_holds_still_reports_its_background_work() {
+        let mut resident = serde_json::to_value(RemoteActor::fixture().state().as_ref()).unwrap();
+        let fields = resident.as_object_mut().unwrap();
+        assert!(fields.remove("work_hold").is_some());
+        fields.insert("background_subagents".into(), json!(["toolu_old"]));
+        let older: Resident = serde_json::from_value(resident).unwrap();
+        let hold = older.work_hold();
+        assert!(!hold.turn);
+        assert_eq!(
+            hold.subagents,
+            [chat::HeldSubagent {
+                name: String::new(),
+                waiting: false
+            }]
+        );
+        assert_eq!(
+            hold.subagents().detail(),
+            "1 background subagent is still running."
+        );
     }
     #[test]
     fn protocol_one_attachment_is_refused_without_starting_or_retiring_its_owner() {
@@ -5067,6 +6238,65 @@ exec /bin/sleep 60
         );
     }
     #[test]
+    fn acknowledged_install_cannot_be_reversed_by_an_inflight_precommit_observation() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let socket = root.path().join("install.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let mut actor = RemoteActor::fixture();
+        Arc::get_mut(&mut actor.0).unwrap().socket = socket;
+        actor.0.installed.store(false, Ordering::Release);
+        let before = {
+            let mut state = actor.0.state.lock().unwrap();
+            let state = Arc::make_mut(&mut state);
+            state.installed = false;
+            state.native_continuity = chat::NativeContinuity::ReconnectOnly;
+            state.clone()
+        };
+        let proof = actor.0.proof.clone();
+        let epoch = actor.0.epoch;
+        let peer = thread::spawn(move || {
+            let (control, _) = listener.accept().unwrap();
+            let request: Invocation = receive(&control, TIMEOUT).unwrap();
+            assert_eq!(request.method, "commit");
+            assert_eq!(request.proof, proof);
+            assert_eq!(request.epoch, Some(epoch));
+            send(&control, &Ok::<Value, String>(Value::Null), TIMEOUT).unwrap();
+        });
+        actor.commit_installation().unwrap();
+        peer.join().unwrap();
+        // This is the exact precommit response an already-issued observer
+        // RPC can return. Equal revisions cannot revoke a successful ACK.
+        assert!(!actor.publish_resident(before.clone()));
+        let installed = actor.state();
+        assert!(installed.installed);
+        assert_eq!(installed.changed, before.changed);
+        assert_eq!(installed.generation, before.generation);
+        assert_eq!(installed.confirmed_session, before.confirmed_session);
+        assert_eq!(
+            installed.native_continuity,
+            chat::NativeContinuity::RetainedClaudeActor { protocol: PROTOCOL }
+        );
+        let mut contradictory = installed.as_ref().clone();
+        contradictory.changed += 1;
+        contradictory.generation += 1;
+        contradictory.native_continuity = chat::NativeContinuity::ReconnectOnly;
+        assert!(!actor.publish_resident(contradictory));
+        let mut next = installed.as_ref().clone();
+        next.changed += 1;
+        next.generation += 1;
+        assert!(actor.publish_resident(next));
+        assert_eq!(actor.state().generation, before.generation + 1);
+        let final_snapshot = Snapshot {
+            exited: true,
+            ..Default::default()
+        };
+        actor.publish_closed_inner(final_snapshot.clone(), Some(before));
+        assert!(actor.state().completed);
+        assert!(actor.state().installed);
+        assert_eq!(actor.state().native_continuity, installed.native_continuity);
+        assert_eq!(actor.snapshot(None), Some(final_snapshot));
+    }
+    #[test]
     fn synchronous_refresh_publishes_all_transitions_and_rejects_a_delayed_observer_response() {
         let root = tempfile::tempdir_in("/var/tmp").unwrap();
         let socket = root.path().join("refresh.sock");
@@ -5095,6 +6325,20 @@ exec /bin/sleep 60
             observed_at: 123,
         };
         next.account_reports.push(usage.clone());
+        let addresses = vec![chat::AgentAddress {
+            address: "a1892b93e88999a7d".into(),
+            subagent: "toolu_relocate".into(),
+        }];
+        next.agent_addresses = addresses.clone();
+        // A helper that predates them reports none.
+        let mut predating = serde_json::to_value(&old).unwrap();
+        predating.as_object_mut().unwrap().remove("agent_addresses");
+        assert!(
+            serde_json::from_value::<Resident>(predating)
+                .unwrap()
+                .agent_addresses
+                .is_empty()
+        );
         let delayed = old.clone();
         let expected = vec![
             Update::Observed {
@@ -5109,12 +6353,18 @@ exec /bin/sleep 60
             Update::PromptAvailable,
             Update::RetainedOutcomes,
             usage,
+            Update::AgentAddresses(addresses),
         ];
         let (observed_poll, poll_started) = crossbeam_channel::bounded(1);
         let (release, wait_release) = crossbeam_channel::bounded(1);
         let (processed, poll_processed) = crossbeam_channel::bounded(1);
         let (stop, stopped) = crossbeam_channel::bounded(1);
         let peer = thread::spawn(move || {
+            // This ordering fixture models an older helper without readiness.
+            let (watch, _) = listener.accept().unwrap();
+            let request: Invocation = receive(&watch, TIMEOUT).unwrap();
+            assert_eq!(request.method, "watch");
+            send(&watch, &Err::<Value, _>(UNKNOWN_METHOD.to_owned()), TIMEOUT).unwrap();
             // Hold the observer's response to force refresh_state to publish
             // the new resident before that observer returns an unchanged poll.
             let (observer, _) = listener.accept().unwrap();
@@ -5186,6 +6436,55 @@ exec /bin/sleep 60
         stop.send(()).unwrap();
         peer.join().unwrap();
     }
+    /// #2339: while a close drains the outbox, the outcome broker refreshes
+    /// the same closed actor. When its newer reply is published first, the
+    /// close's older reply is stale, not a failed close.
+    #[test]
+    fn a_closed_refresh_overtaken_by_a_newer_one_is_stale_not_a_failure() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let socket = root.path().join("closed-refresh.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let actor = RemoteActor::fixture_at(socket);
+        let mut older = actor.state().as_ref().clone();
+        older.completed = true;
+        older.close.completed = true;
+        let mut newer = older.clone();
+        newer.changed += 1;
+        newer.outbox_ack = 1;
+        newer.outbox_latest = 1;
+        actor.publish_closed_inner(
+            Snapshot {
+                exited: true,
+                ..Default::default()
+            },
+            Some(newer.clone()),
+        );
+        // Current, yet it contradicts the acknowledged installation.
+        let mut contradictory = newer.clone();
+        contradictory.installed = false;
+        let replies = [older, contradictory];
+        let peer = thread::spawn(move || {
+            for reply in replies {
+                let (stream, _) = listener.accept().unwrap();
+                let request: Invocation = receive(&stream, TIMEOUT).unwrap();
+                assert_eq!(request.method, "state");
+                send(
+                    &stream,
+                    &Ok::<Value, String>(serde_json::to_value(Some(reply)).unwrap()),
+                    TIMEOUT,
+                )
+                .unwrap();
+            }
+        });
+        actor.refresh_state().unwrap();
+        assert_eq!(actor.state().changed, newer.changed);
+        assert_eq!(actor.state().outbox_ack, 1);
+        assert_eq!(
+            actor.refresh_state().unwrap_err(),
+            "Closed actor metadata was superseded during refresh"
+        );
+        peer.join().unwrap();
+    }
     #[test]
     fn oversized_input_refusal_keeps_the_next_normal_input_admissible() {
         let actor = RemoteActor::fixture();
@@ -5214,12 +6513,652 @@ exec /bin/sleep 60
         ));
     }
     #[test]
+    fn failed_input_call_is_retransmitted_then_settled_by_the_helper() {
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let socket = directory.path().join("actor.sock");
+        let actor = RemoteActor::fixture_at(socket.clone());
+        // The helper is unreachable, so the original `input` call fails and
+        // its delivery is unknown: it may never have reached the helper.
+        let response = actor.enqueue(None, Command::Refresh).unwrap();
+        let identity = actor.pending_inputs().pop().unwrap();
+        assert_eq!(
+            actor.enqueue_now(Command::Refresh).unwrap_err(),
+            UNSETTLED_INPUT
+        );
+        actor.resolve_uncertain_input();
+        let retransmit = |actor: &RemoteActor| {
+            let uncertain = actor.0.uncertain_input.lock().unwrap();
+            let retransmit = uncertain.as_ref().unwrap().retransmit.as_ref();
+            retransmit.map(|retransmit| (retransmit.next, retransmit.delay))
+        };
+        let (next, delay) = retransmit(&actor).expect("a failed call schedules retransmission");
+        assert!(next > Instant::now() && delay > RETRANSMIT_DELAY);
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        actor.resolve_uncertain_input();
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "nothing is retransmitted before its backoff elapses"
+        );
+        listener.set_nonblocking(false).unwrap();
+        let expected = identity.clone();
+        let helper = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let request: Invocation = receive(&stream, TIMEOUT).unwrap();
+            assert_eq!(request.method, "input");
+            let (identity, payload): (InputIdentity, Value) =
+                serde_json::from_value(request.args).unwrap();
+            assert_eq!(identity, expected, "the exact original identity");
+            assert_eq!(
+                payload_digest(&serde_json::to_vec(&payload).unwrap()),
+                identity.hash,
+                "the exact original envelope"
+            );
+            let receipt = InputReceipt {
+                identity,
+                state: InputState::Acknowledged(Ok(())),
+            };
+            send(
+                &stream,
+                &Ok::<Value, String>(serde_json::to_value(receipt).unwrap()),
+                TIMEOUT,
+            )
+            .unwrap();
+        });
+        let backdate = |actor: &RemoteActor| {
+            let mut uncertain = actor.0.uncertain_input.lock().unwrap();
+            uncertain
+                .as_mut()
+                .unwrap()
+                .retransmit
+                .as_mut()
+                .unwrap()
+                .next = Instant::now();
+        };
+        backdate(&actor);
+        actor.resolve_uncertain_input();
+        helper.join().unwrap();
+        assert!(actor.0.uncertain_input.lock().unwrap().is_none());
+        assert_eq!(response.try_recv(), Ok(Ok(())));
+        assert!(actor.pending_inputs().is_empty());
+
+        // Once its caller stops waiting, the input is never sent again: the
+        // helper settles it instead, so it cannot start after the caller was
+        // told its outcome is unknown, and the fence lifts.
+        std::fs::remove_file(&socket).unwrap();
+        let unknown = actor.enqueue(None, Command::Refresh).unwrap();
+        let expected = actor.pending_inputs().pop().unwrap();
+        backdate(&actor);
+        actor
+            .0
+            .uncertain_input
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .acknowledgement_deadline = Instant::now();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let settle =
+            |listener: &UnixListener, expected: &InputIdentity, answer: Result<Value, String>| {
+                let (stream, _) = listener.accept().unwrap();
+                let request: Invocation = receive(&stream, TIMEOUT).unwrap();
+                assert_eq!(request.method, "abandon_input", "never the input itself");
+                let (identity, reason): (InputIdentity, String) =
+                    serde_json::from_value(request.args).unwrap();
+                assert_eq!(&identity, expected);
+                assert_eq!(reason, UNCONFIRMED_INPUT);
+                send(&stream, &answer, TIMEOUT).unwrap();
+            };
+        // A helper that cannot settle the input yet, such as on a busy
+        // journal, leaves the fence in place, and the proxy asks again after
+        // its backoff.
+        let busy = thread::scope(|scope| {
+            let helper =
+                scope.spawn(|| settle(&listener, &expected, Err("database is locked".into())));
+            actor.resolve_uncertain_input();
+            helper.join().unwrap();
+            retransmit(&actor)
+        });
+        assert!(busy.is_some(), "the input stays fenced");
+        backdate(&actor);
+        let settled = InputReceipt {
+            identity: expected.clone(),
+            state: InputState::Acknowledged(Err(UNCONFIRMED_INPUT.into())),
+        };
+        thread::scope(|scope| {
+            let helper = scope.spawn(|| {
+                settle(
+                    &listener,
+                    &expected,
+                    Ok(serde_json::to_value(&settled).unwrap()),
+                )
+            });
+            actor.resolve_uncertain_input();
+            helper.join().unwrap();
+        });
+        assert!(actor.0.uncertain_input.lock().unwrap().is_none());
+        assert_eq!(
+            unknown.try_recv(),
+            Ok(Err(Rejection::Refused(UNCONFIRMED_INPUT.into())))
+        );
+        assert!(actor.pending_inputs().is_empty());
+
+        // An older helper cannot settle inputs at all. The proxy stops asking
+        // and refuses new input at once, saying how to recover, instead of
+        // making each one wait for a fence that will not lift.
+        std::fs::remove_file(&socket).unwrap();
+        let stuck = actor.enqueue(None, Command::Refresh).unwrap();
+        let expected = actor.pending_inputs().pop().unwrap();
+        assert_eq!(expected.sequence, 3);
+        backdate(&actor);
+        actor
+            .0
+            .uncertain_input
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .acknowledgement_deadline = Instant::now();
+        let listener = UnixListener::bind(&socket).unwrap();
+        thread::scope(|scope| {
+            let helper = scope.spawn(|| settle(&listener, &expected, Err(UNKNOWN_METHOD.into())));
+            actor.resolve_uncertain_input();
+            helper.join().unwrap();
+        });
+        assert!(
+            retransmit(&actor).is_none(),
+            "an older helper is not asked again"
+        );
+        let started = Instant::now();
+        assert_eq!(
+            actor.enqueue(None, Command::Refresh).unwrap_err(),
+            UNSETTLEABLE_INPUT
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "refused without waiting"
+        );
+        // A receipt the helper reports on its own still lifts the fence.
+        actor.apply_receipts(&[InputReceipt {
+            identity: expected,
+            state: InputState::Acknowledged(Ok(())),
+        }]);
+        assert_eq!(stuck.try_recv(), Ok(Ok(())));
+        drop(listener);
+        actor.enqueue_now(Command::Refresh).unwrap();
+        let expected = actor.pending_inputs().pop().unwrap();
+        assert_eq!(expected.sequence, 4);
+
+        // A helper that keeps failing to settle an input, such as one that
+        // already retired it, is asked a bounded number of times.
+        std::fs::remove_file(&socket).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        for attempt in 1..=SETTLE_ATTEMPTS {
+            assert!(retransmit(&actor).is_some(), "still asking at {attempt}");
+            backdate(&actor);
+            actor
+                .0
+                .uncertain_input
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .acknowledgement_deadline = Instant::now();
+            thread::scope(|scope| {
+                let helper =
+                    scope.spawn(|| {
+                        settle(
+                        &listener,
+                        &expected,
+                        Err("Input receipt is retired or unavailable; never replay this command"
+                            .into()),
+                    )
+                    });
+                actor.resolve_uncertain_input();
+                helper.join().unwrap();
+            });
+        }
+        assert!(retransmit(&actor).is_none(), "the proxy stops asking");
+        assert_eq!(
+            actor.enqueue(None, Command::Refresh).unwrap_err(),
+            UNSETTLEABLE_INPUT
+        );
+    }
+    /// An admitted input the actor's queue will not take is refused as its
+    /// cause: a closing actor's for good, a full queue's as crowded.
+    #[test]
+    fn an_input_the_actor_queue_refuses_is_refused_as_its_cause() {
+        assert_eq!(unrun_input_outcome(QueueRefusal::Closed), CLOSING_INPUT);
+        assert_eq!(unrun_input_outcome(QueueRefusal::Full), CROWDED_INPUT);
+    }
+    /// A helper that does not answer requests to settle an input, whether
+    /// unreachable or wedged so each request times out, is not counted as
+    /// refusing them. After `SETTLE_LIMIT` new input stops waiting on it, but
+    /// it is still asked, so a helper that returns can still settle it.
+    #[test]
+    fn new_input_stops_waiting_on_a_helper_that_never_answers() {
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let socket = directory.path().join("actor.sock");
+        let actor = RemoteActor::fixture_at(socket.clone());
+        let unknown = actor.enqueue(None, Command::Refresh).unwrap();
+        let expected = actor.pending_inputs().pop().unwrap();
+        let settle_now = |actor: &RemoteActor| {
+            let mut uncertain = actor.0.uncertain_input.lock().unwrap();
+            let uncertain = uncertain.as_mut().unwrap();
+            uncertain.acknowledgement_deadline = Instant::now();
+            uncertain.retransmit.as_mut().unwrap().next = Instant::now();
+        };
+        let state = |actor: &RemoteActor| {
+            let uncertain = actor.0.uncertain_input.lock().unwrap();
+            let uncertain = uncertain.as_ref().unwrap();
+            (
+                uncertain.settling_since.is_some(),
+                uncertain.settle_failures,
+                uncertain.unsettleable,
+                uncertain.retransmit.is_some(),
+            )
+        };
+        // An unreachable helper.
+        for attempt in 1..=SETTLE_ATTEMPTS * 2 {
+            settle_now(&actor);
+            actor.resolve_uncertain_input();
+            assert_eq!(
+                state(&actor),
+                (true, 0, false, true),
+                "asked to settle, uncounted, at {attempt}"
+            );
+        }
+        // A wedged helper takes the request and never answers it.
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let accept = |listener: &UnixListener| {
+            let deadline = Instant::now() + TIMEOUT;
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        return stream;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "the proxy never asked");
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            }
+        };
+        let wedged = |listener: &UnixListener| {
+            let stream = accept(listener);
+            let request: Invocation = receive(&stream, TIMEOUT).unwrap();
+            assert_eq!(request.method, "abandon_input");
+            // Hold the connection until the proxy gives up on the answer.
+            let _ = stream.set_read_timeout(Some(TIMEOUT * 2));
+            let _ = std::io::Read::read(&mut &stream, &mut [0; 1]);
+        };
+        settle_now(&actor);
+        thread::scope(|scope| {
+            let helper = scope.spawn(|| wedged(&listener));
+            actor.resolve_uncertain_input();
+            helper.join().unwrap();
+        });
+        assert_eq!(
+            state(&actor),
+            (true, 0, false, true),
+            "a timeout is uncounted"
+        );
+        let delay = |actor: &RemoteActor| {
+            let uncertain = actor.0.uncertain_input.lock().unwrap();
+            uncertain
+                .as_ref()
+                .unwrap()
+                .retransmit
+                .as_ref()
+                .unwrap()
+                .delay
+        };
+        assert_eq!(delay(&actor), TIMEOUT, "asked as often until overdue");
+        // Past the limit, new input is refused at once.
+        *actor
+            .0
+            .uncertain_input
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .settling_since
+            .as_mut()
+            .unwrap() -= SETTLE_LIMIT;
+        settle_now(&actor);
+        thread::scope(|scope| {
+            let helper = scope.spawn(|| wedged(&listener));
+            actor.resolve_uncertain_input();
+            helper.join().unwrap();
+        });
+        assert_eq!(state(&actor), (true, 0, true, true), "refused, still asked");
+        assert!(delay(&actor) > TIMEOUT, "asked less often once overdue");
+        let started = Instant::now();
+        assert_eq!(
+            actor.enqueue(None, Command::Refresh).unwrap_err(),
+            UNSETTLEABLE_INPUT
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "refused at once"
+        );
+        // A helper that returns still settles it, which lifts the fence.
+        settle_now(&actor);
+        let settled = InputReceipt {
+            identity: expected.clone(),
+            state: InputState::Acknowledged(Err(UNCONFIRMED_INPUT.into())),
+        };
+        thread::scope(|scope| {
+            let helper = scope.spawn(|| {
+                let stream = accept(&listener);
+                let request: Invocation = receive(&stream, TIMEOUT).unwrap();
+                assert_eq!(request.method, "abandon_input");
+                send(
+                    &stream,
+                    &Ok::<Value, String>(serde_json::to_value(&settled).unwrap()),
+                    TIMEOUT,
+                )
+                .unwrap();
+            });
+            actor.resolve_uncertain_input();
+            helper.join().unwrap();
+        });
+        assert!(actor.0.uncertain_input.lock().unwrap().is_none());
+        assert_eq!(
+            unknown.try_recv(),
+            Ok(Err(Rejection::Refused(UNCONFIRMED_INPUT.into())))
+        );
+    }
+    /// A proxy attached to the real helper request handling, served one
+    /// request at a time as the helper's serve loop runs them.
+    struct ServedHelper {
+        actor: RemoteActor,
+        fixture: Arc<Mutex<Fixture>>,
+        requests: Arc<Mutex<Vec<(String, Value)>>>,
+        stop: Arc<AtomicBool>,
+        helper: Option<thread::JoinHandle<()>>,
+    }
+    impl ServedHelper {
+        fn new(prepare: impl FnOnce(&mut Server)) -> Self {
+            let mut fixture = resident_fixture();
+            prepare(&mut fixture.server);
+            fixture.server.listener.set_nonblocking(true).unwrap();
+            let attached = fixture.server.attached().unwrap();
+            let proof = fixture.server.proof.clone();
+            let socket = fixture.server.socket.clone();
+            let fixture = Arc::new(Mutex::new(fixture));
+            let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let helper = {
+                let (fixture, requests, stop) = (fixture.clone(), requests.clone(), stop.clone());
+                thread::spawn(move || {
+                    while !stop.load(Ordering::Acquire) {
+                        let mut fixture = fixture.lock().unwrap();
+                        fixture.server.finish_inputs();
+                        let control = match fixture.server.listener.accept() {
+                            Ok((control, _)) => control,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                drop(fixture);
+                                thread::sleep(Duration::from_millis(5));
+                                continue;
+                            }
+                            Err(error) => panic!("{error}"),
+                        };
+                        let request: Invocation = receive(&control, TIMEOUT).unwrap();
+                        requests
+                            .lock()
+                            .unwrap()
+                            .push((request.method.clone(), request.args.clone()));
+                        // This deliberately models a pre-readiness protocol-2 helper.
+                        let response = if request.method == "watch" {
+                            Err(UNKNOWN_METHOD.into())
+                        } else {
+                            fixture.server.invoke(request)
+                        };
+                        let _ = send(&control, &response, TIMEOUT);
+                    }
+                })
+            };
+            let actor =
+                RemoteActor::from_attached_at(attached, proof, None, socket, |_| {}).unwrap();
+            Self {
+                actor,
+                fixture,
+                requests,
+                stop,
+                helper: Some(helper),
+            }
+        }
+        /// The arguments of the first `input` request for `sequence`.
+        fn input_request(&self, sequence: u64) -> Value {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(method, args)| method == "input" && args[0]["sequence"] == sequence)
+                .map(|(_, args)| args.clone())
+                .unwrap()
+        }
+        /// Deliver `args` to the helper again, as a late copy of its frame.
+        fn invoke_input(&self, args: Value) -> Result<Value, String> {
+            let mut fixture = self.fixture.lock().unwrap();
+            let server = &mut fixture.server;
+            server.invoke(Invocation {
+                proof: server.proof.clone(),
+                epoch: Some(server.epoch),
+                method: "input".into(),
+                args,
+            })
+        }
+    }
+    impl Drop for ServedHelper {
+        fn drop(&mut self) {
+            self.actor.0.stop.store(true, Ordering::Release);
+            self.stop.store(true, Ordering::Release);
+            self.actor.0.wake.notify();
+            if let Some(helper) = self.helper.take() {
+                let _ = helper.join();
+            }
+        }
+    }
+    /// #2242: an input the helper refused without a receipt fenced every
+    /// later input of the conversation for good.
+    #[test]
+    fn refused_input_is_settled_and_the_next_input_is_admitted() {
+        // The helper refuses input before installation, without a receipt.
+        let served = ServedHelper::new(|server| server.installed = false);
+        let (actor, fixture) = (&served.actor, &served.fixture);
+        let installed = |installed| fixture.lock().unwrap().server.installed = installed;
+        // A refusal that ends while its caller waits is still delivered.
+        let model = Command::SetModel {
+            model: "haiku".into(),
+            reasoning: None,
+        };
+        let delivered = actor.enqueue(None, model).unwrap();
+        thread::sleep(RETRANSMIT_DELAY * 3);
+        installed(true);
+        assert_eq!(
+            delivered.recv_timeout(ACKNOWLEDGEMENT_WAIT).unwrap(),
+            Ok(())
+        );
+        // A refusal that lasts until its caller stops waiting is settled: the
+        // caller hears it, rather than an unknown outcome, and the
+        // conversation takes the next input.
+        installed(false);
+        let refused = actor.enqueue(None, Command::Refresh).unwrap();
+        actor
+            .0
+            .uncertain_input
+            .lock()
+            .unwrap()
+            .as_mut()
+            .expect("the refused input is fenced")
+            .acknowledgement_deadline = Instant::now();
+        match refused.recv_timeout(Duration::from_secs(3)) {
+            Ok(Err(Rejection::Refused(reason))) => assert_eq!(
+                reason, UNCONFIRMED_INPUT,
+                "the helper's own reason stays in the logs"
+            ),
+            outcome => panic!("the refused input was never settled: {outcome:?}"),
+        }
+        assert!(actor.0.uncertain_input.lock().unwrap().is_none());
+        installed(true);
+        let next = actor.enqueue(None, Command::Refresh).unwrap();
+        assert_eq!(next.recv_timeout(ACKNOWLEDGEMENT_WAIT).unwrap(), Ok(()));
+        // A late copy of the refused frame never runs: it is answered with
+        // the refusal or, once the proxy retired that, refused as retired.
+        match served
+            .invoke_input(served.input_request(2))
+            .map(serde_json::from_value::<InputReceipt>)
+        {
+            Ok(Ok(InputReceipt {
+                state: InputState::Acknowledged(Err(_)),
+                ..
+            })) => {}
+            Err(refusal) if refusal.contains("never replay") => {}
+            late => panic!("a late copy of a refused input was admitted: {late:?}"),
+        }
+        assert!(fixture.lock().unwrap().server.pending.is_empty());
+    }
+    /// A refusal that waiting cannot change is reported at once with its own
+    /// next step, rather than retransmitted until the caller gives up and
+    /// reported as a delay.
+    #[test]
+    fn a_refusal_that_cannot_clear_is_reported_at_once() {
+        type Toggle = fn(&mut Server, bool);
+        let stopping: Toggle = |server, on| server.session_stopping = on;
+        let preserved: Toggle = |server, on| server.attachment_preserved = on;
+        for (toggle, expected) in [(stopping, CLOSING_INPUT), (preserved, HANDOVER_INPUT)] {
+            let served = ServedHelper::new(|server| toggle(server, true));
+            let actor = &served.actor;
+            let started = Instant::now();
+            let refused = actor.enqueue(None, Command::Refresh).unwrap();
+            assert_eq!(
+                refused.recv_timeout(ACKNOWLEDGEMENT_WAIT),
+                Ok(Err(Rejection::Refused(expected.into())))
+            );
+            // Well before the caller's wait would end with retransmission.
+            assert!(
+                started.elapsed() < ACKNOWLEDGEMENT_WAIT / 2,
+                "reported at once"
+            );
+            assert!(
+                actor.0.uncertain_input.lock().unwrap().is_none(),
+                "the refusal lifts the fence"
+            );
+            // The refusal is the input's outcome: a late copy of its frame
+            // returns it even after the refusal's cause has cleared. Once the
+            // caller has heard it, the proxy retires that receipt on its own
+            // worker, and from then on a late copy is refused as retired.
+            toggle(&mut served.fixture.lock().unwrap().server, false);
+            match served.invoke_input(served.input_request(1)) {
+                Ok(late) => assert_eq!(
+                    serde_json::from_value::<InputReceipt>(late).unwrap().state,
+                    InputState::Acknowledged(Err(expected.into()))
+                ),
+                Err(refusal) => assert!(refusal.contains("never replay"), "{refusal}"),
+            }
+            // The next input is admitted.
+            let next = actor.enqueue(None, Command::Refresh).unwrap();
+            assert_eq!(next.recv_timeout(ACKNOWLEDGEMENT_WAIT).unwrap(), Ok(()));
+            assert!(served.fixture.lock().unwrap().server.pending.is_empty());
+        }
+    }
+    /// A damaged frame, a request this helper's protocol does not describe,
+    /// and input after a continuity loss are each refused for good, without
+    /// running, with their own outcome.
+    #[test]
+    fn inputs_that_can_never_run_are_refused_as_their_outcome() {
+        let served = ServedHelper::new(|_| {});
+        let actor = &served.actor;
+        let delivered = actor.enqueue(None, Command::Refresh).unwrap();
+        assert_eq!(
+            delivered.recv_timeout(ACKNOWLEDGEMENT_WAIT).unwrap(),
+            Ok(())
+        );
+        let refused = |sequence: u64, payload: Value, hash: Option<[u8; 32]>| {
+            let mut args = served.input_request(1);
+            let hash =
+                hash.unwrap_or_else(|| payload_digest(&serde_json::to_vec(&payload).unwrap()));
+            args[0]["sequence"] = json!(sequence);
+            args[0]["id"] = json!(uuid::Uuid::new_v4());
+            args[0]["hash"] = json!(hash);
+            args[1] = payload;
+            serde_json::from_value::<InputReceipt>(served.invoke_input(args).unwrap())
+                .unwrap()
+                .state
+        };
+        let original: InputIdentity =
+            serde_json::from_value(served.input_request(1)[0].clone()).unwrap();
+        assert_eq!(
+            refused(
+                2,
+                json!({"IdlePrompt": {"text": "altered"}}),
+                Some(original.hash)
+            ),
+            InputState::Acknowledged(Err(DAMAGED_INPUT.into()))
+        );
+        assert_eq!(
+            refused(3, json!({"FromANewerProtocol": {}}), None),
+            InputState::Acknowledged(Err(UNSUPPORTED_INPUT.into()))
+        );
+        assert!(served.fixture.lock().unwrap().server.pending.is_empty());
+        // After a continuity loss the proxy's caller hears it at once.
+        served
+            .fixture
+            .lock()
+            .unwrap()
+            .server
+            .journal
+            .lock()
+            .unwrap()
+            .record_loss("fixture loss")
+            .unwrap();
+        *actor.0.input_sequence.lock().unwrap() = 4;
+        let started = Instant::now();
+        let lost = actor.enqueue(None, Command::Refresh).unwrap();
+        assert_eq!(
+            lost.recv_timeout(ACKNOWLEDGEMENT_WAIT),
+            Ok(Err(Rejection::Refused(DISCONTINUOUS_INPUT.into())))
+        );
+        assert!(
+            started.elapsed() < ACKNOWLEDGEMENT_WAIT / 2,
+            "reported at once"
+        );
+        assert!(served.fixture.lock().unwrap().server.pending.is_empty());
+    }
+    #[test]
+    fn a_new_input_waits_for_an_unconfirmed_one_to_settle() {
+        let actor = RemoteActor::fixture();
+        let _first = actor.enqueue(None, Command::Refresh).unwrap();
+        let first = actor.pending_inputs().pop().unwrap();
+        thread::scope(|scope| {
+            let next = scope.spawn(|| actor.enqueue(None, Command::Interrupt));
+            // The second caller waits rather than being refused.
+            thread::sleep(RETRANSMIT_DELAY * 2);
+            assert!(!next.is_finished());
+            assert_eq!(actor.pending_inputs(), vec![first.clone()]);
+            actor.apply_receipts(&[InputReceipt {
+                identity: first.clone(),
+                state: InputState::Accepted,
+            }]);
+            next.join().unwrap().unwrap();
+        });
+        let pending = actor.pending_inputs();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[1].sequence, 2);
+    }
+    #[test]
     fn lost_input_reply_keeps_the_original_envelope_and_fences_new_input() {
         let actor = RemoteActor::fixture();
         let response = actor.enqueue(None, Command::Interrupt).unwrap();
         let identity = actor.pending_inputs().pop().unwrap();
         assert_eq!(identity.sequence, 1);
-        assert!(actor.enqueue(None, Command::Interrupt).is_err());
+        assert!(actor.enqueue_now(Command::Interrupt).is_err());
         assert_eq!(actor.pending_inputs(), vec![identity.clone()]);
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
         let mut journal = Journal::open(directory.path()).unwrap();
@@ -5237,6 +7176,9 @@ exec /bin/sleep 60
     }
     #[test]
     fn adopted_real_helper_reclaims_prior_acknowledgements_before_more_than_capacity_commands() {
+        if crate::retained_fixture::run_isolated() {
+            return;
+        }
         const CHILD: &str = "CAGENTS_ACTOR_RECEIPT_RETIREMENT_TEST";
         if std::env::var_os(CHILD).is_none() {
             let root = tempfile::tempdir_in("/var/tmp").unwrap();
@@ -5263,6 +7205,10 @@ exec /bin/sleep 60
             );
             return;
         }
+        // Each wait below is for a real event; under load the helper's RPCs
+        // and journal writes can take seconds, so the bound only turns a
+        // wedged actor into a failure instead of a hung test.
+        const HANG_GUARD: Duration = Duration::from_secs(120);
         let root = tempfile::tempdir_in("/var/tmp").unwrap();
         std::fs::create_dir(root.path().join("claude")).unwrap();
         let mut source = fixture_source();
@@ -5316,7 +7262,7 @@ done"#;
         let owner = Owner(actor);
         let actor = &owner.0;
         actor.commit_installation().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + HANG_GUARD;
         while !actor.state().ready {
             assert!(Instant::now() < deadline);
             thread::sleep(Duration::from_millis(5));
@@ -5325,18 +7271,11 @@ done"#;
         // Preserve itself fences new helper input, so manufacturing a command
         // after preserve would test a forbidden ordering rather than a lost ACK.
         actor.0.stop.store(true, Ordering::Release);
-        let deadline = Instant::now() + Duration::from_secs(6);
-        while actor
-            .0
-            .worker
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|worker| !worker.is_finished())
-        {
-            assert!(Instant::now() < deadline, "old metadata pump did not stop");
-            thread::sleep(Duration::from_millis(5));
-        }
+        // An idle pump waits for readiness without a timer. Wake this exact
+        // observer before joining it, as production preservation does.
+        actor.0.wake.notify();
+        let pump = actor.0.worker.lock().unwrap().take();
+        pump.expect("metadata pump").join().unwrap();
         let identity = InputIdentity {
             sequence: 1,
             id: uuid::Uuid::new_v4(),
@@ -5359,7 +7298,7 @@ done"#;
         })
         .unwrap();
         let _: InputReceipt = actor.call("input", json!([identity, payload])).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + HANG_GUARD;
         loop {
             let receipt: Option<InputReceipt> =
                 actor.call("input_receipt", json!([identity])).unwrap();
@@ -5372,7 +7311,7 @@ done"#;
         let orphaned: Vec<InputReceipt> = actor.call("acknowledged_inputs", Value::Null).unwrap();
         assert_eq!(orphaned.len(), 1);
         assert_eq!(orphaned[0].identity, identity);
-        actor.preserve().unwrap();
+        fixture_preserve_and_join(actor);
         let record = actor.identity().record;
         drop(_lease);
         let mut proof = source.proof.clone().unwrap();
@@ -5425,7 +7364,7 @@ done"#;
             RemoteActor::adopt(&record, source.clone(), proof.clone(), |_| {}).unwrap();
         let replacement_owner = Owner(replacement);
         let actor = &replacement_owner.0;
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + HANG_GUARD;
         while actor.0.recovering_inputs.load(Ordering::Acquire) {
             assert!(Instant::now() < deadline);
             thread::sleep(Duration::from_millis(5));
@@ -5453,19 +7392,33 @@ done"#;
         let mut total = 0usize;
         while total < journal::MAX_INPUTS + 33 {
             let count = 32.min(journal::MAX_INPUTS + 33 - total);
-            let mut replies = Vec::new();
-            for _ in 0..count {
-                replies.push(actor.enqueue(None, Command::Refresh).unwrap());
+            let mut replies: Vec<crossbeam_channel::Receiver<_>> = Vec::new();
+            while replies.len() < count {
+                match actor.enqueue(None, Command::Refresh) {
+                    Ok(reply) => replies.push(reply),
+                    // A helper slower than this caller's whole wait leaves
+                    // the newest input unconfirmed. The metadata pump
+                    // settles it; then this command is admitted again.
+                    Err(error) if error == UNSETTLED_INPUT => {
+                        let deadline = Instant::now() + HANG_GUARD;
+                        while actor.0.uncertain_input.lock().unwrap().is_some() {
+                            assert!(Instant::now() < deadline, "{error}");
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                    }
+                    Err(error) => panic!("{error}"),
+                }
             }
             for reply in replies {
-                reply
-                    .recv_timeout(Duration::from_secs(10))
-                    .unwrap()
-                    .unwrap();
+                match reply.recv_timeout(HANG_GUARD).unwrap() {
+                    // Settled as never sent after its caller stopped waiting.
+                    Err(Rejection::Refused(reason)) if reason == UNCONFIRMED_INPUT => {}
+                    outcome => outcome.unwrap(),
+                }
             }
             total += count;
         }
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + HANG_GUARD;
         while !actor.0.retiring_inputs.lock().unwrap().is_empty() {
             assert!(Instant::now() < deadline);
             thread::sleep(Duration::from_millis(5));
@@ -5561,7 +7514,7 @@ done"#;
         );
         assert!(matches!(
             response.try_recv().unwrap(),
-            Err(Rejection::Unacknowledged(error)) if error.contains("must not be regenerated")
+            Err(Rejection::Unacknowledged(error)) if error == STOPPED_INPUT
         ));
     }
     #[test]
@@ -5598,3 +7551,20 @@ mod identity_tests;
 #[cfg(test)]
 #[path = "transport_deadline_tests.rs"]
 mod deadline_tests;
+
+#[path = "transport_connections.rs"]
+mod connections;
+
+#[cfg(test)]
+#[path = "transport_connection_tests.rs"]
+mod connection_tests;
+
+#[cfg(test)]
+#[path = "transport_push_tests.rs"]
+mod push_tests;
+
+#[path = "transport_push.rs"]
+mod push;
+
+#[path = "transport_binary.rs"]
+mod binary;

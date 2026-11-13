@@ -31,10 +31,14 @@ fn access(request: &ClientRequest) -> Access<'_> {
         R::Connect { .. }
         | R::Authenticate { .. }
         | R::BuildInfo
+        | R::StartupState
         | R::List
         | R::WatchTerminals
         | R::WatchWorkspaceModel
         | R::ReadWorkspaceModel
+        | R::ReadWorkspaceView { .. }
+        | R::ReadWorkspaceSnapshot
+        | R::ReadWorkspaceMetadata { .. }
         | R::Attach { .. }
         | R::Detach { .. }
         | R::SetVisibility { .. }
@@ -76,6 +80,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::PrepareConfirmedUpgrade { .. }
         | R::ResolveUpgradeChat { .. }
         | R::EditWorkspaceModel { .. }
+        | R::ApplyWorkspaceEdit { .. }
         | R::RefreshAgentActivity { .. }
         | R::ObserveReviewRequests { .. }
         | R::WatchNotifications { .. }
@@ -93,6 +98,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::ChatRead { .. }
         | R::ChatClose { .. }
         | R::ChatCloseRetained { .. }
+        | R::ChatLostProcesses { .. }
         | R::ChatCapacityInspect
         | R::ChatCapacitySet { .. }
         | R::ChatReleaseInspect { .. }
@@ -105,6 +111,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::ChatReturnTerminal { .. }
         | R::ChatCommitTerminal { .. }
         | R::ChatPrepareResume { .. }
+        | R::WatchConversationPullRequests { .. }
         | R::Work(crate::work::Request::Pin { .. } | crate::work::Request::Remove(_)) => {
             Access::Refused
         }

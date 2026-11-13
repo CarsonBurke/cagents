@@ -1,4 +1,4 @@
-//! Resident actors and in-flight starts share one bounded admission budget.
+//! Resident actors, in-flight starts and retained startup custody share one budget.
 use super::*;
 
 pub(in crate::host) fn usage(state: &HostState) -> usize {
@@ -7,6 +7,20 @@ pub(in crate::host) fn usage(state: &HostState) -> usize {
             .chat_spawning
             .keys()
             .filter(|id| !state.chats.contains_key(id))
+            .count()
+        + state
+            .native_actor_startups
+            .keys()
+            .filter(|id| !state.chats.contains_key(id) && !state.chat_spawning.contains_key(id))
+            .count()
+}
+
+fn pending(state: &HostState) -> usize {
+    state.chat_spawning.len()
+        + state
+            .native_actor_startups
+            .keys()
+            .filter(|id| !state.chat_spawning.contains_key(id))
             .count()
 }
 
@@ -18,7 +32,7 @@ pub(super) fn require_available(state: &HostState) -> Result<(), ProtocolError> 
             format!(
                 "Daemon native chat capacity reached: {} resident, {} starting, limit {} ({} distinct slots used). Release explicitly verified completed chats or change the configured capacity; idle chats may still own provider work.",
                 state.chats.len(),
-                state.chat_spawning.len(),
+                pending(state),
                 state.native_chat_capacity,
                 used,
             ),
@@ -190,6 +204,7 @@ impl Drop for Reservation {
         if state.chat_spawning.get(&self.source.id) == Some(&self.source) {
             state.chat_spawning.remove(&self.source.id);
             state.inventory_generation += 1;
+            crate::daemon::wake();
         }
     }
 }
@@ -374,8 +389,14 @@ mod tests {
             |_| {},
         )
         .unwrap();
+        // The reader publishes its read-only reason and its exit as separate
+        // events of one frame, and a snapshot can fall between them. Release
+        // inspection requires both, so wait for the last.
         let deadline = Instant::now() + Duration::from_secs(5);
-        while handle.snapshot(None).unwrap().read_only_reason.is_none() {
+        while !handle
+            .snapshot(None)
+            .is_some_and(|snapshot| snapshot.read_only_reason.is_some() && snapshot.exited)
+        {
             assert!(
                 Instant::now() < deadline,
                 "history initialization did not complete"
@@ -507,14 +528,28 @@ mod tests {
     #[test]
     fn recovery_reservation_counts_existing_resident_once_above_lowered_limit() {
         let host = host();
-        let (_directory, source, _) = closed_history(&host);
+        let (directory, source, _) = closed_history(&host);
         let mut admission = Reservation::new(&host, &source).unwrap();
         assert!(admission.is_some());
         {
             let mut state = host.lock().unwrap();
             state.native_chat_capacity = 1;
             Reservation::install(&mut admission, &host, &mut state, &source).unwrap();
+            // Even an unclaimed context is custody until its exact owner
+            // reconciles it; a cached NoProvider outcome is not a release.
+            let context =
+                Arc::new(chat::protocol::ExecutionContext::capture(directory.path()).unwrap());
+            state.native_actor_startups.insert(
+                source.id,
+                retained_actor::Startup {
+                    source: source.clone(),
+                    requested: source.clone(),
+                    context,
+                    failed_close: None,
+                },
+            );
             assert_eq!(usage(&state), 1);
+            assert_eq!(status_from_state(&state).spawning, 1);
             assert!(require_available(&state).is_err());
         }
         drop(admission);
@@ -733,10 +768,20 @@ mod tests {
         let (directory, mut source, _) = closed_history(host);
         std::fs::create_dir(&source.launch.recipe.working_directory).unwrap();
         let program = directory.path().join("completed-provider");
-        // A real pipe transport consumes initialization and exits normally.
+        // A real pipe transport acknowledges initialization and exits normally.
         // Its transcript comes from the real Claude history adapter, not a
         // hand-built Store or a history reader relabeled as a writer.
-        std::fs::write(&program, "#!/bin/sh\nread -r initialization\nexit 0\n").unwrap();
+        std::fs::write(
+            &program,
+            r#"#!/bin/sh
+read -r initialization
+id=${initialization#*\"request_id\":\"}
+id=${id%%\"*}
+printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id"
+exit 0
+"#,
+        )
+        .unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
         source.launch.recipe.program = program.to_string_lossy().into_owned();
         // Enter through the real daemon start path: ordinary UI writers also
@@ -1048,13 +1093,8 @@ mod tests {
         let (_directory, source, handle) = history_reader(&host, false);
         let proof = inspect(&host, source.id).unwrap().proof;
         let verified_registry = host.lock().unwrap().execution_registry.take().unwrap();
-        let blocked = inspect(&host, source.id).unwrap();
-        assert!(
-            blocked
-                .release_blocked
-                .unwrap()
-                .contains("registry is unavailable")
-        );
+        let blocked = inspect(&host, source.id).unwrap().release_blocked.unwrap();
+        assert!(blocked.contains("registry is unavailable"), "{blocked}");
         assert!(release(&host, &proof, false).is_err());
         assert!(
             !handle.is_completed(),
@@ -1155,7 +1195,10 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let snapshot = client.snapshot();
-            if (!read_only || snapshot.read_only_reason.is_some())
+            // A reader's single initial frame applies its history, read-only
+            // reason and exit one event at a time, so a view can attach between
+            // them. Release requires the settled reader, so wait for its exit.
+            if (!read_only || (snapshot.read_only_reason.is_some() && snapshot.exited))
                 && snapshot.items.iter().any(|item| matches!(&item.content, chat::ItemContent::Text { text, .. } if text.contains("durable history body")))
             {
                 return;
@@ -1278,6 +1321,48 @@ mod tests {
                     .is_read_only_history()
             );
             assert!(!host.lock().unwrap().chats[&source.id].handle.owns_work());
+            // Explicit continuation uses the exact currently authenticated
+            // reader descriptor, not a fabricated retirement or new source.
+            let ServerResponse::ChatResumePrepared { session: prepared } = process_inner(
+                &host,
+                0,
+                ClientRequest::ChatPrepareResume {
+                    source: source.clone(),
+                },
+            )
+            .unwrap() else {
+                panic!("exact history preparation expected")
+            };
+            assert_eq!(prepared, source);
+            let mut changed = source.clone();
+            changed.launch.recipe.working_directory = directory.path().join("another-project");
+            assert!(
+                process_inner(
+                    &host,
+                    0,
+                    ClientRequest::ChatPrepareResume { source: changed }
+                )
+                .is_err()
+            );
+            host.lock()
+                .unwrap()
+                .chat_spawning
+                .insert(source.id, source.clone());
+            assert!(
+                process_inner(
+                    &host,
+                    0,
+                    ClientRequest::ChatPrepareResume {
+                        source: source.clone()
+                    }
+                )
+                .is_err()
+            );
+            host.lock().unwrap().chat_spawning.remove(&source.id);
+            assert!(
+                !marker.exists(),
+                "preparation must never execute the provider"
+            );
             drop(restored);
             server.join().unwrap();
             // Join the owned reader before dropping its host; a final callback
@@ -1353,6 +1438,187 @@ mod tests {
         assert!(host.lock().unwrap().chats.is_empty());
         assert!(host.lock().unwrap().chat_spawning.is_empty());
     }
+
+    #[test]
+    fn old_epoch_history_recovery_uses_real_handshake_without_launching_65_providers() {
+        use std::os::unix::fs::PermissionsExt;
+        let started = Instant::now();
+        let host = host();
+        let (directory, template, _) = closed_history(&host);
+        let original = inspect(&host, template.id).unwrap();
+        release(&host, &original.proof, false).unwrap();
+        let program = directory.path().join("must-not-run-provider");
+        let marker = directory.path().join("provider-was-started");
+        std::fs::write(
+            &program,
+            format!("#!/bin/sh\ntouch '{}'\nexit 91\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for index in 0..65 {
+            // Half the run exercises a restored cwd. Neither filesystem state
+            // may select the provider constructor instead of forced History.
+            if index == 32 {
+                std::fs::create_dir(&template.launch.recipe.working_directory).unwrap();
+            }
+            let mut source = template.clone();
+            source.id = TerminalId::new();
+            source.launch.recipe.program = program.to_string_lossy().into_owned();
+            source.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+            source.proof.as_mut().unwrap().host_incarnation =
+                HostIncarnation::new("previous-daemon");
+            let transcript = provider_history_path(&source);
+            std::fs::write(&transcript, serde_json::json!({"type":"user","uuid":format!("item-{index}"),"parentUuid":null,"sessionId":source.launch.session_id,"message":{"role":"user","content":"durable history body"}}).to_string()+"\n").unwrap();
+            let (client, server) = restore_client(&host, source.clone(), 100 + index);
+            let client = client.unwrap();
+            wait_for_client_history(&client, true);
+            let mut expected = source.clone();
+            expected.proof = Some(host.lock().unwrap().proof().clone());
+            assert_eq!(client.session(), expected);
+            let witness = client
+                .authenticated_upgrade_recovery()
+                .expect("actual Resolve/Attach witness");
+            assert!(witness.validate());
+            assert_eq!(witness.source(), &source);
+            assert_eq!(witness.replacement(), &expected);
+            {
+                let state = host.lock().unwrap();
+                let reader = &state.chats[&source.id];
+                assert!(reader.handle.is_read_only_history());
+                assert!(!reader.handle.owns_work());
+                assert!(!reader.subscribers.contains_key(&0));
+                assert!(!reader.observations.contains_key(&0));
+            }
+            assert!(!marker.exists(), "automatic restore launched a provider");
+            if index == 0 {
+                let mut older_alias = source.clone();
+                older_alias.proof.as_mut().unwrap().host_incarnation =
+                    HostIncarnation::new("still-older-window");
+                let (second, second_server) = restore_client(&host, older_alias.clone(), 301);
+                let second = second.unwrap();
+                wait_for_client_history(&second, true);
+                assert_eq!(second.session(), expected);
+                let second_witness = second.authenticated_upgrade_recovery().unwrap();
+                assert!(second_witness.validate());
+                assert_eq!(second_witness.source(), &older_alias);
+                let mut changed_account = older_alias.clone();
+                changed_account
+                    .launch
+                    .recipe
+                    .environment
+                    .insert("CLAUDE_CONFIG_DIR".into(), "/different-account".into());
+                assert!(register_saved_history_alias(&host, &changed_account).is_err());
+                drop(second);
+                second_server.join().unwrap();
+            }
+            drop(client);
+            server.join().unwrap();
+            let release_proof = inspect(&host, source.id).unwrap();
+            assert_eq!(release_proof.release_blocked, None);
+            release(&host, &release_proof.proof, false).unwrap();
+        }
+        assert!(host.lock().unwrap().chats.is_empty());
+        assert!(!marker.exists());
+        eprintln!(
+            "65 exact history handshakes and releases: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn history_preview_preserves_an_attached_view_and_unrelated_live_consent() {
+        struct Idle;
+        impl chat::protocol::Adapter for Idle {
+            fn initialize(&mut self) -> Result<chat::protocol::Step, String> {
+                Ok(Default::default())
+            }
+            fn command(&mut self, _: chat::Command) -> Result<chat::protocol::Step, String> {
+                Ok(Default::default())
+            }
+            fn receive(&mut self, _: serde_json::Value) -> Result<chat::protocol::Step, String> {
+                Ok(Default::default())
+            }
+        }
+        let host = host();
+        let (directory, source, _) = history_reader(&host, false);
+        let (view, server) = restore_client(&host, source.clone(), 71);
+        let view = view.unwrap();
+        wait_for_client_history(&view, true);
+        // A genuine fixture-owned pipe process supplies unrelated live work.
+        let mut live = session();
+        live.proof = Some(host.lock().unwrap().proof().clone());
+        live.launch.recipe.program = "/bin/cat".into();
+        live.launch.recipe.working_directory = directory.path().to_path_buf();
+        let spec = chat::protocol::ProcessSpec::from(&live.launch.recipe);
+        let mut initial = chat::protocol::Step::default();
+        let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
+        let handle = Handle::start(spec, Box::new(Idle), initial, store, None, |_| {}).unwrap();
+        host.lock().unwrap().chats.insert(
+            live.id,
+            Record {
+                execution_instance: uuid::Uuid::new_v4(),
+                console_recipe: None,
+                paired_terminal: None,
+                session: live.clone(),
+                handle: handle.clone(),
+                source_process: None,
+                subscribers: BTreeMap::new(),
+                observations: BTreeMap::new(),
+                completion_observed: false,
+                returning_terminal: false,
+            },
+        );
+        let preview = |client_id| {
+            let (stream, socket) = std::os::unix::net::UnixStream::pair().unwrap();
+            let server_host = host.clone();
+            let worker = thread::spawn(move || {
+                super::super::super::client::serve(socket, client_id, server_host)
+            });
+            let proof = host.lock().unwrap().proof().clone();
+            crate::host::upgrade_inspect::InspectionClient::fixture_inspect_history(
+                stream, &source, proof,
+            )
+            .unwrap();
+            worker.join().unwrap();
+        };
+        preview(72);
+        let generation = host.lock().unwrap().inventory_generation;
+        let before = host
+            .lock()
+            .unwrap()
+            .upgrade_impact(crate::update::impact::Policy::WhenIdle)
+            .unwrap();
+        assert!(before.sessions.iter().any(|session| session.id == live.id));
+        preview(73);
+        let after = host
+            .lock()
+            .unwrap()
+            .upgrade_impact(crate::update::impact::Policy::WhenIdle)
+            .unwrap();
+        assert_eq!(host.lock().unwrap().inventory_generation, generation);
+        assert!(before.preserves_consent(&after));
+        assert!(!handle.is_completed());
+        assert!(view.is_connected());
+        assert_eq!(view.session(), source);
+        assert!(
+            host.lock().unwrap().chats[&source.id]
+                .subscribers
+                .contains_key(&71)
+        );
+        assert!(
+            inspect(&host, source.id)
+                .unwrap()
+                .release_blocked
+                .unwrap()
+                .contains("attached")
+        );
+        drop(view);
+        server.join().unwrap();
+        handle.close().unwrap();
+        host.lock().unwrap().chats.remove(&live.id);
+        let inspection = inspect(&host, source.id).unwrap();
+        release(&host, &inspection.proof, false).unwrap();
+    }
 }
 
 pub(in crate::host) fn status(host: &SharedHost) -> crate::terminal_ipc::ChatCapacity {
@@ -1363,7 +1629,7 @@ pub(in crate::host) fn status(host: &SharedHost) -> crate::terminal_ipc::ChatCap
 pub(super) fn status_from_state(state: &HostState) -> crate::terminal_ipc::ChatCapacity {
     crate::terminal_ipc::ChatCapacity {
         resident: state.chats.len() as u32,
-        spawning: state.chat_spawning.len() as u32,
+        spawning: pending(state) as u32,
         limit: state.native_chat_capacity as u32,
         used: usage(&state) as u32,
         residents: state
@@ -1665,8 +1931,16 @@ pub(super) fn restore_saved_history(
                 session,
                 handle: handle.clone(),
                 source_process: None,
-                subscribers: BTreeMap::from([(client, false)]),
-                observations: BTreeMap::from([(client, observation)]),
+                subscribers: if client == 0 {
+                    BTreeMap::new()
+                } else {
+                    BTreeMap::from([(client, false)])
+                },
+                observations: if client == 0 {
+                    BTreeMap::new()
+                } else {
+                    BTreeMap::from([(client, observation)])
+                },
                 completion_observed: false,
                 returning_terminal: false,
             };
@@ -1686,6 +1960,101 @@ pub(super) fn restore_saved_history(
     }
     drop(admission);
     result
+}
+
+/// Reopen saved data across daemon epochs, without upgrading it to execution
+/// ownership. The host issues the new proof only after the normal history
+/// constructor verifies the exact thread/account and fences native owners and
+/// managed agents. The old descriptor remains an exact Resolve alias.
+pub(super) fn recover_saved_history(
+    host: &SharedHost,
+    source: &Session,
+) -> Result<(), ProtocolError> {
+    if !source.is_saved_claude_history() {
+        return Err(unavailable(
+            "This saved pane has no supported read-only history route",
+        ));
+    }
+    let mut session = source.clone();
+    session.proof = Some(
+        host.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .proof()
+            .clone(),
+    );
+    restore_saved_history(host, 0, session.clone())?;
+    register_saved_history_alias(host, source)
+}
+
+/// Classify an already authenticated paging reader for an explicit Retry.
+/// This returns its unchanged descriptor, never retirement or launch authority;
+/// normal Start repeats the execution/account/admission checks if requested.
+pub(super) fn prepare_saved_history(
+    host: &SharedHost,
+    source: &Session,
+) -> Result<Option<Session>, ProtocolError> {
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(record) = state.chats.get(&source.id) else {
+        return Ok(None);
+    };
+    if !source.is_saved_claude_history() || !record.handle.is_read_only_history() {
+        return Ok(None);
+    }
+    validate_proof(source.proof.as_ref(), state.proof())?;
+    if record.session != *source
+        || record.handle.session_id() != source.launch.session_id
+        || record.handle.owns_work()
+        || record.returning_terminal
+        || state.shutting_down
+        || state.chat_spawning.contains_key(&source.id)
+        || state.native_closing.contains_key(&source.id)
+        || state.native_actor_startups.contains_key(&source.id)
+    {
+        return Err(unavailable(
+            "The exact saved-history reader changed; no provider was started",
+        ));
+    }
+    Ok(Some(source.clone()))
+}
+
+/// An inactive window may retain a different former proof for this same
+/// paging allocation. Admit that alias independently against the complete
+/// current reader; an earlier alias cannot authenticate different content.
+pub(super) fn register_saved_history_alias(
+    host: &SharedHost,
+    source: &Session,
+) -> Result<(), ProtocolError> {
+    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    let record = state
+        .chats
+        .get(&source.id)
+        .ok_or_else(|| unavailable("Saved history changed during recovery"))?;
+    if !source.is_saved_claude_history()
+        || !record.handle.is_read_only_history()
+        || record.handle.owns_work()
+    {
+        return Ok(()); // native execution keeps its separate lineage contract
+    }
+    let mut expected = source.clone();
+    expected.proof = Some(state.proof().clone());
+    if record.session != expected {
+        return Err(unavailable(
+            "Saved history did not confirm a read-only attachment",
+        ));
+    }
+    let sources = state.upgrade_chats.entry(source.id).or_default();
+    if !sources.iter().any(|previous| previous.source == *source) {
+        if sources.len() >= crate::upgrade::handoff::MAX_CHATS {
+            return Err(unavailable(
+                "Saved history aliases exceed the bounded recovery limit",
+            ));
+        }
+        sources.push(crate::upgrade::handoff::ChatSource {
+            source: source.clone(),
+            launch: source.launch.clone(),
+        });
+    }
+    Ok(())
 }
 
 pub(in crate::host) fn release(

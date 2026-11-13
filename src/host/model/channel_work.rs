@@ -497,7 +497,7 @@ fn resolve_in(
         }
     }
     let mut matches = Vec::new();
-    for view in views::all(db)? {
+    for view in views::occupied(db)? {
         for pane in view.panes {
             let candidate = match pane.kind {
                 CardKind::Chat(session) => HostedSession::Chat(session),

@@ -1,6 +1,6 @@
 //! Presentation-only incidents. Sources remain in the original snapshot/history.
 use super::*;
-use chat::failure::{Failure, FailureKind};
+use chat::failure::{DeliveryOutcome, Failure, FailureKind};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Source {
@@ -10,6 +10,208 @@ enum Source {
     Note(usize),
     Local(Arc<str>),
     Snapshot,
+}
+
+/// Child originals are read only through their published owned-source proof.
+/// Resident details remain an explicitly bounded diagnostic preview.
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct CopyPlan {
+    parts: Vec<(Source, Option<chat::TextCopySource>, String)>,
+}
+
+fn child_source<'a>(snapshot: &'a Snapshot, source: &Source) -> Option<&'a str> {
+    match source {
+        Source::ChildItem(child, id) => snapshot
+            .subagents
+            .iter()
+            .find(|agent| &agent.id == child)?
+            .items
+            .iter()
+            .find(|item| &item.id == id)
+            .and_then(|item| match &item.content {
+                ItemContent::Text { text, .. } => Some(text.as_str()),
+                ItemContent::Delivery { body, .. } => Some(body.as_str()),
+                ItemContent::Tool { output, .. } => Some(output.as_str()),
+                _ => None,
+            }),
+        Source::ChildDetail(child) => snapshot
+            .subagents
+            .iter()
+            .find(|agent| &agent.id == child)
+            .map(|agent| agent.detail.as_str()),
+        _ => None,
+    }
+}
+
+fn child_copy_source(snapshot: &Snapshot, child: &str, id: &str) -> Option<chat::TextCopySource> {
+    let index = snapshot
+        .subagents
+        .iter()
+        .find(|agent| agent.id == child)?
+        .items
+        .iter()
+        .position(|item| item.id == id)?;
+    snapshot
+        .text_copy_sources
+        .children
+        .get(child)?
+        .get(index)?
+        .clone()
+        .filter(|source| source.scope == (chat::TextCopyScope::Subagent { id: child.into() }))
+}
+
+impl CopyPlan {
+    pub(super) fn is_current(&self, snapshot: &Snapshot) -> bool {
+        self.parts
+            .iter()
+            .all(|(identity, source, text)| match (identity, source) {
+                (Source::ChildItem(child, item), Some(source)) => {
+                    child_copy_source(snapshot, child, item).as_ref() == Some(source)
+                        && child_source(snapshot, identity) == Some(text.as_str())
+                }
+                (_, None) => child_source(snapshot, identity) == Some(text.as_str()),
+                _ => false,
+            })
+    }
+
+    pub(super) fn is_current_or_withdrawn(&self, snapshot: &Snapshot) -> bool {
+        self.parts.iter().all(|(identity, source, preview)| {
+            if child_source(snapshot, identity) != Some(preview.as_str()) {
+                return false;
+            }
+            match (identity, source) {
+                (Source::ChildItem(child, item), Some(captured)) => {
+                    child_copy_source(snapshot, child, item)
+                        .as_ref()
+                        .is_none_or(|current| current == captured)
+                }
+                (_, None) => true,
+                _ => false,
+            }
+        })
+    }
+
+    pub(super) fn read(
+        &self,
+        handle: &ClientHandle,
+        current: impl Fn() -> bool,
+    ) -> Result<String, String> {
+        self.read_with(current, |source| handle.copy_text(source.clone()))
+    }
+
+    fn read_with(
+        &self,
+        current: impl Fn() -> bool,
+        mut read: impl FnMut(&chat::TextCopySource) -> Result<String, String>,
+    ) -> Result<String, String> {
+        let mut originals = Vec::new();
+        let mut bytes = 0usize;
+        let started = Instant::now();
+        for (_, source, literal) in &self.parts {
+            // Do not keep admitting independent reads after the user has
+            // copied something else, or accumulate per-source timeouts forever.
+            // An in-flight read retains the client's existing bounded timeout.
+            if !current() || started.elapsed() >= Duration::from_secs(30) {
+                return Err("Diagnostic copy was superseded or exceeded its read window".into());
+            }
+            let text = match source {
+                Some(source) => read(source)?,
+                None => literal.clone(),
+            };
+            if !current() {
+                return Err("Diagnostic copy was superseded".into());
+            }
+            if !originals.contains(&text) {
+                bytes = bytes.saturating_add(text.len()).saturating_add(7);
+                if bytes > chat::TEXT_COPY_LIMIT_BYTES {
+                    return Err("Diagnostic originals exceed the clipboard limit".into());
+                }
+                originals.push(text);
+            }
+        }
+        Ok(originals.join("\n\n---\n\n"))
+    }
+}
+
+#[cfg(test)]
+mod retained_original_tests {
+    use super::*;
+
+    #[test]
+    fn worker_assembles_distinct_originals_and_stops_after_superseding_copy() {
+        let first = format!(
+            "first request-id\r\n{}\nTAIL λ",
+            "猫 original A\n".repeat(20_000)
+        );
+        let second = "second request-id\nDistinct original B\n".to_owned();
+        let cache = uuid::Uuid::new_v4();
+        let plan = CopyPlan {
+            parts: (1..=3)
+                .map(|token| {
+                    (
+                        Source::ChildItem("child".into(), token.to_string()),
+                        Some(chat::TextCopySource {
+                            cache,
+                            scope: chat::TextCopyScope::Subagent { id: "child".into() },
+                            token,
+                            revision: 1,
+                            bytes: if token == 2 {
+                                second.len()
+                            } else {
+                                first.len()
+                            } as u64,
+                        }),
+                        "bounded preview".into(),
+                    )
+                })
+                .collect(),
+        };
+        let mut reads = Vec::new();
+        let actual = plan
+            .read_with(
+                || true,
+                |source| {
+                    reads.push(source.token);
+                    Ok(if source.token == 2 {
+                        second.clone()
+                    } else {
+                        first.clone()
+                    })
+                },
+            )
+            .unwrap();
+        assert_eq!(reads, vec![1, 2, 3]);
+        assert_eq!(actual, format!("{first}\n\n---\n\n{second}"));
+        let current = std::cell::Cell::new(true);
+        let mut reads = 0;
+        let result = plan.read_with(
+            || current.get(),
+            |_| {
+                reads += 1;
+                current.set(false);
+                Ok(first.clone())
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            reads, 1,
+            "a superseded worker cannot keep reading every source"
+        );
+    }
+}
+
+/// A notice kept in the transcript after its live source has gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Note {
+    /// The prompt message it concerns: its identity for deduplication,
+    /// incident scope and sign-in recovery.
+    pub message: Option<String>,
+    /// The item whose group it is drawn after: the transcript's last when
+    /// it was recorded on the latest page. That can lie past the message's
+    /// own exchange, such as after work a delivery started. An item outlasts
+    /// a group key, which paging can change.
+    pub after: Option<String>,
+    pub text: String,
 }
 
 pub(super) struct Incident {
@@ -71,16 +273,7 @@ pub(super) fn diagnostic_item(provider: Provider, item: &chat::Item) -> bool {
 }
 
 fn fallback_summary(text: &str) -> String {
-    let first = text
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or_default()
-        .trim();
-    if first.starts_with(['{', '[']) || first.starts_with("API Error:") {
-        "Request failed".to_owned()
-    } else {
-        Runtime::short_description(first, 160)
-    }
+    Runtime::short_description(chat::failure::headline(text), 160)
 }
 
 fn diagnostic_key(text: &str) -> String {
@@ -98,6 +291,125 @@ pub(super) fn diagnostic_preview_identity(key: &str) -> u64 {
     hash.finish()
 }
 
+// Notice identity follows a decoder message, while Turn keys remain display
+// destinations. Paging can leave a later part of the same message visible.
+pub(super) fn prompt_anchor(provider: Provider, items: &[Arc<chat::Item>]) -> Option<&str> {
+    let last = items
+        .iter()
+        .rev()
+        .find(|item| {
+            item.role == chat::Role::User && !matches!(item.content, ItemContent::Delivery { .. })
+        })
+        .map(|item| item.id.as_str())?;
+    let Some(carrier) = attachment_draft::message_key(provider, last) else {
+        return Some(last);
+    };
+    items
+        .iter()
+        .find(|item| {
+            item.role == chat::Role::User
+                && !matches!(item.content, ItemContent::Delivery { .. })
+                && attachment_draft::message_key(provider, &item.id) == Some(carrier)
+        })
+        .map(|item| item.id.as_str())
+}
+
+pub(super) fn same_prompt(provider: Provider, left: Option<&str>, right: Option<&str>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => match (
+            attachment_draft::message_key(provider, left),
+            attachment_draft::message_key(provider, right),
+        ) {
+            (Some(left), Some(right)) => left == right,
+            _ => left == right,
+        },
+        _ => left == right,
+    }
+}
+
+/// The prompt items in `turn` that the reader typed, not deliveries.
+fn typed_prompt<'a>(runtime: &'a Runtime, turn: &'a turn::Turn) -> impl Iterator<Item = &'a str> {
+    turn.prompt.iter().filter_map(|index| {
+        runtime
+            .snapshot
+            .items
+            .get(*index)
+            .filter(|item| {
+                item.role == chat::Role::User
+                    && !matches!(item.content, ItemContent::Delivery { .. })
+            })
+            .map(|item| item.id.as_str())
+    })
+}
+
+/// The last item of the transcript's last group, where a notice recorded
+/// now is drawn after. `None` while an earlier page is shown, whose end is
+/// the middle of the conversation rather than its latest work.
+pub(super) fn closing_item<'a>(snapshot: &'a Snapshot, turns: &[turn::Turn]) -> Option<&'a str> {
+    if snapshot.has_later {
+        return None;
+    }
+    let turn = turns.last()?;
+    let last = turn
+        .prompt
+        .iter()
+        .chain(
+            turn.steps
+                .iter()
+                .chain(&turn.prose)
+                .map(|placed| &placed.index),
+        )
+        .max()?;
+    snapshot.items.get(*last).map(|item| item.id.as_str())
+}
+
+/// The failure scope of a prompt the reader typed: its decoder message, so
+/// that text and images sent together are one scope. An opaque ID is its
+/// own scope, which cannot collide with a message of the same spelling.
+fn prompt_scope(provider: Provider, id: &str) -> String {
+    match attachment_draft::message_key(provider, id) {
+        Some(carrier) => format!("message\0{carrier}"),
+        None => format!("item\0{id}"),
+    }
+}
+
+/// Where a retained note is drawn: after the group containing the item it
+/// was recorded after, while that item is visible. Otherwise a visible part
+/// of the note's message stands in, and the note goes after the last visible
+/// group before the reader's next prompt. `None` when neither is visible, so
+/// the note never borrows another exchange.
+fn note_destination<'a>(
+    runtime: &'a Runtime,
+    note: &Note,
+    item_groups: &HashMap<&str, &'a str>,
+    user_carriers: &HashMap<&str, String>,
+) -> Option<&'a str> {
+    if let Some(group) = note
+        .after
+        .as_deref()
+        .and_then(|after| item_groups.get(after))
+    {
+        return Some(group);
+    }
+    let anchor = note.message.as_deref()?;
+    let provider = runtime.session.launch.provider;
+    let carrier = attachment_draft::message_key(provider, anchor)
+        .filter(|carrier| user_carriers.contains_key(carrier));
+    let start = runtime.turns.iter().position(|turn| {
+        typed_prompt(runtime, turn).any(|id| {
+            id == anchor
+                || carrier.is_some_and(|carrier| {
+                    attachment_draft::message_key(provider, id) == Some(carrier)
+                })
+        })
+    })?;
+    let replies = runtime.turns[start + 1..]
+        .iter()
+        .take_while(|turn| typed_prompt(runtime, turn).next().is_none())
+        .count();
+    Some(runtime.turns[start + replies].key.as_str())
+}
+
 impl State {
     fn metadata(
         provider: Provider,
@@ -108,23 +420,30 @@ impl State {
         if text.trim().is_empty() {
             return None;
         }
-        let parsed = Failure::parse(provider, text);
-        if known_only && parsed.is_none() {
-            return None;
-        }
-        let (key, summary, guidance, kind) = match parsed {
-            Some(failure) => (
+        let (key, summary, guidance, kind) = if let Some(failure) = Failure::parse(provider, text) {
+            (
                 diagnostic_key(failure.key.as_ref()),
                 failure.summary,
                 failure.action,
                 Some(failure.kind),
-            ),
-            None => (
+            )
+        } else if let Some(outcome) = DeliveryOutcome::parse(text) {
+            // The daemon's report already says what to do next.
+            (
+                diagnostic_key(text),
+                outcome.summary.to_owned(),
+                outcome.action,
+                None,
+            )
+        } else if known_only {
+            return None;
+        } else {
+            (
                 diagnostic_key(text),
                 fallback_summary(text),
                 "Review the details before trying again.",
                 None,
-            ),
+            )
         };
         let meta = Metadata {
             key: diagnostic_key(&format!("{context}\0{key}")),
@@ -256,11 +575,22 @@ impl State {
         // classified. User messages and ordinary assistant prose remain verbatim.
         let mut contexts = HashMap::new();
         let mut context = String::new();
+        let mut user_carriers = HashMap::new();
         for item in &runtime.snapshot.items {
             if item.role == chat::Role::User
                 && !matches!(item.content, ItemContent::Delivery { .. })
             {
-                context.clone_from(&item.id);
+                // One decoder message can contain text and several images.
+                // Keep its exact carrier, rather than making every part a
+                // different failure scope or merging adjacent submissions.
+                if let Some(carrier) = attachment_draft::message_key(provider, &item.id) {
+                    let scope = user_carriers
+                        .entry(carrier)
+                        .or_insert_with(|| prompt_scope(provider, &item.id));
+                    context.clone_from(scope);
+                } else {
+                    context = prompt_scope(provider, &item.id);
+                }
             }
             contexts.insert(item.id.as_str(), context.clone());
         }
@@ -313,7 +643,7 @@ impl State {
                         &context,
                         &causes,
                     );
-                    latest = Some((context, text));
+                    latest = Some((context, text, item.id.as_str()));
                 }
             }
             if (matches!(
@@ -324,10 +654,40 @@ impl State {
                 && Failure::parse(provider, &child.detail).is_some()))
                 && !child.detail.trim().is_empty()
             {
-                // Only a detail containing the exact latest proven error may
-                // join that historical incident. No inference from quoted text.
-                let context = if let Some((context, body)) = latest
-                    && child.detail.ends_with(body)
+                // A bare status line such as "Turn failed" names no cause of
+                // its own. While the latest proven error is still the child's
+                // last item, nothing after it can be that cause: one failure.
+                let explained = latest.as_ref().and_then(|(_, _, id)| {
+                    (Failure::parse(provider, &child.detail).is_none()
+                        && child.items.last().is_some_and(|last| last.id == *id))
+                    .then(|| Source::ChildItem(child.id.clone(), (*id).to_owned()))
+                });
+                if let Some(cause) = explained
+                    && let Some(incident) = state
+                        .incidents
+                        .iter_mut()
+                        .find(|incident| incident.sources.contains(&cause))
+                {
+                    incident.sources.push(Source::ChildDetail(child.id.clone()));
+                    continue;
+                }
+                // Only a detail containing the exact latest proven error, or
+                // reporting the same account limit with the same reset while
+                // that error is still the child's last item, may join that
+                // historical incident. No inference from quoted text.
+                let same_limit = |body: &str| {
+                    Failure::parse(provider, &child.detail)
+                        .zip(Failure::parse(provider, body))
+                        .is_some_and(|(detail, latest)| {
+                            detail.kind == FailureKind::AccountLimit
+                                && detail.reset.is_some()
+                                && detail.key == latest.key
+                        })
+                };
+                let context = if let Some((context, body, id)) = latest
+                    && (child.detail.ends_with(body)
+                        || (child.items.last().is_some_and(|last| last.id == id)
+                            && same_limit(body)))
                 {
                     context
                 } else if Failure::parse(provider, &child.detail)
@@ -347,22 +707,71 @@ impl State {
             }
         }
 
-        for (index, (_, text)) in runtime.failures.iter().enumerate() {
-            if !runtime.expected_remote_close_error(text) {
+        let item_groups: HashMap<&str, &str> = if runtime.failures.is_empty() {
+            HashMap::new()
+        } else {
+            runtime
+                .turns
+                .iter()
+                .flat_map(|turn| {
+                    turn.prompt
+                        .iter()
+                        .chain(
+                            turn.steps
+                                .iter()
+                                .chain(&turn.prose)
+                                .map(|placed| &placed.index),
+                        )
+                        .filter_map(|index| runtime.snapshot.items.get(*index))
+                        .map(|item| (item.id.as_str(), turn.key.as_str()))
+                })
+                .collect()
+        };
+        // A note keeps its message's scope after paging removes the message,
+        // so its incident identity, and an expanded notice, stay put.
+        let note_contexts: Vec<String> = runtime
+            .failures
+            .iter()
+            .map(|note| match note.message.as_deref() {
+                Some(id) => contexts
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_else(|| prompt_scope(provider, id)),
+                None => String::new(),
+            })
+            .collect();
+        for (index, note) in runtime.failures.iter().enumerate() {
+            if !runtime.expected_remote_close_error(&note.text) {
                 state.push(
                     provider,
-                    text,
+                    &note.text,
                     Source::Note(index),
                     false,
-                    runtime.failures[index]
-                        .0
-                        .as_deref()
-                        .and_then(|id| contexts.get(id))
-                        .map(String::as_str)
-                        .unwrap_or(""),
+                    &note_contexts[index],
                 );
             }
         }
+        // The current error joins the note recorded for it, wherever paging
+        // has left that note's message, but only a note drawn here: an error
+        // still awaiting the latest page has no note yet, and must not adopt
+        // an older one with the same text.
+        let snapshot_context = runtime
+            .snapshot
+            .error
+            .as_deref()
+            .filter(|error| {
+                !runtime
+                    .unplaced_failures
+                    .iter()
+                    .any(|notice| notice == error)
+            })
+            .and_then(|error| {
+                runtime.failures.iter().rposition(|note| {
+                    note.text == error
+                        && note_destination(runtime, note, &item_groups, &user_carriers).is_some()
+                })
+            })
+            .map_or(context.as_str(), |index| note_contexts[index].as_str());
         state.local_error = if runtime.failure_ui.local_error.as_deref() == runtime.error.as_deref()
         {
             runtime.failure_ui.local_error.clone()
@@ -383,7 +792,11 @@ impl State {
                 && let Some(source) = source
                 && !runtime.expected_remote_close_error(text)
             {
-                state.push(provider, text, source, false, &context);
+                let scope = match source {
+                    Source::Snapshot => snapshot_context,
+                    _ => context.as_str(),
+                };
+                state.push(provider, text, source, false, scope);
             }
         }
         let recovering = runtime.auth_error().is_some();
@@ -392,10 +805,10 @@ impl State {
                 && incident.kind == Some(FailureKind::Authentication)
                 && incident.sources.iter().any(|source| match source {
                     Source::Local(_) | Source::Snapshot => true,
-                    Source::Note(index) => runtime.active_auth_notice(
-                        &runtime.failures[*index].0,
-                        &runtime.failures[*index].1,
-                    ),
+                    Source::Note(index) => {
+                        let note = &runtime.failures[*index];
+                        runtime.active_auth_notice(&note.message, &note.text)
+                    }
                     Source::Item(id) => contexts
                         .get(id.as_str())
                         .is_some_and(|owner| owner == &context),
@@ -441,12 +854,25 @@ impl State {
                         .map(|turn| turn.key.clone())
                 })
                 .or_else(|| {
+                    // The latest note places the incident: a cause recurring
+                    // with new wording is drawn after its newest work.
                     incident
                         .sources
                         .iter()
-                        .find_map(|source| match source {
-                            Source::Note(index) => Some(runtime.failures[*index].0.clone()),
+                        .filter_map(|source| match source {
+                            Source::Note(index) => Some(*index),
                             _ => None,
+                        })
+                        .max()
+                        .map(|index| {
+                            let note = &runtime.failures[index];
+                            // An unresolved note keeps a key no visible
+                            // group has, which hides it; only a note with
+                            // no placement at all leads the transcript.
+                            note_destination(runtime, note, &item_groups, &user_carriers)
+                                .or(note.after.as_deref())
+                                .or(note.message.as_deref())
+                                .map(str::to_owned)
                         })
                         .unwrap_or_else(|| runtime.turns.last().map(|turn| turn.key.clone()))
                 });
@@ -471,6 +897,7 @@ impl State {
                 &incident.summary,
                 &incident.sources,
                 &incident.first_item,
+                &incident.anchor,
                 &incident.active_recovery,
                 &incident.child_scope,
             )
@@ -518,6 +945,131 @@ struct Preview {
 }
 
 impl Runtime {
+    pub(super) fn failure_plan_still_shown(&self, key: &str, plan: &CopyPlan) -> bool {
+        self.failure_ui
+            .incidents
+            .iter()
+            .find(|incident| incident.key == key)
+            .is_some_and(|incident| {
+                self.diagnostic_sources(incident)
+                    .eq(plan.parts.iter().map(|(captured, _, _)| captured))
+            })
+    }
+    pub(super) fn failure_originals_retained(&self, key: &str) -> Option<bool> {
+        let incident = self
+            .failure_ui
+            .incidents
+            .iter()
+            .find(|incident| incident.key == key)?;
+        let mut retained = false;
+        let mut complete = true;
+        for source in &incident.sources {
+            if let Source::ChildItem(child, id) = source {
+                let item = self
+                    .snapshot
+                    .subagents
+                    .iter()
+                    .find(|agent| &agent.id == child)
+                    .and_then(|agent| agent.items.iter().find(|item| &item.id == id));
+                // A short failure is resident in full; only a preview
+                // depends on its retained original.
+                if item.is_some_and(|item| {
+                    chat::failure::provider_error_text(Provider::Codex, item)
+                        .is_some_and(chat::failure::is_preview)
+                }) {
+                    retained = true;
+                    complete &= child_copy_source(&self.snapshot, child, id).is_some();
+                }
+            } else if !matches!(source, Source::ChildDetail(_)) {
+                complete = false;
+            }
+        }
+        retained.then_some(complete)
+    }
+
+    /// The sources a reader sees and copies for an incident. A child's bare
+    /// status line ("Turn failed") that joined the error explaining it is
+    /// left out: the error is the diagnostic, and the status restates it.
+    fn diagnostic_sources<'a>(
+        &'a self,
+        incident: &'a Incident,
+    ) -> impl Iterator<Item = &'a Source> {
+        incident.sources.iter().filter(move |source| {
+            let Source::ChildDetail(child) = source else {
+                return true;
+            };
+            let restates = child_source(&self.snapshot, source).is_some_and(|detail| {
+                Failure::parse(self.session.launch.provider, detail).is_none()
+            }) && incident
+                .sources
+                .iter()
+                .any(|other| matches!(other, Source::ChildItem(owner, _) if owner == child));
+            !restates
+        })
+    }
+
+    pub(super) fn failure_copy_plan(&self, key: &str) -> Result<Option<CopyPlan>, String> {
+        let Some(incident) = self
+            .failure_ui
+            .incidents
+            .iter()
+            .find(|incident| incident.key == key)
+        else {
+            return Ok(None);
+        };
+        let retained = incident.sources.iter().any(|source| match source {
+            Source::ChildItem(child, id) => self
+                .snapshot
+                .subagents
+                .iter()
+                .find(|agent| &agent.id == child)
+                .and_then(|agent| agent.items.iter().find(|item| &item.id == id))
+                .is_some_and(|item| {
+                    chat::failure::provider_error_text(Provider::Codex, item).is_some()
+                }),
+            _ => false,
+        });
+        if !retained {
+            return Ok(None);
+        }
+        let mut parts = Vec::new();
+        for identity in self.diagnostic_sources(incident) {
+            let text = child_source(&self.snapshot, identity)
+                .ok_or("Original diagnostic unavailable in this view")?;
+            let source = match identity {
+                Source::ChildItem(child, id) => {
+                    let item = self
+                        .snapshot
+                        .subagents
+                        .iter()
+                        .find(|agent| &agent.id == child)
+                        .and_then(|agent| agent.items.iter().find(|item| &item.id == id))
+                        .ok_or("Original diagnostic item is unavailable")?;
+                    match chat::failure::provider_error_text(Provider::Codex, item) {
+                        Some(text) => match child_copy_source(&self.snapshot, child, id) {
+                            Some(source) => Some(source),
+                            // The resident text is the whole original.
+                            None if !chat::failure::is_preview(text) => None,
+                            None => {
+                                return Err(
+                                    "Original diagnostic unavailable: it is no longer retained"
+                                        .into(),
+                                );
+                            }
+                        },
+                        None => None,
+                    }
+                }
+                Source::ChildDetail(_) => None,
+                _ => return Err("Original diagnostic unavailable in this view".into()),
+            };
+            // Capture only the bounded resident preview, including for paged
+            // originals, so withdrawal errors cannot attach to a replacement.
+            parts.push((identity.clone(), source, text.into()));
+        }
+        Ok(Some(CopyPlan { parts }))
+    }
+
     pub(super) fn reconcile_failure_ui(&mut self) -> bool {
         if self.failure_ui.local_error.as_deref() == self.error.as_deref() {
             return false;
@@ -569,7 +1121,7 @@ impl Runtime {
                 .iter()
                 .find(|child| &child.id == id)
                 .map(|child| child.detail.as_str()),
-            Source::Note(index) => self.failures.get(*index).map(|(_, text)| text.as_str()),
+            Source::Note(index) => self.failures.get(*index).map(|note| note.text.as_str()),
             Source::Local(raw) => Some(raw),
             Source::Snapshot => self.snapshot.error.as_deref(),
         }
@@ -601,7 +1153,7 @@ impl Runtime {
             return;
         };
         let mut sources = Vec::new();
-        for source in &incident.sources {
+        for source in self.diagnostic_sources(incident) {
             if let Some(text) = self.failure_source(source)
                 && !sources.contains(&text)
             {
@@ -714,7 +1266,7 @@ impl Runtime {
             .iter()
             .find(|incident| incident.key == key)?;
         let mut details = Vec::new();
-        for source in &incident.sources {
+        for source in self.diagnostic_sources(incident) {
             if let Some(text) = self.failure_source(source)
                 && !details.contains(&text)
             {
@@ -805,7 +1357,15 @@ impl Runtime {
                     .max_height(240)
                     .into(),
                 );
-                if omitted {
+                let retained = self.failure_originals_retained(&incident.key);
+                if let Some(available) = retained {
+                    let caption = if !available {
+                        "Shortened preview. The full diagnostic is no longer available to copy."
+                    } else {
+                        "Shortened preview. Copy details copies the full diagnostic."
+                    };
+                    rows.push(design::caption(caption).width(Length::Fill).into());
+                } else if omitted {
                     rows.push(design::caption("Diagnostic preview is limited to 8 KiB. Copy details includes the complete originals.").width(Length::Fill).into());
                 }
             }
@@ -814,5 +1374,912 @@ impl Runtime {
             .spacing(space::S)
             .width(Length::Fill)
             .into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text(id: &str, role: chat::Role, body: &str) -> chat::Item {
+        chat::Item {
+            id: id.into(),
+            role,
+            at: None,
+            started_at: None,
+            content: ItemContent::Text {
+                text: body.into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+        }
+    }
+
+    fn image(id: &str) -> chat::Item {
+        chat::Item {
+            id: id.into(),
+            role: chat::Role::User,
+            at: None,
+            started_at: None,
+            content: ItemContent::Image {
+                path: String::new(),
+                description: "Synthetic image".into(),
+                reference: None,
+            },
+        }
+    }
+
+    fn provider_error(provider: Provider, id: &str, body: &str) -> chat::Item {
+        let mut item = text(id, chat::Role::System, body);
+        assert!(chat::failure::mark_provider_error(provider, &mut item));
+        item
+    }
+
+    #[test]
+    fn a_delivery_outcome_notice_shows_its_own_next_step_once() {
+        let outcome = State::metadata(
+            Provider::Claude,
+            chat::failure::delivery::UNACKNOWLEDGED_INPUT,
+            false,
+            "",
+        )
+        .unwrap();
+        assert_eq!(outcome.summary, "Claude hasn't confirmed this yet.");
+        assert_eq!(
+            outcome.guidance,
+            "It may still go through, so check the conversation before trying again."
+        );
+        // Other unrecognised failures keep the general guidance, and a
+        // filter for known failures still drops them.
+        let other = State::metadata(Provider::Claude, "Something else broke", false, "").unwrap();
+        assert_eq!(other.guidance, "Review the details before trying again.");
+        assert!(State::metadata(Provider::Claude, "Something else broke", true, "").is_none());
+    }
+
+    /// The content-part ID a provider's decoder assigns to one message.
+    fn part(provider: Provider, message: &str, index: usize) -> String {
+        match provider {
+            Provider::Codex => format!("{message}/input/{index}"),
+            Provider::Claude | Provider::Omp => format!("{message}:{index}"),
+        }
+    }
+
+    fn delivery(id: &str, summary: &str) -> chat::Item {
+        let mut item = text(id, chat::Role::User, "");
+        item.content = ItemContent::Delivery {
+            kind: chat::DeliveryKind::Notice,
+            from: String::new(),
+            sender: String::new(),
+            summary: summary.into(),
+            body: String::new(),
+        };
+        item
+    }
+
+    fn tool(id: &str) -> chat::Item {
+        let mut item = text(id, chat::Role::Assistant, "");
+        item.content = ItemContent::Tool {
+            name: "Bash".into(),
+            input: "ls".into(),
+            output: String::new(),
+            status: chat::ToolStatus::Succeeded,
+        };
+        item
+    }
+
+    fn live_fixture(provider: Provider, items: Vec<chat::Item>) -> (Runtime, Arc<ClientHandle>) {
+        let session = fresh_chat_session(
+            provider,
+            TerminalId::new(),
+            "/project".into(),
+            &Account::system(provider),
+            false,
+        )
+        .unwrap();
+        let snapshot = Snapshot {
+            ready: true,
+            items: items.into_iter().map(Arc::new).collect(),
+            ..Snapshot::default()
+        };
+        let handle = Arc::new(ClientHandle::fixture(session.clone(), snapshot));
+        let runtime = Runtime::new(
+            Target {
+                card: CardId::new(),
+                generation: 1,
+            },
+            session,
+            Connection::Live(handle.clone()),
+            true,
+            crate::settings::EditorSyntaxTheme::default(),
+        );
+        (runtime, handle)
+    }
+
+    fn publish(runtime: &mut Runtime, handle: &ClientHandle, edit: impl FnOnce(&mut Snapshot)) {
+        let mut next = (*handle.snapshot()).clone();
+        next.generation += 1;
+        edit(&mut next);
+        handle.publish_snapshot_for_test(next);
+        runtime.refresh();
+    }
+
+    fn publish_error(runtime: &mut Runtime, handle: &ClientHandle, error: &str) {
+        publish(runtime, handle, |next| next.error = Some(error.into()));
+    }
+
+    /// Whether the incident's notice is part of the visible transcript.
+    fn notice_visible(runtime: &mut Runtime, key: &str) -> bool {
+        runtime.failure_ui.expanded.insert(key.to_owned());
+        runtime.cache_failure_preview(key);
+        runtime
+            .selection_document()
+            .0
+            .text(diagnostic_preview_identity(key))
+            .is_some()
+    }
+
+    #[test]
+    fn multipart_prompt_failure_shows_one_notice() {
+        let raw = "Failed to authenticate: OAuth session expired and could not be refreshed";
+        let message = "11111111-1111-4111-8111-111111111111";
+        for provider in [Provider::Claude, Provider::Codex, Provider::Omp] {
+            let mut items = vec![text(
+                &part(provider, message, 0),
+                chat::Role::User,
+                "Inspect these images",
+            )];
+            items.extend((1..=8).map(|index| image(&part(provider, message, index))));
+            let (mut runtime, handle) = live_fixture(provider, items);
+            publish_error(&mut runtime, &handle, raw);
+
+            // The retained note (first part) and the current error (scoped by
+            // the last image part) must resolve to the same message.
+            assert_eq!(runtime.failures.len(), 1);
+            assert_eq!(
+                runtime.failure_ui.incidents.len(),
+                1,
+                "one notice per message, not per content part: {provider:?}"
+            );
+            let incident = &runtime.failure_ui.incidents[0];
+            assert_eq!(
+                incident.anchor.as_deref(),
+                Some(part(provider, message, 0).as_str()),
+                "drawn after the prompt's only group"
+            );
+            let key = incident.key.clone();
+            assert_eq!(runtime.failure_details(&key).as_deref(), Some(raw));
+            assert!(notice_visible(&mut runtime, &key));
+
+            let revision = runtime.failure_ui.revision;
+            runtime.refresh();
+            assert_eq!(runtime.failure_ui.revision, revision);
+        }
+    }
+
+    #[test]
+    fn notice_stays_below_a_reply_that_spans_several_groups() {
+        let provider = Provider::Claude;
+        let message = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+        let (mut runtime, handle) = live_fixture(
+            provider,
+            vec![
+                text(&part(provider, message, 0), chat::Role::User, "Inspect"),
+                image(&part(provider, message, 1)),
+                text("reply-prose", chat::Role::Assistant, "Checking the images."),
+                tool("reply-tool"),
+            ],
+        );
+        assert_eq!(
+            runtime.turns.len(),
+            2,
+            "a tool after narration opens a group"
+        );
+        publish_error(&mut runtime, &handle, "Opaque provider failure");
+        assert_eq!(runtime.failure_ui.incidents.len(), 1);
+        assert_eq!(
+            runtime.failure_ui.incidents[0].anchor.as_deref(),
+            Some("reply-tool")
+        );
+
+        // A later exchange does not pull the retained notice into itself.
+        publish(&mut runtime, &handle, |next| {
+            next.error = None;
+            next.items
+                .push(Arc::new(text("next-message:0", chat::Role::User, "Next")));
+        });
+        assert_eq!(
+            runtime.failure_ui.incidents[0].anchor.as_deref(),
+            Some("reply-tool")
+        );
+    }
+
+    #[test]
+    fn notice_follows_work_that_a_delivery_started_after_the_prompt() {
+        let provider = Provider::Claude;
+        let message = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+        let (mut runtime, handle) = live_fixture(
+            provider,
+            vec![
+                text(&part(provider, message, 0), chat::Role::User, "Inspect"),
+                image(&part(provider, message, 1)),
+                text(
+                    "reply",
+                    chat::Role::Assistant,
+                    "Started a background check.",
+                ),
+                delivery("finished", "Background command completed"),
+                tool("followup-tool"),
+                text("followup", chat::Role::Assistant, "Reviewing its output."),
+            ],
+        );
+        assert_eq!(
+            runtime.turns.last().map(|turn| turn.key.as_str()),
+            Some("finished"),
+            "the delivery opens the group of the work it prompted"
+        );
+        let raw = "Opaque provider failure";
+        publish_error(&mut runtime, &handle, raw);
+        assert_eq!(
+            runtime.failures[0].message.as_deref(),
+            Some(part(provider, message, 0).as_str()),
+            "a delivery is not the reader's prompt"
+        );
+        assert_eq!(runtime.failure_ui.incidents.len(), 1);
+        assert_eq!(
+            runtime.failure_ui.incidents[0].anchor.as_deref(),
+            Some("finished"),
+            "below the delivery's work, where the reader is"
+        );
+
+        // The same failure recurring after more delivered work stays one
+        // notice and moves below that work.
+        publish(&mut runtime, &handle, |next| {
+            next.error = None;
+            next.items.extend([
+                Arc::new(delivery("finished-again", "Background command completed")),
+                Arc::new(text("more", chat::Role::Assistant, "Checking again.")),
+            ]);
+        });
+        publish_error(&mut runtime, &handle, raw);
+        assert_eq!(runtime.failures.len(), 1);
+        assert_eq!(runtime.failure_ui.incidents.len(), 1);
+        assert_eq!(
+            runtime.failure_ui.incidents[0].anchor.as_deref(),
+            Some("finished-again")
+        );
+
+        // The reader's next prompt does not take the notice with it.
+        publish(&mut runtime, &handle, |next| {
+            next.error = None;
+            next.items
+                .push(Arc::new(text("next-message:0", chat::Role::User, "Next")));
+        });
+        assert_eq!(
+            runtime.failure_ui.incidents[0].anchor.as_deref(),
+            Some("finished-again")
+        );
+    }
+
+    /// A prompt, its reply, and work a background command's completion
+    /// started, as a Claude transcript carries them.
+    fn delivered_work(provider: Provider, message: &str) -> Vec<chat::Item> {
+        vec![
+            text(
+                &part(provider, message, 0),
+                chat::Role::User,
+                "Run the tests",
+            ),
+            text(
+                "reply",
+                chat::Role::Assistant,
+                "Started them in the background.",
+            ),
+            delivery("finished", "Background command completed"),
+            tool("followup-tool"),
+            text("followup", chat::Role::Assistant, "Reviewing their output."),
+        ]
+    }
+
+    #[test]
+    fn notice_keeps_its_identity_and_place_after_its_prompt_pages_out() {
+        let provider = Provider::Claude;
+        let message = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+        let raw = "Opaque provider failure";
+        let (mut runtime, handle) = live_fixture(provider, delivered_work(provider, message));
+        publish_error(&mut runtime, &handle, raw);
+        let key = runtime.failure_ui.incidents[0].key.clone();
+        runtime.failure_ui.expanded.insert(key.clone());
+
+        // The latest page now starts at the delivery, the error still live.
+        publish(&mut runtime, &handle, |page| {
+            page.has_earlier = true;
+            page.items.drain(..2);
+        });
+        assert_eq!(
+            runtime.failure_ui.incidents.len(),
+            1,
+            "the live error joins its note"
+        );
+        let incident = &runtime.failure_ui.incidents[0];
+        assert_eq!(incident.key, key);
+        assert!(incident.sources.contains(&Source::Snapshot));
+        assert_eq!(incident.anchor.as_deref(), Some("finished"));
+        assert!(runtime.failure_ui.expanded.contains(&key));
+        assert!(notice_visible(&mut runtime, &key));
+    }
+
+    #[test]
+    fn a_failure_while_an_earlier_page_is_shown_is_recorded_on_the_latest_page() {
+        let provider = Provider::Claude;
+        let older = "12121212-1212-4212-8212-121212121212";
+        let latest = "34343434-3434-4434-8434-343434343434";
+        let raw = "Opaque provider failure";
+        let mut items = vec![
+            text(&part(provider, older, 0), chat::Role::User, "Earlier"),
+            text("older-reply", chat::Role::Assistant, "Done."),
+        ];
+        items.extend(delivered_work(provider, latest));
+        let (mut runtime, handle) = live_fixture(provider, items.clone());
+
+        // The reader pages back to the older exchange; the failure arrives.
+        publish(&mut runtime, &handle, |page| {
+            page.has_later = true;
+            page.items.truncate(2);
+            page.error = Some(raw.into());
+        });
+        assert!(
+            runtime.failures.is_empty(),
+            "not attributed to the older prompt"
+        );
+        let key = runtime.failure_ui.incidents[0].key.clone();
+        assert!(
+            notice_visible(&mut runtime, &key),
+            "the live error stays visible"
+        );
+
+        // Back on the latest page, it belongs to the latest prompt and is
+        // drawn after the latest work.
+        publish(&mut runtime, &handle, |page| {
+            page.has_later = false;
+            page.items = items.into_iter().map(Arc::new).collect();
+        });
+        assert_eq!(runtime.failures.len(), 1);
+        assert_eq!(
+            runtime.failures[0].message.as_deref(),
+            Some(part(provider, latest, 0).as_str())
+        );
+        assert_eq!(runtime.failure_ui.incidents.len(), 1);
+        let incident = &runtime.failure_ui.incidents[0];
+        assert!(incident.sources.contains(&Source::Snapshot));
+        assert_eq!(incident.anchor.as_deref(), Some("finished"));
+        let key = incident.key.clone();
+        assert!(notice_visible(&mut runtime, &key));
+    }
+
+    #[test]
+    fn a_cause_recurring_with_new_wording_is_drawn_after_its_newest_work() {
+        let provider = Provider::Claude;
+        let message = "abababab-abab-4bab-8bab-abababababab";
+        let first =
+            "You've hit your limit · resets 1:30pm (America/Los_Angeles)\nrequest-id: first";
+        let second = "API Error: rate_limit_error; resets at 1:30pm (America/Los_Angeles)\nrequest-id: second";
+        let (mut runtime, handle) = live_fixture(provider, delivered_work(provider, message));
+        publish_error(&mut runtime, &handle, first);
+        publish(&mut runtime, &handle, |next| {
+            next.error = None;
+            next.items.extend([
+                Arc::new(delivery("finished-again", "Background command completed")),
+                Arc::new(text("more", chat::Role::Assistant, "Checking again.")),
+            ]);
+        });
+        publish_error(&mut runtime, &handle, second);
+        assert_eq!(runtime.failures.len(), 2);
+        assert_eq!(runtime.failure_ui.incidents.len(), 1, "one account limit");
+        assert_eq!(
+            runtime.failure_ui.incidents[0].anchor.as_deref(),
+            Some("finished-again")
+        );
+
+        // The first wording recurring after still more work moves there too.
+        publish(&mut runtime, &handle, |next| {
+            next.error = None;
+            next.items.extend([
+                Arc::new(delivery("finished-third", "Background command completed")),
+                Arc::new(text("still-more", chat::Role::Assistant, "Once more.")),
+            ]);
+        });
+        publish_error(&mut runtime, &handle, first);
+        assert_eq!(runtime.failures.len(), 2);
+        assert_eq!(runtime.failure_ui.incidents.len(), 1);
+        assert_eq!(
+            runtime.failure_ui.incidents[0].anchor.as_deref(),
+            Some("finished-third")
+        );
+    }
+
+    #[test]
+    fn paged_out_first_part_keeps_the_notice_beside_the_remaining_part() {
+        let provider = Provider::Claude;
+        let message = "22222222-2222-4222-8222-222222222222";
+        let first = part(provider, message, 0);
+        let last = part(provider, message, 8);
+        let raw = "Opaque provider failure\nexact original details";
+        let (mut runtime, handle) = live_fixture(
+            provider,
+            vec![text(&first, chat::Role::User, "Prompt"), image(&last)],
+        );
+        publish_error(&mut runtime, &handle, raw);
+        let key = runtime.failure_ui.incidents[0].key.clone();
+
+        publish(&mut runtime, &handle, |page| {
+            page.has_earlier = true;
+            page.items.retain(|item| item.id == last);
+        });
+        assert_eq!(runtime.failures[0].message.as_deref(), Some(first.as_str()));
+        assert_eq!(runtime.failure_ui.incidents.len(), 1);
+        assert_eq!(runtime.failure_ui.incidents[0].key, key);
+        assert_eq!(
+            runtime.failure_ui.incidents[0].anchor.as_deref(),
+            Some(last.as_str())
+        );
+        assert!(notice_visible(&mut runtime, &key));
+
+        // An unrelated prompt must not adopt the notice of an absent message.
+        publish(&mut runtime, &handle, |next| {
+            next.error = None;
+            next.items = vec![Arc::new(text(
+                "another-message:0",
+                chat::Role::User,
+                "Unrelated",
+            ))];
+        });
+        let key = runtime.failure_ui.incidents[0].key.clone();
+        assert!(!notice_visible(&mut runtime, &key));
+    }
+
+    #[test]
+    fn distinct_messages_and_children_keep_identical_errors_separate() {
+        let provider = Provider::Claude;
+        let raw = "Opaque provider failure\nidentical complete details";
+        let a = "33333333-3333-4333-8333-333333333333";
+        let b = "44444444-4444-4444-8444-444444444444";
+        let (mut runtime, handle) = live_fixture(
+            provider,
+            vec![
+                text(&part(provider, a, 0), chat::Role::User, "First"),
+                image(&part(provider, a, 1)),
+                provider_error(provider, "error-a:0", raw),
+                text(&part(provider, b, 0), chat::Role::User, "Second"),
+                image(&part(provider, b, 1)),
+                provider_error(provider, "error-b:0", raw),
+            ],
+        );
+        publish_error(&mut runtime, &handle, raw);
+        assert_eq!(runtime.failure_ui.incidents.len(), 2);
+
+        // Child failures reporting the same body after the multipart prompt
+        // stay scoped to each child rather than merging into the parent.
+        publish(&mut runtime, &handle, |next| {
+            for id in ["child-a", "child-b"] {
+                let mut call = text(id, chat::Role::Assistant, "");
+                call.content = ItemContent::Tool {
+                    name: "Agent".into(),
+                    input: "Synthetic reviewer".into(),
+                    output: String::new(),
+                    status: chat::ToolStatus::Failed,
+                };
+                next.items.push(Arc::new(call));
+            }
+            next.subagents = ["child-a", "child-b"]
+                .map(|id| chat::Subagent {
+                    id: id.into(),
+                    kind: "reviewer".into(),
+                    description: "Synthetic child failure".into(),
+                    model: None,
+                    status: chat::ToolStatus::Failed,
+                    waiting: false,
+                    detail: raw.into(),
+                    background: true,
+                    items: vec![Arc::new(provider_error(provider, "child-error:0", raw))],
+                })
+                .into();
+        });
+        let incidents = &runtime.failure_ui.incidents;
+        assert_eq!(incidents.len(), 4);
+        assert_eq!(
+            incidents
+                .iter()
+                .map(|incident| &incident.key)
+                .collect::<HashSet<_>>()
+                .len(),
+            4
+        );
+        for id in ["child-a", "child-b"] {
+            let scoped: Vec<_> = incidents
+                .iter()
+                .filter(|incident| incident.child_scope.as_deref() == Some(id))
+                .collect();
+            assert_eq!(scoped.len(), 1);
+            assert_eq!(
+                scoped[0].sources,
+                vec![
+                    Source::ChildItem(id.into(), "child-error:0".into()),
+                    Source::ChildDetail(id.into()),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn a_bare_failed_status_joins_the_child_error_that_is_still_its_last_item() {
+        let provider = Provider::Codex;
+        let raw = "You've hit your session limit · resets 3:40pm\nrequest-id: child";
+        let child = |items: Vec<chat::Item>| chat::Subagent {
+            id: "child".into(),
+            kind: "Quinn".into(),
+            description: String::new(),
+            model: None,
+            status: chat::ToolStatus::Failed,
+            waiting: false,
+            detail: "Turn failed".into(),
+            background: true,
+            items: items.into_iter().map(Arc::new).collect(),
+        };
+        let (mut runtime, handle) = live_fixture(provider, Vec::new());
+        publish(&mut runtime, &handle, |next| {
+            next.subagents = vec![child(vec![
+                text("work", chat::Role::Assistant, "Original child work"),
+                provider_error(provider, "codex-notice:limit", raw),
+            ])];
+        });
+        let [incident] = runtime.failure_ui.incidents.as_slice() else {
+            panic!("one failure is one card");
+        };
+        assert_eq!(
+            incident.sources,
+            vec![
+                Source::ChildItem("child".into(), "codex-notice:limit".into()),
+                Source::ChildDetail("child".into()),
+            ]
+        );
+        // The status restates the error, so details and Copy hold the error.
+        let key = incident.key.clone();
+        assert_eq!(runtime.failure_details(&key).as_deref(), Some(raw));
+        runtime.cache_failure_preview(&key);
+        assert_eq!(runtime.failure_preview(&key), Some((raw, false)));
+        let plan = runtime.failure_copy_plan(&key).unwrap().unwrap();
+        assert!(
+            plan.parts
+                .iter()
+                .all(|(source, _, _)| !matches!(source, Source::ChildDetail(_)))
+        );
+        // A failed read of that plan still reports on the shown card.
+        assert!(runtime.failure_plan_still_shown(&key, &plan));
+
+        // Later work means the status may describe something else, so the
+        // bare status keeps its own notice rather than borrowing that cause.
+        publish(&mut runtime, &handle, |next| {
+            next.subagents = vec![child(vec![
+                provider_error(provider, "codex-notice:limit", raw),
+                text("later", chat::Role::Assistant, "Later child work"),
+            ])];
+        });
+        assert_eq!(runtime.failure_ui.incidents.len(), 2);
+    }
+
+    /// Claude reports one weekly limit three ways when a foreground subagent
+    /// hits it: the failed Agent call's result, the parent's own error reply,
+    /// and the turn's error. The reader sees one notice with the reset time,
+    /// and the subagent's own transcript keeps its one notice. A background
+    /// subagent's call has already returned, so its failure stays with the
+    /// subagent until the parent itself fails.
+    #[test]
+    fn a_subagent_hitting_the_weekly_limit_shows_one_notice_with_the_reset() {
+        let provider = Provider::Claude;
+        let limit = "You've hit your weekly limit · resets Nov 8, 8am (America/Vancouver)";
+        let terminated = format!(
+            "Agent terminated early due to an API error: {limit} (error type rate_limit, \
+             HTTP 429, request id req_synthetic, model sent to the API: claude-opus-5-5)"
+        );
+        let summary = "Claude weekly limit reached · resets Nov 8, 8am (America/Vancouver)";
+        let message = "55555555-5555-4555-8555-555555555555";
+        for background in [false, true] {
+            let call = |status| {
+                let mut call = text("agent-explore", chat::Role::Assistant, "");
+                call.content = ItemContent::Tool {
+                    name: "Agent".into(),
+                    input: "How accounts store credentials".into(),
+                    output: match status {
+                        chat::ToolStatus::Failed => terminated.clone(),
+                        chat::ToolStatus::Succeeded => "Async agent launched successfully.".into(),
+                        _ => String::new(),
+                    },
+                    status,
+                };
+                call
+            };
+            let child = |status, detail: &str, items: Vec<chat::Item>| chat::Subagent {
+                id: "agent-explore".into(),
+                kind: "Explore".into(),
+                description: "How accounts store credentials".into(),
+                model: None,
+                status,
+                waiting: false,
+                detail: detail.into(),
+                background,
+                items: items.into_iter().map(Arc::new).collect(),
+            };
+            // Each transcript, the parent's and the subagent's, shows the limit
+            // at most once, and the parent's is drawn in the conversation.
+            let assert_notices = |runtime: &mut Runtime, stage: &str, parent: bool, child: bool| {
+                let stage = format!("{stage} (background: {background})");
+                let incidents = &runtime.failure_ui.incidents;
+                for incident in incidents {
+                    assert_eq!(incident.summary, summary, "{stage}");
+                    assert_eq!(incident.kind, Some(FailureKind::AccountLimit), "{stage}");
+                }
+                let count = |scope: Option<&str>| {
+                    incidents
+                        .iter()
+                        .filter(|incident| incident.child_scope.as_deref() == scope)
+                        .count()
+                };
+                assert_eq!(count(None), usize::from(parent), "{stage}: parent notices");
+                assert_eq!(
+                    count(Some("agent-explore")),
+                    usize::from(child),
+                    "{stage}: subagent notices"
+                );
+                assert_eq!(
+                    incidents.len(),
+                    usize::from(parent) + usize::from(child),
+                    "{stage}"
+                );
+                if let Some(key) = incidents
+                    .iter()
+                    .find(|incident| incident.child_scope.is_none())
+                    .map(|incident| incident.key.clone())
+                {
+                    assert!(notice_visible(runtime, &key), "{stage}");
+                }
+            };
+
+            let (mut runtime, handle) = live_fixture(
+                provider,
+                vec![
+                    text(&part(provider, message, 0), chat::Role::User, "Find it"),
+                    call(if background {
+                        chat::ToolStatus::Succeeded
+                    } else {
+                        chat::ToolStatus::Running
+                    }),
+                ],
+            );
+            assert!(runtime.failure_ui.incidents.is_empty());
+
+            // The subagent's own error arrives while its call is still running.
+            publish(&mut runtime, &handle, |next| {
+                next.subagents = vec![child(
+                    chat::ToolStatus::Running,
+                    "",
+                    vec![provider_error(provider, "child-limit:0", limit)],
+                )];
+            });
+            assert_notices(&mut runtime, "child error", false, true);
+
+            // A foreground call fails with Claude's wrapper around the same
+            // limit; a background subagent's failure reaches only its record.
+            publish(&mut runtime, &handle, |next| {
+                if !background {
+                    next.items[1] = Arc::new(call(chat::ToolStatus::Failed));
+                }
+                next.subagents = vec![child(
+                    chat::ToolStatus::Failed,
+                    &terminated,
+                    vec![provider_error(provider, "child-limit:0", limit)],
+                )];
+            });
+            assert_notices(&mut runtime, "failed subagent", !background, true);
+
+            // The parent then replies with the bare limit and the turn fails.
+            publish(&mut runtime, &handle, |next| {
+                next.items
+                    .push(Arc::new(provider_error(provider, "parent-limit:0", limit)));
+            });
+            assert_notices(&mut runtime, "parent error", true, true);
+            publish_error(&mut runtime, &handle, limit);
+            assert_notices(&mut runtime, "turn error", true, true);
+
+            // A status reporting the limit after later child work is a new report,
+            // not the earlier error, so it does not join that error's notice.
+            if background {
+                publish(&mut runtime, &handle, |next| {
+                    next.subagents = vec![child(
+                        chat::ToolStatus::Failed,
+                        &terminated,
+                        vec![
+                            provider_error(provider, "child-limit:0", limit),
+                            text("resumed", chat::Role::Assistant, "Resumed child work"),
+                        ],
+                    )];
+                });
+                let joined = runtime.failure_ui.incidents.iter().any(|incident| {
+                    incident.sources.contains(&Source::ChildItem(
+                        "agent-explore".into(),
+                        "child-limit:0".into(),
+                    )) && incident
+                        .sources
+                        .contains(&Source::ChildDetail("agent-explore".into()))
+                });
+                assert!(!joined, "a later status does not join an earlier error");
+            }
+
+            // Reopening the parent's history keeps its single notice.
+            let snapshot = handle.snapshot();
+            let (mut restored, _) = live_fixture(
+                provider,
+                snapshot.items.iter().map(|item| (**item).clone()).collect(),
+            );
+            assert_notices(&mut restored, "history", true, false);
+        }
+    }
+
+    #[test]
+    fn opaque_item_id_does_not_alias_a_message_with_the_same_spelling() {
+        let provider = Provider::Claude;
+        let raw = "Opaque provider failure";
+        let (runtime, _) = live_fixture(
+            provider,
+            vec![
+                text("m", chat::Role::User, "Legacy opaque item"),
+                provider_error(provider, "error-legacy:0", raw),
+                text("m:0", chat::Role::User, "Canonical message"),
+                provider_error(provider, "error-message:0", raw),
+            ],
+        );
+        assert_eq!(runtime.failure_ui.incidents.len(), 2);
+    }
+
+    #[test]
+    fn error_is_attributed_to_the_incoming_message_within_a_shared_turn() {
+        let raw = "Opaque provider failure\nexact original diagnostic";
+        let a = "77777777-7777-4777-8777-777777777777";
+        let b = "88888888-8888-4888-8888-888888888888";
+        let c = "99999999-9999-4999-8999-999999999999";
+        for provider in [Provider::Claude, Provider::Codex, Provider::Omp] {
+            // One publication carries both adjacent prompts and the failure.
+            let (mut runtime, handle) = live_fixture(provider, vec![]);
+            publish(&mut runtime, &handle, |next| {
+                next.items = vec![
+                    Arc::new(text(&part(provider, a, 0), chat::Role::User, "First")),
+                    Arc::new(image(&part(provider, a, 1))),
+                    Arc::new(text(&part(provider, b, 0), chat::Role::User, "Second")),
+                    Arc::new(image(&part(provider, b, 1))),
+                ];
+                next.error = Some(raw.into());
+            });
+            assert_eq!(runtime.turns.len(), 1, "adjacent prompts share a turn");
+            assert_eq!(
+                runtime.failures[0].message.as_deref(),
+                Some(part(provider, b, 0).as_str())
+            );
+            assert_eq!(runtime.failure_ui.incidents.len(), 1, "{provider:?}");
+            let incident = &runtime.failure_ui.incidents[0];
+            assert!(incident.sources.contains(&Source::Note(0)));
+            assert!(incident.sources.contains(&Source::Snapshot));
+            assert_eq!(
+                incident.anchor.as_deref(),
+                Some(runtime.turns[0].key.as_str())
+            );
+
+            // A later message reporting the same diagnostic is a new incident.
+            publish(&mut runtime, &handle, |next| {
+                next.error = None;
+                next.items.push(Arc::new(text(
+                    &part(provider, c, 0),
+                    chat::Role::User,
+                    "Third",
+                )));
+                next.items.push(Arc::new(image(&part(provider, c, 1))));
+            });
+            publish_error(&mut runtime, &handle, raw);
+            assert_eq!(runtime.failures.len(), 2);
+            assert_eq!(runtime.failure_ui.incidents.len(), 2);
+        }
+    }
+
+    #[test]
+    fn opaque_note_follows_its_visible_item_and_never_borrows_another() {
+        let raw = "Opaque provider failure\ncomplete original diagnostic";
+        for provider in [Provider::Claude, Provider::Codex, Provider::Omp] {
+            let (mut runtime, handle) = live_fixture(
+                provider,
+                vec![
+                    text("legacy-first", chat::Role::User, "First"),
+                    text("legacy-second", chat::Role::User, "Second"),
+                ],
+            );
+            publish_error(&mut runtime, &handle, raw);
+            // The note belongs to the later item but displays on the turn
+            // that contains it, keyed by the first item.
+            assert_eq!(
+                runtime.failures[0].message.as_deref(),
+                Some("legacy-second")
+            );
+            assert_eq!(
+                runtime.failure_ui.incidents[0].anchor.as_deref(),
+                Some("legacy-first")
+            );
+            let key = runtime.failure_ui.incidents[0].key.clone();
+            assert!(notice_visible(&mut runtime, &key));
+
+            publish(&mut runtime, &handle, |next| next.error = None);
+            assert!(
+                notice_visible(&mut runtime, &key),
+                "clearing the error keeps the retained note"
+            );
+
+            // Without its group or item there is no proof of where the
+            // note belongs.
+            publish(&mut runtime, &handle, |next| {
+                next.items = vec![Arc::new(text("legacy-third", chat::Role::User, "Third"))];
+            });
+            assert!(!notice_visible(&mut runtime, &key), "{provider:?}");
+        }
+    }
+
+    #[test]
+    fn auth_recovery_after_paging_clears_only_the_current_message_warning() {
+        let provider = Provider::Codex;
+        let a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let b = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        let raw = "Authentication required. Please sign in again.";
+        let (mut runtime, handle) = live_fixture(
+            provider,
+            vec![
+                text(&part(provider, a, 0), chat::Role::User, "First"),
+                image(&part(provider, a, 1)),
+            ],
+        );
+        publish_error(&mut runtime, &handle, raw);
+        let first_note = runtime.failures[0].clone();
+
+        // A changed error after B joins the same visual turn must not replace A.
+        publish(&mut runtime, &handle, |next| {
+            next.items.push(Arc::new(text(
+                &part(provider, b, 0),
+                chat::Role::User,
+                "Second",
+            )));
+            next.items.push(Arc::new(image(&part(provider, b, 1))));
+            next.error = Some(chat::sign_in_verification_failure(
+                raw,
+                "Synthetic verification failure",
+            ));
+        });
+        assert_eq!(runtime.turns.len(), 1);
+        assert_eq!(runtime.failures.len(), 2);
+        assert_eq!(runtime.failures[0], first_note);
+        let active = |runtime: &Runtime, index: usize| {
+            let note = &runtime.failures[index];
+            runtime.active_auth_notice(&note.message, &note.text)
+        };
+        assert!(!active(&runtime, 0));
+        assert!(active(&runtime, 1));
+
+        // Paging B's first part away keeps B's scope for dedup and recovery.
+        publish(&mut runtime, &handle, |page| {
+            page.has_earlier = true;
+            page.items.retain(|item| item.id == part(provider, b, 1));
+        });
+        assert!(active(&runtime, 1));
+        runtime.note(runtime.failures[1].text.clone());
+        assert_eq!(runtime.failures.len(), 2);
+
+        publish(&mut runtime, &handle, |next| {
+            next.error = None;
+            next.busy = false;
+        });
+        assert_eq!(runtime.failures, vec![first_note]);
     }
 }

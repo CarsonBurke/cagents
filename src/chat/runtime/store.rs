@@ -9,13 +9,15 @@ use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use std::{fs, io::Write, os::unix::fs::OpenOptionsExt, path::PathBuf};
 
-const PART_BYTES: usize = 128 * 1024;
-const WINDOW_BYTES: usize = 3 * 1024 * 1024;
+const PART_BYTES: usize = crate::chat::TRANSCRIPT_PART_BYTES;
+const WINDOW_BYTES: usize = crate::chat::TRANSCRIPT_WINDOW_BYTES;
 const WINDOW_ITEMS: usize = 128;
 // Leave room between provider items for overlapping history pages to supply
 // missing records without renumbering the whole conversation on every page.
 const ORDINAL_STRIDE: i64 = 1 << 32;
 const ORDINAL_LIMIT: i64 = i64::MAX / 2;
+/// Matches `journal_size_limit`: the WAL bytes retained between writes.
+const WAL_LIMIT: u64 = 1024 * 1024;
 /// The serialized item carries identity only, so it is not pageable and must stay small.
 const METADATA_LIMIT: usize = 64 * 1024;
 /// An identity string a provider can make arbitrarily long is trimmed to this
@@ -46,6 +48,7 @@ pub(super) struct Window {
 }
 pub(crate) struct Store {
     db: Connection,
+    pub(super) diagnostics: super::child_diagnostics::Backing,
     copy_cache: uuid::Uuid,
     copy_revision: u64,
     copy_projection: Vec<Option<crate::chat::TextCopySource>>,
@@ -58,7 +61,7 @@ pub(crate) struct Store {
     pub(super) file_cwd: Option<PathBuf>,
     pub(super) presented_file_changes: Option<(u64, crate::chat::FileChangesCoverage)>,
     directory: PathBuf,
-    _lease: fs::File,
+    _lease: crate::instance::OwnedLock,
     end: Option<Cursor>,
     first: Option<Cursor>,
     newest: Option<Cursor>,
@@ -81,6 +84,19 @@ pub(crate) struct Store {
 impl Store {
     pub(super) fn directory(&self) -> &std::path::Path {
         &self.directory
+    }
+    pub(super) fn diagnostic_source(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::chat::TextCopySource>, String> {
+        self.copy_parent_source(id)
+    }
+    pub(super) fn diagnostic_boundary(&self, id: &str, offset: usize) -> Result<bool, String> {
+        let byte = self.field(id, 0, offset, offset + 1)?;
+        let Some(byte) = byte.first() else {
+            return Err("Original diagnostic range is unavailable".into());
+        };
+        Ok(byte & 0xc0 != 0x80)
     }
     #[cfg(test)]
     pub(super) fn read_only_for_test(&mut self) -> Result<(), String> {
@@ -134,6 +150,7 @@ impl Store {
         if self.child_files_seen
             || self.file_index_incomplete
             || !self.presented_children.is_empty()
+            || !self.diagnostics.is_empty()
         {
             return Ok(false);
         }
@@ -207,15 +224,25 @@ impl Store {
     }
 
     pub fn new() -> Result<Self, String> {
+        Self::with_budget(false)
+    }
+    pub(super) fn diagnostic_backing() -> Result<Self, String> {
+        Self::with_budget(true)
+    }
+    fn with_budget(diagnostic: bool) -> Result<Self, String> {
         #[cfg(test)]
         let root = std::env::temp_dir();
         #[cfg(not(test))]
         let root = crate::daemon::RuntimePaths::discover()
             .map_err(|e| e.to_string())?
             .directory;
-        Self::at(root)
+        Self::at_with_budget(root, diagnostic)
     }
+    #[cfg(test)]
     fn at(root: PathBuf) -> Result<Self, String> {
+        Self::at_with_budget(root, false)
+    }
+    fn at_with_budget(root: PathBuf, diagnostic: bool) -> Result<Self, String> {
         let (directory, lease) = crate::transcript_cache::create(&root)
             .map_err(|error| format!("Cannot create private transcript cache: {error}"))?;
         let path = directory.join("transcript.sqlite");
@@ -227,14 +254,50 @@ impl Store {
                 .open(&path)
                 .map_err(|e| e.to_string())?;
             let db = Connection::open(&path).map_err(|e| e.to_string())?;
-            db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-8192; PRAGMA foreign_keys=ON;
-                CREATE TABLE items(id TEXT PRIMARY KEY, ordinal INTEGER UNIQUE NOT NULL, metadata BLOB NOT NULL, len0 INTEGER NOT NULL, len1 INTEGER NOT NULL, len2 INTEGER NOT NULL, spans BLOB NOT NULL);
+            if diagnostic {
+                // One private backing per actor, not one connection per child.
+                // Limit the database before schema or payload writes. DELETE
+                // journal mode avoids an independently growing WAL/SHM pair.
+                db.execute_batch("PRAGMA page_size=4096; PRAGMA max_page_count=3072; PRAGMA journal_mode=DELETE; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-256; PRAGMA mmap_size=0; PRAGMA journal_size_limit=0; PRAGMA temp_store=MEMORY; PRAGMA foreign_keys=ON;")
+                    .map_err(|error| error.to_string())?;
+                let mode: String = db
+                    .pragma_query_value(None, "journal_mode", |row| row.get(0))
+                    .map_err(|error| error.to_string())?;
+                let page: u64 = db
+                    .pragma_query_value(None, "page_size", |row| row.get(0))
+                    .map_err(|error| error.to_string())?;
+                let pages: u64 = db
+                    .pragma_query_value(None, "max_page_count", |row| row.get(0))
+                    .map_err(|error| error.to_string())?;
+                if mode != "delete" || page != 4096 || pages != 3072 {
+                    return Err("Diagnostic backing limits could not be established".into());
+                }
+                for (pragma, expected) in [
+                    ("cache_size", -256i64),
+                    ("mmap_size", 0),
+                    ("journal_size_limit", 0),
+                    ("temp_store", 2),
+                ] {
+                    let actual: i64 = db
+                        .pragma_query_value(None, pragma, |row| row.get(0))
+                        .map_err(|error| error.to_string())?;
+                    if actual != expected {
+                        return Err(format!(
+                            "Diagnostic backing {pragma} limit could not be established"
+                        ));
+                    }
+                }
+            } else {
+                db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-8192; PRAGMA wal_autocheckpoint=256; PRAGMA journal_size_limit=1048576; PRAGMA busy_timeout=0; PRAGMA foreign_keys=ON;").map_err(|error| error.to_string())?;
+            }
+            db.execute_batch("CREATE TABLE items(id TEXT PRIMARY KEY, ordinal INTEGER UNIQUE NOT NULL, metadata BLOB NOT NULL, len0 INTEGER NOT NULL, len1 INTEGER NOT NULL, len2 INTEGER NOT NULL, spans BLOB NOT NULL);
                 CREATE TABLE chunks(id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE, field INTEGER NOT NULL, position INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(id,field,position));").map_err(|e| e.to_string())?;
             db.execute_batch(file_changes::SCHEMA)
                 .map_err(|e| e.to_string())?;
             db.execute_batch(text_copy::SCHEMA)
                 .map_err(|e| e.to_string())?;
             Ok(Self {
+                diagnostics: Default::default(),
                 copy_cache: uuid::Uuid::new_v4(),
                 copy_revision: 0,
                 copy_projection: Default::default(),
@@ -272,6 +335,18 @@ impl Store {
         }
         result
     }
+    /// A single large transaction can grow the WAL past the autocheckpoint
+    /// size; truncate it now rather than at the next write. Best-effort: the
+    /// store is the file's only connection, so with no busy timeout a
+    /// checkpoint blocked by a reader returns at once and the next write
+    /// retries it.
+    fn trim_wal(&self) {
+        if fs::metadata(self.directory.join("transcript.sqlite-wal"))
+            .is_ok_and(|wal| wal.len() > WAL_LIMIT)
+        {
+            let _ = self.db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
+        }
+    }
     fn exists(&self, id: &str) -> Result<bool, String> {
         self.db
             .query_row(
@@ -285,7 +360,7 @@ impl Store {
     /// holds identity alone. Returns a non-fatal warning instead of an error when an
     /// item's identity still cannot be cached intact: a single unrepresentable item
     /// must never end the conversation.
-    fn put(&mut self, item: Item, older: bool) -> Result<Option<String>, String> {
+    pub(super) fn put(&mut self, item: Item, older: bool) -> Result<Option<String>, String> {
         self.put_at(item, older, None)
     }
     fn put_at(
@@ -451,7 +526,7 @@ impl Store {
         } else {
             body0.len() as i64
         };
-        let copy_prefix = if matches!(item.content, ItemContent::Text { .. }) {
+        let copy_prefix = if item.logical_copy_body().is_some() {
             self.copy_parent_prefix(&item.id, &body0)?
         } else {
             false
@@ -475,7 +550,7 @@ impl Store {
         let copy_invalidated = Self::copy_parent_put(
             &transaction,
             &item.id,
-            matches!(item.content, ItemContent::Text { .. }).then_some(len0 as usize),
+            item.logical_copy_body().is_some().then_some(len0 as usize),
             copy_prefix,
         )?;
         transaction.commit().map_err(|e| e.to_string())?;
@@ -752,6 +827,7 @@ impl Store {
     /// Returns the events the store does not own, plus any non-fatal warning raised
     /// while caching. Warnings are events, never errors: the caller must stay alive.
     pub fn apply(&mut self, mut event: Event) -> Result<Vec<Event>, String> {
+        self.diagnostics.observe(&mut event);
         if let Some(seal) = &self.messages {
             match &mut event {
                 Event::Item(item) => seal.recognize(item),
@@ -928,6 +1004,7 @@ impl Store {
                 self.latest_boundary = None;
                 self.dirty = true;
                 out.push(Event::Reset { reason });
+                self.trim_wal();
                 return Ok(out);
             }
             Event::HistoryLoading(false) => {
@@ -960,6 +1037,7 @@ impl Store {
                 return Ok(out);
             }
         }
+        self.trim_wal();
         Ok(out)
     }
     fn flush_text(&mut self) -> Result<Option<String>, String> {
@@ -1037,6 +1115,7 @@ impl Store {
             transaction.commit().map_err(|e| e.to_string())?;
             self.changed(id);
         }
+        self.trim_wal();
         Ok(warning)
     }
     /// Returns true when earlier history is already cached (no provider command).
@@ -1127,6 +1206,51 @@ impl Store {
             Some(index) => Ok(start + index + 1),
             None => self.boundary(id, len0, target),
         }
+    }
+    /// Marks every cached step still running or waiting as stopped, once the provider
+    /// that ran it has exited and nothing will report its end. A step's
+    /// status is part of its metadata, so its cached output is kept as is.
+    pub(super) fn stop_running_steps(&mut self) -> Result<(), String> {
+        let mut statement = self
+            .db
+            .prepare("SELECT id,metadata FROM items")
+            .map_err(|e| e.to_string())?;
+        let mut stopped = Vec::new();
+        let mut rows = statement.query([]).map_err(|e| e.to_string())?;
+        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            let metadata: Vec<u8> = row.get(1).map_err(|e| e.to_string())?;
+            let mut item: Item = postcard::from_bytes(&metadata).map_err(|e| e.to_string())?;
+            if let Some(status) = item.content.status_mut()
+                && status.is_live()
+            {
+                *status = crate::chat::ToolStatus::Stopped;
+                // It ended now, so its duration runs to the provider's exit.
+                item.started_at = item.started_at.or(item.at);
+                item.at = observed_at();
+                let id: String = row.get(0).map_err(|e| e.to_string())?;
+                stopped.push((id, postcard::to_stdvec(&item).map_err(|e| e.to_string())?));
+            }
+        }
+        drop(rows);
+        drop(statement);
+        if stopped.is_empty() {
+            return Ok(());
+        }
+        let transaction = self.db.transaction().map_err(|e| e.to_string())?;
+        for (id, metadata) in &stopped {
+            transaction
+                .execute(
+                    "UPDATE items SET metadata=?2 WHERE id=?1",
+                    params![id, metadata],
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        transaction.commit().map_err(|e| e.to_string())?;
+        for (id, _) in &stopped {
+            self.changed(id);
+        }
+        self.dirty = true;
+        Ok(())
     }
     fn changed(&mut self, id: &str) {
         if let Some(changed) = &mut self.changed {
@@ -1230,9 +1354,15 @@ impl Store {
                 // A part's identity carries its field ranges and layout so
                 // disclosure state cannot move to different bytes on rewrite.
                 let item_id = if part > 0 {
-                    std::borrow::Cow::Owned(format!(
-                        "{id}:native-part:{part}:{kind}:{start0}-{end0}:{start1}-{end1}"
-                    ))
+                    std::borrow::Cow::Owned(
+                        crate::chat::TranscriptPart {
+                            item: &id,
+                            index: part,
+                            layout: kind,
+                            fields: [(start0, end0), (start1, end1)],
+                        }
+                        .id(),
+                    )
                 } else {
                     std::borrow::Cow::Borrowed(base.id.as_str())
                 };
@@ -1247,7 +1377,7 @@ impl Store {
                 {
                     break 'records;
                 }
-                let copy_source = if matches!(base.content, ItemContent::Text { .. }) {
+                let copy_source = if base.logical_copy_body().is_some() {
                     self.copy_parent_source(&id)?
                 } else {
                     None
@@ -1633,6 +1763,122 @@ mod tests {
     use crate::chat::Role;
     use std::os::unix::fs::PermissionsExt;
 
+    fn wal_bytes(store: &Store) -> u64 {
+        match fs::metadata(store.directory.join("transcript.sqlite-wal")) {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => panic!("WAL observation failed: {error}"),
+        }
+    }
+
+    fn assert_copy(store: &Store, id: &str, expected: &str) {
+        let source = store.copy_parent_source(id).unwrap().unwrap();
+        let mut copied = String::new();
+        loop {
+            let page = store.text_copy(&source, copied.len() as u64).unwrap();
+            copied.push_str(&page.text);
+            if page.done {
+                break;
+            }
+        }
+        assert_eq!(copied, expected);
+    }
+
+    #[test]
+    fn repeated_large_rewrites_bound_retained_wal_without_changing_transcript() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = Store::at(root.path().to_owned()).unwrap();
+        for revision in 0..64 {
+            let body = format!("{revision}:{}", "x".repeat(1024 * 1024));
+            store
+                .apply(Event::Item(history_item("same", &body)))
+                .unwrap();
+            let bytes = wal_bytes(&store);
+            assert!(
+                bytes <= WAL_LIMIT,
+                "rewrite {revision} retained {bytes} WAL bytes"
+            );
+            assert_eq!(
+                store.field("same", 0, 0, body.len()).unwrap(),
+                body.as_bytes()
+            );
+            assert_copy(&store, "same", &body);
+        }
+        for (pragma, expected) in [
+            ("synchronous", 1),
+            ("cache_size", -8192),
+            ("wal_autocheckpoint", 256),
+            ("journal_size_limit", WAL_LIMIT as i64),
+        ] {
+            let actual: i64 = store
+                .db
+                .pragma_query_value(None, pragma, |row| row.get(0))
+                .unwrap();
+            assert_eq!(actual, expected, "{pragma}");
+        }
+    }
+
+    #[test]
+    fn large_commit_wal_held_by_a_reader_is_trimmed_by_the_next_write() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = Store::at(root.path().to_owned()).unwrap();
+        let large = "large 🦀\n".repeat(1024 * 1024);
+        store
+            .apply(Event::Item(history_item("large", &large)))
+            .unwrap();
+        assert!(wal_bytes(&store) <= WAL_LIMIT);
+        // A reader snapshot keeps the checkpoint from resetting the WAL.
+        let reader = Connection::open(store.directory.join("transcript.sqlite")).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        reader
+            .query_row("SELECT count(*) FROM chunks", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        let pinned = "p".repeat(2 * 1024 * 1024);
+        store
+            .apply(Event::Item(history_item("pinned", &pinned)))
+            .unwrap();
+        assert!(wal_bytes(&store) > WAL_LIMIT);
+        drop(reader);
+        store
+            .apply(Event::Item(history_item("next", "next")))
+            .unwrap();
+        assert!(wal_bytes(&store) <= WAL_LIMIT);
+        assert_copy(&store, "large", &large);
+        assert_copy(&store, "pinned", &pinned);
+    }
+
+    #[test]
+    fn diagnostic_backing_keeps_aggregate_disk_and_cache_limits_across_writes() {
+        let mut store = Store::diagnostic_backing().unwrap();
+        for revision in 0..4 {
+            let body = format!("{revision}:{}", "x".repeat(1024 * 1024));
+            store.put(history_item("same", &body), false).unwrap();
+        }
+        let mode: String = store
+            .db
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "delete");
+        for (pragma, expected) in [
+            ("page_size", 4096i64),
+            ("max_page_count", 3072),
+            ("cache_size", -256),
+            ("mmap_size", 0),
+            ("journal_size_limit", 0),
+            ("temp_store", 2),
+        ] {
+            let actual: i64 = store
+                .db
+                .pragma_query_value(None, pragma, |row| row.get(0))
+                .unwrap();
+            assert_eq!(actual, expected, "{pragma}");
+        }
+        assert!(!store.directory.join("transcript.sqlite-wal").exists());
+        assert!(!store.directory.join("transcript.sqlite-shm").exists());
+    }
+
     #[test]
     fn dropping_a_store_removes_ordinary_cache_but_preserves_unretired_actor_evidence() {
         use std::fs::OpenOptions;
@@ -1660,6 +1906,9 @@ mod tests {
             .unwrap();
         journal.sync_all().unwrap();
         drop(journal);
+        // An unrelated fork duplicates the lease description until exec. It
+        // cannot extend Store ownership after the reducer has been dropped.
+        let unrelated_fork = retained._lease.try_clone().unwrap();
         drop(retained);
         assert!(retained_directory.join("transcript.sqlite").exists());
         assert_eq!(
@@ -1679,6 +1928,7 @@ mod tests {
             1
         );
         assert!(!retained_directory.exists());
+        drop(unrelated_fork);
     }
 
     #[test]
@@ -2591,7 +2841,7 @@ mod tests {
     }
 
     /// A 2 MiB screenshot used to be rejected by the 64 KiB identity guard, which
-    /// killed the provider and made the session unreopenable.
+    /// killed the provider and prevented the session from reopening.
     #[test]
     fn inline_image_far_past_the_identity_budget_round_trips() {
         let mut store = Store::at(std::env::temp_dir()).unwrap();
@@ -2617,6 +2867,9 @@ mod tests {
                 path, description, ..
             } => {
                 assert!(path.starts_with(store.directory.to_str().unwrap()));
+                assert!(crate::chat::is_cached_inline_image(std::path::Path::new(
+                    path
+                )));
                 assert_eq!(fs::read(path).unwrap(), b"ABC".repeat(512 * 1024));
                 assert_eq!(description, "screenshot");
             }
@@ -3132,6 +3385,68 @@ mod tests {
         let completed = store.window().unwrap().items[0].clone();
         assert_eq!(completed.started_at, Some(started));
         assert!(completed.at.unwrap() >= streaming.at.unwrap());
+    }
+
+    #[test]
+    fn steps_left_running_at_exit_are_stopped_with_their_output_kept() {
+        use crate::chat::ToolStatus;
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        let tool = |id: &str, status| Item {
+            id: id.into(),
+            role: Role::Assistant,
+            content: ItemContent::Tool {
+                name: "Bash".into(),
+                input: "sleep 6001".into(),
+                output: String::new(),
+                status,
+            },
+            started_at: None,
+            at: None,
+        };
+        store
+            .apply(Event::Item(tool("running", ToolStatus::Running)))
+            .unwrap();
+        store
+            .apply(Event::OutputDelta {
+                id: "running".into(),
+                offset: 0,
+                delta: "epoch 1 of 40".into(),
+            })
+            .unwrap();
+        store
+            .apply(Event::Item(tool("done", ToolStatus::Succeeded)))
+            .unwrap();
+        store
+            .apply(Event::Item(tool("waiting", ToolStatus::Waiting)))
+            .unwrap();
+        // The actor reuses its last window, so the stop must reach it as a
+        // change, not only in a fresh read.
+        let mut presented = store.window().unwrap().items;
+        let (started, streamed) = (presented[0].started_at, presented[0].at);
+        store.stop_running_steps().unwrap();
+        let items = store.window_reusing(&mut presented).unwrap().items;
+        // The step ended when its provider did, not at its last output.
+        assert_eq!(items[0].started_at, started);
+        assert!(items[0].at >= streamed && items[0].at.is_some());
+        let steps: Vec<_> = items
+            .iter()
+            .map(|item| match &item.content {
+                ItemContent::Tool { output, status, .. } => (output.as_str(), *status),
+                other => panic!("unexpected item {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            steps,
+            [
+                ("epoch 1 of 40", ToolStatus::Stopped),
+                ("", ToolStatus::Succeeded),
+                ("", ToolStatus::Stopped)
+            ]
+        );
+        // Nothing is left to stop the second time.
+        store.dirty = false;
+        store.stop_running_steps().unwrap();
+        assert!(!store.dirty);
     }
 
     /// The stamp is read as the moment an item finished, and a running daemon

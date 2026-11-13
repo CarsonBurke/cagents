@@ -37,21 +37,49 @@ cagents agent interrupt 1a2b
 cagents agent close 1a2b
 ```
 
-An interrupt may also stop the provider's running background subagents (Claude
-does this). The daemon refuses that interrupt unless you pass
-`--including-subagents`. It checks the current tasks at provider dispatch, so a
+An interrupt may also stop the provider's background subagents, including one
+waiting on its own background work (Claude does this). The daemon refuses that
+interrupt unless you pass `--including-subagents`, and names the subagents it
+would stop by their tasks. It checks the current tasks at provider dispatch, so a
 background task that starts after your status check remains protected. To stop
 just one task, use its subagent Stop action in chat instead. The provider console
 uses `/interrupt` with the same safeguard; `/interrupt --including-subagents`
 explicitly permits stopping the background work. Stopped background tasks do not
-resume automatically. Closing an agent stops the entire owned conversation and
-its background tasks.
+resume automatically. Closing an agent ends the entire owned conversation, and
+the provider ends its background subagents as it quits.
 
-Daemon Stop confirmation counts running background subagents as well as hosted
-sessions. If those tasks change before confirmation is accepted, refresh the
-preview and confirm again. An update with **When idle** waits for background work
-to finish; **Interrupt** previews which background tasks will stop. New affected
+Closing a chat, or stopping the daemon, ends its provider the way quitting the
+provider's own CLI does, and cagents stops nothing more. Whatever the provider
+leaves running keeps running, such as a server an agent started with `setsid`,
+`nohup` or `tmux`. Claude Code stops the commands it was still running as it
+quits; how Codex treats its running commands hasn't been checked. An update
+that carries a chat over doesn't close it, so its processes keep running too.
+These cases stop everything the provider started instead:
+- an automation's agent, or one another session started, until a person takes
+  part in it;
+- a provider something outside cagents killed, such as the system for memory;
+- a close that hands the chat elsewhere, such as returning it to its terminal,
+  closing it with its paired terminal, or switching accounts.
+
+Daemon Stop confirmation counts background subagents, running or waiting on their
+own background work, as well as hosted sessions. If those tasks change before
+confirmation is accepted, refresh the preview and confirm again. An update with
+**When idle** waits for background work to finish. A subagent waiting on its own
+background work, such as a dev server it started, may never finish while its
+conversation looks done, so the preview names it: stop it from its tab, or
+choose **Interrupt**, which previews which background tasks will stop. Automatic
+cleanup of an automation's agent is refused for the same reason, naming the
+subagent. New affected
 tasks require fresh update confirmation.
+
+Stopping the daemon does not close its agents. Each agent's provider and any
+turn in progress end, and the stopped provider can no longer act for the agent,
+but the agent stays open: `agent list` still shows it, and its card stays in its
+channel, where its saved conversation can be resumed. A turn the stop cut short
+ends with a note that it may be incomplete and is never resent, so inspect the
+conversation before sending more work. Until the conversation is resumed, a new
+prompt to the agent fails without being sent. `agent close` still retires a
+stopped agent.
 
 Every command takes an agent by its exact name, or an agent or run by its whole ID or any unique prefix of one, matched against the caller's open agents and their latest runs; an ambiguous prefix fails and names the candidates. An agent handle stands for its latest run, and a run handle for its agent. A whole ID outside that list is passed on as an agent, or to `wait` as an older run. Names resolve without case sensitivity and take precedence over ID prefixes. People read eight-character IDs; JSON always carries whole ones.
 
@@ -65,7 +93,7 @@ Waiting commands use exit code **0** for success, **3** for timeout, **4** for f
 
 A run moves from `Accepted` to `Running`, may enter `Waiting`, and finishes as `Succeeded`, `Failed`, `Cancelled`, or `Interrupted`. Waiting returns promptly so a caller can route the approval/question to a person. It is not successful completion. The result contains provider-correlated text, usage, an optional diagnostic, and an explicit truncation flag. Text is bounded to 1 MiB; diagnostics to 16 KiB. Terminal output is never scraped to infer completion.
 
-Acceptance and its dispatch claim commit to the daemon's SQLite registry with `synchronous=FULL` before spawning a provider or submitting a prompt. An identical request with the same caller and idempotency key returns the original IDs; it does not send the prompt again. Reusing a key for different content fails. The CLI generates a key when `--idempotency-key` is omitted and retries once with it, on a new connection, when the daemon's answer is lost. A submission that still fails reports its key in the error; retry by hand with the identical request and that key.
+Acceptance and its dispatch claim commit to the daemon's SQLite registry with `synchronous=FULL` before spawning a provider or submitting a prompt. An identical request with the same caller and idempotency key returns the original IDs; it does not send the prompt again. Reusing a key for different content fails. Because each commit waits on the disk, the CLI allows the daemon 30 seconds to answer a submission, rather than the 5 seconds it allows ordinary requests. The CLI generates a key when `--idempotency-key` is omitted and retries once with it, on a new connection, when the daemon's answer is lost. A submission that still fails reports its key in the error; retry by hand with the identical request and that key.
 
 If a daemon restart loses proof of an accepted prompt's outcome, the run becomes `Interrupted`. Its external effects may already have happened. It is never resent automatically and retains its concurrency reservation until explicitly reconciled/closed. A private pending launch record preserves ownership if a process started but its final descriptor could not be committed. Such a record is not exposed as an adoptable UI session. A startup failure that retains a known hosted session reports that descriptor; inspect or close it before deciding how to proceed.
 
@@ -114,7 +142,7 @@ for the full report contract.
 
 ## Finding other sessions
 
-`cagents sessions` (alias `ls`) lists the live provider conversations in the current project, whoever started them. That includes native chats, provider CLIs running in terminals, delegated agents, and automations. `--project PATH` selects another open project; `--all` lists every project. A directory outside every open project lists everything, and the reply's `scope` says so.
+`cagents sessions` (alias `ls`) lists the live provider conversations in the current project, whoever started them. That includes native chats, provider CLIs running in terminals, delegated agents, and automations. `--project PATH` selects another open project; `--all` lists every project; `--channel` lists the caller's channel (see [Reading your channel](#reading-your-channel)). A directory outside every open project lists everything, and the reply's `scope` says so.
 
 ```sh
 cagents ls
@@ -131,6 +159,37 @@ cagents whoami
 Each entry carries the live session ID, provider, `Idle`/`Working`/`Waiting` state, working directory, checkout (repository or linked worktree), project, and, for delegated agents, the owner and latest run. `relation` places it relative to the caller: `Myself`, `Parent` (a session of the lineage that owns the caller), `Child` (an agent the caller may control; one started by a CLI outside cagents is shown as a user agent, because every such caller shares it), or `Peer`. A plain shell appears only as the caller or as the owner of a listed agent. `whoami` reports the calling session, its relatives, and peers working in the same checkout, which are the sessions most likely to collide with its edits.
 
 The caller's identity comes from its daemon-issued capability, never from an environment variable a process could set. A CLI outside cagents has no session of its own. Listing is read-only: the agent commands below remain restricted to an agent's owner. Inside a hosted session the lower-level `cagents terminal` commands are restricted too. That includes a plain shell, since an agent may be running in it. They still list, snapshot and wait on any terminal, but `write` and `close` reach only the terminals the session's lineage controls: its own session, the terminals it started with `cagents terminal spawn`, and the sessions and consoles of the agents it delegated to. To reach anyone else's, message its owner. The daemon records which lineage started each terminal, from registry schema version 6, so this survives a reconnect and a daemon restart; a terminal relaunched in its card keeps its owner. A spawn from inside a session may start a new terminal but not relaunch an existing one. The check applies to the connection the CLI authenticates with the session's capability, which also refuses everything outside the terminal surface. Like a CLI outside cagents, a process that reaches the daemon socket without authenticating acts for the user. So does a command run with `CAGENTS_AGENT_AUTHORITY` unset, which a person at a hosted shell can use to act as themselves. Session IDs address the live process; a relaunched or recovered conversation is listed under a new ID. Its `lineage`, printed beneath a session whose lineage differs from its ID, names the root session it succeeds and stays the same across those relaunches and recoveries.
+
+## Reading your channel
+
+`cagents ls --channel` lists the sessions in the caller's channel, or in `--channel CHANNEL`. It includes native chats whose provider has exited, for example after a usage limit, until their card is closed, and lists the most recently active first, with when each conversation was last saved. With `--json` it returns `data.channel`, plus `data.me` (when the caller is in that channel) and `data.sessions`. Each member holds its directory entry as `session`, with `exited`, `failure` and `active_at` (Unix milliseconds). `whoami` marks the peers that share the caller's channel.
+
+A session its provider refused at an account usage limit is listed as `limited` (`Limited` in JSON) rather than idle, with the limit as `limit`: its `summary`, the provider's own `reset` wording and, when the account's usage readings date it, `resets_at` (Unix seconds). The daemon judges the limit from the provider's last error. A reading taken after the refusal dates it by the latest reset among the account's used-up windows. The limit lifts when that reset passes, when a reading taken after the refusal shows allowance again, or when the conversation's own next turn is accepted; background subagents still working do not lift it. Without a dating reading, the limit lasts until the conversation continues. Each live session also carries `account`: the provider account it runs on, its usage status, the allowance left in each window with its reset, and whether that reading is stale. `ls`, `whoami` and `agent status` print both, plain and in JSON, and the app marks a limited conversation's tab and project with an alarm badge.
+
+`cagents transcript SESSION` (alias `history`) reads a page of another session's conversation from the provider's own saved history: Claude's project transcript or Codex's rollout, including an archived one. It names sessions as `cagents send` does. The daemon locates the file from that session's own launch: provider, conversation, working directory and account home. Callers never pass a path. Reading neither starts the provider nor requires it to be running, and it grants no control, like listing.
+
+```sh
+cagents ls --channel
+cagents transcript 7c0f
+cagents transcript 7c0f --before 3f2a1b7c-0d9e-4c8b-a7f6-5e4d3c2b1a00
+cagents transcript 7c0f --tools --full --json
+```
+
+```text
+Session 7c0fba49-2f0e-4b8e-9d0a-1c2b3d4e5f60 (claude, exited), active 12 min ago
+Failed: Claude usage limit reached · resets 3pm
+Earlier: cagents transcript 7c0f --before 3f2a1b7c-0d9e-4c8b-a7f6-5e4d3c2b1a00
+
+[user]
+  The login test fails one run in ten; find out why.
+
+[tools] Run ×9, Read ×4, Edit ×2; edited tests/login.rs, src/auth.rs
+
+[assistant]
+  The session cookie expires during the retry loop. I extended its lifetime in the fixture and ...
+```
+
+A page holds the last `--limit` messages (10 by default, at most 200): user messages, assistant text, messages delivered by other sessions and reports from subagents. Notices between them, including Claude's compaction summaries and Codex's compaction markers, come along. Each run of consecutive tool calls folds into one line with counts, failures and edited paths; `--tools` lists every call with clipped output instead. Messages are clipped to 2,000 bytes and notices to 600, with the omitted size shown; `--full` keeps them whole, except that a Codex command's output is kept to 64 KiB. The page lists oldest first, so the newest message is last. Each entry's text is indented under its label, so text that quotes another transcript cannot read as an entry. A failure is summarized in one line. A listing of one channel, and a transcript's heading, show only a session's own title, never its channel's. Its `Earlier:` line gives the command for the previous page, with the same options. `--json` returns the session as a channel listing reports it, the entries with their IDs and the `earlier` cursor. A forked Codex thread includes the history it replays from its parent; Codex's own instructions and environment context are left out. Reasoning never appears, and tool output appears only with `--tools`. A provider CLI in a terminal is read from the conversation it is resuming or was last seen in. Omp conversations cannot be read yet.
 
 ## Messages between sessions
 
@@ -151,6 +210,8 @@ cagents inbox
 
 The daemon's courier gives a live native conversation its oldest waiting message as a prompt once the conversation is idle: ready, not working, and not waiting on a question or approval. It never interrupts a turn, and the next message waits for the turn the previous one started to finish. It prompts as an execution client, so delivering a message never takes a delegated agent over. If the conversation refuses the prompt, usually because a person's own prompt reached it first, the message returns to the queue. Delivery is at most once: a prompt the conversation took but did not acknowledge in time, a provider that rejects a turn after accepting the prompt, or a daemon that stops between claiming a message and prompting leaves the message marked delivered rather than risk a second prompt. A session running in a terminal, such as a provider CLI, is never prompted; it reads its messages with `cagents inbox`. A message to a lineage with no live session waits for the next one to start.
 
+The courier does not prompt a conversation stopped by a usage limit. Its messages stay pending until the limit lifts, and the courier looks again when a dated limit resets. `send` and `ask` say so beneath their `Sent` line, and give the recipient's session and the `notice` in JSON. `ask` does not wait for a limited recipient; a later reply arrives as a message. `agent send` refuses an agent stopped until a known reset with the error `agent_limited`, and sends nothing; a retry of a submission the daemon already accepted still returns that acceptance. When the reset is unknown, `agent send` sends the prompt, since a new turn shows whether the limit still holds, and adds a `notice`.
+
 For a live terminal running a provider CLI, unread mail creates separate **Session messages waiting** attention in the app. Desktop delivery follows the existing Waiting notification preference and focus policy. The alert contains only fixed instructions: no message body, sender title, directory, URL or authority token. Opening it resolves the current, unambiguous terminal for the recipient's lineage and focuses only an open pane with the same launch and live host proof. A closed, replaced or ambiguous recipient leaves the inbox unread and reports that it is unavailable here. It never types into the PTY, prompts the provider, or starts a daemon.
 
 Notification acknowledgement and mailbox receipts are independent. Focusing or dismissing an alert leaves messages unread; `cagents inbox` reads them explicitly. Arrivals coalesce per lineage without replacing lifecycle or review attention. A new message can reactivate dismissed inbox attention; repeated reconciliation, partial reads and daemon restart preserve the same arrival identity and dismissal. Held ask replies become alert-eligible when their hold ends, while older available mail remains eligible. A held reply that was explicitly read before release never creates an alert later. Releasing an earlier queued hold is not a new arrival: dismissing a later coalesced alert also covers earlier queued replies, so their release does not redisplay that alert. When all pending mail is read, delivered or expires, obsolete inbox attention is retired. An offline lineage keeps existing attention but receives no new desktop alert until one live provider terminal owns it; native chats retain their idle prompt delivery.
@@ -170,7 +231,7 @@ A message body is at most 64 KiB, and a lineage holds at most 64 undelivered mes
 
 ## Console surface
 
-`--surface terminal` creates a real hosted terminal running a cagents console over the same native provider actor. It does not launch another provider process and does not emulate the provider's stock TUI. The console streams a bounded transcript, structured usage, run outcomes, approvals, and questions.
+`--surface terminal` creates a real hosted terminal running a cagents console over the same native provider actor. It does not launch another provider process and does not emulate the provider's stock TUI. The console prints what the agent said and one line per finished step, plus a line for any step still running after a few seconds; command output, tool payloads and delivered reports are left out. It also prints run outcomes with their token usage, approvals, and questions. A line appears once it is complete, and a step that finishes after later text was printed appears as one new line, so the transcript is not reprinted.
 
 - Ordinary input submits a new durable run.
 - `/interrupt` requests interruption through the native adapter. It refuses an interruption that would stop running background subagents; `/interrupt --including-subagents` permits that wider impact. A successful interrupt takes the agent over; a refusal leaves its owner in control.

@@ -129,24 +129,35 @@ pub struct RemainingWindow {
     pub reset_elapsed: bool,
 }
 
-impl AccountInfo {
-    pub fn set_usage(&mut self, usage: UsageSnapshot, now: u64) {
-        self.age_ms = now.checked_sub(usage.observed_at);
-        self.remaining = usage
+impl RemainingWindow {
+    /// What each of a reading's windows has left at `now`, in Unix
+    /// milliseconds.
+    pub fn of(usage: &UsageSnapshot, now: u64) -> Vec<Self> {
+        usage
             .windows
             .iter()
-            .map(|window| RemainingWindow {
+            .map(|window| Self {
                 remaining_fraction: window.left(),
                 reset_elapsed: window
                     .resets_at
                     .is_some_and(|at| at >= 0 && (at as u64).saturating_mul(1000) <= now),
                 window: window.clone(),
             })
-            .collect();
-        self.stale = self
-            .age_ms
-            .is_none_or(|age| age >= super::schedule::DISPLAY_STALE_AFTER)
-            || self.remaining.iter().any(|window| window.reset_elapsed);
+            .collect()
+    }
+
+    /// Whether a reading this old, with these windows, is too stale to plan on.
+    pub fn stale(age_ms: Option<u64>, remaining: &[Self]) -> bool {
+        age_ms.is_none_or(|age| age >= super::schedule::DISPLAY_STALE_AFTER)
+            || remaining.iter().any(|window| window.reset_elapsed)
+    }
+}
+
+impl AccountInfo {
+    pub fn set_usage(&mut self, usage: UsageSnapshot, now: u64) {
+        self.age_ms = now.checked_sub(usage.observed_at);
+        self.remaining = RemainingWindow::of(&usage, now);
+        self.stale = RemainingWindow::stale(self.age_ms, &self.remaining);
         self.credits_remaining_fraction = usage
             .credits
             .as_ref()
@@ -311,6 +322,7 @@ mod tests {
                     email: Some("fixture@example.test".into()),
                     organization: None,
                     plan: Some("pro".into()),
+                    disputed_by: None,
                 }),
                 observed_identity: None,
                 identity_conflict: false,

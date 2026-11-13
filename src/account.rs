@@ -178,6 +178,47 @@ fn brokered_digest(service: &str, key: &str) -> String {
         .collect()
 }
 
+/// Validate an existing-home operand without interpreting it on this device.
+/// CLI callers retain the original spelling; native fields may trim it first.
+pub(crate) fn validate_linked_home_operand(value: &str) -> Result<(), String> {
+    // The destination's established linker trims text-field input. Refuse an
+    // ambiguous CLI operand rather than silently selecting a different home.
+    if value.trim() != value {
+        return Err("Use an account home without leading or trailing whitespace".into());
+    }
+    if value
+        .strip_prefix("~/")
+        .is_some_and(|relative| Path::new(relative).is_absolute())
+    {
+        return Err("Use one slash after ~ so the account home stays relative to the selected device's home".into());
+    }
+    if value.contains('\0') || !(Path::new(value).is_absolute() || value.starts_with("~/")) {
+        return Err(
+            "Use an absolute account home on the selected device, or one starting with ~/".into(),
+        );
+    }
+    Ok(())
+}
+
+/// Expand only on the device that owns the account registry. An absolute
+/// remainder after ~/ would replace HOME during Path::join, so reject it first.
+#[cfg(any(feature = "ui", feature = "host", test))]
+pub(crate) fn expand_linked_home(
+    value: &str,
+    home: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf, String> {
+    validate_linked_home_operand(value)?;
+    let path = if let Some(relative) = value.strip_prefix("~/") {
+        PathBuf::from(home.ok_or("HOME is unavailable")?).join(relative)
+    } else {
+        PathBuf::from(value)
+    };
+    if !path.is_absolute() {
+        return Err("Use an absolute account home on the selected device".into());
+    }
+    Ok(path)
+}
+
 /// The environment variable a provider's CLI reads its home from.
 pub fn home_variable(provider: Provider) -> Option<&'static str> {
     match provider {
@@ -259,6 +300,33 @@ pub fn is_account_namespace(provider: Provider, path: &Path) -> bool {
 /// never listed, so it survives into a cagents process started from there.
 pub const SELECTION_MARKER: &str = "CAGENTS_ACCOUNT_HOMES";
 
+/// Carried by every terminal and conversation cagents starts on the system
+/// Claude login with a `CLAUDE_CONFIG_DIR` the reader started cagents with -
+/// the one the daemon that starts it was started with - as a
+/// `CLAUDE_CONFIG_DIR=path` line. It tells a cagents process started
+/// there that the home is the reader's own choice, which a launch by earlier
+/// cagents, exporting Claude's default for every system launch, could not
+/// (see [`inherited_selections`]).
+pub const SYSTEM_HOME_MARKER: &str = "CAGENTS_SYSTEM_HOMES";
+
+/// The value of [`SYSTEM_HOME_MARKER`] for a process about to start with the
+/// provider homes `home_of` names and the [`SELECTION_MARKER`] `selection`,
+/// from a process whose own environment is `own`: the Claude home it exports
+/// when that is the one this process was started with and no account
+/// selected it. A conversation saved by earlier cagents, resuming with the
+/// default it exported, is not listed.
+pub fn system_home_marker(
+    home_of: impl Fn(&str) -> Option<String>,
+    selection: Option<&str>,
+    own: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    let variable = home_variable(Provider::Claude)?;
+    let home = home_of(variable).filter(|home| !home.is_empty())?;
+    let line = format!("{variable}={home}");
+    let selected = selection.is_some_and(|selection| selection.lines().any(|l| l == line));
+    (!selected && own(variable).is_some_and(|own| own == home)).then_some(line)
+}
+
 /// The provider home variables to drop from an inherited environment, read
 /// through `environment`: those that only record an account cagents selected
 /// for a launch, which a cagents process started under that launch must not
@@ -275,6 +343,16 @@ pub const SELECTION_MARKER: &str = "CAGENTS_ACCOUNT_HOMES";
 /// named one home and reported one login, system work ran on the chosen
 /// account, and signing in to the system account signed the chosen
 /// account's home in to the system login.
+///
+/// In a process cagents started, `CLAUDE_CONFIG_DIR` naming Claude Code's
+/// default `~/.claude` is dropped too, unless [`SYSTEM_HOME_MARKER`] lists
+/// it. Earlier cagents exported it for every launch on the system login, and
+/// it selects no other home: it only moves the login's record of who it is
+/// from `~/.claude.json` into that directory. Kept, a window, daemon or
+/// command started from such a launch would read and write a second record
+/// of who the system login is, unlike the reader's own `claude` and every
+/// other cagents process. Outside a cagents launch, or listed by one, the
+/// variable is the reader's own setting and kept.
 pub fn inherited_selections(environment: &dyn Fn(&str) -> Option<String>) -> Vec<&'static str> {
     let marker = environment(SELECTION_MARKER).unwrap_or_default();
     Account::PROVIDERS
@@ -286,10 +364,45 @@ pub fn inherited_selections(environment: &dyn Fn(&str) -> Option<String>) -> Vec
                 line.split_once('=')
                     .is_some_and(|(name, home)| name == variable && home == value)
             });
-            (selected || is_account_namespace(provider, Path::new(&value))).then_some(variable)
+            (selected
+                || is_account_namespace(provider, Path::new(&value))
+                || legacy_claude_default(provider, variable, &value, environment))
+            .then_some(variable)
         })
         .collect()
 }
+
+/// Whether `value` of `variable` is Claude Code's default directory as an
+/// earlier cagents launch exported it: `environment`'s `HOME` joined with
+/// `.claude`, compared by path components, in a process cagents started,
+/// and not listed by [`SYSTEM_HOME_MARKER`]. Only a lexical comparison, as
+/// the account views read this on every render.
+fn legacy_claude_default(
+    provider: Provider,
+    variable: &str,
+    value: &str,
+    environment: &dyn Fn(&str) -> Option<String>,
+) -> bool {
+    let launched = LAUNCH_MARKERS
+        .iter()
+        .any(|marker| environment(marker).is_some_and(|value| !value.is_empty()));
+    let declared = environment(SYSTEM_HOME_MARKER).is_some_and(|listed| {
+        listed
+            .lines()
+            .any(|line| line.split_once('=') == Some((variable, value)))
+    });
+    provider == Provider::Claude
+        && launched
+        && !declared
+        && environment("HOME")
+            .filter(|user| !user.is_empty())
+            .is_some_and(|user| Path::new(value) == Path::new(&user).join(".claude"))
+}
+
+/// Set in the environment of every terminal cagents starts
+/// (`CAGENTS_TERMINAL_ID`) and of every conversation agent it hosts
+/// ([`crate::agent_execution::AUTHORITY_ENV`]).
+const LAUNCH_MARKERS: [&str; 2] = ["CAGENTS_TERMINAL_ID", crate::agent_execution::AUTHORITY_ENV];
 
 /// Forgets the provider homes this process inherited from an account
 /// cagents selected (see [`inherited_selections`]), so that neither it nor
@@ -504,10 +617,87 @@ impl Account {
         self.home_directory(&|name| std::env::var(name).ok())
     }
 
+    /// The home a conversation, terminal or sign-in on this account exports
+    /// through its provider's home variable, or `None` when it exports none
+    /// and the CLI resolves its own default.
+    ///
+    /// A managed, linked or selected device's home is always exported, as is
+    /// the system account's when cagents itself was started with one, unless
+    /// it was inherited from a cagents launch (see [`inherited_selections`]);
+    /// every cagents process started alike resolves the same. The system Claude login
+    /// otherwise exports nothing, so every launch reads
+    /// the same records as the reader's own `claude`: Claude Code keeps who a
+    /// login belongs to in its global configuration, which any explicit
+    /// `CLAUDE_CONFIG_DIR` moves from `~/.claude.json` into that directory -
+    /// even when the variable names the default `~/.claude`. Exporting the
+    /// default would give one login two records of who it is, one that only
+    /// cagents' launches keep.
+    pub fn launch_home(&self) -> Option<PathBuf> {
+        self.launch_home_in(&|name| std::env::var(name).ok())
+    }
+
+    /// [`Self::launch_home`] against `environment`.
+    pub fn launch_home_in(&self, environment: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
+        let home = self.home_directory(environment)?;
+        if !matches!(self.home, AccountHome::System) || self.provider != Provider::Claude {
+            return Some(home);
+        }
+        let variable = home_variable(self.provider)?;
+        let explicit = environment(variable).is_some_and(|value| !value.is_empty())
+            && !inherited_selections(environment).contains(&variable);
+        explicit.then_some(home)
+    }
+
+    /// Binds `recipe`'s provider home to this account, replacing whatever
+    /// binding it had: exports [`Self::launch_home`], or, where that is
+    /// `None` for the system Claude login, unsets the variable, so the CLI
+    /// resolves its default as the reader's own `claude` and this account's
+    /// probe do, whatever the process that spawns it inherited. A daemon
+    /// started with its own `CLAUDE_CONFIG_DIR` would otherwise hand it on.
+    ///
+    /// Leaves `recipe` unchanged when the home is not a path it can record.
+    pub fn bind_home(&self, recipe: &mut crate::model::LaunchRecipe) -> Result<(), String> {
+        self.bind_home_in(recipe, &|name| std::env::var(name).ok())
+    }
+
+    /// [`Self::bind_home`] against `environment`.
+    pub fn bind_home_in(
+        &self,
+        recipe: &mut crate::model::LaunchRecipe,
+        environment: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<(), String> {
+        let Some(variable) = home_variable(self.provider) else {
+            return Ok(());
+        };
+        let home = self
+            .launch_home_in(environment)
+            .map(|home| {
+                home.into_os_string()
+                    .into_string()
+                    .map_err(|_| "The account's home is not a path a launch can record".to_owned())
+            })
+            .transpose()?;
+        recipe.environment.remove(variable);
+        recipe.unset_environment.remove(variable);
+        match home {
+            Some(home) => {
+                recipe.environment.insert(variable.to_owned(), home);
+            }
+            None if self.provider == Provider::Claude
+                && matches!(self.home, AccountHome::System) =>
+            {
+                recipe.unset_environment.insert(variable.to_owned());
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
     /// The environment a probe of this account sets on the CLI.
     ///
     /// The system account sets nothing, so the CLI resolves its default
-    /// exactly as it would in the user's own shell.
+    /// exactly as it would in the user's own shell, and as the system
+    /// account's launches have it resolve (see [`Self::launch_home`]).
     pub fn probe_environment(&self) -> Option<(&'static str, PathBuf)> {
         match &self.home {
             AccountHome::System | AccountHome::SystemAt { .. } | AccountHome::Brokered { .. } => {
@@ -538,13 +728,114 @@ impl Account {
 
 /// Who an account is signed in as. Only what the CLI reports as display
 /// metadata: never a token, a key, or anything that authorizes a request.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Records - the shared cache, a device's probe reply - keep every field.
+/// The daemon's binary wire keeps the fields it has always carried, in their
+/// order, so that adding [`Self::disputed_by`] did not change its protocol:
+/// what the wire's readers need of a dispute, they are told as a conflict.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Identity {
     pub email: Option<String>,
     pub organization: Option<String>,
     /// The provider's plan identifier (`max`, `prolite`), not a display name;
     /// see [`plan_label`].
     pub plan: Option<String>,
+    /// The login another record of the same credentials names, when the
+    /// records disagree.
+    ///
+    /// Claude Code keeps who a login is in its global configuration file,
+    /// apart from its credentials, and `claude auth status` reports that
+    /// record without asking the service. One set of credentials can therefore be
+    /// described by two records naming two logins (see
+    /// [`Account::launch_home`]); nothing a probe can read without a token
+    /// says which is right, so the probe reports both rather than vouch for
+    /// either. Only the system account's default home can have a second
+    /// record.
+    pub disputed_by: Option<String>,
+}
+
+/// [`Identity`] as a record keeps it.
+#[derive(Deserialize)]
+#[serde(rename = "Identity")]
+struct IdentityRecord {
+    email: Option<String>,
+    organization: Option<String>,
+    plan: Option<String>,
+    #[serde(default)]
+    disputed_by: Option<String>,
+}
+
+/// [`IdentityRecord`], written.
+#[derive(Serialize)]
+#[serde(rename = "Identity")]
+struct IdentityRecordRef<'a> {
+    email: &'a Option<String>,
+    organization: &'a Option<String>,
+    plan: &'a Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disputed_by: Option<&'a String>,
+}
+
+/// [`Identity`] as the binary wire carries it.
+#[derive(Deserialize)]
+#[serde(rename = "Identity")]
+struct IdentityWire {
+    email: Option<String>,
+    organization: Option<String>,
+    plan: Option<String>,
+}
+
+/// [`IdentityWire`], written.
+#[derive(Serialize)]
+#[serde(rename = "Identity")]
+struct IdentityWireRef<'a> {
+    email: &'a Option<String>,
+    organization: &'a Option<String>,
+    plan: &'a Option<String>,
+}
+
+impl Serialize for Identity {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let (email, organization, plan) = (&self.email, &self.organization, &self.plan);
+        if serializer.is_human_readable() {
+            IdentityRecordRef {
+                email,
+                organization,
+                plan,
+                disputed_by: self.disputed_by.as_ref(),
+            }
+            .serialize(serializer)
+        } else {
+            IdentityWireRef {
+                email,
+                organization,
+                plan,
+            }
+            .serialize(serializer)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Identity {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if deserializer.is_human_readable() {
+            let record = IdentityRecord::deserialize(deserializer)?;
+            Ok(Self {
+                email: record.email,
+                organization: record.organization,
+                plan: record.plan,
+                disputed_by: record.disputed_by,
+            })
+        } else {
+            let wire = IdentityWire::deserialize(deserializer)?;
+            Ok(Self {
+                email: wire.email,
+                organization: wire.organization,
+                plan: wire.plan,
+                disputed_by: None,
+            })
+        }
+    }
 }
 
 impl Identity {
@@ -556,7 +847,17 @@ impl Identity {
     /// compared where both sides name one, because one person can belong to
     /// a personal and a team organization under the same address, and those
     /// are separate allowances.
+    ///
+    /// Nor can a login whose records disagree about who it is (see
+    /// [`Self::disputed_by`]): it claims a login, which
+    /// [`Self::claims_same_login`] compares, but is not known to be it.
     pub fn same_login(&self, other: &Identity) -> bool {
+        self.disputed_by.is_none() && other.disputed_by.is_none() && self.claims_same_login(other)
+    }
+
+    /// Whether `self` and `other` name the same login, as [`Self::same_login`]
+    /// compares them, whether or not either is disputed.
+    pub fn claims_same_login(&self, other: &Identity) -> bool {
         let (Some(mine), Some(theirs)) = (self.email.as_deref(), other.email.as_deref()) else {
             return false;
         };
@@ -753,6 +1054,10 @@ pub struct UsageSnapshot {
     pub detail: Option<String>,
 }
 
+/// How far apart, in seconds, two reports of one weekly allowance may place
+/// its reset: providers round it, and report it at different moments.
+pub const RESET_TOLERANCE: u64 = 3_600;
+
 impl UsageSnapshot {
     /// A snapshot that reports a state rather than figures.
     pub fn state(status: UsageStatus, detail: impl Into<String>, observed_at: u64) -> Self {
@@ -779,6 +1084,32 @@ impl UsageSnapshot {
             .iter()
             .find(|window| window.binding)
             .or_else(|| tightest(&self.windows))
+    }
+
+    /// Whether `self` and `other` are the figures of two separate
+    /// allowances, as of `now` in Unix seconds: a weekly window both report
+    /// under one key still runs in both and resets more than
+    /// [`RESET_TOLERANCE`] apart. One login seen through two homes draws on
+    /// one allowance, whose every window resets once.
+    pub fn separate_allowance(&self, other: &UsageSnapshot, now: i64) -> bool {
+        let running = |window: &UsageWindow| {
+            window.kind == WindowKind::Weekly
+                && window.resets_at.is_some_and(|resets_at| resets_at > now)
+        };
+        self.windows
+            .iter()
+            .filter(|window| running(window))
+            .any(|mine| {
+                other
+                    .windows
+                    .iter()
+                    .filter(|window| running(window) && window.key == mine.key)
+                    .any(|theirs| {
+                        mine.resets_at
+                            .zip(theirs.resets_at)
+                            .is_some_and(|(mine, theirs)| mine.abs_diff(theirs) > RESET_TOLERANCE)
+                    })
+            })
     }
 
     /// Recomputes the status from the windows after they changed, keeping a
@@ -1072,6 +1403,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn linked_home_expansion_keeps_destination_home_and_refuses_absolute_remainders() {
+        use std::ffi::OsStr;
+        let destination = OsStr::new("/selected-device/home");
+        // The defect selected /other/account instead of the chosen device HOME.
+        assert_eq!(
+            Path::new(destination).join("/other/account"),
+            Path::new("/other/account")
+        );
+        for value in [
+            "~//other/account",
+            "~///other/account",
+            "relative/account",
+            "",
+            "~/bad\0home",
+        ] {
+            assert!(
+                expand_linked_home(value, Some(destination)).is_err(),
+                "{value:?}"
+            );
+        }
+        assert_eq!(
+            expand_linked_home("~/account homes/work", Some(destination)).unwrap(),
+            Path::new("/selected-device/home/account homes/work")
+        );
+        assert_eq!(
+            expand_linked_home("/explicit/other home", None).unwrap(),
+            Path::new("/explicit/other home")
+        );
+        assert_eq!(
+            expand_linked_home("~/", Some(destination)).unwrap(),
+            Path::new("/selected-device/home")
+        );
+        assert!(expand_linked_home("~/account", None).is_err());
+        assert!(expand_linked_home("~/account", Some(OsStr::new("relative/home"))).is_err());
+        // Neither UI normalization nor CLI validation may rebind the operand.
+        assert_eq!(
+            expand_linked_home("  ~/account homes/work  ".trim(), Some(destination)).unwrap(),
+            Path::new("/selected-device/home/account homes/work")
+        );
+        assert!(validate_linked_home_operand("  ~/account homes/work  ").is_err());
+        assert!(validate_linked_home_operand("~/account homes/work").is_ok());
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let home = OsStr::from_bytes(b"/selected-device/\xff");
+            assert_eq!(
+                expand_linked_home("~/account", Some(home)).unwrap(),
+                Path::new(home).join("account")
+            );
+        }
+    }
+
+    #[test]
     fn managed_identity_requires_exact_provider_and_canonical_uuid_path() {
         let root = Path::new("/installation/accounts");
         let key = uuid::Uuid::parse_str("12345678-1234-4234-8234-123456789abc").unwrap();
@@ -1245,6 +1629,117 @@ mod tests {
         );
         assert_eq!(codex.home_directory(&environment(&[])), None);
         assert_eq!(claude.probe_environment(), None);
+        // The system Claude login exports no home of its own, so the CLI
+        // reads `~/.claude.json` as in the reader's shell: an explicit
+        // `CLAUDE_CONFIG_DIR=~/.claude` would have it read and write
+        // `~/.claude/.claude.json` instead, a second record of who it is.
+        let user = environment(&[("HOME", "/home/a")]);
+        assert_eq!(claude.launch_home_in(&user), None);
+        // A directory the reader started cagents with is theirs, and kept.
+        let chosen = environment(&[
+            ("HOME", "/home/a"),
+            ("CLAUDE_CONFIG_DIR", "/home/a/claude-config"),
+        ]);
+        assert_eq!(
+            claude.launch_home_in(&chosen),
+            Some(PathBuf::from("/home/a/claude-config"))
+        );
+        // In a cagents terminal, the default spelled out is no choice of
+        // another home, only the second record earlier cagents exported.
+        for spelled in ["/home/a/.claude", "/home/a/.claude/", "/home/a//.claude"] {
+            let pinned = move |name: &str| match name {
+                "HOME" => Some("/home/a".to_owned()),
+                "CLAUDE_CONFIG_DIR" => Some(spelled.to_owned()),
+                "CAGENTS_TERMINAL_ID" => Some("terminal".to_owned()),
+                _ => None,
+            };
+            assert_eq!(inherited_selections(&pinned), ["CLAUDE_CONFIG_DIR"]);
+            assert_eq!(claude.launch_home_in(&pinned), None);
+            assert_eq!(
+                claude.home_directory(&pinned),
+                Some(PathBuf::from("/home/a/.claude"))
+            );
+        }
+        // Outside one it is the reader's own setting, and Codex's default
+        // is never dropped.
+        let own = environment(&[
+            ("HOME", "/home/a"),
+            ("CLAUDE_CONFIG_DIR", "/home/a/.claude"),
+        ]);
+        assert!(inherited_selections(&own).is_empty());
+        assert_eq!(
+            claude.launch_home_in(&own),
+            Some(PathBuf::from("/home/a/.claude"))
+        );
+        let codex_default = environment(&[
+            ("HOME", "/home/a"),
+            ("CODEX_HOME", "/home/a/.claude"),
+            ("CAGENTS_TERMINAL_ID", "terminal"),
+        ]);
+        assert!(inherited_selections(&codex_default).is_empty());
+        // A conversation agent's process is a cagents launch as well; an
+        // empty marker is none.
+        for (marker, value, dropped) in [
+            ("CAGENTS_AGENT_AUTHORITY", "token", true),
+            ("CAGENTS_TERMINAL_ID", "", false),
+        ] {
+            let launched = move |name: &str| match name {
+                "HOME" => Some("/home/a".to_owned()),
+                "CLAUDE_CONFIG_DIR" => Some("/home/a/.claude".to_owned()),
+                name if name == marker => Some(value.to_owned()),
+                _ => None,
+            };
+            assert_eq!(!inherited_selections(&launched).is_empty(), dropped);
+        }
+        // A launch by this cagents of a reader who chose the default lists
+        // it, so a cagents process started there keeps it too.
+        let home_of =
+            |name: &str| (name == "CLAUDE_CONFIG_DIR").then(|| "/home/a/.claude".to_owned());
+        let declared = system_home_marker(home_of, None, home_of).unwrap();
+        assert_eq!(declared, "CLAUDE_CONFIG_DIR=/home/a/.claude");
+        let kept = |name: &str| match name {
+            SYSTEM_HOME_MARKER => Some(declared.clone()),
+            "HOME" => Some("/home/a".to_owned()),
+            "CLAUDE_CONFIG_DIR" => Some("/home/a/.claude".to_owned()),
+            "CAGENTS_TERMINAL_ID" => Some("terminal".to_owned()),
+            _ => None,
+        };
+        assert!(inherited_selections(&kept).is_empty());
+        assert_eq!(
+            claude.launch_home_in(&kept),
+            Some(PathBuf::from("/home/a/.claude"))
+        );
+        // A selected home is never listed as the system's, nor one the
+        // spawning process was not started with - a conversation earlier
+        // cagents saved with the default - and an unset one lists nothing.
+        assert_eq!(
+            system_home_marker(home_of, Some("CLAUDE_CONFIG_DIR=/home/a/.claude"), home_of),
+            None
+        );
+        assert_eq!(system_home_marker(home_of, None, |_| None), None);
+        assert_eq!(system_home_marker(|_| None, None, home_of), None);
+        // One inherited from an account cagents selected is not.
+        let selected = environment(&[
+            ("HOME", "/home/a"),
+            ("CLAUDE_CONFIG_DIR", "/home/a/.claude"),
+            (SELECTION_MARKER, "CLAUDE_CONFIG_DIR=/home/a/.claude"),
+        ]);
+        assert_eq!(claude.launch_home_in(&selected), None);
+        // Codex keeps its login in its home either way.
+        assert_eq!(
+            codex.launch_home_in(&user),
+            Some(PathBuf::from("/home/a/.codex"))
+        );
+        // Every other home is the account's own and always exported.
+        let linked = Account::linked(
+            Provider::Claude,
+            uuid::Uuid::from_u128(2),
+            "/home/a/.claude-work".into(),
+        );
+        assert_eq!(
+            linked.launch_home_in(&user),
+            Some(PathBuf::from("/home/a/.claude-work"))
+        );
         let key = uuid::Uuid::from_u128(1);
         let managed = Account::managed(Provider::Codex, key, "/data/accounts/codex/1".into());
         assert_eq!(
@@ -1265,6 +1760,75 @@ mod tests {
         );
         assert_ne!(managed.lock_name(), codex.lock_name());
         assert!(!managed.is_system() && codex.is_system());
+    }
+
+    /// A launch on the system Claude login unsets the home variable rather
+    /// than leaving it out, so a daemon started with its own
+    /// `CLAUDE_CONFIG_DIR` cannot hand it on and split the login's record
+    /// from the one its probe reads. Every other binding replaces the last.
+    #[test]
+    fn a_launch_binds_the_home_its_account_resolves_whatever_spawns_it() {
+        let environment = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).to_owned())
+            }
+        };
+        let user = environment(&[("HOME", "/home/a")]);
+        let chosen = environment(&[("HOME", "/home/a"), ("CLAUDE_CONFIG_DIR", "/chosen")]);
+        let recipe = || crate::model::LaunchRecipe {
+            program: "claude".into(),
+            arguments: Vec::new(),
+            working_directory: "/".into(),
+            environment: [("CLAUDE_CONFIG_DIR".into(), "/home/a/.claude".into())].into(),
+            unset_environment: ["ANTHROPIC_API_KEY".into()].into(),
+        };
+        let bound = |account: &Account, environment: &dyn Fn(&str) -> Option<String>| {
+            let mut recipe = recipe();
+            account.bind_home_in(&mut recipe, environment).unwrap();
+            (recipe.environment, recipe.unset_environment)
+        };
+        let system = Account::system(Provider::Claude);
+        assert_eq!(
+            bound(&system, &user),
+            (
+                Default::default(),
+                ["ANTHROPIC_API_KEY".into(), "CLAUDE_CONFIG_DIR".into()].into()
+            )
+        );
+        assert_eq!(
+            bound(&system, &chosen),
+            (
+                [("CLAUDE_CONFIG_DIR".into(), "/chosen".into())].into(),
+                ["ANTHROPIC_API_KEY".into()].into()
+            )
+        );
+        // Moving a system launch onto another account exports its home
+        // instead of leaving the default unset.
+        let linked = Account::linked(
+            Provider::Claude,
+            uuid::Uuid::from_u128(2),
+            "/home/a/.claude-work".into(),
+        );
+        let mut moved = recipe();
+        system.bind_home_in(&mut moved, &user).unwrap();
+        linked.bind_home_in(&mut moved, &user).unwrap();
+        assert_eq!(
+            (moved.environment, moved.unset_environment),
+            (
+                [("CLAUDE_CONFIG_DIR".into(), "/home/a/.claude-work".into())].into(),
+                ["ANTHROPIC_API_KEY".into()].into()
+            )
+        );
+        // Codex keeps its login in its home, which it always exports.
+        let (environment, unset) = bound(&Account::system(Provider::Codex), &user);
+        assert_eq!(
+            environment.get("CODEX_HOME").map(String::as_str),
+            Some("/home/a/.codex")
+        );
+        assert!(!unset.contains("CODEX_HOME"));
     }
 
     /// Regression for #520: a cagents process started from inside a
@@ -1359,6 +1923,7 @@ mod tests {
         const CHILD: &str = "CAGENTS_TEST_DETACH_SELECTIONS";
         if std::env::var_os(CHILD).is_none() {
             let key = uuid::Uuid::new_v4();
+            // Preserve the caller's scope; override only these fixture inputs.
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -1366,7 +1931,6 @@ mod tests {
                     "--nocapture",
                     "--test-threads=1",
                 ])
-                .env_clear()
                 .env(CHILD, "1")
                 .env("HOME", "/home/a")
                 .env("CODEX_HOME", format!("/data/accounts/codex/{key}"))
@@ -1402,6 +1966,7 @@ mod tests {
             email: email.map(str::to_owned),
             organization: organization.map(str::to_owned),
             plan: None,
+            disputed_by: None,
         };
         let work = identity(Some("Me@Example.com"), Some("Acme"));
         assert!(work.same_login(&identity(Some("me@example.com "), Some("Acme"))));
@@ -1409,6 +1974,102 @@ mod tests {
         assert!(!work.same_login(&identity(Some("me@example.com"), Some("Personal"))));
         assert!(!work.same_login(&identity(Some("you@example.com"), Some("Acme"))));
         assert!(!identity(None, None).same_login(&identity(None, None)));
+        // A login whose records disagree claims an address, but is not known
+        // to be it.
+        let disputed = Identity {
+            disputed_by: Some("other@example.com".into()),
+            ..identity(Some("me@example.com"), Some("Acme"))
+        };
+        assert!(disputed.claims_same_login(&work) && work.claims_same_login(&disputed));
+        assert!(!disputed.same_login(&work) && !work.same_login(&disputed));
+    }
+
+    /// A dispute is kept wherever an identity is recorded, and the daemon's
+    /// binary wire carries an identity exactly as before it existed.
+    #[test]
+    fn a_dispute_is_recorded_but_leaves_the_binary_wire_as_it_was() {
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct Before {
+            email: Option<String>,
+            organization: Option<String>,
+            plan: Option<String>,
+        }
+        let disputed = Identity {
+            email: Some("me@example.com".into()),
+            organization: None,
+            plan: Some("max".into()),
+            disputed_by: Some("other@example.com".into()),
+        };
+        let before = Before {
+            email: disputed.email.clone(),
+            organization: None,
+            plan: disputed.plan.clone(),
+        };
+        let wire = postcard::to_allocvec(&disputed).unwrap();
+        assert_eq!(wire, postcard::to_allocvec(&before).unwrap());
+        assert_eq!(
+            postcard::from_bytes::<Identity>(&wire).unwrap(),
+            Identity {
+                disputed_by: None,
+                ..disputed.clone()
+            }
+        );
+        let record = serde_json::to_value(&disputed).unwrap();
+        assert_eq!(record["disputed_by"], "other@example.com");
+        assert_eq!(
+            serde_json::from_value::<Identity>(record).unwrap(),
+            disputed
+        );
+        // A record written before disputes existed, or of an undisputed
+        // login, reads as undisputed, and is written as it was.
+        let undisputed = serde_json::to_value(&before).unwrap();
+        let identity = serde_json::from_value::<Identity>(undisputed.clone()).unwrap();
+        assert_eq!(identity.disputed_by, None);
+        assert_eq!(serde_json::to_value(&identity).unwrap(), undisputed);
+        assert_eq!(
+            serde_json::from_value::<Identity>(serde_json::json!({})).unwrap(),
+            Identity::default()
+        );
+    }
+
+    #[test]
+    fn one_allowance_resets_once_and_only_running_windows_are_compared() {
+        let window = |key: &str, kind: WindowKind, resets_at: Option<i64>| UsageWindow {
+            key: key.into(),
+            kind,
+            label: String::new(),
+            used: 0.5,
+            resets_at,
+            span_secs: None,
+            binding: false,
+        };
+        let snapshot = |windows: Vec<UsageWindow>| {
+            let mut snapshot = UsageSnapshot::state(UsageStatus::Ok, "", 0);
+            snapshot.windows = windows;
+            snapshot
+        };
+        let now = 1_000_000;
+        let weekly = |resets_at: i64| window("weekly_all", WindowKind::Weekly, Some(resets_at));
+        let week = snapshot(vec![
+            window("session", WindowKind::Session, Some(now + 60)),
+            weekly(now + 86_400),
+        ]);
+        // Reported a moment apart, or rounded: one allowance.
+        assert!(!week.separate_allowance(&snapshot(vec![weekly(now + 86_400 + 1_800)]), now));
+        assert!(week.separate_allowance(&snapshot(vec![weekly(now + 3 * 86_400)]), now));
+        // The session window says nothing about the weekly allowance.
+        let session = window("session", WindowKind::Session, Some(now + 9_000));
+        assert!(!week.separate_allowance(&snapshot(vec![session]), now));
+        // A window that has already reset is a figure from before it.
+        assert!(!week.separate_allowance(&snapshot(vec![weekly(now - 3 * 86_400)]), now));
+        // Another weekly window of the same login - one model's, listed
+        // first by one report - resets on its own schedule, and is compared
+        // only with itself.
+        let model = |resets_at: i64| window("weekly_opus", WindowKind::Weekly, Some(resets_at));
+        let listed = snapshot(vec![model(now + 5 * 86_400), weekly(now + 86_400)]);
+        assert!(!week.separate_allowance(&listed, now));
+        assert!(!listed.separate_allowance(&week, now));
+        assert!(listed.separate_allowance(&snapshot(vec![model(now + 86_400)]), now));
     }
 
     #[test]

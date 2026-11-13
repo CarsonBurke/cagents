@@ -15,6 +15,7 @@ use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt};
 use std::{collections::BTreeMap, path::PathBuf};
 
 mod images;
+pub(crate) mod rollout;
 
 /// The Codex configuration key for a thread's reasoning effort. A launch
 /// recipe names it as `--config model_reasoning_effort=<effort>`, the way the
@@ -172,7 +173,84 @@ pub fn align_resume_identity(arguments: &mut Vec<String>, id: &str) -> Result<()
     Ok(())
 }
 
+/// Where an account's shared Codex daemon listens, relative to its home.
+const SHARED_CONTROL_SOCKET: &str = "app-server-control/app-server-control.sock";
+
+/// The account home a Codex process launched from `spec` keeps its state in.
+fn account_home(spec: &ProcessSpec) -> Result<PathBuf, &'static str> {
+    let home = spec
+        .environment
+        .get("CODEX_HOME")
+        .cloned()
+        .map(PathBuf::from)
+        .or_else(|| {
+            spec.environment
+                .get("HOME")
+                .cloned()
+                .map(|home| PathBuf::from(home).join(".codex"))
+        })
+        .ok_or("Cannot locate the existing Codex daemon: CODEX_HOME/HOME are unavailable")?;
+    Ok(if home.is_absolute() {
+        home
+    } else {
+        spec.working_directory.join(home)
+    })
+}
+
+/// The account's shared daemon endpoint, when `launch` would join it.
+///
+/// A bare `unix://` remote, without a socket named after it, selects the
+/// shared daemon of the account home the launch runs under. Any named
+/// endpoint is a request for that exact server, so none is reported.
+pub(crate) fn shared_daemon_socket(launch: &Launch) -> Option<PathBuf> {
+    let mut shared = false;
+    let mut named = false;
+    let mut args = launch.recipe.arguments.iter();
+    while let Some(arg) = args.next() {
+        let remote = match arg.as_str() {
+            "--sock" => {
+                args.next();
+                named = true;
+                continue;
+            }
+            "--remote" => args.next()?,
+            _ if arg.starts_with("--remote=") => &arg["--remote=".len()..],
+            _ if arg == "resume"
+                || crate::agent::Provider::Codex.is_value_option(arg)
+                || crate::agent::Provider::Codex.is_cwd_option(arg) =>
+            {
+                args.next();
+                continue;
+            }
+            _ => continue,
+        };
+        shared = true;
+        named = remote != "unix://";
+    }
+    let spec = ProcessSpec::from(&launch.recipe);
+    (shared && !named)
+        .then(|| account_home(&spec).ok())
+        .flatten()
+        .map(|home| home.join(SHARED_CONTROL_SOCKET))
+}
+
+/// The lock file whose holder Codex makes the one writer of `thread` in the
+/// account home `launch` runs under. Codex holds it while the thread is loaded.
+pub(crate) fn thread_writer_lock(launch: &Launch, thread: &str) -> Option<PathBuf> {
+    let home = account_home(&ProcessSpec::from(&launch.recipe)).ok()?;
+    Some(
+        home.join("thread-writer-locks")
+            .join(format!("{thread}.lock")),
+    )
+}
+
 pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
+    create_for_start(launch).map_err(|error| error.to_string())
+}
+
+pub(crate) fn create_for_start(
+    launch: &Launch,
+) -> Result<(ProcessSpec, Box<dyn Adapter>), super::SetupError> {
     create_inner(launch, None, None)
 }
 
@@ -180,6 +258,13 @@ pub(crate) fn create_with_listener(
     launch: &Launch,
     socket: PathBuf,
 ) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
+    create_with_listener_for_start(launch, socket).map_err(|error| error.to_string())
+}
+
+pub(crate) fn create_with_listener_for_start(
+    launch: &Launch,
+    socket: PathBuf,
+) -> Result<(ProcessSpec, Box<dyn Adapter>), super::SetupError> {
     let bytes = socket.as_os_str().as_encoded_bytes();
     // Match the actual platform Unix address before any provider can start.
     // All sockaddr_un fields are integers, so its all-zero value is valid.
@@ -191,9 +276,9 @@ pub(crate) fn create_with_listener(
         || bytes.contains(&0)
         || bytes.len() >= capacity
     {
-        return Err(format!(
+        return Err(super::SetupError::Invalid(format!(
             "Owned Codex listener requires a nonempty, UTF-8, NUL-free Unix socket path shorter than {capacity} bytes; use a shorter UTF-8 temporary directory"
-        ));
+        )));
     }
     create_inner(launch, Some(socket), None)
 }
@@ -203,6 +288,12 @@ pub(crate) fn create_with_listener(
 pub(crate) fn create_restored(
     recovery: &crate::chat::native_holder::Recovery,
 ) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
+    create_restored_for_start(recovery).map_err(|error| error.to_string())
+}
+
+pub(crate) fn create_restored_for_start(
+    recovery: &crate::chat::native_holder::Recovery,
+) -> Result<(ProcessSpec, Box<dyn Adapter>), super::SetupError> {
     let confirmed = recovery
         .server_identity
         .clone()
@@ -217,7 +308,7 @@ fn create_inner(
     launch: &Launch,
     owned_socket: Option<PathBuf>,
     retained_identity: Option<ServerIdentity>,
-) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
+) -> Result<(ProcessSpec, Box<dyn Adapter>), super::SetupError> {
     if launch
         .session_id
         .as_ref()
@@ -241,11 +332,13 @@ fn create_inner(
             "--remote" => {
                 shared = true;
                 explicit_socket =
-                    remote_socket(args.next().ok_or("Missing Codex --remote address")?)?;
+                    remote_socket(args.next().ok_or("Missing Codex --remote address")?)
+                        .map_err(super::SetupError::Invalid)?;
             }
             _ if arg.starts_with("--remote=") => {
                 shared = true;
-                explicit_socket = remote_socket(&arg["--remote=".len()..])?;
+                explicit_socket =
+                    remote_socket(&arg["--remote=".len()..]).map_err(super::SetupError::Invalid)?;
             }
             "resume" => {
                 let id = args
@@ -256,9 +349,9 @@ fn create_inner(
                 }
             }
             "-m" | "--model" | "-s" | "--sandbox" | "-a" | "--ask-for-approval" => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| format!("Missing value for Codex {arg}"))?;
+                let value = args.next().ok_or_else(|| {
+                    super::SetupError::Invalid(format!("Missing value for Codex {arg}"))
+                })?;
                 // Attaching must not mutate a running thread's configuration.
                 if launch.session_id.is_none() {
                     let key = match arg.as_str() {
@@ -270,9 +363,9 @@ fn create_inner(
                 }
             }
             "--config" | "-c" if launch.session_id.is_none() => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| format!("Missing value for Codex {arg}"))?;
+                let value = args.next().ok_or_else(|| {
+                    super::SetupError::Invalid(format!("Missing value for Codex {arg}"))
+                })?;
                 // Only an override with a typed `thread/start` equivalent is
                 // translated; any other key would silently change meaning.
                 let effort = value
@@ -286,9 +379,9 @@ fn create_inner(
                     })
                     .filter(|effort| crate::agent_execution::valid_reasoning_effort(effort))
                     .ok_or_else(|| {
-                        format!(
+                        super::SetupError::Invalid(format!(
                             "Codex launch option {arg} {value:?} cannot safely be translated to native app-server mode"
-                        )
+                        ))
                     })?;
                 start["config"][REASONING_EFFORT_KEY] = json!(effort);
             }
@@ -297,8 +390,9 @@ fn create_inner(
             {
                 // The exact thread is already configured on the shared
                 // server. Keep its live permissions/model, not TUI defaults.
-                args.next()
-                    .ok_or_else(|| format!("Missing value for Codex {arg}"))?;
+                args.next().ok_or_else(|| {
+                    super::SetupError::Invalid(format!("Missing value for Codex {arg}"))
+                })?;
             }
             "--search" if launch.session_id.is_some() => {}
             "--dangerously-bypass-approvals-and-sandbox" | "--yolo" => {
@@ -312,37 +406,21 @@ fn create_inner(
                 }
             }
             _ => {
-                return Err(format!(
+                return Err(super::SetupError::Invalid(format!(
                     "Codex launch option {arg:?} cannot safely be translated to native app-server mode"
-                ));
+                )));
             }
         }
     }
-    let home = spec
-        .environment
-        .get("CODEX_HOME")
-        .cloned()
-        .map(PathBuf::from)
-        .or_else(|| {
-            spec.environment
-                .get("HOME")
-                .cloned()
-                .map(|home| PathBuf::from(home).join(".codex"))
-        })
-        .ok_or("Cannot locate the existing Codex daemon: CODEX_HOME/HOME are unavailable")?;
-    let home = if home.is_absolute() {
-        home
-    } else {
-        spec.working_directory.join(home)
-    };
+    let home = account_home(&spec)?;
     let expected_home = if let Some(identity) = &retained_identity {
         identity.canonical_home.clone()
     } else {
         std::fs::canonicalize(&home).map_err(|e| {
-            format!(
+            super::SetupError::Unavailable(format!(
                 "Cannot verify Codex account directory {}: {e}",
                 home.display()
-            )
+            ))
         })?
     };
     // Joining a thread that already exists means joining whichever process
@@ -362,19 +440,18 @@ fn create_inner(
         ];
         spec.transport = TransportSpec::OwnedUnixWebSocket { socket };
     } else if shared || launch.session_id.is_some() || explicit_socket.is_some() {
-        let socket = explicit_socket
-            .unwrap_or_else(|| home.join("app-server-control/app-server-control.sock"));
+        let socket = explicit_socket.unwrap_or_else(|| home.join(SHARED_CONTROL_SOCKET));
         let socket = if socket.is_absolute() {
             socket
         } else {
             spec.working_directory.join(socket)
         };
-        let metadata = std::fs::metadata(&socket).map_err(|error| format!("Cannot join existing Codex daemon at {}: {error}. Start the Codex shared daemon first; no private fallback is launched.", socket.display()))?;
+        let metadata = std::fs::metadata(&socket).map_err(|error| super::SetupError::Unavailable(format!("Cannot join existing Codex daemon at {}: {error}. Start the Codex shared daemon first; no private fallback is launched.", socket.display())))?;
         if !metadata.file_type().is_socket() {
-            return Err(format!(
+            return Err(super::SetupError::Unavailable(format!(
                 "Codex endpoint {} is not a Unix socket",
                 socket.display()
-            ));
+            )));
         }
         // Linux sun_path is 108 bytes. The symlink resolves to this exact
         // verified socket, not a discovered/newest daemon or a different
@@ -385,20 +462,26 @@ fn create_inner(
             std::fs::DirBuilder::new()
                 .mode(0o700)
                 .create(&directory)
-                .map_err(|e| format!("Creating private Codex socket alias: {e}"))?;
+                .map_err(|e| {
+                    super::SetupError::Unavailable(format!(
+                        "Creating private Codex socket alias: {e}"
+                    ))
+                })?;
             let link = directory.join("s");
             if let Err(error) = std::os::unix::fs::symlink(&socket, &link) {
                 let _ = std::fs::remove_dir(&directory);
-                return Err(format!("Creating exact Codex socket alias: {error}"));
+                return Err(super::SetupError::Unavailable(format!(
+                    "Creating exact Codex socket alias: {error}"
+                )));
             }
             let verified = std::fs::metadata(&link)
                 .is_ok_and(|m| m.dev() == metadata.dev() && m.ino() == metadata.ino());
             if !verified {
                 let _ = std::fs::remove_file(&link);
                 let _ = std::fs::remove_dir(&directory);
-                return Err(
+                return Err(super::SetupError::Unavailable(
                     "Codex socket changed during alias verification; reconnect explicitly".into(),
-                );
+                ));
             }
             alias = Some(directory);
             link
@@ -472,7 +555,10 @@ fn create_inner(
             children: BTreeMap::new(),
             branch_points: Vec::new(),
             is_child: false,
+            child_failure: None,
             child_buffer: BTreeMap::new(),
+            turn_diffs: BTreeMap::new(),
+            repo_root: None,
         }),
     ))
 }
@@ -629,7 +715,27 @@ struct Codex {
     children: BTreeMap<String, Box<Codex>>,
     branch_points: Vec<chat::BranchPoint>,
     is_child: bool,
+    /// The turn and message of the last final error a child reported, which
+    /// Codex repeats in that turn's failed completion: one failure, one item.
+    child_failure: Option<(String, String)>,
     child_buffer: BTreeMap<String, Vec<Value>>,
+    /// Each running turn's latest cumulative diff and the files its own
+    /// file-change items edited. The part of the diff no item shows, such as
+    /// a file a shell command rewrote, is shown as the turn's own change.
+    turn_diffs: BTreeMap<String, TurnDiff>,
+    /// The repository the session's directory is in, which a turn diff's
+    /// paths are relative to, once looked up.
+    repo_root: Option<Option<PathBuf>>,
+}
+
+#[derive(Default)]
+struct TurnDiff {
+    diff: String,
+    /// Each completed file-change item of the turn, by its ID, with the
+    /// lines it changed in each file, by absolute path, as `+line` or
+    /// `-line`. An item reported again replaces itself.
+    edited: BTreeMap<String, Vec<(String, Vec<String>)>>,
+    shown: bool,
 }
 
 #[derive(Clone, Default)]
@@ -659,6 +765,119 @@ impl Drop for Codex {
     }
 }
 impl Codex {
+    /// The diff state of `turn`, kept for the few turns still running.
+    fn turn_diff(&mut self, turn: &str) -> &mut TurnDiff {
+        if !self.turn_diffs.contains_key(turn) && self.turn_diffs.len() >= 16 {
+            self.turn_diffs.pop_first();
+        }
+        self.turn_diffs.entry(turn.into()).or_default()
+    }
+
+    /// Note the lines a completed file-change item changed, so the turn's
+    /// diff shows only what no item did, and show the diff again.
+    fn note_file_change(&mut self, turn: &str, value: &Value, step: &mut Step) {
+        if value["type"] != "fileChange" || value["status"] != "completed" {
+            return;
+        }
+        let Some(item) = value["id"].as_str() else {
+            return;
+        };
+        let mut noted = Vec::new();
+        for change in value["changes"].as_array().into_iter().flatten() {
+            let lines = changed_lines(
+                change["diff"].as_str().unwrap_or_default(),
+                change["kind"]["type"].as_str(),
+            );
+            for path in [&change["path"], &change["kind"]["move_path"]] {
+                if let Some(path) = path.as_str() {
+                    noted.push((
+                        self.cwd.join(path).to_string_lossy().into_owned(),
+                        lines.clone(),
+                    ));
+                }
+            }
+        }
+        self.turn_diff(turn).edited.insert(item.into(), noted);
+        self.show_turn_diff(turn, step);
+    }
+
+    /// Show the changes the turn's diff holds that none of its file-change
+    /// items made, such as a file a shell command rewrote, as one change row
+    /// for the turn, or retract that row once items account for all of them.
+    fn show_turn_diff(&mut self, turn: &str, step: &mut Step) {
+        if !self.turn_diffs.contains_key(turn) {
+            return;
+        }
+        let root = self
+            .repo_root
+            .get_or_insert_with(|| {
+                self.cwd
+                    .ancestors()
+                    .find(|dir| std::fs::symlink_metadata(dir.join(".git")).is_ok())
+                    .map(std::path::Path::to_path_buf)
+            })
+            .clone()
+            .unwrap_or_else(|| self.cwd.clone());
+        let state = self.turn_diffs.get_mut(turn).expect("checked above");
+        let absolute = |path: &str| root.join(path).to_string_lossy().into_owned();
+        let changes = turn_diff_changes(&state.diff)
+            .into_iter()
+            .map(|mut change| {
+                change.path = absolute(&change.path);
+                if let ChangeKind::Renamed { from } = &mut change.kind {
+                    *from = absolute(from);
+                }
+                change
+            })
+            .filter(|change| {
+                let mut paths = vec![change.path.as_str()];
+                if let ChangeKind::Renamed { from } = &change.kind {
+                    paths.push(from);
+                }
+                let edits = state
+                    .edited
+                    .values()
+                    .flatten()
+                    .filter(|(path, _)| paths.contains(&path.as_str()))
+                    .flat_map(|(_, lines)| lines)
+                    .collect::<Vec<_>>();
+                // Explained when the items edited the file and made every
+                // line of the turn's change to it, as often as it appears.
+                // No item changes a file's mode, so a mode change is never.
+                edits.is_empty() || change.diff.starts_with("old mode ") || {
+                    let mut made = BTreeMap::<&str, usize>::new();
+                    for line in edits {
+                        *made.entry(line).or_default() += 1;
+                    }
+                    !changed_lines(&change.diff, None).iter().all(|line| {
+                        made.get_mut(line.as_str())
+                            .filter(|count| **count > 0)
+                            .map(|count| *count -= 1)
+                            .is_some()
+                    })
+                }
+            })
+            .collect::<Vec<_>>();
+        let id = format!("{turn}/diff");
+        if changes.is_empty() {
+            if std::mem::take(&mut state.shown) {
+                step.events.push(Event::ItemsRemoved { ids: vec![id] });
+            }
+            return;
+        }
+        state.shown = true;
+        step.events.push(Event::Item(Item {
+            id,
+            role: Role::Assistant,
+            content: ItemContent::Changes {
+                changes,
+                status: ToolStatus::Succeeded,
+            },
+            started_at: None,
+            at: None,
+        }));
+    }
+
     fn discover_child(
         &mut self,
         id: &str,
@@ -732,11 +951,11 @@ impl Codex {
             waiting: None,
             detail: None,
             id: id.into(),
-            kind: metadata["agentNickname"]
-                .as_str()
-                .or_else(|| metadata["agentRole"].as_str())
-                .unwrap_or(if discovered { "Codex agent" } else { "" })
-                .into(),
+            // A role says what an agent can do, not who it is. Sparse or
+            // role-only metadata publishes no name, so the runtime keeps the
+            // nickname it already has; an unnamed child is left to the tab's
+            // own fallback.
+            kind: agent_nickname(metadata).unwrap_or_default().into(),
             description: metadata["message"]
                 .as_str()
                 .or_else(|| metadata["preview"].as_str())
@@ -751,7 +970,7 @@ impl Codex {
     // Child parsers share a server connection, so their local RPC IDs must
     // never escape into the parent's ID space. Keep the original correlation
     // inside the child and allocate every wire request through the parent.
-    fn child_step(&mut self, id: &str, content: Step, step: &mut Step) -> Result<(), String> {
+    fn child_step(&mut self, id: &str, mut content: Step, step: &mut Step) -> Result<(), String> {
         if content.events.iter().any(|event| {
             matches!(
                 event,
@@ -776,6 +995,15 @@ impl Codex {
                     .and_then(|child| child.subagent_status),
                 background: None,
             });
+        }
+        // Client/RPC errors belong to the child too, but do not prove a
+        // provider-marked failure. Genuine provider errors already carry
+        // their provenance from the notification decoder. Preserve other
+        // diagnostics as plain notices without changing lifecycle state.
+        for event in &mut content.events {
+            if let Event::Error { message, .. } = event {
+                *event = session_notice(std::mem::take(message));
+            }
         }
         step.events.extend(chat::child_events(id, content.events));
         for frame in content.writes {
@@ -914,7 +1142,7 @@ impl Codex {
                     && pair[1]["type"] == "localImage"
                     && let (Some(marker), Some(path)) =
                         (pair[0]["text"].as_str(), pair[1]["path"].as_str())
-                    && super::image_references::claims_reference(marker)
+                    && super::image_references::claims(marker, path)
                 {
                     if let Some(reference) = super::image_references::restore(marker, path) {
                         synthetic.insert(index);
@@ -1282,6 +1510,11 @@ impl Codex {
                         self.discover_child(id, &metadata, step)?;
                     }
                 }
+                if active {
+                    // A turn still running when this conversation attached:
+                    // its later diffs must not show again what these did.
+                    self.note_file_change(turn_id, value, step);
+                }
                 let mut windows = BTreeMap::new();
                 let parsed = parse_item_with_windows(value, !active, turn_id, |id, window| {
                     windows.insert(id.to_owned(), window);
@@ -1352,9 +1585,10 @@ impl Codex {
             if !path.is_file() {
                 return Err(format!("Attachment is not a file: {}", path.display()));
             }
+            // Codex wraps the pixels in its own tag naming the path.
             if let Some(reference) = &attachment.reference {
                 input.push(
-                    json!({"type":"text","text":super::image_references::marker(reference)?}),
+                    json!({"type":"text","text":super::image_references::caption(reference)?}),
                 );
             }
             input.push(json!({"type":"localImage","path":path.to_str().ok_or("Attachment path is not UTF-8")?}));
@@ -2905,6 +3139,7 @@ impl Adapter for Codex {
                     self.turn = self.busy.then(|| turn_id.to_owned());
                 }
                 for value in array(turn, "items")? {
+                    self.note_file_change(turn_id, value, &mut step);
                     let mut windows = BTreeMap::new();
                     let parsed = parse_item_with_windows(
                         value,
@@ -2921,6 +3156,10 @@ impl Adapter for Codex {
                         step.events.push(Event::Item(item));
                     }
                 }
+                // Its diff can no longer change, and its row says all of it.
+                if method == "turn/completed" {
+                    self.turn_diffs.remove(turn_id);
+                }
                 // Non-blocking questions can outlive their originating turn.
                 // Only serverRequest/resolved or thread closure invalidates them.
                 if current {
@@ -2935,13 +3174,24 @@ impl Adapter for Codex {
                     });
                 }
                 if turn["error"].is_object() {
-                    step.events.push(Event::Error {
-                        message: turn["error"]["message"]
-                            .as_str()
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| turn["error"].to_string()),
-                        fatal: false,
-                    });
+                    let message = turn["error"]["message"]
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| turn["error"].to_string());
+                    // Codex repeats a child's final error notification in the
+                    // turn's failed completion; one failure keeps one item.
+                    let reported = self
+                        .child_failure
+                        .as_ref()
+                        .is_some_and(|(turn, text)| turn == turn_id && *text == message);
+                    if self.is_child && !reported {
+                        step.events.push(provider_error_notice(message));
+                    } else if !self.is_child {
+                        step.events.push(Event::Error {
+                            message,
+                            fatal: false,
+                        });
+                    }
                 }
                 if method == "turn/completed" {
                     self.finish_execution(turn, &mut step, false)?;
@@ -2993,6 +3243,9 @@ impl Adapter for Codex {
                         windows.insert(id.to_owned(), window);
                     },
                 )?;
+                if done {
+                    self.note_file_change(string(params, "turnId")?, &params["item"], &mut step);
+                }
                 for item in parsed {
                     if done {
                         self.active_items.remove(&item.id);
@@ -3149,6 +3402,7 @@ impl Adapter for Codex {
                 self.subagent_waiting = false;
                 self.subagent_detail = "Agent disconnected".into();
                 step.events.push(Event::Ready(false));
+                let interrupted = self.busy;
                 self.busy = false;
                 self.subagent_status = Some(
                     self.subagent_status
@@ -3157,10 +3411,24 @@ impl Adapter for Codex {
                 );
                 self.lifecycle_revision = self.lifecycle_revision.saturating_add(1);
                 self.invalidate(&mut step);
-                step.events.push(Event::Error {
-                    message: format!("Codex {method}; reconnect explicitly"),
-                    fatal: true,
-                });
+                if !self.is_child {
+                    step.events.push(Event::Error {
+                        message: format!("Codex {method}; reconnect explicitly"),
+                        fatal: true,
+                    });
+                } else if interrupted {
+                    // Codex also closes a child's thread once its work is
+                    // done; only a close that cut work short is news, and the
+                    // child has no reconnect of its own to point at.
+                    step.events.push(session_notice(
+                        if method == "thread/deleted" {
+                            "Codex removed this agent before it finished"
+                        } else {
+                            "Codex closed this agent before it finished"
+                        }
+                        .into(),
+                    ));
+                }
             }
             "error" => {
                 let message = params["error"]["message"]
@@ -3169,12 +3437,16 @@ impl Adapter for Codex {
                     .unwrap_or_else(|| params["error"].to_string());
                 // A retry describes work still in progress. Putting it in
                 // Snapshot.error leaves a recovered turn marked as failed.
-                if params["willRetry"] == true {
-                    let mut notice = session_notice(message);
-                    if let Event::Item(item) = &mut notice {
-                        chat::failure::mark_provider_error(crate::agent::Provider::Codex, item);
+                // Child diagnostics must likewise stay in their own timeline
+                // before generic child routing discards parent error state.
+                if params["willRetry"] == true || self.is_child {
+                    if self.is_child
+                        && params["willRetry"] != true
+                        && let Some(turn) = params["turnId"].as_str()
+                    {
+                        self.child_failure = Some((turn.to_owned(), message.clone()));
                     }
-                    step.events.push(notice);
+                    step.events.push(provider_error_notice(message));
                 } else {
                     step.events.push(Event::Error {
                         message,
@@ -3200,18 +3472,13 @@ impl Adapter for Codex {
                 }
                 step.events.push(session_notice(message));
             }
-            "turn/diff/updated" => step.events.push(Event::Item(Item {
-                id: format!("{}/diff", string(params, "turnId")?),
-                role: Role::Assistant,
-                content: ItemContent::Tool {
-                    name: "Turn diff".into(),
-                    input: String::new(),
-                    output: string(params, "diff")?.into(),
-                    status: ToolStatus::Succeeded,
-                },
-                started_at: None,
-                at: None,
-            })),
+            // The turn's cumulative diff restates the file changes its own
+            // items show; only the files none of them edited are its own.
+            "turn/diff/updated" => {
+                let turn = string(params, "turnId")?;
+                self.turn_diff(turn).diff = string(params, "diff")?.into();
+                self.show_turn_diff(turn, &mut step);
+            }
             "turn/plan/updated" => step.events.push(Event::Plan {
                 steps: plan_steps(&params["plan"]),
             }),
@@ -3270,6 +3537,17 @@ fn session_notice(text: String) -> Event {
         at: None,
     })
 }
+
+/// Only the provider's explicit error notification/turn field grants this
+/// provenance. Client-generated disconnect or RPC diagnostics remain notices.
+fn provider_error_notice(text: String) -> Event {
+    let mut notice = session_notice(text);
+    if let Event::Item(item) = &mut notice {
+        chat::failure::mark_provider_error(crate::agent::Provider::Codex, item);
+    }
+    notice
+}
+
 impl Codex {
     fn observe_thread_status(&mut self, status: &Value) {
         if matches!(status["type"].as_str(), Some("active" | "systemError")) {
@@ -3324,6 +3602,14 @@ impl Codex {
         Ok(())
     }
 }
+/// The nickname Codex reported for a child, if it reported a real one.
+fn agent_nickname(metadata: &Value) -> Option<&str> {
+    metadata["agentNickname"]
+        .as_str()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+}
+
 fn agent_status(status: &Value) -> Option<ToolStatus> {
     match status.as_str().or_else(|| status["type"].as_str()) {
         Some("completed" | "idle" | "shutdown") => Some(ToolStatus::Succeeded),
@@ -3559,6 +3845,145 @@ fn file_changes(value: &Value) -> Result<Vec<FileChange>, String> {
     }
     Ok(changes)
 }
+/// The lines a file change added and removed, as `+line` and `-line`. A
+/// patch is read from its hunks; a change Codex gives as the file's content,
+/// as it may for a file it added or deleted, is every line of it.
+fn changed_lines(diff: &str, kind: Option<&str>) -> Vec<String> {
+    let hunks = if diff.starts_with("@@") {
+        Some(0)
+    } else {
+        diff.find("\n@@").map(|at| at + 1)
+    };
+    match hunks {
+        Some(start) => diff[start..]
+            .lines()
+            .filter(|line| line.starts_with('+') || line.starts_with('-'))
+            .map(str::to_owned)
+            .collect(),
+        _ => {
+            let sign = match kind {
+                Some("add") => '+',
+                Some("delete") => '-',
+                _ => return Vec::new(),
+            };
+            diff.lines().map(|line| format!("{sign}{line}")).collect()
+        }
+    }
+}
+
+/// The files a turn's cumulative diff changed, one per `diff --git` section,
+/// each with its own hunks.
+fn turn_diff_changes(diff: &str) -> Vec<FileChange> {
+    let mut sections = Vec::new();
+    let mut start = None;
+    let mut offset = 0;
+    for line in diff.split_inclusive('\n') {
+        if line.starts_with("diff --git ") {
+            if let Some(start) = start {
+                sections.push(&diff[start..offset]);
+            }
+            start = Some(offset);
+        }
+        offset += line.len();
+    }
+    if let Some(start) = start {
+        sections.push(&diff[start..]);
+    }
+    sections
+        .into_iter()
+        .filter_map(|section| {
+            let header_end = section.find("\n@@").map_or(section.len(), |at| at + 1);
+            let header = &section[..header_end];
+            let field = |prefix: &str| {
+                header
+                    .lines()
+                    .find_map(|line| line.strip_prefix(prefix))
+                    .map(str::trim_end)
+            };
+            let side = |prefix: &str, marker: &str| {
+                field(prefix)
+                    .filter(|path| *path != "/dev/null")
+                    .map(|path| path.strip_prefix(marker).unwrap_or(path).to_owned())
+            };
+            let old = side("--- ", "a/");
+            let new = side("+++ ", "b/");
+            // A change with no hunks, such as an empty or binary file or a
+            // mode change, names its path only on its first line.
+            let named = || {
+                let first = header.lines().next()?.strip_prefix("diff --git a/")?;
+                first.split_once(" b/").map(|(_, path)| path.to_owned())
+            };
+            let (path, kind) =
+                if let (Some(from), Some(to)) = (field("rename from "), field("rename to ")) {
+                    (to.to_owned(), ChangeKind::Renamed { from: from.into() })
+                } else if header.contains("\nnew file mode") {
+                    (new.or(old).or_else(named)?, ChangeKind::Added)
+                } else if header.contains("\ndeleted file mode") {
+                    (old.or(new).or_else(named)?, ChangeKind::Deleted)
+                } else {
+                    (new.or(old).or_else(named)?, ChangeKind::Updated)
+                };
+            let body = &section[header_end..];
+            Some(FileChange {
+                path,
+                kind,
+                // A change with no hunks keeps what its header says of it,
+                // and one with hunks any change of mode it also made.
+                diff: if body.is_empty() {
+                    header
+                        .lines()
+                        .skip(1)
+                        .filter(|line| !line.starts_with("index "))
+                        .map(|line| format!("{line}\n"))
+                        .collect()
+                } else {
+                    header
+                        .lines()
+                        .filter(|line| {
+                            line.starts_with("old mode ") || line.starts_with("new mode ")
+                        })
+                        .map(|line| format!("{line}\n"))
+                        .chain(std::iter::once(body.to_owned()))
+                        .collect()
+                },
+            })
+        })
+        .collect()
+}
+
+/// The agents a collaboration call addressed, each with its state when Codex
+/// reported one. A call in progress, or one its turn cut short, names its
+/// receivers before it has their states, and the row still says whom it was
+/// for.
+fn agent_states(value: &Value) -> Value {
+    let mut states = value["agentsStates"]
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    for receiver in value["receiverThreadIds"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .take(32)
+    {
+        states
+            .entry(receiver)
+            .or_insert_with(|| Value::Object(Default::default()));
+    }
+    Value::Object(states)
+}
+
+/// A tool call's arguments as its detail shows them: nothing when it was
+/// called with none.
+fn arguments(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::Object(object) if object.is_empty() => String::new(),
+        Value::String(text) => text.clone(),
+        value => value.to_string(),
+    }
+}
 fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String> {
     parse_item_with_windows(value, done, turn, |_, _| {})
 }
@@ -3595,12 +4020,14 @@ fn parse_item_with_windows(
         _ if value["success"] == false || value["error"].is_object() => ToolStatus::Failed,
         Some("failed") => ToolStatus::Failed,
         Some("declined") => ToolStatus::Denied,
+        // A collaboration call cut short with its turn.
+        Some("interrupted") => ToolStatus::Stopped,
         Some("inProgress") => ToolStatus::Running,
         Some("completed") => ToolStatus::Succeeded,
         _ if done => ToolStatus::Succeeded,
         _ => ToolStatus::Running,
     };
-    let tool = |name: String, input: String, output: String| {
+    let tool_call = |name: String, input: String, output: String| {
         vec![Item {
             id: id.into(),
             role: Role::Assistant,
@@ -3639,7 +4066,7 @@ fn parse_item_with_windows(
                         pair[0]["text"].as_str(),
                         pair[1]["path"].as_str().or_else(|| pair[1]["url"].as_str()),
                     )
-                    && super::image_references::claims_reference(marker)
+                    && super::image_references::claims(marker, source)
                 {
                     if let Some(reference) = super::image_references::restore(marker, source) {
                         synthetic.insert(index);
@@ -3647,7 +4074,7 @@ fn parse_item_with_windows(
                     } else if !source.starts_with("data:image/") {
                         // Keep the literal marker visible, but do not read a
                         // possibly foreign device's coincident absolute path.
-                        unverified.insert(index + 1, format!("{} is unavailable on this device: its owned image receipt could not be verified. Use the originating device or attach the image again.", super::image_references::candidate(marker).map(|r| r.label()).unwrap_or_else(|| "Image reference".into())));
+                        unverified.insert(index + 1, format!("{} is unavailable on this device: its owned image receipt could not be verified. Use the originating device or attach the image again.", super::image_references::claimed_label(marker, source)));
                     }
                 }
             }
@@ -3752,30 +4179,51 @@ fn parse_item_with_windows(
             started_at: None,
             at: None,
         }],
-        "mcpToolCall" => images::tool_result(
-            id,
-            status,
-            format!("{} / {}", string(value, "server")?, string(value, "tool")?),
-            value["arguments"].to_string(),
-            if !value["error"].is_null() {
-                &value["error"]
-            } else if !value["result"].is_null() {
-                &value["result"]
-            } else {
-                &Value::Null
-            },
-        ),
+        // Named by the app the call went through when Codex knows it, as the
+        // person connected it, and otherwise by its server; the reader's
+        // `server / tool` form is the one the transcript titles.
+        "mcpToolCall" => {
+            let app = &value["appContext"];
+            let server = app["appName"]
+                .as_str()
+                .filter(|name| !name.trim().is_empty())
+                .map_or_else(|| string(value, "server"), Ok)?;
+            let tool = app["actionName"]
+                .as_str()
+                .filter(|name| !name.trim().is_empty())
+                .map_or_else(|| string(value, "tool"), Ok)?;
+            match value["error"]["message"].as_str() {
+                // What went wrong, as the server said it, rather than the
+                // error object it was carried in.
+                Some(message) => tool_call(
+                    format!("{server} / {tool}"),
+                    arguments(&value["arguments"]),
+                    message.into(),
+                ),
+                None => images::tool_result(
+                    id,
+                    status,
+                    format!("{server} / {tool}"),
+                    arguments(&value["arguments"]),
+                    if !value["error"].is_null() {
+                        &value["error"]
+                    } else {
+                        &value["result"]
+                    },
+                ),
+            }
+        }
         "dynamicToolCall" => images::tool_result(
             id,
             status,
             string(value, "tool")?.into(),
-            value["arguments"].to_string(),
+            arguments(&value["arguments"]),
             &value["contentItems"],
         ),
-        "collabAgentToolCall" => tool(
+        "collabAgentToolCall" => tool_call(
             string(value, "tool")?.into(),
             value["prompt"].as_str().unwrap_or("").into(),
-            value["agentsStates"].to_string(),
+            agent_states(value).to_string(),
         ),
         "webSearch" => vec![Item {
             id: id.into(),
@@ -3802,10 +4250,10 @@ fn parse_item_with_windows(
             started_at: None,
             at: None,
         }],
-        "functionCallOutput" => tool(
+        "functionCallOutput" => tool_call(
             string(value, "name")?.into(),
             String::new(),
-            value["output"].to_string(),
+            images::readable(&value["output"]),
         ),
         "imageView" => vec![Item {
             id: id.into(),
@@ -3813,7 +4261,13 @@ fn parse_item_with_windows(
             content: ItemContent::Image {
                 reference: None,
                 path: string(value, "path")?.into(),
-                description: "Codex image".into(),
+                // The file it looked at, which is what a reader would call it.
+                description: std::path::Path::new(string(value, "path")?)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or("Image")
+                    .into(),
             },
             started_at: None,
             at: None,
@@ -3852,10 +4306,18 @@ fn parse_item_with_windows(
                         },
                     }]
                 }
-                _ => tool(
+                _ => tool_call(
                     "Image generation".into(),
                     value["revisedPrompt"].as_str().unwrap_or("").into(),
-                    "No displayable image was returned.".into(),
+                    match value["failure"]["type"].as_str() {
+                        Some("usageLimitExceeded") => {
+                            "Image generation has reached its usage limit.".into()
+                        }
+                        Some(other) => format!("Image generation failed ({other})."),
+                        // Still generating: there is nothing to say yet.
+                        None if status == ToolStatus::Running => String::new(),
+                        None => "No displayable image was returned.".into(),
+                    },
                 ),
             }
         }
@@ -3865,23 +4327,63 @@ fn parse_item_with_windows(
             false,
             Role::System,
         )],
-        "contextCompaction" => vec![text(
-            id.into(),
-            "Context compacted".into(),
-            false,
-            Role::System,
-        )],
-        "hookPrompt" => vec![text(
-            id.into(),
-            value["fragments"].to_string(),
-            false,
-            Role::System,
-        )],
-        // Codex's own auxiliary items, `sleep` and `subAgentActivity` among
-        // them, and any item type a later Codex introduces, still belong to the
+        // Codex starts the item when it begins compacting and completes it
+        // when the context has been replaced. The name stays the same either
+        // way and the status says how far it got, so an item a turn left
+        // unfinished, or one replayed from a turn still running, never reads
+        // as still compacting once it is not.
+        "contextCompaction" => tool_call("Compact context".into(), String::new(), String::new()),
+        // Context the hooks added for the model, in their own words, shown
+        // as a notice of where it came from rather than as the agent's prose;
+        // the run IDs the fragments are keyed by are Codex's bookkeeping.
+        // Hooks that added nothing leave no row.
+        "hookPrompt" => {
+            let added = value["fragments"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|fragment| fragment["text"].as_str())
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            if added.is_empty() {
+                Vec::new()
+            } else {
+                vec![Item {
+                    id: id.into(),
+                    role: Role::System,
+                    content: ItemContent::Delivery {
+                        kind: chat::DeliveryKind::Notice,
+                        from: String::new(),
+                        sender: String::new(),
+                        summary: "Context from a hook".into(),
+                        body: added,
+                    },
+                    started_at: None,
+                    at: None,
+                }]
+            }
+        }
+        // The agent pausing, named as a pause. As with compaction, the status
+        // and not the wording says whether the pause is over.
+        "sleep" => {
+            let seconds = value["durationMs"].as_u64().unwrap_or(0).div_ceil(1000);
+            let duration = match seconds {
+                0..60 => format!("{seconds}s"),
+                _ => format!("{}m {}s", seconds / 60, seconds % 60),
+            };
+            tool_call(format!("Wait {duration}"), String::new(), String::new())
+        }
+        // A subagent's lifecycle is reported on the subagent itself, as its
+        // collaboration calls and thread status discover it; a row per
+        // transition would repeat that for every agent a turn coordinates.
+        "subAgentActivity" => Vec::new(),
+        // Any other auxiliary item, and any item type a later Codex
+        // introduces, still belongs to the
         // turn. The tool disclosure exists to keep an unrecognized item
         // renderable rather than ending the session over it.
-        other => tool(other.into(), String::new(), value.to_string()),
+        other => tool_call(other.into(), String::new(), value.to_string()),
     };
     for item in &mut items {
         let mut window = OutputWindow::default();
@@ -4278,7 +4780,8 @@ mod tests {
                 } else if failure == 1 {
                     candidate.id = uuid::Uuid::new_v4();
                 }
-                let mut marker = super::super::image_references::marker(&candidate).unwrap();
+                let mut marker =
+                    super::super::image_references::legacy::marker(&candidate).unwrap();
                 if failure == 2 {
                     marker = marker.replace("{\"id\"", "{\"future\":true,\"id\"");
                 }
@@ -4364,7 +4867,7 @@ mod tests {
             assert_eq!(input[0], json!({"type":"text","text":text}));
             assert_eq!(
                 input[1]["text"],
-                super::super::image_references::marker(&reference).unwrap()
+                super::super::image_references::caption(&reference).unwrap()
             );
             assert_eq!(
                 input[2],
@@ -4416,7 +4919,7 @@ mod tests {
             let mut forged = reference.clone();
             forged.id = uuid::Uuid::new_v4();
             let forged = json!({"type":"userMessage","id":"forged","content":[
-                {"type":"text","text":super::super::image_references::marker(&forged).unwrap()},
+                {"type":"text","text":super::super::image_references::legacy::marker(&forged).unwrap()},
                 {"type":"localImage","path":attachment.path.to_str().unwrap()}
             ]});
             let items = parse_item(&forged, true, "turn").unwrap();
@@ -4428,6 +4931,73 @@ mod tests {
                     ..
                 }
             ));
+            let parsed = |caption: String, path: &std::path::Path| {
+                parse_item(
+                    &json!({"type":"userMessage","id":"captioned","content":[
+                        {"type":"text","text":caption},
+                        {"type":"localImage","path":path.to_str().unwrap()}
+                    ]}),
+                    true,
+                    "turn",
+                )
+                .unwrap()
+            };
+            // A transcript written with the old JSON marker still restores.
+            let legacy = parsed(
+                super::super::image_references::legacy::marker(&reference).unwrap(),
+                &attachment.path,
+            );
+            assert!(
+                matches!(&legacy[..], [Item { content: ItemContent::Image { reference: Some(restored), .. }, .. }] if restored == &reference)
+            );
+            // The caption's number must be the stored file's own receipt.
+            let renumbered = parsed(
+                format!("[Image {}]", reference.number + 1),
+                &attachment.path,
+            );
+            assert!(
+                matches!(&renumbered[1].content, ItemContent::Image { reference: None, path, .. } if path.is_empty())
+            );
+            let mut queued = |caption: String, path: &std::path::Path| {
+                let mut step = Step::default();
+                adapter
+                    .queue_page(
+                        &json!({"data":[{"id":"queued-caption","input":[
+                            {"type":"text","text":caption},
+                            {"type":"localImage","path":path.to_str().unwrap()}
+                        ]}],"nextCursor":null}),
+                        &mut step,
+                    )
+                    .unwrap();
+                step.events
+                    .into_iter()
+                    .find_map(|event| match event {
+                        Event::QueueChanged(mut messages) => messages.pop(),
+                        _ => None,
+                    })
+                    .unwrap()
+            };
+            let unverified = queued(
+                format!("[Image {}]", reference.number + 1),
+                &attachment.path,
+            );
+            assert!(
+                !unverified.editable,
+                "an unverified caption is never replayed by path"
+            );
+            assert!(unverified.attachments[0].path.as_os_str().is_empty());
+            // Text that only says [Image N] beside an ordinary file is the
+            // user's own words, and the file stays theirs to edit and resend.
+            let ordinary = display.path().join("screenshot.png");
+            std::fs::copy(&attachment.path, &ordinary).unwrap();
+            let typed = queued(reference.token(), &ordinary);
+            assert!(typed.editable);
+            assert_eq!(typed.text, reference.token());
+            assert_eq!(typed.attachments, [Attachment::file(&ordinary)]);
+            let typed = parsed(reference.token(), &ordinary);
+            assert!(
+                matches!(&typed[..], [Item { content: ItemContent::Text { .. }, .. }, Item { content: ItemContent::Image { reference: None, path, .. }, .. }] if path == ordinary.to_str().unwrap())
+            );
             let submitted = adapter
                 .command(Command::Prompt {
                     text,
@@ -4473,12 +5043,12 @@ mod tests {
             assert_eq!(input[0]["text"], text);
             assert_eq!(
                 input[1]["text"],
-                super::super::image_references::marker(second_ref).unwrap()
+                super::super::image_references::caption(second_ref).unwrap()
             );
             assert_eq!(input[2]["path"], second.path.to_str().unwrap());
             assert_eq!(
                 input[3]["text"],
-                super::super::image_references::marker(first_ref).unwrap()
+                super::super::image_references::caption(first_ref).unwrap()
             );
             assert_eq!(input[4]["path"], first.path.to_str().unwrap());
             assert!(adapter.input(text, vec![first.clone(), first]).is_err());
@@ -4822,6 +5392,152 @@ mod tests {
                 .iter()
                 .any(|frame| frame["method"] == "thread/prediction/request")
         );
+    }
+
+    #[test]
+    fn tool_rows_fixture_settles_parent_and_child_without_leaving_update_work() {
+        // Use the actual offline peer's frames and RPC responses, including
+        // child hydration. No provider executable, account or socket is used.
+        let export = std::process::Command::new("/usr/bin/python3")
+            .args([
+                "-c",
+                r#"
+import json, runpy, sys
+peer = runpy.run_path(sys.argv[1])
+scenario = peer['Scenario']()
+scenario.thread, scenario.child = 'thread-exact', 'child-exact'
+frames = scenario.request({'id': 1, 'method': 'turn/start', 'params': {
+    'threadId': scenario.thread}}, '/private/codex')[1:]
+resume = scenario.request({'id': 2, 'method': 'thread/resume', 'params': {
+    'threadId': scenario.child}}, '/private/codex')
+turn = frames[0]['params']['turn']['id']
+prediction = scenario.request({'id': 3, 'method': 'thread/prediction/request', 'params': {
+    'threadId': scenario.thread, 'sourceTurnId': turn}}, '/private/codex')
+print(json.dumps({'frames': frames, 'replies': {
+    'thread/resume': resume, 'thread/prediction/request': prediction}}))
+"#,
+            ])
+            .arg(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/codex-tool-rows.py"),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            export.status.success(),
+            "fixture export failed: {}",
+            String::from_utf8_lossy(&export.stderr)
+        );
+        let fixture: Value = serde_json::from_slice(&export.stdout).unwrap();
+        let frames = fixture["frames"].as_array().unwrap();
+        let pause = frames
+            .iter()
+            .position(|frame| frame.get("_sleep").is_some())
+            .unwrap();
+
+        struct Fixture {
+            parser: Codex,
+            replies: Value,
+        }
+        impl Adapter for Fixture {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Err("fixture accepts provider frames only".into())
+            }
+            fn receive(&mut self, frame: Value) -> Result<Step, String> {
+                let mut pending = std::collections::VecDeque::from([frame]);
+                let mut result = Step::default();
+                let mut consumed = 0;
+                while let Some(frame) = pending.pop_front() {
+                    consumed += 1;
+                    assert!(consumed < 32, "fixture RPC responses did not settle");
+                    let step = self.parser.receive(frame)?;
+                    result.events.extend(step.events);
+                    for request in step.writes {
+                        let method = request["method"].as_str().unwrap();
+                        let replies = self.replies[method]
+                            .as_array()
+                            .unwrap_or_else(|| panic!("unexpected fixture RPC: {request}"));
+                        for mut reply in replies.iter().cloned() {
+                            if reply.get("id").is_some() {
+                                reply["id"] = request["id"].clone();
+                            }
+                            pending.push_back(reply);
+                        }
+                    }
+                }
+                Ok(result)
+            }
+        }
+        let snapshot = |frames: Vec<Value>, replies: Value| {
+            crate::chat::runtime::notification_frames_with_snapshot_for_test(
+                Box::new(Fixture {
+                    parser: adapter(),
+                    replies,
+                }),
+                frames,
+                false,
+            )
+            .1
+        };
+        // There is deliberately no outcome before the pause. Inspect the
+        // parser directly rather than asking a notification-outcome harness
+        // to synthesize a completion for still-running work.
+        let mut active = Fixture {
+            parser: adapter(),
+            replies: fixture["replies"].clone(),
+        };
+        for frame in &frames[..pause] {
+            active.receive(frame.clone()).unwrap();
+        }
+        assert!(active.parser.busy);
+        assert!(
+            active.parser.children["child-exact"].busy,
+            "the pause must represent actual delegated work"
+        );
+        assert_eq!(
+            active.parser.children["child-exact"].subagent_status,
+            Some(ToolStatus::Running)
+        );
+        let completed: Vec<_> = frames
+            .iter()
+            .filter(|frame| frame.get("_sleep").is_none())
+            .cloned()
+            .collect();
+        let settled = snapshot(completed.clone(), fixture["replies"].clone());
+        assert!(!settled.busy && !settled.is_working());
+        assert!(settled.requests.is_empty());
+        assert_eq!(settled.subagents.len(), 1);
+        assert_eq!(settled.subagents[0].status, ToolStatus::Succeeded);
+
+        // Recreate the old fixture: hydration says idle, completed collab
+        // items assert Running again, and no child lifecycle ever follows.
+        // A parent's success alone cannot prove its background work ended.
+        let broken: Vec<_> = completed
+            .into_iter()
+            .filter(|frame| frame["params"]["threadId"] != "child-exact")
+            .map(|mut frame| {
+                if frame["method"] == "item/completed"
+                    && frame["params"]["item"]["type"] == "collabAgentToolCall"
+                {
+                    frame["params"]["item"]["agentsStates"]["child-exact"]["status"] =
+                        json!("running");
+                }
+                frame
+            })
+            .collect();
+        let mut replies = fixture["replies"].clone();
+        replies["thread/resume"][0]["result"]["thread"]["status"]["type"] = json!("idle");
+        replies["thread/resume"][0]["result"]["initialTurnsPage"]["data"] = json!([]);
+        let stranded = snapshot(broken, replies);
+        assert!(!stranded.busy, "the parent turn really completed");
+        assert!(
+            stranded.is_working(),
+            "the old update check still sees the orphaned Running child"
+        );
+        assert_eq!(stranded.subagents[0].status, ToolStatus::Running);
     }
 
     #[test]
@@ -5867,7 +6583,10 @@ mod tests {
             children: BTreeMap::new(),
             branch_points: Vec::new(),
             is_child: false,
+            child_failure: None,
             child_buffer: BTreeMap::new(),
+            turn_diffs: BTreeMap::new(),
+            repo_root: None,
         }
     }
 
@@ -5972,6 +6691,510 @@ mod tests {
             Some("Reconnecting... 1/2")
         );
         assert!(chat::failure::provider_error_text(Provider::Claude, item).is_none());
+    }
+
+    #[test]
+    fn a_child_failed_turn_restating_its_final_error_adds_no_second_notice() {
+        let mut parent = adapter();
+        let mut child = adapter();
+        child.thread = Some("child-thread".into());
+        child.is_child = true;
+        parent
+            .children
+            .insert("child-thread".into(), Box::new(child));
+        parent.receive(json!({"method":"turn/started","params":{"threadId":"child-thread","turn":{"id":"child-turn","items":[]}}})).unwrap();
+        let notices = |step: Step| {
+            step.events
+                .iter()
+                .filter(|event| {
+                    matches!(event, Event::SubagentItem { item, .. }
+                    if chat::failure::provider_error_text(Provider::Codex, item).is_some())
+                })
+                .count()
+        };
+        let error = parent.receive(json!({"method":"error","params":{"threadId":"child-thread","turnId":"child-turn","willRetry":false,"error":{"message":"Usage limit · resets 3:40pm"}}})).unwrap();
+        assert_eq!(notices(error), 1);
+        let failed = |turn: &str, message: &str| json!({"method":"turn/completed","params":{"threadId":"child-thread","turn":{"id":turn,"status":"failed","error":{"message":message},"items":[]}}});
+        let restated = parent
+            .receive(failed("child-turn", "Usage limit · resets 3:40pm"))
+            .unwrap();
+        assert_eq!(notices(restated), 0, "the same failure is already shown");
+        parent.receive(json!({"method":"turn/started","params":{"threadId":"child-thread","turn":{"id":"next-turn","items":[]}}})).unwrap();
+        let different = parent
+            .receive(failed("next-turn", "Usage limit · resets 3:40pm"))
+            .unwrap();
+        assert_eq!(notices(different), 1, "another turn's failure is its own");
+    }
+
+    #[test]
+    fn terminal_child_errors_keep_exact_provider_notices_without_claiming_lifecycle() {
+        let mut parent = adapter();
+        let mut child = adapter();
+        child.thread = Some("child-thread".into());
+        child.is_child = true;
+        parent
+            .children
+            .insert("child-thread".into(), Box::new(child));
+        parent.receive(json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"parent-turn","items":[]}}})).unwrap();
+        parent.receive(json!({"method":"turn/started","params":{"threadId":"child-thread","turn":{"id":"child-turn","items":[]}}})).unwrap();
+        parent.receive(json!({"method":"thread/status/changed","params":{"threadId":"child-thread","status":{"type":"active","activeFlags":["waitingOnUserInput"]}}})).unwrap();
+        let raw = format!(
+            "You've hit your session limit · resets 3:40pm (America/Vancouver)\nrequest-id: child-original\n{}\nFinal diagnostic λ",
+            "original response\n".repeat(5_000)
+        );
+        let mut ids = std::collections::BTreeSet::new();
+        for will_retry in [Some(json!(false)), Some(Value::Null), None] {
+            let mut frame = json!({"method":"error","params":{"threadId":"child-thread","turnId":"child-turn","error":{"message":raw}}});
+            if let Some(flag) = will_retry {
+                frame["params"]["willRetry"] = flag;
+            }
+            // Repeated occurrences have no event ID on this wire. Preserve
+            // each original rather than deduplicating equal diagnostic text.
+            for _ in 0..2 {
+                let observed = parent.receive(frame.clone()).unwrap();
+                let [Event::SubagentItem { id, item }] = observed.events.as_slice() else {
+                    panic!("A child failure must be only its own transcript item");
+                };
+                assert_eq!(id, "child-thread");
+                assert_eq!(item.role, Role::System);
+                assert!(ids.insert(item.id.clone()));
+                assert_eq!(
+                    chat::failure::provider_error_text(Provider::Codex, item),
+                    Some(raw.as_str())
+                );
+                assert!(chat::failure::provider_error_text(Provider::Claude, item).is_none());
+                assert!(
+                    observed.writes.is_empty(),
+                    "A diagnostic never retries or sends a command"
+                );
+                assert!(parent.busy);
+                assert_eq!(parent.turn.as_deref(), Some("parent-turn"));
+                let child = &parent.children["child-thread"];
+                assert!(child.busy && child.subagent_waiting);
+                assert_eq!(child.turn.as_deref(), Some("child-turn"));
+                assert_eq!(child.subagent_status, Some(ToolStatus::Running));
+                assert_eq!(child.subagent_detail, "Waiting for your answer");
+            }
+            let mut foreign = frame.clone();
+            foreign["params"]["threadId"] = json!("unrelated-thread");
+            let ignored = parent.receive(foreign).unwrap();
+            assert!(ignored.events.is_empty() && ignored.writes.is_empty());
+            frame["params"]["threadId"] = json!("thread-exact");
+            let original = parent.receive(frame).unwrap();
+            assert!(
+                matches!(original.events.as_slice(), [Event::Error {message, fatal:false}] if message == &raw)
+            );
+            assert!(original.writes.is_empty());
+        }
+        let warning = parent
+            .receive(json!({"method":"warning","params":{"threadId":"child-thread","message":raw}}))
+            .unwrap();
+        let [Event::SubagentItem { id, item }] = warning.events.as_slice() else {
+            panic!("A child advisory must remain a child advisory");
+        };
+        assert_eq!(id, "child-thread");
+        assert!(chat::failure::provider_error_text(Provider::Codex, item).is_none());
+        assert!(matches!(&item.content, ItemContent::Text {text,..} if text == &raw));
+    }
+
+    /// Known child parsers already attached to this account's parent thread,
+    /// as in the existing child routing tests. Native metadata frames below
+    /// publish their exact names through the real adapter and runtime store.
+    fn child_error_runtime_fixture() -> (Codex, Vec<Value>) {
+        let mut parent = adapter();
+        for id in ["child-thread", "sibling-thread"] {
+            let mut child = adapter();
+            child.thread = Some(id.into());
+            child.is_child = true;
+            parent.children.insert(id.into(), Box::new(child));
+        }
+        let mut frames = vec![
+            json!({"method":"thread/name/updated","params":{"threadId":"thread-exact","threadName":"Parent conversation"}}),
+            json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"parent-turn","items":[{"id":"parent-answer","type":"agentMessage","text":"Parent work remains here"}]}}}),
+            json!({"method":"thread/tokenUsage/updated","params":{"threadId":"thread-exact","turnId":"parent-turn","tokenUsage":{"total":{"inputTokens":71,"outputTokens":19},"last":{"totalTokens":90},"modelContextWindow":1000}}}),
+        ];
+        for (id, name) in [("child-thread", "Quinn"), ("sibling-thread", "Nora")] {
+            frames.push(json!({"method":"thread/started","params":{"thread":{"id":id,"parentThreadId":"thread-exact","agentNickname":name,"model":"child-model","status":{"type":"active"}}}}));
+            frames.push(json!({"method":"turn/started","params":{"threadId":id,"turn":{"id":"child-turn","items":[{"id":"answer","type":"agentMessage","text":"Original child work"}]}}}));
+        }
+        (parent, frames)
+    }
+
+    fn parent_question_after_child_error() -> Value {
+        // Supply an independently fingerprinted parent question while its
+        // turn stays running. A waiting child can already produce aggregate
+        // Waiting attention; a child error must not supply a parent outcome.
+        json!({"id":71,"method":"item/tool/requestUserInput","params":{"threadId":"thread-exact","turnId":"parent-turn","questions":[{"id":"parent-choice","header":"Parent choice","question":"Continue parent work?","options":[{"label":"Keep","description":"Keep parent work"},{"label":"Replace","description":"Replace parent work"}]}]}})
+    }
+
+    fn assert_child_error_parent_and_sibling(state: &chat::Snapshot) {
+        assert_eq!(state.session_id.as_deref(), Some("thread-exact"));
+        assert_eq!(state.title.as_deref(), Some("Parent conversation"));
+        assert!(state.busy && state.ready && !state.exited);
+        assert!(
+            state.error.is_none(),
+            "Child failures must not become parent errors"
+        );
+        assert_eq!(
+            state.turn_generation, 2,
+            "Only the helper's initial and actual parent starts count"
+        );
+        assert_eq!(state.usage.input_tokens, 71);
+        assert_eq!(state.usage.output_tokens, 19);
+        assert_eq!(state.usage.context_tokens, 90);
+        assert_eq!(state.usage.context_limit, 1000);
+        assert_eq!(
+            state.requests.len(),
+            1,
+            "Only the genuine parent question requests attention"
+        );
+        assert_eq!(state.items.len(), 1);
+        assert!(
+            matches!(&state.items[0].content, ItemContent::Text {text,..} if text == "Parent work remains here")
+        );
+        assert!(chat::failure::provider_error_text(Provider::Codex, &state.items[0]).is_none());
+        assert_eq!(
+            state.subagents.len(),
+            2,
+            "Foreign thread frames must not create a child"
+        );
+        let sibling = state
+            .subagents
+            .iter()
+            .find(|child| child.id == "sibling-thread")
+            .unwrap();
+        assert_eq!(sibling.kind, "Nora");
+        assert_eq!(sibling.model.as_deref(), Some("child-model"));
+        assert!(sibling.background && !sibling.waiting);
+        assert_eq!(sibling.status, ToolStatus::Running);
+        assert!(sibling.detail.is_empty());
+        assert_eq!(sibling.items.len(), 1);
+        assert!(
+            matches!(&sibling.items[0].content, ItemContent::Text {text,..} if text == "Original child work")
+        );
+    }
+
+    #[test]
+    fn terminal_child_error_originals_survive_actor_store_without_parent_contamination() {
+        let (parent, mut frames) = child_error_runtime_fixture();
+        frames.push(json!({"method":"thread/status/changed","params":{"threadId":"child-thread","status":{"type":"active","activeFlags":["waitingOnUserInput"]}}}));
+        let first = format!(
+            "You've hit your session limit · resets 3:40pm (America/Vancouver)\nrequest-id: first\n{}\nFinal original λ",
+            "response line\n".repeat(400)
+        );
+        let second = "Connection reset by peer\nrequest-id: second\nDistinct original diagnostic";
+        let retry = "Reconnecting... 1/2\nrequest-id: genuine-retry";
+        for (flag, raw) in [
+            (Some(json!(false)), first.as_str()),
+            (None, second),
+            (Some(Value::Null), first.as_str()),
+            (Some(json!(true)), retry),
+        ] {
+            let mut frame = json!({"method":"error","params":{"threadId":"child-thread","turnId":"child-turn","error":{"message":raw}}});
+            if let Some(flag) = flag {
+                frame["params"]["willRetry"] = flag;
+            }
+            frames.push(frame);
+        }
+        frames
+            .push(json!({"method":"warning","params":{"threadId":"child-thread","message":first}}));
+        frames.push(json!({"method":"error","params":{"threadId":"unrelated-thread","turnId":"child-turn","error":{"message":"Foreign child diagnostic"}}}));
+        frames.push(json!({"method":"thread/tokenUsage/updated","params":{"threadId":"child-thread","turnId":"child-turn","tokenUsage":{"total":{"inputTokens":9000,"outputTokens":8000},"last":{"totalTokens":17000},"modelContextWindow":20000}}}));
+        frames.push(parent_question_after_child_error());
+        let (receipts, state) = crate::chat::runtime::notification_frames_with_snapshot_for_test(
+            Box::new(parent),
+            frames,
+            false,
+        );
+        let [
+            (child_waiting, child_context),
+            (parent_question, parent_context),
+        ] = receipts.as_slice()
+        else {
+            panic!("only the real child wait and parent question notify: {receipts:?}");
+        };
+        assert_eq!(child_waiting.kind, crate::notifications::Kind::Waiting);
+        assert_eq!(parent_question.kind, crate::notifications::Kind::Waiting);
+        assert_eq!(
+            child_context,
+            &crate::notifications::Content {
+                conversation: "Parent conversation".into(),
+                preview: "Parent work remains here".into(),
+                request: None,
+            },
+            "child waiting announces aggregate activity before a parent request exists"
+        );
+        assert_eq!(
+            parent_context,
+            &crate::notifications::Content {
+                conversation: "Parent conversation".into(),
+                preview: "Parent choice · Continue parent work?".into(),
+                request: Some(crate::notifications::RequestType::Question),
+            },
+            "only the genuine parent question changes actionable request metadata"
+        );
+        let (child_owner, child_generation) = child_waiting.key.rsplit_once(":waiting:").unwrap();
+        let (parent_owner, parent_generation) =
+            parent_question.key.rsplit_once(":waiting:").unwrap();
+        assert_eq!(child_owner, parent_owner);
+        assert!(
+            child_generation.parse::<u64>().unwrap() < parent_generation.parse::<u64>().unwrap()
+        );
+        assert_child_error_parent_and_sibling(&state);
+        let child = state
+            .subagents
+            .iter()
+            .find(|child| child.id == "child-thread")
+            .unwrap();
+        assert_eq!(child.kind, "Quinn");
+        assert_eq!(child.model.as_deref(), Some("child-model"));
+        assert!(child.background && child.waiting);
+        assert_eq!(
+            child.status,
+            ToolStatus::Running,
+            "No error invents a terminal lifecycle transition"
+        );
+        assert_eq!(child.detail, "Waiting for your answer");
+        let notices: Vec<_> = child
+            .items
+            .iter()
+            .filter(|item| chat::failure::provider_error_text(Provider::Codex, item).is_some())
+            .collect();
+        assert_eq!(notices.len(), 4);
+        assert_eq!(
+            notices
+                .iter()
+                .map(|item| chat::failure::provider_error_text(Provider::Codex, item).unwrap())
+                .collect::<Vec<_>>(),
+            [first.as_str(), second, first.as_str(), retry]
+        );
+        assert_eq!(
+            notices
+                .iter()
+                .map(|item| &item.id)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            4
+        );
+        assert!(
+            notices
+                .iter()
+                .all(|item| item.id.starts_with("codex-notice:")
+                    && item.role == Role::System
+                    && chat::failure::provider_error_text(Provider::Claude, item).is_none())
+        );
+        assert_eq!(
+            child.items.len(),
+            6,
+            "Original answer, four failures and unmarked advisory all remain"
+        );
+        assert!(
+            matches!(&child.items[0].content, ItemContent::Text {text,..} if text == "Original child work")
+        );
+        assert!(matches!(&child.items[5].content, ItemContent::Text {text,..} if text == &first));
+    }
+
+    #[test]
+    fn failed_child_turn_keeps_original_error_and_authentic_outcome_through_actor_store() {
+        let (parent, mut frames) = child_error_runtime_fixture();
+        let raw = "You've hit your session limit · resets 3:40pm (America/Vancouver)\nrequest-id: failed-turn\nOriginal server response λ";
+        frames.push(json!({"method":"turn/completed","params":{"threadId":"child-thread","turn":{"id":"child-turn","status":"failed","error":{"message":raw},"items":[{"id":"partial","type":"agentMessage","text":"Partial child answer"}]}}}));
+        frames.push(json!({"method":"thread/status/changed","params":{"threadId":"child-thread","status":{"type":"idle"}}}));
+        frames.push(json!({"method":"turn/completed","params":{"threadId":"unrelated-thread","turn":{"id":"foreign-turn","status":"failed","error":{"message":"Foreign failure"},"items":[]}}}));
+        frames.push(parent_question_after_child_error());
+        let (receipts, state) = crate::chat::runtime::notification_frames_with_snapshot_for_test(
+            Box::new(parent),
+            frames,
+            false,
+        );
+        assert_eq!(
+            receipts.len(),
+            1,
+            "Child failure must not notify as a parent result"
+        );
+        assert_eq!(receipts[0].0.kind, crate::notifications::Kind::Waiting);
+        assert_child_error_parent_and_sibling(&state);
+        let child = state
+            .subagents
+            .iter()
+            .find(|child| child.id == "child-thread")
+            .unwrap();
+        assert_eq!(child.kind, "Quinn");
+        assert_eq!(child.status, ToolStatus::Failed);
+        assert!(!child.waiting);
+        assert_eq!(child.items.len(), 3);
+        for (item, expected) in child
+            .items
+            .iter()
+            .zip(["Original child work", "Partial child answer"])
+        {
+            assert!(matches!(&item.content, ItemContent::Text {text,..} if text == expected));
+        }
+        let error = &child.items[2];
+        assert_eq!(
+            chat::failure::provider_error_text(Provider::Codex, error),
+            Some(raw)
+        );
+        assert!(chat::failure::provider_error_text(Provider::Claude, error).is_none());
+        assert!(error.id.starts_with("codex-notice:"));
+    }
+
+    #[test]
+    fn child_disconnect_diagnostics_remain_unmarked_and_do_not_fail_the_parent() {
+        for method in ["thread/closed", "thread/deleted"] {
+            let (parent, mut frames) = child_error_runtime_fixture();
+            frames.push(json!({"method":method,"params":{"threadId":"child-thread"}}));
+            frames.push(parent_question_after_child_error());
+            let (receipts, state) =
+                crate::chat::runtime::notification_frames_with_snapshot_for_test(
+                    Box::new(parent),
+                    frames,
+                    false,
+                );
+            assert_eq!(receipts.len(), 1);
+            assert_eq!(receipts[0].0.kind, crate::notifications::Kind::Waiting);
+            assert_child_error_parent_and_sibling(&state);
+            let child = state
+                .subagents
+                .iter()
+                .find(|child| child.id == "child-thread")
+                .unwrap();
+            assert_eq!(child.status, ToolStatus::Stopped);
+            assert!(!child.waiting);
+            assert_eq!(child.items.len(), 2);
+            let notice = &child.items[1];
+            assert_eq!(notice.role, Role::System);
+            let expected = if method == "thread/deleted" {
+                "Codex removed this agent before it finished"
+            } else {
+                "Codex closed this agent before it finished"
+            };
+            assert!(matches!(&notice.content, ItemContent::Text {text,..} if text == expected));
+            assert!(chat::failure::provider_error_text(Provider::Codex, notice).is_none());
+        }
+    }
+
+    #[test]
+    fn large_child_originals_survive_actor_reads_and_old_completion_cannot_settle_next_turn() {
+        let (parent, mut frames) = child_error_runtime_fixture();
+        let raw = format!(
+            "You've hit your session limit · resets 3:40pm (America/Vancouver)\nrequest-id: large-original\n{}\nTAIL original λ",
+            "猫 café diagnostic\n".repeat(20_000)
+        );
+        frames.push(json!({"method":"error","params":{"threadId":"child-thread","turnId":"child-turn","error":{"message":raw},"willRetry":false}}));
+        let failed = json!({"method":"turn/completed","params":{"threadId":"child-thread","turn":{"id":"child-turn","status":"failed","error":{"message":raw},"items":[]}}});
+        frames.push(failed.clone());
+        frames.push(json!({"method":"thread/status/changed","params":{"threadId":"child-thread","status":{"type":"idle"}}}));
+        frames.push(json!({"method":"thread/closed","params":{"threadId":"child-thread"}}));
+        frames.push(json!({"method":"turn/started","params":{"threadId":"child-thread","turn":{"id":"next-child","status":"inProgress","items":[]}}}));
+        frames.push(failed);
+        frames.push(parent_question_after_child_error());
+        let (receipts, state, originals) =
+            crate::chat::runtime::notification_frames_with_probe_for_test(
+                Box::new(parent),
+                frames,
+                false,
+                |state, read| -> Result<Vec<String>, String> {
+                    let child = state
+                        .subagents
+                        .iter()
+                        .find(|child| child.id == "child-thread")
+                        .ok_or("missing child")?;
+                    let sources = state
+                        .text_copy_sources
+                        .children
+                        .get("child-thread")
+                        .ok_or("missing child authority")?;
+                    let mut originals = Vec::new();
+                    for (index, item) in child.items.iter().enumerate() {
+                        if chat::failure::provider_error_text(Provider::Codex, item).is_none() {
+                            continue;
+                        }
+                        let source = sources
+                            .get(index)
+                            .and_then(Option::as_ref)
+                            .ok_or("original not retained")?;
+                        let mut raw = String::new();
+                        loop {
+                            let page = read(source, raw.len() as u64)?;
+                            if page.source != *source || page.offset != raw.len() as u64 {
+                                return Err("wrong page identity".into());
+                            }
+                            raw.push_str(&page.text);
+                            if page.done {
+                                break;
+                            }
+                            if page.text.is_empty() {
+                                return Err("empty original page".into());
+                            }
+                        }
+                        originals.push(raw);
+                    }
+                    Ok(originals)
+                },
+            );
+        assert_child_error_parent_and_sibling(&state);
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].0.kind, crate::notifications::Kind::Waiting);
+        assert_eq!(
+            receipts[0].1.preview,
+            "Parent choice · Continue parent work?"
+        );
+        let child = state
+            .subagents
+            .iter()
+            .find(|child| child.id == "child-thread")
+            .unwrap();
+        assert_eq!(child.status, ToolStatus::Running);
+        assert!(!child.waiting);
+        assert!(child.items.len() <= 64);
+        assert!(
+            child
+                .items
+                .iter()
+                .map(|item| item.content.byte_len())
+                .sum::<usize>()
+                <= 64 * 1024
+        );
+        let originals = originals.unwrap();
+        // The failed completion and its stale repeat restate the error
+        // notification, so the child shows the one failure once.
+        assert_eq!(originals, vec![raw]);
+    }
+
+    #[test]
+    fn sparse_child_diagnostic_shapes_preserve_exact_fallback_without_lifecycle_claims() {
+        for flag in [
+            Value::Null,
+            json!(false),
+            json!(true),
+            json!(0),
+            json!(1),
+            json!("true"),
+            json!("false"),
+            json!([]),
+            json!({}),
+        ] {
+            for error in [
+                Value::Null,
+                json!("diagnostic string"),
+                json!({"code":429,"requestId":"exact λ"}),
+                json!({"message":17}),
+            ] {
+                let (mut parent, _) = child_error_runtime_fixture();
+                let observed = parent.receive(json!({"method":"error","params":{"threadId":"child-thread","willRetry":flag,"error":error}})).unwrap();
+                let [Event::SubagentItem { id, item }] = observed.events.as_slice() else {
+                    panic!("only an exact child diagnostic is allowed");
+                };
+                assert_eq!(id, "child-thread");
+                assert_eq!(
+                    chat::failure::provider_error_text(Provider::Codex, item),
+                    Some(error.to_string().as_str())
+                );
+                assert!(observed.writes.is_empty());
+                assert!(!parent.busy && !parent.children["child-thread"].busy);
+            }
+        }
     }
 
     #[test]
@@ -6165,6 +7388,32 @@ mod tests {
     }
 
     #[test]
+    fn child_identity_uses_only_reported_nonblank_nickname_without_guessing_roles() {
+        let mut parent = adapter();
+        for (nickname, expected) in [
+            (Value::Null, ""),
+            (json!(""), ""),
+            (json!(" \t\n"), ""),
+            (json!(" Scout "), "Scout"),
+            // A real nickname may happen to equal a role or the old default.
+            (json!("worker"), "worker"),
+            (json!("Codex agent"), "Codex agent"),
+        ] {
+            let mut step = Step::default();
+            parent
+                .discover_child(
+                    "child",
+                    &json!({"agentNickname":nickname,"agentRole":"worker"}),
+                    &mut step,
+                )
+                .unwrap();
+            assert!(step.events.iter().any(|event| matches!(event,
+                Event::Subagent { id, kind, .. } if id == "child" && kind == expected
+            )));
+        }
+    }
+
+    #[test]
     fn proven_child_start_discovers_early_streams_and_hydration_failure_keeps_them() {
         let mut parent = adapter();
         let started = parent.receive(json!({"method":"thread/started","params":{"thread":{"id":"child", "parentThreadId":"thread-exact", "agentNickname":"Scout", "status":{"type":"active"}}}})).unwrap();
@@ -6252,6 +7501,15 @@ mod tests {
             ] {
                 let observed = parent.receive(frame).unwrap();
                 assert!(observed.events.iter().any(|event| matches!(event, Event::Subagent {status:Some(status), ..} if *status == expected)), "{:?}", observed.events);
+                // A finished child's thread closing is routine, not a notice.
+                assert!(
+                    !observed
+                        .events
+                        .iter()
+                        .any(|event| matches!(event, Event::SubagentItem { .. })),
+                    "{:?}",
+                    observed.events
+                );
             }
             let next = parent.receive(json!({"method":"turn/started","params":{"threadId":"child","turn":{"id":"next","items":[]}}})).unwrap();
             assert!(next.events.iter().any(|event| matches!(
@@ -7675,6 +8933,7 @@ mod tests {
                 std::fs::File::open(&cwd).unwrap(),
             )));
             let spec = ProcessSpec {
+                stdout_noise: None,
                 execution: Some(Arc::new(context)),
                 messages: None,
                 transport: TransportSpec::History,
@@ -8025,6 +9284,341 @@ mod tests {
         assert_eq!(changes[0].kind, ChangeKind::Updated);
     }
 
+    fn only_tool(value: Value, done: bool) -> (String, String, String, ToolStatus) {
+        match &parse_item(&value, done, "turn").unwrap()[..] {
+            [
+                Item {
+                    content:
+                        ItemContent::Tool {
+                            name,
+                            input,
+                            output,
+                            status,
+                        },
+                    ..
+                },
+            ] => (name.clone(), input.clone(), output.clone(), *status),
+            items => panic!("one tool row, not {items:?}"),
+        }
+    }
+
+    /// A tool row carries what a reader can use: the app's name for an MCP
+    /// call, no arguments when there were none, the text a tool returned
+    /// rather than the content parts carrying it, and the error's message.
+    #[test]
+    fn tool_rows_carry_readable_names_arguments_results_and_errors() {
+        let called = json!({"id":"m","type":"mcpToolCall","server":"codex_apps","tool":"linear_get_issue",
+            "appContext":{"connectorId":"c","appName":"Linear","actionName":"get_issue"},
+            "status":"completed","arguments":null,
+            "result":{"content":[{"type":"text","text":"ENG-42: Tool rows"},{"type":"text","text":"Status: open"}],"structuredContent":null}});
+        assert_eq!(
+            only_tool(called, true),
+            (
+                "Linear / get_issue".into(),
+                String::new(),
+                "ENG-42: Tool rows\n\nStatus: open".into(),
+                ToolStatus::Succeeded
+            )
+        );
+        let structured = json!({"id":"m","type":"mcpToolCall","server":"docs","tool":"search","status":"completed",
+            "arguments":{"query":"hover"},"result":{"content":[],"structuredContent":{"hits":1}}});
+        let (name, input, output, _) = only_tool(structured, true);
+        assert_eq!(
+            (name.as_str(), input.as_str()),
+            ("docs / search", r#"{"query":"hover"}"#)
+        );
+        assert_eq!(output, "{\n  \"hits\": 1\n}");
+        let failed = json!({"id":"m","type":"mcpToolCall","server":"docs","tool":"search","status":"failed",
+            "arguments":{},"error":{"message":"Connector is not authorized"}});
+        assert_eq!(
+            only_tool(failed, true),
+            (
+                "docs / search".into(),
+                String::new(),
+                "Connector is not authorized".into(),
+                ToolStatus::Failed
+            )
+        );
+        for output in [
+            json!("plain text"),
+            json!([{"type":"input_text","text":"plain text"}]),
+        ] {
+            let item =
+                json!({"id":"f","type":"functionCallOutput","name":"lookup","output":output});
+            assert_eq!(only_tool(item, true).2, "plain text");
+        }
+        let interrupted = json!({"id":"c","type":"collabAgentToolCall","tool":"interruptAgent","status":"interrupted",
+            "senderThreadId":"thread-exact","receiverThreadIds":["child"],"agentsStates":{}});
+        let (_, _, states, status) = only_tool(interrupted, true);
+        assert_eq!(status, ToolStatus::Stopped);
+        // The receiver is named even before Codex reports its state.
+        assert_eq!(states, r#"{"child":{}}"#);
+        let reported = json!({"id":"c","type":"collabAgentToolCall","tool":"sendMessage","status":"completed",
+            "senderThreadId":"thread-exact","receiverThreadIds":["child"],
+            "agentsStates":{"child":{"status":"running"}}});
+        assert_eq!(
+            only_tool(reported, true).2,
+            r#"{"child":{"status":"running"}}"#
+        );
+    }
+
+    /// Codex's own events read as events: an image being generated says
+    /// nothing until it has a result, compaction says it is under way until
+    /// it is done, a hook's prompt is its text, a pause is a pause, and a
+    /// subagent's lifecycle adds no rows of its own.
+    #[test]
+    fn codex_events_read_as_what_happened() {
+        let generating = json!({"id":"g","type":"imageGeneration","status":"inProgress","inputImages":[],"revisedPrompt":"A fox"});
+        assert_eq!(
+            only_tool(generating, false),
+            (
+                "Image generation".into(),
+                "A fox".into(),
+                String::new(),
+                ToolStatus::Running
+            )
+        );
+        let limited = json!({"id":"g","type":"imageGeneration","status":"failed","inputImages":[],
+            "failure":{"type":"usageLimitExceeded","limitId":"images"}});
+        let (_, _, output, status) = only_tool(limited, true);
+        assert_eq!(
+            (output.as_str(), status),
+            (
+                "Image generation has reached its usage limit.",
+                ToolStatus::Failed
+            )
+        );
+        let viewed = parse_item(
+            &json!({"id":"v","type":"imageView","path":"/repo/shots/after.png"}),
+            true,
+            "turn",
+        )
+        .unwrap();
+        assert!(matches!(&viewed[0].content,
+            ItemContent::Image { description, .. } if description == "after.png"));
+        let notice = |value: Value, done: bool| match &parse_item(&value, done, "turn").unwrap()[..]
+        {
+            [
+                Item {
+                    role: Role::System,
+                    content:
+                        ItemContent::Delivery {
+                            kind: chat::DeliveryKind::Notice,
+                            summary,
+                            body,
+                            ..
+                        },
+                    ..
+                },
+            ] => format!("{summary}: {body}"),
+            items => panic!("one notice, not {items:?}"),
+        };
+        // A pause or a compaction keeps its name; its status says how far it
+        // got, so a replayed or abandoned one never reads as still going.
+        let compaction = json!({"id":"k","type":"contextCompaction"});
+        let running = only_tool(compaction.clone(), false);
+        assert_eq!(
+            (running.0.as_str(), running.3),
+            ("Compact context", ToolStatus::Running)
+        );
+        let done = only_tool(compaction, true);
+        assert_eq!(
+            (done.0.as_str(), done.3),
+            ("Compact context", ToolStatus::Succeeded)
+        );
+        let empty =
+            json!({"id":"h0","type":"hookPrompt","fragments":[{"hookRunId":"run-0","text":"  "}]});
+        assert!(parse_item(&empty, true, "turn").unwrap().is_empty());
+        let hook = json!({"id":"h","type":"hookPrompt","fragments":[
+            {"hookRunId":"run-1","text":"Remember the style guide."},{"hookRunId":"run-2","text":"Run the tests."}]});
+        assert_eq!(
+            notice(hook, true),
+            "Context from a hook: Remember the style guide.\n\nRun the tests."
+        );
+        let sleep = json!({"id":"s","type":"sleep","durationMs":90_000});
+        let running = only_tool(sleep.clone(), false);
+        assert_eq!(
+            (running.0.as_str(), running.3),
+            ("Wait 1m 30s", ToolStatus::Running)
+        );
+        let done = only_tool(sleep, true);
+        assert_eq!(
+            (done.0.as_str(), done.3),
+            ("Wait 1m 30s", ToolStatus::Succeeded)
+        );
+        let activity = json!({"id":"a","type":"subAgentActivity","kind":"started","agentThreadId":"child","agentPath":"/root/review"});
+        assert!(parse_item(&activity, true, "turn").unwrap().is_empty());
+        let mut adapter = adapter();
+        let diff = adapter
+            .receive(json!({"method":"turn/diff/updated","params":{"threadId":"thread-exact","turnId":"turn","diff":"@@ -1 +1 @@\n-a\n+b\n"}}))
+            .unwrap();
+        assert!(diff.events.is_empty());
+    }
+
+    /// A tool result's structured content follows its text when it says
+    /// more than the text, and is not repeated when the text is that JSON.
+    #[test]
+    fn a_tool_result_keeps_structured_content_its_text_does_not_carry() {
+        let both = json!({"content":[{"type":"text","text":"Found two issues"}],
+            "structuredContent":{"issues":["ENG-1","ENG-2"]}});
+        assert_eq!(
+            images::readable(&both),
+            "Found two issues\n\n{\n  \"issues\": [\n    \"ENG-1\",\n    \"ENG-2\"\n  ]\n}"
+        );
+        let same = json!({"content":[{"type":"text","text":"{\"issues\":[\"ENG-1\"]}"}],
+            "structuredContent":{"issues":["ENG-1"]}});
+        assert_eq!(images::readable(&same), "{\"issues\":[\"ENG-1\"]}");
+    }
+
+    /// A turn's diff is its own change row only for the files none of its
+    /// file-change items edited, such as one a shell command rewrote, and
+    /// that row goes once items account for every file.
+    #[test]
+    fn a_turn_diff_shows_only_the_files_no_item_changed() {
+        let diff = "diff --git a/src/lib.rs b/src/lib.rs\nindex 1..2 100644\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-a\n+b\n\
+diff --git a/README.md b/README.md\nindex 3..4 100644\n--- a/README.md\n+++ b/README.md\n@@ -1 +1,2 @@\n # Title\n+More\n\
+diff --git a/new.txt b/new.txt\nnew file mode 100644\nindex 0..5\n--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1 @@\n+hi\n\
+diff --git a/old.txt b/old.txt\ndeleted file mode 100644\nindex 6..0\n--- a/old.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-bye\n\
+diff --git a/a.txt b/b.txt\nsimilarity index 100%\nrename from a.txt\nrename to b.txt\n\
+diff --git a/run.sh b/run.sh\nold mode 100644\nnew mode 100755\n\
+diff --git a/empty.txt b/empty.txt\nnew file mode 100644\nindex 0000000..e69de29\n\
+diff --git a/logo.png b/logo.png\ndeleted file mode 100644\nindex 1..0\nBinary files a/logo.png and /dev/null differ\n";
+        let changes = turn_diff_changes(diff);
+        assert_eq!(
+            changes
+                .iter()
+                .map(|change| (change.path.as_str(), change.kind.clone()))
+                .collect::<Vec<_>>(),
+            [
+                ("src/lib.rs", ChangeKind::Updated),
+                ("README.md", ChangeKind::Updated),
+                ("new.txt", ChangeKind::Added),
+                ("old.txt", ChangeKind::Deleted),
+                (
+                    "b.txt",
+                    ChangeKind::Renamed {
+                        from: "a.txt".into()
+                    }
+                ),
+                ("run.sh", ChangeKind::Updated),
+                ("empty.txt", ChangeKind::Added),
+                ("logo.png", ChangeKind::Deleted),
+            ]
+        );
+        assert_eq!(changes[1].diff, "@@ -1 +1,2 @@\n # Title\n+More\n");
+        assert_eq!(changes[5].diff, "old mode 100644\nnew mode 100755\n");
+
+        let mut adapter = adapter();
+        let file_change = |id: &str, path: &str, diff: &str| {
+            json!({"method":"item/completed","params":{"threadId":"thread-exact","turnId":"turn","item":
+                {"id":id,"type":"fileChange","status":"completed","changes":[{"path":path,"kind":{"type":"update"},"diff":diff}]}}})
+        };
+        // A patch the agent made, and one to a different file of the same name.
+        adapter
+            .receive(file_change(
+                "lib",
+                "/tmp/src/lib.rs",
+                "@@ -1 +1 @@\n-a\n+b\n",
+            ))
+            .unwrap();
+        adapter
+            .receive(file_change(
+                "docs",
+                "/tmp/docs/README.md",
+                "@@ -1 +1,2 @@\n # Title\n+More\n",
+            ))
+            .unwrap();
+        // The README a shell command edited, and a second line a shell
+        // command added to the patched file.
+        let diff = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,2 +1,3 @@\n-a\n+b\n c\n+d\n\
+diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1 +1,2 @@\n # Title\n+More\n";
+        let shown = adapter
+            .receive(json!({"method":"turn/diff/updated","params":{"threadId":"thread-exact","turnId":"turn","diff":diff}}))
+            .unwrap();
+        let paths = |events: &[Event]| match events {
+            [
+                Event::Item(Item {
+                    id,
+                    content:
+                        ItemContent::Changes {
+                            changes,
+                            status: ToolStatus::Succeeded,
+                        },
+                    ..
+                }),
+            ] if id == "turn/diff" => changes
+                .iter()
+                .map(|change| change.path.clone())
+                .collect::<Vec<_>>(),
+            events => panic!("one change row, not {events:?}"),
+        };
+        assert_eq!(paths(&shown.events), ["/tmp/src/lib.rs", "/tmp/README.md"]);
+        // Items that account for every changed line retract the row.
+        let partly = adapter
+            .receive(file_change(
+                "readme",
+                "/tmp/README.md",
+                "@@ -1 +1,2 @@\n # Title\n+More\n",
+            ))
+            .unwrap();
+        assert_eq!(paths(&partly.events[..1]), ["/tmp/src/lib.rs"]);
+        let covered = adapter
+            .receive(file_change(
+                "lib2",
+                "/tmp/src/lib.rs",
+                "@@ -1,2 +1,3 @@\n b\n c\n+d\n",
+            ))
+            .unwrap();
+        assert!(matches!(&covered.events[0], Event::ItemsRemoved { ids } if ids == &["turn/diff"]));
+        let unchanged = adapter
+            .receive(json!({"method":"turn/diff/updated","params":{"threadId":"thread-exact","turnId":"turn","diff":diff}}))
+            .unwrap();
+        assert!(unchanged.events.is_empty());
+
+        // An item reported again counts once: a shell's second `-a/+b` in
+        // the same file stays shown when the patch is replayed.
+        let mut adapter = super::tests::adapter();
+        adapter
+            .receive(file_change(
+                "lib",
+                "/tmp/src/lib.rs",
+                "@@ -1 +1 @@\n-a\n+b\n",
+            ))
+            .unwrap();
+        let twice = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,3 +1,3 @@\n-a\n+b\n c\n-a\n+b\n";
+        let diff_update = |diff: &str| json!({"method":"turn/diff/updated","params":{"threadId":"thread-exact","turnId":"turn","diff":diff}});
+        assert_eq!(
+            paths(&adapter.receive(diff_update(twice)).unwrap().events),
+            ["/tmp/src/lib.rs"]
+        );
+        let replayed = adapter
+            .receive(file_change(
+                "lib",
+                "/tmp/src/lib.rs",
+                "@@ -1 +1 @@\n-a\n+b\n",
+            ))
+            .unwrap();
+        assert_eq!(paths(&replayed.events[..1]), ["/tmp/src/lib.rs"]);
+        // A line whose text starts `++` is a change like any other.
+        let plus = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1,2 @@\n-a\n+b\n+++ note\n";
+        assert_eq!(
+            paths(&adapter.receive(diff_update(plus)).unwrap().events),
+            ["/tmp/src/lib.rs"]
+        );
+        // A mode change no item made stays, with the lines an item did make.
+        let mode = "diff --git a/src/lib.rs b/src/lib.rs\nold mode 100644\nnew mode 100755\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-a\n+b\n";
+        let moded = adapter.receive(diff_update(mode)).unwrap();
+        assert!(
+            matches!(&moded.events[..], [Event::Item(Item { content: ItemContent::Changes { changes, .. }, .. })]
+            if changes[0].diff == "old mode 100644\nnew mode 100755\n@@ -1 +1 @@\n-a\n+b\n")
+        );
+        // An empty diff retracts what an earlier one showed.
+        let empty = adapter.receive(diff_update("")).unwrap();
+        assert!(
+            matches!(&empty.events[..], [Event::ItemsRemoved { ids }] if ids == &["turn/diff"])
+        );
+    }
+
     #[test]
     fn an_unrecognized_item_part_or_untracked_patch_cannot_end_the_session() {
         let future = json!({"id":"0","type":"quantumThought","status":"completed","why":"new"});
@@ -8364,6 +9958,7 @@ mod tests {
             email: Some("expected@example.test".into()),
             organization: None,
             plan: None,
+            disputed_by: None,
         };
         let request = adapter
             .command(Command::ResumeAfterLogin {

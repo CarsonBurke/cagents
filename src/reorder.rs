@@ -4,6 +4,7 @@
 //! Only a completed drop reaches the application; pointer motion never mutates
 //! its order or clones its editor/terminal state.
 
+use crate::input_trace::HIGHLIGHT_DWELL;
 use crate::{
     design,
     model::{CardId, ChannelId},
@@ -13,7 +14,9 @@ use cosmic::iced::advanced::{
     Clipboard, Layout, Shell, Widget, layout, overlay, renderer,
     widget::{Id, Operation, Tree, tree},
 };
-use cosmic::iced::{Event, Length, Point, Rectangle, Size, Vector, keyboard, mouse, window};
+use cosmic::iced::{
+    Event, Length, Point, Rectangle, Size, Vector, keyboard, mouse, time::Instant, window,
+};
 use cosmic::{Element, Renderer, Theme};
 
 const THRESHOLD: f32 = 6.0;
@@ -138,6 +141,37 @@ struct State {
     suppress_release: bool,
     channel_drag: Option<ChannelDrag>,
     channel_targeted: bool,
+    /// The channel a moved drag is over and since when; it is highlighted
+    /// once the drag has stayed there for [`HIGHLIGHT_DWELL`].
+    channel_candidate: Option<Settling<ChannelId>>,
+}
+
+/// Where a moved drag would land, which is marked only once the drag has
+/// stayed on it for [`HIGHLIGHT_DWELL`]: sweeping across the strip draws no
+/// trail of markers, while a release lands wherever it is at once.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Settling<T> {
+    target: T,
+    since: Instant,
+}
+
+impl<T: PartialEq + Copy> Settling<T> {
+    /// Follows `target`, restarting the dwell when it changes. Returns when
+    /// the mark is due, for a redraw then.
+    fn follow(slot: &mut Option<Self>, target: T, now: Instant) -> Option<Instant> {
+        match slot {
+            Some(settling) if settling.target == target => None,
+            _ => {
+                *slot = Some(Self { target, since: now });
+                Some(now + HIGHLIGHT_DWELL)
+            }
+        }
+    }
+
+    fn settled(slot: &Option<Self>, now: Instant) -> Option<T> {
+        slot.filter(|settling| now >= settling.since + HIGHLIGHT_DWELL)
+            .map(|settling| settling.target)
+    }
 }
 struct ChannelDrag {
     source: CardId,
@@ -221,6 +255,10 @@ struct Drag {
     position: Point,
     moved: bool,
     order: Vec<CardId>,
+    /// The successor the insertion marker is settling on.
+    marker: Option<Settling<Option<CardId>>>,
+    /// The successor whose marker the next frame draws, once settled.
+    marked: Option<Option<CardId>>,
 }
 struct Handle(CardId);
 struct Hit {
@@ -247,11 +285,75 @@ fn before(items: &[Item], source: CardId, x: f32) -> Option<CardId> {
         .map(|item| item.id)
 }
 
+thread_local! {
+    /// Set while a channel scope that is cancelling its gesture diffs its
+    /// content; see [`diff_retained`].
+    static CANCELLING_CHANNEL_GESTURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `diff` with the channel gesture cancelled if `cancel` is set or an
+/// enclosing scope already cancelled it, restoring the enclosing value after,
+/// even when `diff` unwinds.
+fn cancelling_channel_gesture<T>(cancel: bool, diff: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CANCELLING_CHANNEL_GESTURE.set(self.0);
+        }
+    }
+    let outer = CANCELLING_CHANNEL_GESTURE.get();
+    let _restore = Restore(outer);
+    CANCELLING_CHANNEL_GESTURE.set(outer || cancel);
+    diff()
+}
+
+/// A cancelled channel gesture is cleared from every tree under its scope,
+/// during the scope's diff, since a modal may keep the base from seeing
+/// another event. A widget that keeps a child Tree out of its tree children,
+/// where that walk cannot reach it, calls this from its own `diff` for that
+/// Tree, whether or not it rebuilds it.
+pub(crate) fn diff_retained(tree: &mut Tree) {
+    if CANCELLING_CHANNEL_GESTURE.get() {
+        clear_channel_gesture(tree);
+    }
+}
+
+/// Hooks for tests of widgets that hold channel targets.
+#[cfg(test)]
+pub(crate) mod channel_gesture_tests {
+    use super::*;
+
+    /// Highlights a channel's targets, as a settled drag does.
+    pub(crate) fn highlight(channel: ChannelId) -> impl Operation {
+        HighlightChannel(Some(channel))
+    }
+
+    /// Counts the highlighted channel targets it reaches.
+    #[derive(Default)]
+    pub(crate) struct Highlighted(pub(crate) usize);
+    impl Operation for Highlighted {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+        fn custom(&mut self, _: Option<&Id>, _: Rectangle, state: &mut dyn std::any::Any) {
+            if let Some(target) = state.downcast_ref::<ChannelTarget>() {
+                self.0 += usize::from(target.highlighted);
+            }
+        }
+    }
+
+    /// Runs `diff` as a channel scope cancelling its gesture runs it.
+    pub(crate) fn cancelling<T>(diff: impl FnOnce() -> T) -> T {
+        super::cancelling_channel_gesture(true, diff)
+    }
+}
+
 fn clear_channel_gesture(tree: &mut Tree) {
     if tree.tag == tree::Tag::of::<State>() {
         let state = tree.state.downcast_mut::<State>();
         state.channel_drag = None;
         state.channel_targeted = false;
+        state.channel_candidate = None;
         state.suppress_release |= state.drag.take().is_some();
     }
     for child in &mut tree.children {
@@ -285,7 +387,9 @@ impl<Message> Widget<Message, Theme, Renderer> for Reorder<'_, Message> {
         }
         let cancel_channel = matches!(&self.kind, Kind::ChannelScope { generation, enabled, .. }
             if !enabled || state.channel_drag.as_ref().is_some_and(|drag| drag.generation != *generation));
-        tree.diff_children(std::slice::from_mut(&mut self.content));
+        cancelling_channel_gesture(cancel_channel, || {
+            tree.diff_children(std::slice::from_mut(&mut self.content));
+        });
         if cancel_channel {
             // A modal overlay can consume release without updating the base tree.
             clear_channel_gesture(tree);
@@ -425,12 +529,26 @@ impl<Message> Widget<Message, Theme, Renderer> for Reorder<'_, Message> {
                     .and_then(|hit| hit.target)
                     .filter(|channel| allowed(drag.source, *channel))
             });
+            let candidate = &mut tree.state.downcast_mut::<State>().channel_candidate;
+            let highlighted = match destination {
+                Some(channel) => {
+                    let now = match event {
+                        Event::Window(window::Event::RedrawRequested(now)) => *now,
+                        _ => Instant::now(),
+                    };
+                    if let Some(due) = Settling::follow(candidate, channel, now) {
+                        shell.request_redraw_at(due);
+                    }
+                    Settling::settled(candidate, now)
+                }
+                None => candidate.take().and(None),
+            };
             if drag.is_some() || was_dragging {
                 self.content.as_widget_mut().operate(
                     &mut tree.children[0],
                     layout,
                     renderer,
-                    &mut HighlightChannel(destination),
+                    &mut HighlightChannel(highlighted),
                 );
             }
             if matches!(
@@ -557,6 +675,8 @@ impl<Message> Widget<Message, Theme, Renderer> for Reorder<'_, Message> {
                         position: point,
                         moved: false,
                         order: items.iter().map(|item| item.id).collect(),
+                        marker: None,
+                        marked: None,
                     });
                     shell.capture_event();
                     return;
@@ -566,6 +686,17 @@ impl<Message> Widget<Message, Theme, Renderer> for Reorder<'_, Message> {
                 if let Some(point) = cursor.position() {
                     drag.position = point;
                     drag.moved |= point.distance(drag.origin) >= THRESHOLD;
+                }
+                if drag.moved {
+                    let now = match event {
+                        Event::Window(window::Event::RedrawRequested(now)) => *now,
+                        _ => Instant::now(),
+                    };
+                    let successor = before(items, drag.source, drag.position.x - layout.bounds().x);
+                    if let Some(due) = Settling::follow(&mut drag.marker, successor, now) {
+                        shell.request_redraw_at(due);
+                    }
+                    drag.marked = Settling::settled(&drag.marker, now);
                 }
                 if matches!(
                     event,
@@ -689,7 +820,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Reorder<'_, Message> {
                     border: cosmic::iced::Border {
                         color: design::accent_color(theme),
                         width: 1.0,
-                        radius: 4.0.into(),
+                        radius: theme.cosmic().corner_radii.radius_s.into(),
                     },
                     ..Default::default()
                 },
@@ -706,8 +837,9 @@ impl<Message> Widget<Message, Theme, Renderer> for Reorder<'_, Message> {
             && let Some(clipped) = layout.bounds().intersection(viewport)
         {
             let bounds = layout.bounds();
-            let successor = before(items, drag.source, drag.position.x - bounds.x);
+            let successor = drag.marked;
             let x = successor
+                .flatten()
                 .and_then(|id| {
                     items
                         .iter()
@@ -808,6 +940,81 @@ mod tests {
         Drop(CardId, Option<CardId>),
         Scroll(f32),
         Move(CardId, ChannelId),
+    }
+
+    /// Keeps its child's Tree in its own state, out of the tree children, as
+    /// the sidebar's cached project list does.
+    struct Retained<'a>(Element<'a, Action>);
+    impl Widget<Action, Theme, Renderer> for Retained<'_> {
+        fn tag(&self) -> tree::Tag {
+            tree::Tag::of::<Tree>()
+        }
+        fn state(&self) -> tree::State {
+            tree::State::new(Tree::new(&self.0))
+        }
+        fn children(&self) -> Vec<Tree> {
+            Vec::new()
+        }
+        fn diff(&mut self, tree: &mut Tree) {
+            let child = tree.state.downcast_mut::<Tree>();
+            child.diff(self.0.as_widget_mut());
+            diff_retained(child);
+        }
+        fn size(&self) -> Size<Length> {
+            self.0.as_widget().size()
+        }
+        fn layout(
+            &mut self,
+            tree: &mut Tree,
+            renderer: &Renderer,
+            limits: &layout::Limits,
+        ) -> layout::Node {
+            let child = tree.state.downcast_mut::<Tree>();
+            self.0.as_widget_mut().layout(child, renderer, limits)
+        }
+        fn operate(
+            &mut self,
+            tree: &mut Tree,
+            layout: Layout<'_>,
+            renderer: &Renderer,
+            operation: &mut dyn Operation,
+        ) {
+            let child = tree.state.downcast_mut::<Tree>();
+            self.0
+                .as_widget_mut()
+                .operate(child, layout, renderer, operation);
+        }
+        fn update(
+            &mut self,
+            tree: &mut Tree,
+            event: &Event,
+            layout: Layout<'_>,
+            cursor: mouse::Cursor,
+            renderer: &Renderer,
+            clipboard: &mut dyn Clipboard,
+            shell: &mut Shell<'_, Action>,
+            viewport: &Rectangle,
+        ) {
+            let child = tree.state.downcast_mut::<Tree>();
+            self.0.as_widget_mut().update(
+                child, event, layout, cursor, renderer, clipboard, shell, viewport,
+            );
+        }
+        fn draw(
+            &self,
+            tree: &Tree,
+            renderer: &mut Renderer,
+            theme: &Theme,
+            style: &renderer::Style,
+            layout: Layout<'_>,
+            cursor: mouse::Cursor,
+            viewport: &Rectangle,
+        ) {
+            let child = tree.state.downcast_ref::<Tree>();
+            self.0
+                .as_widget()
+                .draw(child, renderer, theme, style, layout, cursor, viewport);
+        }
     }
 
     fn tabs(ids: &[CardId], alt: bool) -> Element<'static, Action> {
@@ -940,6 +1147,46 @@ mod tests {
                 x,
             )
         }
+    }
+
+    fn marked(tree: &Tree) -> Option<Option<CardId>> {
+        if tree.tag == tree::Tag::of::<State>()
+            && let Some(drag) = tree.state.downcast_ref::<State>().drag.as_ref()
+        {
+            return drag.marked;
+        }
+        tree.children.iter().find_map(marked)
+    }
+
+    #[test]
+    fn the_insertion_marker_waits_for_the_drag_to_rest_but_the_drop_does_not() {
+        let ids = [CardId::new(), CardId::new()];
+        let mut surface = Surface::new(&ids, false);
+        let redraw = |surface: &mut Surface, at, x| {
+            surface.event(Event::Window(window::Event::RedrawRequested(at)), x)
+        };
+        assert!(surface.press(10.0).is_empty());
+        assert!(surface.moved(100.0).is_empty());
+        assert!(surface.moved(150.0).is_empty());
+        assert_eq!(marked(&surface.tree), None, "sweeping draws no marker");
+        redraw(&mut surface, Instant::now() + HIGHLIGHT_DWELL, 150.0);
+        assert_eq!(
+            marked(&surface.tree),
+            Some(None),
+            "resting at the end marks the end"
+        );
+        assert!(surface.moved(10.0).is_empty());
+        assert_eq!(
+            marked(&surface.tree),
+            None,
+            "a new place hides the old marker until the drag rests there"
+        );
+        assert!(surface.moved(150.0).is_empty());
+        assert_eq!(
+            surface.release(150.0),
+            vec![Action::Drop(ids[0], None)],
+            "an unsettled drag still drops where it is"
+        );
     }
 
     #[test]
@@ -1339,7 +1586,7 @@ mod tests {
         }
         let ids = [CardId::new(), CardId::new()];
         let channel = ChannelId::new();
-        let make = |generation, modal: bool| {
+        let make = |generation, modal: bool, retained: bool| {
             let target = channel_target(
                 widget::button::custom(widget::Space::new())
                     .width(120)
@@ -1348,6 +1595,11 @@ mod tests {
                 channel,
                 true,
             );
+            let target = if retained {
+                Element::new(Retained(target))
+            } else {
+                target
+            };
             let base = channel_scope(
                 widget::row::with_children(vec![target, tabs(&ids, false)]),
                 Id::new("reorder.test"),
@@ -1374,9 +1626,9 @@ mod tests {
         let press = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
         let release = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
         let mut renderer = Surface::new(&ids, false).renderer;
-        for modal in [true, false] {
+        for (modal, retained) in [(true, false), (false, false), (true, true), (false, true)] {
             let mut ui = UserInterface::build(
-                make(1, false),
+                make(1, false, retained),
                 Size::new(280.0, 30.0),
                 Cache::new(),
                 &mut renderer,
@@ -1393,12 +1645,27 @@ mod tests {
             let mut highlighted = Highlights(0);
             ui.operate(&renderer, &mut highlighted);
             assert_eq!(
+                highlighted.0, 0,
+                "a drag passing over a channel does not highlight it yet"
+            );
+            let _ = ui.update(
+                &[Event::Window(window::Event::RedrawRequested(
+                    Instant::now() + HIGHLIGHT_DWELL,
+                ))],
+                mouse::Cursor::Available(Point::new(20.0, 15.0)),
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            let mut highlighted = Highlights(0);
+            ui.operate(&renderer, &mut highlighted);
+            assert_eq!(
                 highlighted.0, 1,
-                "the actual native drag reached its channel target"
+                "the actual native drag settled on its channel target"
             );
             let generation = if modal { 1 } else { 2 };
             ui = UserInterface::build(
-                make(generation, modal),
+                make(generation, modal, retained),
                 Size::new(280.0, 30.0),
                 ui.into_cache(),
                 &mut renderer,
@@ -1421,7 +1688,7 @@ mod tests {
             }
             assert!(messages.is_empty());
             ui = UserInterface::build(
-                make(generation, false),
+                make(generation, false, retained),
                 Size::new(280.0, 30.0),
                 ui.into_cache(),
                 &mut renderer,

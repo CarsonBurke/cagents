@@ -1,3 +1,6 @@
+#[cfg(test)]
+use crate::flock::fdinfo_owns_lock as fdinfo_owns_slot;
+use crate::flock::{flock_owner, process_owns_lock as process_owns_slot};
 use std::{
     env,
     fs::{self, File, OpenOptions},
@@ -24,8 +27,11 @@ use std::{
 };
 
 mod daemon_admission;
+#[doc(hidden)]
+pub mod ui_options;
+pub use daemon_admission::DaemonStillStarting;
 pub(crate) use daemon_admission::{
-    DAEMON_FENCE_ENV, DaemonAdmissionGuard, LaunchFence, has_inherited_daemon_fence,
+    AdmissionFence, DAEMON_FENCE_ENV, DaemonAdmissionGuard, LaunchFence, daemon_launch_is_updating,
     inherit_daemon_fence,
 };
 
@@ -47,6 +53,20 @@ const MAX_ACTIVATION_LINE_BYTES: usize = 4096;
 const PRIVATE_FILE_MODE: u32 = 0o600;
 const LEASE_CAPABLE_PROCESS_NAME: &str = "cagents-ui-v2";
 const LEGACY_PROCESS_NAME: &str = "cagents-ui";
+/// The modes `cagents-ui` spawns itself with, each its first argument. None of
+/// them takes the window lease or opens the session store.
+pub const CONFIRM_DAEMON_STOP_MODE: &str = "--confirm-daemon-stop";
+pub const STARTUP_ERROR_MODE: &str = "--startup-error";
+pub const STARTUP_UPDATE_MODE: &str = "--startup-update";
+pub const STARTUP_WAIT_MODE: &str = "--startup-wait";
+pub const RENDER_PAGE_MODE: &str = "--internal-render-page";
+const HELPER_MODES: [&str; 5] = [
+    CONFIRM_DAEMON_STOP_MODE,
+    STARTUP_ERROR_MODE,
+    STARTUP_UPDATE_MODE,
+    STARTUP_WAIT_MODE,
+    RENDER_PAGE_MODE,
+];
 const LEASE_MARKER_FILE: &str = ".cagents-ui-lease-v1";
 // `full` names the product that ships the embedded browser: it claims that
 // package's application id, window class, and peer directory. A UI built with
@@ -75,6 +95,64 @@ pub const UI_LAUNCH_RECOVERY_PROGRESS_PREFIX: &str = "recovering: ";
 
 pub const PRIMARY_WINDOW: &str = "primary";
 static WINDOW_SLOT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Recovery windows may display existing owners and retained history, while
+/// provider starts continue to require an explicit action in the pane.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WindowRestorePolicy {
+    #[default]
+    Ordinary,
+    ExistingOnly,
+}
+
+pub const RESTORE_EXISTING_ONLY_ARGUMENT: &str = "--restore-existing-only";
+struct WindowRestore {
+    launch: WindowRestorePolicy,
+    finished: AtomicBool,
+}
+static WINDOW_RESTORE_POLICY: OnceLock<WindowRestore> = OnceLock::new();
+
+/// Set once from this UI process's argv. A launch policy is never inherited by
+/// ordinary children through an environment marker.
+pub fn initialize_window_restore_policy(policy: WindowRestorePolicy) -> io::Result<()> {
+    let selected = WINDOW_RESTORE_POLICY.get_or_init(|| WindowRestore {
+        launch: policy,
+        finished: AtomicBool::new(false),
+    });
+    if selected.launch != policy {
+        return Err(io::Error::other(
+            "window restore policy already initialized",
+        ));
+    }
+    Ok(())
+}
+
+pub fn window_restore_policy() -> WindowRestorePolicy {
+    WINDOW_RESTORE_POLICY
+        .get()
+        .map_or(WindowRestorePolicy::Ordinary, |restore| {
+            if restore.finished.load(Ordering::Acquire) {
+                WindowRestorePolicy::Ordinary
+            } else {
+                restore.launch
+            }
+        })
+}
+
+pub(crate) fn window_launch_restore_policy() -> WindowRestorePolicy {
+    WINDOW_RESTORE_POLICY
+        .get()
+        .map_or(WindowRestorePolicy::Ordinary, |restore| restore.launch)
+}
+
+/// The startup gate reached its saved-pane verdict, including an incomplete
+/// recovery. Later work uses ordinary admission; already-issued pane tasks
+/// retain their explicitly captured attachment-only intent.
+pub(crate) fn finish_window_restore() {
+    if let Some(restore) = WINDOW_RESTORE_POLICY.get() {
+        restore.finished.store(true, Ordering::Release);
+    }
+}
 
 pub fn window_slot() -> &'static str {
     WINDOW_SLOT
@@ -142,19 +220,34 @@ fn destination_socket_name(destination: &crate::notifications::Destination) -> S
 /// A lock ends with its owning scope, even if a concurrent fork inherited the
 /// file description and has not reached exec yet. Closing a File alone does
 /// not release flock until every inherited descriptor has also closed.
-pub(crate) struct OwnedLock(File);
+#[derive(Debug)]
+pub(crate) struct OwnedLock(Option<File>);
 
 impl std::ops::Deref for OwnedLock {
     type Target = File;
 
     fn deref(&self) -> &File {
-        &self.0
+        self.0.as_ref().expect("owned lock file")
+    }
+}
+
+impl OwnedLock {
+    fn file_mut(&mut self) -> &mut File {
+        self.0.as_mut().expect("owned lock file")
+    }
+
+    /// Hand this description to a process that already inherited its own copy.
+    /// Closing the returned file preserves that recipient's lock ownership.
+    pub(crate) fn into_file(mut self) -> File {
+        self.0.take().expect("owned lock file")
     }
 }
 
 impl Drop for OwnedLock {
     fn drop(&mut self) {
-        let _ = self.0.unlock();
+        if let Some(file) = &self.0 {
+            let _ = file.unlock();
+        }
     }
 }
 
@@ -185,7 +278,81 @@ pub(crate) fn owned_file_lock(lock: File, operation: i32) -> io::Result<OwnedLoc
     if unsafe { libc::flock(lock.as_raw_fd(), operation) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(OwnedLock(lock))
+    Ok(OwnedLock(Some(lock)))
+}
+
+/// Expected contention with the installation coordinator, distinct from a
+/// filesystem failure or a window that is already open.
+#[derive(Debug, Error)]
+#[error("an update is in progress")]
+pub struct UpdateInProgress;
+
+pub fn is_update_in_progress(error: &(dyn std::error::Error + 'static)) -> bool {
+    caused_by::<UpdateInProgress>(error)
+}
+
+/// Whether a window gave up waiting for a daemon that is still starting.
+pub fn is_daemon_still_starting(error: &(dyn std::error::Error + 'static)) -> bool {
+    caused_by::<DaemonStillStarting>(error)
+}
+
+fn caused_by<T: std::error::Error + 'static>(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if error.is::<T>()
+            || error
+                .downcast_ref::<io::Error>()
+                .is_some_and(|error| error.get_ref().is_some_and(|inner| inner.is::<T>()))
+        {
+            return true;
+        }
+        current = error.source();
+    }
+    false
+}
+
+/// Observe an existing private lock without creating, repairing, or retaining
+/// it. This is a point-in-time status observation, never launch admission.
+#[cfg(feature = "ui")]
+pub(crate) fn private_lock_is_held(path: &Path) -> io::Result<bool> {
+    let named = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let safe = |metadata: &fs::Metadata| {
+        metadata.is_file()
+            && metadata.uid() == current_uid()
+            && metadata.mode() & 0o077 == 0
+            && metadata.nlink() == 1
+    };
+    if !safe(&named) {
+        return Err(io::Error::other("update ownership is unavailable"));
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)?;
+    let opened = file.metadata()?;
+    let same = |a: &fs::Metadata, b: &fs::Metadata| a.dev() == b.dev() && a.ino() == b.ino();
+    if !safe(&opened) || !same(&named, &opened) {
+        return Err(io::Error::other("update ownership changed"));
+    }
+    let held = match owned_file_lock(file, libc::LOCK_SH | libc::LOCK_NB) {
+        Ok(_probe) => false,
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => true,
+        Err(error) => return Err(error),
+    };
+    let current = fs::symlink_metadata(path)?;
+    if !safe(&current) || !same(&opened, &current) {
+        return Err(io::Error::other("update ownership changed"));
+    }
+    Ok(held)
+}
+
+#[cfg(feature = "ui")]
+pub(crate) fn update_fence_held() -> io::Result<bool> {
+    private_lock_is_held(&runtime_directory()?.join(format!("{APPLICATION_LOCK_FILE}.update")))
 }
 
 /// A slot owns its full workspace snapshot; terminal identifiers still refer to
@@ -197,36 +364,62 @@ pub struct WindowLease {
 }
 
 impl WindowLease {
+    /// Take this window's lease, waiting quietly while a starting daemon
+    /// holds the launch fence. See [`WindowLease::acquire_waiting`].
     pub fn acquire(new_window: bool, requested: Option<&str>) -> io::Result<Self> {
-        let (lease, slot) = Self::acquire_in(&runtime_directory()?, new_window, requested)?;
+        Self::acquire_waiting(new_window, requested, &mut |_| {})
+    }
+
+    /// Take this window's lease. While a starting daemon holds the launch
+    /// fence for its admission, wait for it: `waiting` hears each check that
+    /// finds it still starting, with the time waited so far. An update fails
+    /// at once with [`UpdateInProgress`]; a daemon that does not finish in
+    /// time fails with [`DaemonStillStarting`].
+    pub fn acquire_waiting(
+        new_window: bool,
+        requested: Option<&str>,
+        waiting: &mut dyn FnMut(Duration),
+    ) -> io::Result<Self> {
+        let (lease, slot) = Self::acquire_waiting_in(
+            &runtime_directory()?,
+            new_window,
+            requested,
+            daemon_admission::admission_wait_timeout(),
+            waiting,
+        )?;
         let mut identity = owned_lock(
             &runtime_directory()?.join(format!("{ACTIVATION_SOCKET_FILE}.{slot}.device")),
             libc::LOCK_EX,
         )?;
-        identity.0.set_len(0)?;
+        identity.set_len(0)?;
         if let Some(device) = crate::device::selected() {
-            identity.0.write_all(device.name.as_bytes())?;
+            identity.file_mut().write_all(device.name.as_bytes())?;
         }
-        identity.0.sync_all()?;
+        identity.sync_all()?;
         WINDOW_SLOT
             .set(slot)
             .map_err(|_| io::Error::other("window slot already initialized"))?;
         Ok(lease)
     }
 
+    #[cfg(test)]
     fn acquire_in(
         runtime: &Path,
         new_window: bool,
         requested: Option<&str>,
     ) -> io::Result<(Self, String)> {
+        Self::acquire_waiting_in(runtime, new_window, requested, Duration::ZERO, &mut |_| {})
+    }
+
+    fn acquire_waiting_in(
+        runtime: &Path,
+        new_window: bool,
+        requested: Option<&str>,
+        admission_timeout: Duration,
+        waiting: &mut dyn FnMut(Duration),
+    ) -> io::Result<(Self, String)> {
         require_owned_runtime_directory(runtime)?;
-        let _launch = owned_lock(
-            &runtime.join(format!("{APPLICATION_LOCK_FILE}.update")),
-            libc::LOCK_SH | libc::LOCK_NB,
-        )
-        .map_err(|error| {
-            io::Error::new(error.kind(), format!("an update is in progress: {error}"))
-        })?;
+        let _launch = daemon_admission::shared_launch_fence(runtime, admission_timeout, waiting)?;
         if !IS_DEVELOPMENT && peer_ui_predates_lease(Path::new(PEER_PACKAGE_DIRECTORY)) {
             return Err(io::Error::other(
                 "installed peer UI predates the shared-session lease; upgrade that package first",
@@ -256,7 +449,7 @@ impl WindowLease {
                 libc::LOCK_EX | libc::LOCK_NB,
             ) {
                 Ok(mut lock) => {
-                    daemon_admission::publish_capability(&mut lock.0)?;
+                    daemon_admission::publish_capability(lock.file_mut())?;
                     return Ok((
                         Self {
                             _legacy_fence: legacy,
@@ -277,6 +470,65 @@ impl WindowLease {
         }
         Err(io::Error::other("all window slots are occupied"))
     }
+}
+
+/// The detached notice a starting window shows while it waits for the daemon,
+/// with the lock that makes it the only one on screen.
+#[cfg(feature = "ui")]
+static STARTUP_WAIT_NOTICE: std::sync::Mutex<Option<(process::Child, OwnedLock)>> =
+    std::sync::Mutex::new(None);
+
+/// Show a starting window's wait notice until [`dismiss_startup_wait_notice`].
+///
+/// Launches that wait together wait for the same daemon, so one notice speaks
+/// for all of them: while another starting window shows one, this does
+/// nothing. The lock outside the window slot namespace ends with its holder.
+#[cfg(feature = "ui")]
+pub fn show_startup_wait_notice(
+    spawn: impl FnOnce() -> io::Result<process::Child>,
+) -> io::Result<()> {
+    let lock = match owned_lock(
+        &runtime_directory()?.join(format!("{APPLICATION_LOCK_FILE}-startup-notice")),
+        libc::LOCK_EX | libc::LOCK_NB,
+    ) {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let notice = spawn()?;
+    let previous = STARTUP_WAIT_NOTICE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .replace((notice, lock));
+    if let Some((previous, _)) = previous {
+        close_startup_wait_notice(previous);
+    }
+    Ok(())
+}
+
+/// Close the wait notice, if one is showing: the window it stood in for has
+/// opened, or startup has ended in another way that explains itself.
+#[cfg(feature = "ui")]
+pub fn dismiss_startup_wait_notice() {
+    let notice = STARTUP_WAIT_NOTICE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some((notice, _lock)) = notice {
+        close_startup_wait_notice(notice);
+    }
+}
+
+#[cfg(feature = "ui")]
+fn close_startup_wait_notice(mut notice: process::Child) {
+    // The notice holds no state. Signal it here and reap it elsewhere, so
+    // neither the UI thread nor an exiting launch waits for its teardown.
+    let _ = notice.kill();
+    let _ = thread::Builder::new()
+        .name("cagents-startup-notice-reaper".into())
+        .spawn(move || {
+            let _ = notice.wait();
+        });
 }
 
 pub fn ui_launch_handshake_requested() -> bool {
@@ -324,7 +576,7 @@ pub fn report_ui_startup(result: &Result<(), String>) -> io::Result<()> {
 pub use crate::runtime_state::{RecoveredPanicScope, recovered_panic_scope};
 
 pub fn install_panic_hook(product: &'static str) {
-    install_panic_hook_with_version(product, crate::VERSION);
+    install_panic_hook_with_version(product, crate::version());
 }
 
 pub fn install_panic_hook_with_version(product: &'static str, version: &'static str) {
@@ -353,6 +605,55 @@ pub fn install_panic_hook_with_version(product: &'static str, version: &'static 
 
 pub fn report_startup_failure() {
     crate::diagnostics::record(crate::diagnostics::Event::StartupFailed);
+}
+
+/// A file a development daemon appends its standard error, and so its tracing
+/// and panic output, to. Daemons are spawned with standard error on
+/// `/dev/null`; `scripts/run-development --daemon-log PATH` sets this so a
+/// development run can read what its daemon did.
+pub const DEVELOPMENT_DAEMON_LOG_ENV: &str = "CAGENTS_DEVELOPMENT_DAEMON_LOG";
+
+/// Points standard error at [`DEVELOPMENT_DAEMON_LOG_ENV`]'s file when a
+/// development build names one, and removes the variable so the daemon's
+/// terminals and agents do not inherit it; children that inherit standard
+/// error, such as helpers, write to the same file. Production builds ignore
+/// the variable. A file that cannot be opened is reported on the original
+/// standard error, which a spawned daemon has on `/dev/null`.
+///
+/// # Safety
+/// Call from the single-threaded entry point: this changes the environment.
+pub unsafe fn redirect_development_daemon_log() {
+    let Some(path) = env::var_os(DEVELOPMENT_DAEMON_LOG_ENV) else {
+        return;
+    };
+    // SAFETY: the caller guarantees that no other thread accesses environment.
+    unsafe { env::remove_var(DEVELOPMENT_DAEMON_LOG_ENV) };
+    if !IS_DEVELOPMENT {
+        return;
+    }
+    let file = match OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            eprintln!(
+                "cagentsd: cannot open daemon log {}: {error}",
+                Path::new(&path).display()
+            );
+            return;
+        }
+    };
+    // SAFETY: both descriptors are open; dup2 replaces descriptor 2 atomically.
+    if unsafe { libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO) } < 0 {
+        eprintln!(
+            "cagentsd: cannot write daemon log: {}",
+            io::Error::last_os_error()
+        );
+    }
 }
 
 pub fn install_tracing(_product: &'static str, default_filter: &str) {
@@ -415,20 +716,48 @@ pub fn window_database_path(slot: &str) -> io::Result<PathBuf> {
 }
 
 pub fn window_database_paths() -> io::Result<Vec<PathBuf>> {
-    let primary = window_database_path(PRIMARY_WINDOW)?;
+    window_database_paths_at(window_database_path(PRIMARY_WINDOW)?)
+}
+
+fn window_database_paths_at(primary: PathBuf) -> io::Result<Vec<PathBuf>> {
+    // Old inactive snapshots are retained for ordinary reopening/migration.
+    // Bound enumeration before allocating paths or opening SQLite stores.
+    const MAX_STORES: usize = 1024;
+    const MAX_ENTRIES: usize = 8192;
     let mut paths = vec![primary.clone()];
     let windows = primary.parent().unwrap().join("windows");
     match fs::read_dir(windows) {
         Ok(entries) => {
-            for entry in entries {
+            for (index, entry) in entries.enumerate() {
+                if index >= MAX_ENTRIES {
+                    return Err(io::Error::other(
+                        "Saved window enumeration exceeds its bounded entry limit",
+                    ));
+                }
                 let entry = entry?;
                 if entry.file_type()?.is_dir()
                     && let Some(slot) = entry.file_name().to_str()
                     && validate_window_slot(slot).is_ok()
                 {
                     let path = entry.path().join("sessions.sqlite3");
-                    if path.is_file() {
-                        paths.push(path);
+                    match fs::symlink_metadata(&path) {
+                        Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
+                            if paths.len() >= MAX_STORES {
+                                return Err(io::Error::other(
+                                    "Saved window inventory exceeds its bounded store limit",
+                                ));
+                            }
+                            // Include symlinks so the NOFOLLOW reader reports
+                            // a refusal instead of silently omitting a store.
+                            paths.push(path);
+                        }
+                        Ok(_) => {
+                            return Err(io::Error::other(
+                                "Saved window store is not a regular database file",
+                            ));
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error),
                     }
                 }
             }
@@ -465,12 +794,13 @@ fn running_window_slots(runtime: &Path) -> io::Result<Vec<String>> {
 
 /// A shared launch fence prevents a reviewed handoff from committing while a
 /// public launcher authenticates and restores the surviving window's daemon.
+/// Like a window, it waits out a daemon admission and refuses an update.
 pub(crate) fn recovery_launch_fence() -> io::Result<OwnedLock> {
-    owned_lock(
-        &runtime_directory()?.join(format!("{APPLICATION_LOCK_FILE}.update")),
-        libc::LOCK_SH | libc::LOCK_NB,
+    daemon_admission::shared_launch_fence(
+        &runtime_directory()?,
+        daemon_admission::admission_wait_timeout(),
+        &mut |_| {},
     )
-    .map_err(|error| io::Error::new(error.kind(), format!("an update is in progress: {error}")))
 }
 
 static EDITOR_PROTECTION_READY: OnceLock<OwnedLock> = OnceLock::new();
@@ -484,8 +814,16 @@ fn editor_ready_path(runtime: &Path, pid: u32) -> PathBuf {
     runtime.join(format!("{product}.worktrees-ready.{pid}"))
 }
 
+/// The launch fence for a standalone editor, which takes it on its UI thread
+/// while it opens. It never waits: a daemon still starting fails this at once
+/// with [`DaemonStillStarting`], and the editor says it cannot open its
+/// folders yet rather than freezing until the daemon is ready.
+pub(crate) fn editor_launch_fence() -> io::Result<OwnedLock> {
+    daemon_admission::shared_launch_fence(&runtime_directory()?, Duration::ZERO, &mut |_| {})
+}
+
 pub(crate) fn standalone_editor_protection_ready() -> io::Result<()> {
-    let _launch = recovery_launch_fence()?;
+    let _launch = editor_launch_fence()?;
     if EDITOR_PROTECTION_READY.get().is_none() {
         let lock = owned_lock(
             &editor_ready_path(&runtime_directory()?, process::id()),
@@ -633,11 +971,9 @@ pub(crate) fn window_protection_ready() -> io::Result<OwnedLock> {
 }
 
 /// Blocks new windows while automatic cleanup authenticates existing owners.
-pub(crate) fn worktree_mutation_launch_fence() -> io::Result<OwnedLock> {
-    owned_lock(
-        &runtime_directory()?.join(format!("{APPLICATION_LOCK_FILE}.update")),
-        libc::LOCK_EX | libc::LOCK_NB,
-    )
+/// Windows launched meanwhile wait for it rather than report an update.
+pub(crate) fn worktree_mutation_launch_fence() -> io::Result<AdmissionFence> {
+    AdmissionFence::acquire()
 }
 
 pub(crate) struct VerifiedWindow {
@@ -700,6 +1036,58 @@ impl VerifiedWindow {
         // SAFETY: poll points to one initialized descriptor and does not block.
         unsafe { libc::poll(&mut poll, 1, 0) == 0 }
     }
+
+    /// Signal exactly the pinned process; a reused PID is never addressed.
+    /// False means it had already exited.
+    fn signal(&self, signal: libc::c_int) -> io::Result<bool> {
+        // SAFETY: the pidfd is owned by self, the signal is valid, and a null
+        // siginfo with zero flags is the documented kill(2)-equivalent form.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.pidfd.as_raw_fd(),
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        if result == -1 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error);
+            }
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// Whether the pinned process exited within `timeout`. The kernel closes
+    /// its descriptors, and so releases its slot flock, before the pidfd
+    /// reports the exit.
+    fn wait_exit(&self, timeout: Duration) -> io::Result<bool> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let mut poll = libc::pollfd {
+                fd: self.pidfd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let milliseconds = libc::c_int::try_from(remaining.as_millis()).unwrap_or(i32::MAX);
+            // SAFETY: poll points to one initialized descriptor.
+            match unsafe { libc::poll(&mut poll, 1, milliseconds) } {
+                -1 => {
+                    let error = io::Error::last_os_error();
+                    if error.kind() != io::ErrorKind::Interrupted {
+                        return Err(error);
+                    }
+                }
+                0 if remaining.is_zero() => return Ok(false),
+                0 => {}
+                _ => return Ok(true),
+            }
+        }
+    }
 }
 
 /// Contention alone is not ownership: require the exact exclusive flock in the
@@ -739,31 +1127,6 @@ pub(crate) fn verified_windows_for_daemon(
         ));
     }
     Ok((windows, legacy))
-}
-
-fn flock_owner(line: &str, metadata: &fs::Metadata) -> Option<u32> {
-    let fields: Vec<_> = line.split_whitespace().collect();
-    if fields.len() != 8
-        || fields[1..4] != ["FLOCK", "ADVISORY", "WRITE"]
-        || fields[6..8] != ["0", "EOF"]
-    {
-        return None;
-    }
-    let identity: Vec<_> = fields[5].split(':').collect();
-    if identity.len() != 3
-        || u64::from_str_radix(identity[0], 16).is_err()
-        || u64::from_str_radix(identity[1], 16).is_err()
-        || identity[2].parse::<u64>().ok() != Some(metadata.ino())
-    {
-        return None;
-    }
-    fields[4].parse::<u32>().ok().filter(|pid| *pid > 1)
-}
-
-fn fdinfo_owns_slot(info: &str, pid: u32, metadata: &fs::Metadata) -> bool {
-    info.lines()
-        .filter_map(|line| line.strip_prefix("lock:"))
-        .any(|line| flock_owner(line, metadata) == Some(pid))
 }
 
 fn verified_windows_in(runtime: &Path, proc_root: &Path) -> io::Result<Vec<VerifiedWindow>> {
@@ -847,21 +1210,6 @@ fn verified_window_lease_owners_in(
     Ok(owners)
 }
 
-fn process_owns_slot(process: &Path, pid: u32, expected: &fs::Metadata) -> io::Result<bool> {
-    Ok(fs::read_dir(process.join("fdinfo"))?
-        .filter_map(Result::ok)
-        .any(|entry| {
-            let descriptor = process.join("fd").join(entry.file_name());
-            let matches = |actual: fs::Metadata| {
-                actual.dev() == expected.dev() && actual.ino() == expected.ino()
-            };
-            fs::metadata(&descriptor).is_ok_and(&matches)
-                && fs::read_to_string(entry.path())
-                    .is_ok_and(|info| fdinfo_owns_slot(&info, pid, expected))
-                && fs::metadata(&descriptor).is_ok_and(matches)
-        }))
-}
-
 pub fn update_in_progress() -> bool {
     runtime_directory()
         .and_then(|runtime| {
@@ -895,12 +1243,178 @@ pub struct UiUpdateGuard {
     _legacy_fence: OwnedLock,
     prepared: Vec<String>,
     closed: Vec<String>,
+    close: CloseEvidence,
     fallback_executable: Option<PathBuf>,
+    restore_policy: WindowRestorePolicy,
+}
+
+/// A committed window is already closing. After this long its update stops
+/// waiting politely: Drop reopens without it, and recovery ends or signals it.
+const COMMITTED_WINDOW_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a saved window that ignored its close deadline has after SIGTERM.
+const SAVED_WINDOW_TERMINATE_GRACE: Duration = Duration::from_secs(5);
+/// SIGKILL cannot be refused; this only bounds the kernel's teardown.
+const SAVED_WINDOW_KILL_REAP: Duration = Duration::from_secs(5);
+/// How often recovery reports a window it is still waiting for.
+const UNPROVEN_WINDOW_PROGRESS: Duration = Duration::from_secs(15);
+
+/// A lingering window that cannot be proven to have saved since closing.
+struct Unproven<'a> {
+    reason: String,
+    /// The pinned process of a window that acknowledged closing and has not
+    /// been seen to give up its slot: a daemon cannot start beside it.
+    /// None for a window that may be healthy, such as one that never
+    /// acknowledged or whose slot another process now holds.
+    closing: Option<Closing<'a>>,
+}
+
+struct Closing<'a> {
+    window: &'a VerifiedWindow,
+    /// Verified as the slot's current owner, so it may be signalled.
+    owns_slot: bool,
+}
+
+impl<'a> Unproven<'a> {
+    fn unknown(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            closing: None,
+        }
+    }
+
+    fn closing(reason: String, window: &'a VerifiedWindow, owns_slot: bool) -> Self {
+        Self {
+            reason,
+            closing: Some(Closing { window, owns_slot }),
+        }
+    }
+}
+
+/// What the update can prove about each window it is closing.
+#[derive(Default)]
+struct CloseEvidence {
+    /// Window processes pinned when the update prepared them, by slot. A
+    /// forced close signals exactly that process, never a reused PID.
+    pinned: Vec<(String, VerifiedWindow)>,
+    /// Slots whose window acknowledged update-commit, with the wall-clock
+    /// millisecond at which the commit was requested. Final-flush evidence
+    /// recorded before that instant belongs to an earlier save.
+    committed: Vec<(String, u64)>,
+}
+
+fn unix_millis_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+fn close_deadline_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        "windows did not finish saving and closing; update cancelled",
+    )
+}
+
+/// End windows that saved their workspace and acknowledged closing but are
+/// still running: SIGTERM to all, one shared grace period, then SIGKILL to
+/// any that remain. Every step is logged to the update job.
+fn end_saved_windows(
+    windows: &[(&str, &VerifiedWindow)],
+    waited: Duration,
+    grace: Duration,
+) -> io::Result<()> {
+    let signal = |slot: &str, window: &VerifiedWindow, signal, name| {
+        window.signal(signal).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "could not send {name} to window {slot} (pid {}): {error}",
+                    window.pid
+                ),
+            )
+        })
+    };
+    let mut running = Vec::with_capacity(windows.len());
+    for &(slot, window) in windows {
+        let pid = window.pid;
+        if signal(slot, window, libc::SIGTERM, "SIGTERM")? {
+            eprintln!(
+                "Window {slot} (pid {pid}) saved its workspace and acknowledged closing, but is still running after {}s; sent SIGTERM.",
+                waited.as_secs()
+            );
+            running.push((slot, window));
+        } else {
+            eprintln!(
+                "Window {slot} (pid {pid}) exited on its own after {}s.",
+                waited.as_secs()
+            );
+        }
+    }
+    let deadline = std::time::Instant::now() + grace;
+    let mut killed = Vec::new();
+    for (slot, window) in running {
+        let pid = window.pid;
+        if window.wait_exit(deadline.saturating_duration_since(std::time::Instant::now()))? {
+            eprintln!("Window {slot} (pid {pid}) exited after SIGTERM.");
+            continue;
+        }
+        if signal(slot, window, libc::SIGKILL, "SIGKILL")? {
+            eprintln!(
+                "Window {slot} (pid {pid}) did not exit within {}s of SIGTERM; sent SIGKILL.",
+                grace.as_secs()
+            );
+            killed.push((slot, window));
+        } else {
+            eprintln!("Window {slot} (pid {pid}) exited after SIGTERM.");
+        }
+    }
+    let deadline = std::time::Instant::now() + SAVED_WINDOW_KILL_REAP;
+    for (slot, window) in killed {
+        let pid = window.pid;
+        if !window.wait_exit(deadline.saturating_duration_since(std::time::Instant::now()))? {
+            return Err(io::Error::other(format!(
+                "window {slot} (pid {pid}) did not exit after SIGKILL"
+            )));
+        }
+        eprintln!("Window {slot} (pid {pid}) exited after SIGKILL.");
+    }
+    Ok(())
 }
 
 impl UiUpdateGuard {
+    /// Retain this exact exclusive fence through an authenticated recovery.
+    /// A plain File duplicate closes without explicitly unlocking its parent.
+    pub(crate) fn duplicate_for_recovery(&self) -> io::Result<(File, File)> {
+        let fence = self
+            .lock
+            .as_ref()
+            .ok_or_else(|| io::Error::other("update launch fence was released"))?
+            .try_clone()?;
+        Ok((fence, self._legacy_fence.try_clone()?))
+    }
+
+    /// Exact slots frozen by this update, for an explicitly authorized recovery.
+    pub(crate) fn prepared_window_slots(&self) -> &[String] {
+        &self.prepared
+    }
+
+    /// The authenticated windows while this guard is held. Its shared legacy
+    /// fence already excludes a legacy exclusive UI owner, so absence of
+    /// window leases means no windows; probing legacy exclusivity again would
+    /// conflict with the guard's own fence.
+    pub(crate) fn verified_windows(&self) -> io::Result<Vec<VerifiedWindow>> {
+        verified_window_lease_owners_in(&self.runtime, Path::new("/proc"))
+    }
+
     pub fn set_fallback_executable(&mut self, executable: PathBuf) {
         self.fallback_executable = Some(executable);
+    }
+
+    /// Apply to every later launch, including Drop after a partial close.
+    pub(crate) fn set_recovery_restore_only(&mut self) {
+        self.restore_policy = WindowRestorePolicy::ExistingOnly;
     }
 
     pub fn has_running_windows(&self) -> io::Result<bool> {
@@ -961,7 +1475,9 @@ impl UiUpdateGuard {
             runtime,
             prepared: Vec::new(),
             closed: Vec::new(),
+            close: CloseEvidence::default(),
             fallback_executable: None,
+            restore_policy: WindowRestorePolicy::Ordinary,
         })
     }
 
@@ -975,10 +1491,18 @@ impl UiUpdateGuard {
         timeout: Duration,
         preflight: impl FnOnce(&Self) -> io::Result<()>,
     ) -> io::Result<Vec<String>> {
+        let slots = self.prepare_windows(timeout)?;
+        preflight(self)?;
+        self.close_prepared_windows(&slots, timeout)?;
+        Ok(slots)
+    }
+
+    /// Flush and freeze windows while a candidate asks for destructive consent.
+    /// Dropping the guard cancels preparation without closing a window.
+    pub(crate) fn prepare_windows(&mut self, timeout: Duration) -> io::Result<Vec<String>> {
         let deadline = std::time::Instant::now() + timeout;
         let slots = running_window_slots(&self.runtime)?;
         for slot in &slots {
-            // Include a possibly timed-out participant in cancellation.
             self.prepared.push(slot.clone());
             update_window(
                 &self.runtime,
@@ -987,34 +1511,327 @@ impl UiUpdateGuard {
                 deadline.saturating_duration_since(std::time::Instant::now()),
             )?;
         }
-        preflight(self)?;
-        if std::time::Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "Source inspection exceeded the window preparation allowance; source windows remain usable",
-            ));
+        // Pin each prepared process now, while its identity is reviewed. A
+        // window that cannot be pinned is never forced closed later.
+        match verified_window_lease_owners_in(&self.runtime, Path::new("/proc")) {
+            Ok(windows) => {
+                self.close.pinned = windows
+                    .into_iter()
+                    .filter_map(|window| {
+                        let slot = slots.iter().find(|slot| {
+                            window.lease_path == self.runtime.join(slot_lock_name(slot))
+                        })?;
+                        Some((slot.clone(), window))
+                    })
+                    .collect();
+            }
+            Err(error) => eprintln!(
+                "Could not identify the prepared window processes: {error}. A window that does not close in time cancels the update."
+            ),
         }
-        for slot in &slots {
+        Ok(slots)
+    }
+
+    /// Human review has no window-RPC deadline. Closing gets its own budget.
+    pub(crate) fn close_prepared_windows(
+        &mut self,
+        slots: &[String],
+        timeout: Duration,
+    ) -> io::Result<()> {
+        self.close_prepared_windows_with(
+            slots,
+            timeout,
+            crate::diagnostics::ui_final_flush_complete,
+            SAVED_WINDOW_TERMINATE_GRACE,
+        )
+    }
+
+    fn close_prepared_windows_with(
+        &mut self,
+        slots: &[String],
+        timeout: Duration,
+        flushed: impl Fn(u32, u64) -> io::Result<bool>,
+        grace: Duration,
+    ) -> io::Result<()> {
+        let deadline = std::time::Instant::now() + timeout;
+        for slot in slots {
             // A lost ACK cannot prove that the UI did not accept an irreversible close.
             self.closed.push(slot.clone());
+            let requested = unix_millis_now();
             update_window(
                 &self.runtime,
                 slot,
                 "update-commit",
                 deadline.saturating_duration_since(std::time::Instant::now()),
             )?;
+            self.close.committed.push((slot.clone(), requested));
         }
         while !running_window_slots(&self.runtime)?.is_empty() {
             if std::time::Instant::now() >= deadline {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "windows did not finish saving and closing; update cancelled",
-                ));
+                self.terminate_saved_windows(timeout, &flushed, grace)?;
+                break;
             }
             std::thread::sleep(Duration::from_millis(25));
         }
         self.prepared.clear();
-        Ok(slots)
+        Ok(())
+    }
+
+    /// At the close deadline, end windows that already saved but did not
+    /// exit. Each must have acknowledged update-commit and then recorded a
+    /// complete final flush; nothing it owns remains unsaved. Any other
+    /// lingering window cancels the update, and every window keeps running.
+    fn terminate_saved_windows(
+        &self,
+        waited: Duration,
+        flushed: &impl Fn(u32, u64) -> io::Result<bool>,
+        grace: Duration,
+    ) -> io::Result<()> {
+        let lingering = running_window_slots(&self.runtime)?;
+        let mut saved = Vec::with_capacity(lingering.len());
+        for slot in &lingering {
+            match self.saved_window(slot, flushed) {
+                Ok(Some(window)) => saved.push((slot.as_str(), window)),
+                Ok(None) => eprintln!("Window {slot} exited at the close deadline."),
+                Err(Unproven { reason, .. }) => {
+                    eprintln!(
+                        "Window {slot} is still open after {}s and {reason}; it keeps running.",
+                        waited.as_secs()
+                    );
+                    return Err(close_deadline_error());
+                }
+            }
+        }
+        end_saved_windows(&saved, waited, grace)?;
+        let remaining = running_window_slots(&self.runtime)?;
+        if !remaining.is_empty() {
+            eprintln!(
+                "Window {} still holds a slot after the saved windows exited.",
+                remaining.join(", ")
+            );
+            return Err(close_deadline_error());
+        }
+        eprintln!("Every window closed; continuing the update.");
+        Ok(())
+    }
+
+    /// The pinned window for `slot` if it is proven to have nothing unsaved,
+    /// or None if that process has already exited and released its slot.
+    fn saved_window(
+        &self,
+        slot: &str,
+        flushed: &impl Fn(u32, u64) -> io::Result<bool>,
+    ) -> Result<Option<&VerifiedWindow>, Unproven<'_>> {
+        let Some((_, window)) = self.close.pinned.iter().find(|(s, _)| s == slot) else {
+            return Err(Unproven::unknown(
+                "its process was not identified when the update prepared it",
+            ));
+        };
+        // An exit between listing slots and verifying the process is success,
+        // not an unverifiable window: its procfs entries are already gone.
+        let exited = |window: &VerifiedWindow| !window.is_alive();
+        if exited(window) {
+            return Ok(None);
+        }
+        let Some((_, requested)) = self.close.committed.iter().find(|(s, _)| s == slot) else {
+            return Err(Unproven::unknown("did not acknowledge closing"));
+        };
+        match window.still_owns_lease() {
+            Ok(true) => {}
+            _ if exited(window) => return Ok(None),
+            Ok(false) => {
+                return Err(Unproven::unknown(
+                    "its slot now belongs to a different process",
+                ));
+            }
+            Err(error) => {
+                return Err(Unproven::closing(
+                    format!("its process could not be verified: {error}"),
+                    window,
+                    false,
+                ));
+            }
+        }
+        match flushed(window.pid, *requested) {
+            Ok(true) => Ok(Some(window)),
+            Ok(false) => Err(Unproven::closing(
+                "has not reported that its workspace was saved".into(),
+                window,
+                true,
+            )),
+            Err(error) => Err(Unproven::closing(
+                format!("its save report could not be read: {error}"),
+                window,
+                true,
+            )),
+        }
+    }
+
+    /// Before a daemon restarts after rollback, ensure no committed window
+    /// still holds its slot. A daemon admits only authenticated live windows,
+    /// and a half-exited one fails that check: a daemon restarted beside it
+    /// exits instead of serving. Wait for committed windows, then end those
+    /// that already saved. Any other window that acknowledged closing and
+    /// still holds its slot gets one SIGTERM and is waited for without a cap,
+    /// since starting beside it cannot succeed; only interrupting this worker
+    /// ends that wait, with Interrupted. Windows that never acknowledged, or
+    /// whose slot another process now holds, may be healthy live windows the
+    /// daemon admits: they are left alone and the restart proceeds.
+    pub(crate) fn settle_committed_windows(&self) -> io::Result<()> {
+        // Only a signal to this worker ends the wait: a daemon started beside
+        // a window that holds its slot can only be refused.
+        let _interrupt = crate::update::WorkerInterrupt::install()?;
+        self.settle_committed_windows_with(
+            COMMITTED_WINDOW_EXIT_TIMEOUT,
+            crate::diagnostics::ui_final_flush_complete,
+            SAVED_WINDOW_TERMINATE_GRACE,
+            crate::update::WorkerInterrupt::requested,
+            UNPROVEN_WINDOW_PROGRESS,
+        )
+    }
+
+    fn settle_committed_windows_with(
+        &self,
+        timeout: Duration,
+        flushed: impl Fn(u32, u64) -> io::Result<bool>,
+        grace: Duration,
+        interrupted: impl Fn() -> bool,
+        progress: Duration,
+    ) -> io::Result<()> {
+        match self.wait_for_committed_windows_within(timeout) {
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => {}
+            settled => return settled,
+        }
+        let live = running_window_slots(&self.runtime)?;
+        let mut unsaved = Vec::new();
+        let mut saved = Vec::new();
+        for slot in self.closed.iter().filter(|slot| live.contains(slot)) {
+            match self.saved_window(slot, &flushed) {
+                Ok(Some(window)) => saved.push((slot.as_str(), window)),
+                Ok(None) => {}
+                Err(Unproven {
+                    reason,
+                    closing: Some(closing),
+                }) => {
+                    eprintln!(
+                        "Window {slot} is still closing after {}s and {reason}.",
+                        timeout.as_secs()
+                    );
+                    unsaved.push((slot.as_str(), closing));
+                }
+                Err(Unproven {
+                    reason,
+                    closing: None,
+                }) => eprintln!(
+                    "Window {slot} is still open after {}s and {reason}; it keeps running beside the restarted terminal service.",
+                    timeout.as_secs()
+                ),
+            }
+        }
+        end_saved_windows(&saved, timeout, grace)?;
+        // It saved when it acknowledged closing; SIGTERM lets it exit cleanly.
+        // Without a later save report it is never killed.
+        for (slot, Closing { window, owns_slot }) in &unsaved {
+            if !owns_slot {
+                continue;
+            }
+            match window.signal(libc::SIGTERM) {
+                Ok(true) => eprintln!("Window {slot} (pid {}): sent SIGTERM.", window.pid),
+                Ok(false) => {}
+                Err(error) => eprintln!(
+                    "Could not send SIGTERM to window {slot} (pid {}): {error}",
+                    window.pid
+                ),
+            }
+        }
+        let mut next_progress = std::time::Instant::now();
+        loop {
+            let live = running_window_slots(&self.runtime)?;
+            // Once its pinned process is gone, whatever holds the slot is a
+            // different window that the restarted daemon can admit.
+            let waiting: Vec<_> = unsaved
+                .iter()
+                .filter(|(slot, closing)| {
+                    closing.window.is_alive() && live.iter().any(|live| live == slot)
+                })
+                .map(|(slot, closing)| (*slot, closing.owns_slot.then_some(closing.window.pid)))
+                .collect();
+            if waiting.is_empty() {
+                return Ok(());
+            }
+            if interrupted() {
+                let reports: Vec<_> = waiting
+                    .iter()
+                    .map(|(slot, pid)| match pid {
+                        Some(pid) => format!(
+                            "Window {slot} (pid {pid}) is still closing, so the terminal service was not restarted. To continue now, end it: kill {pid}, then run: cagents daemon start"
+                        ),
+                        None => format!(
+                            "Window {slot} is still closing, so the terminal service was not restarted. Once it exits, run: cagents daemon start"
+                        ),
+                    })
+                    .collect();
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    reports.join(" "),
+                ));
+            }
+            if std::time::Instant::now() >= next_progress {
+                for (slot, pid) in &waiting {
+                    match pid {
+                        Some(pid) => eprintln!(
+                            "Window {slot} (pid {pid}) is still closing; the terminal service restarts as soon as it exits. To continue now, end it: kill {pid}"
+                        ),
+                        None => eprintln!(
+                            "Window {slot} is still closing; the terminal service restarts as soon as it exits."
+                        ),
+                    }
+                }
+                next_progress = std::time::Instant::now() + progress;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn wait_for_committed_windows_within(&self, timeout: Duration) -> io::Result<()> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let live = running_window_slots(&self.runtime)?;
+            let lingering: Vec<_> = self
+                .closed
+                .iter()
+                .filter(|slot| live.contains(slot))
+                .map(String::as_str)
+                .collect();
+            if lingering.is_empty() {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "window {} is still closing after {}s",
+                        lingering.join(", "),
+                        timeout.as_secs()
+                    ),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    /// Finish a staged update without reopening windows that never closed.
+    /// On a partial close, Drop cancels the remaining prepared windows and waits
+    /// for committed windows to exit before reopening only those slots.
+    pub(crate) fn relaunch_closed_windows(mut self, executable: &Path) -> io::Result<()> {
+        if self.prepared.is_empty() {
+            let closed = self.closed.clone();
+            self.relaunch_windows(&closed, executable)
+        } else {
+            self.set_fallback_executable(executable.to_owned());
+            drop(self);
+            Ok(())
+        }
     }
 
     pub fn relaunch_windows(mut self, slots: &[String], executable: &Path) -> io::Result<()> {
@@ -1023,14 +1840,16 @@ impl UiUpdateGuard {
         self.closed.clear();
         let mut errors = Vec::new();
         for slot in slots {
-            if let Err(error) = launch_window_at(executable, false, Some(slot), None) {
-                errors.push(format!("{slot}: {error}"));
+            if let Err(error) =
+                launch_window_at(executable, false, Some(slot), None, self.restore_policy)
+            {
+                errors.push((slot.as_str(), error.to_string()));
             }
         }
         if errors.is_empty() {
             Ok(())
         } else {
-            Err(io::Error::other(errors.join("; ")))
+            Err(io::Error::other(relaunch_failure(slots.len(), &errors)))
         }
     }
 
@@ -1044,7 +1863,45 @@ impl UiUpdateGuard {
     }
 }
 
+/// What the update reports when windows did not reopen cleanly. Someone reads
+/// this: the launcher's handshake prefix goes, and windows stopped by the same
+/// thing share one sentence instead of repeating it per window.
+pub(crate) fn relaunch_failure(windows: usize, errors: &[(&str, String)]) -> String {
+    let mut groups: Vec<(Vec<&str>, String)> = Vec::new();
+    for (slot, error) in errors {
+        let text = error
+            .strip_prefix(UI_LAUNCH_RECOVERY_INCOMPLETE_PREFIX)
+            .unwrap_or(error);
+        let mut chars = text.chars();
+        let reason = chars
+            .next()
+            .map(|first| first.to_uppercase().chain(chars).collect::<String>())
+            .unwrap_or_default();
+        match groups.iter_mut().find(|(_, known)| *known == reason) {
+            Some((slots, _)) => slots.push(slot),
+            None => groups.push((vec![slot], reason)),
+        }
+    }
+    if let [(slots, reason)] = groups.as_slice()
+        && slots.len() == windows
+    {
+        return reason.clone();
+    }
+    groups
+        .iter()
+        .map(|(slots, reason)| format!("{}: {reason}", slots.join(", ")))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 pub(crate) const INSTALL_GUARD_ENV: &str = "CAGENTS_UI_UPDATE_GUARD_FD";
+pub(crate) fn update_recovery_fences() -> io::Result<(PathBuf, PathBuf)> {
+    let runtime = runtime_directory()?;
+    Ok((
+        runtime.join(format!("{APPLICATION_LOCK_FILE}.update")),
+        runtime.join(APPLICATION_LOCK_FILE),
+    ))
+}
 const INSTALL_GUARD_FD: i32 = 197;
 
 /// Verify the inherited open-file description owns the active exclusive fence.
@@ -1117,7 +1974,7 @@ impl Drop for UiUpdateGuard {
         // A committed close is already on its bounded LSP teardown path.
         // Wait for that lease before reopening, rather than racing a still-live
         // process and silently losing its relaunch.
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + COMMITTED_WINDOW_EXIT_TIMEOUT;
         while !self.closed.is_empty()
             && running_window_slots(&self.runtime)
                 .is_ok_and(|live| self.closed.iter().any(|slot| live.contains(slot)))
@@ -1128,9 +1985,12 @@ impl Drop for UiUpdateGuard {
         let _ = self.release_launch_fence();
         for slot in &self.closed {
             if let Some(executable) = &self.fallback_executable {
-                let _ = launch_window_at(executable, false, Some(slot), None);
+                let _ = launch_window_at(executable, false, Some(slot), None, self.restore_policy);
             } else {
-                let _ = launch_window(false, Some(slot), None);
+                if let Ok(executable) = crate::companion::Product::Ui.beside_current() {
+                    let _ =
+                        launch_window_at(&executable, false, Some(slot), None, self.restore_policy);
+                }
             }
         }
         let _ = self._legacy_fence.unlock();
@@ -1140,7 +2000,13 @@ impl Drop for UiUpdateGuard {
 /// Starts another independent process using the same installed UI executable.
 pub fn launch_window(new_window: bool, slot: Option<&str>, source: Option<&str>) -> io::Result<()> {
     let executable = crate::companion::Product::Ui.beside_current()?;
-    launch_window_at(&executable, new_window, slot, source)
+    launch_window_at(
+        &executable,
+        new_window,
+        slot,
+        source,
+        WindowRestorePolicy::Ordinary,
+    )
 }
 
 /// Session ids belong to a daemon/device namespace. Never resolve a local
@@ -1159,7 +2025,7 @@ pub(crate) fn window_matches_selected_device(slot: &str) -> io::Result<bool> {
                 Err(error) => return Err(error),
             };
             let mut name = String::new();
-            (&mut identity.0).take(64).read_to_string(&mut name)?;
+            identity.file_mut().take(64).read_to_string(&mut name)?;
             Ok(name == selected.name)
         }
     }
@@ -1178,7 +2044,7 @@ fn window_device_identity(
         libc::LOCK_SH,
     )?;
     let mut name = String::new();
-    (&mut identity.0).take(64).read_to_string(&mut name)?;
+    identity.file_mut().take(64).read_to_string(&mut name)?;
     if !devices.iter().any(|device| device.name == name) {
         return Err(io::Error::other(format!(
             "device profile for window {slot} is unavailable"
@@ -1192,6 +2058,7 @@ fn launch_window_at(
     new_window: bool,
     slot: Option<&str>,
     source: Option<&str>,
+    restore_policy: WindowRestorePolicy,
 ) -> io::Result<()> {
     if let Some(slot) = slot {
         validate_window_slot(slot)?;
@@ -1200,6 +2067,9 @@ fn launch_window_at(
         validate_window_slot(source)?;
     }
     let mut command = process::Command::new(executable);
+    if restore_policy == WindowRestorePolicy::ExistingOnly {
+        command.arg(RESTORE_EXISTING_ONLY_ARGUMENT);
+    }
     let device_name = match slot {
         Some(slot) => window_device_identity(&runtime_directory()?, slot, &crate::device::list()?)?,
         None => crate::device::selected().map(|device| device.name.clone()),
@@ -1852,7 +2722,13 @@ fn parse_activation_request(line: &str) -> io::Result<ActivationRequest> {
     }
 }
 
-fn mark_lease_capable_process() -> io::Result<()> {
+/// Names this process so a starting window does not mistake it for a UI that
+/// predates the session-store lease.
+///
+/// Every mode of the current UI executable takes it, not only a window that
+/// holds the lease: the legacy scan matches any process still named
+/// `cagents-ui` that is not running a helper mode.
+pub fn mark_lease_capable_process() -> io::Result<()> {
     fs::write("/proc/self/comm", LEASE_CAPABLE_PROCESS_NAME)
 }
 fn peer_ui_predates_lease(peer_directory: &Path) -> bool {
@@ -1886,7 +2762,7 @@ fn legacy_ui_process_running(proc_root: &Path) -> io::Result<bool> {
         if name.trim_end() == LEGACY_PROCESS_NAME {
             let stat = match fs::read_to_string(entry.path().join("stat")) {
                 Ok(stat) => stat,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) if process_exited(&error) => continue,
                 Err(error) => return Err(error),
             };
             let fields = stat
@@ -1910,10 +2786,34 @@ fn legacy_ui_process_running(proc_root: &Path) -> io::Result<bool> {
             if matches!(state, "Z" | "X") && fields.get(17) == Some(&"1") {
                 continue;
             }
-            return Ok(true);
+            // Every helper mode postdates the lease, so one still carrying the
+            // old name is a lease-aware build's helper. A launcher started
+            // before an update can open the progress window from a build that
+            // does not rename its helpers; refusing on it would block the
+            // update's own windows.
+            match runs_helper_mode(&entry.path()) {
+                Ok(true) => continue,
+                Err(error) if process_exited(&error) => continue,
+                Ok(false) | Err(_) => return Ok(true),
+            }
         }
     }
     Ok(false)
+}
+
+/// A process that ended after its name was read: opening one of its `/proc`
+/// entries then fails with ENOENT, and reading one already open with ESRCH.
+fn process_exited(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
+}
+
+/// Unreadable arguments are not evidence of a helper, so they keep the refusal.
+fn runs_helper_mode(process: &Path) -> io::Result<bool> {
+    let arguments = fs::read(process.join("cmdline"))?;
+    Ok(arguments
+        .split(|byte| *byte == 0)
+        .nth(1)
+        .is_some_and(|mode| HELPER_MODES.iter().any(|helper| helper.as_bytes() == mode)))
 }
 
 fn current_uid() -> u32 {
@@ -1957,8 +2857,73 @@ pub const RUNTIME_SUBDIRECTORY: &str = if IS_DEVELOPMENT {
     "cagents"
 };
 
+/// Selects one of several side-by-side development instances, each with its
+/// own storage and daemon. `scripts/run-development --instance` sets it; a
+/// production build ignores it.
+pub const DEVELOPMENT_INSTANCE_ENV: &str = "CAGENTS_DEVELOPMENT_INSTANCE";
+const DEVELOPMENT_INSTANCE_MAX: usize = 24;
+
+fn development_instance_name(value: Option<&std::ffi::OsStr>) -> Result<Option<String>, String> {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    match value.to_str() {
+        Some(name)
+            if name.len() <= DEVELOPMENT_INSTANCE_MAX
+                && name.starts_with(|c: char| c.is_ascii_alphanumeric())
+                && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') =>
+        {
+            Ok(Some(name.to_owned()))
+        }
+        _ => Err(format!(
+            "{DEVELOPMENT_INSTANCE_ENV} must be 1-{DEVELOPMENT_INSTANCE_MAX} ASCII letters, \
+             digits or hyphens, starting with a letter or digit"
+        )),
+    }
+}
+
+/// The directory name under the data, config, state and runtime roots that
+/// holds this instance's files: `STORAGE_NAME` / `RUNTIME_SUBDIRECTORY`, with a
+/// development instance's name appended. An invalid name stops the process
+/// rather than falling back to the shared development state.
+fn namespace() -> &'static str {
+    static NAMESPACE: OnceLock<String> = OnceLock::new();
+    NAMESPACE.get_or_init(|| {
+        if !IS_DEVELOPMENT {
+            return STORAGE_NAME.to_owned();
+        }
+        match development_instance_name(env::var_os(DEVELOPMENT_INSTANCE_ENV).as_deref()) {
+            Ok(Some(name)) => format!("{STORAGE_NAME}-{name}"),
+            Ok(None) => STORAGE_NAME.to_owned(),
+            Err(message) => panic!("{message}"),
+        }
+    })
+}
+
+/// The development instance this process belongs to. Agents and terminals it
+/// starts keep it, so a `cagents` they run reaches this instance's daemon
+/// rather than starting a shared one.
+pub fn development_instance() -> Option<&'static str> {
+    instance_in(namespace())
+}
+
+fn instance_in(namespace: &str) -> Option<&str> {
+    namespace.strip_prefix(STORAGE_NAME)?.strip_prefix('-')
+}
+
+/// Names this instance's data, configuration and state directories.
+pub fn storage_name() -> &'static str {
+    namespace()
+}
+
+/// Names this instance's directory under `XDG_RUNTIME_DIR`, which holds the
+/// daemon socket and its lock.
+pub fn runtime_subdirectory() -> &'static str {
+    namespace()
+}
+
 pub fn project_dirs() -> Option<ProjectDirs> {
-    ProjectDirs::from("dev", "cagents", STORAGE_NAME)
+    ProjectDirs::from("dev", "cagents", storage_name())
 }
 
 /// This instance's settings file, which the UI owns and the CLI only reads.
@@ -1971,6 +2936,42 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     use tempfile::tempdir;
+
+    #[test]
+    fn a_namespace_names_its_development_instance() {
+        assert_eq!(instance_in(STORAGE_NAME), None);
+        assert_eq!(
+            instance_in(&format!("{STORAGE_NAME}-pr2064")),
+            Some("pr2064")
+        );
+    }
+
+    #[test]
+    fn development_instance_names_are_short_path_safe_words() {
+        use std::ffi::OsStr;
+        assert_eq!(development_instance_name(None), Ok(None));
+        assert_eq!(development_instance_name(Some(OsStr::new(""))), Ok(None));
+        for name in ["pr2064", "a", "Steward-3", "x23456789012345678901234"] {
+            assert_eq!(
+                development_instance_name(Some(OsStr::new(name))),
+                Ok(Some(name.to_owned()))
+            );
+        }
+        for name in [
+            "-leading",
+            "has space",
+            "../escape",
+            "dot.name",
+            "under_score",
+            "x234567890123456789012345",
+            "é",
+        ] {
+            assert!(
+                development_instance_name(Some(OsStr::new(name))).is_err(),
+                "{name}"
+            );
+        }
+    }
 
     use super::*;
 
@@ -2028,6 +3029,81 @@ mod tests {
         assert!(matches!(busy.raw_os_error(), Some(libc::EWOULDBLOCK)));
         drop(held);
         assert!(owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB).is_ok());
+    }
+
+    fn copied_description(file: &File) -> File {
+        // dup and fork share the same open-file description. Keeping this copy
+        // alive models a child paused between fork and its CLOEXEC boundary.
+        file.try_clone().unwrap()
+    }
+
+    #[test]
+    fn close_alone_retains_flock_in_a_copied_description() {
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let owner = File::open(path.path()).unwrap();
+        assert_eq!(unsafe { libc::flock(owner.as_raw_fd(), libc::LOCK_EX) }, 0);
+        let copied = copied_description(&owner);
+        drop(owner);
+        let error = owned_file_lock(
+            File::open(path.path()).unwrap(),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        // Clean up explicitly so unrelated test forks cannot retain this proof.
+        assert_eq!(unsafe { libc::flock(copied.as_raw_fd(), libc::LOCK_UN) }, 0);
+    }
+
+    #[test]
+    fn scope_exit_releases_shared_and_exclusive_locks_despite_copied_descriptions() {
+        for operation in [libc::LOCK_SH, libc::LOCK_EX] {
+            let path = tempfile::NamedTempFile::new().unwrap();
+            let owner = owned_file_lock(File::open(path.path()).unwrap(), operation).unwrap();
+            let copied = copied_description(&owner);
+            drop(owner);
+            let next = owned_file_lock(
+                File::open(path.path()).unwrap(),
+                libc::LOCK_EX | libc::LOCK_NB,
+            )
+            .unwrap();
+            drop(copied);
+            assert_eq!(
+                owned_file_lock(
+                    File::open(path.path()).unwrap(),
+                    libc::LOCK_EX | libc::LOCK_NB
+                )
+                .unwrap_err()
+                .kind(),
+                io::ErrorKind::WouldBlock
+            );
+            drop(next);
+        }
+    }
+
+    #[test]
+    fn explicit_transfer_preserves_recipient_custody_until_its_scope_ends() {
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let parent = owned_file_lock(File::open(path.path()).unwrap(), libc::LOCK_EX).unwrap();
+        let recipient = owned_file_lock(copied_description(&parent), libc::LOCK_EX).unwrap();
+        let unrelated = copied_description(&parent);
+        drop(parent.into_file());
+        assert_eq!(
+            owned_file_lock(
+                File::open(path.path()).unwrap(),
+                libc::LOCK_EX | libc::LOCK_NB
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(recipient);
+        let next = owned_file_lock(
+            File::open(path.path()).unwrap(),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+        .unwrap();
+        drop(unrelated);
+        drop(next);
     }
 
     #[test]
@@ -2169,6 +3245,557 @@ mod tests {
         assert!(verified_editors_in(runtime.path(), processes.path()).is_err());
     }
 
+    fn guard_in(runtime: &Path) -> UiUpdateGuard {
+        UiUpdateGuard {
+            lock: Some(
+                owned_lock(
+                    &runtime.join(format!("{APPLICATION_LOCK_FILE}.update")),
+                    libc::LOCK_EX | libc::LOCK_NB,
+                )
+                .unwrap(),
+            ),
+            runtime: runtime.into(),
+            _legacy_fence: owned_lock(
+                &runtime.join(APPLICATION_LOCK_FILE),
+                libc::LOCK_SH | libc::LOCK_NB,
+            )
+            .unwrap(),
+            prepared: Vec::new(),
+            closed: Vec::new(),
+            close: CloseEvidence::default(),
+            // Drop's reopen of committed slots must never start a real UI.
+            fallback_executable: Some(runtime.join("no-ui-in-tests")),
+            restore_policy: WindowRestorePolicy::Ordinary,
+        }
+    }
+
+    /// A process that holds a window slot lease the way a closing window
+    /// does, optionally ignoring SIGTERM like a window stuck in teardown.
+    struct LingeringWindow(process::Child);
+
+    const LINGERING_LEASE: &str = "CAGENTS_TEST_LINGERING_WINDOW_LEASE";
+    const LINGERING_IGNORES_TERM: &str = "CAGENTS_TEST_LINGERING_WINDOW_IGNORES_TERM";
+    const LINGERING_SOCKET: &str = "CAGENTS_TEST_LINGERING_WINDOW_SOCKET";
+
+    impl LingeringWindow {
+        fn spawn(runtime: &Path, slot: &str, ignores_term: bool) -> Self {
+            Self::spawn_with(runtime, slot, ignores_term, false)
+        }
+
+        /// One that also answers update-prepare and update-commit, as a
+        /// window does before it stalls in teardown.
+        fn spawn_answering(runtime: &Path, slot: &str) -> Self {
+            Self::spawn_with(runtime, slot, false, true)
+        }
+
+        fn spawn_with(runtime: &Path, slot: &str, ignores_term: bool, answers: bool) -> Self {
+            let mut command = process::Command::new(env::current_exe().unwrap());
+            if answers {
+                command.env(LINGERING_SOCKET, runtime.join(slot_socket_name(slot)));
+            }
+            command
+                .args([
+                    "--exact",
+                    "instance::tests::lingering_window_child",
+                    "--include-ignored",
+                ])
+                .env(LINGERING_LEASE, runtime.join(slot_lock_name(slot)))
+                .stdout(process::Stdio::null())
+                .stderr(process::Stdio::null());
+            if ignores_term {
+                command.env(LINGERING_IGNORES_TERM, "1");
+            }
+            let child = Self(command.spawn().unwrap());
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while !running_window_slots(runtime)
+                .unwrap()
+                .iter()
+                .any(|live| live == slot)
+                || (answers && !runtime.join(slot_socket_name(slot)).exists())
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the window never took its slot"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            child
+        }
+
+        fn exit_signal(&mut self) -> Option<i32> {
+            use std::os::unix::process::ExitStatusExt;
+            self.0
+                .try_wait()
+                .unwrap()
+                .and_then(|status| status.signal())
+        }
+    }
+
+    impl Drop for LingeringWindow {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    #[ignore = "child process for saved-window termination tests"]
+    fn lingering_window_child() {
+        let Some(lease) = env::var_os(LINGERING_LEASE) else {
+            return;
+        };
+        if env::var_os(LINGERING_IGNORES_TERM).is_some() {
+            // SAFETY: ignoring a signal installs no handler code.
+            unsafe { libc::signal(libc::SIGTERM, libc::SIG_IGN) };
+        }
+        let _lease = owned_lock(Path::new(&lease), libc::LOCK_EX).unwrap();
+        if let Some(socket) = env::var_os(LINGERING_SOCKET) {
+            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let stream = stream.unwrap();
+                    let _request = read_capped_line(&stream).unwrap();
+                    writeln!(&stream, "ok").unwrap();
+                }
+            });
+        }
+        std::thread::sleep(Duration::from_secs(60));
+    }
+
+    fn pin_committed(guard: &mut UiUpdateGuard, slot: &str) {
+        let window = verified_window_lease_owners_in(&guard.runtime, Path::new("/proc"))
+            .unwrap()
+            .pop()
+            .unwrap();
+        guard.close.pinned.push((slot.into(), window));
+        guard.close.committed.push((slot.into(), 0));
+        guard.closed.push(slot.into());
+    }
+
+    #[test]
+    fn a_window_without_save_evidence_keeps_running_and_cancels_the_update() {
+        let runtime = tempdir().unwrap();
+        let mut guard = guard_in(runtime.path());
+        let mut window = LingeringWindow::spawn(runtime.path(), "second", false);
+        pin_committed(&mut guard, "second");
+        let error = guard
+            .terminate_saved_windows(Duration::from_secs(45), &|_, _| Ok(false), Duration::ZERO)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            window.exit_signal(),
+            None,
+            "an unsaved window is never signalled"
+        );
+        // Unacknowledged commit is equally no proof, even with a flush.
+        guard.close.committed.clear();
+        assert!(
+            guard
+                .terminate_saved_windows(Duration::from_secs(45), &|_, _| Ok(true), Duration::ZERO)
+                .is_err()
+        );
+        assert_eq!(window.exit_signal(), None);
+        // Recovery reports a committed window that never exits, bounded.
+        let error = guard
+            .wait_for_committed_windows_within(Duration::from_millis(100))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("second"), "{error}");
+    }
+
+    #[test]
+    fn a_window_that_exits_while_being_verified_counts_as_closed() {
+        let runtime = tempdir().unwrap();
+        let mut guard = guard_in(runtime.path());
+        let mut window = LingeringWindow::spawn(runtime.path(), "second", false);
+        pin_committed(&mut guard, "second");
+        // It exits after its slot was listed but before it was verified:
+        // its procfs entries vanish, which must not read as unverifiable.
+        window.0.kill().unwrap();
+        window.0.wait().unwrap();
+        let unreadable = |_, _| Err(io::Error::other("no save report"));
+        assert!(matches!(
+            guard.saved_window("second", &unreadable),
+            Ok(None)
+        ));
+        guard.close.committed.clear();
+        assert!(
+            matches!(guard.saved_window("second", &unreadable), Ok(None)),
+            "an exited window needs no commit acknowledgement either"
+        );
+    }
+
+    #[test]
+    fn a_saved_window_that_lingers_is_terminated_and_the_candidate_starts() {
+        let runtime = tempdir().unwrap();
+        let mut guard = guard_in(runtime.path());
+        let mut window = LingeringWindow::spawn(runtime.path(), "second", false);
+        pin_committed(&mut guard, "second");
+        let checked = std::cell::Cell::new(None);
+        guard
+            .terminate_saved_windows(
+                Duration::from_secs(45),
+                &|pid, since| {
+                    checked.set(Some((pid, since)));
+                    Ok(true)
+                },
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        assert_eq!(checked.get(), Some((window.0.id(), 0)));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while window.exit_signal().is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(window.exit_signal(), Some(libc::SIGTERM));
+        assert!(running_window_slots(runtime.path()).unwrap().is_empty());
+        guard
+            .wait_for_committed_windows_within(Duration::from_secs(1))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_window_that_saves_after_commit_but_lingers_is_ended_at_the_close_deadline() {
+        let runtime = tempdir().unwrap();
+        let mut guard = guard_in(runtime.path());
+        let mut window = LingeringWindow::spawn_answering(runtime.path(), "second");
+        let slots = guard.prepare_windows(Duration::from_secs(5)).unwrap();
+        assert_eq!(slots, ["second"]);
+        assert_eq!(
+            guard.close.pinned.len(),
+            1,
+            "prepare pins the window process"
+        );
+        let before_commit = unix_millis_now();
+        let checked = std::cell::Cell::new(None);
+        guard
+            .close_prepared_windows_with(
+                &slots,
+                Duration::from_millis(300),
+                |pid, since| {
+                    checked.set(Some((pid, since)));
+                    // A save recorded before the commit request is no proof;
+                    // this one is recorded after it.
+                    Ok(since >= before_commit)
+                },
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        let (pid, since) = checked
+            .get()
+            .expect("the deadline consults the save report");
+        assert_eq!(pid, window.0.id());
+        assert!(since >= before_commit && since <= unix_millis_now());
+        assert!(guard.prepared.is_empty(), "closing completed");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while window.exit_signal().is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(window.exit_signal(), Some(libc::SIGTERM));
+    }
+
+    #[test]
+    fn a_window_whose_only_save_predates_the_commit_cancels_the_update() {
+        let runtime = tempdir().unwrap();
+        let mut guard = guard_in(runtime.path());
+        let mut window = LingeringWindow::spawn_answering(runtime.path(), "second");
+        let slots = guard.prepare_windows(Duration::from_secs(5)).unwrap();
+        let before_commit = unix_millis_now();
+        let error = guard
+            .close_prepared_windows_with(
+                &slots,
+                Duration::from_millis(300),
+                // The only complete flush was recorded before the commit.
+                |_, since| Ok(since < before_commit),
+                Duration::ZERO,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(window.exit_signal(), None);
+        assert!(
+            !guard.prepared.is_empty(),
+            "the update still owns a prepared window"
+        );
+        // Drop must not wait out a window this test keeps alive.
+        guard.prepared.clear();
+        guard.closed.clear();
+    }
+
+    #[test]
+    fn rollback_ends_a_saved_committed_window_before_the_daemon_restarts() {
+        let runtime = tempdir().unwrap();
+        let mut guard = guard_in(runtime.path());
+        let mut window = LingeringWindow::spawn(runtime.path(), "second", true);
+        pin_committed(&mut guard, "second");
+        guard
+            .settle_committed_windows_with(
+                Duration::from_millis(100),
+                |_, _| Ok(true),
+                Duration::from_millis(200),
+                || false,
+                UNPROVEN_WINDOW_PROGRESS,
+            )
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while window.exit_signal().is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(window.exit_signal(), Some(libc::SIGKILL));
+        assert!(running_window_slots(runtime.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn rollback_waits_for_an_unsaved_window_and_never_kills_it() {
+        let runtime = tempdir().unwrap();
+        let mut guard = guard_in(runtime.path());
+        // It ignores SIGTERM, like a window wedged after acknowledging.
+        let mut window = LingeringWindow::spawn(runtime.path(), "second", true);
+        pin_committed(&mut guard, "second");
+        let polls = std::cell::Cell::new(0);
+        let error = guard
+            .settle_committed_windows_with(
+                Duration::from_millis(100),
+                |_, _| Ok(false),
+                Duration::ZERO,
+                || {
+                    polls.set(polls.get() + 1);
+                    polls.get() > 20
+                },
+                Duration::from_millis(100),
+            )
+            .unwrap_err();
+        // Only an interrupt ends the wait; no daemon may start beside it.
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        let pid = window.0.id();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Window second (pid {pid}) is still closing, so the terminal service was not restarted. To continue now, end it: kill {pid}, then run: cagents daemon start"
+            )
+        );
+        assert_eq!(
+            window.exit_signal(),
+            None,
+            "an unsaved window is never killed"
+        );
+        assert_eq!(running_window_slots(runtime.path()).unwrap(), ["second"]);
+    }
+
+    #[test]
+    fn rollback_sends_an_unsaved_window_one_sigterm_and_waits_for_it() {
+        let runtime = tempdir().unwrap();
+        let mut guard = guard_in(runtime.path());
+        let mut window = LingeringWindow::spawn(runtime.path(), "second", false);
+        pin_committed(&mut guard, "second");
+        guard
+            .settle_committed_windows_with(
+                Duration::from_millis(100),
+                |_, _| Ok(false),
+                Duration::ZERO,
+                || false,
+                UNPROVEN_WINDOW_PROGRESS,
+            )
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while window.exit_signal().is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(window.exit_signal(), Some(libc::SIGTERM));
+    }
+
+    #[test]
+    fn rollback_restarts_beside_a_window_that_never_acknowledged_closing() {
+        let runtime = tempdir().unwrap();
+        let mut guard = guard_in(runtime.path());
+        let mut window = LingeringWindow::spawn(runtime.path(), "second", false);
+        pin_committed(&mut guard, "second");
+        // Its slot was marked closed before update-commit, but the window
+        // never acknowledged it: it may be healthy and never exit. Even a
+        // save report must not get it signalled or awaited.
+        guard.close.committed.clear();
+        guard
+            .settle_committed_windows_with(
+                Duration::from_millis(100),
+                |_, _| Ok(true),
+                Duration::ZERO,
+                || panic!("a healthy window must not be waited for"),
+                UNPROVEN_WINDOW_PROGRESS,
+            )
+            .unwrap();
+        assert_eq!(window.exit_signal(), None);
+        assert_eq!(running_window_slots(runtime.path()).unwrap(), ["second"]);
+        // A window that never received a commit is not awaited at all.
+        guard.closed.clear();
+        guard
+            .settle_committed_windows_with(
+                Duration::from_secs(30),
+                |_, _| Ok(true),
+                Duration::ZERO,
+                || panic!("nothing is closing"),
+                UNPROVEN_WINDOW_PROGRESS,
+            )
+            .unwrap();
+        assert_eq!(window.exit_signal(), None);
+    }
+
+    #[test]
+    fn rollback_restarts_beside_a_slot_another_process_now_holds() {
+        let runtime = tempdir().unwrap();
+        let mut guard = guard_in(runtime.path());
+        let mut first = LingeringWindow::spawn(runtime.path(), "second", false);
+        pin_committed(&mut guard, "second");
+        // The committed window exits and the user reopens that slot.
+        first.0.kill().unwrap();
+        first.0.wait().unwrap();
+        let mut reopened = LingeringWindow::spawn(runtime.path(), "second", false);
+        guard
+            .settle_committed_windows_with(
+                Duration::from_millis(100),
+                |_, _| Ok(false),
+                Duration::ZERO,
+                || panic!("a reopened window must not be waited for"),
+                UNPROVEN_WINDOW_PROGRESS,
+            )
+            .unwrap();
+        assert_eq!(reopened.exit_signal(), None);
+    }
+
+    #[test]
+    fn a_saved_window_that_ignores_sigterm_is_killed_after_its_grace() {
+        let runtime = tempdir().unwrap();
+        let mut guard = guard_in(runtime.path());
+        let mut window = LingeringWindow::spawn(runtime.path(), "second", true);
+        pin_committed(&mut guard, "second");
+        guard
+            .terminate_saved_windows(
+                Duration::from_secs(45),
+                &|_, _| Ok(true),
+                Duration::from_millis(200),
+            )
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while window.exit_signal().is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(window.exit_signal(), Some(libc::SIGKILL));
+        assert!(running_window_slots(runtime.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn update_guard_sees_no_windows_without_mistaking_its_own_fence_for_a_legacy_ui() {
+        let runtime = tempfile::tempdir().unwrap();
+        let lock = owned_lock(
+            &runtime
+                .path()
+                .join(format!("{APPLICATION_LOCK_FILE}.update")),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+        .unwrap();
+        let legacy = owned_lock(
+            &runtime.path().join(APPLICATION_LOCK_FILE),
+            libc::LOCK_SH | libc::LOCK_NB,
+        )
+        .unwrap();
+        let guard = UiUpdateGuard {
+            lock: Some(lock),
+            runtime: runtime.path().into(),
+            _legacy_fence: legacy,
+            prepared: Vec::new(),
+            closed: Vec::new(),
+            close: CloseEvidence::default(),
+            fallback_executable: None,
+            restore_policy: WindowRestorePolicy::Ordinary,
+        };
+        // A daemon-only update has no windows; the generic probe cannot tell
+        // the guard's own shared fence from a legacy UI.
+        assert!(verified_windows_in(runtime.path(), Path::new("/proc")).is_err());
+        assert!(guard.verified_windows().unwrap().is_empty());
+    }
+
+    #[test]
+    fn recovery_guard_relaunch_and_drop_keep_attachment_policy_out_of_ordinary_launches() {
+        const CHILD: &str = "CAGENTS_TEST_RECOVERY_WINDOW_POLICY";
+        if env::var_os(CHILD).is_some() {
+            initialize_window_restore_policy(WindowRestorePolicy::ExistingOnly).unwrap();
+            let executable = PathBuf::from(env::var_os("CAGENTS_TEST_WINDOW_EXECUTABLE").unwrap());
+            let arguments = PathBuf::from(env::var_os("CAGENTS_TEST_WINDOW_ARGUMENTS").unwrap());
+            let mut guard = UiUpdateGuard::acquire().unwrap();
+            guard.set_recovery_restore_only();
+            guard.set_fallback_executable(executable.clone());
+            guard.closed.push(PRIMARY_WINDOW.into());
+            // Model a fallible recovery after a committed window close.
+            drop(guard);
+            let drop_arguments = fs::read_to_string(&arguments).unwrap();
+            assert!(
+                drop_arguments
+                    .lines()
+                    .any(|arg| arg == RESTORE_EXISTING_ONLY_ARGUMENT)
+            );
+
+            let mut guard = UiUpdateGuard::acquire().unwrap();
+            guard.set_recovery_restore_only();
+            guard
+                .relaunch_windows(&[PRIMARY_WINDOW.into()], &executable)
+                .unwrap();
+            let explicit_arguments = fs::read_to_string(&arguments).unwrap();
+            assert!(
+                explicit_arguments
+                    .lines()
+                    .any(|arg| arg == RESTORE_EXISTING_ONLY_ARGUMENT)
+            );
+
+            // A later ordinary launch from this same process has no recovery
+            // argv or environment policy to inherit.
+            launch_window_at(
+                &executable,
+                false,
+                Some(PRIMARY_WINDOW),
+                None,
+                WindowRestorePolicy::Ordinary,
+            )
+            .unwrap();
+            let ordinary_arguments = fs::read_to_string(&arguments).unwrap();
+            assert!(
+                !ordinary_arguments
+                    .lines()
+                    .any(|arg| arg == RESTORE_EXISTING_ONLY_ARGUMENT)
+            );
+            assert!(ordinary_arguments.contains("--window\nprimary\n"));
+            return;
+        }
+        let root = tempdir().unwrap();
+        for directory in ["home", "runtime", "config", "data", "cache"] {
+            fs::create_dir(root.path().join(directory)).unwrap();
+        }
+        let executable = root.path().join("fake-ui");
+        fs::write(&executable, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$CAGENTS_TEST_WINDOW_ARGUMENTS\"\nprintf 'ready\\n'\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let name = std::thread::current().name().unwrap().to_owned();
+        let output = process::Command::new(env::current_exe().unwrap())
+            .args(["--exact", &name, "--nocapture"])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", root.path().join("home"))
+            .env("XDG_RUNTIME_DIR", root.path().join("runtime"))
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .env("XDG_CACHE_HOME", root.path().join("cache"))
+            .env("CAGENTS_TEST_WINDOW_EXECUTABLE", &executable)
+            .env(
+                "CAGENTS_TEST_WINDOW_ARGUMENTS",
+                root.path().join("arguments"),
+            )
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn recovery_rejects_unknown_legacy_ownership_and_pending_handoff() {
         let runtime = tempfile::tempdir().unwrap();
@@ -2211,7 +3838,7 @@ mod tests {
                 !sensitive_browser_diagnostic(metadata.target(), metadata.level())
             }))
             .with(Observe(seen.clone()));
-        tracing::subscriber::with_default(subscriber, || {
+        crate::test_tracing::with_thread_subscriber(subscriber, || {
             tracing::debug!(target: "net::cookie", "fixture bearer cookie must be filtered");
             // Pinned Servo emits the complete Cookie header at INFO, including
             // when a site reads document.cookie, not just during extraction.
@@ -2300,6 +3927,33 @@ mod tests {
     }
 
     #[test]
+    fn saved_window_enumeration_retains_inactive_stores_and_refuses_excess() {
+        let root = tempdir().unwrap();
+        let primary = root.path().join("sessions.sqlite3");
+        let old = root.path().join("windows/september-copy/sessions.sqlite3");
+        fs::create_dir_all(old.parent().unwrap()).unwrap();
+        fs::write(&old, "original legacy store bytes").unwrap();
+        let mut expected = vec![primary.clone(), old.clone()];
+        expected.sort();
+        assert_eq!(window_database_paths_at(primary.clone()).unwrap(), expected);
+        assert_eq!(fs::read(&old).unwrap(), b"original legacy store bytes");
+        for index in 0..1023 {
+            let path = root
+                .path()
+                .join(format!("windows/old-{index}/sessions.sqlite3"));
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, []).unwrap();
+        }
+        assert!(
+            window_database_paths_at(primary)
+                .unwrap_err()
+                .to_string()
+                .contains("bounded store limit")
+        );
+        assert_eq!(fs::read(&old).unwrap(), b"original legacy store bytes");
+    }
+
+    #[test]
     fn window_leases_allow_multiple_slots_and_reuse_only_closed_slots() {
         let runtime = tempdir().unwrap();
         let (primary, name) = WindowLease::acquire_in(runtime.path(), false, None).unwrap();
@@ -2342,7 +3996,9 @@ mod tests {
             _legacy_fence: legacy,
             prepared: Vec::new(),
             closed: Vec::new(),
+            close: CloseEvidence::default(),
             fallback_executable: None,
+            restore_policy: WindowRestorePolicy::Ordinary,
         };
         assert!(WindowLease::acquire_in(runtime.path(), true, None).is_err());
         drop(guard);
@@ -2394,7 +4050,9 @@ mod tests {
             runtime: runtime.path().into(),
             prepared: Vec::new(),
             closed: Vec::new(),
+            close: CloseEvidence::default(),
             fallback_executable: None,
+            restore_policy: WindowRestorePolicy::Ordinary,
         };
         assert!(
             guard
@@ -2467,7 +4125,9 @@ mod tests {
             runtime: runtime.path().into(),
             prepared: vec![],
             closed: vec![],
+            close: CloseEvidence::default(),
             fallback_executable: None,
+            restore_policy: WindowRestorePolicy::Ordinary,
         };
         let error = guard
             .prepare_and_close_windows_with_preflight(Duration::from_secs(5), |guard| {
@@ -2486,6 +4146,101 @@ mod tests {
             );
             worker.join().unwrap();
         }
+    }
+
+    #[test]
+    fn relaunch_closed_windows_cancels_open_prepared_windows_and_preserves_their_leases() {
+        let runtime = tempdir().unwrap();
+        let lock = owned_lock(
+            &runtime
+                .path()
+                .join(format!("{APPLICATION_LOCK_FILE}.update")),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+        .unwrap();
+        let legacy =
+            owned_lock(&runtime.path().join(APPLICATION_LOCK_FILE), libc::LOCK_SH).unwrap();
+        let mut leases = Vec::new();
+        let mut workers = Vec::new();
+        for slot in [PRIMARY_WINDOW, "window-2"] {
+            leases.push(
+                owned_lock(&runtime.path().join(slot_lock_name(slot)), libc::LOCK_EX).unwrap(),
+            );
+            let listener =
+                std::os::unix::net::UnixListener::bind(runtime.path().join(slot_socket_name(slot)))
+                    .unwrap();
+            listener.set_nonblocking(true).unwrap();
+            workers.push(std::thread::spawn(move || {
+                let mut actions = Vec::new();
+                for _ in 0..2 {
+                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    let stream = loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => break stream,
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                assert!(
+                                    std::time::Instant::now() < deadline,
+                                    "prepared window was not cancelled"
+                                );
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                            Err(error) => panic!("window accept: {error}"),
+                        }
+                    };
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(1)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(1)))
+                        .unwrap();
+                    actions.push(read_capped_line(&stream).unwrap());
+                    writeln!(&stream, "ok").unwrap();
+                }
+                actions
+            }));
+        }
+        let mut guard = UiUpdateGuard {
+            lock: Some(lock),
+            runtime: runtime.path().into(),
+            _legacy_fence: legacy,
+            prepared: Vec::new(),
+            closed: Vec::new(),
+            close: CloseEvidence::default(),
+            fallback_executable: None,
+            restore_policy: WindowRestorePolicy::Ordinary,
+        };
+        let slots = guard.prepare_windows(Duration::from_secs(5)).unwrap();
+        assert_eq!(slots.len(), 2);
+        // A cancelled stop prompt and a failure before commit both arrive here:
+        // the original windows are still running and must simply unfreeze.
+        guard
+            .relaunch_closed_windows(&runtime.path().join("must-not-launch"))
+            .unwrap();
+        for worker in workers {
+            assert_eq!(worker.join().unwrap(), ["update-prepare", "update-cancel"]);
+        }
+        assert_eq!(running_window_slots(runtime.path()).unwrap(), slots);
+        for slot in &slots {
+            assert!(
+                owned_lock(
+                    &runtime.path().join(slot_lock_name(slot)),
+                    libc::LOCK_EX | libc::LOCK_NB,
+                )
+                .is_err(),
+                "the original window lost its lease"
+            );
+        }
+        assert!(
+            owned_lock(
+                &runtime
+                    .path()
+                    .join(format!("{APPLICATION_LOCK_FILE}.update")),
+                libc::LOCK_EX | libc::LOCK_NB,
+            )
+            .is_ok(),
+            "the cancelled update retained the launch fence"
+        );
+        drop(leases);
     }
 
     #[test]
@@ -2521,6 +4276,11 @@ mod tests {
         assert!(!legacy_ui_process_running(proc_root.path()).unwrap());
 
         fs::write(legacy.join("comm"), "cagents-ui\n").unwrap();
+        fs::write(
+            legacy.join("cmdline"),
+            "/old/cagents-ui\0--window\0primary\0",
+        )
+        .unwrap();
         let mut fields = ["0"; 18];
         fields[0] = "S";
         fields[1] = "1";
@@ -2538,10 +4298,59 @@ mod tests {
         fields[17] = "2";
         fs::write(legacy.join("stat"), stat(&fields)).unwrap();
         assert!(legacy_ui_process_running(proc_root.path()).unwrap());
+        for mode in HELPER_MODES {
+            fs::write(
+                legacy.join("cmdline"),
+                format!("/old/cagents-ui\0{mode}\0payload\0"),
+            )
+            .unwrap();
+            assert!(!legacy_ui_process_running(proc_root.path()).unwrap());
+        }
+        fs::write(
+            legacy.join("cmdline"),
+            "/old/cagents-ui\0--window\0primary\0",
+        )
+        .unwrap();
+        assert!(legacy_ui_process_running(proc_root.path()).unwrap());
+        // A helper flag is only a mode in first position.
+        fs::write(
+            legacy.join("cmdline"),
+            "/old/cagents-ui\0--window\0--startup-update\0",
+        )
+        .unwrap();
+        assert!(legacy_ui_process_running(proc_root.path()).unwrap());
+        // Arguments that cannot be read are not evidence of a helper.
+        fs::remove_file(legacy.join("cmdline")).unwrap();
+        fs::create_dir(legacy.join("cmdline")).unwrap();
+        assert!(legacy_ui_process_running(proc_root.path()).unwrap());
+        fs::remove_dir(legacy.join("cmdline")).unwrap();
+        // A process that exited after its name was read is gone.
+        assert!(!legacy_ui_process_running(proc_root.path()).unwrap());
         fs::write(legacy.join("stat"), "malformed").unwrap();
         assert!(legacy_ui_process_running(proc_root.path()).is_err());
         fs::remove_file(legacy.join("stat")).unwrap();
         assert!(!legacy_ui_process_running(proc_root.path()).unwrap());
+    }
+
+    #[test]
+    fn relaunch_failure_reads_once_per_reason_without_the_handshake_prefix() {
+        let same = format!("{UI_LAUNCH_RECOVERY_INCOMPLETE_PREFIX}the service stopped");
+        assert_eq!(
+            relaunch_failure(2, &[("primary", same.clone()), ("window-2", same.clone())]),
+            "The service stopped"
+        );
+        // Windows that opened are not reported as stopped.
+        assert_eq!(
+            relaunch_failure(3, &[("window-2", same.clone()), ("window-3", same.clone())]),
+            "window-2, window-3: The service stopped"
+        );
+        assert_eq!(
+            relaunch_failure(
+                2,
+                &[("primary", same), ("window-2", "no display".to_owned())]
+            ),
+            "primary: The service stopped; window-2: No display"
+        );
     }
 
     #[test]
@@ -2893,6 +4702,112 @@ mod tests {
                 "cagents-ui.lock",
                 "cagents-ui.activate",
             )
+        );
+    }
+}
+
+#[cfg(all(test, feature = "ui"))]
+mod startup_update_tests {
+    use super::*;
+    #[test]
+    fn held_update_fence_is_typed_and_readonly_probe_preserves_original_ownership() {
+        let runtime = tempfile::tempdir().unwrap();
+        fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = runtime
+            .path()
+            .join(format!("{APPLICATION_LOCK_FILE}.update"));
+        let held = owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        let original = fs::metadata(&path).unwrap();
+        let Err(error) = WindowLease::acquire_in(runtime.path(), false, None) else {
+            panic!("original update fence must block startup")
+        };
+        assert!(is_update_in_progress(&error));
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(error.to_string(), "an update is in progress");
+        assert!(private_lock_is_held(&path).unwrap());
+        assert!(owned_lock(&path, libc::LOCK_SH | libc::LOCK_NB).is_err());
+        assert_eq!(fs::metadata(&path).unwrap().ino(), original.ino());
+        assert_eq!(fs::metadata(&path).unwrap().mode(), original.mode());
+        drop(held);
+        assert!(!private_lock_is_held(&path).unwrap());
+        let missing = runtime.path().join("absent");
+        assert!(!private_lock_is_held(&missing).unwrap());
+        assert!(!missing.exists());
+        assert!(!is_update_in_progress(&io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "not an update"
+        )));
+        assert!(!is_update_in_progress(&io::Error::from_raw_os_error(
+            libc::EAGAIN
+        )));
+    }
+    #[test]
+    fn a_window_launched_during_daemon_admission_waits_and_then_takes_its_lease() {
+        let runtime = tempfile::tempdir().unwrap();
+        fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let mut admission =
+            Some(daemon_admission::AdmissionFence::acquire_in(runtime.path()).unwrap());
+        let mut waited = Vec::new();
+        let (lease, slot) = WindowLease::acquire_waiting_in(
+            runtime.path(),
+            false,
+            None,
+            Duration::from_secs(30),
+            &mut |elapsed| {
+                waited.push(elapsed);
+                if waited.len() == 2 {
+                    admission.take();
+                }
+            },
+        )
+        .expect("a window opened during daemon startup opens once it is ready");
+        assert_eq!(slot, PRIMARY_WINDOW);
+        assert_eq!(waited.len(), 2);
+        assert!(waited[1] > waited[0], "progress reports the time waited");
+        drop(lease);
+
+        // The launch decision distinguishes the outcomes by type, not text.
+        let _admission = daemon_admission::AdmissionFence::acquire_in(runtime.path()).unwrap();
+        let error = WindowLease::acquire_waiting_in(
+            runtime.path(),
+            false,
+            None,
+            Duration::from_millis(60),
+            &mut |_| {},
+        )
+        .err()
+        .unwrap();
+        assert!(!is_update_in_progress(&error));
+        assert!(is_daemon_still_starting(&error));
+    }
+
+    #[test]
+    fn existing_window_activation_still_uses_the_original_private_protocol_during_an_update() {
+        let runtime = tempfile::tempdir().unwrap();
+        fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let _held = owned_lock(
+            &runtime
+                .path()
+                .join(format!("{APPLICATION_LOCK_FILE}.update")),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+        .unwrap();
+        let (sender, receiver) = async_channel::unbounded();
+        let _listener = UiActivationListener::bind_in(runtime.path(), sender).unwrap();
+        assert!(activate_window_at_with_token(runtime.path(), PRIMARY_WINDOW, None).unwrap());
+        let activation = receiver.recv_blocking().unwrap();
+        assert!(
+            activation.update.is_none()
+                && activation.session.is_none()
+                && activation.token.is_none()
+        );
+        assert!(
+            private_lock_is_held(
+                &runtime
+                    .path()
+                    .join(format!("{APPLICATION_LOCK_FILE}.update"))
+            )
+            .unwrap()
         );
     }
 }

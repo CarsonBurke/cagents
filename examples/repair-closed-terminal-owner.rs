@@ -5,8 +5,8 @@
 use cagents::{
     control::ControlClient,
     model::{
-        BootId, CardId, CardKind, CardState, Existence, Exposure, LaunchRecipe, Residency,
-        TerminalContinuity, WorkspaceId,
+        BootId, CardId, CardKind, CardState, Existence, LaunchRecipe, TerminalContinuity,
+        WorkspaceId,
     },
     persistence::{SnapshotBase, StateStore},
     workspace_model::views::{Pane, Scope},
@@ -35,6 +35,8 @@ struct OfflineAuthority {
     revision: u64,
     expected_historical_launch: LaunchRecipe,
 }
+
+cagents::stamp_version!();
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args_os().skip(1);
@@ -88,8 +90,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         title: request.pane.title,
         width_fraction: request.pane.width_fraction,
         existence: Existence::Open,
-        exposure: Exposure::Offscreen,
-        residency: Residency::Cold,
         kind: request.pane.kind,
     };
     let base = SnapshotBase {

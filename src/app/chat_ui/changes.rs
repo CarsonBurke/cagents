@@ -199,6 +199,7 @@ fn patch_label(patch: &chat::FileChangePatch, index: usize) -> String {
         chat::ToolStatus::Succeeded => "",
         chat::ToolStatus::Denied => " · Denied",
         chat::ToolStatus::Stopped => " · Stopped",
+        chat::ToolStatus::Waiting => " · Waiting on background work",
     };
     let history = if patch.imported {
         " · Earlier history"
@@ -231,7 +232,7 @@ impl Runtime {
                 .subagents
                 .iter()
                 .find(|agent| &agent.id == id)
-                .map(|agent| format!("Subagent: {}", Self::native_child_name(agent)))
+                .map(|agent| format!("Subagent: {}", self.child_label(agent, 80)))
                 .unwrap_or_else(|| format!("Subagent: {}", id.chars().take(8).collect::<String>())),
         }
     }

@@ -157,9 +157,9 @@ impl Runtime {
             .align_y(Alignment::Center)
             .into(),
         ];
-        if let Some(error) = self.error.as_ref().or(snapshot.error.as_ref()) {
+        if let Some(error) = self.reported_errors().next() {
             content.push(
-                design::caption(error.as_str())
+                design::caption(error)
                     .class(cosmic::theme::Text::Custom(design::warning_text))
                     .into(),
             );

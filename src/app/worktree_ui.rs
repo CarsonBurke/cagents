@@ -1,5 +1,5 @@
 use super::*;
-use crate::model::ChannelId;
+use crate::model::{Cards, ChannelId, WorktreeId};
 
 /// Ownership comes from the launch recipe, never a shell's current directory or
 /// OSC title. Component-aware matching also keeps `repo-fix` outside `repo`.
@@ -12,24 +12,179 @@ pub(super) fn worktree_root<'a>(
         .max_by_key(|root| root.components().count())
 }
 
+/// Resolves a directory to the worktree root holding it, a path that lives
+/// as long as `'a` rather than as the resolver.
+pub(super) trait ResolveRoot<'a> {
+    fn resolve(&self, directory: &Path) -> Option<&'a Path>;
+}
+
+/// The nearest root among `directory`'s ancestors, found by looking each up
+/// rather than comparing the directory with every historical checkout.
+fn nearest_root<'a>(
+    directory: &Path,
+    root: impl Fn(&Path) -> Option<&'a Path>,
+) -> Option<&'a Path> {
+    directory
+        .ancestors()
+        .find_map(&root)
+        .or_else(|| root(Path::new("")))
+}
+
 /// Resolve a directory by its ancestors rather than comparing it with every
 /// historical checkout. Built for one immutable workspace projection.
 pub(super) struct WorktreeRoots<'a> {
-    roots: HashMap<&'a Path, &'a Path>,
+    roots: HashSet<&'a Path>,
 }
 
 impl<'a> WorktreeRoots<'a> {
-    fn new(roots: impl Iterator<Item = &'a Path>) -> Self {
+    pub(super) fn new(roots: impl Iterator<Item = &'a Path>) -> Self {
         Self {
-            roots: roots.map(|root| (root, root)).collect(),
+            roots: roots.collect(),
         }
     }
 
     fn resolve(&self, directory: &Path) -> Option<&'a Path> {
+        nearest_root(directory, |ancestor| self.roots.get(ancestor).copied())
+    }
+}
+
+impl<'a> ResolveRoot<'a> for WorktreeRoots<'a> {
+    fn resolve(&self, directory: &Path) -> Option<&'a Path> {
+        WorktreeRoots::resolve(self, directory)
+    }
+}
+
+/// The worktree rows' paths, indexed for `refresh_sidebar_worktree_panes`,
+/// which runs after nearly every update. Hashing a path walks its components,
+/// so with a long worktree list, building these maps on each pass cost more
+/// than the rest of the update together. They are kept until the known roots
+/// or the rows they were built from change, which comparing ids and path
+/// bytes detects for a small fraction of that cost.
+#[derive(Default)]
+pub(super) struct WorktreePathIndex {
+    /// What the maps were built from, in the order `path_sources` yields it.
+    built_from: Vec<(PathSource, PathBuf)>,
+    /// The known roots and every worktree row's path.
+    roots: HashSet<PathBuf>,
+    /// The first loaded row at each path, which attention is filed under.
+    first_row: HashMap<PathBuf, (ProjectId, WorktreeId)>,
+    /// Every worktree row at each path: a path listed under two projects is a
+    /// row of both.
+    rows: HashMap<PathBuf, Vec<(ProjectId, WorktreeId)>>,
+    /// Counts rebuilds, so what is derived from the maps can tell they moved.
+    generation: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PathSource {
+    Known,
+    Folder(ProjectId, WorktreeId),
+    Worktree(ProjectId, WorktreeId),
+}
+
+fn path_sources<'a>(
+    known: &'a HashSet<PathBuf>,
+    projects: &'a [SidebarProject],
+) -> impl Iterator<Item = (PathSource, &'a Path)> {
+    let known = known.iter().map(|root| (PathSource::Known, root.as_path()));
+    let rows = projects.iter().flat_map(|project| {
+        let folder = project.folder_key().map(|key| {
+            (
+                PathSource::Folder(key.project_id, key.worktree_id),
+                project.repository.as_path(),
+            )
+        });
+        folder
+            .into_iter()
+            .chain(project.worktrees.iter().map(|worktree| {
+                (
+                    PathSource::Worktree(project.id, worktree.id),
+                    worktree.path.as_path(),
+                )
+            }))
+    });
+    known.chain(rows)
+}
+
+impl WorktreePathIndex {
+    /// Rebuilds the maps if the known roots or the rows changed.
+    pub(super) fn refresh(&mut self, known: &HashSet<PathBuf>, projects: &[SidebarProject]) {
+        let unchanged = self
+            .built_from
+            .iter()
+            .map(|(source, path)| (*source, path.as_os_str()))
+            .eq(path_sources(known, projects).map(|(source, path)| (source, path.as_os_str())));
+        if unchanged {
+            return;
+        }
+        self.generation += 1;
+        self.built_from = path_sources(known, projects)
+            .map(|(source, path)| (source, path.to_owned()))
+            .collect();
+        self.roots.clear();
+        self.first_row.clear();
+        self.rows.clear();
+        for (source, path) in &self.built_from {
+            match *source {
+                PathSource::Known => {
+                    self.roots.insert(path.clone());
+                }
+                PathSource::Folder(project, worktree) => {
+                    self.first_row
+                        .entry(path.clone())
+                        .or_insert((project, worktree));
+                }
+                PathSource::Worktree(project, worktree) => {
+                    self.roots.insert(path.clone());
+                    self.first_row
+                        .entry(path.clone())
+                        .or_insert((project, worktree));
+                    self.rows
+                        .entry(path.clone())
+                        .or_default()
+                        .push((project, worktree));
+                }
+            }
+        }
+    }
+
+    /// The first loaded row, a project folder's or a worktree's, at `path`.
+    fn first_row(&self, path: &Path) -> Option<(ProjectId, WorktreeId)> {
+        self.first_row.get(path).copied()
+    }
+
+    /// Whether Projects lists a row, a project folder's or a worktree's, at
+    /// `path`: what `SidebarModel::worktree_at` finds, without scanning every
+    /// row.
+    pub(super) fn lists(&self, path: &Path) -> bool {
+        self.first_row.contains_key(path)
+    }
+
+    /// Counts the rebuilds of the maps.
+    pub(super) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The project whose root or worktree holds `directory`.
+    pub(super) fn project_of(&self, directory: &Path) -> Option<ProjectId> {
         directory
             .ancestors()
-            .find_map(|ancestor| self.roots.get(ancestor).copied())
-            .or_else(|| self.roots.get(Path::new("")).copied())
+            .find_map(|ancestor| self.first_row.get(ancestor))
+            .map(|(project, _)| *project)
+    }
+
+    /// Every worktree row at `path`.
+    fn rows(&self, path: &Path) -> &[(ProjectId, WorktreeId)] {
+        self.rows.get(path).map_or(&[], Vec::as_slice)
+    }
+}
+
+impl<'a> ResolveRoot<'a> for &'a WorktreePathIndex {
+    fn resolve(&self, directory: &Path) -> Option<&'a Path> {
+        let index: &'a WorktreePathIndex = self;
+        nearest_root(directory, |ancestor| {
+            index.roots.get(ancestor).map(PathBuf::as_path)
+        })
     }
 }
 
@@ -144,22 +299,17 @@ fn scope_descriptor(
             .flat_map(|channel| channel.cards.iter().copied())
             .collect::<HashSet<_>>()
     });
-    let cards = state
-        .cards
-        .iter()
-        .filter(|card| {
-            selected_channel.map_or_else(
-                || {
-                    !channel_cards
-                        .as_ref()
-                        .is_some_and(|cards| cards.contains(&card.id))
-                        && belongs_to_scope(card, scope, roots, owners)
-                },
-                |channel| card.existence.is_open() && channel.cards.contains(&card.id),
-            )
-        })
-        .cloned()
-        .collect::<Vec<_>>();
+    let cards = state.cards.filtered(|card| {
+        selected_channel.map_or_else(
+            || {
+                !channel_cards
+                    .as_ref()
+                    .is_some_and(|cards| cards.contains(&card.id))
+                    && belongs_to_scope(card, scope, roots, owners)
+            },
+            |channel| card.existence.is_open() && channel.cards.contains(&card.id),
+        )
+    });
     let focused = preferred_focus
         .filter(|id| cards.iter().any(|card| card.id == *id))
         .or_else(|| {
@@ -193,6 +343,7 @@ fn scope_descriptor(
         card_scopes: HashMap::new(),
         chat_drafts: HashMap::new(),
         chat_draft_attachments: HashMap::new(),
+        chat_waiting_messages: HashMap::new(),
         agent_updates: Default::default(),
         workspace_history: Vec::new(),
         repository_navigation: HashMap::new(),
@@ -207,7 +358,7 @@ fn scope_descriptor(
 
 fn insertion_indices(
     visible: &[WorkspaceCard],
-    durable: &[CardState],
+    durable: &Cards,
     focused: Option<CardId>,
 ) -> (usize, usize) {
     let anchor = focused.and_then(|id| {
@@ -261,6 +412,13 @@ impl Cagents {
                 self.worktree_focus.remove(path);
             }
         }
+        let open = self
+            .durable
+            .cards
+            .iter()
+            .filter(|card| card.existence.is_open())
+            .map(|card| card.id)
+            .collect::<HashSet<_>>();
         let needs_update = self.durable.active_worktree != self.active_workspace
             || self.durable.worktree_focus != self.worktree_focus
             || active_order.as_ref().is_some_and(|(id, order)| {
@@ -271,13 +429,7 @@ impl Cagents {
             })
             || self.durable.channels.iter().any(|channel| {
                 (Some(channel.id) == self.durable.active_channel && channel.focused != focused)
-                    || channel.cards.iter().any(|id| {
-                        !self
-                            .durable
-                            .cards
-                            .iter()
-                            .any(|card| card.id == *id && card.existence.is_open())
-                    })
+                    || channel.cards.iter().any(|id| !open.contains(id))
             });
         if !needs_update {
             return;
@@ -289,12 +441,7 @@ impl Cagents {
             }
         }
         for channel in &mut durable.channels {
-            channel.cards.retain(|id| {
-                durable
-                    .cards
-                    .iter()
-                    .any(|card| card.id == *id && card.existence.is_open())
-            });
+            channel.cards.retain(|id| open.contains(id));
             if !channel
                 .focused
                 .is_some_and(|id| channel.cards.contains(&id))
@@ -364,7 +511,20 @@ impl Cagents {
         )
     }
 
+    /// Shows channel `id`, saving the workspace now: callers may have changed
+    /// it on the way here.
     pub(super) fn select_channel(&mut self, id: ChannelId) -> Task<Message> {
+        self.show_channel(id, DurableChange::Content)
+    }
+
+    /// Shows channel `id` when nothing but where this window is changes, as
+    /// when the user opens it from the sidebar. The switch is saved with the
+    /// next save, or within [`NAVIGATION_SAVE_DELAY`].
+    pub(super) fn navigate_to_channel(&mut self, id: ChannelId) -> Task<Message> {
+        self.show_channel(id, DurableChange::Navigation)
+    }
+
+    fn show_channel(&mut self, id: ChannelId, change: DurableChange) -> Task<Message> {
         let Some(path) = self.channel_directory(id) else {
             return Task::none();
         };
@@ -383,7 +543,15 @@ impl Cagents {
                 .filter(|card| card.existence.is_open() && channel.cards.contains(&card.id))
                 .map(|card| card.id))
         {
-            return Task::none();
+            // Choosing the channel already open still means going to it: the
+            // keyboard returns to its focused pane unless something inside
+            // that pane already holds it.
+            return match self.workspace.focused() {
+                Some(card) if self.card_holds_keyboard(card) => {
+                    self.focus_pane_keyboard_after_press(card)
+                }
+                _ => Task::none(),
+            };
         }
         self.snapshot_workspace_scope();
         let discarded = if self.durable.active_channel != Some(id) {
@@ -400,7 +568,7 @@ impl Cagents {
             .and_then(|channel| channel.focused);
         let scoped = scope_descriptor(&self.durable, &path, &[], &self.worktree_owners, focused);
         let offset = self.channel_offsets.get(&id).copied();
-        let scope = self.install_workspace_scope(scoped, path, offset);
+        let scope = self.install_workspace_scope(scoped, path, offset, change);
         if discarded {
             self.persist();
         }
@@ -514,7 +682,9 @@ impl Cagents {
             terminal_output_tests::record_folder_root_refresh();
             self.refresh_worktree_owners(None);
         }
-        let roots = self.indexed_worktree_roots();
+        self.worktree_paths
+            .refresh(&self.known_worktree_roots, &self.sidebar_model.projects);
+        let index = &self.worktree_paths;
         let channeled = self
             .durable
             .channels
@@ -526,37 +696,17 @@ impl Cagents {
             .cards
             .iter()
             .filter(|card| card.existence.is_open() && !channeled.contains(&card.id))
-            .filter_map(|card| self.unchanneled_card_worktree_indexed(card, &roots))
+            .filter_map(|card| self.unchanneled_card_worktree_indexed(card, &index))
             .collect::<HashSet<_>>();
-        let worktrees = self
-            .sidebar_model
-            .projects
+        let worktrees = occupied
             .iter()
-            .flat_map(|project| {
-                project
-                    .worktrees
-                    .iter()
-                    .filter(|worktree| occupied.contains(worktree.path.as_path()))
-                    .map(move |worktree| (project.id, worktree.id))
-            })
+            .flat_map(|path| index.rows(path))
+            .copied()
             .collect();
         // Attention chooses the first matching loaded row, unlike occupancy:
         // the latter deliberately marks every project sharing an exact path.
         // Folder boundaries were admitted above; their keys identify the
         // exact loaded row once the longest-root lookup resolves a directory.
-        let mut loaded = HashMap::new();
-        for project in &self.sidebar_model.projects {
-            if let Some(key) = project.folder_key() {
-                loaded
-                    .entry(project.repository.as_path())
-                    .or_insert((key.project_id, key.worktree_id));
-            }
-            for worktree in &project.worktrees {
-                loaded
-                    .entry(worktree.path.as_path())
-                    .or_insert((project.id, worktree.id));
-            }
-        }
         let attention = self
             .sidebar_state
             .attention_cards()
@@ -570,8 +720,8 @@ impl Cagents {
                             && matches!(card.kind, CardKind::Terminal(_) | CardKind::Chat(_))
                             && !channeled.contains(&id)
                     })
-                    .and_then(|card| self.unchanneled_card_worktree_indexed(card, &roots))
-                    .and_then(|directory| loaded.get(directory).copied());
+                    .and_then(|card| self.unchanneled_card_worktree_indexed(card, &index))
+                    .and_then(|directory| index.first_row(directory));
                 (id, owner)
             })
             .collect::<Vec<_>>();
@@ -623,23 +773,33 @@ impl Cagents {
     }
 
     pub(super) fn indexed_worktree_roots(&self) -> WorktreeRoots<'_> {
-        WorktreeRoots::new(
-            self.known_worktree_roots
-                .iter()
-                .map(PathBuf::as_path)
-                .chain(self.sidebar_model.projects.iter().flat_map(|project| {
-                    project
-                        .worktrees
-                        .iter()
-                        .map(|worktree| worktree.path.as_path())
-                })),
-        )
+        WorktreeRoots::new(self.worktree_root_candidates())
+    }
+
+    /// The roots `indexed_worktree_roots` indexes, owned, for an index that
+    /// must outlive mutable updates of this window.
+    pub(super) fn worktree_root_paths(&self) -> Vec<PathBuf> {
+        self.worktree_root_candidates()
+            .map(Path::to_owned)
+            .collect()
+    }
+
+    fn worktree_root_candidates(&self) -> impl Iterator<Item = &Path> {
+        self.known_worktree_roots
+            .iter()
+            .map(PathBuf::as_path)
+            .chain(self.sidebar_model.projects.iter().flat_map(|project| {
+                project
+                    .worktrees
+                    .iter()
+                    .map(|worktree| worktree.path.as_path())
+            }))
     }
 
     pub(super) fn unchanneled_card_worktree_indexed<'a>(
         &'a self,
         card: &'a CardState,
-        roots: &WorktreeRoots<'a>,
+        roots: &impl ResolveRoot<'a>,
     ) -> Option<&'a Path> {
         if let Some(scope) = self
             .worktree_owners
@@ -692,6 +852,23 @@ impl Cagents {
         &mut self,
         path: PathBuf,
         create_if_empty: bool,
+    ) -> (bool, Task<Message>) {
+        self.show_worktree(path, create_if_empty, DurableChange::Content)
+    }
+
+    /// Shows the worktree at `path` when nothing but where this window is
+    /// changes, as when the user opens it from the sidebar. The switch is
+    /// saved with the next save, or within [`NAVIGATION_SAVE_DELAY`]; a
+    /// default pane opened for an empty worktree saves itself.
+    pub(super) fn navigate_to_worktree(&mut self, path: PathBuf) -> Task<Message> {
+        self.show_worktree(path, true, DurableChange::Navigation).1
+    }
+
+    fn show_worktree(
+        &mut self,
+        path: PathBuf,
+        create_if_empty: bool,
+        change: DurableChange,
     ) -> (bool, Task<Message>) {
         let path = self
             .refresh_worktree_owners(Some(&path))
@@ -798,7 +975,7 @@ impl Cagents {
             .iter()
             .any(|card| matches!(card.kind, CardKind::Terminal(_) | CardKind::Chat(_)));
         let offset = self.worktree_offsets.get(&path).copied();
-        let scope = self.install_workspace_scope(scoped, path.clone(), offset);
+        let scope = self.install_workspace_scope(scoped, path.clone(), offset, change);
         let terminal = if create_if_empty && !has_terminal {
             self.add_default_pane(path, self.settings.default_worktree_pane)
         } else {
@@ -815,11 +992,14 @@ impl Cagents {
         scoped: WorkspaceState,
         path: PathBuf,
         offset: Option<f32>,
+        change: DurableChange,
     ) -> Task<Message> {
         let width = self.workspace.viewport_width();
         // Hide before replacing the strip: its former widgets no longer get a
         // chance to send native-surface visibility updates after unmounting.
-        self.set_workspace_surfaces_visible(false);
+        // The warm chat budget waits for `apply_viewport` below, once the
+        // panes this scope shows are visible again and so not candidates.
+        self.apply_workspace_surface_visibility(false);
         self.active_workspace = Some(path);
         self.workspace_view_generation = self.workspace_view_generation.wrapping_add(1);
         // Iced inherits old anonymous IDs during diff. A named generation ID
@@ -834,22 +1014,30 @@ impl Cagents {
         // to a strip restores its actual offset, even if focus is offscreen.
         let offset = offset.unwrap_or_else(|| self.workspace.camera().target());
         self.workspace.native_scroll(offset, width);
+        // The cards this strip shows, and those the strip being left showed.
+        // Every surface was just hidden, so a card on screen both before and
+        // after is told again to show itself. Every other card stays where
+        // it was, offscreen.
         let transitions = self
             .durable
             .cards
             .iter()
             .filter(|card| card.existence.is_open())
-            .map(|card| VisibilityTransition {
-                id: card.id,
-                from: match card.exposure {
+            .filter_map(|card| {
+                let from = match self.exposure(card.id) {
                     Exposure::Visible => VisibilityClass::Visible,
                     Exposure::Prefetch => VisibilityClass::Overscan,
                     Exposure::Offscreen => VisibilityClass::Offscreen,
-                },
-                to: self
+                };
+                let to = self
                     .workspace
                     .visibility(card.id)
-                    .unwrap_or(VisibilityClass::Offscreen),
+                    .unwrap_or(VisibilityClass::Offscreen);
+                (from != to || to != VisibilityClass::Offscreen).then_some(VisibilityTransition {
+                    id: card.id,
+                    from,
+                    to,
+                })
             })
             .collect();
         let viewport = self.apply_viewport(
@@ -858,7 +1046,7 @@ impl Cagents {
                 transitions,
             },
             true,
-            true,
+            change,
         );
         // The strip being left keeps its visuals for the usual grace, so
         // coming straight back finds its panes as they were instead of
@@ -989,7 +1177,8 @@ mod tests {
                 loose.clone(),
                 companion.clone(),
                 channeled.clone(),
-            ],
+            ]
+            .into(),
             active_worktree: Some("/repo".into()),
             channels: vec![ProjectChannel {
                 title_source: Default::default(),
@@ -1038,7 +1227,7 @@ mod tests {
         let a = ChannelId::new();
         let b = ChannelId::new();
         app.durable = Arc::new(WorkspaceState {
-            cards: vec![main.clone(), first.clone(), focused.clone(), second.clone()],
+            cards: vec![main.clone(), first.clone(), focused.clone(), second.clone()].into(),
             focused: Some(focused.id),
             active_worktree: Some("/repo".into()),
             active_channel: Some(a),
@@ -1103,7 +1292,7 @@ mod tests {
         let closed = terminal("/repo");
         let main = terminal("/repo");
         app.durable = Arc::new(WorkspaceState {
-            cards: vec![main.clone(), closed.clone()],
+            cards: vec![main.clone(), closed.clone()].into(),
             channels: vec![ProjectChannel {
                 title_source: Default::default(),
                 id,
@@ -1151,8 +1340,6 @@ mod tests {
             title: path.into(),
             width_fraction: 0.7,
             existence: Existence::Open,
-            exposure: Exposure::Visible,
-            residency: Residency::Cold,
             kind: CardKind::Repository(RepositoryView {
                 selected_file: None,
                 project: ProjectId::new(),
@@ -1212,7 +1399,7 @@ mod tests {
         let nested = terminal("/repo/worktree/src");
         let channeled = terminal("/repo/idle");
         app.durable = Arc::new(WorkspaceState {
-            cards: vec![root.clone(), nested.clone(), channeled.clone()],
+            cards: vec![root.clone(), nested.clone(), channeled.clone()].into(),
             channels: vec![ProjectChannel {
                 title_source: Default::default(),
                 id: ChannelId::new(),
@@ -1261,7 +1448,7 @@ mod tests {
         let shell = terminal("/repo");
         let id = shell.id;
         app.durable = Arc::new(WorkspaceState {
-            cards: vec![shell],
+            cards: vec![shell].into(),
             ..WorkspaceState::default()
         });
         // Any message that reaches the end of `update` derives the rows.
@@ -1296,7 +1483,7 @@ mod tests {
         let channeled = terminal("/home/user");
         let channel = ChannelId::new();
         app.durable = Arc::new(WorkspaceState {
-            cards: vec![main.clone(), nested.clone(), channeled.clone()],
+            cards: vec![main.clone(), nested.clone(), channeled.clone()].into(),
             active_worktree: Some("/repo".into()),
             channels: vec![ProjectChannel {
                 title_source: Default::default(),
@@ -1553,7 +1740,7 @@ mod tests {
             terminal: Some(source),
         });
         app.durable = Arc::new(WorkspaceState {
-            cards: vec![card.clone()],
+            cards: vec![card.clone()].into(),
             ..WorkspaceState::default()
         });
         let _ = app.select_worktree("/repo/nested".into(), true);
@@ -1587,7 +1774,7 @@ mod tests {
         let a = terminal("/a");
         let b = terminal("/b");
         app.durable = Arc::new(WorkspaceState {
-            cards: vec![a, b],
+            cards: vec![a, b].into(),
             ..WorkspaceState::default()
         });
         let mut workspace = Workspace::default();
@@ -1685,7 +1872,7 @@ mod tests {
         let a = [terminal("/a"), terminal("/a/src"), terminal("/a")];
         let b = terminal("/b");
         app.durable = Arc::new(WorkspaceState {
-            cards: vec![a[0].clone(), b.clone(), a[1].clone(), a[2].clone()],
+            cards: vec![a[0].clone(), b.clone(), a[1].clone(), a[2].clone()].into(),
             focused: Some(a[2].id),
             ..WorkspaceState::default()
         });
@@ -1700,7 +1887,7 @@ mod tests {
         assert_eq!(app.workspace.camera().offset(), 0.0);
         assert!(
             a.iter()
-                .all(|card| app.card_state(card.id).unwrap().exposure == Exposure::Offscreen)
+                .all(|card| app.exposure(card.id) == Exposure::Offscreen)
         );
         let _ = app.update(Message::Viewport {
             generation: a_generation,
@@ -1755,7 +1942,7 @@ mod tests {
         let a = [terminal("/a/src"), terminal("/a/src"), terminal("/a/src")];
         let b = terminal("/b");
         app.durable = Arc::new(WorkspaceState {
-            cards: vec![a[0].clone(), a[1].clone(), a[2].clone(), b.clone()],
+            cards: vec![a[0].clone(), a[1].clone(), a[2].clone(), b.clone()].into(),
             focused: Some(a[0].id),
             ..WorkspaceState::default()
         });
@@ -1767,7 +1954,7 @@ mod tests {
         register_worktrees(&mut app, &["/a", "/b"]);
         let _ = app.select_worktree("/a".into(), false);
         assert!(app.workspace.card(b.id).is_none());
-        assert_eq!(app.card_state(b.id).unwrap().exposure, Exposure::Offscreen);
+        assert_eq!(app.exposure(b.id), Exposure::Offscreen);
         assert_eq!(app.workspace.camera().offset(), 250.0);
         assert_eq!(app.workspace.focused(), Some(a[0].id));
     }
@@ -1780,18 +1967,22 @@ mod tests {
             let editor = repository("/a");
             let shell = terminal("/a");
             app.durable = Arc::new(WorkspaceState {
-                cards: vec![editor.clone(), shell.clone()],
+                cards: vec![editor.clone(), shell.clone()].into(),
                 focused: Some(shell.id),
                 ..WorkspaceState::default()
             });
             app.window_width = width;
-            app.context_tab = ContextTab::Changes;
+            app.context_sections
+                .set_open(context_sections::Section::Workspace, true);
             let _ = app.restore_worktree_scope();
             let key = app.sidebar_state.active_worktree().unwrap().clone();
             let was_overlay = app.context_inspector_is_overlay();
             let _ = app.route_panel_open(&key, &RepoPath::parse("src/main.rs").unwrap());
             assert_eq!(app.workspace.focused(), Some(editor.id));
-            assert_eq!(app.context_tab, ContextTab::Changes);
+            assert_eq!(
+                app.workspace_view_shown(),
+                Some(context_sections::WorkspaceView::SourceControl)
+            );
             assert_eq!(app.context_inspector_open, !was_overlay);
             if was_overlay {
                 assert!(app.workspace_inputs_blocked());
@@ -1819,7 +2010,7 @@ mod tests {
         let legacy = terminal("/home/user");
         let owned = terminal("/repo");
         app.durable = Arc::new(WorkspaceState {
-            cards: vec![legacy.clone(), owned.clone()],
+            cards: vec![legacy.clone(), owned.clone()].into(),
             focused: Some(owned.id),
             ..WorkspaceState::default()
         });
@@ -1854,7 +2045,7 @@ mod tests {
             &[root.to_str().unwrap(), nested.to_str().unwrap()],
         );
         app.durable = Arc::new(WorkspaceState {
-            cards: vec![shell.clone(), editor.clone()],
+            cards: vec![shell.clone(), editor.clone()].into(),
             ..WorkspaceState::default()
         });
         let _ = app.select_worktree(alias.join("worktrees/feature"), false);
@@ -1874,7 +2065,7 @@ mod tests {
         let shell = terminal(missing.to_str().unwrap());
         let mut app = super::super::tests::context_inspector_test_app(false);
         app.durable = Arc::new(WorkspaceState {
-            cards: vec![shell.clone()],
+            cards: vec![shell.clone()].into(),
             ..WorkspaceState::default()
         });
         let _ = app.select_worktree(directory.path().into(), false);
@@ -1921,7 +2112,7 @@ mod tests {
             let parent = terminal("/repo");
             let retained = terminal("/repo/worktrees/deleted/src");
             app.durable = Arc::new(WorkspaceState {
-                cards: vec![parent.clone(), retained.clone()],
+                cards: vec![parent.clone(), retained.clone()].into(),
                 ..WorkspaceState::default()
             });
             if restored_without_row {
@@ -1936,10 +2127,7 @@ mod tests {
             register_worktrees(&mut app, &["/repo"]);
             let _ = app.select_worktree("/repo".into(), false);
             assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![parent.id]);
-            assert_eq!(
-                app.card_state(retained.id).unwrap().exposure,
-                Exposure::Offscreen
-            );
+            assert_eq!(app.exposure(retained.id), Exposure::Offscreen);
             assert!(app.card_state(retained.id).unwrap().existence.is_open());
         }
     }
@@ -1953,7 +2141,7 @@ mod tests {
         let source = repository(nested.to_str().unwrap());
         let mut app = super::super::tests::context_inspector_test_app(false);
         app.durable = Arc::new(WorkspaceState {
-            cards: vec![source.clone()],
+            cards: vec![source.clone()].into(),
             focused: Some(source.id),
             active_worktree: Some(root.clone()),
             card_scopes: HashMap::from([(source.id, root.clone())]),
@@ -2045,6 +2233,154 @@ mod tests {
     }
 
     #[test]
+    fn worktree_path_index_is_kept_until_its_roots_or_rows_change() {
+        fn row(id: WorktreeId, path: &str) -> SidebarWorktree {
+            SidebarWorktree::new(id, path.into(), None, false, false, None, None, None)
+        }
+        let (folder, repository) = (ProjectId::new(), ProjectId::new());
+        let (folder_row, shared_row, nested_row) =
+            (WorktreeId::new(), WorktreeId::new(), WorktreeId::new());
+        let mut projects = vec![
+            SidebarProject::new(
+                folder,
+                RepositoryId::new(),
+                "Folder".into(),
+                "/root".into(),
+                vec![row(folder_row, "/root")],
+                vec![],
+            )
+            .with_kind(ProjectKind::Folder),
+            SidebarProject::new(
+                repository,
+                RepositoryId::new(),
+                "Repository".into(),
+                "/root".into(),
+                vec![row(shared_row, "/root"), row(nested_row, "/root/nested")],
+                vec![],
+            ),
+        ];
+        let folder_key = projects[0].folder_key().unwrap();
+        let mut known = HashSet::from([PathBuf::from("/known")]);
+        let mut index = WorktreePathIndex::default();
+        index.refresh(&known, &projects);
+        index.refresh(&known, &projects);
+        assert_eq!(
+            index.generation(),
+            1,
+            "unchanged rows and roots keep the index"
+        );
+        // Both projects list /root, so it is a row of each; attention goes to
+        // the first loaded row there, the folder's own.
+        assert_eq!(
+            index.rows(Path::new("/root")),
+            [(folder, folder_row), (repository, shared_row)]
+        );
+        assert_eq!(
+            index.first_row(Path::new("/root")),
+            Some((folder_key.project_id, folder_key.worktree_id))
+        );
+        assert_eq!(
+            (&index).resolve(Path::new("/root/nested/src")),
+            Some(Path::new("/root/nested"))
+        );
+        assert_eq!(
+            (&index).resolve(Path::new("/known/src")),
+            Some(Path::new("/known"))
+        );
+        assert_eq!((&index).resolve(Path::new("/elsewhere")), None);
+
+        projects[1].worktrees[1] = row(nested_row, "/root/moved");
+        index.refresh(&known, &projects);
+        assert_eq!(index.generation(), 2, "a moved row rebuilds the index");
+        assert_eq!(index.rows(Path::new("/root/nested")), []);
+        assert_eq!(
+            (&index).resolve(Path::new("/root/moved/src")),
+            Some(Path::new("/root/moved"))
+        );
+
+        known.insert("/admitted".into());
+        index.refresh(&known, &projects);
+        assert_eq!(
+            index.generation(),
+            3,
+            "a newly known root rebuilds the index"
+        );
+        assert_eq!(
+            (&index).resolve(Path::new("/admitted/src")),
+            Some(Path::new("/admitted"))
+        );
+
+        let folder_project = projects.remove(0);
+        index.refresh(&known, &projects);
+        assert_eq!(
+            index.generation(),
+            4,
+            "a removed project rebuilds the index"
+        );
+        assert_eq!(index.rows(Path::new("/root")), [(repository, shared_row)]);
+        assert_eq!(
+            index.first_row(Path::new("/root")),
+            Some((repository, shared_row))
+        );
+
+        projects.push(folder_project);
+        index.refresh(&known, &projects);
+        assert_eq!(index.generation(), 5, "an added project rebuilds the index");
+        assert_eq!(
+            index.first_row(Path::new("/root")),
+            Some((repository, shared_row)),
+            "the first project listing a path owns its attention"
+        );
+        projects.swap(0, 1);
+        index.refresh(&known, &projects);
+        assert_eq!(
+            index.generation(),
+            6,
+            "reordered projects rebuild the index"
+        );
+        assert_eq!(
+            index.first_row(Path::new("/root")),
+            Some((folder_key.project_id, folder_key.worktree_id))
+        );
+
+        projects[0].kind = ProjectKind::Git;
+        index.refresh(&known, &projects);
+        assert_eq!(
+            index.generation(),
+            7,
+            "a folder becoming a repository rebuilds"
+        );
+        assert_eq!(
+            index.first_row(Path::new("/root")),
+            Some((folder, folder_row)),
+            "without its folder key, the project's own row is first"
+        );
+        projects[1].kind = ProjectKind::Folder;
+        index.refresh(&known, &projects);
+        assert_eq!(
+            index.generation(),
+            8,
+            "a repository becoming a folder rebuilds"
+        );
+        let became_folder = projects[1].folder_key().unwrap();
+        assert_eq!(
+            index.first_row(Path::new("/root")),
+            Some((folder, folder_row))
+        );
+        projects.swap(0, 1);
+        index.refresh(&known, &projects);
+        assert_eq!(
+            index.first_row(Path::new("/root")),
+            Some((became_folder.project_id, became_folder.worktree_id)),
+            "a folder's key comes before its rows"
+        );
+        assert_eq!(
+            index.rows(Path::new("/root")),
+            [(repository, shared_row), (folder, folder_row)]
+        );
+    }
+
+    #[test]
     fn indexed_roots_match_component_matching_for_nested_and_relative_paths() {
         let roots = [
             Path::new("/repo"),
@@ -2098,7 +2434,8 @@ mod tests {
                 browser.clone(),
                 b.clone(),
                 b_editor.clone(),
-            ],
+            ]
+            .into(),
             focused: Some(a.id),
             ..WorkspaceState::default()
         };
@@ -2108,8 +2445,8 @@ mod tests {
         let a_view = scope_descriptor(&state, roots[0], &roots, &owners, Some(a.id));
         let b_view = scope_descriptor(&state, roots[1], &roots, &owners, Some(b.id));
         let returned = scope_descriptor(&state, roots[0], &roots, &owners, a_view.focused);
-        assert_eq!(a_view.cards, vec![a, a_editor, browser.clone()]);
-        assert_eq!(b_view.cards, vec![browser, b, b_editor]);
+        assert_eq!(a_view.cards, vec![a, a_editor, browser.clone()].into());
+        assert_eq!(b_view.cards, vec![browser, b, b_editor].into());
         assert_eq!(returned, a_view);
         assert_eq!(state, before);
     }
@@ -2120,7 +2457,7 @@ mod tests {
         let hidden = terminal("/b");
         let next = terminal("/a");
         let state = WorkspaceState {
-            cards: vec![a.clone(), hidden.clone(), next.clone()],
+            cards: vec![a.clone(), hidden.clone(), next.clone()].into(),
             focused: Some(a.id),
             ..WorkspaceState::default()
         };
@@ -2134,7 +2471,7 @@ mod tests {
         inserted.cards.insert(indices.1, added.clone());
         let restored =
             scope_descriptor(&inserted, roots[0], &roots, &HashMap::new(), Some(added.id));
-        assert_eq!(restored.cards, vec![a, added, next]);
+        assert_eq!(restored.cards, vec![a, added, next].into());
         assert_eq!(inserted.cards[2], hidden);
         assert_eq!(
             insertion_indices(workspace.cards(), &state.cards, None),
@@ -2149,7 +2486,7 @@ mod tests {
         let a_focused = terminal("/repo");
         let b = terminal("/repo/nested/src");
         app.durable = Arc::new(WorkspaceState {
-            cards: vec![a_first.clone(), b.clone(), a_focused.clone()],
+            cards: vec![a_first.clone(), b.clone(), a_focused.clone()].into(),
             focused: Some(a_focused.id),
             ..WorkspaceState::default()
         });
@@ -2192,10 +2529,7 @@ mod tests {
             app.terminal_directory(),
             Some(PathBuf::from("/repo/nested"))
         );
-        assert_eq!(
-            app.card_state(a_focused.id).unwrap().exposure,
-            Exposure::Offscreen
-        );
+        assert_eq!(app.exposure(a_focused.id), Exposure::Offscreen);
         assert_eq!(
             app.sidebar_state.active_worktree().unwrap().canonical_path,
             PathBuf::from("/repo/nested")
@@ -2223,7 +2557,7 @@ mod tests {
             vec![a_first.id, a_focused.id]
         );
         assert_eq!(app.workspace.viewport_width(), 1_280.0);
-        assert_eq!(app.card_state(b.id).unwrap().exposure, Exposure::Offscreen);
+        assert_eq!(app.exposure(b.id), Exposure::Offscreen);
         assert_eq!(
             app.durable
                 .cards
@@ -2249,13 +2583,78 @@ mod tests {
         assert_eq!(app.durable.cards.len(), 3);
     }
 
+    /// Opening worktrees from the sidebar changes where this window is and
+    /// nothing else: the durable state follows each click at once, and the
+    /// burst is handed to the writer once.
+    #[test]
+    fn opening_worktrees_from_the_sidebar_saves_once_after_the_burst() {
+        use super::super::terminal_output_tests::persists;
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let a = terminal("/repo");
+        let b = terminal("/repo/nested");
+        app.durable = Arc::new(WorkspaceState {
+            cards: vec![a.clone(), b.clone()].into(),
+            focused: Some(a.id),
+            ..WorkspaceState::default()
+        });
+        app.sidebar_model.projects = vec![SidebarProject::new(
+            ProjectId::new(),
+            RepositoryId::new(),
+            "repo".into(),
+            "/repo".into(),
+            ["/repo", "/repo/nested"]
+                .into_iter()
+                .map(|path| {
+                    SidebarWorktree::new(
+                        crate::model::WorktreeId::new(),
+                        path.into(),
+                        None,
+                        false,
+                        false,
+                        None,
+                        None,
+                        None,
+                    )
+                })
+                .collect(),
+            Vec::new(),
+        )];
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.workspace.resize_viewport(1_280.0);
+        let _ = app.restore_worktree_scope();
+
+        let saved = persists();
+        for (path, card) in [("/repo/nested", &b), ("/repo", &a), ("/repo/nested", &b)] {
+            let project = &app.sidebar_model.projects[0];
+            let worktree = project
+                .worktrees
+                .iter()
+                .find(|worktree| worktree.path == std::path::Path::new(path))
+                .unwrap();
+            let open = SidebarAction::OpenWorktree {
+                project_id: project.id,
+                worktree_id: worktree.id,
+                path: path.into(),
+            };
+            drop(app.update(Message::Sidebar(open)));
+            assert_eq!(app.workspace.focused(), Some(card.id));
+            assert_eq!(
+                app.durable.active_worktree.as_deref(),
+                Some(std::path::Path::new(path))
+            );
+            assert_eq!(persists(), saved, "a click alone waits for the burst");
+        }
+        drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
+        assert_eq!(persists(), saved + 1, "the burst is saved once");
+    }
+
     #[test]
     fn application_close_protects_unsaved_editors_in_hidden_worktrees() {
         let mut app = super::super::tests::context_inspector_test_app(false);
         register_worktrees(&mut app, &["/a", "/b"]);
         let editor = repository("/a");
         app.durable = Arc::new(WorkspaceState {
-            cards: vec![editor.clone(), terminal("/b")],
+            cards: vec![editor.clone(), terminal("/b")].into(),
             focused: Some(editor.id),
             ..WorkspaceState::default()
         });
@@ -2289,14 +2688,14 @@ mod tests {
             fidelity: BrowserRestoreFidelity::UrlOnly,
         });
         app.durable = Arc::new(WorkspaceState {
-            cards: vec![a.clone(), b.clone(), browser.clone()],
+            cards: vec![a.clone(), b.clone(), browser.clone()].into(),
             focused: Some(a.id),
             ..WorkspaceState::default()
         });
         let _ = app.restore_worktree_scope();
         let _ = app.select_worktree("/b".into(), false);
         let update = app.workspace.focus(browser.id).unwrap();
-        let _ = app.apply_viewport(update, false, false);
+        let _ = app.apply_viewport(update, false, DurableChange::None);
         let mut restarted = super::super::tests::context_inspector_test_app(false);
         restarted.durable = Arc::clone(&app.durable);
         restarted.sidebar_model = app.sidebar_model.clone();
@@ -2319,7 +2718,7 @@ mod tests {
         app.settings.default_worktree_pane = settings::DefaultPane::Terminal;
         let parent_terminal = terminal(root.path().to_str().unwrap());
         app.durable = Arc::new(WorkspaceState {
-            cards: vec![parent_terminal.clone()],
+            cards: vec![parent_terminal.clone()].into(),
             focused: Some(parent_terminal.id),
             ..WorkspaceState::default()
         });
@@ -2426,6 +2825,7 @@ mod tests {
         .unwrap();
         let destination = repository.join("worktrees/zulu-new");
         let request = CreateWorktreeRequest {
+            resolution_warnings: Vec::new(),
             setup_intent: None,
             repository: repository.clone(),
             managed_root: repository.join("worktrees"),

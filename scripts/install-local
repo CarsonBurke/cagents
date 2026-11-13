@@ -1,0 +1,263 @@
+#!/usr/bin/env bash
+# Build the committed HEAD as a matched production set and stage it into this
+# user's installation, then finish through the reviewed `daemon upgrade` flow.
+set -euo pipefail
+
+PROGRAM=install-local
+ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+BUILD_HOST=
+STAGE_ONLY=0
+THIS_COMMIT=0
+UPGRADE_ARGS=()
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM" "$*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/install-local [--build-host HOST] [--stage-only] [--this-commit]
+                             [--yes] [--interrupt]
+
+Builds HEAD with the `local` Cargo profile as version <version>+local.<sha>,
+stages it with install.sh --stage-only, and runs `cagents daemon upgrade`.
+
+The build runs in the repository's .worktrees/.install-local, a detached
+checkout this script owns, so its target directory stays warm between runs
+and edits in other checkouts never reach the binaries.
+
+  --build-host HOST  Build on HOST over ssh, then install here. HEAD is pushed
+                     to the repository at the same path relative to $HOME.
+  --stage-only       Stop after staging; finish later with: cagents daemon upgrade
+  --this-commit      Build HEAD even when it is detached or its branch is
+                     behind its upstream.
+  --yes, --interrupt
+                     Passed to `cagents daemon upgrade`.
+
+CARGO_BUILD_JOBS defaults to every CPU of the build host.
+EOF
+}
+
+# Repeated, shell-quoted, in a suggested command.
+ARGUMENTS=$( (($# == 0)) || printf ' %q' "$@")
+while (($#)); do
+    case $1 in
+        --build-host)
+            (($# >= 2)) && [[ -n $2 ]] || fail '--build-host requires a host'
+            BUILD_HOST=$2
+            shift 2
+            ;;
+        --stage-only) STAGE_ONLY=1; shift ;;
+        --this-commit) THIS_COMMIT=1; shift ;;
+        --yes|--interrupt) UPGRADE_ARGS+=("$1"); shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) fail "unknown argument: $1 (see --help)" ;;
+    esac
+done
+((STAGE_ONLY == 0 || ${#UPGRADE_ARGS[@]} == 0)) || fail '--yes and --interrupt apply to the upgrade, not --stage-only'
+
+# install.sh refuses hosted agent sessions; say so before spending a build.
+[[ ${CAGENTS_AGENT_AUTHORITY+x} != x ]] || fail 'run this from your own terminal; hosted sessions cannot change the installation'
+
+cd "$ROOT_DIR"
+# Only HEAD is built; refuse rather than silently leave tracked edits out.
+[[ -z $(git status --porcelain --untracked-files=no) ]] || fail 'commit or discard tracked changes first'
+COMMIT=$(git rev-parse --verify HEAD)
+SHORT=$(git rev-parse --short=9 HEAD)
+
+# Updates the remote-tracking ref for REF on REMOTE so the comparison below
+# sees what has been published since the last fetch. It never prompts (HTTPS
+# or SSH); a failure is reported and leaves the last fetched state to compare
+# with.
+refresh_remote_ref() {
+    GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh} -o BatchMode=yes" git fetch --quiet --no-tags -- "$1" "$2" </dev/null 2>/dev/null \
+        || printf '%s: could not fetch %s from %s; comparing with the last fetched state\n' \
+            "$PROGRAM" "$2" "$1" >&2
+}
+
+commits() {
+    if (($1 == 1)); then echo '1 commit'; else echo "$1 commits"; fi
+}
+
+# Explains why HEAD is probably not what should be installed and how to get
+# there, then refuses. A deliberate build of this commit passes --this-commit.
+refuse_stale_head() {
+    printf '%s: %s\n' "$PROGRAM" "$1" >&2
+    printf '%s\n' "$2" "To build $SHORT anyway, add --this-commit." >&2
+    exit 1
+}
+
+# A detached HEAD or a branch behind its upstream is usually a checkout nobody
+# updated rather than a chosen commit; building it would install old code.
+check_head() {
+    local branch default tip behind worktree remote merge upstream ahead
+    default=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || :)
+    default=${default#origin/}
+    default=${default:-main}
+    if ! branch=$(git symbolic-ref --quiet --short HEAD); then
+        refresh_remote_ref origin "refs/heads/$default"
+        tip=$(git rev-parse --quiet --verify "refs/remotes/origin/$default^{commit}" || :)
+        if [[ $tip == "$COMMIT" ]]; then
+            printf 'Building detached HEAD %s, the tip of origin/%s.\n' "$SHORT" "$default"
+            return
+        fi
+        if ((THIS_COMMIT)); then
+            printf 'Building detached HEAD %s.\n' "$SHORT"
+            return
+        fi
+        behind=
+        if [[ -n $tip ]] && git merge-base --is-ancestor HEAD "$tip"; then
+            behind=" ($(commits "$(git rev-list --count "HEAD..$tip")") behind origin/$default)"
+        fi
+        # A branch checked out in another worktree cannot be checked out here.
+        # awk reads to the end: exiting early could kill git with SIGPIPE,
+        # which pipefail and set -e would turn into a silent exit.
+        worktree=$(git worktree list --porcelain | awk -v ref="refs/heads/$default" '
+            /^worktree / { path = substr($0, 10) }
+            $0 == "branch " ref && !found { print path; found = 1 }')
+        if [[ -n $worktree ]]; then
+            refuse_stale_head "HEAD is detached at $SHORT$behind." \
+                "To build $default, run: cd $(printf '%q' "$worktree") && git pull --ff-only && scripts/install-local$ARGUMENTS"
+        fi
+        refuse_stale_head "HEAD is detached at $SHORT$behind." \
+            "To build $default, run: git checkout $default && git pull --ff-only"
+    fi
+    remote=$(git config --get "branch.$branch.remote" || :)
+    merge=$(git config --get "branch.$branch.merge" || :)
+    if [[ -n $remote && -n $merge ]] \
+        && upstream=$(git rev-parse --quiet --abbrev-ref '@{upstream}' 2>/dev/null); then
+        # A local upstream (remote ".") is already current.
+        [[ $remote == . ]] || refresh_remote_ref "$remote" "$merge"
+        read -r ahead behind < <(git rev-list --left-right --count 'HEAD...@{upstream}')
+        if ((behind > 0 && THIS_COMMIT == 0)); then
+            if ((ahead > 0)); then
+                refuse_stale_head "$branch has diverged from $upstream ($ahead ahead, $behind behind)." \
+                    "Bring in $upstream first, for example with: git pull --rebase"
+            fi
+            refuse_stale_head "$branch is $(commits "$behind") behind $upstream." \
+                "To update it, run: git pull --ff-only"
+        fi
+    fi
+    if [[ $branch == "$default" ]]; then
+        printf 'Building %s at %s.\n' "$branch" "$SHORT"
+    else
+        printf 'Building branch %s at %s, not %s.\n' "$branch" "$SHORT" "$default"
+    fi
+}
+check_head
+MANIFEST_VERSION=$(sed -n '/^\[package\]/,/^\[/{s/^version = "\([^"]*\)"$/\1/p;}' Cargo.toml)
+VERSION=$MANIFEST_VERSION+local.$SHORT
+# Worktrees share their repository's objects; address the main checkout.
+REPOSITORY=$(dirname -- "$(git rev-parse --path-format=absolute --git-common-dir)")
+PREFIX=${XDG_DATA_HOME:-$HOME/.local/share}/cagents-install
+ARCHIVE=cagents-$VERSION-x86_64-unknown-linux-gnu.tar.gz
+OUTPUT=${TMPDIR:-/var/tmp}/cagents-install-local/$VERSION
+BUILD_REF=refs/cagents/install-local
+
+# Checks out COMMIT in the script-owned build checkout and packages it into
+# OUTPUT. Runs unchanged on this host or, through `declare -f`, on a build host.
+build_commit() {
+    local repository=$1 commit=$2 version=$3 output=$4 jobs=$5
+    local checkout=$repository/.worktrees/.install-local
+    if [[ ! -e $checkout ]]; then
+        git -C "$repository" worktree add --quiet --detach "$checkout" "$commit"
+    elif git -C "$checkout" symbolic-ref --quiet HEAD >/dev/null; then
+        echo "install-local: $checkout is on a branch; it is not this script's checkout" >&2
+        return 1
+    fi
+    git -C "$checkout" checkout --quiet --force --detach "$commit"
+    rm -rf -- "$output"
+    mkdir -p -- "$output"
+    (
+        cd "$checkout"
+        # rustup selects rust-toolchain.toml; mise supplies the pinned Zig.
+        export PATH=$HOME/.cargo/bin:$PATH
+        export CARGO_BUILD_JOBS=${jobs:-$(nproc)}
+        local tools=()
+        if command -v mise >/dev/null; then
+            # This checkout only ever holds commits chosen by this script.
+            mise trust --quiet mise.toml
+            tools=(mise exec --)
+        fi
+        VERSION=$version CAGENTS_CARGO_PROFILE=local CAGENTS_DIST_DIR=$output \
+            "${tools[@]}" scripts/package-linux.sh --variant full --archive-only
+    )
+}
+
+# Removes local builds other than the current one, the two most recent
+# others (rollback targets), and any version a running process executes from.
+prune_versions() {
+    local versions current name exe kept=0
+    versions=$(realpath -- "$PREFIX/versions")
+    current=$(basename -- "$(readlink -- "$PREFIX/current")")
+    local -A in_use=()
+    for exe in /proc/[0-9]*/exe; do
+        exe=$(readlink -- "$exe" 2>/dev/null) || continue
+        [[ $exe == "$versions"/* ]] || continue
+        exe=${exe#"$versions"/}
+        in_use[${exe%%/*}]=1
+    done
+    while IFS= read -r name; do
+        [[ $name == *+local.* && $name != "$current" && -z ${in_use[$name]:-} ]] || continue
+        if ((kept < 2)); then
+            kept=$((kept + 1))
+            continue
+        fi
+        printf 'Removing old local build %s\n' "$name"
+        rm -rf -- "${versions:?}/$name"
+    done < <(cd "$versions" && ls -1t)
+}
+
+if [[ $PREFIX/current -ef $PREFIX/versions/$VERSION ]]; then
+    printf '%s is already current; skipping the build.\n' "$VERSION"
+elif [[ -e $PREFIX/versions/$VERSION ]]; then
+    fail "$PREFIX/versions/$VERSION exists but is not current; remove it to reinstall"
+else
+    if [[ -z $BUILD_HOST ]]; then
+        build_commit "$REPOSITORY" "$COMMIT" "$VERSION" "$OUTPUT" "${CARGO_BUILD_JOBS:-}" </dev/null
+    else
+        REMOTE_REPOSITORY=${REPOSITORY#"$HOME"/}
+        [[ $REMOTE_REPOSITORY != "$REPOSITORY" ]] || fail 'the repository must be under $HOME to locate it on the build host'
+        REMOTE_OUTPUT=/var/tmp/cagents-install-local/$VERSION
+        git push --quiet --force "ssh://$BUILD_HOST/~/$REMOTE_REPOSITORY" "$COMMIT:$BUILD_REF"
+        # The host's login shell may not be POSIX and re-parses ssh arguments,
+        # dropping empty ones. Bash reads this script from stdin instead, with
+        # every value quoted for bash; the build must not consume the rest.
+        ssh "$BUILD_HOST" bash -s <<EOF
+set -euo pipefail
+$(declare -f build_commit)
+build_commit "\$HOME"/$(printf '%q ' "$REMOTE_REPOSITORY" "$COMMIT" "$VERSION" "$REMOTE_OUTPUT" "${CARGO_BUILD_JOBS:-}")</dev/null
+EOF
+        rm -rf -- "$OUTPUT"
+        mkdir -p -- "$OUTPUT"
+        scp -q "$BUILD_HOST:$REMOTE_OUTPUT/$ARCHIVE" "$BUILD_HOST:$REMOTE_OUTPUT/SHA256SUMS" "$OUTPUT/"
+        # shellcheck disable=SC2029
+        ssh "$BUILD_HOST" rm -rf -- "$REMOTE_OUTPUT"
+    fi
+
+    # A remote build may link against a newer glibc than this host provides.
+    have=$(getconf GNU_LIBC_VERSION | awk '{ print $2 }')
+    tar -xzf "$OUTPUT/$ARCHIVE" -C "$OUTPUT" "cagents-$VERSION/bin"
+    versions=
+    for binary in cagents cagentsd cagents-ui; do
+        versions+=$(LC_ALL=C readelf --wide --version-info "$OUTPUT/cagents-$VERSION/bin/$binary")$'\n' \
+            || fail "could not read the glibc versions $binary requires"
+    done
+    # No GLIBC symbol leaves need empty; pipefail must not turn grep's status
+    # into a silent exit before the message below.
+    need=$(grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' <<<"$versions" | sed 's/GLIBC_//' | sort -Vu | tail -n1) || :
+    [[ -n $need ]] || fail 'could not determine the glibc the build requires'
+    [[ $(printf '%s\n%s\n' "$need" "$have" | sort -V | tail -n1) == "$have" ]] \
+        || fail "the build requires glibc $need; this host has $have"
+    CAGENTS_ARCHIVE=$OUTPUT/$ARCHIVE CAGENTS_CHECKSUMS=$OUTPUT/SHA256SUMS \
+        sh "$ROOT_DIR/install.sh" --version "$VERSION" --stage-only
+    rm -rf -- "$OUTPUT"
+    prune_versions
+fi
+
+if ((STAGE_ONLY)); then
+    printf 'Staged %s. Finish the update with: cagents daemon upgrade\n' "$VERSION"
+    exit 0
+fi
+exec "$PREFIX/current/bin/cagents" daemon upgrade "${UPGRADE_ARGS[@]}"

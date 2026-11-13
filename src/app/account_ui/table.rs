@@ -271,15 +271,34 @@ fn order(state: &State, sort: Sort, left: &AccountState, right: &AccountState) -
     }
 }
 
+/// Pane visibility is separate from a successful account or quota reading:
+/// a system account whose check failed stays listed for its retry control,
+/// unless its CLI is missing, which the group explains with its remedy.
+pub(super) fn listed(state: &State, account: &AccountState) -> bool {
+    account.present
+        || !account.account.is_system()
+        || (account.failure.is_some()
+            && state.installed.get(&account.account.provider) != Some(&false))
+}
+
 /// The accounts the pane lists for `provider`, in `sort` order: every
-/// account cagents added, and the system account where its CLI is set up.
+/// account cagents added, and the system account where its CLI is set up or
+/// its last check failed and the reader needs its retry control.
 fn rows<'a>(state: &'a State, provider: Provider, sort: Sort) -> Vec<&'a AccountState> {
     let mut rows: Vec<&AccountState> = state
         .of(provider)
-        .filter(|account| account.present || !account.account.is_system())
+        .filter(|account| listed(state, account))
         .collect();
     rows.sort_by(|left, right| order(state, sort, left, right));
     rows
+}
+
+#[cfg(test)]
+pub(super) fn row_ids_for_test(state: &State, provider: Provider) -> Vec<AccountId> {
+    rows(state, provider, state.table.sort)
+        .into_iter()
+        .map(|account| account.id.clone())
+        .collect()
 }
 
 pub(super) fn view(app: &Cagents) -> Element<'_, Message> {
@@ -575,13 +594,19 @@ fn group<'a>(
         lines.push(design::horizontal_rule());
         lines.push(login_row(login));
     }
-    if lines.is_empty() {
-        let empty = match state.omp_problem().filter(|_| provider == Provider::Omp) {
+    // A missing CLI stops every account of the provider, so the group says
+    // so once, with its remedy, rather than each row reporting a failed check.
+    let missing = state.installed.get(&provider) == Some(&false);
+    if lines.is_empty() || missing {
+        let notice = match state
+            .omp_problem()
+            .filter(|_| provider == Provider::Omp && lines.is_empty())
+        {
             Some(problem) => format!(
                 "{problem}, so the accounts {} keeps cannot be listed.",
                 probe::cli_name(provider)
             ),
-            None if state.installed.get(&provider) == Some(&false) => format!(
+            None if missing => format!(
                 "{} CLI not found on PATH. Install it, then refresh Accounts.",
                 probe::cli_name(provider)
             ),
@@ -591,14 +616,17 @@ fn group<'a>(
                 probe::cli_name(provider),
             ),
         };
+        if !lines.is_empty() {
+            lines.push(design::horizontal_rule());
+        }
         lines.push(
             widget::container(
-                design::caption(empty).wrapping(cosmic::iced::widget::text::Wrapping::Word),
+                design::caption(notice).wrapping(cosmic::iced::widget::text::Wrapping::Word),
             )
             .padding([space::M, space::M])
             .into(),
         );
-        if state.installed.get(&provider) == Some(&false) {
+        if missing {
             lines.push(
                 crate::ui_controls::button::primary(format!("Install {}", provider.label()))
                     .on_press(Message::AccountUi(Action::Install(provider)))
@@ -695,7 +723,8 @@ fn row<'a>(
             UsageStatus::Ok | UsageStatus::Warning | UsageStatus::Limited
         )
     });
-    let stale = snapshot.is_some_and(|snapshot| is_stale(snapshot, now));
+    let stale =
+        account.failure.is_some() || snapshot.is_some_and(|snapshot| is_stale(snapshot, now));
     let cells = layout
         .columns
         .iter()
@@ -748,19 +777,47 @@ fn row<'a>(
             (column.width(layout.usage), cell)
         })
         .collect::<Vec<_>>();
-    if layout.stacked {
-        return stacked_row(
+    let content = if layout.stacked {
+        stacked_row(
             account_cell(app, account, project),
             layout.columns.iter().copied().zip(cells).collect(),
             actions(app, account, now, project),
+        )
+    } else {
+        line(
+            account_cell(app, account, project),
+            cells,
+            actions(app, account, now, project),
+            ROW_HEIGHT,
+        )
+    };
+    // Keep the account and its controls in the same child slot when a
+    // background check fails. The explanation can wrap below the fixed-height
+    // row, including when the Status column has been dropped for space.
+    let mut lines = vec![content];
+    // The group explains a missing CLI once, with the way to install it.
+    if let Some(reason) = failure_caption(account, now)
+        .filter(|_| state.installed.get(&account.account.provider) != Some(&false))
+    {
+        lines.push(
+            widget::container(
+                design::caption(reason)
+                    .class(cosmic::theme::Text::Custom(design::warning_text))
+                    .wrapping(cosmic::iced::widget::text::Wrapping::Word),
+            )
+            .padding(Padding {
+                top: 0.0,
+                right: space::M,
+                bottom: space::M,
+                left: space::M,
+            })
+            .width(Length::Fill)
+            .into(),
         );
     }
-    line(
-        account_cell(app, account, project),
-        cells,
-        actions(app, account, now, project),
-        ROW_HEIGHT,
-    )
+    widget::column::with_children(lines)
+        .width(Length::Fill)
+        .into()
 }
 
 /// A row for a card too narrow for columns: the account and its actions,
@@ -798,6 +855,9 @@ fn account_cell<'a>(
     project: Option<(crate::model::ProjectId, &'a str, &'a Path)>,
 ) -> Element<'a, Message> {
     let state = &app.account_ui;
+    // A login whose records disagree is listed by the address it reports,
+    // and the other one beneath it, so neither is cut off by the badges.
+    let row_name = state.name(account, false);
     let renaming = state
         .table
         .rename
@@ -814,7 +874,7 @@ fn account_cell<'a>(
         }
         // Filling the cell is what lets a long name give way to the badge
         // after it instead of running under the row's actions.
-        None => design::body(state.display_name(account))
+        None => design::body(row_name.clone())
             .wrapping(cosmic::iced::widget::text::Wrapping::None)
             .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
                 cosmic::iced::advanced::text::EllipsizeHeightLimit::Lines(1),
@@ -825,7 +885,8 @@ fn account_cell<'a>(
     let mut title: Vec<Element<'a, Message>> = vec![name];
     let several = state
         .of(account.account.provider)
-        .filter(|other| other.present || !other.account.is_system())
+        .filter(|other| listed(state, other))
+        .take(2)
         .count()
         > 1;
     if several && state.registry.is_default(&account.account) && renaming.is_none() {
@@ -849,7 +910,9 @@ fn account_cell<'a>(
         && renaming.is_none()
     {
         let tone = match conflict {
-            LoginConflict::Changed { .. } => design::destructive_color,
+            LoginConflict::Changed { .. }
+            | LoginConflict::Disputed { .. }
+            | LoginConflict::Contradicted { .. } => design::destructive_color,
             LoginConflict::SameHome { .. } | LoginConflict::SameLogin { .. } => {
                 design::warning_color
             }
@@ -867,8 +930,17 @@ fn account_cell<'a>(
             "Kept by {}, which picks the login to use",
             probe::cli_name(account.account.provider)
         ));
-    } else if let Some(email) = email.filter(|email| *email != state.display_name(account)) {
-        subtitle.push(email.to_owned());
+    } else if let Some(email) = email {
+        let disputed = account
+            .identity
+            .as_ref()
+            .and_then(|identity| identity.disputed_by.as_deref());
+        match (email == row_name, disputed) {
+            (true, None) => {}
+            (true, Some(other)) => subtitle.push(format!("Also recorded as {other}")),
+            (false, None) => subtitle.push(email.to_owned()),
+            (false, Some(other)) => subtitle.push(format!("{email}, also recorded as {other}")),
+        }
     }
     if account.account.is_system() {
         subtitle.push(format!(
@@ -952,12 +1024,11 @@ fn usage_cell<'a>(window: Option<&UsageWindow>, now: Millis, stale: bool) -> Ele
 
 /// How an account stands, in a word and a tone.
 fn status(account: &AccountState) -> (&'static str, fn(&cosmic::Theme) -> iced::Color) {
+    if account.failure.is_some() {
+        return ("Check failed", design::warning_color);
+    }
     let Some(snapshot) = &account.snapshot else {
-        return if account.failure.is_some() {
-            ("Unavailable", design::muted_color)
-        } else {
-            ("Checking", design::muted_color)
-        };
+        return ("Checking", design::muted_color);
     };
     match snapshot.status {
         UsageStatus::Ok => ("Available", design::success_color),
@@ -966,6 +1037,48 @@ fn status(account: &AccountState) -> (&'static str, fn(&cosmic::Theme) -> iced::
         UsageStatus::NeedsLogin => ("Signed out", design::warning_color),
         UsageStatus::Unavailable => ("Unavailable", design::muted_color),
     }
+}
+
+/// A failed read does not invalidate the last figures, but they no longer
+/// describe the outcome of the most recent check.
+fn failure_caption(account: &AccountState, now: Millis) -> Option<String> {
+    let failure = account.failure.as_ref()?;
+    // Remote transport diagnostics can be longer than the probe's own fixed
+    // summaries. Bound the always-visible text without copying the full
+    // diagnostic; the existing tooltip still carries it in full.
+    let mut chars = failure.chars();
+    let mut detail: String = chars
+        .by_ref()
+        .take(240)
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .collect();
+    if chars.next().is_some() {
+        detail.push('…');
+    } else {
+        detail.truncate(detail.trim_end().len());
+    }
+    if !matches!(detail.chars().last(), Some('.' | '!' | '?' | '…')) {
+        detail.push('.');
+    }
+    let figures = if account.snapshot.as_ref().is_some_and(|snapshot| {
+        matches!(
+            snapshot.status,
+            UsageStatus::Ok | UsageStatus::Warning | UsageStatus::Limited
+        )
+    }) {
+        " Showing last known usage."
+    } else {
+        ""
+    };
+    // Name the row's own control, in the state it is in right now.
+    let next = if account.schedule.in_flight(now) || account.queued.is_some() {
+        "Checking again…"
+    } else if account.schedule.manual_ready(now) {
+        "Use Check now to try again."
+    } else {
+        "You can check again shortly."
+    };
+    Some(format!("Last check failed: {detail}{figures} {next}"))
 }
 
 fn status_badge<'a>(account: &AccountState) -> Element<'a, Message> {
@@ -1032,12 +1145,12 @@ fn in_use_warning<'a>(cards: usize, linked: bool) -> Element<'a, Message> {
         0 => iced::widget::Space::new().into(),
         count => design::caption(if linked {
             format!(
-                "{count} open {} on this home and will keep running.",
-                if count == 1 { "card runs" } else { "cards run" }
+                "{count} open {} this home. The daemon refuses to forget it while a hosted process uses it.",
+                if count == 1 { "card uses" } else { "cards use" }
             )
         } else {
             format!(
-                "{count} open {} this account. Running processes are not stopped, but may lose access after sign-out.",
+                "{count} open {} this account. Its processes, login and files are kept; managed account removal is unavailable.",
                 if count == 1 { "card uses" } else { "cards use" },
             )
         })
@@ -1056,14 +1169,16 @@ fn menu<'a>(
     let id = &account.id;
     let content: Element<'a, Message> = if state.table.confirm_remove.as_ref() == Some(id) {
         widget::column::with_children(vec![
-            design::body(format!("Remove {}?", state.display_name(account))).into(),
+            design::body(if account.account.is_linked() {
+                format!("Forget {}?", state.display_name(account))
+            } else {
+                "Managed account removal is unavailable".into()
+            })
+            .into(),
             design::caption(if account.account.is_linked() {
                 "This only removes the home from cagents. Its login, sessions and files stay where they are.".to_owned()
             } else {
-                format!(
-                    "{} signs this account out and cagents deletes its files. Resuming saved conversations will require choosing another account that can access them.",
-                    probe::cli_name(account.account.provider)
-                )
+                "Managed accounts can't be removed yet. This one stays, with its login, conversations and files unchanged.".to_owned()
             })
             .wrapping(cosmic::iced::widget::text::Wrapping::Word)
             .into(),
@@ -1073,8 +1188,12 @@ fn menu<'a>(
                 crate::ui_controls::button::secondary("Cancel")
                     .on_press(action(Action::RemoveCancel))
                     .into(),
-                crate::ui_controls::button::destructive("Remove")
-                    .on_press(action(Action::RemoveConfirm(id.clone())))
+                crate::ui_controls::button::destructive(if account.account.is_linked() {
+                    "Forget home"
+                } else {
+                    "Removal unavailable"
+                })
+                    .on_press_maybe(account.account.is_linked().then(|| action(Action::RemoveConfirm(id.clone()))))
                     .into(),
             ])
             .spacing(space::S)
@@ -1181,14 +1300,15 @@ fn menu<'a>(
             items.push(
                 crate::ui_controls::popover_item(
                     Icon::Minus,
-                    "Remove",
+                    if account.account.is_linked() { "Forget home" } else { "Removal unavailable" },
                     if account.account.is_linked() {
                         "Forget this home without changing its files"
                     } else {
-                        "Sign out and delete this account's files"
+                        "Managed accounts can't be removed yet; its login, conversations and files are kept"
                     },
                     action(Action::Remove(id.clone())),
                 )
+                .on_press_maybe(account.account.is_linked().then(|| action(Action::Remove(id.clone()))))
                 .into(),
             );
         }
@@ -1387,6 +1507,167 @@ mod tests {
     }
 
     #[test]
+    fn failure_caption_names_what_check_now_can_do_right_now() {
+        let now = 10 * schedule::MANUAL_DEBOUNCE;
+        let mut account = AccountState::new(Account::system(Provider::Codex));
+        account.failure = Some("Codex could not read usage just now".into());
+        let caption = |account: &AccountState, at| failure_caption(account, at).unwrap();
+        assert_eq!(
+            caption(&account, now),
+            "Last check failed: Codex could not read usage just now. Use Check now to try again."
+        );
+        account.schedule.start(Trigger::Manual, now);
+        assert!(caption(&account, now).ends_with(" Checking again…"));
+        account.schedule.fail(now + 1);
+        // The control stays disabled through the manual debounce.
+        assert!(caption(&account, now + 1).ends_with(" You can check again shortly."));
+        assert!(
+            caption(&account, now + schedule::MANUAL_DEBOUNCE)
+                .ends_with(" Use Check now to try again.")
+        );
+    }
+
+    #[test]
+    fn failed_system_rows_keep_error_and_refresh_when_status_columns_drop() {
+        use iced::advanced::{clipboard, mouse};
+        use iced::runtime::{UserInterface, user_interface::Cache};
+
+        let mut renderer = crate::app::tests::headless_renderer();
+        for provider in [Provider::Claude, Provider::Codex] {
+            for (width, stacked, status_visible) in [
+                (420.0, true, false),
+                (500.0, false, false),
+                (1_200.0, false, true),
+            ] {
+                let mut app = crate::app::tests::context_inspector_test_app(false);
+                app.account_ui.now_ms = 1_790_000_000_000;
+                let now = app.account_ui.now_ms;
+                let managed = app.account_ui.add_managed_fixture(provider, 1938006);
+                app.account_ui
+                    .set_fixture_label(&managed, Some("Other account"));
+                app.account_ui
+                    .registry
+                    .set_default(&Account::system(provider));
+                let completed = app.account_ui.account_mut(&managed).unwrap();
+                // Synthetic completed-check timing keeps only the System row's
+                // Refresh enabled; no provider future runs in this widget test.
+                completed.schedule.start(Trigger::Manual, now);
+                completed.schedule.succeed(now);
+                assert!(!completed.schedule.in_flight(now));
+                assert!(!completed.schedule.manual_ready(now));
+                let id = Account::system(provider).id();
+                let account = app.account_ui.account_mut(&id).unwrap();
+                // A first failed check has no quota or reported identity. This
+                // fixture exercises only the actual table's labels and input.
+                account.present = false;
+                account.snapshot = None;
+                account.identity = None;
+                account.failure = Some("The provider returned no usable quota".into());
+
+                let columns = layout(width);
+                assert_eq!(columns.stacked, stacked, "{provider:?} {width}");
+                assert_eq!(
+                    columns.columns.contains(&Column::Status),
+                    status_visible,
+                    "{provider:?} {width}"
+                );
+                let mut ui = UserInterface::build(
+                    table(&app, width),
+                    iced::Size::new(width, 600.0),
+                    Cache::new(),
+                    &mut renderer,
+                );
+                ui.draw(
+                    &mut renderer,
+                    &cosmic::theme::active(),
+                    &iced::advanced::renderer::Style::default(),
+                    mouse::Cursor::Unavailable,
+                );
+                let tree = ui.a11y_nodes(mouse::Cursor::Unavailable);
+                let nodes = tree
+                    .root()
+                    .iter()
+                    .chain(tree.children())
+                    .collect::<Vec<_>>();
+                let labels = nodes
+                    .iter()
+                    .filter_map(|node| node.node().label())
+                    .collect::<Vec<_>>();
+                assert!(labels.contains(&"System default"), "{provider:?} {width}");
+                assert!(labels.contains(&"Other account"), "{provider:?} {width}");
+                assert_eq!(
+                    labels
+                        .iter()
+                        .copied()
+                        .filter(|label| *label == "Default")
+                        .count(),
+                    1,
+                    "{provider:?} {width}: both listed rows preserve the selected default"
+                );
+                let login = format!("{}'s own login", probe::cli_name(provider));
+                // Every width explains the failure beneath the row and keeps
+                // the account's original login context.
+                assert!(
+                    labels.contains(
+                        &"Last check failed: The provider returned no usable quota. Use Check now to try again."
+                    ),
+                    "{provider:?} {width}: {labels:?}"
+                );
+                assert!(
+                    labels.iter().any(|label| label.contains(login.as_str())),
+                    "{provider:?} {width}: {labels:?}"
+                );
+                assert_eq!(
+                    labels.contains(&"Check failed"),
+                    status_visible,
+                    "{provider:?} {width}: the status column names the failed check"
+                );
+                let refresh = nodes
+                    .iter()
+                    .filter(|node| node.node().label() == Some("Check now"))
+                    .collect::<Vec<_>>();
+                assert_eq!(refresh.len(), 1, "{provider:?} {width}");
+                assert!(!refresh[0].node().is_disabled());
+                let bounds = refresh[0].node().bounds().expect("refresh geometry");
+                let refresh = iced::Rectangle {
+                    x: bounds.x0 as f32,
+                    y: bounds.y0 as f32,
+                    width: (bounds.x1 - bounds.x0) as f32,
+                    height: (bounds.y1 - bounds.y0) as f32,
+                };
+                assert_eq!(refresh.width, design::COMPACT_CONTROL_SIZE);
+                assert_eq!(refresh.height, design::COMPACT_CONTROL_SIZE);
+                assert!(
+                    refresh.x.is_finite()
+                        && refresh.y.is_finite()
+                        && refresh.x >= 0.0
+                        && refresh.x + refresh.width <= width
+                        && refresh.y >= 0.0
+                        && refresh.y + refresh.height <= 600.0,
+                    "{provider:?} {width}: full retry target stays inside the pane"
+                );
+                let point = refresh.center();
+                let mut messages = Vec::new();
+                let _ = ui.update(
+                    &[
+                        iced::Event::Mouse(mouse::Event::CursorMoved { position: point }),
+                        iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                        iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                    ],
+                    mouse::Cursor::Available(point),
+                    &mut renderer,
+                    &mut clipboard::Null,
+                    &mut messages,
+                );
+                assert!(
+                    matches!(messages.as_slice(), [Message::AccountUi(Action::Refresh(actual))] if actual == &id),
+                    "{provider:?} {width}: actual retry click keeps the original account"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn escape_closes_a_menu_before_a_rename() {
         let id = Account::system(Provider::Claude).id();
         let mut table = Table {
@@ -1400,5 +1681,363 @@ mod tests {
         table.escape();
         assert_eq!(table.rename, None);
         assert!(!table.has_popup());
+    }
+
+    #[test]
+    fn a_failed_check_keeps_usage_and_explains_it_in_wide_and_narrow_rows() {
+        use iced::advanced::{
+            Layout as WidgetLayout, layout,
+            widget::{Operation, Tree},
+        };
+
+        #[derive(Default)]
+        struct Texts(Vec<(String, iced::Rectangle)>);
+        impl Operation for Texts {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, bounds: iced::Rectangle, text: &str) {
+                self.0.push((text.to_owned(), bounds));
+            }
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        let measure = |app: &Cagents, id: &AccountId, width: f32| {
+            let mut element = row(
+                app,
+                app.account_ui.account(id).unwrap(),
+                &layout(width),
+                None,
+            );
+            let mut tree = Tree::new(element.as_widget());
+            let available = width.min(MAX_WIDTH) - 2.0 * GUTTER;
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(available, 900.0)),
+            );
+            let mut texts = Texts::default();
+            element.as_widget_mut().operate(
+                &mut tree,
+                WidgetLayout::new(&node),
+                &renderer,
+                &mut texts,
+            );
+            (texts.0, node.size(), node.children()[0].bounds())
+        };
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let id = app.account_ui.add_managed_fixture(Provider::Codex, 1167);
+        let mut snapshot = UsageSnapshot::state(UsageStatus::Ok, "", app.account_ui.now_ms);
+        snapshot.detail = None;
+        snapshot.windows = vec![UsageWindow {
+            key: "session".into(),
+            kind: account::WindowKind::Session,
+            label: "Session".into(),
+            used: 0.4,
+            resets_at: None,
+            span_secs: None,
+            binding: false,
+        }];
+        // Exercise accepted probe completions; no returned background Task is polled.
+        let probe = |app: &mut crate::app::Cagents, id: &AccountId, outcome| {
+            let now = app.account_ui.now_ms;
+            let (owner, ticket) = app.account_ui.begin_probe_for_test(id, Trigger::Focus, now);
+            drop(app.update(Message::AccountUi(Action::Probed {
+                owner,
+                id: id.clone(),
+                ticket,
+                outcome,
+            })));
+        };
+        probe(
+            &mut app,
+            &id,
+            Outcome::Answered {
+                identity: None,
+                catalog: None,
+                snapshot: snapshot.clone(),
+            },
+        );
+        let widths = [1_400.0, 1_100.0, 520.0, 360.0];
+        let healthy = widths.map(|width| measure(&app, &id, width));
+        assert!(healthy[0].0.iter().any(|(text, _)| text == "Available"));
+        assert!(healthy.iter().all(|(texts, _, _)| {
+            texts.iter().any(|(text, _)| text == "60% left")
+                && !texts
+                    .iter()
+                    .any(|(text, _)| text.starts_with("Last check failed:"))
+        }));
+        let failure = "Codex did not answer within 30 seconds";
+        probe(&mut app, &id, Outcome::Failed(failure.into()));
+        assert_eq!(
+            app.account_ui.account(&id).unwrap().snapshot.as_ref(),
+            Some(&snapshot)
+        );
+        let caption = "Last check failed: Codex did not answer within 30 seconds. Showing last known usage. Use Check now to try again.";
+        let mut wide_caption_height = None;
+        for (index, width) in widths.into_iter().enumerate() {
+            let (texts, size, controls) = measure(&app, &id, width);
+            assert_eq!(
+                controls, healthy[index].2,
+                "existing controls stay in child zero"
+            );
+            assert!(texts.iter().any(|(text, _)| text == "60% left"));
+            assert!(!texts.iter().any(|(text, _)| text == "Available"));
+            assert_eq!(
+                texts.iter().any(|(text, _)| text == "Check failed"),
+                layout(width).columns.contains(&Column::Status),
+            );
+            let matches = texts
+                .iter()
+                .filter(|(text, _)| text == caption)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                matches.len(),
+                1,
+                "reason must be rendered, not tooltip-only: {width}"
+            );
+            let bounds = matches[0].1;
+            assert!(bounds.width.is_finite() && bounds.height.is_finite());
+            assert!(bounds.width > 0.0 && bounds.height > 0.0);
+            assert!(bounds.y >= controls.y + controls.height);
+            assert!(bounds.x >= 0.0 && bounds.x + bounds.width <= size.width + 0.1);
+            assert!(bounds.y + bounds.height <= size.height + 0.1);
+            assert!(size.height > healthy[index].1.height);
+            if index == 0 {
+                wide_caption_height = Some(bounds.height);
+            }
+            if width == 360.0 {
+                assert!(
+                    bounds.height > wide_caption_height.unwrap(),
+                    "narrow reason wraps"
+                );
+                assert!(!layout(width).columns.contains(&Column::Status));
+            }
+        }
+        probe(
+            &mut app,
+            &id,
+            Outcome::Answered {
+                identity: None,
+                catalog: None,
+                snapshot: snapshot.clone(),
+            },
+        );
+        assert_eq!(
+            app.account_ui.account(&id).unwrap().snapshot.as_ref(),
+            Some(&snapshot)
+        );
+        for (index, width) in widths.into_iter().enumerate() {
+            let (texts, size, controls) = measure(&app, &id, width);
+            assert_eq!((size, controls), (healthy[index].1, healthy[index].2));
+            assert!(texts.iter().any(|(text, _)| text == "60% left"));
+            assert!(
+                !texts
+                    .iter()
+                    .any(|(text, _)| text.starts_with("Last check failed:"))
+            );
+            assert!(!texts.iter().any(|(text, _)| text == "Check failed"));
+            if layout(width).columns.contains(&Column::Status) {
+                assert!(texts.iter().any(|(text, _)| text == "Available"));
+            }
+        }
+        // Long transport diagnostics cannot turn the visible row into an
+        // unbounded body. Unicode stays intact and guidance is outside the cap.
+        let long_failure = "界🙂é ".repeat(4_000);
+        probe(&mut app, &id, Outcome::Failed(long_failure.clone()));
+        let state = app.account_ui.account(&id).unwrap();
+        assert_eq!(state.failure.as_ref(), Some(&long_failure));
+        assert_eq!(state.snapshot.as_ref(), Some(&snapshot));
+        // status_badge's existing tooltip still formats this whole state.failure.
+        let expected = format!(
+            "Last check failed: {}… Showing last known usage. Use Check now to try again.",
+            "界🙂é ".repeat(60),
+        );
+        let (texts, size, controls) = measure(&app, &id, 360.0);
+        let captions = texts
+            .iter()
+            .filter(|(text, _)| text.starts_with("Last check failed:"))
+            .collect::<Vec<_>>();
+        assert_eq!(captions.len(), 1);
+        assert_eq!(captions[0].0, expected);
+        assert!(captions[0].0.chars().count() < 340);
+        assert!(captions[0].1.height.is_finite() && captions[0].1.height > 0.0);
+        assert!(captions[0].1.x + captions[0].1.width <= size.width + 0.1);
+        assert!(captions[0].1.y + captions[0].1.height <= size.height + 0.1);
+        assert_eq!(controls, healthy[3].2);
+        // Existing sentence punctuation is not duplicated by the caption.
+        probe(
+            &mut app,
+            &id,
+            Outcome::Failed("Codex could not read usage just now.".into()),
+        );
+        let (texts, _, _) = measure(&app, &id, 520.0);
+        assert!(texts.iter().any(|(text, _)| text ==
+            "Last check failed: Codex could not read usage just now. Showing last known usage. Use Check now to try again."));
+        // A first failed check explains the failure without claiming cached figures.
+        let unchecked = app.account_ui.add_managed_fixture(Provider::Codex, 1168);
+        probe(&mut app, &unchecked, Outcome::Failed(failure.into()));
+        let (texts, _, _) = measure(&app, &unchecked, 360.0);
+        assert!(texts.iter().any(|(text, _)| text
+            == "Last check failed: Codex did not answer within 30 seconds. Use Check now to try again."));
+        assert!(
+            !texts
+                .iter()
+                .any(|(text, _)| text.contains("last known usage"))
+        );
+    }
+
+    #[test]
+    fn a_missing_cli_is_explained_once_for_the_group_with_its_remedy() {
+        use iced::advanced::{
+            Layout as WidgetLayout, layout,
+            widget::{Operation, Tree},
+        };
+
+        #[derive(Default)]
+        struct Texts(Vec<String>);
+        impl Operation for Texts {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, text: &str) {
+                self.0.push(text.to_owned());
+            }
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let first = app.account_ui.add_managed_fixture(Provider::Codex, 1168);
+        let second = app.account_ui.add_managed_fixture(Provider::Codex, 1169);
+        app.account_ui.installed.insert(Provider::Codex, false);
+        for id in [&first, &second] {
+            app.account_ui.account_mut(id).unwrap().failure = Some("Codex is not installed".into());
+        }
+        let width = 1_100.0;
+        let mut element = group(&app, Provider::Codex, &layout(width), None);
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 2_000.0)),
+        );
+        let mut texts = Texts::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, WidgetLayout::new(&node), &renderer, &mut texts);
+        let texts = texts.0;
+        let count = |wanted: &str| texts.iter().filter(|text| text.as_str() == wanted).count();
+        assert_eq!(
+            count("Codex CLI not found on PATH. Install it, then refresh Accounts."),
+            1
+        );
+        assert_eq!(count("Install Codex"), 1);
+        assert!(
+            !texts
+                .iter()
+                .any(|text| text.starts_with("Last check failed:")),
+            "rows do not repeat the group's explanation: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn removal_menus_keep_managed_files_and_only_allow_linked_forget() {
+        use iced::advanced::{clipboard, widget::Operation};
+        use iced::runtime::{UserInterface, user_interface::Cache};
+        use iced::{Event, Point, Rectangle, Size, mouse};
+
+        #[derive(Default)]
+        struct Texts(Vec<(String, Rectangle)>);
+        impl Operation for Texts {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, bounds: Rectangle, text: &str) {
+                self.0.push((text.into(), bounds));
+            }
+        }
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let managed = app.account_ui.add_managed_fixture(Provider::Codex, 1087);
+        let directory = tempfile::tempdir().unwrap();
+        let linked_home = directory.path().join("linked");
+        std::fs::create_dir(&linked_home).unwrap();
+        let linked_key = uuid::Uuid::new_v4();
+        let mut registry = app.account_ui.registry.clone();
+        registry
+            .link(
+                Provider::Codex,
+                linked_key,
+                linked_home.clone(),
+                None,
+                app.account_ui.homes.as_ref(),
+                1,
+            )
+            .unwrap();
+        app.account_ui.set_registry(registry);
+        let linked = Account::linked(Provider::Codex, linked_key, linked_home).id();
+        let mut renderer = crate::app::tests::headless_renderer();
+        for width in [700.0, 320.0] {
+            for (id, enabled) in [(managed.clone(), false), (linked.clone(), true)] {
+                app.account_ui.table.confirm_remove = Some(id.clone());
+                app.account_ui.table.confirm_in_use = 1;
+                let account = app.account_ui.account(&id).unwrap();
+                let element = menu(&app, account, None);
+                let mut ui = UserInterface::build(
+                    element,
+                    Size::new(width, 600.0),
+                    Cache::new(),
+                    &mut renderer,
+                );
+                let mut texts = Texts::default();
+                ui.operate(&renderer, &mut texts);
+                let button = if enabled {
+                    "Forget home"
+                } else {
+                    "Removal unavailable"
+                };
+                assert!(!texts.0.iter().any(|(text, _)| text.contains("Resuming saved conversations will require")));
+                let caption = if enabled {
+                    "This only removes the home from cagents. Its login, sessions and files stay where they are."
+                } else {
+                    "Managed accounts can't be removed yet. This one stays, with its login, conversations and files unchanged."
+                };
+                let bounds = texts
+                    .0
+                    .iter()
+                    .find(|(text, _)| text == caption)
+                    .expect("visible truthful caption")
+                    .1;
+                assert!(bounds.width > 0.0 && bounds.height > 0.0 && bounds.height.is_finite());
+                assert!(bounds.x >= 0.0 && bounds.x + bounds.width <= width + 0.1);
+                assert!(bounds.y + bounds.height < 600.0);
+                let target = texts
+                    .0
+                    .iter()
+                    .find(|(text, _)| text == button)
+                    .expect("button label")
+                    .1;
+                let point = Point::new(target.center_x(), target.center_y());
+                let mut messages = Vec::new();
+                let _ = ui.update(
+                    &[
+                        Event::Mouse(mouse::Event::CursorMoved { position: point }),
+                        Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                        Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                    ],
+                    mouse::Cursor::Available(point),
+                    &mut renderer,
+                    &mut clipboard::Null,
+                    &mut messages,
+                );
+                if enabled {
+                    assert!(
+                        matches!(messages.as_slice(), [Message::AccountUi(Action::RemoveConfirm(received))] if *received == id)
+                    );
+                } else {
+                    assert!(
+                        messages.is_empty(),
+                        "managed removal has no native callback"
+                    );
+                }
+            }
+        }
     }
 }

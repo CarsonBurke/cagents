@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 
@@ -75,9 +76,11 @@ generation = os.environ["MOCK_GENERATION"]
 product.write_text(
     "#!" + sys.executable + "\n"
     "import json, os, sys\n"
-    "with open(os.environ['MOCK_LAUNCH'], 'w') as output:\n"
+    "temporary = os.environ['MOCK_LAUNCH'] + '.tmp'\n"
+    "with open(temporary, 'w') as output:\n"
     "    json.dump({'executable': sys.argv[0], 'args': sys.argv[1:], "
     "'cwd': os.getcwd(), 'generation': " + repr(generation) + "}, output)\n"
+    "os.replace(temporary, os.environ['MOCK_LAUNCH'])\n"
 )
 product.chmod(0o755)
 mode = os.environ.get("MOCK_ARTIFACT_MODE") if name == "ceditor" else None
@@ -138,6 +141,71 @@ sys.exit(101 if mode == "failed" else 0)
         self.assertEqual(len(self.cargo_calls()), 1)
         self.assertIn("fixture compiler warning", result.stderr)
 
+    @unittest.skipUnless(shutil.which("gio"), "gio is required to exercise desktop Exec parsing")
+    def test_desktop_launcher_preserves_special_characters_and_file_arguments(self):
+        gio = shutil.which("gio")
+        documents = [
+            self.directory / 'document "quote" \\backslash $dollar `backtick` %F.rs',
+            self.directory / "second document %U.rs",
+        ]
+        for document in documents:
+            document.write_text("fixture document\n")
+        arguments = [str(document) for document in documents]
+        # Keep the caller's context; only fixture build/data paths are overridden.
+        environment = os.environ.copy()
+        for name in ("PATH", "XDG_DATA_HOME", "MOCK_CHECKOUT", "MOCK_CALLS",
+                     "MOCK_LAUNCH", "MOCK_GENERATION"):
+            environment[name] = self.environment[name]
+        environment["CARGO_BUILD_TARGET"] = "x86_64-unknown-linux-gnu"
+        directories = (
+            "target with spaces",
+            'target "quote"',
+            "target \\backslash",
+            "target $dollar",
+            "target `backtick`",
+            "target %F 100%",
+            'target "quote" \\backslash $dollar `backtick` %F',
+            "target %F=assigned",
+        )
+        desktop = self.home / "data/applications/io.github.cagents.ceditor.Development.desktop"
+        for directory in directories:
+            with self.subTest(target=directory):
+                target = self.directory / directory
+                environment["MOCK_TARGET"] = str(target)
+                executable = str(target / "x86_64-unknown-linux-gnu/dev-runtime/ceditor")
+                result = subprocess.run(
+                    ["/bin/sh", str(self.checkout / "scripts/run-ceditor-development"),
+                     "--", *arguments],
+                    cwd=self.directory, env=environment, text=True, capture_output=True, timeout=10,
+                )
+                self.assert_success(result)
+                direct = json.loads(self.launch.read_text())
+                self.assertEqual(direct["executable"], executable)
+                self.assertEqual(direct["args"], arguments)
+                self.assertEqual(direct["cwd"], str(self.directory))
+                file_sets = [arguments]
+                if "%" in directory:
+                    file_sets.append([])
+                for files in file_sets:
+                    with self.subTest(files=files):
+                        self.launch.unlink(missing_ok=True)
+                        # GLib expands the entry and starts only our inert fixture.
+                        result = subprocess.run(
+                            [gio, "launch", str(desktop), *files],
+                            cwd=self.directory, env=environment,
+                            text=True, capture_output=True, timeout=10,
+                        )
+                        self.assert_success(result)
+                        deadline = time.monotonic() + 2
+                        while not self.launch.exists() and time.monotonic() < deadline:
+                            time.sleep(0.01)
+                        self.assertTrue(self.launch.exists(),
+                                        "desktop launch did not execute the fixture: " + result.stderr)
+                        launched = json.loads(self.launch.read_text())
+                        self.assertEqual(launched["executable"], executable)
+                        self.assertEqual(launched["args"], files)
+                        self.assertEqual(launched["cwd"], str(self.directory))
+
     def test_runner_does_not_launch_stale_unqualified_artifact(self):
         stale = self.target / "dev-runtime/ceditor"
         self.executable(stale, "#!/bin/sh\nexit 97\n")
@@ -161,16 +229,15 @@ sys.exit(101 if mode == "failed" else 0)
         self.assertIn("/custom-target/dev-runtime/", json.loads(self.launch.read_text())["executable"])
 
     def test_missing_python_fails_before_any_build_or_desktop_change(self):
-        minimal = self.directory / "minimal-tools"
-        minimal.mkdir()
-        (minimal / "dirname").symlink_to(shutil.which("dirname"))
-        self.environment["PATH"] = str(minimal)
+        # They check what they will run. `python3` stays on PATH: that isn't it.
         for name, arguments in (("run-ceditor-development", ()),
                                 ("install-ceditor", ("--prefix", str(self.prefix)))):
             with self.subTest(script=name):
+                script = self.checkout / "scripts" / name
+                script.write_text(script.read_text().replace("/usr/bin/python3", "/nonexistent/python3"))
                 result = self.run_script(name, *arguments)
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn("required command not found: python3", result.stderr)
+                self.assertIn("required command not found: /nonexistent/python3", result.stderr)
                 self.assertFalse(self.calls.exists())
                 self.assertFalse(self.prefix.exists())
                 self.assertFalse((self.home / "data").exists())

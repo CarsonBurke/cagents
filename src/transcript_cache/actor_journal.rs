@@ -62,7 +62,6 @@ impl ActorJournalRetention {
             journal: (metadata.dev(), metadata.ino()),
         };
         write_new(&directory.join(IDENTITY), &identity)?;
-        File::open(directory)?.sync_all()?;
         Ok(Self {
             directory: directory.to_owned(),
             identity,
@@ -72,13 +71,20 @@ impl ActorJournalRetention {
     /// The Journal owner has permanently fenced future semantic appends and
     /// proved its exact ACK/loss state under the same mutex. The caller writes
     /// the authenticated native retirement receipt before this cache permit.
+    ///
+    /// Nothing here is fsynced. The cache lives in the runtime directory and
+    /// its journal is never reopened, so durability across an OS crash
+    /// protects no reader: a disposition lost with that crash only preserves
+    /// the cache. The retiring helper calls this from its single request
+    /// loop, where each fsync can take seconds on a disk-backed runtime
+    /// directory and expire its `retire` request (#2180).
     pub(crate) fn allow_removal(&self) -> io::Result<()> {
-        self.allow_removal_with_sync(|| File::open(&self.directory)?.sync_all())
+        self.allow_removal_with(|temporary, disposition| fs::rename(temporary, disposition))
     }
 
-    fn allow_removal_with_sync(
+    fn allow_removal_with(
         &self,
-        sync_directory: impl FnOnce() -> io::Result<()>,
+        publish: impl FnOnce(&Path, &Path) -> io::Result<()>,
     ) -> io::Result<()> {
         let identity: Identity = read_private(&self.directory.join(IDENTITY))?;
         if identity != self.identity || directory_identity(&self.directory)? != identity.directory {
@@ -86,7 +92,6 @@ impl ActorJournalRetention {
         }
         let journal =
             crate::secure_file::open_existing_private_file_readonly(&self.directory.join(JOURNAL))?;
-        journal.sync_all()?;
         let metadata = journal.metadata()?;
         if (metadata.dev(), metadata.ino()) != identity.journal {
             return Err(io::Error::other("Retained journal file identity changed"));
@@ -99,15 +104,10 @@ impl ActorJournalRetention {
         let temporary = self
             .directory
             .join(format!(".actor-journal-drained-{}", uuid::Uuid::new_v4()));
-        let result = (|| {
-            write_new(&temporary, &disposition)?;
-            fs::rename(&temporary, self.directory.join(DISPOSITION))?;
-            sync_directory()
-        })();
+        let result = write_new(&temporary, &disposition)
+            .and_then(|()| publish(&temporary, &self.directory.join(DISPOSITION)));
         if result.is_err() {
             let _ = fs::remove_file(&temporary);
-            let _ = fs::remove_file(self.directory.join(DISPOSITION));
-            let _ = File::open(&self.directory).and_then(|directory| directory.sync_all());
         }
         result
     }
@@ -130,8 +130,7 @@ fn write_new<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)?;
-    file.write_all(&bytes)?;
-    file.sync_all()
+    file.write_all(&bytes)
 }
 
 fn read_private<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<T> {
@@ -188,6 +187,44 @@ pub(super) fn reclaimable(directory: &Path) -> io::Result<bool> {
         && FileVersion::of(&journal) == disposition.journal)
 }
 
+/// Whether an undrained journal whose owner has ended has outlived its
+/// evidence retention. The caller holds the cache's lease, which a live helper
+/// or store would hold for as long as it runs.
+///
+/// A helper that is killed, crashes or is abandoned never drains its journal,
+/// and nothing reopens it: `Journal::open` only ever creates one exclusively.
+/// The directory is then kept `retention` past its newest write so the
+/// failure can still be inspected, and reclaimed after that. Anything that is
+/// not a plain private file keeps the directory, as does a write time in the
+/// future.
+pub(super) fn orphan_expired(
+    directory: &Path,
+    now: std::time::SystemTime,
+    retention: std::time::Duration,
+) -> io::Result<bool> {
+    match fs::symlink_metadata(directory.join(JOURNAL)) {
+        Ok(journal) if journal.is_file() => {}
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    }
+    let mut newest = fs::symlink_metadata(directory)?.modified()?;
+    for entry in fs::read_dir(directory)? {
+        let metadata = match fs::symlink_metadata(entry?.path()) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if !metadata.is_file() || metadata.uid() != crate::daemon::current_uid() {
+            return Ok(false);
+        }
+        newest = newest.max(metadata.modified()?);
+    }
+    Ok(now
+        .duration_since(newest)
+        .is_ok_and(|idle| idle >= retention))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,6 +268,51 @@ mod tests {
     }
 
     #[test]
+    fn an_orphaned_journal_is_kept_for_its_retention_and_then_reclaimed() {
+        let root = tempfile::tempdir().unwrap();
+        let (orphan, lease) = crate::transcript_cache::create(root.path()).unwrap();
+        let mut file = journal(&orphan);
+        file.write_all(b"unacknowledged semantic evidence").unwrap();
+        let _retention = ActorJournalRetention::create(&orphan, &file).unwrap();
+        drop(file);
+        drop(lease);
+        let (live, _live_lease) = crate::transcript_cache::create(root.path()).unwrap();
+        drop(journal(&live));
+        let (odd, odd_lease) = crate::transcript_cache::create(root.path()).unwrap();
+        drop(journal(&odd));
+        fs::create_dir(odd.join("unexpected")).unwrap();
+        drop(odd_lease);
+
+        let later = |after| std::time::SystemTime::now() + after;
+        let retention = crate::transcript_cache::ORPHANED_JOURNAL_RETENTION;
+        assert_eq!(
+            crate::transcript_cache::sweep_at(
+                root.path(),
+                Path::new("/proc"),
+                later(retention / 2)
+            )
+            .unwrap()
+            .count,
+            0,
+            "a recent failure stays inspectable"
+        );
+        assert!(orphan.join(JOURNAL).exists());
+        let swept = crate::transcript_cache::sweep_at(
+            root.path(),
+            Path::new("/proc"),
+            later(retention + std::time::Duration::from_secs(60)),
+        )
+        .unwrap();
+        assert_eq!(swept.count, 1);
+        assert!(!orphan.exists());
+        assert!(
+            live.exists(),
+            "a leased journal belongs to a running helper"
+        );
+        assert!(odd.exists(), "an unexpected entry keeps the directory");
+    }
+
+    #[test]
     fn changed_journal_and_cross_cache_or_malformed_dispositions_never_authorize_removal() {
         let root = tempfile::tempdir().unwrap();
         let (first, _first_lease) = crate::transcript_cache::create(root.path()).unwrap();
@@ -271,12 +353,19 @@ mod tests {
         let failed_retention = ActorJournalRetention::create(&failed, &failed_file).unwrap();
         assert!(
             failed_retention
-                .allow_removal_with_sync(|| Err(io::Error::other(
-                    "injected directory fsync failure"
+                .allow_removal_with(|_, _| Err(io::Error::other(
+                    "injected disposition publication failure"
                 )))
                 .is_err()
         );
         assert!(!reclaimable(&failed).unwrap());
-        assert!(!failed.join(DISPOSITION).exists());
+        assert!(
+            fs::read_dir(&failed).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".actor-journal-drained-")),
+            "an interrupted publication leaves no temporary disposition"
+        );
     }
 }

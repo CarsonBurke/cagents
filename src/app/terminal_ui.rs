@@ -434,7 +434,7 @@ mod tests {
                         .iter()
                         .any(|entry| entry.notice.message == expected)
                 );
-                assert!(ended_terminal(app.card_state(card)).is_none());
+                assert!(app.ended_terminal(card).is_none());
                 surface.stop_for_test();
             }
         }
@@ -547,7 +547,7 @@ impl Cagents {
             if *confirmed
                 && let Some((target, text)) = pending
                 && target == *card
-                && ended_terminal(self.card_state(*card)).is_none()
+                && self.ended_terminal(*card).is_none()
                 && !self.terminal_close_pending(*card)
                 && let Some(CardRuntime::Terminal(handle)) = self.cards.get(card)
             {
@@ -645,9 +645,7 @@ impl Cagents {
             }
             Action::Paste(_, text) => {
                 self.terminal_context = None;
-                if ended_terminal(self.card_state(card)).is_some()
-                    || self.terminal_close_pending(card)
-                {
+                if self.ended_terminal(card).is_some() || self.terminal_close_pending(card) {
                     return Task::none();
                 }
                 if self.settings.confirm_multiline_paste

@@ -3,6 +3,106 @@
 use super::*;
 use crate::daemon::holder_registry::{self as registry, Kind};
 
+#[cfg(test)]
+mod paired_projection_tests;
+#[cfg(test)]
+mod settled_retry_tests;
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_PUBLICATION: std::cell::RefCell<Option<Box<dyn FnOnce(&SharedHost)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct BeforePublicationHook(std::marker::PhantomData<std::rc::Rc<()>>);
+
+#[cfg(test)]
+impl Drop for BeforePublicationHook {
+    fn drop(&mut self) {
+        BEFORE_PUBLICATION.with(|slot| slot.borrow_mut().take());
+    }
+}
+
+#[cfg(test)]
+fn before_publication_for_test(
+    action: impl FnOnce(&SharedHost) + 'static,
+) -> BeforePublicationHook {
+    BEFORE_PUBLICATION.with(|slot| {
+        assert!(
+            slot.borrow().is_none(),
+            "native publication hook already owned"
+        );
+        *slot.borrow_mut() = Some(Box::new(action));
+    });
+    BeforePublicationHook(std::marker::PhantomData)
+}
+
+fn project_paired_terminal(
+    state: &HostState,
+    terminal: &crate::model::TerminalSession,
+    paired_holder: Option<&crate::terminal::holder::Record>,
+    proof: &HostSessionProof,
+) -> Result<
+    (
+        crate::model::TerminalSession,
+        crate::terminal::TerminalHandle,
+    ),
+    String,
+> {
+    // Raw terminal records retain their original custody descriptor. Current
+    // ownership comes from the same authenticated worker, not that old proof.
+    let current = state
+        .terminals
+        .get(&terminal.id)
+        .filter(|current| {
+            current.handle.holder_identity().is_some()
+                && current.handle.holder_identity() == paired_holder
+                && current.session.launch == terminal.launch
+                && current.session.owned_codex_listener == terminal.owned_codex_listener
+        })
+        .ok_or("The paired terminal could not be recovered; native ownership was preserved")?;
+    let projected = state.native_terminal_projection(terminal.id)?;
+    if projected.continuity.live_proof().as_ref() != Some(proof) {
+        return Err("The paired terminal belongs to a different daemon owner".into());
+    }
+    Ok((projected, current.handle.clone()))
+}
+
+fn pair_projection_is_current(
+    state: &HostState,
+    terminal: Option<&crate::model::TerminalSession>,
+    handle: Option<&crate::terminal::TerminalHandle>,
+) -> bool {
+    match (terminal, handle) {
+        (None, None) => true,
+        (Some(terminal), Some(handle)) => {
+            state.terminals.get(&terminal.id).is_some_and(|current| {
+                current.handle.same_worker(handle)
+                    && state
+                        .native_terminal_projection(terminal.id)
+                        .is_ok_and(|projected| projected == *terminal)
+            })
+        }
+        _ => false,
+    }
+}
+
+fn restored_thread_ready(handle: &Handle, expected: Option<&str>) -> Result<bool, String> {
+    match handle.confirmed_session_id() {
+        None => Ok(false),
+        Some(actual) if Some(actual.as_str()) != expected => {
+            Err("Retained server confirmed a different conversation".into())
+        }
+        // Confirmation and durable capability are published separately. Until
+        // both arrive, UpdateSource's unsupported no-op is not an ownership ACK.
+        Some(_) => Ok(matches!(
+            handle.native_continuity(),
+            chat::NativeContinuity::Durable { .. }
+        )),
+    }
+}
+
 /// Diagnostic data only: it never authorizes attaching, launching or cleanup.
 /// Keep hashes rather than another copy of launch environments for every alias.
 #[derive(Default)]
@@ -86,12 +186,47 @@ pub(super) fn restore_with_admission(
     host: &SharedHost,
     client: ClientId,
     source: &Session,
-    mut admission: Option<capacity::Reservation>,
+    admission: Option<capacity::Reservation>,
 ) -> Result<ServerResponse, String> {
+    restore_with_policy(host, client, source, admission, false)
+}
+
+/// A Ready checkpoint proves the exact prior daemon issued this retained
+/// source. An older unavailable-history floor must not prevent authenticating
+/// its still-owned provider. This retained-owner path never replays a recipe.
+pub(in crate::host) fn restore_ready_checkpoint(
+    host: &SharedHost,
+    source: &Session,
+    checkpoint: &crate::upgrade::handoff::Checkpoint,
+) -> Result<ServerResponse, String> {
+    checkpoint.require_ready()?;
+    if !source.native_continuity.retains_provider()
+        || source.proof.as_ref() != Some(&checkpoint.proof)
+        || !checkpoint.chats.iter().any(|chat| &chat.source == source)
+    {
+        return Err("The Ready checkpoint does not identify this exact retained source".into());
+    }
+    restore_with_policy(host, 0, source, None, true)
+}
+
+fn restore_with_policy(
+    host: &SharedHost,
+    client: ClientId,
+    source: &Session,
+    mut admission: Option<capacity::Reservation>,
+    previously_adopted: bool,
+) -> Result<ServerResponse, String> {
+    if crate::upgrade::floor::load()?.blocks_id(source.id) && !previously_adopted {
+        return Err(
+            "This conversation was stopped for the update; its earlier provider is not attached"
+                .into(),
+        );
+    }
     // Main's durable holder format has no immutable account-home proof.
     super::super::account_lifecycle::ensure_idle(host).map_err(|error| error.message)?;
     let proof = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        require_unreserved_terminals(&state, source).map_err(|error| error.message)?;
         if state.shutting_down
             || (state.chat_spawning.contains_key(&source.id) && admission.is_none())
             || state.native_closing.contains_key(&source.id)
@@ -118,7 +253,19 @@ pub(super) fn restore_with_admission(
         {
             return Err("Native conversation ownership or capacity prevents adoption".into());
         }
-        if !state.chats.contains_key(&source.id) && admission.is_none() {
+        // A prepublication failure still owns a slot. Only its complete issued
+        // source may reuse that slot, even when the daemon has spare capacity.
+        // This is admission bookkeeping; restore_reserved still authenticates
+        // the retained holder before it can publish an actor.
+        let retained_startup = if let Some(pending) = state.native_actor_startups.get(&source.id) {
+            if &pending.source != source {
+                return Err("The retained startup belongs to another exact descriptor".into());
+            }
+            true
+        } else {
+            false
+        };
+        if !state.chats.contains_key(&source.id) && admission.is_none() && !retained_startup {
             capacity::require_available(&state).map_err(|error| error.message)?;
         }
         capacity::Reservation::install(&mut admission, host, &mut state, source)
@@ -231,21 +378,7 @@ fn restore_authenticated(
         store,
         recovery,
         holder,
-        move |update| {
-            if let Update::Execution { run, update } = update {
-                if let Some(host) = weak.upgrade() {
-                    super::super::agent_execution::observed(
-                        &host,
-                        id,
-                        execution_instance,
-                        run,
-                        update,
-                    );
-                }
-            } else {
-                changed(&weak, id, update);
-            }
-        },
+        move |update| changed_owned(&weak, id, execution_instance, update),
     )?;
     // Installation is still reversible: close drops only this new connection
     // until the exact server confirms the retained thread and the host owns it.
@@ -263,15 +396,14 @@ fn restore_authenticated(
             if handle.is_completed() {
                 return Err("Retained server disconnected during adoption".into());
             }
-            if let Some(actual) = handle.confirmed_session_id() {
-                return if Some(actual) == expected_thread {
-                    Ok(())
-                } else {
-                    Err("Retained server confirmed a different conversation".into())
-                };
+            if restored_thread_ready(&handle, expected_thread.as_deref())? {
+                return Ok(());
             }
             if Instant::now() >= deadline {
-                return Err("Retained server did not confirm its thread within 30 seconds".into());
+                return Err(
+                    "Retained server did not confirm durable continuity for its thread within 30 seconds"
+                        .into(),
+                );
             }
             thread::sleep(Duration::from_millis(20));
         }
@@ -301,19 +433,10 @@ fn restore_authenticated(
         // Terminal recovery has already authenticated its own holder lineage.
         // Keep that exact worker through the native holder's acknowledgment;
         // an equal recipe alone cannot authorize a concurrent replacement.
-        let current = state
-            .terminals
-            .get(&terminal.id)
-            .filter(|current| {
-                current.handle.holder_identity().is_some()
-                    && current.handle.holder_identity() == paired_holder.as_ref()
-                    && current.session.launch == terminal.launch
-                    && current.session.owned_codex_listener == terminal.owned_codex_listener
-                    && current.session.continuity.live_proof().as_ref() == Some(proof)
-            })
-            .ok_or("The paired terminal could not be recovered; native ownership was preserved")?;
-        *terminal = current.session.clone();
-        Ok(Some(current.handle.clone()))
+        let (projected, worker) =
+            project_paired_terminal(&state, terminal, paired_holder.as_ref(), proof)?;
+        *terminal = projected;
+        Ok(Some(worker))
     })();
     let paired = match paired {
         Ok(paired) => paired,
@@ -338,28 +461,27 @@ fn restore_authenticated(
             .cloned()
             .map(crate::agent_execution::HostedSession::Chat),
     );
-    if let Err(error) = execution_registry
+    let adopted = execution_registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .adopt_authenticated_agent_session(
             &retained,
             &crate::agent_execution::HostedSession::Chat(session.clone()),
-        )
-    {
-        let _ = handle.close();
-        return Err(error);
-    }
-    let state = host.lock().unwrap_or_else(|p| p.into_inner());
-    let pair_unchanged = match (&session.terminal, &paired) {
-        (None, None) => true,
-        (Some(terminal), Some(handle)) => {
-            state.terminals.get(&terminal.id).is_some_and(|current| {
-                current.session == *terminal && current.handle.same_worker(handle)
-            })
+        );
+    let adopted = match adopted {
+        Ok(adopted) => adopted,
+        Err(error) => {
+            let _ = handle.close();
+            return Err(error);
         }
-        _ => false,
     };
-    if state.shutting_down || !pair_unchanged {
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    let pair_unchanged =
+        pair_projection_is_current(&state, session.terminal.as_ref(), paired.as_ref());
+    if state.shutting_down
+        || !pair_unchanged
+        || require_unreserved_terminals(&state, &session).is_err()
+    {
         drop(state);
         let _ = handle.close();
         return Err(
@@ -391,28 +513,36 @@ fn restore_authenticated(
         completion_observed: false,
         returning_terminal: false,
     };
-    let expected_pair = record.session.terminal.clone();
     drop(state);
     let response = session_snapshot(&record.session, &record.handle)?;
-    record.handle.commit_native_installation()?;
+    #[cfg(test)]
+    BEFORE_PUBLICATION.with(|slot| {
+        if let Some(action) = slot.borrow_mut().take() {
+            action(host);
+        }
+    });
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     if state.shutting_down
+        || require_unreserved_terminals(&state, &record.session).is_err()
         || state.proof() != proof
         || state
             .chats
             .get(&id)
             .is_some_and(|current| current.handle.owns_work())
-        || expected_pair.as_ref().is_some_and(|terminal| {
-            state
-                .terminals
-                .get(&terminal.id)
-                .is_none_or(|current| current.session != *terminal)
-        })
+        || !pair_projection_is_current(
+            &state,
+            record.session.terminal.as_ref(),
+            record.paired_terminal.as_ref(),
+        )
     {
         drop(state);
         let _ = record.handle.close();
         return Err("Native adoption changed before attachment publication".into());
     }
+    // This path constructs a Local adopted handle: committing is an atomic
+    // flag, not a holder RPC. Keep it uncommitted through every refusal above
+    // so dropping the failed attachment preserves the original provider.
+    record.handle.commit_native_installation()?;
     let retired = state.chats.insert(id, record);
     if let Some(context) = execution_context {
         context.installed();
@@ -421,6 +551,12 @@ fn restore_authenticated(
     state.inventory_generation += 1;
     drop(state);
     drop(retired);
+    // The agent's record, and possibly its pane, now name the successor, which
+    // is installed; watching windows learn it from the edge. A refusal above
+    // leaves the change for the next announcement.
+    if adopted {
+        super::super::agent_execution::announce(host, &execution_registry);
+    }
     Ok(response)
 }
 
@@ -431,6 +567,17 @@ pub(super) fn retained_upgrade_sources(
     sources
         .into_iter()
         .filter(|source| source != successor)
+        .filter(|source| {
+            // Adopt rotates the native proof before the independently recovered
+            // terminal projection is acknowledged. Holders retain that internal
+            // state for exact cleanup, but no pane was issued the mismatched
+            // pair. Keep it out of checkpoints, including older helper journals.
+            let paired_proof = source
+                .terminal
+                .as_ref()
+                .and_then(|terminal| terminal.continuity.live_proof());
+            paired_proof.is_none_or(|proof| source.proof.as_ref() == Some(&proof))
+        })
         .map(|source| crate::upgrade::handoff::ChatSource {
             // The holder authenticated these immutable aliases, including the
             // first descriptor issued before the provider named its thread.
@@ -449,14 +596,29 @@ pub(in crate::host) fn restore_orphaned_native(
     host: &SharedHost,
     refused: &[TerminalId],
 ) -> Result<(), String> {
+    restore_orphaned_native_preserving(host, refused, &Default::default())
+}
+
+/// Retry historically adopted owners through the ordinary authentication path.
+/// A failed earlier restart may have saved their history in the floor ledger;
+/// that snapshot is not evidence that an original helper has stopped forever.
+/// Originally paused IDs never enter this set, and no recipe is executed.
+pub(in crate::host) fn restore_orphaned_native_preserving(
+    host: &SharedHost,
+    refused: &[TerminalId],
+    preserved: &std::collections::BTreeSet<TerminalId>,
+) -> Result<(), String> {
     let proof = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .proof()
         .clone();
     let directory = registry::directory(Kind::Native)?;
+    let stopped = crate::upgrade::floor::load()?;
     for record in registry::recovery_candidates(&directory, &proof.boot_id, Kind::Native)? {
-        if refused.contains(&record.terminal) {
+        if (stopped.blocks_id(record.terminal) && !preserved.contains(&record.terminal))
+            || refused.contains(&record.terminal)
+        {
             continue;
         }
         if host
@@ -468,11 +630,33 @@ pub(in crate::host) fn restore_orphaned_native(
             continue;
         }
         let result = if Handle::is_remote_record(&record) {
-            Handle::inspect_remote(&record, proof.clone())
-                .and_then(|inspection| restore(host, 0, &inspection.source))
+            match super::retained_actor::finish_interrupted_exit(host, &record) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(session = %record.terminal, %error, "an interrupted exit could not be finished; holder evidence preserved");
+                    continue;
+                }
+            }
+            Handle::inspect_remote(&record, proof.clone()).and_then(|inspection| {
+                restore_with_policy(
+                    host,
+                    0,
+                    &inspection.source,
+                    None,
+                    preserved.contains(&inspection.source.id),
+                )
+            })
         } else {
-            chat::native_holder::inspect(&record, &proof)
-                .and_then(|(recovery, _)| restore(host, 0, &recovery.source))
+            chat::native_holder::inspect(&record, &proof).and_then(|(recovery, _)| {
+                restore_with_policy(
+                    host,
+                    0,
+                    &recovery.source,
+                    None,
+                    preserved.contains(&recovery.source.id),
+                )
+            })
         };
         if let Err(error) = result {
             tracing::warn!(session = %record.terminal, %error, "retained native conversation could not be reattached; holder evidence preserved");

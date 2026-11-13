@@ -85,7 +85,9 @@ impl Cagents {
             return None;
         }
         health.quarantined.iter().find_map(|write| {
-            let WriteSubject::Workspace { card: Some(id) } = write.subject else {
+            let (WriteSubject::Workspace { card: Some(id) } | WriteSubject::Pane { card: id }) =
+                write.subject
+            else {
                 return None;
             };
             if self.shared_views.defaults.contains_key(&id) || self.chat_is_unused_default(id) {
@@ -205,6 +207,7 @@ impl Cagents {
                     return recovery_focus(0);
                 }
                 let snapshot = self.persistent_workspace();
+                self.record_shared_chat_identities();
                 let receipt = self
                     .session
                     .as_ref()

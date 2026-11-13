@@ -35,7 +35,6 @@ host = [
     "dep:base64",
     "dep:hmac",
     "dep:image",
-    "dep:imara-diff",
     "dep:ksni",
     "dep:libghostty-vt",
     "dep:notify",
@@ -63,10 +62,10 @@ ui = [
     "image/bmp",
     "image/ico",
     "image/tiff",
-    "dep:imara-diff",
     "dep:jiff",
     "dep:libcosmic",
     "dep:lsp-types",
+    "dep:memchr",
     "dep:mermaid-rs-renderer",
     "dep:unicase",
     "dep:notify",
@@ -148,6 +147,10 @@ name = "agent_console_contract"
 required-features = ["host"]
 
 [[test]]
+name = "older_client_contract"
+required-features = ["host"]
+
+[[test]]
 name = "automation_cli_contract"
 required-features = ["host"]
 
@@ -191,6 +194,10 @@ required-features = ["ui"]
 name = "session_restore_contract"
 required-features = ["ui"]
 
+[[test]]
+name = "ui_process_identity_contract"
+required-features = ["ui"]
+
 [dependencies]
 cagents-browser-import = { path = "crates/browser-import", features = ["desktop-keyring"], optional = true }
 cookie = { version = "0.18", optional = true }
@@ -232,10 +239,13 @@ keyboard-types = { version = "=0.8.3", features = ["serde"], optional = true }
 # `highlighter` backs the editor's syntax highlighting; it is not in libcosmic's
 # default set and the editor is the only consumer.
 libcosmic = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", default-features = false, features = ["a11y", "highlighter", "markdown", "multi-window", "surface-message", "tokio", "wgpu", "winit", "xdg-portal"], optional = true }
-imara-diff = { version = "0.2.0", optional = true }
+imara-diff = "0.2.0"
 ksni = { version = "0.3.6", optional = true }
 libc = "0.2.189"
 libghostty-vt = { version = "0.2.1", default-features = false, features = ["tracing"], optional = true }
+# Finds records worth parsing in large provider transcripts for the resume
+# picker; already in the resolved graph through regex.
+memchr = { version = "2.7", optional = true }
 # Pinned to the version `async-lsp` 0.2.4 depends on so protocol types unify.
 lsp-types = { version = "0.95", optional = true }
 notify = { version = "8.2", optional = true }
@@ -292,6 +302,7 @@ wayland-client = { version = "=0.31.15", features = ["system"], optional = true 
 wayland-protocols = { version = "=0.32.13", features = ["client"], optional = true }
 
 [dev-dependencies]
+tokio = { version = "1.47", features = ["test-util"] }
 tracing-log = "0.2"
 
 [profile.dev]
@@ -300,6 +311,15 @@ debug = "line-tables-only"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# Production builds for this workstation: release identity and optimization,
+# without the whole-crate code generation that makes each release take tens of
+# minutes. `scripts/install-local` uses it; published releases keep `release`.
+[profile.local]
+inherits = "release"
+lto = false
+codegen-units = 256
+incremental = true
 
 [profile.dev.package."*"]
 debug = 0
@@ -323,6 +343,11 @@ debug = "line-tables-only"
 
 [profile.test.package."*"]
 debug = 0
+
+# Lifecycle tests hash their actual executables within the startup budget.
+# Keep SHA-256 at production speed without changing ordinary dev builds.
+[profile.test.package.sha2]
+opt-level = 3
 
 [profile.test.package."libghostty-vt-sys"]
 debug = "line-tables-only"

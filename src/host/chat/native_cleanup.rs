@@ -11,6 +11,22 @@ pub(in crate::host) struct NativeClose {
 }
 
 impl NativeClose {
+    /// A retained close of `source`'s unpaired owner, as Close records it once
+    /// it adopts that owner, and once its Release is answered when `closed`.
+    #[cfg(test)]
+    pub(in crate::host) fn adopted(
+        source: Session,
+        owner: chat::native_holder::Detached,
+        closed: bool,
+    ) -> Self {
+        Self {
+            source,
+            owner,
+            closed,
+            paired: None,
+        }
+    }
+
     pub(in crate::host) fn working_directory(&self) -> &std::path::Path {
         &self.source.launch.recipe.working_directory
     }
@@ -18,6 +34,8 @@ impl NativeClose {
 
 #[derive(Clone)]
 struct RetainedPair {
+    // Only a live pair needs a close source. A receipt-proved completed pair
+    // still keeps its exact handle for the replacement fences below.
     source: Option<crate::model::TerminalSession>,
     holder: crate::terminal::holder::Record,
     handle: Option<crate::terminal::TerminalHandle>,
@@ -28,7 +46,9 @@ struct RetainedPair {
 /// Claude cleanup adopts its authenticated resident reducer with close-only
 /// authority from its durable registration; this grants no account read or input
 /// authority. Exact ownership and the current daemon lease authorize either
-/// route; disappearance never proves a successful close.
+/// route; disappearance never proves a successful close. A Codex owner that
+/// ended without a receipt settles only on the evidence that nothing of it can
+/// still run; see `settle_lost_execution`.
 pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Result<(), String> {
     close_retained_inner(host, source, None, None)
 }
@@ -121,7 +141,12 @@ fn close_retained_inner(
             return Err("The exact hosted attachment changed before native cleanup".into());
         }
         let actor = if let Some(record) = state.chats.get(&source.id) {
-            if record.handle.owns_work() {
+            // Ordinary close has joined this exact captured attachment and
+            // proved its provider teardown. A retained protocol diagnosis must
+            // not block its paired cleanup; unattached cleanup still cannot
+            // bypass a failed or live actor's own close path.
+            let closed_capture = expected.is_some() && record.handle.is_completed();
+            if record.handle.owns_work() && !closed_capture {
                 return Err("The native actor still owns work; use its existing close path".into());
             }
             // Identity/continuity are cached actor metadata; never hydrate a
@@ -166,22 +191,29 @@ fn close_retained_inner(
     let result = (|| {
         let socket = registry::socket(&registry::directory(Kind::Native)?, source.id);
         let receipt = chat::native_holder::closed_source(source, &proof)?;
-        let owner = pending
+        let owner = match pending
             .as_ref()
             .map(|pending| pending.owner.record.clone())
             .or_else(|| receipt.as_ref().map(|(record, _)| record.clone()))
-            .map(Ok)
-            .unwrap_or_else(|| {
-                registry::recovery_candidate(&socket, Kind::Native).and_then(|record| {
-                    record.ok_or_else(|| {
-                        "No exact native holder or confirmed close receipt is available".to_owned()
-                    })
-                })
-            })?;
+        {
+            Some(owner) => owner,
+            None => match registry::recovery_candidate(&socket, Kind::Native)? {
+                Some(record) if !chat::native_holder::retire_abandoned(&record)? => record,
+                // The owner ended without a receipt and left nothing to
+                // adopt. The resident, if any, is removed below.
+                _ => return super::settle_lost_execution(host, source, &proof),
+            },
+        };
         preflight_current_retirements(host, source, &owner, &proof)?;
         if let Some((record, true)) = &receipt {
             retire_closed_execution(host, source, record, &proof)?;
             return Ok(());
+        }
+        // A holder that died while its provider runs on can no longer be
+        // asked to stop it, and nothing else may: say so, rather than fail
+        // reaching the holder.
+        if let Some(refusal) = super::holder_lost_refusal(source, &owner)? {
+            return Err(refusal);
         }
         let mut pending = match pending {
             Some(pending) => pending,
@@ -269,12 +301,19 @@ fn close_retained_inner(
                 .require_current(host)
                 .map_err(|error| error.message)?;
         }
+        // An owner that ended before its Release, or with its provider during
+        // it, settled this close without a receipt, so there is none to
+        // confirm. Its close stays pending until the loss is proved; an owner
+        // still running keeps its record, which refuses the loss.
+        if pending.paired.is_none() && chat::native_holder::closed_source(source, &proof)?.is_none()
+        {
+            chat::native_holder::retire_abandoned(&pending.owner.record)?;
+            return super::settle_lost_execution(host, source, &proof);
+        }
         if let Some(pair) = &pending.paired {
-            if let Some(handle) = &pair.handle {
-                handle.close_with_receipt(
-                    pair.source.as_ref().expect("captured worker source"),
-                    &proof,
-                )?;
+            if let Some(source) = &pair.source {
+                let handle = pair.handle.as_ref().expect("captured worker source");
+                handle.close_with_receipt(source, &proof)?;
             } else if !crate::terminal::holder::cleanup::confirmed_owner_with_role(
                 &pair.holder,
                 &proof,
@@ -461,11 +500,55 @@ fn retained_pair(
                     .into(),
             );
         }
+        if state.proof() != proof || !proof.is_complete() {
+            return Err("The paired terminal belongs to a different daemon owner".into());
+        }
+        let handle = current.handle.clone();
+        if handle.is_completed() {
+            // A completed worker has no live projection. Its exact holder's
+            // source-digest receipt can recognize the acknowledged source even
+            // when the observer descriptor and old aliases no longer show it.
+            // Keep this same worker for the later replacement fences.
+            drop(state);
+            let confirmed = match terminal {
+                Some(terminal) => crate::terminal::holder::cleanup::confirmed_with_role(
+                    terminal,
+                    holder,
+                    proof,
+                    original_role.as_ref(),
+                )?,
+                None => crate::terminal::holder::cleanup::confirmed_owner_with_role(
+                    holder,
+                    proof,
+                    original_role.as_ref(),
+                )?,
+            };
+            if !confirmed {
+                return Err(
+                    "The completed paired terminal has not proved its exact teardown".into(),
+                );
+            }
+            return Ok(Some(RetainedPair {
+                source: None,
+                holder: holder.clone(),
+                handle: Some(handle),
+                original_role,
+            }));
+        }
+        // Cleanup owns the authenticated worker, not observer 0's attachment.
+        // A live projection failure must refuse, never use a presentation or
+        // historical descriptor as a substitute ownership proof.
+        let projected = state.native_terminal_projection(holder.terminal)?;
+        if projected.continuity.live_proof().as_ref() != Some(proof) {
+            return Err("The paired terminal belongs to a different daemon owner".into());
+        }
         let descriptor = state
             .descriptor(0, holder.terminal)
             .map_err(|error| error.message)?;
         if terminal.is_some_and(|terminal| {
-            descriptor.session != *terminal && !descriptor.upgrade_sources.contains(terminal)
+            projected != *terminal
+                && descriptor.session != *terminal
+                && !descriptor.upgrade_sources.contains(terminal)
         }) {
             return Err(
                 "The paired terminal does not retain this exact native holder's source identity"
@@ -473,9 +556,9 @@ fn retained_pair(
             );
         }
         return Ok(Some(RetainedPair {
-            source: Some(descriptor.session),
+            source: Some(projected),
             holder: holder.clone(),
-            handle: Some(current.handle.clone()),
+            handle: Some(handle),
             original_role,
         }));
     }

@@ -123,7 +123,8 @@ enum Command {
     Mouse(MouseInput),
     ReadViewport {
         offset: Option<u64>,
-        rows: u16,
+        /// `None` reads as many rows as the terminal has.
+        rows: Option<u16>,
         reply: Sender<Result<Arc<RenderSnapshot>, String>>,
     },
     Focus(bool),
@@ -480,6 +481,7 @@ struct PublishedState {
     retained_holder: Mutex<Option<holder::Holder>>,
     holder_identity: OnceLock<super::holder::Record>,
     launch_directory: OnceLock<(holder::LaunchDirectoryPin, File)>,
+    original_holder_process: OnceLock<Arc<File>>,
     original_holder_role: OnceLock<crate::daemon::holder_registry::OriginalRole>,
     // The source descriptors pin both identities through terminal retirement;
     // numeric inode receipts alone cannot distinguish later inode reuse.
@@ -496,6 +498,11 @@ struct PublishedState {
     /// reveal forces.
     announced_generation: AtomicU64,
     visible: AtomicBool,
+    /// The newest generation published before the worker last stopped
+    /// showing the terminal. `visible` turns on when a reveal starts, before
+    /// its capture is published or while a synchronized update holds it back;
+    /// until a later generation is published, the screen is from before.
+    hidden_through: AtomicU64,
     wake: Arc<WakeCallback>,
     output_observer: OnceLock<Arc<dyn Fn(u64) + Send + Sync>>,
     output_armed: AtomicBool,
@@ -577,10 +584,12 @@ impl PublishedState {
             retained_holder: Mutex::new(None),
             holder_identity: OnceLock::new(),
             launch_directory: OnceLock::new(),
+            original_holder_process: OnceLock::new(),
             original_holder_role: OnceLock::new(),
             transcript_location: OnceLock::new(),
             announced_generation: AtomicU64::new(0),
             visible: AtomicBool::new(visible),
+            hidden_through: AtomicU64::new(0),
             wake,
             output_observer: OnceLock::new(),
             output_armed: AtomicBool::new(false),
@@ -683,12 +692,21 @@ impl PublishedState {
         if self.shutdown_requested.load(Ordering::Acquire) {
             return Err(TerminalSendError::Closed);
         }
-        if let Command::HostVisibility(visibility) = &command {
-            // HostState already offers this retained generation when a view
-            // becomes visible. Calling its wake callback here would reenter
-            // the host mutex held by visibility/attach/detach operations.
-            self.visible
-                .store(*visibility == Visibility::Visible, Ordering::Release);
+        // Visibility and focus belong to the retained surface, independent
+        // of whether its completed scrollback could be archived. They do not
+        // need the parser or history, and must not repeat a retention failure.
+        let visible = match &command {
+            Command::HostVisibility(visibility) => Some(*visibility == Visibility::Visible),
+            Command::Hide | Command::Hibernate => Some(false),
+            Command::Reveal => Some(true),
+            Command::Restore { visible } => Some(*visible),
+            Command::Focus(_) => return Ok(()),
+            _ => None,
+        };
+        if let Some(visible) = visible {
+            // HostState already offers the retained generation on reveal.
+            // A wake here could reenter the host mutex held by its caller.
+            self.visible.store(visible, Ordering::Release);
             return Ok(());
         }
         if !matches!(
@@ -714,10 +732,23 @@ impl PublishedState {
         };
         let events = events.clone();
         let result = match history {
-            Err(message) => Some(TerminalEvent::Error {
-                operation: "review completed terminal",
-                message: message.clone(),
-            }),
+            Err(message) => match command {
+                Command::ReadViewport { reply, .. } => {
+                    // Completion already reported the loss once. The parser
+                    // is gone; its final retained screen is still readable,
+                    // even when no scrollback could replace it.
+                    let _ = reply.send(Ok(self.snapshot.load_full()));
+                    return Ok(());
+                }
+                Command::Scroll(_)
+                | Command::Resize(_)
+                | Command::SetTheme(_)
+                | Command::ClearScrollback => return Ok(()),
+                _ => Some(TerminalEvent::Error {
+                    operation: "review completed terminal",
+                    message: message.clone(),
+                }),
+            },
             Ok(history) => {
                 match command {
                     Command::Search {
@@ -774,12 +805,6 @@ impl PublishedState {
                     Command::Resize(size) => history.resize(size),
                     Command::SetTheme(theme) => history.set_theme(theme),
                     Command::ClearScrollback => history.clear(),
-                    Command::Hide | Command::Hibernate => {
-                        self.visible.store(false, Ordering::Release)
-                    }
-                    Command::Reveal => self.visible.store(true, Ordering::Release),
-                    Command::Restore { visible } => self.visible.store(visible, Ordering::Release),
-                    Command::Focus(_) => return Ok(()),
                     _ => return Err(TerminalSendError::Closed),
                 }
                 let snapshot = history.snapshot(
@@ -883,8 +908,42 @@ impl PublishedState {
         }
     }
 
-    fn suppress_wakes(&self) {
+    /// Stops announcing frames and marks what is published as the screen
+    /// from before, which a reveal must replace before reads can trust it.
+    fn stop_presenting(&self) {
         self.visible.store(false, Ordering::Release);
+        self.hidden_through.store(
+            self.published_generation.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+    }
+
+    /// Admits commands to what the completed terminal left. Nothing is
+    /// published after this, so the published screen is its screen even when
+    /// it completed hidden and no history could be kept to replace it.
+    fn freeze(
+        &self,
+        history: Result<archive::History, String>,
+        events: Arc<Sender<TerminalEvent>>,
+    ) {
+        self.hidden_through.store(0, Ordering::Release);
+        *self.archive.lock().unwrap_or_else(|p| p.into_inner()) =
+            ArchivePhase::Frozen { history, events };
+        self.archive_ready.notify_all();
+    }
+
+    fn frozen(&self) -> bool {
+        matches!(
+            *self.archive.lock().unwrap_or_else(|p| p.into_inner()),
+            ArchivePhase::Frozen { .. }
+        )
+    }
+
+    /// Whether `snapshot`, read from this state, is the screen the worker is
+    /// showing now rather than one from before it was last hidden.
+    fn presents(&self, snapshot: &RenderSnapshot) -> bool {
+        self.visible.load(Ordering::Acquire)
+            && snapshot.generation > self.hidden_through.load(Ordering::Acquire)
     }
 
     /// Records the generation the subscriber drew and releases the capture
@@ -930,6 +989,15 @@ impl Drop for HandleInner {
 #[derive(Clone)]
 pub struct TerminalHandle {
     inner: Arc<HandleInner>,
+}
+
+/// Retirement observes actual join and the exact original holder's exit.
+/// Completion or transfer to the child reaper alone is not a release receipt.
+pub(crate) enum TerminalRetirement {
+    Pending,
+    WaitingForHolder(Arc<File>),
+    Released,
+    Retained(String),
 }
 
 /// Callback identity without retaining the worker through its own wake closure.
@@ -1226,31 +1294,58 @@ impl TerminalHandle {
         }
     }
 
+    /// `shown` says the host has asked this worker to show the terminal.
+    /// Until the worker has published a screen since, what it published is a
+    /// hibernation marker, nothing, or the screen from before it was hidden.
+    /// Such a read is answered on the worker, after the reveal queued ahead
+    /// of it.
     pub(crate) fn viewport_snapshot(
         &self,
         offset: Option<u64>,
-        rows: u16,
+        rows: Option<u16>,
+        shown: bool,
     ) -> Result<Arc<RenderSnapshot>, String> {
         let published = self.snapshot();
-        if published.detached || published.rows == 0 {
+        let drawn = !published.detached && published.rows > 0;
+        if !shown && !drawn {
             return Ok(published);
         }
-        if offset.is_none()
-            && rows == published.rows
-            && published.scroll.offset == published.scroll.max_offset()
-        {
+        // A reveal turns `visible` on before its capture is published, and a
+        // synchronized update can hold that capture back; until then the
+        // published screen is the one from before the terminal was hidden.
+        let current = !shown || self.inner.published.presents(&published);
+        let default_view = drawn
+            && offset.is_none()
+            && rows.is_none_or(|rows| rows == published.rows)
+            && published.scroll.offset == published.scroll.max_offset();
+        if current && default_view {
             return Ok(published);
         }
         let (reply, receive) = crossbeam_channel::bounded(1);
-        self.try_command(Command::ReadViewport {
+        match self.try_command(Command::ReadViewport {
             offset,
             rows,
             reply,
-        })
-        .map_err(|error| error.to_string())?;
-        receive
-            .recv_timeout(Duration::from_secs(3))
-            .map_err(|error| error.to_string())?
+        }) {
+            Ok(()) => {}
+            // A closed worker shows nothing new: what it left is its screen.
+            Err(TerminalSendError::Closed) if !drawn || default_view => {
+                return Ok(self.snapshot());
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+        match receive.recv_timeout(Duration::from_secs(3)) {
+            Ok(result) => result,
+            // A completed terminal whose history could not be kept reports
+            // that as an event and keeps what it published. Only its archive
+            // drops a read unanswered; anything else that does is a failure.
+            Err(RecvTimeoutError::Disconnected)
+                if !drawn || (default_view && self.inner.published.frozen()) =>
+            {
+                Ok(self.snapshot())
+            }
+            Err(error) => Err(error.to_string()),
+        }
     }
 
     pub fn snapshot(&self) -> Arc<RenderSnapshot> {
@@ -1501,6 +1596,75 @@ impl TerminalHandle {
     }
     pub(crate) fn same_worker(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    pub(crate) fn begin_completed_retirement(&self) -> Result<(), &'static str> {
+        if !self.is_completed() {
+            return Err("The original terminal has not completed");
+        }
+        self.request_shutdown();
+        // The already-joined fast path need not enqueue another lane task.
+        crate::daemon::wake();
+        Ok(())
+    }
+
+    pub(crate) fn completed_retirement(
+        &self,
+        source: &TerminalSession,
+        proof: &crate::model::HostSessionProof,
+    ) -> TerminalRetirement {
+        match self.inner.worker.retirement_ready() {
+            Err(error) => return TerminalRetirement::Retained(error.into()),
+            Ok(false) => return TerminalRetirement::Pending,
+            Ok(true) => {}
+        }
+        if !self.is_completed() {
+            return TerminalRetirement::Retained(
+                "Original terminal cleanup remains unconfirmed".into(),
+            );
+        }
+        let Some(original) = self.inner.published.original_holder_process.get() else {
+            return TerminalRetirement::Retained(
+                "Original holder process evidence is unavailable".into(),
+            );
+        };
+        let mut event = libc::pollfd {
+            fd: original.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // The held pidfd cannot observe a reused numeric PID. Keep it alive
+        // through the daemon's wait when an adopted or fsyncing holder remains.
+        match unsafe { libc::poll(&mut event, 1, 0) } {
+            0 => TerminalRetirement::WaitingForHolder(Arc::clone(original)),
+            n if n < 0
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted =>
+            {
+                TerminalRetirement::WaitingForHolder(Arc::clone(original))
+            }
+            n if n > 0
+                && event.revents & libc::POLLIN != 0
+                && event.revents & (libc::POLLNVAL | libc::POLLERR) == 0 =>
+            {
+                if let Some(record) = self.holder_identity() {
+                    match super::holder::cleanup::confirmed_with_role(
+                        source,
+                        record,
+                        proof,
+                        self.inner.published.original_holder_role.get(),
+                    ) {
+                        Ok(true) => TerminalRetirement::Released,
+                        Ok(false) => TerminalRetirement::Retained(
+                            "The exact original holder cleanup receipt is unavailable".into(),
+                        ),
+                        Err(error) => TerminalRetirement::Retained(error),
+                    }
+                } else {
+                    TerminalRetirement::Released
+                }
+            }
+            _ => TerminalRetirement::Retained("Original holder exit could not be observed".into()),
+        }
     }
 
     pub(crate) fn downgrade(&self) -> WeakTerminalHandle {
@@ -1916,21 +2080,33 @@ impl TerminalHandle {
         let outcome = result
             .recv_timeout(std::time::Duration::from_secs(3))
             .unwrap_or_else(|error| TerminalCloseResult::Unknown(error.to_string()));
-        if matches!(outcome, TerminalCloseResult::Unknown(_))
-            && matches!(
-                *self
-                    .inner
-                    .published
-                    .archive
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner()),
-                ArchivePhase::Frozen { .. }
-            )
-        {
-            return match self.shutdown() {
-                Ok(()) => TerminalCloseResult::Closed,
-                Err(error) => TerminalCloseResult::Unknown(error.to_string()),
-            };
+        if matches!(outcome, TerminalCloseResult::Unknown(_)) {
+            // An adopted root can already be reaped when preparation tries to
+            // capture its live process identity. A checked close may then run
+            // before the queued exit report and PTY EOF finish publication.
+            // Give that ordinary completion the remainder of the close budget;
+            // neither the failed inspection nor elapsed time proves release.
+            let published = &self.inner.published;
+            let mut archive = published.archive.lock().unwrap_or_else(|p| p.into_inner());
+            while matches!(*archive, ArchivePhase::Live | ArchivePhase::Preparing) {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let (next, _) = published
+                    .archive_ready
+                    .wait_timeout(archive, remaining)
+                    .unwrap_or_else(|p| p.into_inner());
+                archive = next;
+            }
+            let frozen = matches!(*archive, ArchivePhase::Frozen { .. });
+            drop(archive);
+            if frozen {
+                return match self.shutdown() {
+                    Ok(()) => TerminalCloseResult::Closed,
+                    Err(error) => TerminalCloseResult::Unknown(error.to_string()),
+                };
+            }
         }
         if outcome == TerminalCloseResult::Closed {
             // Completion is not reported until the owner has released its PTY.
@@ -2511,7 +2687,7 @@ struct Worker {
     capture_dirty: bool,
     viewport_reads: Vec<(
         Option<u64>,
-        u16,
+        Option<u16>,
         Sender<Result<Arc<RenderSnapshot>, String>>,
         Option<Arc<admission::Permit>>,
     )>,
@@ -2757,15 +2933,37 @@ impl Worker {
             command.env_remove(name);
         }
         command.env("CAGENTS_TERMINAL_ID", session.id.to_string());
+        match crate::instance::development_instance() {
+            Some(instance) => command.env(crate::instance::DEVELOPMENT_INSTANCE_ENV, instance),
+            None => command.env_remove(crate::instance::DEVELOPMENT_INSTANCE_ENV),
+        };
         // A cagents process started in this terminal must not take the
         // account selected for it for the system account.
-        match crate::account::registry::selection_marker(|name| {
-            command.get_env(name)?.to_str().map(str::to_owned)
-        }) {
-            Some(marker) => command.env(crate::account::SELECTION_MARKER, marker),
-            None => command.env_remove(crate::account::SELECTION_MARKER),
+        let home_of = |name: &str| command.get_env(name)?.to_str().map(str::to_owned);
+        let selection = crate::account::registry::selection_marker(home_of);
+        // It must keep the Claude home the reader started cagents with,
+        // though, rather than take it for the default earlier cagents
+        // exported to every launch.
+        let system = crate::account::system_home_marker(home_of, selection.as_deref(), |name| {
+            std::env::var(name).ok()
+        });
+        for (marker, value) in [
+            (crate::account::SELECTION_MARKER, selection),
+            (crate::account::SYSTEM_HOME_MARKER, system),
+        ] {
+            match value {
+                Some(value) => command.env(marker, value),
+                None => command.env_remove(marker),
+            }
         }
         command.env_remove(crate::agent_execution::AUTHORITY_ENV);
+        command.env_remove(crate::agent_execution::CONSOLE_STARTUP_OWNER_ENV);
+        if let Some(proof) = &config.console_startup_owner {
+            command.env(
+                crate::agent_execution::CONSOLE_STARTUP_OWNER_ENV,
+                serde_json::to_string(proof).map_err(|error| error.to_string())?,
+            );
+        }
         if let Some(token) = config.agent_authority.token() {
             command.env(crate::agent_execution::AUTHORITY_ENV, token);
         }
@@ -2824,6 +3022,9 @@ impl Worker {
                 ) {
                     command.env("PATH", path);
                 }
+                // Before the holder forks, so nothing this launch starts
+                // predates its record.
+                crate::lineage_birth::record_instance_launch(&session)?;
                 (
                     holder::spawn_recoverable(
                         command,
@@ -2907,6 +3108,10 @@ impl Worker {
             KeyEncoder::new().map_err(|error| format!("create key encoder: {error}"))?;
         let mouse_encoder =
             MouseEncoder::new().map_err(|error| format!("create mouse encoder: {error}"))?;
+        let original_holder_process = held
+            .holder
+            .original_process_descriptor()
+            .map_err(|error| format!("retain original holder observation: {error}"))?;
         // Install only an already-held exact root identity, and allocate its
         // CLOEXEC clone before adoption commit can transfer replay custody.
         let launch_directory = held
@@ -2921,6 +3126,9 @@ impl Worker {
             .transpose()?;
         // Replay transfer and reader activation remain in commit_start, after
         // the complete original Worker has moved outside the panic guard.
+        if let Some(original) = original_holder_process {
+            let _ = published.original_holder_process.set(Arc::new(original));
+        }
         if let Some(role) = held.holder.original_role() {
             let _ = published.original_holder_role.set(role.clone());
         }
@@ -3369,15 +3577,7 @@ impl Worker {
             } else if let Err(message) = &history {
                 self.error("retain completed terminal history", message.clone());
             }
-            *self
-                .published
-                .archive
-                .lock()
-                .unwrap_or_else(|p| p.into_inner()) = ArchivePhase::Frozen {
-                history,
-                events: self.events.clone(),
-            };
-            self.published.archive_ready.notify_all();
+            self.published.freeze(history, self.events.clone());
             self.published
                 .request_wake(self.published.published_generation.load(Ordering::Acquire));
             while let Ok(command) = self.commands.try_recv() {
@@ -3603,6 +3803,24 @@ impl Worker {
                 rows,
                 reply,
             } => {
+                if self.visibility != Visibility::Visible {
+                    // Nothing is captured until a reveal, so the read cannot
+                    // wait for one. Hibernated or never shown, the published
+                    // marker is the answer; hidden, the parser's screen is.
+                    let base = self.published.snapshot.load_full();
+                    let _ = reply.send(if self.visual.is_none() {
+                        Ok(base)
+                    } else {
+                        super::snapshot::capture_viewport(
+                            &self.terminal,
+                            &base,
+                            offset,
+                            rows.unwrap_or(base.rows),
+                        )
+                        .map_err(|error| error.to_string())
+                    });
+                    return false;
+                }
                 self.viewport_reads
                     .push((offset, rows, reply, self.current_admission.clone()));
                 if self.capture_dirty {
@@ -3728,7 +3946,7 @@ impl Worker {
                             .and_then(crate::model::agent_recovery::recipe_from_hint).is_some()
                             && !self.agent_process.as_ref().is_some_and(|process| family.only_agent_tree(process.pid))
                         {
-                            return Err("Terminal also owns unrelated background jobs; finish or close them before upgrading".into());
+                            return Err("Terminal also owns unrelated background jobs that cannot be checkpointed".into());
                         }
                         Ok(UpgradeSnapshot {
                             hint: self.resume_hint.clone(),
@@ -4062,7 +4280,7 @@ impl Worker {
 
     fn set_hidden(&mut self) {
         self.visibility = Visibility::Hidden;
-        self.published.suppress_wakes();
+        self.published.stop_presenting();
         // Nothing is published while away, so there is no update to time.
         self.synchronized_since = None;
     }
@@ -4093,7 +4311,7 @@ impl Worker {
 
     fn hibernate_visuals(&mut self) {
         self.visibility = Visibility::Hibernated;
-        self.published.suppress_wakes();
+        self.published.stop_presenting();
         self.synchronized_since = None;
         self.visual = None;
         self.generation = self.generation.saturating_add(1);
@@ -4211,6 +4429,7 @@ impl Worker {
         }
         let base = self.published.snapshot.load_full();
         for (offset, rows, reply, _permit) in std::mem::take(&mut self.viewport_reads) {
+            let rows = rows.unwrap_or(base.rows);
             let result = super::snapshot::capture_viewport(&self.terminal, &base, offset, rows)
                 .map_err(|error| error.to_string());
             let _ = reply.send(result);
@@ -4613,7 +4832,9 @@ impl Worker {
             || !self.commands.is_empty()
             || !self.retained_commands.is_empty()
         {
-            return Err("Terminal input or control is still pending; let it finish or cancel input before upgrading".into());
+            return Err(
+                "Terminal input or control is still pending and cannot be checkpointed".into(),
+            );
         }
         Ok(())
     }
@@ -5566,7 +5787,7 @@ fn terminal_environment(command: &mut CommandBuilder) {
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
     command.env("TERM_PROGRAM", "cagents");
-    command.env("TERM_PROGRAM_VERSION", crate::VERSION);
+    command.env("TERM_PROGRAM_VERSION", crate::version());
 }
 
 fn pty_size(size: TerminalSize) -> PtySize {
@@ -6111,6 +6332,424 @@ mod tests {
 
     use super::*;
 
+    fn isolated_retirement_worker_case() -> bool {
+        use std::os::unix::ffi::OsStringExt;
+        const CHILD: &str = "CAGENTS_TERMINAL_RETIREMENT_TEST_CHILD";
+        let name = thread::current().name().unwrap().to_owned();
+        if std::env::var(CHILD).as_deref() == Ok(name.as_str()) {
+            return false;
+        }
+        let private = tempfile::Builder::new().prefix("tr-").tempdir().unwrap();
+        fs::set_permissions(private.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let output = private.path().join("child.log");
+        let log = File::create(&output).unwrap();
+        // This exact child inherits HOME and opaque caller authority unchanged.
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+            .env(CHILD, &name)
+            .env("TMPDIR", private.path())
+            .env("XDG_RUNTIME_DIR", private.path())
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(40);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                // Remove only the owned fault before failure-only child cleanup,
+                // so a holder already processing ReleaseProved can still finish.
+                if let Ok(bytes) = fs::read(private.path().join("release-obstruction")) {
+                    let fault = PathBuf::from(std::ffi::OsString::from_vec(bytes));
+                    if fault.starts_with(private.path()) {
+                        let _ = fs::remove_dir(fault);
+                    }
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "retirement child timed out; evidence: {}",
+                    private.keep().display()
+                );
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
+        let log = fs::read_to_string(output).unwrap();
+        print!("{log}");
+        assert!(
+            status.success(),
+            "retirement child failed ({status}); evidence: {}",
+            private.keep().display()
+        );
+        assert!(log.contains(&name) && log.contains("1 passed; 0 failed"));
+        true
+    }
+
+    fn retirement_test_proof() -> crate::model::HostSessionProof {
+        crate::model::HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new(uuid::Uuid::new_v4().to_string()),
+            boot_id: crate::daemon::read_boot_id().unwrap(),
+            host_incarnation: crate::model::HostIncarnation::new(uuid::Uuid::new_v4().to_string()),
+        }
+    }
+
+    fn wait_for_retirement_fact(mut ready: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready() {
+            assert!(
+                Instant::now() < deadline,
+                "original retirement fact did not settle"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn completed_retirement_waits_for_actual_tls_join() {
+        if isolated_retirement_worker_case() {
+            return;
+        }
+        let (handle, release, entered) = TerminalHandle::spawn_with_blocked_tls_for_test();
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(handle.is_completed());
+        assert!(!handle.worker_joined_for_test());
+        let source = shell_session("exit 0");
+        let proof = retirement_test_proof();
+        let before = Instant::now();
+        handle.begin_completed_retirement().unwrap();
+        assert!(
+            before.elapsed() < Duration::from_secs(1),
+            "retirement request waited for TLS"
+        );
+        assert!(matches!(
+            handle.completed_retirement(&source, &proof),
+            TerminalRetirement::Pending
+        ));
+        assert!(
+            !handle.worker_joined_for_test(),
+            "completion publication is not OS join"
+        );
+        drop(release); // also releases the real destructor if an assertion unwinds
+        wait_for_retirement_fact(|| handle.inner.worker.native_settled_for_test());
+        assert!(handle.worker_joined_for_test());
+        assert!(
+            matches!(
+                handle.completed_retirement(&source, &proof),
+                TerminalRetirement::Retained(_)
+            ),
+            "holderless TLS fixture cannot manufacture native exit evidence"
+        );
+    }
+
+    #[test]
+    fn late_completed_retirement_reuses_naturally_settled_original_worker() {
+        if isolated_retirement_worker_case() {
+            return;
+        }
+        let source = shell_session("printf 'natural-retirement-result'; exit 7");
+        let handle =
+            TerminalHandle::spawn(source.clone(), TerminalConfig::default(), |_| {}).unwrap();
+        let worker = Arc::clone(&handle.inner.worker);
+        wait_for_retirement_fact(|| handle.is_completed() && worker.native_settled_for_test());
+        assert!(handle.worker_joined_for_test());
+        assert_eq!(TerminalHandle::reserved_worker_joins_for_test(), 0);
+        assert!(
+            !handle
+                .inner
+                .published
+                .shutdown_requested
+                .load(Ordering::Acquire)
+        );
+        assert!(handle.snapshot().lines.iter().any(|row| {
+            row.cells
+                .iter()
+                .map(|cell| cell.text.as_str())
+                .collect::<String>()
+                .contains("natural-retirement-result")
+        }));
+        let original = handle
+            .inner
+            .published
+            .original_holder_process
+            .get()
+            .unwrap();
+        let flags = unsafe { libc::fcntl(original.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0);
+        let proof = retirement_test_proof();
+        assert!(
+            matches!(
+                handle.completed_retirement(&source, &proof),
+                TerminalRetirement::Pending
+            ),
+            "natural join does not request release"
+        );
+        handle.begin_completed_retirement().unwrap();
+        assert!(Arc::ptr_eq(&worker, &handle.inner.worker));
+        assert_eq!(
+            TerminalHandle::reserved_worker_joins_for_test(),
+            0,
+            "late request must not acquire a new cleanup ticket"
+        );
+        assert!(matches!(
+            handle.completed_retirement(&source, &proof),
+            TerminalRetirement::Released
+        ));
+        handle.begin_completed_retirement().unwrap();
+        assert!(matches!(
+            handle.completed_retirement(&source, &proof),
+            TerminalRetirement::Released
+        ));
+        assert!(handle.worker_joined_for_test());
+    }
+
+    #[test]
+    fn checked_close_waits_for_an_adopted_reaped_roots_exact_release() {
+        if isolated_retirement_worker_case() {
+            return;
+        }
+        let proof = retirement_test_proof();
+        let paths = crate::daemon::RuntimePaths::discover().unwrap();
+        let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+        let mut source = shell_session("printf 'already-reaped-console'; exit 1");
+        source.continuity = crate::model::TerminalContinuity::DetachedSameBoot {
+            host_session_id: proof.host_session_id.clone(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: proof.host_incarnation.clone(),
+        };
+        let config = TerminalConfig {
+            holder_recovery: Some(crate::terminal::holder::Recovery {
+                source: source.clone(),
+                previous_sources: Vec::new(),
+                relaunches: Vec::new(),
+                options: super::super::TerminalSpawnOptions::default(),
+                execution_environment: None,
+                execution_recipe: None,
+            }),
+            ..TerminalConfig::default()
+        };
+        let (commands, receiver) = command_channel(1);
+        let (events, event_receiver) = crossbeam_channel::unbounded();
+        let published = Arc::new(PublishedState::new(true, Arc::new(|_| {})));
+        let owner = joins::JoinOwner::new(published.clone(), joins::reserve().unwrap());
+        let handle = TerminalHandle {
+            inner: Arc::new(HandleInner {
+                commands,
+                events: event_receiver,
+                published: published.clone(),
+                worker: owner.clone(),
+            }),
+        };
+        let (ready, initialized) = crossbeam_channel::bounded(1);
+        let (begin, admitted) = crossbeam_channel::bounded(1);
+        let worker_owner = owner.clone();
+        let worker_source = source.clone();
+        let worker_published = published.clone();
+        owner.install(thread::spawn(move || {
+            let _body = joins::BodyCompletion(worker_owner);
+            let (mut worker, _) = Worker::start(
+                worker_source,
+                config,
+                None,
+                receiver,
+                events,
+                worker_published,
+            )
+            .unwrap();
+            assert!(worker.child.exited_within(Duration::from_secs(5)).unwrap());
+            // Adoption after this actual exit cannot capture a live root.
+            // Keep its real pending exit report and PTY output for the worker.
+            worker.child_identity = None;
+            ready.send(()).unwrap();
+            admitted.recv().unwrap();
+            worker.run();
+        }));
+        initialized.recv_timeout(Duration::from_secs(5)).unwrap();
+        let expected = handle.holder_identity().unwrap().clone();
+        let closer = handle.clone();
+        let close_source = source.clone();
+        let close_proof = proof.clone();
+        let result = thread::spawn(move || closer.close_with_receipt(&close_source, &close_proof));
+        wait_for_retirement_fact(|| published.priority_close.lock().unwrap().is_some());
+        begin.send(()).unwrap();
+        result.join().unwrap().unwrap();
+        assert!(handle.is_completed());
+        assert!(
+            crate::terminal::holder::cleanup::confirmed_with_role(
+                &source,
+                &expected,
+                &proof,
+                published.original_holder_role.get(),
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn completed_retirement_waits_for_exact_holder_exit_and_authenticated_receipt() {
+        if isolated_retirement_worker_case() {
+            return;
+        }
+        use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt};
+        let proof = retirement_test_proof();
+        let paths = crate::daemon::RuntimePaths::discover().unwrap();
+        let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+        let mut source = shell_session("printf 'registered-retirement-result'; exit 0");
+        source.continuity = crate::model::TerminalContinuity::DetachedSameBoot {
+            host_session_id: proof.host_session_id.clone(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: proof.host_incarnation.clone(),
+        };
+        let recovery = crate::terminal::holder::Recovery {
+            source: source.clone(),
+            previous_sources: Vec::new(),
+            relaunches: Vec::new(),
+            options: crate::terminal::TerminalSpawnOptions::default(),
+            execution_environment: None,
+            execution_recipe: None,
+        };
+        let handle = TerminalHandle::spawn(
+            source.clone(),
+            TerminalConfig {
+                holder_recovery: Some(recovery),
+                ..TerminalConfig::default()
+            },
+            |_| {},
+        )
+        .unwrap();
+        wait_for_retirement_fact(|| handle.is_completed() && handle.worker_joined_for_test());
+        let record = handle.holder_identity().unwrap().clone();
+        assert!(record.holder.is_current());
+        assert!(
+            !record.root.is_current(),
+            "actual original PTY root must already be reaped"
+        );
+        let original = Arc::clone(
+            handle
+                .inner
+                .published
+                .original_holder_process
+                .get()
+                .unwrap(),
+        );
+        let flags = unsafe { libc::fcntl(original.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0);
+        let receipt = paths.directory.join("holders").join(format!(
+            "{}-{}-{}.closed",
+            record.terminal, record.holder.pid, record.holder.start
+        ));
+        // Exercise the existing real holder's durable-receipt retry, not a fake
+        // publication flag or a substitute JoinOwner. Its exclusive destination
+        // is deliberately a directory until after the original release attempt.
+        fs::create_dir(&receipt).unwrap();
+        struct ReleaseObstruction(PathBuf);
+        impl Drop for ReleaseObstruction {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir(&self.0);
+            }
+        }
+        let obstruction = ReleaseObstruction(receipt.clone());
+        let fault_marker = std::env::temp_dir().join("release-obstruction");
+        fs::write(&fault_marker, receipt.as_os_str().as_bytes()).unwrap();
+        handle.begin_completed_retirement().unwrap();
+        wait_for_retirement_fact(|| handle.inner.worker.native_settled_for_test());
+        assert!(handle.worker_joined_for_test());
+        assert_eq!(TerminalHandle::reserved_worker_joins_for_test(), 0);
+        assert!(
+            record.holder.is_current(),
+            "receipt fault must retain the same live holder"
+        );
+        assert!(
+            crate::daemon::child_reaper::has_outstanding_ownership(),
+            "original holder Child custody must survive transfer out of JoinOwner"
+        );
+        match handle.completed_retirement(&source, &proof) {
+            TerminalRetirement::WaitingForHolder(waiting) => {
+                assert!(
+                    Arc::ptr_eq(&waiting, &original),
+                    "wait must use the held original descriptor"
+                );
+                assert_eq!(waiting.as_raw_fd(), original.as_raw_fd());
+                let mut event = libc::pollfd {
+                    fd: waiting.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                assert_eq!(
+                    unsafe { libc::poll(&mut event, 1, 0) },
+                    0,
+                    "original holder must still be alive"
+                );
+            }
+            _ => panic!("join/release transfer falsely certified original holder exit"),
+        }
+        drop(obstruction);
+        fs::remove_file(fault_marker).unwrap();
+        wait_for_retirement_fact(|| {
+            let mut event = libc::pollfd {
+                fd: original.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            (unsafe { libc::poll(&mut event, 1, 0) }) > 0 && event.revents & libc::POLLIN != 0
+        });
+        assert!(matches!(
+            handle.completed_retirement(&source, &proof),
+            TerminalRetirement::Released
+        ));
+        wait_for_retirement_fact(|| {
+            !record.holder.is_current() && !crate::daemon::child_reaper::has_outstanding_ownership()
+        });
+        let exact_bytes = fs::read(&receipt).unwrap();
+        let saved = receipt.with_extension("closed.saved");
+        fs::rename(&receipt, &saved).unwrap();
+        assert!(
+            matches!(
+                handle.completed_retirement(&source, &proof),
+                TerminalRetirement::Retained(_)
+            ),
+            "exit alone is not the registered receipt"
+        );
+        let mut wrong: serde_json::Value = serde_json::from_slice(&exact_bytes).unwrap();
+        wrong["sources"] = serde_json::json!([vec![0u8; 32]]);
+        let mut bad_receipt = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&receipt)
+            .unwrap();
+        bad_receipt
+            .write_all(&serde_json::to_vec(&wrong).unwrap())
+            .unwrap();
+        bad_receipt.sync_all().unwrap();
+        drop(bad_receipt);
+        assert!(
+            matches!(
+                handle.completed_retirement(&source, &proof),
+                TerminalRetirement::Retained(_)
+            ),
+            "a different source digest cannot certify this registered owner"
+        );
+        fs::remove_file(&receipt).unwrap();
+        fs::rename(saved, &receipt).unwrap(); // restore actual untouched holder-written inode
+        assert_eq!(fs::read(&receipt).unwrap(), exact_bytes);
+        assert!(matches!(
+            handle.completed_retirement(&source, &proof),
+            TerminalRetirement::Released
+        ));
+        let mut wrong_source = source.clone();
+        wrong_source
+            .launch
+            .arguments
+            .push("different-source".into());
+        assert!(matches!(
+            handle.completed_retirement(&wrong_source, &proof),
+            TerminalRetirement::Retained(_)
+        ));
+        assert_eq!(handle.holder_identity(), Some(&record));
+    }
+
     #[test]
     fn fallback_process_title_uses_launch_when_foreground_is_unavailable() {
         let mut launch = LaunchRecipe::shell(PathBuf::from("/repo/alpha")).unwrap();
@@ -6130,16 +6769,29 @@ mod tests {
         std::fs::create_dir(&foreground_directory).unwrap();
         let mut launch = LaunchRecipe::shell(directory.path().to_owned()).unwrap();
         launch.program = "/bin/false".into();
-        let mut child = std::process::Command::new("/bin/sleep")
-            .arg("5")
+        // A successful spawn can precede Linux publishing the new /proc comm.
+        // A builtin readiness message proves the shell has reached userspace;
+        // its builtin read keeps that same process alive until inspection ends.
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "printf ready; IFS= read -r release || :"])
             .current_dir(&foreground_directory)
             .process_group(0)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
+        let mut ready = [0; 5];
+        child
+            .stdout
+            .as_mut()
+            .unwrap()
+            .read_exact(&mut ready)
+            .unwrap();
+        assert_eq!(&ready, b"ready");
         let title = super::foreground_process_title(Some(child.id() as libc::pid_t), &launch);
-        let _ = child.kill();
-        child.wait().unwrap();
-        assert_eq!(title, "sleep · alpha");
+        child.stdin.take().unwrap().write_all(b"release\n").unwrap();
+        assert!(child.wait().unwrap().success());
+        assert_eq!(title, "sh · alpha");
     }
 
     #[test]
@@ -6776,7 +7428,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let holders = directory
             .path()
-            .join(crate::instance::RUNTIME_SUBDIRECTORY)
+            .join(crate::instance::runtime_subdirectory())
             .join("holders");
         let mut cleanup = Cleanup {
             daemon: None,
@@ -7470,7 +8122,7 @@ mod tests {
         let (reply, receive) = crossbeam_channel::bounded(1);
         worker.handle_command(Command::ReadViewport {
             offset: Some(0),
-            rows: 10,
+            rows: Some(10),
             reply,
         });
         let capture = receive
@@ -7497,7 +8149,7 @@ mod tests {
         let (reply, receive) = crossbeam_channel::bounded(1);
         worker.handle_command(Command::ReadViewport {
             offset: Some(0),
-            rows: 10,
+            rows: Some(10),
             reply,
         });
         assert!(receive.try_recv().is_err());
@@ -7583,6 +8235,217 @@ mod tests {
         worker.process_output(b" done\x1b[?2026l".to_vec());
         assert_eq!(published_row(&worker, 0), "half done");
         worker.run();
+    }
+
+    /// A reveal shows the terminal before its capture is published, and an
+    /// update in progress holds that capture back. A read that asked to see
+    /// the terminal meanwhile must show what arrived while it was hidden, not
+    /// the screen from before (#2521).
+    #[test]
+    fn a_read_during_a_reveal_shows_output_from_while_hidden() {
+        let (mut worker, _) = capture_worker();
+        worker.process_output(b"before".to_vec());
+        worker.publish_snapshot(true);
+        present(&worker);
+        worker.handle_command(Command::Hide);
+        worker.process_output(b"\r\nwhile hidden\x1b[?2026h".to_vec());
+        worker.handle_command(Command::Reveal);
+        assert!(worker.published.visible.load(Ordering::Acquire));
+        assert_eq!(published_row(&worker, 1), "", "the reveal was not held");
+
+        let (commands, pending) = command_channel(1);
+        let published = Arc::clone(&worker.published);
+        let handle = TerminalHandle {
+            inner: Arc::new(HandleInner {
+                commands,
+                events: crossbeam_channel::never(),
+                worker: joins::JoinOwner::empty(Arc::clone(&published)),
+                published,
+            }),
+        };
+        let read = std::thread::spawn(move || handle.viewport_snapshot(None, None, true));
+        let command = pending
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the read was answered with the screen from before");
+        worker.handle_command(command);
+        worker.process_output(b"\x1b[?2026l".to_vec());
+        let screen = read.join().unwrap().unwrap();
+        let row = screen.lines[1]
+            .cells
+            .iter()
+            .map(|cell| cell.text.as_str())
+            .collect::<String>();
+        assert_eq!(row.trim_end(), "while hidden");
+        worker.run();
+    }
+
+    fn completed_without_history(hibernated: bool) -> (TerminalHandle, Receiver<TerminalEvent>) {
+        let (mut worker, events) = capture_worker();
+        worker.process_output(b"before".to_vec());
+        worker.publish_snapshot(true);
+        present(&worker);
+        worker.handle_command(if hibernated {
+            Command::Hibernate
+        } else {
+            Command::Hide
+        });
+        worker.process_output(b"\r\nfinished while away".to_vec());
+        let published = Arc::clone(&worker.published);
+        // Observe natural PTY EOF and child exit, rather than shutting down
+        // through the command channel. Fault only the archive byte budget.
+        let (commands, receiver) = command_channel(8);
+        worker.commands = receiver;
+        archive::with_capture_budget(0, || worker.run());
+        assert!(published.completed.load(Ordering::Acquire));
+        assert!(matches!(
+            &*published.archive.lock().unwrap(),
+            ArchivePhase::Frozen {
+                history: Err(_),
+                ..
+            }
+        ));
+        let handle = TerminalHandle {
+            inner: Arc::new(HandleInner {
+                commands,
+                events: events.clone(),
+                worker: joins::JoinOwner::empty(Arc::clone(&published)),
+                published,
+            }),
+        };
+        (handle, events)
+    }
+
+    #[test]
+    fn completed_without_history_retains_output_produced_while_away() {
+        for hibernated in [false, true] {
+            let (handle, events) = completed_without_history(hibernated);
+            let screen = handle.snapshot();
+            assert!(!screen.detached);
+            assert!(screen.lines.iter().any(|row| {
+                row.cells
+                    .iter()
+                    .map(|cell| cell.text.as_str())
+                    .collect::<String>()
+                    .contains("finished while away")
+            }));
+            assert_eq!(
+                events
+                    .try_iter()
+                    .filter(|event| matches!(
+                        event,
+                        TerminalEvent::Error {
+                            operation: "retain completed terminal history",
+                            ..
+                        }
+                    ))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn completed_without_history_visibility_commands_do_not_repeat_the_loss() {
+        for hibernated in [false, true] {
+            let (handle, events) = completed_without_history(hibernated);
+            let _: Vec<_> = events.try_iter().collect();
+            for _ in 0..3 {
+                handle.hide().unwrap();
+                handle.hibernate().unwrap();
+                handle.reveal().unwrap();
+                handle.restore(false).unwrap();
+                handle.restore(true).unwrap();
+                handle.focus(false).unwrap();
+                handle.focus(true).unwrap();
+                assert!(
+                    events
+                        .try_iter()
+                        .all(|event| !matches!(event, TerminalEvent::Error { .. }))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn completed_without_history_presentation_refresh_does_not_repeat_loss() {
+        for hibernated in [false, true] {
+            let (handle, events) = completed_without_history(hibernated);
+            let _: Vec<_> = events.try_iter().collect();
+            for _ in 0..3 {
+                // HostState refreshes focus and the size owner's saved size
+                // when revealing/focusing a completed terminal.
+                handle
+                    .set_host_visibility(super::super::ipc::TerminalVisibility::Visible)
+                    .unwrap();
+                handle.focus(true).unwrap();
+                handle
+                    .resize(TerminalSize {
+                        columns: 80,
+                        rows: 24,
+                        cell_width_px: 8,
+                        cell_height_px: 16,
+                    })
+                    .unwrap();
+                handle.set_theme(TerminalTheme::Light).unwrap();
+                handle.scroll_to_top().unwrap();
+                handle.clear_scrollback().unwrap();
+                assert!(
+                    events
+                        .try_iter()
+                        .all(|event| !matches!(event, TerminalEvent::Error { .. }))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn completed_without_history_answers_repeated_viewport_reads() {
+        for hibernated in [false, true] {
+            let (handle, events) = completed_without_history(hibernated);
+            let _: Vec<_> = events.try_iter().collect();
+            handle
+                .set_host_visibility(super::super::ipc::TerminalVisibility::Visible)
+                .unwrap();
+            for _ in 0..3 {
+                let screen = handle.viewport_snapshot(Some(0), Some(1), true).unwrap();
+                assert!(!screen.detached);
+                assert!(screen.rows > 0);
+                assert!(
+                    events
+                        .try_iter()
+                        .all(|event| !matches!(event, TerminalEvent::Error { .. }))
+                );
+            }
+        }
+    }
+
+    /// Nothing is published after a terminal completes, so a terminal that
+    /// completed hidden, without history to replace its screen, is shown with
+    /// what it published: no trip to the archive, and no error for each read.
+    #[test]
+    fn a_shown_read_of_a_terminal_that_completed_hidden_shows_its_last_screen() {
+        let fixture = RenderStreamFixture::new(|_| {});
+        let published = &fixture.handle.inner.published;
+        let mut screen = RenderSnapshot::empty();
+        screen.generation = 1;
+        screen.rows = 1;
+        published.publish(Arc::new(screen));
+        published.stop_presenting();
+        published.freeze(
+            Err("The completed terminal view is unavailable".into()),
+            Arc::clone(&fixture.events),
+        );
+        fixture
+            .handle
+            .set_host_visibility(super::super::ipc::TerminalVisibility::Visible)
+            .unwrap();
+
+        let read = fixture.handle.viewport_snapshot(None, None, true).unwrap();
+        assert_eq!(read.generation, 1);
+        assert!(
+            fixture.handle.events().try_recv().is_err(),
+            "the read went to an archive without history"
+        );
     }
 
     #[test]
@@ -8783,7 +9646,7 @@ mod tests {
         assert_eq!(command.get_env("TERM_PROGRAM"), Some(OsStr::new("cagents")));
         assert_eq!(
             command.get_env("TERM_PROGRAM_VERSION"),
-            Some(OsStr::new(crate::VERSION))
+            Some(OsStr::new(crate::version()))
         );
         // The test below proves the scrub removes names; this one proves
         // `command_from_recipe` still calls it. Only markers this host
@@ -8900,9 +9763,12 @@ mod tests {
                 assert!(std::process::Command::new(std::env::current_exe().unwrap())
                     .args(["--exact", "terminal::worker::tests::removed_managed_home_cannot_relaunch_from_final_pty_environment", "--nocapture"])
                     .env_clear().env(CHILD, mode).env("HOME", directory.path())
+                    // The child names its storage as this process does.
+                    .envs(std::env::var_os(crate::instance::DEVELOPMENT_INSTANCE_ENV)
+                        .map(|instance| (crate::instance::DEVELOPMENT_INSTANCE_ENV, instance)))
                     .env("XDG_DATA_HOME", directory.path().join("data"))
                     .env("PATH", "/usr/bin:/bin")
-                    .env("CODEX_HOME", directory.path().join("data").join(crate::instance::STORAGE_NAME).join("accounts/codex/12345678-1234-4234-8234-123456789abc"))
+                    .env("CODEX_HOME", directory.path().join("data").join(crate::instance::storage_name()).join("accounts/codex/12345678-1234-4234-8234-123456789abc"))
                     .status().unwrap().success());
             }
             return;
@@ -8984,6 +9850,75 @@ mod tests {
             }
             worker.run();
             std::fs::remove_file(directory.path().join("isolated")).unwrap();
+        }
+    }
+
+    /// A shell in a development instance runs `cagents` against that
+    /// instance's daemon, whatever environment it was handed; outside one it
+    /// never inherits a stale instance.
+    #[test]
+    fn terminals_keep_their_development_instance_and_only_theirs() {
+        const CHILD: &str = "CAGENTS_TERMINAL_INSTANCE_TEST";
+        const NAME: &str = "probe";
+        let test =
+            "terminal::worker::tests::terminals_keep_their_development_instance_and_only_theirs";
+        let Some(expected) = std::env::var_os(CHILD) else {
+            let directory = tempfile::tempdir().unwrap();
+            for instance in [Some(NAME), None] {
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+                child
+                    .args(["--exact", test, "--nocapture"])
+                    .env_clear()
+                    .env(CHILD, instance.unwrap_or("unset"))
+                    .env("HOME", directory.path())
+                    .env("PATH", "/usr/bin:/bin")
+                    .envs(std::env::var_os("TMPDIR").map(|tmp| ("TMPDIR", tmp)));
+                if let Some(instance) = instance {
+                    child.env(crate::instance::DEVELOPMENT_INSTANCE_ENV, instance);
+                }
+                assert!(child.status().unwrap().success(), "{instance:?}");
+            }
+            return;
+        };
+        let directory = tempfile::tempdir().unwrap();
+        for returned in [false, true] {
+            let mut recipe = env_recipe(BTreeMap::new());
+            recipe.working_directory = directory.path().into();
+            recipe.arguments = vec![
+                "-c".into(),
+                "printf %s \"${CAGENTS_DEVELOPMENT_INSTANCE-unset}\" > seen.tmp && mv seen.tmp seen"
+                    .into(),
+            ];
+            // An environment handed back from a chat may carry another value.
+            let config = TerminalConfig {
+                execution_environment: returned.then(|| {
+                    crate::terminal_ipc::ChatExecutionEnvironment(BTreeMap::from([
+                        ("PATH".into(), "/usr/bin:/bin".into()),
+                        (
+                            crate::instance::DEVELOPMENT_INSTANCE_ENV.into(),
+                            "stale".into(),
+                        ),
+                    ]))
+                }),
+                ..TerminalConfig::default()
+            };
+            let (worker, _) = capture_worker_with(recipe, config);
+            let seen = directory.path().join("seen");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !seen.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the shell never reported"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            worker.run();
+            assert_eq!(
+                std::fs::read_to_string(&seen).unwrap(),
+                expected.to_str().unwrap(),
+                "returned: {returned}"
+            );
+            std::fs::remove_file(&seen).unwrap();
         }
     }
 

@@ -1,0 +1,251 @@
+#!/bin/sh
+# Seed a checkout's new Cargo build directory from the main checkout's.
+#
+# Each worktree builds in its own build directory. Sharing one between
+# worktrees looks cheaper, but Cargo names a workspace crate's artifacts by its
+# path relative to the workspace, so two worktrees on different commits
+# overwrite each other's `cagents` and vendored crates and recompile them at
+# almost every build. A fresh build directory avoids that but compiles every
+# dependency again: tens of minutes of CPU and over 30 GiB per worktree.
+#
+# Seeding copies the main checkout's compiled dependencies with reflinks, which
+# share the data on disk until either copy is rewritten. Cargo then reuses
+# whatever still matches and rebuilds the rest. Build scripts that recorded
+# their output directory are relocated by Cargo itself. Incremental caches are
+# not copied.
+#
+# Cargo decides a path package is fresh by comparing its sources' times with
+# its fingerprint's, and names the fingerprint by the path within the workspace.
+# A copied fingerprint can so be newer than different sources in this checkout,
+# and Cargo would call main's build of them fresh. Registry and Git packages
+# are identified by version and commit instead. So the fingerprints of this
+# checkout's path packages are never kept, whatever the sources' times.
+#
+# This is an optimization: when anything is unsuitable, it leaves the build
+# directory alone and Cargo builds as it would have.
+set -eu
+
+program=seed-build-dir
+note() {
+    printf '%s: %s\n' "$program" "$*" >&2
+}
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/seed-build-dir [--from BUILD_DIR] [--to BUILD_DIR]
+       scripts/seed-build-dir --forget-local BUILD_DIR
+
+Copies the compiled dependencies of BUILD_DIR (default: the main checkout's
+Cargo build directory) into an empty build directory (default: this
+checkout's), using reflinks. Does nothing when the destination already has a
+build, the source is missing or the same, this checkout has no Cargo.lock, or
+the file system cannot reflink.
+
+--forget-local makes Cargo rebuild this checkout's own and vendored crates in
+a Cargo target or build directory copied by hand, as every copy must before it
+is built in: otherwise Cargo can call the original's build of them fresh and
+run it. Run it from the checkout that will build there.
+
+Environment:
+  CAGENTS_BUILD_SEED=0   Never seed
+EOF
+}
+
+# The lock file of the workspace holding the working directory, as Cargo finds it.
+lock_file() {
+    root=$(cargo metadata --format-version 1 --no-deps 2>/dev/null |
+        sed -n 's/.*"workspace_root":"\([^"]*\)".*/\1/p')
+    [ -n "$root" ] && [ -f "$root/Cargo.lock" ] || return 1
+    printf '%s\n' "$root/Cargo.lock"
+}
+
+# The path packages of lock file $1, the ones with no `source`, as alternatives
+# of a regular expression. Fails when there are none: every workspace has one,
+# so that lock file was not understood.
+local_packages() {
+    packages=$(awk '
+        function finish() { if (name != "" && !sourced) print name }
+        { sub(/\r$/, "") }
+        /^\[/ { finish(); name = ""; sourced = 0 }
+        /^name = / { name = $3; gsub(/"/, "", name) }
+        /^source = / { sourced = 1 }
+        END { finish() }
+    ' "$1") || return 1
+    [ -n "$packages" ] || return 1
+    printf '%s\n' "$packages" | paste -s -d '|' -
+}
+
+# Removes the fingerprints of the packages matching $1 from build directory $2,
+# in every profile however deep: Cargo adds a directory for a target triple.
+# Without a fingerprint Cargo rebuilds a package, and then whatever depends on
+# it. A directory holding none has nothing stale; one that can't be searched or
+# cleaned fails.
+forget_local() {
+    fingerprints=$(find "$2/" -type d -name .fingerprint -prune -print) || return 1
+    [ -n "$fingerprints" ] || { note "no fingerprints in $2, so nothing to forget"; return 0; }
+    printf '%s\n' "$fingerprints" | while IFS= read -r directory; do
+        # Each is named <package>-<hash>; a package can begin with another's name.
+        find "$directory" -mindepth 1 -maxdepth 1 -type d -regextype posix-extended \
+            -regex ".*/($1)-[0-9a-f]+" -exec rm -rf -- {} + || exit 1
+    done
+}
+
+from=
+to=
+while [ "$#" -gt 0 ]; do
+    case $1 in
+        --from) [ "$#" -gt 1 ] || { usage >&2; exit 2; }; from=$2; shift ;;
+        --to) [ "$#" -gt 1 ] || { usage >&2; exit 2; }; to=$2; shift ;;
+        --forget-local)
+            [ "$#" -eq 2 ] && [ -n "$2" ] || { usage >&2; exit 2; }
+            lock=$(lock_file) || { note "cargo metadata names no Cargo.lock at $(pwd -P)"; exit 1; }
+            packages=$(local_packages "$lock") || { note "$lock names no crate of this checkout"; exit 1; }
+            forget_local "$packages" "$2" || { note "could not forget this checkout's crates in $2"; exit 1; }
+            exit 0
+            ;;
+        -h|--help) usage; exit 0 ;;
+        *) usage >&2; exit 2 ;;
+    esac
+    shift
+done
+[ "${CAGENTS_BUILD_SEED:-1}" != 0 ] || exit 0
+
+# The build directory Cargo uses for the workspace in $1, from its own
+# configuration. Empty when that is not a Cargo workspace.
+build_dir_of() {
+    metadata=$(cd "$1" && cargo metadata --format-version 1 --no-deps 2>/dev/null) || metadata=
+    build_dir=$(printf '%s\n' "$metadata" | sed -n 's/.*"build_directory":"\([^"]*\)".*/\1/p')
+    # A Cargo that reports no build directory builds in the target.
+    [ -n "$build_dir" ] || build_dir=$(printf '%s\n' "$metadata" |
+        sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
+    printf '%s\n' "$build_dir"
+}
+
+# A build directory with any compiled profile has been built in or seeded.
+built() {
+    for fingerprints in "$1"/*/.fingerprint; do
+        [ -d "$fingerprints" ] && return 0
+    done
+    return 1
+}
+
+# Cargo tags only a build directory it creates, and pruners such as
+# prune-cargo-build-dirs reclaim only tagged ones, so tag those this script
+# created, including ones seeded before seeding tagged them. Never others.
+# scripts/prune-build-dirs goes by Cargo's other markers instead, and keeps
+# a main checkout's build directory, which seeds the rest, however tagged.
+tag() {
+    [ -e "$1/CACHEDIR.TAG" ] || printf '%s\n' \
+        'Signature: 8a477f597d28d172789f06886806bc55' \
+        '# This file is a cache directory tag created by cargo.' \
+        '# For information about cache directory tags see https://bford.info/cachedir/' \
+        >"$1/CACHEDIR.TAG" 2>/dev/null || :
+}
+
+if [ -z "$to" ]; then
+    to=$(build_dir_of .)
+    [ -n "$to" ] || exit 0
+fi
+if built "$to"; then
+    [ ! -e "$to/.seed-lock" ] || tag "$to"
+    exit 0
+fi
+if [ -z "$from" ]; then
+    common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || exit 0
+    main=$(dirname -- "$common")
+    [ -f "$main/Cargo.toml" ] || exit 0
+    from=$(build_dir_of "$main")
+    [ -n "$from" ] || exit 0
+fi
+
+# An unbuilt source has nothing to copy, and a built one is not the empty
+# destination.
+built "$from" || exit 0
+if ! lock=$(lock_file) || ! packages=$(local_packages "$lock"); then
+    note "not seeding $to: no Cargo.lock names this checkout's own crates"
+    exit 0
+fi
+
+mkdir -p -- "$to"
+tag "$to"
+# One seeder per destination; a second waits, then finds it seeded.
+exec 9>>"$to/.seed-lock"
+flock 9
+! built "$to" || exit 0
+# Left by a seeder that was killed outright.
+rm -rf -- "$to"/.seeding.*
+
+started=$(date +%s)
+stage=$(mktemp -d "$to/.seeding.XXXXXX")
+trap 'rm -rf -- "$stage"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+# btrfs reflinks only between files that agree on copy-on-write, and new
+# files inherit their directory's No_COW attribute.
+case $(lsattr -d -- "$from" 2>/dev/null | cut -d' ' -f1) in
+    *C*) chattr +C -- "$stage" 2>/dev/null || : ;;
+    *) chattr -C -- "$stage" 2>/dev/null || : ;;
+esac
+
+# Each failed clone costs a pass over every file, so try one first.
+probe=$(find "$from" -path '*/deps/*' -type f -print -quit)
+[ -n "$probe" ] || exit 0
+if ! cp --reflink=always -- "$probe" "$stage/.probe" 2>/dev/null; then
+    note "not seeding $to: this file system cannot reflink from $from"
+    exit 0
+fi
+rm -f -- "$stage/.probe"
+
+# Run the remaining arguments holding shared locks on both of the profile
+# lock files Cargo versions use, so the copy never sees a half-written
+# artifact. Cargo takes them exclusively and in an order this cannot know, so
+# the second is only tried, and both are released before trying again. Gives
+# up after about 15 minutes of a busy source.
+holding_cargo_locks() {
+    directory=$1
+    shift
+    attempt=0
+    while [ "$attempt" -lt 15 ]; do
+        status=0
+        flock -s -E 75 -w 55 "$directory/.cargo-lock" \
+            flock -s -E 75 -n "$directory/.cargo-build-lock" "$@" || status=$?
+        [ "$status" -eq 75 ] || return "$status"
+        attempt=$((attempt + 1))
+        sleep 5
+    done
+    return 75
+}
+
+profiles=
+for fingerprints in "$from"/*/.fingerprint; do
+    [ -d "$fingerprints" ] || continue
+    source=${fingerprints%/.fingerprint}
+    profile=${source##*/}
+    mkdir -- "$stage/$profile"
+    set --
+    for part in deps build .fingerprint; do
+        [ ! -d "$source/$part" ] || set -- "$@" "$source/$part"
+    done
+    status=0
+    holding_cargo_locks "$source" \
+        cp -a --reflink=always -- "$@" "$stage/$profile/" 2>"$stage/.errors" ||
+        status=$?
+    case $status in
+        0) ;;
+        75) note "not seeding $to: $source stayed busy"; exit 0 ;;
+        *)
+            head -n 3 -- "$stage/.errors" >&2
+            note "not seeding $to: copying $source failed"
+            exit 0
+            ;;
+    esac
+    profiles="$profiles $profile"
+done
+
+forget_local "$packages" "$stage"
+for profile in $profiles; do
+    # Replaces only a missing or empty profile directory, so a build that
+    # started meanwhile keeps its own.
+    mv -T -- "$stage/$profile" "$to/$profile" 2>/dev/null || :
+done
+note "seeded $to from $from ($profiles ) in $(($(date +%s) - started))s"

@@ -152,6 +152,31 @@ fn preview_summary(preview: &crate::update::impact::Preview) -> &'static str {
     }
 }
 
+fn confirmation_message<'a>(
+    confirmation: &crate::update::UpdateConfirmation,
+    job: Option<&'a UpdateJob>,
+) -> &'a str {
+    if confirmation.stop.is_some() {
+        job.map_or(
+            "Stopping live work needs confirmation in a terminal.",
+            |job| job.message.as_str(),
+        )
+    } else {
+        preview_summary(&confirmation.preview)
+    }
+}
+
+fn confirmation_details(
+    confirmation: &crate::update::UpdateConfirmation,
+    job: Option<&UpdateJob>,
+) -> String {
+    if confirmation.stop.is_some() {
+        confirmation_message(confirmation, job).to_owned()
+    } else {
+        preview_details(&confirmation.preview)
+    }
+}
+
 /// Why the update cannot be confirmed yet, counted so the reader knows how
 /// much stands in the way before reading any of it.
 fn attention_summary(daemon: &crate::update::impact::DaemonImpact) -> Option<String> {
@@ -217,7 +242,7 @@ fn preview_details(preview: &crate::update::impact::Preview) -> String {
         preview_summary(preview)
     );
     if let Some(daemon) = &preview.daemon {
-        for session in &daemon.sessions {
+        for session in daemon.sessions.iter().map(|session| session.review()) {
             details.push_str(&format!(
                 "\n{} — {}\n{}\n",
                 session.title,
@@ -225,8 +250,8 @@ fn preview_details(preview: &crate::update::impact::Preview) -> String {
                 session.reason
             ));
         }
-        for blocker in &daemon.blockers {
-            details.push_str(&format!("\n{blocker}\n"));
+        for notice in daemon.review_notices() {
+            details.push_str(&format!("\n{notice}\n"));
         }
     }
     details
@@ -300,12 +325,24 @@ impl Cagents {
                 .into(),
             None => title,
         };
-        let blocked = preview
-            .daemon
-            .as_ref()
-            .is_some_and(|daemon| daemon.blocked());
-        let mut body = vec![heading, notice_body(preview_summary(preview))];
-        if let Some(daemon) = &preview.daemon {
+        let terminal_confirmation = confirmation.stop.is_some();
+        let mut body = vec![
+            heading,
+            notice_body(if terminal_confirmation {
+                "Stopping live work needs confirmation in a terminal."
+            } else {
+                preview_summary(preview)
+            }),
+        ];
+        let mut rows = Vec::new();
+        if terminal_confirmation {
+            // The worker's list and command replace the old refusal details in
+            // the existing bounded area, keeping Cancel and Copy details visible.
+            rows.push(notice_body(confirmation_message(
+                confirmation,
+                self.update_ui.job.as_ref(),
+            )));
+        } else if let Some(daemon) = &preview.daemon {
             if let Some(attention) = attention_summary(daemon) {
                 body.push(
                     widget::selectable_text(attention)
@@ -320,31 +357,36 @@ impl Cagents {
             let (attention, settled): (Vec<_>, Vec<_>) = daemon
                 .sessions
                 .iter()
+                .map(|session| session.review())
                 .partition(|session| session.disposition == Disposition::Blocked);
-            let mut rows = attention
-                .into_iter()
-                .chain(settled)
-                .map(|session| self.update_session_row(session))
-                .collect::<Vec<_>>();
-            rows.extend(daemon.blockers.iter().map(notice_body));
-            if !rows.is_empty() {
-                body.push(
-                    widget::container(widget::scrollable(
-                        widget::column::with_children(rows)
-                            .spacing(space::M)
-                            .padding(design::with_vertical_rail(iced::Padding::ZERO)),
-                    ))
-                    .max_height(320)
+            rows.extend(
+                attention
+                    .into_iter()
+                    .chain(settled)
+                    .map(|session| self.update_session_row(session)),
+            );
+            rows.extend(daemon.review_notices().into_iter().map(notice_body));
+        }
+        if !rows.is_empty() {
+            body.push(
+                widget::container(widget::scrollable(
+                    widget::column::with_children(rows)
+                        .spacing(space::M)
+                        .padding(design::with_vertical_rail(iced::Padding::ZERO)),
+                ))
+                .max_height(320)
+                .into(),
+            );
+        }
+        if !terminal_confirmation
+            && let Some(daemon) = &preview.daemon
+            && let Some((label, policy)) = policy_choice(daemon)
+        {
+            body.push(
+                crate::ui_controls::button::secondary(label)
+                    .on_press(Message::UpdateUi(Action::ChoosePolicy(policy)))
                     .into(),
-                );
-            }
-            if let Some((label, policy)) = policy_choice(daemon) {
-                body.push(
-                    crate::ui_controls::button::secondary(label)
-                        .on_press(Message::UpdateUi(Action::ChoosePolicy(policy)))
-                        .into(),
-                );
-            }
+            );
         }
         body.push(
             widget::row::with_children(vec![
@@ -357,22 +399,22 @@ impl Cagents {
                     .id(widget::Id::new("update.cancel"))
                     .on_press(Message::UpdateUi(Action::CancelApply))
                     .into(),
-                crate::ui_controls::button::primary(
-                    if preview.daemon.as_ref().is_some_and(|daemon| {
-                        daemon
-                            .sessions
-                            .iter()
-                            .any(|session| session.disposition == Disposition::WaitsForIdle)
-                    }) {
-                        "Update when idle"
-                    } else {
-                        "Update and reopen"
-                    },
-                )
+                crate::ui_controls::button::primary(if terminal_confirmation {
+                    "Continue in terminal"
+                } else if preview.daemon.as_ref().is_some_and(|daemon| {
+                    daemon
+                        .sessions
+                        .iter()
+                        .any(|session| session.disposition == Disposition::WaitsForIdle)
+                }) {
+                    "Update when idle"
+                } else {
+                    "Update and reopen"
+                })
                 .id(widget::Id::new("update.confirm"))
-                .on_press_maybe((!blocked).then_some(Message::UpdateUi(Action::ConfirmApply(
-                    confirmation.nonce.clone(),
-                ))))
+                .on_press_maybe((!terminal_confirmation).then_some(Message::UpdateUi(
+                    Action::ConfirmApply(confirmation.nonce.clone()),
+                )))
                 .into(),
             ])
             .align_y(Alignment::Center)
@@ -391,11 +433,11 @@ impl Cagents {
     /// window is the one holding its tab.
     fn update_session_row<'a>(
         &self,
-        session: &'a crate::update::impact::SessionImpact,
+        session: crate::update::impact::SessionReview,
     ) -> Element<'a, Message> {
         use crate::update::impact::Disposition;
         let mut header = vec![
-            widget::selectable_text(session.title.as_str())
+            widget::selectable_text(session.title.clone())
                 .size(design::TEXT_HEADING)
                 .font(design::heading_font())
                 .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
@@ -419,7 +461,7 @@ impl Cagents {
                 .align_y(Alignment::Center)
                 .spacing(space::S)
                 .into(),
-            notice_detail(session.reason.as_str()),
+            notice_detail(session.reason),
         ])
         .spacing(space::XXS)
         .into()
@@ -803,7 +845,10 @@ impl Cagents {
                     .as_ref()
                     .map_or_else(Task::none, |confirmation| {
                         chat_ui::invalidate_copy_intent();
-                        iced::clipboard::write(preview_details(&confirmation.preview))
+                        iced::clipboard::write(confirmation_details(
+                            confirmation,
+                            self.update_ui.job.as_ref(),
+                        ))
                     })
             }
             Action::ReviewJob => {
@@ -822,7 +867,9 @@ impl Cagents {
                     .update_ui
                     .confirmation
                     .as_ref()
-                    .is_none_or(|confirmation| confirmation.nonce != nonce)
+                    .is_none_or(|confirmation| {
+                        confirmation.nonce != nonce || confirmation.stop.is_some()
+                    })
                 {
                     return Task::none();
                 }
@@ -910,8 +957,14 @@ impl Cagents {
                         self.update_ui.poll_retry = false;
                         self.update_ui.error = None;
                         if matches!(job.phase, UpdatePhase::Failed) {
-                            self.update_ui.error = Some(job.message.clone());
-                            self.status = Some(TransientNotice::error(job.message.clone()));
+                            let failure = startup_gate::update_failure(&job.message);
+                            self.update_ui.error = Some(failure.summary);
+                            // This window has already said the same thing.
+                            if self.startup_gate.reported_notice()
+                                != Some(failure.notice.message.as_str())
+                            {
+                                self.status = Some(failure.notice);
+                            }
                         }
                         // A review set aside returns by itself once nothing
                         // blocks the update, and never outlives its job.
@@ -1102,6 +1155,38 @@ mod tests {
         );
     }
 
+    /// A stopped update's message is usually the windows' own reports, which
+    /// each window has already shown; only something it has not said is new.
+    #[test]
+    fn a_failed_update_does_not_repeat_what_this_window_reported() {
+        let report = "2 saved panes are waiting for the shared workspace: \u{201c}A\u{201d}, \u{201c}B\u{201d}.";
+        for (message, shown) in [
+            (
+                format!(
+                    "primary: recovery-incomplete: {report}; window-2: recovery-incomplete: {report}"
+                ),
+                false,
+            ),
+            ("installed daemon startup failed".to_owned(), true),
+        ] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            app.startup_gate = crate::app::startup_gate::State::fixture_reported_saying(report);
+            let job = UpdateJob {
+                id: "stopped".into(),
+                version: "0.1.3+local.new".into(),
+                phase: UpdatePhase::Failed,
+                message,
+                log_path: "/nonexistent/update.log".into(),
+                confirmation: None,
+            };
+            app.update_ui.job = Some(job.clone());
+            app.status = None;
+            drop(app.update_update_ui(Action::Polled(Some("stopped".into()), Ok(Some(job)))));
+            assert_eq!(app.status.is_some(), shown, "{:?}", app.status);
+            assert!(app.update_ui.error.is_some());
+        }
+    }
+
     #[test]
     fn a_reconciled_historical_failure_clears_the_live_warning() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -1209,8 +1294,15 @@ mod tests {
     fn transient_status_failure_keeps_observing_and_revokes_stale_confirmation() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let confirmation = crate::update::UpdateConfirmation {
+            stop: None,
             nonce: uuid::Uuid::new_v4().to_string(),
             preview: crate::update::impact::Preview {
+                from_version: String::new(),
+                windows: 0,
+                stopped: Vec::new(),
+                stopped_windows: Vec::new(),
+                labels: Default::default(),
+                editors: Vec::new(),
                 candidate: crate::update::impact::Candidate {
                     version: "new".into(),
                     protocol: 32,
@@ -1327,8 +1419,15 @@ mod tests {
     fn live_session_confirmation_is_modal_and_cancel_never_starts_an_update() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         app.update_ui.confirmation = Some(crate::update::UpdateConfirmation {
+            stop: None,
             nonce: uuid::Uuid::new_v4().to_string(),
             preview: crate::update::impact::Preview {
+                from_version: String::new(),
+                windows: 0,
+                stopped: Vec::new(),
+                stopped_windows: Vec::new(),
+                labels: Default::default(),
+                editors: Vec::new(),
                 candidate: crate::update::impact::Candidate {
                     version: "9.8.7".into(),
                     protocol: 32,
@@ -1366,13 +1465,61 @@ mod tests {
         assert_eq!(app.update_ui.error.as_deref(), Some("Helper exited"));
     }
 
+    #[test]
+    fn terminal_confirmation_failure_keeps_the_command_in_the_notice_summary() {
+        let command = "Stopping live work needs confirmation in a terminal. Run `cagents daemon upgrade --version 9.8.7` from a system terminal outside cagents.";
+        let details = "The running terminal service (old) cannot hand these over.\nUpdating stops them:\n\n  build · Release Details: rollout · alpha\n      shell running `cargo test`\n";
+        let failure = startup_gate::update_failure(&format!("{command} Details: {details}"));
+        assert_eq!(failure.summary, command.trim_end_matches('.'));
+        assert_eq!(failure.notice.message, command);
+        assert_eq!(failure.notice.details.as_deref(), Some(details));
+    }
+
+    #[test]
+    fn a_stop_preview_keeps_its_terminal_instructions_and_cannot_submit_confirm() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let mut confirmation = daemon_preview(Vec::new());
+        confirmation.stop = Some(
+            serde_json::from_value(serde_json::json!({
+                "from_version": "old",
+                "items": [],
+            }))
+            .unwrap(),
+        );
+        let mut job = awaiting(&confirmation);
+        job.message =
+            "To update to 9.8.7, run `cagents daemon upgrade --version 9.8.7` in a terminal."
+                .into();
+        assert_eq!(confirmation_message(&confirmation, Some(&job)), job.message);
+        assert_eq!(confirmation_details(&confirmation, Some(&job)), job.message);
+        assert_eq!(
+            confirmation_message(&confirmation, None),
+            "Stopping live work needs confirmation in a terminal."
+        );
+        app.update_ui.job = Some(job.clone());
+        app.update_ui.confirmation = Some(confirmation.clone());
+        let ids = custom_widget_ids(&mut app.update_dialog().expect("instructions are shown"));
+        assert!(ids.iter().any(|id| id == "update.cancel"));
+        drop(app.update_update_ui(Action::ConfirmApply(confirmation.nonce)));
+        assert!(app.update_ui.confirmation.is_some());
+        assert!(app.update_ui.submitted_confirmation.is_none());
+        assert_eq!(app.update_ui.job.as_ref().unwrap().message, job.message);
+    }
+
     fn daemon_preview(
         sessions: Vec<crate::update::impact::SessionImpact>,
     ) -> crate::update::UpdateConfirmation {
         use crate::model::{BootId, HostIncarnation, HostSessionId, HostSessionProof};
         crate::update::UpdateConfirmation {
+            stop: None,
             nonce: uuid::Uuid::new_v4().to_string(),
             preview: crate::update::impact::Preview {
+                from_version: String::new(),
+                windows: 0,
+                stopped: Vec::new(),
+                stopped_windows: Vec::new(),
+                labels: Default::default(),
+                editors: Vec::new(),
                 candidate: crate::update::impact::Candidate {
                     version: "9.8.7".into(),
                     protocol: 32,
@@ -1507,10 +1654,47 @@ mod tests {
         );
         let details = preview_details(&confirmation.preview);
         assert!(details.starts_with("Update to 9.8.7\n"));
-        assert!(
-            details.contains("Shell · project — Continues\nWhy Shell · project is Continues\n")
-        );
+        assert!(details.contains(
+            "Shell · project — Continues\nThe conversation and its running work stay alive.\n"
+        ));
         assert!(details.ends_with("Wait for starting sessions to finish opening.\n"));
+    }
+
+    #[test]
+    fn copied_review_keeps_diagnostics_out_and_preserves_recovery_actions() {
+        use crate::update::impact::{Disposition, STOPPED_WITH_UNSETTLED_WORK};
+        let raw =
+            "Cannot join existing Codex daemon at /run/private.socket: Source transport failed";
+        let mut blocked = session("Conversation", Disposition::Blocked);
+        blocked.reason = raw.into();
+        let mut confirmation = daemon_preview(vec![blocked]);
+        let daemon = confirmation.preview.daemon.as_mut().unwrap();
+        daemon.blockers.push(raw.into());
+        daemon
+            .blockers
+            .push("Wait for starting sessions to finish opening.".into());
+
+        let details = preview_details(&confirmation.preview);
+        for internal in [raw, "/run/", "socket", "daemon", "Source", "transport"] {
+            assert!(!details.contains(internal), "{details}");
+        }
+        assert!(
+            details.contains("Let its work finish, then try again"),
+            "{details}"
+        );
+        assert!(details.contains("try the update again"), "{details}");
+        assert!(
+            details.contains("Wait for starting sessions to finish opening."),
+            "{details}"
+        );
+
+        confirmation.preview.daemon.as_mut().unwrap().sessions[0].reason =
+            STOPPED_WITH_UNSETTLED_WORK.into();
+        let details = preview_details(&confirmation.preview);
+        assert!(
+            details.contains("Close this conversation before updating."),
+            "{details}"
+        );
     }
 
     /// The restart saves and closes every window, so it must lose to anything

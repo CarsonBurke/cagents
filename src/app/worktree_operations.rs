@@ -523,6 +523,30 @@ impl Cagents {
     }
 }
 
+/// The notice for a created worktree. A worktree created despite a warning,
+/// such as a remote that could not be refreshed so its last fetched commit was
+/// used, exists and opens, but the user is told what it was created from.
+pub(super) fn created_worktree_notice(
+    path: &Path,
+    warnings: &[crate::process::ProcessFailure],
+) -> TransientNotice {
+    let created = format!("Created worktree {}", path.display());
+    let mut lines = warnings.iter().map(|warning| match warning.stderr_line() {
+        Some(line) => format!("{}: {line}", warning.message),
+        None => warning.message.clone(),
+    });
+    let Some(first) = lines.next() else {
+        return TransientNotice::success(created);
+    };
+    let rest: Vec<_> = lines.collect();
+    let notice = TransientNotice::warning(format!("{created}. {first}"));
+    if rest.is_empty() {
+        notice
+    } else {
+        notice.with_details(rest.join("\n"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -646,5 +670,39 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![other]
         );
+    }
+
+    #[test]
+    fn created_worktree_notice_names_a_cached_base() {
+        let path = Path::new("/repo/.worktrees/topic");
+        let clean = created_worktree_notice(path, &[]);
+        assert_eq!(clean.severity, NoticeSeverity::Success);
+        assert_eq!(clean.message, "Created worktree /repo/.worktrees/topic");
+        let warning = crate::process::ProcessFailure {
+            kind: crate::process::ProcessFailureKind::Exit,
+            program: "git".into(),
+            exit_code: Some(128),
+            signal: None,
+            stdout: Vec::new(),
+            stderr: b"fatal: unable to access 'https://git.example.invalid/app.git/'\n".to_vec(),
+            message:
+                "Could not refresh refs/remotes/origin/topic; created from its last fetched commit"
+                    .into(),
+            started: true,
+        };
+        let cached = created_worktree_notice(path, std::slice::from_ref(&warning));
+        assert_eq!(cached.severity, NoticeSeverity::Warning);
+        assert_eq!(
+            cached.message,
+            "Created worktree /repo/.worktrees/topic. Could not refresh refs/remotes/origin/topic; \
+             created from its last fetched commit: fatal: unable to access \
+             'https://git.example.invalid/app.git/'"
+        );
+        assert_eq!(cached.details, None);
+        let mut unlock = warning.clone();
+        unlock.stderr.clear();
+        unlock.message = "worktree unlock failed".into();
+        let both = created_worktree_notice(path, &[warning, unlock]);
+        assert_eq!(both.details.as_deref(), Some("worktree unlock failed"));
     }
 }

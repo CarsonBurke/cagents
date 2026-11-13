@@ -1,0 +1,1242 @@
+#!/bin/bash
+# Native before/after evidence for a checkout, in an isolated fixture session.
+# See "Native evidence" in docs/development.md.
+set -euo pipefail
+# Read whole before any of it runs: a build or session runs for minutes, and
+# a checkout updated meanwhile must not change what the rest of this does.
+{
+
+self=$(readlink -f "$0")
+tool_root=${self%/scripts/*}
+session_name=evidence
+native_lock=${CAGENTS_EVIDENCE_NATIVE_LOCK:-/var/tmp/cagents-fw16-native.lock}
+# Builds go to the build host's shared slots, even from the build host itself:
+# a slot keeps the build output and reuses it for the next build, whichever
+# checkout that is, and only the executables come back to the task.
+export CAGENTS_BUILD_REMOTE_LOOPBACK=${CAGENTS_BUILD_REMOTE_LOOPBACK:-1}
+# With CAGENTS_BUILD_REMOTE=local, they build in the task's own target instead,
+# joining this host's existing Cargo queue. Its lanes still take that lock
+# directly, so one slot keeps these builds in line behind them.
+export CAGENTS_BUILD_LOCK=${CAGENTS_BUILD_LOCK:-/var/tmp/cagents-fw16-cargo.lock}
+export CAGENTS_BUILD_SLOTS=${CAGENTS_BUILD_SLOTS:-1}
+export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-8}
+# A task's target isn't the checkout's build directory the gate would seed.
+export CAGENTS_BUILD_SEED=0
+# The session's own commands run below a compositor with a private HOME.
+real_home=${CAGENTS_EVIDENCE_REAL_HOME:-$HOME}
+
+usage() {
+    cat <<'USAGE'
+Usage: scripts/native-evidence --task DIR COMMAND
+
+Sides are "before" and "after". Each has its own checkout and target directory;
+both use the same fixture data and selected providers.
+
+  build SIDE CHECKOUT
+                  Build the runner's three browserless executables in one of
+                  the build host's shared slots, and keep them in the side's
+                  target. scripts/prune-build-dirs reclaims a task's targets
+                  once no build or session has used them for 12 hours, or 1
+                  hour while the disk is low.
+  start SIDE [--width PX] [--height PX] [--keep-state] [--wait-lock SECONDS] [--limit SECONDS]
+        [--startup-timeout SECONDS]
+        [--portal gtk|kde|gnome|cosmic] [--codex tool-rows|child-errors|terminal-escape]
+        [--instance NAME] [--ui-trace]
+                  Take the native lock and start a headless session at the
+                  requested logical width and height (default 1500x900). The lock is
+                  released by stop, or after --limit seconds (default 2700).
+                  --startup-timeout bounds the wait for the app window (default
+                  180, range 1-3600 seconds); it does not extend --limit.
+                  --portal runs xdg-desktop-portal with that backend inside the
+                  session, so the app's file chooser opens there for drive to
+                  operate. --codex installs that offline Codex app-server peer
+                  as the fixture's codex. --codex-executable ABSOLUTE_PATH copies a
+                  real ELF into the isolated fixture, without its config or
+                  credentials. With neither option, Codex is not installed.
+                  --ui-trace has the UI log a summary of its UI-thread work
+                  every 5 seconds: updates by message, view, subscription,
+                  layout, draw, events, overlays and the rest of the widget
+                  tree's work, and every call over 50 ms.
+  cli ARGS...     Run this side's cagents CLI in the fixture environment.
+  env CMD...      Run a command in the fixture environment, which keeps nothing
+                  from this shell beyond locale and terminal settings and
+                  where Cargo and rustup live. Between sessions it runs under
+                  the side the last session ran, with no daemon running.
+  drive ARGS...   Run niri-harness against the session (observe, click, key...).
+  nested CMD...   Run a command in the nested compositor's environment.
+  shot NAME       Capture shots/SIDE-NAME.webp and record its source revision.
+  relaunch [--chat-stages]
+                  After closing the app window, run the same built UI again in
+                  this session, keeping its daemon and providers alive. Runs in
+                  the foreground; stop still ends the complete session.
+                  --chat-stages records UI stage timings on normal close.
+  stop            End the session, its daemon and its processes; release the lock.
+                  Also ends what remains of a session whose supervisor was killed.
+  save-seed       Keep the stopped fixture as the data every later start restores.
+  status          Report the session and the native lock.
+
+--task may also come from CAGENTS_EVIDENCE_TASK.
+USAGE
+}
+
+die() {
+    printf 'native-evidence: %s\n' "$1" >&2
+    exit "${2:-1}"
+}
+
+# This route is for a genuine User shell, such as plain SSH. Hosted agents keep
+# the same refusal as fixture_env in docs/chat-composer-fixture.md: authority is
+# never removed to get past it.
+refuse_inherited_authority() {
+    local name
+    for name in CAGENTS_AGENT_AUTHORITY CAGENTS_AGENT_TOKEN CAGENTS_SESSION_TOKEN; do
+        if [ "${!name+x}" ]; then
+            printf '%s\n' "This fixture requires a genuine User shell; inherited agent authority was not modified." >&2
+            printf '%s\n' "From a cagents session, run it on the build host over SSH instead: scripts/native-evidence --remote fw16 --task DIR COMMAND (see \"Native evidence from a cagents session\" in docs/development.md)." >&2
+            exit 77
+        fi
+    done
+}
+
+select_task() {
+    task=${1:-}
+    [ -n "$task" ] || die 'name a task directory with --task or CAGENTS_EVIDENCE_TASK' 2
+    # fish leaves the tilde in `export CAGENTS_EVIDENCE_TASK=~/...`.
+    case $task in
+        '~') task=$HOME ;;
+        '~/'*) task=$HOME/${task#'~/'} ;;
+    esac
+    # Checked before it exists, so a refused path leaves nothing behind.
+    task=$(realpath -m -- "$task")
+    # The compositor's session command is split on spaces, and socket paths are
+    # limited to 108 bytes including the suffixes the daemon and fixtures add.
+    [[ $task =~ ^/[A-Za-z0-9._/-]+$ ]] || die "task path has unsupported characters: $task" 2
+    [ "${#task}" -le 48 ] || die "task path is over 48 bytes, too long for its sockets: $task" 2
+    # Recovery storage refuses to live inside a Git checkout, so a fixture below
+    # one fails for unrelated-looking reasons.
+    local ancestor=$task
+    while [ "$ancestor" != / ]; do
+        [ ! -e "$ancestor/.git" ] && [ ! -L "$ancestor/.git" ] ||
+            die "task directory must be outside Git ancestry; found $ancestor/.git. Sandboxes can leave one in /tmp, /var/tmp or ~/.cache; ~/.local/state/cev/TASK avoids them." 2
+        ancestor=${ancestor%/*}
+        ancestor=${ancestor:-/}
+    done
+    mkdir -p -- "$task"
+    fixture=$task/fixture
+    seed=$task/fixture-seed
+    seed_home=$task/fixture-seed.home
+    runtime=$task/rt
+    state=$task/session
+    logs=$task/logs
+    shots=$task/shots
+    harness_root=$task/niri
+    compositor_home=$task/compositor
+    # Sessions replace their fixture and runtime directories, so never adopt a
+    # directory that holds anything else.
+    if [ ! -e "$task/.native-evidence" ]; then
+        [ -z "$(ls -A -- "$task")" ] || die "not a native-evidence task directory, and not empty: $task" 2
+        touch -- "$task/.native-evidence"
+    fi
+    mkdir -p -- "$logs" "$state" "$shots"
+    instance_name=$(cat "$state/instance" 2>/dev/null) || instance_name=
+}
+
+require_side() {
+    case ${1:-} in
+        before | after) ;;
+        *) die 'side must be before or after' 2 ;;
+    esac
+}
+
+target_of() {
+    printf '%s/target-%s\n' "$task" "$1"
+}
+
+# The source a build came from, so a capture cannot use stale executables.
+source_state() (
+    cd -- "$1"
+    # The session computes this under a different HOME: personal ignore rules must
+    # not make an unchanged checkout look changed.
+    export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+    git rev-parse HEAD
+    {
+        git -c core.excludesFile=/dev/null status --porcelain=v1 -z
+        git diff --cached --binary HEAD
+        git -c core.excludesFile=/dev/null ls-files --modified --others --exclude-standard -z |
+            xargs -0r sha256sum 2>/dev/null || true
+    } | sha256sum | cut -d' ' -f1
+)
+
+source_is_current() {
+    [ "$(source_state "$checkout")" = "$built_revision"$'\n'"$built_tree" ]
+}
+
+zig_executable() (
+    cd -- "$1"
+    local zig_command
+    zig_command=${CAGENTS_ZIG:-$(command -v zig)} || exit 1
+    # Under a moved HOME or XDG_DATA_HOME a mise shim re-executes itself without
+    # end. As in scripts/run-development, go to the pinned installation directly.
+    if [[ $zig_command == */shims/zig && -L $zig_command && $(readlink "$zig_command") == ?(*/)mise ]]; then
+        local pinned data
+        pinned=$(sed -n 's/^[[:space:]]*zig[[:space:]]*=[[:space:]]*"\([^"]*\)".*$/\1/p' mise.toml 2>/dev/null | head -n 1) || true
+        if [ -n "$pinned" ]; then
+            data=${MISE_DATA_DIR:-${zig_command%/shims/zig}}
+            zig_command=$data/installs/zig/$pinned/zig
+            [ -x "$zig_command" ] || zig_command=$data/installs/zig/$pinned/bin/zig
+            [ -x "$zig_command" ] || die "pinned Zig $pinned is not installed in $data; set CAGENTS_ZIG"
+        fi
+    fi
+    "$zig_command" env | sed -n \
+        -e 's/^[[:space:]]*"zig_exe":[[:space:]]*"\([^"]*\)",\{0,1\}[[:space:]]*$/\1/p' \
+        -e 's/^[[:space:]]*\.zig_exe[[:space:]]*=[[:space:]]*"\([^"]*\)",\{0,1\}[[:space:]]*$/\1/p'
+)
+
+# What `build` compiles, and all a session's cargo accepts. Keep these in step with
+# scripts/run-development's browserless builds, which cannot be asked to only build: the
+# before side may predate any option. A real-runner test fails if they drift.
+build_arguments() {
+    local common='--locked --profile dev-runtime --no-default-features --features'
+    printf '%s\n' \
+        "$common development --bin cagents" \
+        "$common development,host --bin cagentsd" \
+        "$common development,ui --bin cagents-ui"
+}
+
+refuse_running_side() {
+    if live_session && [ "$(cat "$state/side")" = "$1" ]; then
+        die "$1 is running; stop it before rebuilding what it was started from"
+    fi
+}
+
+cmd_build() {
+    local side=${1:-} checkout=${2:-}
+    require_side "$side"
+    [ -n "$checkout" ] || die 'build needs a checkout' 2
+    shift 2
+    while [ "$#" -gt 0 ]; do
+        case $1 in
+            --seed-target)
+                # A slot already holds a nearby build; a copied target adds only disk.
+                : "${2:?--seed-target needs a directory}"
+                printf 'native-evidence: ignoring --seed-target, which builds in shared slots no longer need\n' >&2
+                shift 2
+                ;;
+            *) die "unknown build option: $1" 2 ;;
+        esac
+    done
+    refuse_running_side "$side"
+    checkout=$(cd -- "$checkout" && pwd -P)
+    git -C "$checkout" rev-parse --git-dir >/dev/null
+    local target zig cargo_path
+    target=$(target_of "$side")
+    zig=$(zig_executable "$checkout")
+    [ -x "$zig" ] || die 'could not resolve the checkout'"'"'s Zig; set CAGENTS_ZIG'
+    # mise ignores an untrusted worktree's mise.toml, and a build with the wrong
+    # Zig only surfaces once the session starts.
+    local pinned actual
+    pinned=$(sed -n 's/^[[:space:]]*zig[[:space:]]*=[[:space:]]*"\([^"]*\)".*$/\1/p' "$checkout/mise.toml" 2>/dev/null | head -n 1) || true
+    actual=$("$zig" env | sed -n \
+        -e 's/^[[:space:]]*"version":[[:space:]]*"\([^"]*\)",\{0,1\}[[:space:]]*$/\1/p' \
+        -e 's/^[[:space:]]*\.version[[:space:]]*=[[:space:]]*"\([^"]*\)",\{0,1\}[[:space:]]*$/\1/p')
+    [ -z "$pinned" ] || [ "$actual" = "$pinned" ] ||
+        die "the checkout pins Zig $pinned but $zig is $actual; set CAGENTS_ZIG or run mise trust there"
+    # The runner puts Zig's directory first on PATH, ahead of the session's cargo.
+    [ ! -e "${zig%/*}/cargo" ] ||
+        die "$zig has a cargo beside it, which a session would run while holding the native lock; set CAGENTS_ZIG to a Zig installed apart from Cargo"
+    cargo_path=$(cd -- "$checkout" && rustup which cargo)
+    # The other side stays in use while this one builds, even if the guard
+    # below starts the pruner.
+    mark_used
+    # Builds in shared slots skip the gate's disk guard, which starts the
+    # pruner on its schedule and refuses a build when the disk is too full.
+    # When the slots are this host's, they share its disk, so run it here; a
+    # build on another host brings back only its executables.
+    if builds_here; then
+        (cd -- "$checkout" && "$tool_root/scripts/build-disk-guard" "$target") || exit
+    fi
+    # Each of the three builds goes through the gate's `cargo`, into one slot
+    # it holds for all three: on the build host, or with
+    # CAGENTS_BUILD_REMOTE=local here. The hold is the checkout's, whose
+    # builds alone can use it.
+    (cd -- "$checkout" && "$tool_root/scripts/cargo-gate" exec --hold "$self" --task "$task" \
+        __build "$side" "$checkout" "$zig" "${cargo_path%/*}")
+}
+
+# Whether this build compiles on this host: in its own slots, reached by
+# loopback, or in place. `cargo-offload --host` decides without waiting.
+builds_here() {
+    local where status=0
+    [ -x "$tool_root/scripts/cargo-offload" ] || return 0
+    where=$("$tool_root/scripts/cargo-offload" --host 2>/dev/null) || status=$?
+    [ "$status" -eq 75 ] && return 0
+    [ "$status" -eq 0 ] && case $where in *"$(printf '\t')loopback") return 0 ;; esac
+    return 1
+}
+
+# Marks both sides' targets as just used, so the pruner leaves them for its
+# --evidence-hours from now: a task between its before and after sessions is
+# in use. A missing target is reported by what reads it.
+mark_used() {
+    local side
+    for side in before after; do
+        touch -- "$(target_of "$side")/.native-evidence-used" 2>/dev/null || :
+    done
+}
+
+run_build() {
+    local side=$1 checkout=$2 zig=$3 cargo_bin=$4 target revision
+    # A session may have started during the wait for this slot.
+    refuse_running_side "$side"
+    target=$(target_of "$side")
+    mkdir -p -- "$target"
+    # The pruner leaves a target that a process has open. Cargo doesn't get
+    # it: a compiler daemon that outlived the build would keep it forever.
+    exec 8<"$target"
+    # From here until the build finishes, the target matches no recorded source:
+    # a failed rebuild keeps stale output.
+    rm -f -- "$target/evidence-source"
+    revision=$(source_state "$checkout")
+    (
+        cd -- "$checkout"
+        export CARGO_TARGET_DIR=$target
+        # The gate's `cargo` stays first among Cargos: the toolchain's own,
+        # ahead of it, would compile here.
+        export PATH=${zig%/*}:$PATH
+        local arguments
+        while IFS= read -r arguments; do
+            # shellcheck disable=SC2086 # Deliberately one word per argument.
+            cargo build $arguments 8<&-
+        done < <(build_arguments)
+    )
+    [ "$(source_state "$checkout")" = "$revision" ] ||
+        die "$checkout changed during the build; build it again"
+    {
+        printf '%s\n' "$checkout" "$zig" "$cargo_bin"
+        printf '%s\n' "$revision"
+    } >"$target/evidence-source"
+    printf 'built %s at %s\n' "$side" "$(head -n1 <<<"$revision")"
+}
+
+# What a side without a build says. scripts/prune-build-dirs reclaims one that
+# has gone unused, which only another build brings back.
+not_built() {
+    printf '%s has not been built, or its unused build was reclaimed; run: build %s %s\n' "$1" "$1" "$2"
+}
+
+# Reads what the side's build recorded: its checkout, tools and source state.
+load_side() {
+    local side=$1 record=${2:-}
+    record=${record:-$(target_of "$side")/evidence-source}
+    [ -f "$record" ] || die "$(not_built "$side" CHECKOUT)"
+    {
+        read -r checkout
+        read -r zig
+        read -r cargo_bin
+        read -r built_revision
+        read -r built_tree
+    } <"$record"
+    target=$(target_of "$side")
+}
+
+live_session() {
+    local pid
+    pid=$(cat "$state/pid" 2>/dev/null) || return 1
+    local arguments
+    arguments=$(tr '\0' '\n' 2>/dev/null <"/proc/$pid/cmdline") || return 1
+    grep -qxF -- "$task" <<<"$arguments" && grep -qxF -- __session <<<"$arguments"
+}
+
+current_side() {
+    if ! live_session; then
+        [ ! -e "$state/over-limit" ] || die "$(cat "$state/over-limit")"
+        die 'no session is running; run: start SIDE'
+    fi
+    cat "$state/side"
+}
+
+# Starts from an empty environment. Credentials, agents and the desktop bus in the
+# caller's shell stay out; the authority refusal has already run by this point.
+# Only the app inherits session variables, which belong to the nested desktop.
+# Git reaches only local repositories, so a fixture project's github.com
+# remote, which the offline forge needs, is never fetched from or pushed to.
+session_variables=
+session_path=
+fixture_env() {
+    local name passed=()
+    for name in LANG LC_ALL LC_CTYPE TERM $session_variables; do
+        if [ "${!name+x}" ]; then
+            passed+=("$name=${!name}")
+        fi
+    done
+    env -i "${passed[@]}" \
+        HOME="$fixture/home" XDG_RUNTIME_DIR="$runtime" \
+        XDG_DATA_HOME="$fixture/data" XDG_CONFIG_HOME="$fixture/config" \
+        XDG_CACHE_HOME="$fixture/cache" XDG_STATE_HOME="$fixture/state" \
+        CARGO_HOME="${CARGO_HOME:-$real_home/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$real_home/.rustup}" \
+        CARGO_TARGET_DIR="$target" CAGENTS_ZIG="$zig" \
+        CAGENTS_EVIDENCE_FIXTURE="$fixture" CAGENTS_DEVELOPMENT_INSTANCE="$instance_name" GIT_ALLOW_PROTOCOL=file \
+        PATH="$session_path$fixture/bin:$cargo_bin:${zig%/*}:/usr/local/bin:/usr/bin" \
+        "$@"
+}
+
+# The provider home a seed's chats recorded, as device and inode: the
+# fixture's when the seed was saved, kept in $seed_home.
+seeded_home_identity() {
+    stat -c '%d:%i' -- "$fixture/home/.claude" 2>/dev/null || :
+}
+
+prepare_fixture() {
+    local keep_state=$1
+    if [ "$keep_state" = false ]; then
+        if [ -d "$seed" ] && [ -d "$fixture" ]; then
+            # Restore the seed into the fixture rather than replacing it: a
+            # chat records its provider home's identity, its device and
+            # inode, and refuses to reopen once that directory is replaced,
+            # and a transcript's location records its file's. Syncing in
+            # place keeps every directory and file both share, so a
+            # conversation saved in the seed reopens on either side.
+            if ! rsync -aH --inplace --delete --force -- "$seed/" "$fixture/" 2>"$logs/seed.log"; then
+                printf 'could not restore the seed into the fixture; see %s\n' "$logs/seed.log" >"$state/failed"
+                return 1
+            fi
+        else
+            rm -rf -- "$fixture"
+            if [ -d "$seed" ]; then
+                cp -a --reflink=auto -- "$seed" "$fixture"
+            fi
+        fi
+        # The session runs detached; start shows this once it is ready.
+        if [ -d "$seed" ] && [ "$(seeded_home_identity)" != "$(cat -- "$seed_home" 2>/dev/null)" ]; then
+            printf '%s\n' 'the provider home is not the one the seed was saved from, so chats in the seed will not reopen; recreate them and save-seed again' >>"$state/notice"
+        fi
+    fi
+    # home/.config holds the forge's switch and avatars its seeds; a steps file
+    # writes into both without creating them.
+    mkdir -p "$fixture"/{bin,home/.claude,home/.config,avatars,data,config,cache,state,project}
+    # The Codex peers refuse a root others can read; so would a seed's mode.
+    chmod 700 -- "$fixture"
+    # Both sides get this tool's synthetic provider: the data must not differ
+    # because an older before checkout carries an older fixture.
+    install -m 755 "$tool_root/tests/fixtures/chat-composer-claude.sh" "$fixture/bin/claude"
+    # Refuses everything until home/.config/fixture-forge exists; see docs/fixtures.md.
+    install -m 755 "$tool_root/tests/fixtures/fixture-gh.sh" "$fixture/bin/gh"
+    # Avatars come only from the seeds the forge copies into the app's cache.
+    printf '#!/bin/sh\necho "curl: (7) the fixture has no network access" >&2\nexit 7\n' >"$fixture/bin/curl"
+    chmod 755 "$fixture/bin/curl"
+    # Links the app opens are recorded in state/opened-urls, not shown in a browser.
+    install -m 755 "$tool_root/tests/fixtures/fixture-xdg-open.sh" "$fixture/bin/xdg-open"
+    install_codex
+    if [ ! -e "$fixture/project/.git" ]; then
+        (
+            export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+            git init --quiet --initial-branch=main "$fixture/project"
+            git -C "$fixture/project" -c user.name=Fixture -c user.email=fixture@example.invalid \
+                commit --quiet --allow-empty --message 'Fixture project'
+        )
+    fi
+}
+
+# Snapshot the explicitly selected ELF before queuing for the native lock.
+# Validation never executes it. A queued session uses these exact bytes even
+# if the original executable is replaced while it waits.
+copy_codex_executable() {
+    /usr/bin/python3 - "$@" <<'PY'
+from pathlib import Path
+import hashlib
+import json
+import os
+import stat
+import sys
+import tempfile
+
+source, destination, receipt = map(Path, sys.argv[1:4])
+expected_receipt = Path(sys.argv[4]) if len(sys.argv) == 5 else None
+temporary = None
+descriptor = None
+
+def identity(info):
+    return {"device": info.st_dev, "inode": info.st_ino, "size": info.st_size,
+            "mode": stat.S_IMODE(info.st_mode), "mtime_ns": info.st_mtime_ns,
+            "ctime_ns": info.st_ctime_ns}
+
+try:
+    if not source.is_absolute():
+        raise ValueError("--codex-executable needs an absolute path")
+    # O_NONBLOCK lets a non-regular input be refused without waiting on a FIFO.
+    descriptor = os.open(source, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    before = os.fstat(descriptor)
+    if not stat.S_ISREG(before.st_mode):
+        raise ValueError("--codex-executable must name a regular file")
+    with os.fdopen(descriptor, "rb") as original:
+        descriptor = None
+        if not before.st_mode & 0o111 or not os.access(f"/proc/self/fd/{original.fileno()}", os.X_OK):
+            raise ValueError("--codex-executable must name an executable file")
+        header = original.read(64)
+        if (len(header) < 52 or header[:4] != b"\x7fELF" or header[4] not in (1, 2)
+                or header[5] not in (1, 2) or header[6] != 1
+                or (header[4] == 2 and len(header) < 64)):
+            raise ValueError("--codex-executable must name an ELF executable")
+        byte_order = "little" if header[5] == 1 else "big"
+        if int.from_bytes(header[16:18], byte_order) not in (2, 3):
+            raise ValueError("--codex-executable must name an executable or PIE ELF")
+        expected = None
+        if expected_receipt is not None:
+            expected = json.loads(expected_receipt.read_text())
+            if (not isinstance(expected, dict)
+                    or not isinstance(expected.get("snapshot_identity"), dict)
+                    or not isinstance(expected.get("sha256"), str)
+                    or len(expected["sha256"]) != 64
+                    or any(character not in "0123456789abcdef" for character in expected["sha256"])):
+                raise ValueError("the selected Codex snapshot receipt is invalid")
+        if expected is not None and identity(before) != expected["snapshot_identity"]:
+            raise ValueError("the selected Codex snapshot changed before installation")
+        original.seek(0)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=destination.parent, delete=False) as copied:
+            temporary = Path(copied.name)
+            digest = hashlib.sha256()
+            size = 0
+            while block := original.read(1024 * 1024):
+                copied.write(block)
+                digest.update(block)
+                size += len(block)
+            if identity(before) != identity(os.fstat(original.fileno())) or size != before.st_size:
+                raise ValueError("the selected Codex executable changed while copying")
+            sha256 = digest.hexdigest()
+            if expected is not None and sha256 != expected["sha256"]:
+                raise ValueError("the selected Codex snapshot's contents changed")
+            # A new inode with explicit permissions imports no set-id bits,
+            # extended attributes or capabilities from the original binary.
+            os.fchmod(copied.fileno(), 0o755)
+        temporary.replace(destination)
+        temporary = None
+        if expected is not None:
+            record = {**expected, "installed_path": str(destination),
+                      "installed_identity": identity(destination.stat()),
+                      "installed_sha256": sha256}
+        else:
+            record = {"source_path": str(source), "source_identity": identity(before),
+                      "sha256": sha256, "snapshot_path": str(destination),
+                      "snapshot_identity": identity(destination.stat())}
+        receipt.write_text(json.dumps(record, indent=2) + "\n")
+except (OSError, ValueError, KeyError) as error:
+    print(f"native-evidence: {error}", file=sys.stderr)
+    sys.exit(2)
+finally:
+    if descriptor is not None:
+        os.close(descriptor)
+    if temporary is not None:
+        temporary.unlink(missing_ok=True)
+PY
+}
+
+# A codex on PATH makes the app list Codex as installed. Install only the
+# explicitly requested peer or isolated real executable; plain starts reset it.
+install_codex() {
+    local peer peers=$fixture/libexec/codex
+    peer=$(cat -- "$state/codex" 2>/dev/null) || peer=
+    rm -rf -- "$peers" "$fixture/bin/codex"
+    if [ -f "$state/codex-executable" ]; then
+        copy_codex_executable "$state/codex-executable" "$peers/codex" \
+            "$state/codex-executable-installed.json" "$state/codex-executable.json"
+        mkdir -p -- "$fixture/bin" "$fixture/home/.codex"
+        ln -s -- ../libexec/codex/codex "$fixture/bin/codex"
+        return
+    fi
+    [ -n "$peer" ] || return 0
+    mkdir -p -- "$peers" "$fixture/home/.codex"
+    # The peers load their transport from beside them.
+    install -m 644 -t "$peers" -- "$tool_root"/tests/fixtures/{terminal-escape-codex,codex-tool-rows,codex-child-errors}.py
+    printf '%s\n' "$peer" >"$peers/peer"
+    install -m 755 "$tool_root/tests/fixtures/fixture-codex.sh" "$fixture/bin/codex"
+}
+
+# The fixture's runtime directory and HOME are the proof of ownership: nothing else
+# on the host carries either. Providers rebuild their environment, so check both.
+session_processes() {
+    grep -lFxz -e "XDG_RUNTIME_DIR=$runtime" -e "HOME=$fixture/home" /proc/[0-9]*/environ 2>/dev/null |
+        sed -E 's#^/proc/([0-9]+)/environ$#\1#' | grep -vxF -e "$$" -e "$BASHPID" || true
+}
+
+settle_session_processes() {
+    local remaining attempt
+    remaining=$(session_processes)
+    [ -n "$remaining" ] || return 0
+    printf 'ending leftover fixture processes: %s\n' "$(tr '\n' ' ' <<<"$remaining")"
+    # shellcheck disable=SC2086
+    kill -TERM $remaining 2>/dev/null || true
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+        remaining=$(session_processes)
+        [ -n "$remaining" ] || return 0
+        sleep 0.5
+    done
+    remaining=$(session_processes)
+    # shellcheck disable=SC2086
+    [ -z "$remaining" ] || kill -KILL $remaining 2>/dev/null || true
+}
+
+stop_fixture_daemon() {
+    local capability
+    capability=$(fixture_env timeout -k 5 20 "$target/dev-runtime/cagents" --no-start daemon preflight 2>/dev/null) || return 0
+    fixture_env timeout -k 5 20 "$target/dev-runtime/cagents" --no-start daemon stop --confirm "$capability" >/dev/null 2>&1 || true
+}
+
+end_compositor() {
+    local attempt
+    [ -n "${compositor:-}" ] || return 0
+    kill -TERM "$compositor" 2>/dev/null || true
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+        kill -0 "$compositor" 2>/dev/null || break
+        sleep 1
+    done
+    kill -KILL "$compositor" 2>/dev/null || true
+    wait "$compositor" 2>/dev/null || true
+}
+
+end_session() {
+    {
+        end_compositor
+        stop_fixture_daemon
+        settle_session_processes
+    } 9>&-
+}
+
+# A mise shim looks for its target on PATH. Under a private XDG_DATA_HOME it no
+# longer recognizes its own directory there, and re-executes itself forever.
+path_without_shims() {
+    local entry path= rest=$PATH:
+    while [ -n "$rest" ]; do
+        entry=${rest%%:*}
+        rest=${rest#*:}
+        case $entry in
+            */mise/shims) ;;
+            *) path=${path:+$path:}$entry ;;
+        esac
+    done
+    printf '%s\n' "$path"
+}
+
+# Gives up if asked to stop, or if the start command that wanted this session is
+# gone: nobody would drive or stop a session that began after that.
+wait_for_native_lock() {
+    local wait_lock=$1 starter=$2 waited=0
+    if [ "$wait_lock" -eq 0 ]; then
+        # A zero budget still tries the idle lock. Starting a queued helper
+        # and immediately cancelling it races the helper's first scheduling.
+        if flock -n 9; then
+            :
+        else
+            local status=$?
+            if [ "$status" -eq 1 ]; then
+                printf 'the native lock stayed busy for 0 seconds (see scripts/lock-holders %s)\n' "$native_lock" >"$state/failed"
+            else
+                printf 'could not take the native lock\n' >"$state/failed"
+            fi
+            return 1
+        fi
+    else
+        # Stay in the kernel's queue the whole time: retrying with a short timeout
+        # loses to every blocked waiter, and could wait out the limit behind them.
+        # The child shares this descriptor, so the lock outlives it.
+        flock 9 &
+        lock_waiter=$!
+        local waiter=$lock_waiter
+        while kill -0 "$waiter" 2>/dev/null; do
+            if [ -e "$state/stop" ] || ! kill -0 "$starter" 2>/dev/null; then
+                kill -KILL "$waiter" 2>/dev/null || true
+                wait "$waiter" 2>/dev/null || true
+                printf 'stopped while waiting for the native lock\n' >"$state/failed"
+                return 1
+            fi
+            if [ "$waited" -ge "$wait_lock" ]; then
+                kill -KILL "$waiter" 2>/dev/null || true
+                wait "$waiter" 2>/dev/null || true
+                printf 'the native lock stayed busy for %s seconds (see scripts/lock-holders %s)\n' "$wait_lock" "$native_lock" >"$state/failed"
+                return 1
+            fi
+            sleep 1
+            waited=$((waited + 1))
+        done
+        wait "$waiter" || {
+            printf 'could not take the native lock\n' >"$state/failed"
+            return 1
+        }
+        lock_waiter=
+    fi
+    if [ -e "$state/stop" ] || ! kill -0 "$starter" 2>/dev/null; then
+        printf 'stopped while waiting for the native lock\n' >"$state/failed"
+        return 1
+    fi
+}
+
+# Holds the native lock for the life of the session. No child inherits its
+# descriptor, so nothing that outlives or wedges the session can keep the lock.
+# Over its limit a session goes all at once, so nothing inside it can say why.
+report_over_limit() {
+    local notice
+    notice=$(grep -m 1 '^memory-capped: stopped' "$logs/kwin-$1.log" 2>/dev/null) || return 0
+    printf '%s\n' "$notice" | tee "$state/over-limit"
+    [ -e "$state/ready" ] || printf '%s\n' "$notice" >"$state/failed"
+}
+
+require_startup_timeout() {
+    [[ $1 =~ ^[1-9][0-9]{0,3}$ ]] && [ "$1" -le 3600 ] ||
+        die 'startup timeout must be a whole number from 1 to 3600 seconds' 2
+}
+
+run_session() {
+    local side=$1 width=$2 keep_state=$3 wait_lock=$4 limit=$5 starter=$6 height=${7:-900} startup_timeout=${8-180}
+    require_startup_timeout "$startup_timeout"
+    load_side "$side" "$state/source"
+    # Open for the whole session, even while it waits for the native lock, so
+    # the pruner leaves the target.
+    { exec 8<"$target"; } 2>/dev/null || {
+        not_built "$side" "$checkout" >"$state/failed"
+        return 1
+    }
+    exec 9>"$native_lock"
+    compositor=
+    lock_waiter=
+    # A waiter left in the queue would take the lock for a moment later on.
+    trap '[ -z "$lock_waiter" ] || kill -KILL "$lock_waiter" 2>/dev/null; end_session; mark_used; exit 143' TERM INT HUP
+    wait_for_native_lock "$wait_lock" "$starter" || return 1
+    settle_session_processes 9>&-
+    # A document portal can leave a FUSE mount in the runtime directory.
+    if [ -d "$runtime" ]; then
+        {
+            awk -v runtime="$runtime" 'index($5, runtime "/") == 1 && $(NF - 2) ~ /^fuse/ { print $5 }' \
+                /proc/self/mountinfo | while IFS= read -r mount; do
+                timeout -k 5 10 fusermount3 -u -z "$mount" 2>/dev/null ||
+                    timeout -k 5 10 fusermount -u -z "$mount" 2>/dev/null || :
+            done
+        } 9>&-
+    fi
+    local clear_status=0
+    timeout -k 5 30 rm -rf -- "$runtime" "$harness_root" "$compositor_home" "$logs/ui-$side.log" \
+        2>"$logs/clear-$side.log" 9>&- || clear_status=$?
+    if [ "$clear_status" -eq 124 ] || [ "$clear_status" -eq 137 ]; then
+        printf 'could not clear the last session: it was still going after 30 seconds, so a mount in %s may be stuck\n' \
+            "$runtime" >"$state/failed"
+        return 1
+    elif [ "$clear_status" -ne 0 ]; then
+        printf 'could not clear the last session; see %s\n' "$logs/clear-$side.log" >"$state/failed"
+        return 1
+    fi
+    mkdir -m 700 "$runtime"
+    mkdir -p -- "$compositor_home"/{home,config,data,cache,state}
+    # KWin owns only this task's nested compositor window. Give its client
+    # framebuffer both requested dimensions before niri fits its logical width;
+    # scaling the old fixed 1280x800 frame also scaled away the vertical space.
+    cat >"$compositor_home/config/kwinrulesrc" <<RULES
+[General]
+count=1
+rules=1
+
+[1]
+Description=Native evidence viewport
+wmclassmatch=0
+types=4294967295
+position=0,0
+positionrule=2
+size=$width,$height
+sizerule=2
+noborder=true
+noborderrule=2
+RULES
+    prepare_fixture "$keep_state" 9>&-
+
+    # The compositor reads and rewrites its settings on exit, so it gets its own
+    # HOME: a virtual session must not change the desktop's output configuration,
+    # and desktop settings must not feed into the evidence. Each stage dies with
+    # its parent, so a killed supervisor does not leave a compositor behind.
+    # Its memory limit is made here, with the user manager still reachable.
+    setpriv --pdeathsig TERM "$tool_root/scripts/memory-capped" --name 'the native evidence session' env -u DISPLAY -u WAYLAND_DISPLAY -u WAYLAND_SOCKET -u NIRI_SOCKET -u NIRI_HARNESS_STATE \
+        -u XDG_SESSION_TYPE -u XDG_CURRENT_DESKTOP -u XCURSOR_THEME -u XCURSOR_SIZE \
+        HOME="$compositor_home/home" XDG_RUNTIME_DIR="$runtime" \
+        XDG_CONFIG_HOME="$compositor_home/config" XDG_DATA_HOME="$compositor_home/data" \
+        XDG_CACHE_HOME="$compositor_home/cache" XDG_STATE_HOME="$compositor_home/state" \
+        CAGENTS_EVIDENCE_REAL_HOME="$real_home" PATH="$(path_without_shims)" \
+        setpriv --pdeathsig TERM dbus-run-session -- setpriv --pdeathsig TERM \
+        kwin_wayland --virtual --no-lockscreen --socket "$session_name" \
+        --width "$width" --height "$height" --exit-with-session \
+        "$self --task $task __inner $side $width $startup_timeout" \
+        >"$logs/kwin-$side.log" 2>&1 8<&- 9>&- &
+    compositor=$!
+    local deadline=$((SECONDS + limit)) stop_deadline=
+    while kill -0 "$compositor" 2>/dev/null; do
+        # A session that can't start has nothing to wait for.
+        if [ -e "$state/failed" ]; then
+            break
+        fi
+        if [ -z "$stop_deadline" ]; then
+            if [ -e "$state/stop" ]; then
+                stop_deadline=$((SECONDS + 40))
+            elif [ "$SECONDS" -ge "$deadline" ]; then
+                printf 'stopping: the session reached its %s second limit\n' "$limit"
+                touch "$state/stop"
+                stop_deadline=$((SECONDS + 40))
+            fi
+        elif [ "$SECONDS" -ge "$stop_deadline" ]; then
+            break
+        fi
+        sleep 1
+    done
+    trap - TERM INT HUP
+    report_over_limit "$side"
+    [ -e "$state/ready" ] || [ -e "$state/failed" ] ||
+        printf 'the compositor exited before the session was ready; see %s\n' "$logs/kwin-$side.log" >"$state/failed"
+    end_session
+    # Unused from now on, as far as the pruner can tell.
+    mark_used
+}
+
+run_inner() {
+    local side=$1 width=$2 startup_timeout=${3-180} failure=
+    require_startup_timeout "$startup_timeout"
+    local startup_outer_timeout=$((startup_timeout + 60))
+    load_side "$side" "$state/source"
+    local portal
+    portal=$(cat "$state/portal" 2>/dev/null) || portal=
+    if ! timeout -k 5 "$startup_outer_timeout" niri-harness session start "$session_name" --root "$harness_root" --timeout "$startup_timeout" \
+        --width "$width" ${portal:+--portal "$portal"} --cmd "exec $self --task $task __app $side" \
+        >"$logs/harness-$side.log" 2>&1; then
+        failure="the app window did not appear; see $logs/harness-$side.log, $harness_root/session.log and $logs/ui-$side.log"
+    elif ! source_is_current; then
+        failure="$checkout changed while the session was starting; run: build $side $checkout"
+    fi
+    if [ -n "$failure" ]; then
+        [ -e "$state/failed" ] || printf '%s\n' "$failure" >"$state/failed"
+        touch "$state/stop"
+    else
+        {
+            printf 'WAYLAND_DISPLAY=%s\n' "$WAYLAND_DISPLAY"
+            printf 'DBUS_SESSION_BUS_ADDRESS=%s\n' "${DBUS_SESSION_BUS_ADDRESS:-}"
+        } >"$state/env"
+        touch "$state/ready"
+    fi
+    while [ ! -e "$state/stop" ] && kill -0 "$PPID" 2>/dev/null; do sleep 0.5; done
+    timeout -k 5 30 niri-harness session stop "$session_name" >>"$logs/harness-$side.log" 2>&1 || true
+}
+
+# The session's cargo, until the harness reports it ready, shortly after its window
+# appears. The runner runs for real, but every build it asks for was finished by `build`,
+# so evidence can't show anything other than what was built. Anything else fails here, at
+# once, rather than compiling or waiting under the native lock. Afterwards it is real
+# Cargo: the app inherits this PATH, and a terminal or language server in it shouldn't
+# end a session that is in use. One that runs Cargo in that short gap still does.
+write_session_cargo() {
+    local side=$1 checkout=$2
+    mkdir -p -- "$state/session-bin"
+    {
+        printf '#!/bin/bash\n'
+        printf 'state=%q\nadvice=%q\nreal_cargo=%q\nprofile=dev-runtime\n' \
+            "$state" "run: build $side $checkout" "$cargo_bin/cargo"
+        printf 'recorded=%q\n' "$(build_arguments)"
+        cat <<'CARGO'
+[ ! -e "$state/ready" ] || [ -e "$state/replaying" ] || exec "$real_cargo" "$@"
+refuse() {
+    local message="refusing to $1 while holding the native lock${2:+; $2}"
+    printf '%s\n' "$message" >"$state/failed.$$"
+    mv -f -- "$state/failed.$$" "$state/failed"
+    printf 'native-evidence: %s\n' "$message" >&2
+    exit 101
+}
+subcommand=${1:-}
+[ "$#" -eq 0 ] || shift
+arguments=()
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = -- ]; then
+        shift
+        break
+    fi
+    [ "$1" = --quiet ] || arguments+=("$1")
+    shift
+done
+request=${arguments[*]:-}
+case $subcommand in
+    metadata)
+        # All a runner asks of it: where the recorded executables are.
+        printf '{"target_directory":"%s"}\n' "$CARGO_TARGET_DIR"
+        exit 0
+        ;;
+    build|run) ;;
+    *) refuse "run cargo $subcommand" "this tool and the checkout's runner disagree" ;;
+esac
+grep -qxF -- "$request" <<<"$recorded" ||
+    refuse "run cargo $subcommand $request" "build did not compile that; this tool and the checkout's runner disagree"
+bin=${request##* }
+executable=$CARGO_TARGET_DIR/$profile/$bin
+[ -x "$executable" ] || refuse "compile $bin" "$advice"
+[ "$subcommand" = run ] || exit 0
+exec "$executable" "$@"
+CARGO
+    } >"$state/session-bin/cargo"
+    chmod +x "$state/session-bin/cargo"
+}
+
+run_app() {
+    local side=$1
+    load_side "$side" "$state/source"
+    # A session holds the native lock while others queue, so it must not wait on
+    # Cargo, whose shared locks and fingerprints make even a no-op build uncertain.
+    if ! source_is_current; then
+        printf '%s changed while waiting for the native lock; run: build %s %s\n' \
+            "$checkout" "$side" "$checkout" >"$state/failed"
+        exit 1
+    fi
+    cd -- "$checkout"
+    session_variables='WAYLAND_DISPLAY DBUS_SESSION_BUS_ADDRESS NIRI_SOCKET XDG_CURRENT_DESKTOP XDG_SESSION_TYPE XCURSOR_THEME XCURSOR_SIZE'
+    write_session_cargo "$side" "$checkout"
+    session_path=$state/session-bin:
+    # The runner still calls scripts/cargo-gate, which must not join the shared queue.
+    # Its builds replay the recorded ones through the session's cargo, here.
+    # They write nothing, so their disk guard is off: it would start the
+    # pruner, under this private HOME, beside the app being captured, and
+    # sync the file system for each one while the disk is low. Builds run
+    # inside the session once it is ready are not disk-guarded either.
+    local status=0 stage_environment=() runner_instance=()
+    [ -z "$instance_name" ] || runner_instance=(--instance "$instance_name" --in-session)
+    [ -z "${chat_stage_output:-}" ] || stage_environment+=("CAGENTS_CHAT_STAGE_OUTPUT=$chat_stage_output")
+    [ "$(cat "$state/ui-trace" 2>/dev/null)" != 1 ] || stage_environment+=(CAGENTS_UI_TRACE=1)
+    fixture_env env "${stage_environment[@]}" CAGENTS_BUILD_LOCK="$state/session-build.lock" CAGENTS_BUILD_SLOTS=1 CAGENTS_BUILD_SEED=0 \
+        CAGENTS_BUILD_REMOTE=local CAGENTS_BUILD_FREE_FLOOR_GIB=0 \
+        scripts/run-development --browserless "${runner_instance[@]}" \
+            --debug --log-file "$logs/ui-$side.log" || status=$?
+    # Don't leave the lock held until the harness gives up on a window.
+    if [ ! -e "$state/ready" ] && [ ! -e "$state/failed" ]; then
+        printf 'the runner exited with status %s before the app window appeared; see %s and %s\n' \
+            "$status" "$harness_root/session.log" "$logs/ui-$side.log" >"$state/failed"
+    fi
+    return "$status"
+}
+
+# Query the isolated compositor, which represents a closed window as [].
+app_window_is_open() {
+    local observed
+    observed=$(timeout -k 1 10 niri msg --json windows 2>/dev/null) || return 2
+    /usr/bin/python3 -c 'import json,sys
+try:
+    windows=json.load(sys.stdin)
+    if not isinstance(windows,list):
+        sys.exit(2)
+    for window in windows:
+        if not isinstance(window,dict) or "app_id" not in window:
+            sys.exit(2)
+        if window["app_id"] is not None and not isinstance(window["app_id"],str):
+            sys.exit(2)
+    sys.exit(0 if any(window["app_id"] == "dev.cagents.Cagents.Development" for window in windows) else 1)
+except (ValueError,AttributeError):
+    sys.exit(2)
+' <<<"$observed"
+}
+
+cmd_relaunch() {
+    local side watcher observed status=0 chat_stage_output=
+    side=$(current_side)
+    case ${1:-} in
+        --chat-stages)
+            [ "$#" -eq 1 ] || die 'relaunch accepts only --chat-stages'
+            mkdir -p -m 700 -- "$logs/chat-stages"
+            chat_stage_output=$logs/chat-stages/$side-$(date +%s)-$$.json
+            printf 'chat stages: %s\n' "$chat_stage_output"
+            ;;
+        '') ;;
+        *) die 'relaunch accepts only --chat-stages' ;;
+    esac
+    [ -f "$harness_root/session.rc" ] || die 'close the app window before relaunching it'
+    exec 7>"$state/relaunch.lock"
+    flock -n 7 || die 'a relaunched app is already running'
+    nested_session_env
+    local session_environment
+    session_environment=$(timeout -k 5 30 niri-harness --session "$session_name" session env)
+    eval "$session_environment"
+    app_window_is_open && observed=0 || observed=$?
+    case $observed in
+        0) die 'close the app window before relaunching it' ;;
+        1) ;;
+        *) die "could not observe whether the app window is closed; see $harness_root/session.log" ;;
+    esac
+    # Product copies need not contain Cargo dependency lists, so the runner's
+    # ordinary warm-build shortcut may decline them. Replay the exact recorded
+    # builds again until the new window appears; never compile under this lock.
+    touch "$state/replaying"
+    (
+        for _ in {1..300}; do
+            live_session || exit 1
+            if app_window_is_open; then
+                rm -f -- "$state/replaying"
+                exit 0
+            fi
+            sleep 0.1
+        done
+        printf 'the relaunched app window did not appear; see %s\n' "$logs/ui-$side.log" >"$state/failed"
+        touch "$state/stop"
+    ) 7>&- &
+    watcher=$!
+    trap 'rm -f -- "$state/replaying"; kill "$watcher" 2>/dev/null || :; wait "$watcher" 2>/dev/null || :' EXIT
+    trap 'exit 143' TERM HUP
+    run_app "$side" 7>&- || status=$?
+    if [ -e "$state/replaying" ]; then
+        printf 'the relaunched app exited before its window appeared; see %s\n' "$logs/ui-$side.log" >"$state/failed"
+        [ "$status" -ne 0 ] || status=1
+    fi
+    exit "$status"
+}
+
+cmd_start() {
+    local side=${1:-} width=1500 height=900 keep_state=false wait_lock=1800 limit=2700 startup_timeout=180 portal= codex= codex_executable= ui_trace=
+    require_side "$side"
+    shift
+    while [ "$#" -gt 0 ]; do
+        case $1 in
+            --width) width=${2:?--width needs pixels}; shift 2 ;;
+            --height) height=${2:?--height needs pixels}; shift 2 ;;
+            --keep-state) keep_state=true; shift ;;
+            --instance) instance_name=${2:?--instance needs a name}; shift 2 ;;
+            --wait-lock) wait_lock=${2:?--wait-lock needs seconds}; shift 2 ;;
+            --limit) limit=${2:?--limit needs seconds}; shift 2 ;;
+            --startup-timeout)
+                [ "$#" -ge 2 ] || die '--startup-timeout needs seconds' 2
+                startup_timeout=$2; shift 2 ;;
+            --portal) portal=${2:?--portal needs a backend: gtk, kde, gnome or cosmic}; shift 2 ;;
+            --codex) codex=${2:?--codex needs a peer: tool-rows, child-errors or terminal-escape}; shift 2 ;;
+            --codex-executable) codex_executable=${2:?--codex-executable needs an absolute ELF path}; shift 2 ;;
+            --ui-trace) ui_trace=1; shift ;;
+            *) die "unknown start option: $1" 2 ;;
+        esac
+    done
+    [[ $width =~ ^[1-9][0-9]*$ && $height =~ ^[1-9][0-9]*$ && $wait_lock =~ ^[0-9]+$ && $limit =~ ^[1-9][0-9]*$ ]] ||
+        die 'width and height must be positive pixels; lock wait and session limit must be whole numbers' 2
+    require_startup_timeout "$startup_timeout"
+    [[ -z $portal || $portal =~ ^(gtk|kde|gnome|cosmic)$ ]] ||
+        die "unknown portal backend: $portal; use gtk, kde, gnome or cosmic" 2
+    [[ -z $codex || $codex =~ ^(tool-rows|child-errors|terminal-escape)$ ]] ||
+        die "unknown Codex peer: $codex; use tool-rows, child-errors or terminal-escape" 2
+    [[ -z $codex || -z $codex_executable ]] ||
+        die '--codex and --codex-executable are mutually exclusive' 2
+    [[ $self =~ ^/[A-Za-z0-9._/-]+$ ]] || die "the tool's path has unsupported characters: $self" 2
+    [[ -z $instance_name || $instance_name =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,23}$ ]] ||
+        die 'instance names must be 1-24 ASCII letters, digits or hyphens, starting with a letter or digit' 2
+    if [ -f "$state/instance" ] && [ "$(cat "$state/instance")" != "$instance_name" ]; then
+        die 'this task already selected another instance; use a new task to change it' 2
+    fi
+    live_session && die 'a session is already running for this task; stop it first'
+    if [ "$keep_state" = false ] && [ -d "$seed" ] && [ -d "$fixture" ] && ! command -v rsync >/dev/null 2>&1; then
+        die 'restoring the seed needs rsync, which keeps the directories its chats recorded; install rsync'
+    fi
+    # Before anything reads it: the pruner leaves a target written meanwhile.
+    mark_used
+    load_side "$side"
+    source_is_current || die "$checkout changed since its build; run: build $side $checkout"
+    if [ -n "$codex_executable" ]; then
+        copy_codex_executable "$codex_executable" "$state/codex-executable" "$state/codex-executable.json"
+    else
+        rm -f -- "$state/codex-executable" "$state/codex-executable.json"
+    fi
+    rm -f -- "$state/codex-executable-installed.json"
+    rm -f -- "$state/ready" "$state/failed" "$state/stop" "$state/env" "$state/over-limit" "$state/notice"
+    # Fix what this session runs: everything it reports reads this copy.
+    cp -- "$(target_of "$side")/evidence-source" "$state/source" 2>/dev/null ||
+        die "$(not_built "$side" "$checkout")"
+    printf '%s\n' "$instance_name" >"$state/instance"
+    printf '%s\n' "$side" >"$state/side"
+    printf '%s\n' "$width" >"$state/width"
+    printf '%s\n' "$height" >"$state/height"
+    printf '%s\n' "$startup_timeout" >"$state/startup-timeout"
+    printf '%s\n' "$portal" >"$state/portal"
+    printf '%s\n' "$codex" >"$state/codex"
+    printf '%s\n' "$ui_trace" >"$state/ui-trace"
+    printf 'waiting for the native session (lock wait up to %ss)\n' "$wait_lock"
+    # The session outlives this command, so it starts in its own process session.
+    setsid nohup "$self" --task "$task" __session "$side" "$width" "$keep_state" "$wait_lock" "$limit" "$$" "$height" "$startup_timeout" \
+        >>"$logs/session-$side.log" 2>&1 </dev/null &
+    local pid=$!
+    printf '%s\n' "$pid" >"$state/pid"
+    while [ ! -e "$state/ready" ] && [ ! -e "$state/failed" ]; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            [ -e "$state/failed" ] && break
+            die "the session exited early; see $logs/session-$side.log"
+        fi
+        sleep 1
+    done
+    if [ -e "$state/failed" ]; then
+        # The next step is usually a build, which a running side refuses.
+        local attempt
+        for attempt in $(seq 1 120); do
+            live_session || die "$(cat "$state/failed")"
+            sleep 1
+        done
+        die "$(cat "$state/failed"); it is still stopping, see $logs/session-$side.log"
+    fi
+    printf 'session ready: %s at %s, width %s, stopping itself after %s seconds\n' \
+        "$side" "$built_revision" "$width" "$limit"
+    if [ -s "$state/notice" ]; then
+        sed 's/^/native-evidence: /' "$state/notice" >&2
+    fi
+}
+
+nested_session_env() {
+    local name value
+    while IFS='=' read -r name value; do
+        export "$name=$value"
+    done <"$state/env"
+    export XDG_RUNTIME_DIR=$runtime
+}
+
+cmd_drive() {
+    current_side >/dev/null
+    nested_session_env
+    # Healing moves the pointer, which would disturb hover states between shots.
+    exec timeout -k 5 300 niri-harness --no-heal --session "$session_name" "$@"
+}
+
+cmd_nested() {
+    current_side >/dev/null
+    nested_session_env
+    local session_environment
+    session_environment=$(timeout -k 5 30 niri-harness --session "$session_name" session env)
+    eval "$session_environment"
+    exec "$@"
+}
+
+cmd_shot() {
+    local name=${1:-} side
+    [[ $name =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]] || die 'shot name must use letters, digits and hyphens' 2
+    side=$(current_side)
+    load_side "$side" "$state/source"
+    (
+        nested_session_env
+        local observed
+        observed=$(timeout -k 5 30 niri-harness --no-heal --session "$session_name" --json observe --no-text) ||
+            die "could not observe the session; see $harness_root/session.log and $logs/ui-$side.log"
+        /usr/bin/python3 -c '
+import json, sys
+state = json.load(sys.stdin)
+window = state.get("window")
+if not window:
+    sys.exit("native-evidence: the app has no window to capture")
+viewport = state["output"]["logical"]
+width, height = viewport["width"], viewport["height"]
+w, h = window["size"]
+if w > width + 2 or h > height + 2:
+    sys.exit(f"native-evidence: app window {w}x{h} exceeds viewport {width}x{height}; restart with a larger --width/--height")
+' <<<"$observed"
+        timeout -k 5 60 niri-harness --no-heal --session "$session_name" shot "$side-$name" >/dev/null
+    )
+    local webp="$shots/$side-$name.webp" manifest="$shots/manifest.tsv"
+    magick "$harness_root/shots/$side-$name.png" -quality 92 "$webp"
+    # A retake replaces its row, so each image has one record of its source.
+    {
+        grep -vF -- "$side-$name.webp"$'\t' "$manifest" 2>/dev/null || true
+        printf '%s\t%s\t%s\t%s\t%s\n' "$side-$name.webp" "$built_revision" "$built_tree" \
+            "$(cat "$state/width")" "$(magick identify -format '%wx%h' "$webp")"
+    } >"$manifest.new"
+    mv -- "$manifest.new" "$manifest"
+    printf '%s\n' "$webp"
+}
+
+cmd_stop() {
+    if ! live_session; then
+        if [ -n "$(session_processes)" ] && [ -f "$state/source" ]; then
+            load_side "$(cat "$state/side")" "$state/source"
+            stop_fixture_daemon
+            settle_session_processes
+            printf 'ended what remained of a lost session\n'
+        else
+            printf 'no session is running\n'
+        fi
+        return 0
+    fi
+    local pid
+    pid=$(cat "$state/pid")
+    touch "$state/stop"
+    local attempt
+    for attempt in $(seq 1 120); do
+        live_session || {
+            printf 'stopped\n'
+            return 0
+        }
+        sleep 1
+    done
+    die "session $pid has not stopped after 120 seconds; see $logs"
+}
+
+cmd_status() {
+    if live_session; then
+        printf 'session: %s, pid %s, %s\n' "$(cat "$state/side")" "$(cat "$state/pid")" \
+            "$([ -e "$state/ready" ] && echo ready || echo starting)"
+    elif [ -n "$(session_processes)" ]; then
+        printf 'session: lost, its supervisor is gone but processes remain; run: stop\n'
+    else
+        printf 'session: none\n'
+        [ ! -e "$state/over-limit" ] || printf 'last session: %s\n' "$(cat "$state/over-limit")"
+    fi
+    if (exec 9>"$native_lock" && flock -n 9); then
+        printf 'native lock: free\n'
+    else
+        printf 'native lock: held\n'
+    fi
+}
+
+# On another host, over SSH; nothing native runs here. See native-evidence-remote.
+# Only as a leading option, beside --task: a later --remote is a command's.
+if [ "${1:-}" = --remote ] || { [ "${1:-}" = --task ] && [ "${3:-}" = --remote ]; }; then
+    exec "$tool_root/scripts/native-evidence-remote" "$@"
+fi
+[ -z "${CAGENTS_EVIDENCE_REMOTE:-}" ] || exec "$tool_root/scripts/native-evidence-remote" "$@"
+
+refuse_inherited_authority
+
+task_argument=${CAGENTS_EVIDENCE_TASK:-}
+case ${1:-} in
+    --task) task_argument=${2:-}; shift 2 || die '--task needs a directory' 2 ;;
+    --help | -h | '') usage; exit 0 ;;
+esac
+command=${1:-}
+[ -n "$command" ] || { usage >&2; exit 2; }
+shift
+select_task "$task_argument"
+
+case $command in
+    build) cmd_build "$@" ;;
+    start) cmd_start "$@" ;;
+    relaunch) cmd_relaunch "$@" ;;
+    cli)
+        side=$(current_side)
+        load_side "$side" "$state/source"
+        fixture_env "$target/dev-runtime/cagents" "$@"
+        ;;
+    env)
+        # Between sessions the fixture is still there, with no daemon holding
+        # its stores, so setup that needs the daemon stopped runs then, under
+        # the side the last session ran.
+        if live_session || [ ! -f "$state/side" ]; then
+            side=$(current_side)
+        else
+            side=$(cat "$state/side")
+        fi
+        load_side "$side" "$state/source"
+        fixture_env "$@"
+        ;;
+    drive) cmd_drive "$@" ;;
+    nested) cmd_nested "$@" ;;
+    shot) cmd_shot "$@" ;;
+    stop) cmd_stop ;;
+    save-seed)
+        live_session && die 'stop the session before saving its fixture'
+        [ -d "$fixture" ] || die 'there is no fixture to save yet'
+        rm -rf -- "$seed" "$seed_home"
+        cp -a --reflink=auto -- "$fixture" "$seed"
+        seeded_home_identity >"$seed_home"
+        printf 'saved %s\n' "$seed"
+        ;;
+    status) cmd_status ;;
+    __build) run_build "$@" ;;
+    __session) run_session "$@" ;;
+    __inner) run_inner "$@" ;;
+    __app) run_app "$@" ;;
+    *) usage >&2; exit 2 ;;
+esac
+exit
+}

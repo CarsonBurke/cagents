@@ -87,10 +87,32 @@ with open(os.environ["FIXTURE_EVENTS"], "a") as output:
             "--features", "host", "--bin", "cagentsd",
             "--message-format=json-render-diagnostics",
         ])
-        self.assertEqual(cargo[2]["args"], [
-            "test", "--locked", "--release", "--no-default-features",
-            "--features", "host", "--all-targets",
-        ])
+        # Counts alone allow a missing feature to silently repeat the CLI
+        # graph. Keep every independently qualified release boundary explicit.
+        for lane, index, arguments in (
+            ("CLI", 0, [
+                "test", "--locked", "--release", "--no-default-features",
+                "--all-targets",
+            ]),
+            ("HOST", 2, [
+                "test", "--locked", "--release", "--no-default-features",
+                "--features", "host", "--all-targets",
+            ]),
+            ("browserless UI", 3, [
+                "test", "--locked", "--release", "--no-default-features",
+                "--features", "ui", "--all-targets",
+            ]),
+            ("ceditor", 4, [
+                "test", "--locked", "--release", "--package", "ceditor",
+                "--all-targets",
+            ]),
+            ("integrated browser", 5, [
+                "test", "--locked", "--release", "--features",
+                "integrated-browser", "--all-targets",
+            ]),
+        ):
+            with self.subTest(lane=lane):
+                self.assertEqual(cargo[index]["args"], arguments)
         self.assertEqual(cargo[2]["helper"], helper)
         self.assertTrue(all(event["helper"] is None
                             for index, event in enumerate(cargo) if index != 2))

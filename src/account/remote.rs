@@ -26,6 +26,12 @@ pub enum Operation {
     Remove {
         id: AccountId,
     },
+    /// Lists an unregistered managed home again under its original key, once
+    /// its provider confirms the login. See [`restore_reserved`].
+    Restore {
+        provider: Provider,
+        key: uuid::Uuid,
+    },
 }
 
 #[cfg(feature = "host")]
@@ -63,18 +69,27 @@ pub(crate) fn affected_account(operation: &Operation) -> Result<Option<super::Ac
             key,
             path,
         } => {
-            let chosen = if let Some(relative) = path.trim().strip_prefix("~/") {
-                std::path::PathBuf::from(std::env::var_os("HOME").ok_or("HOME unavailable")?)
-                    .join(relative)
-            } else {
-                std::path::PathBuf::from(path.trim())
-            };
-            if !chosen.is_absolute() {
-                return Err("Enter an absolute account home path".into());
-            }
+            let chosen =
+                super::expand_linked_home(path.trim(), std::env::var_os("HOME").as_deref())?;
             // Keep the user's ORIGINAL operand. Home capture resolves and pins
             // it while retaining this spelling for every later revalidation.
             Ok(Some(Account::linked(*provider, *key, chosen)))
+        }
+        // Only the home being restored is reserved. Its duplicate check reads
+        // the system login the way the accounts view does, without making
+        // every open terminal on the system home refuse the restoration.
+        Operation::Restore { provider, key } => {
+            if registry.contains_managed_home(&homes, *provider, *key) {
+                return Ok(None);
+            }
+            if !homes.is_unregistered(&registry, *provider, *key) {
+                return Err(NO_HOME.into());
+            }
+            Ok(Some(Account::managed(
+                *provider,
+                *key,
+                homes.path(*provider, *key),
+            )))
         }
         Operation::Create { provider, .. } => Ok(Some(Account::system(*provider))),
         Operation::Remove { id } => registry
@@ -83,7 +98,6 @@ pub(crate) fn affected_account(operation: &Operation) -> Result<Option<super::Ac
             .find(|account| account.id() == *id)
             .map(Some)
             .ok_or("The device account was removed".into()),
-        _ => Ok(None),
     }
 }
 
@@ -93,7 +107,8 @@ pub(crate) fn affected_accounts(operation: &Operation) -> Result<Vec<super::Acco
         Operation::Create { provider, .. }
         | Operation::Link { provider, .. }
         | Operation::Register { provider, .. }
-        | Operation::Abandon { provider, .. } => Some(provider),
+        | Operation::Abandon { provider, .. }
+        | Operation::Restore { provider, .. } => Some(provider),
         _ => None,
     };
     if provider.is_some_and(|provider| !super::Account::PROVIDERS.contains(provider)) {
@@ -132,6 +147,22 @@ pub enum Settled {
         registry: Option<super::registry::Registry>,
     },
     Abandoned(Option<super::registry::Registry>),
+}
+
+#[cfg(feature = "host")]
+const NO_HOME: &str = "This account's files are no longer on this device";
+/// A home the sign-in left behind - it duplicated a listed account, or was
+/// cancelled - is not an account the list lost.
+#[cfg(feature = "host")]
+const RELEASED: &str =
+    "This home is from a sign-in that was not kept, so it is not restored. Its files were kept.";
+
+/// The reply to [`Operation::Restore`].
+#[cfg(any(feature = "ui", feature = "host"))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RestoredHome {
+    pub registry: super::registry::Registry,
+    pub restored: super::registry::Restored,
 }
 
 #[cfg(feature = "host")]
@@ -197,7 +228,7 @@ fn execute_at(
                 })
             })?;
             let account = Account::managed(provider, key, home.clone());
-            let recipe = match login_recipe(&account, program) {
+            let recipe = match login_recipe_with_path(&account, program, search.as_deref()) {
                 Ok(recipe) => recipe,
                 Err(error) => {
                     return Err(format!(
@@ -216,17 +247,8 @@ fn execute_at(
             if !Account::PROVIDERS.contains(&provider) {
                 return Err("Omp manages its own logins".into());
             }
-            let chosen = if let Some(relative) = path.trim().strip_prefix("~/") {
-                std::path::PathBuf::from(
-                    std::env::var_os("HOME").ok_or("Remote HOME is unavailable")?,
-                )
-                .join(relative)
-            } else {
-                std::path::PathBuf::from(path.trim())
-            };
-            if !chosen.is_absolute() {
-                return Err("Enter an absolute device path or one starting with ~/".into());
-            }
+            let chosen =
+                super::expand_linked_home(path.trim(), std::env::var_os("HOME").as_deref())?;
             let path = reservation.link_home(provider, key, &chosen)?;
             crate::secure_file::validate_owned_directory(&path)
                 .map_err(|error| error.to_string())?;
@@ -279,7 +301,7 @@ fn execute_at(
             }
             if !probe::confirms_login(identity.as_ref(), snapshot.status) {
                 let (registry, ()) = reservation.commit(|| {
-                    store.try_update_reserved(reservation, |registry| registry.abandon(key))
+                    store.try_update_reserved(reservation, |registry| registry.release(key, &homes))
                 })?;
                 return serde_json::to_value(Settled::Abandoned(Some(registry)))
                     .map_err(|error| error.to_string());
@@ -323,7 +345,9 @@ fn execute_at(
                 },
                 Err(existing) => {
                     let (registry, ()) = reservation.commit(|| {
-                        store.try_update_reserved(reservation, |registry| registry.abandon(key))
+                        store.try_update_reserved(reservation, |registry| {
+                            registry.release(key, &homes)
+                        })
                     })?;
                     Settled::Duplicate {
                         existing,
@@ -343,10 +367,15 @@ fn execute_at(
                 return Err("This pending sign-in changed on the device".into());
             }
             let (registry, ()) = reservation.commit(|| {
-                store.try_update_reserved(reservation, |registry| registry.abandon(key))
+                store.try_update_reserved(reservation, |registry| registry.release(key, &homes))
             })?;
             serde_json::to_value(Settled::Abandoned(Some(registry)))
                 .map_err(|error| error.to_string())
+        }
+        Operation::Restore { provider, key } => {
+            let restored = restore_reserved(&runtime, reservation, &homes, &store, provider, key)
+                .map_err(|failure| failure.message)?;
+            serde_json::to_value(restored).map_err(|error| error.to_string())
         }
         Operation::Remove { id } => {
             let registry = store.try_load().map_err(|error| error.to_string())?;
@@ -374,22 +403,195 @@ fn execute_at(
     }
 }
 
+/// Why a home was not restored.
 #[cfg(feature = "host")]
+#[derive(Debug)]
+pub(crate) struct RestoreFailure {
+    pub message: String,
+    /// The home was examined and stays as it is: asking again would get the
+    /// same answer. Otherwise something was busy or did not answer.
+    pub settled: bool,
+}
+
+#[cfg(feature = "host")]
+impl RestoreFailure {
+    fn settled(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            settled: true,
+        }
+    }
+}
+
+#[cfg(feature = "host")]
+impl<T: Into<String>> From<T> for RestoreFailure {
+    fn from(message: T) -> Self {
+        Self {
+            message: message.into(),
+            settled: false,
+        }
+    }
+}
+
+/// Restores one of this installation's unregistered homes under the
+/// daemon's reservation on it. Used by the daemon's startup sweep.
+#[cfg(feature = "host")]
+pub(crate) fn restore_installation_home(
+    reservation: &crate::host::AccountReservation,
+    provider: Provider,
+    key: uuid::Uuid,
+) -> Result<RestoredHome, RestoreFailure> {
+    use super::{home::Homes, registry::Store};
+    let homes = Homes::installation().ok_or("The device has no account data directory")?;
+    let store = Store::installation().ok_or("The device has no account registry")?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())?;
+    reservation.verify()?;
+    restore_reserved(&runtime, reservation, &homes, &store, provider, key)
+}
+
+/// Restores one managed home the registry lost, keeping its original key.
+///
+/// The home must be this user's own real directory in this installation's
+/// managed namespace, named by its key, and the provider's status probe -
+/// the same one that confirms a new sign-in - must confirm a login in it.
+/// A home with no confirmed login is left exactly as it is: it may be a
+/// sign-in that never finished. A login the system account or another
+/// active account already uses is recorded archived, not listed twice.
+#[cfg(feature = "host")]
+fn restore_reserved(
+    runtime: &tokio::runtime::Runtime,
+    reservation: &crate::host::AccountReservation,
+    homes: &super::home::Homes,
+    store: &super::registry::Store,
+    provider: Provider,
+    key: uuid::Uuid,
+) -> Result<RestoredHome, RestoreFailure> {
+    use super::{
+        Account, UsageStatus,
+        cache::Cache,
+        probe::{self, Outcome},
+        registry::{Registered, RestoreProbe, Restored},
+    };
+    if !Account::PROVIDERS.contains(&provider) {
+        return Err(RestoreFailure::settled("Omp manages its own logins"));
+    }
+    let registry = store.try_load().map_err(|error| error.to_string())?;
+    if registry.is_newer() {
+        return Err(RestoreFailure::settled(
+            "The account list was saved by a newer cagents, so this version leaves it unchanged",
+        ));
+    }
+    if registry.contains_managed_home(homes, provider, key) {
+        return Ok(RestoredHome {
+            registry,
+            restored: Restored::AlreadyRegistered,
+        });
+    }
+    if !homes.is_unregistered(&registry, provider, key) {
+        return Err(RestoreFailure::settled(NO_HOME));
+    }
+    if registry.is_released(key) {
+        return Err(RestoreFailure::settled(RELEASED));
+    }
+    let cli = probe::cli_name(provider);
+    let account = Account::managed(provider, key, homes.path(provider, key));
+    let outcome = {
+        let _probe = RestoreProbe::begin(provider, key).ok_or_else(|| {
+            RestoreFailure::from("This account is already being restored; try again in a moment")
+        })?;
+        runtime.block_on(probe::run(account, Cache::installation(), true))
+    };
+    let (identity, snapshot) = match outcome {
+        Outcome::Answered {
+            identity, snapshot, ..
+        } => (identity, snapshot),
+        Outcome::Failed(error) => {
+            return Err(format!("{cli} could not confirm this account's sign-in: {error}").into());
+        }
+        Outcome::Busy => {
+            return Err(
+                format!("{cli} is already checking this account; try again in a moment").into(),
+            );
+        }
+    };
+    if snapshot.status == UsageStatus::NeedsLogin
+        || !probe::confirms_login(identity.as_ref(), snapshot.status)
+    {
+        return Err(RestoreFailure::settled(format!(
+            "{cli} reports no sign-in for this account, so it was not restored. Its files were kept."
+        )));
+    }
+    reservation.verify()?;
+    let system = match runtime.block_on(probe::run(
+        Account::system(provider),
+        Cache::installation(),
+        false,
+    )) {
+        Outcome::Answered {
+            identity: Some(identity),
+            ..
+        } => vec![(provider, identity)],
+        Outcome::Answered { identity: None, .. } => Vec::new(),
+        // Without the system login, a duplicate of it would be listed twice.
+        Outcome::Failed(_) | Outcome::Busy => {
+            return Err(format!(
+                "{cli} could not report the system account's login to compare with; try again"
+            )
+            .into());
+        }
+    };
+    let added_at = std::fs::metadata(homes.path(provider, key))
+        .and_then(|metadata| metadata.created())
+        .ok()
+        .and_then(|created| created.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|since| u64::try_from(since.as_millis()).ok())
+        .or_else(crate::chat::now_ms)
+        .unwrap_or_default();
+    let managed = Registered {
+        key,
+        provider,
+        linked_home: None,
+        label: None,
+        email: identity
+            .as_ref()
+            .and_then(|identity| identity.email.clone()),
+        organization: identity
+            .as_ref()
+            .and_then(|identity| identity.organization.clone()),
+        added_at,
+    };
+    let (registry, restored) =
+        reservation.commit(|| store.try_restore_reserved(reservation, homes, managed, &system))?;
+    Ok(RestoredHome { registry, restored })
+}
+
+#[cfg(feature = "host")]
+#[cfg(test)]
 fn login_recipe(
     account: &super::Account,
     program: std::path::PathBuf,
 ) -> Result<crate::model::LaunchRecipe, String> {
+    login_recipe_with_path(
+        account,
+        program,
+        super::probe::current_search_path().as_deref(),
+    )
+}
+
+#[cfg(feature = "host")]
+fn login_recipe_with_path(
+    account: &super::Account,
+    program: std::path::PathBuf,
+    search_path: Option<&std::ffi::OsStr>,
+) -> Result<crate::model::LaunchRecipe, String> {
     let mut environment = std::collections::BTreeMap::new();
-    if let (Some(variable), Some(home)) = (
-        super::home_variable(account.provider),
-        account.resolved_home(),
-    ) {
-        environment.insert(variable.into(), home.display().to_string());
-    }
-    if let Some(path) = super::probe::shell_search_path().and_then(|path| path.to_str()) {
+    if let Some(path) = search_path.and_then(|path| path.to_str()) {
         environment.insert("PATH".into(), path.into());
     }
-    Ok(crate::model::LaunchRecipe {
+    let mut recipe = crate::model::LaunchRecipe {
         program: program.to_str().ok_or("Provider path is not UTF-8")?.into(),
         arguments: match account.provider {
             Provider::Claude => vec!["auth".into(), "login".into(), "--claudeai".into()],
@@ -405,7 +607,9 @@ fn login_recipe(
             .iter()
             .map(|name| (*name).into())
             .collect(),
-    })
+    };
+    account.bind_home(&mut recipe)?;
+    Ok(recipe)
 }
 
 #[cfg(all(test, feature = "host"))]
@@ -582,5 +786,29 @@ mod tests {
             std::fs::read(linked.join("history")).unwrap(),
             b"keep linked history"
         );
+    }
+
+    #[test]
+    fn a_prepared_remote_login_uses_its_selected_path_snapshot() {
+        let selected = std::ffi::OsString::from("/old/node/bin:/old/cli/bin");
+        let recipe = login_recipe_with_path(
+            &Account::system(Provider::Codex),
+            "/old/cli/bin/codex".into(),
+            Some(&selected),
+        )
+        .unwrap();
+        assert_eq!(recipe.program, "/old/cli/bin/codex");
+        assert_eq!(
+            recipe.environment.get("PATH").map(String::as_str),
+            selected.to_str()
+        );
+        assert_eq!(recipe.arguments, ["login", "--device-auth"]);
+        let no_path = login_recipe_with_path(
+            &Account::system(Provider::Codex),
+            "/old/cli/bin/codex".into(),
+            None,
+        )
+        .unwrap();
+        assert!(!no_path.environment.contains_key("PATH"));
     }
 }

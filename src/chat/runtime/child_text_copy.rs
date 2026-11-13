@@ -1,6 +1,6 @@
 //! Copy authority for complete text already held by the bounded child view.
 //! This module owns metadata only; trimming never leaves another body owner.
-use super::{Event, ItemContent, Snapshot};
+use super::{Event, Snapshot};
 use crate::chat::{TEXT_COPY_PAGE_BYTES, TextCopyPage, TextCopyScope, TextCopySource};
 use std::collections::BTreeMap;
 
@@ -12,10 +12,7 @@ pub(super) struct Update {
 }
 
 fn text(item: &crate::chat::Item) -> Option<&str> {
-    match &item.content {
-        ItemContent::Text { text, .. } => Some(text),
-        _ => None,
-    }
+    item.logical_copy_body()
 }
 
 fn valid(source: &TextCopySource, child: &str, body: &str) -> bool {
@@ -205,7 +202,7 @@ pub(super) fn read(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chat::{Item, Phase, Role, ToolStatus};
+    use crate::chat::{DeliveryKind, Item, ItemContent, Phase, Role, ToolStatus};
 
     fn apply(state: &mut Snapshot, event: Event) {
         super::super::apply_event(state, &mut BTreeMap::new(), event);
@@ -248,6 +245,69 @@ mod tests {
         state.text_copy_sources.children[child][index]
             .clone()
             .expect("complete child source")
+    }
+
+    fn context(id: &str, body: &str) -> Item {
+        Item {
+            role: Role::System,
+            content: ItemContent::Delivery {
+                kind: DeliveryKind::Notice,
+                from: String::new(),
+                sender: String::new(),
+                summary: "Claude context".into(),
+                body: body.into(),
+            },
+            ..item(id, "")
+        }
+    }
+
+    #[test]
+    fn provider_context_copy_keeps_child_identity_and_rejects_rewrite_trim_and_user_notice() {
+        let mut state = Snapshot::default();
+        let publish = |state: &mut Snapshot, child: &str, item| {
+            apply(
+                state,
+                Event::SubagentItem {
+                    id: child.into(),
+                    item,
+                },
+            );
+        };
+        publish(&mut state, "first", context("same", "original λ\r\n"));
+        publish(&mut state, "second", context("same", "other child"));
+        let first = source(&state, "first", 0);
+        let second = source(&state, "second", 0);
+        assert_eq!(read(&state, &first, 0).unwrap().text, "original λ\r\n");
+        assert_eq!(read(&state, &second, 0).unwrap().text, "other child");
+        let mut wrong_child = first.clone();
+        wrong_child.scope = second.scope.clone();
+        assert!(read(&state, &wrong_child, 0).is_err());
+        publish(
+            &mut state,
+            "first",
+            context("same", "original λ\r\n appended"),
+        );
+        assert_eq!(read(&state, &first, 0).unwrap().text, "original λ\r\n");
+        publish(&mut state, "first", context("same", "rewritten"));
+        assert!(read(&state, &first, 0).is_err());
+        let rewritten = source(&state, "first", 0);
+        publish(
+            &mut state,
+            "first",
+            context("same", &"x".repeat(MAX_BYTES + 1)),
+        );
+        assert!(state.text_copy_sources.children["first"][0].is_none());
+        assert!(read(&state, &rewritten, 0).is_err());
+        publish(&mut state, "first", context("same", "recovered full body"));
+        assert_eq!(
+            read(&state, &source(&state, "first", 0), 0).unwrap().text,
+            "recovered full body"
+        );
+        let mut user_notice = context("same", "ordinary visible notice");
+        user_notice.role = Role::User;
+        publish(&mut state, "first", user_notice);
+        assert!(state.text_copy_sources.children["first"][0].is_none());
+        assert_eq!(read(&state, &second, 0).unwrap().text, "other child");
     }
 
     #[test]

@@ -78,7 +78,8 @@ pub struct CommandSpec {
     pub timeout: Option<Duration>,
     pub stdout_limit: usize,
     pub stderr_limit: usize,
-    // Borrowed only during execute; the journal service holds the owning file.
+    // Borrowed only during execute; the journal holds a scoped SH lock. The
+    // child opens its independent SH description after fork and retains it across exec.
     pub(crate) inherited_lease: Option<i32>,
     inherited_files: Vec<InheritedFile>,
 }
@@ -161,12 +162,20 @@ impl CommandSpec {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
             if let Some(lease) = self.inherited_lease {
-                // SAFETY: fcntl is async-signal-safe; only the child clears CLOEXEC
-                // on a duplicate. Descendants retain the flock across parent death.
+                let path = std::ffi::CString::new(format!("/proc/self/fd/{lease}")).unwrap();
+                // SAFETY: the path is prepared before fork. Only Linux open,
+                // flock and close syscalls run here; the child alone creates
+                // its independent, non-CLOEXEC shared lease description.
                 unsafe {
                     command.pre_exec(move || {
-                        if libc::fcntl(lease, libc::F_DUPFD, 3) == -1 {
+                        let child_lease = libc::open(path.as_ptr(), libc::O_RDWR);
+                        if child_lease == -1 {
                             return Err(io::Error::last_os_error());
+                        }
+                        if libc::flock(child_lease, libc::LOCK_SH | libc::LOCK_NB) != 0 {
+                            let error = io::Error::last_os_error();
+                            libc::close(child_lease);
+                            return Err(error);
                         }
                         Ok(())
                     });
@@ -295,7 +304,7 @@ impl ProcessFailure {
     ///
     /// [`ProcessFailureKind::Exit`] is the one kind whose own `message` says
     /// nothing: `Display` renders it as `{program}: process exited with status
-    /// Some(4)`, a number standing in for the two sentences `gh` wrote about
+    /// 4`, a number standing in for the two sentences `gh` wrote about
     /// how to log in, or for `fatal: not a git repository`. So it is the one
     /// kind whose stderr is preferred, and only when there is some.
     ///
@@ -352,7 +361,11 @@ impl ProcessOutput {
                 signal: self.signal,
                 stdout: self.stdout,
                 stderr: self.stderr,
-                message: format!("process exited with status {:?}", self.exit_code),
+                message: match (self.exit_code, self.signal) {
+                    (Some(code), _) => format!("process exited with status {code}"),
+                    (None, Some(signal)) => format!("process was terminated by signal {signal}"),
+                    (None, None) => "process exited unsuccessfully".to_owned(),
+                },
                 started: true,
             })
         }
@@ -880,6 +893,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_failed_exit_names_its_status_or_signal_rather_than_an_option() {
+        let failure = |exit_code, signal| {
+            ProcessOutput {
+                exit_code,
+                signal,
+                success: false,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            }
+            .require_success(Path::new("gh"))
+            .unwrap_err()
+            .to_string()
+        };
+        assert_eq!(failure(Some(1), None), "gh: process exited with status 1");
+        assert_eq!(
+            failure(None, Some(9)),
+            "gh: process was terminated by signal 9"
+        );
+        assert_eq!(failure(None, None), "gh: process exited unsuccessfully");
+    }
+
+    #[test]
     #[cfg(target_os = "linux")]
     fn inherited_directory_survives_spec_drop_and_path_replacement() {
         use std::os::unix::fs::MetadataExt;
@@ -1391,10 +1426,31 @@ sys.exit(7)
 
     #[cfg(unix)]
     #[test]
-    fn a_quick_command_returns_without_any_polling_latency() {
-        // The old 15 ms poll interval cost at least one sleep per invocation, so
-        // twenty of these could not have come in under ~300 ms. The wait now
-        // blocks on the child, so the only cost is fork/exec.
+    fn repeated_quick_commands_preserve_output_status_and_unregister_cancellation() {
+        let command = CommandSpec::new("/bin/sh")
+            .args(["-c", "printf quick; printf diagnostic >&2"])
+            .timeout(Duration::from_secs(5));
+        let cancellation = CancellationToken::new();
+
+        for _ in 0..20 {
+            let output = SystemProcessExecutor
+                .execute(&command, &cancellation)
+                .unwrap();
+            assert!(output.success);
+            assert_eq!(output.exit_code, Some(0));
+            assert_eq!(output.signal, None);
+            assert_eq!(output.stdout, b"quick");
+            assert_eq!(output.stderr, b"diagnostic");
+            assert!(lock_wakers(&cancellation.0).is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "wall-clock performance benchmark; run explicitly on an idle host"]
+    fn quick_command_latency_benchmark() {
+        // This diagnostic includes fork/exec and scheduler latency. The
+        // deterministic readiness-wait tests cover the poll timeout policy.
         let command = CommandSpec::new("/bin/sh")
             .args(["-c", "exit 0"])
             .timeout(Duration::from_secs(5));
@@ -1409,7 +1465,7 @@ sys.exit(7)
 
         assert!(
             elapsed < Duration::from_millis(250),
-            "20 trivial commands took {elapsed:?}, which suggests a polling wait"
+            "20 trivial commands took {elapsed:?}, exceeding the 250 ms benchmark budget"
         );
     }
 

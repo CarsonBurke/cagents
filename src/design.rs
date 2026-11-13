@@ -3,11 +3,12 @@
 //! COSMIC supplies the palette and the widget toolkit; everything a surface
 //! needs to look like part of this workbench is named here. Dimensions live
 //! in this module, the spacing scale in [`space`], semantic color in `color`,
-//! the type scale in `typography`, and the responsive mounting of the shell's
-//! regions in `layout`. Composed controls live in [`crate::ui_controls`].
+//! the type scale and its spacing rhythm in `typography`, the shared list grid
+//! in [`list`], and the responsive mounting of the shell's regions in `layout`. Composed controls live in [`crate::ui_controls`].
 
 mod color;
 mod layout;
+pub mod list;
 pub mod space;
 mod typography;
 
@@ -39,8 +40,6 @@ pub const TAB_STATUS_ICON_SIZE: u16 = 14;
 pub const WINDOW_CONTROL_SIZE: f32 = 32.0;
 pub const COMMAND_POPOVER_WIDTH: f32 = 292.0;
 pub const NOTICE_POPOVER_WIDTH: f32 = 408.0;
-pub const PANE_NAVIGATOR_MIN_WIDTH: f32 = 42.0;
-pub const PANE_NAVIGATOR_RESERVED_WIDTH: f32 = 110.0;
 pub const TAB_MIN_WIDTH: f32 = 160.0;
 pub const TAB_MAX_WIDTH: f32 = 420.0;
 /// New panes fill a tiled workspace without changing existing pane widths.
@@ -126,6 +125,11 @@ pub use crate::layout_metrics::{
     NAVIGATION_MAX_WIDTH, NAVIGATION_MIN_WIDTH,
 };
 pub const NAVIGATION_RAIL_WIDTH: f32 = 52.0;
+
+/// The band along a free window edge in which the window shell, not the
+/// interface, receives presses and starts an interactive resize. It is in the
+/// compositor's logical pixels, before the interface scale.
+pub const WINDOW_RESIZE_BORDER: f32 = 8.0;
 
 /// Shared gutter geometry for native scrollables and custom-rendered content.
 ///
@@ -234,6 +238,38 @@ pub const ELEVATION: iced::Shadow = iced::Shadow {
     offset: iced::Vector::new(0.0, 4.0),
     blur_radius: 16.0,
 };
+
+/// A pane docked against the window's leading edge, on COSMIC's Primary
+/// layer.
+///
+/// `Container::Primary` rounds all four corners for a card floating in a
+/// layout. A navigation pane runs the full height of the window and meets its
+/// neighbour at a rule, so a rounded corner there only notches the frame:
+/// against the content beside it and the status bar beneath it. Only the
+/// top-left corner is the window's own, so it alone follows the window: round
+/// as libcosmic rounds a floating window, square when the window is
+/// maximized or tiled. The layer's fill and ink are unchanged.
+pub fn docked_primary(window_rounded: bool) -> cosmic::theme::Container<'static> {
+    cosmic::theme::Container::custom(move |theme| widget::container::Style {
+        border: iced::Border {
+            radius: iced::border::Radius::default().top_left(if window_rounded {
+                window_corner_radius(theme)
+            } else {
+                0.0
+            }),
+            ..iced::Border::default()
+        },
+        ..cosmic::theme::Container::primary(theme.cosmic(), theme.transparent)
+    })
+}
+
+/// The radius libcosmic gives a floating window's corners
+/// (`cosmic::app::Application::view_main`), so content painted into a window
+/// corner meets the window's outline instead of squaring it off.
+pub fn window_corner_radius(theme: &cosmic::Theme) -> f32 {
+    let radius = theme.cosmic().radius_s()[0];
+    if radius < 4.0 { radius } else { radius + 4.0 }
+}
 
 /// An alignment-only container class.
 ///

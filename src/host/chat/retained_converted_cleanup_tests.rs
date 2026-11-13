@@ -4,6 +4,9 @@ use std::{fs, path::Path};
 
 #[test]
 fn pending_converted_cleanup_preserves_independent_terminal_worker() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     const CHILD: &str = "CAGENTS_PENDING_CONVERTED_CLEANUP_TEST";
     if std::env::var_os(CHILD).is_none() {
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
@@ -23,6 +26,7 @@ fn pending_converted_cleanup_preserves_independent_terminal_worker() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", &exact, "--nocapture"])
             .env_clear()
+            .envs(crate::retained_fixture::owner_env())
             .env(CHILD, "1")
             .env(
                 "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
@@ -171,6 +175,7 @@ fn pending_converted_cleanup_preserves_independent_terminal_worker() {
             source: source.clone(),
             requested: source.clone(),
             context: context.clone(),
+            failed_close: None,
         },
     );
     drop(lease);
