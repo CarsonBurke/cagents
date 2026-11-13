@@ -273,7 +273,9 @@ makes no claim about previously disowned processes outside that family. Native
 provider holders separately reap all owned provider/tool descendants before
 confirming their release. While they run, native holders and retained Claude
 actors also reap tool processes that their provider left behind and that have
-exited, without signalling any process that is still running.
+exited, without signalling any process that is still running. They reap when a
+child exits, read from a signalfd, rather than on a timer, so an idle actor
+does not wake.
 The live emulator's screen before an unexpected crash is unavailable; the UI
 warns once for the affected pane, preserves subsequent output, and requests that
 foreground programs redraw through the PTY. That redraw temporarily toggles one

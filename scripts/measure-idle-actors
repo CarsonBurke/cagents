@@ -64,16 +64,19 @@ cleanup() {
 trap cleanup EXIT
 
 fixture "$bin/cagents" project open "$root/project" >/dev/null
-names=()
+# One at a time: the daemon bounds how many agents may run at once, and a
+# settled one no longer counts.
 for i in $(seq 1 "$count"); do
-    names+=("idle-$i")
     fixture "$bin/cagents" agent spawn --provider claude --name "idle-$i" \
         --repository "$root/project" 'Say hello.' >/dev/null
+    fixture "$bin/cagents" agent wait --timeout 60 "idle-$i" >/dev/null
 done
-fixture "$bin/cagents" agent wait --timeout 300 "${names[@]}" >/dev/null
-actors=$(for pid in $(fixture_processes); do
-    tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q -- '--cagents-native-actor' && echo "$pid"
-done | wc -l)
+actors=0
+for pid in $(fixture_processes); do
+    if tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q -- '--cagents-native-actor'; then
+        actors=$((actors + 1))
+    fi
+done
 printf 'build=%s actors=%s; settling 10 s\n' "$bin" "$actors"
 sleep 10
 python3 -I "$checkout/scripts/measure-idle-wakeups" --seconds "$seconds" \
