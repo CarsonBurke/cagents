@@ -686,6 +686,11 @@ impl Renderer {
                     self.dark,
                 )
                     .hash(&mut revision);
+                // A block showing an image draws again once its preview is
+                // decoded, released or found missing.
+                if markdown::shows_image(item) {
+                    self.figures.version().hash(&mut revision);
+                }
                 let revision = revision.finish();
                 let estimate = renderer.stats().estimate(settings)
                     + if index == 0 { 0.0 } else { settings.spacing.0 };

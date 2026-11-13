@@ -2236,6 +2236,7 @@ impl Runtime {
                     self.item_expanded(&item.id),
                     self.child_find_revision(),
                     dark,
+                    cached.shows_figures().then(|| self.figures.version()),
                 )
                     .hash(&mut revision);
                 let estimate = CachedItem::prose(&item.content).map_or(80.0, |body| {
@@ -6324,6 +6325,9 @@ mod issue1506_tests;
 
 #[cfg(test)]
 mod user_image_preview_tests;
+
+#[cfg(test)]
+mod figure_tests;
 
 #[cfg(test)]
 mod provider_context_tests;

@@ -81,6 +81,17 @@ pub(in crate::app) enum Outcome {
     Deferred(Pressure),
 }
 
+#[cfg(test)]
+impl Outcome {
+    pub(in crate::app) fn ready_for_test() -> Self {
+        Self::Ready {
+            handle: iced::widget::image::Handle::from_rgba(2, 1, vec![0; 8]),
+            path: "/var/tmp/mockup.png".into(),
+            stamp: None,
+        }
+    }
+}
+
 enum State {
     /// Not loaded yet, or released; `size` keeps a released preview's room.
     Unseen {
@@ -334,6 +345,14 @@ impl Figures {
             store.trim();
         }
         None
+    }
+
+    /// Starts loading image `id` of a parent conversation, as a worker would.
+    #[cfg(test)]
+    pub(in crate::app) fn begin_for_test(&self, id: u64) -> u64 {
+        self.begin(id, false, false)
+            .expect("an image to load")
+            .attempt
     }
 
     /// The preview drawn with `image`, for the image context menu's Copy.
@@ -604,6 +623,11 @@ fn menu(
 }
 
 impl Shared {
+    /// Changes whenever any image this item could show draws differently.
+    pub(in crate::app::chat_ui) fn version(&self) -> u64 {
+        self.figures.version()
+    }
+
     /// Image `url` as an answer shows it: a preview, or a compact link to its
     /// source. `alt` names it for the tooltip and assistive technology;
     /// `title` is shown beneath a preview only when the answer gives one.
