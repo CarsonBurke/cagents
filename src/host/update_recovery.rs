@@ -76,14 +76,28 @@ pub(super) fn restore_ordinary(host: &SharedHost) -> Result<(), String> {
     let retained_runs = chat::retained_actor::retained_runs(host);
     // A committed acceptance is not proof of provider delivery. Until a
     // restored actor supplies exact run evidence, never authorize a resend.
+    let boot = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .proof()
+        .boot_id
+        .clone();
     if let Ok(registry) = agent_execution::registry(host) {
-        registry
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .interrupt_unproven_agent_runs_except(
-                crate::chat::now_ms().unwrap_or(0),
-                &retained_runs,
-            )?;
+        let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+        registry.interrupt_unproven_agent_runs_except(
+            crate::chat::now_ms().unwrap_or(0),
+            &retained_runs,
+        )?;
+        // With every earlier run settled, an agent whose pane records an
+        // unadopted in-place reopen from an earlier boot follows its pane, so
+        // that pane's view can open again.
+        let adopted = registry.adopt_reopened_panes(&boot)?;
+        if adopted > 0 {
+            tracing::info!(
+                adopted,
+                "agents followed panes reopened in place before this boot"
+            );
+        }
     }
     let (proof, terminals, chats) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());

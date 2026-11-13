@@ -1868,13 +1868,20 @@ impl Registry {
     /// pending launch refuse; runs that ended (including `Interrupted` ones a
     /// crash recovery recorded) do not. Returns whether anything changed; no
     /// authority is issued for the successor.
+    ///
+    /// A conversation can also reopen in place after an unclean restart,
+    /// keeping its chat ID under a new process proof, as a Codex conversation
+    /// does through its retained listener allocation. That successor is the
+    /// same chat under a later boot; only an earlier boot proves its
+    /// predecessor ended, and any authority that predecessor held is dropped.
     pub(crate) fn adopt_successor(
         &mut self,
         predecessor: &crate::chat::Session,
         successor: &crate::chat::Session,
     ) -> Result<bool, String> {
-        if successor.id == predecessor.id {
-            return Err("A resumed successor needs its own chat ID".into());
+        let in_place = successor.id == predecessor.id;
+        if in_place && successor == predecessor {
+            return Ok(false);
         }
         if successor.launch.provider != predecessor.launch.provider
             || successor.launch.recipe.working_directory
@@ -1912,7 +1919,7 @@ impl Registry {
                 |row| row.get(0),
             )
             .map_err(|error| error.to_string())?;
-        if bound {
+        if bound && !in_place {
             return Err("The successor already belongs to another agent".into());
         }
         // Only a recorded stop, or a boot the successor does not share, proves
@@ -1923,30 +1930,31 @@ impl Registry {
             .proof
             .as_ref()
             .is_some_and(|proof| proof.boot_id != boot);
-        if !stopped && !earlier_boot {
+        // A chat reopened in place shares its ID with the process it
+        // replaces, so only a boot that process did not survive tells them
+        // apart.
+        if !earlier_boot && (in_place || !stopped) {
             return Err("The predecessor may still be running; stop it first".into());
         }
         // Any authority left from an earlier boot is stale. Rewriting the
         // record below also drops the predecessor's stop marker.
-        tx.execute(
-            "DELETE FROM agent_authorities WHERE session_id = ?1",
-            [predecessor.id.to_string()],
-        )
-        .map_err(|error| error.to_string())?;
-        // A prompt still queued unsent belongs to the agent, not to the ended
-        // process, and goes to the successor.
-        let unsettled: bool = tx
-            .query_row(
-                &format!(
-                    "SELECT EXISTS(SELECT 1 FROM agent_runs r WHERE r.agent = ?1
-                     AND r.state IN ('accepted', 'running', 'waiting') AND NOT ({UNSENT}))
-                 OR EXISTS(SELECT 1 FROM agent_launches WHERE agent = ?1)"
-                ),
-                [agent.id.to_string()],
-                |row| row.get(0),
+        if in_place {
+            // The reopened process shares the ID; keep only what was issued
+            // to it.
+            let successor_source = encode(&HostedSession::Chat(successor.clone()))?;
+            tx.execute(
+                "DELETE FROM agent_authorities WHERE session_id = ?1 AND source != ?2",
+                params![predecessor.id.to_string(), successor_source],
             )
             .map_err(|error| error.to_string())?;
-        if unsettled {
+        } else {
+            tx.execute(
+                "DELETE FROM agent_authorities WHERE session_id = ?1",
+                [predecessor.id.to_string()],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        if unsettled(&tx, agent.id)? {
             return Err("The stopped agent still has unsettled work; it cannot be rebound".into());
         }
         let next = HostedSession::Chat(successor.clone());
@@ -1969,6 +1977,80 @@ impl Registry {
         .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(true)
+    }
+
+    /// Rebind each open agent whose pane shows its chat reopened in place by
+    /// a process the agent never adopted, as one reopened before in-place
+    /// adoption existed. A pane that disagrees with its agent blocks its whole
+    /// view from opening, and so the reopen that would adopt it never comes.
+    /// Both processes must come from boots before `boot`, so neither can still
+    /// act; the agent then follows the pane, which records the later reopen,
+    /// and authority left to either is dropped. An agent with unsettled work
+    /// is left for that work's own recovery. Returns how many were rebound.
+    pub(in crate::host) fn adopt_reopened_panes(
+        &mut self,
+        boot: &crate::model::BootId,
+    ) -> Result<usize, String> {
+        let earlier = |session: &crate::chat::Session| {
+            session
+                .proof
+                .as_ref()
+                .is_some_and(|proof| proof.is_complete() && &proof.boot_id != boot)
+        };
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let records = tx
+            .prepare("SELECT record FROM agents WHERE closed = 0")
+            .map_err(|error| error.to_string())?
+            .query_map([], |row| row.get::<_, String>(0))
+            .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
+            .map_err(|error| error.to_string())?;
+        let mut adopted = 0;
+        for record in records {
+            let mut agent: Agent = decode(&record)?;
+            let Some(HostedSession::Chat(bound)) = &agent.session else {
+                continue;
+            };
+            let Some(shown) = super::views::agent_pane_chat(&tx, agent.id)? else {
+                continue;
+            };
+            let previous = HostedSession::Chat(bound.clone());
+            let next = HostedSession::Chat(shown.clone());
+            if shown.id != bound.id
+                || next.same_process(&previous)
+                || !earlier(bound)
+                || !earlier(&shown)
+                || shown.launch.provider != bound.launch.provider
+                || shown.launch.recipe.working_directory != bound.launch.recipe.working_directory
+                || unsettled(&tx, agent.id)?
+            {
+                continue;
+            }
+            tx.execute(
+                "DELETE FROM agent_authorities WHERE session_id = ?1",
+                [bound.id.to_string()],
+            )
+            .map_err(|error| error.to_string())?;
+            agent.console = shown.terminal.clone();
+            agent.session = Some(next);
+            tx.execute(
+                "UPDATE agents SET record = ?2 WHERE id = ?1",
+                params![agent.id.to_string(), encode(&agent)?],
+            )
+            .map_err(|error| error.to_string())?;
+            adopted += 1;
+        }
+        if adopted > 0 {
+            tx.execute(
+                "UPDATE metadata SET sequence = sequence + 1 WHERE key = 0",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(adopted)
     }
 
     /// Whether this open agent's bound process was proven to have ended (a
@@ -2396,6 +2478,23 @@ fn process_agent(tx: &Transaction<'_>, source: &HostedSession) -> Result<Option<
     .map_err(|e| e.to_string())?
     .map(|record| decode(&record))
     .transpose()
+}
+
+/// Whether the agent has work its bound process has not settled: a prompt
+/// accepted and sent but not finished, or a launch still pending. A prompt
+/// still queued unsent belongs to the agent, not to the process, and follows
+/// it to a successor.
+fn unsettled(tx: &Connection, agent: AgentId) -> Result<bool, String> {
+    tx.query_row(
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM agent_runs r WHERE r.agent = ?1
+             AND r.state IN ('accepted', 'running', 'waiting') AND NOT ({UNSENT}))
+         OR EXISTS(SELECT 1 FROM agent_launches WHERE agent = ?1)"
+        ),
+        [agent.to_string()],
+        |row| row.get(0),
+    )
+    .map_err(|error| error.to_string())
 }
 
 /// Whether a daemon stop recorded that this open agent's bound process ended.
