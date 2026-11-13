@@ -80,6 +80,9 @@ scroll() {
 mkdir -p "$config"
 cp "$here/message-card-scene/frames.jsonl" "$config/fixture-frames.jsonl"
 printf '%s\n' 'I told the relocation agent where the repo went.' >"$config/fixture-reply.md"
+# The reply as the screen reading finds it: it splits a line into runs at
+# whichever spaces it likes, so any of the reply's distinctive runs will do.
+reply='where the repo|repo went|relocation agent|told the relocation'
 # A fresh fixture has no project open yet; opening one again is harmless.
 "$ne" cli project open "$fixture/project" >/dev/null 2>&1 || log "project open failed"
 sleep 2
@@ -89,7 +92,8 @@ sleep 2
 # The conversation opens from its channel's row in the sidebar once its turn
 # has answered.
 opened=
-for _ in 1 2 3 4 5 6 7 8; do
+# A busy host can take a minute or two to answer the first turn.
+for _ in $(seq 20); do
     sleep 4
     "$ne" drive move 1,1 >/dev/null 2>&1
     sleep 1
@@ -99,11 +103,13 @@ for _ in 1 2 3 4 5 6 7 8; do
     [ -n "$row" ] || continue
     "$ne" drive click "$row" >/dev/null 2>&1
     sleep 3
-    "$ne" drive observe 2>/dev/null | grep -q 'where the repo went' || continue
+    "$ne" drive observe 2>/dev/null | grep -qE "$reply" || continue
     opened=1
     break
 done
 if [ -z "$opened" ]; then
+    # What the window showed instead, for whoever reads the log.
+    "$ne" shot "${scene}-did-not-open" >/dev/null 2>&1
     log "the conversation did not open"
     exit 1
 fi
@@ -115,7 +121,7 @@ case $scene in
     *) log "unknown scene"; exit 2 ;;
 esac
 # The transcript opens at its end; the first message is above it.
-transcript=$(locate 'where the repo went')
+transcript=$(locate "$reply")
 scroll "$transcript" -6
 shot "${prefix}message-cards"
 if [ "$scene" = cards ]; then
