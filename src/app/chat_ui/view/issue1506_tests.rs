@@ -961,13 +961,18 @@ fn child_chooser_actions_preserve_reader_and_cover_transcript_until_closed() {
         .insert(target.card, CardRuntime::Chat(Box::new(live)));
     let main_reader = Scroll::new(321.0, 4000.0, 600.0);
     let child_reader = Scroll::new(173.0, 3000.0, 600.0);
-    drop(app.handle_chat_ui(Action::Scrolled(target, None, main_reader, true)));
+    drop(app.handle_chat_ui(Action::Scrolled(
+        target,
+        None,
+        main_reader,
+        Some(Page::Earlier),
+    )));
     drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("chosen-worker".into()))));
     drop(app.handle_chat_ui(Action::Scrolled(
         target,
         Some("chosen-worker".into()),
         child_reader,
-        true,
+        Some(Page::Earlier),
     )));
     let publication = runtime(&app, target).snapshot.clone();
     let (before, mut cache) = labels(&app, target, Cache::new());

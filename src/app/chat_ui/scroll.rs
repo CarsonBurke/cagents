@@ -1198,7 +1198,7 @@ struct Anchor {
     active: Option<usize>,
     clock: u64,
     reported: Option<Report>,
-    pending_input: bool,
+    pending_input: Option<view::Page>,
     modifiers: iced::keyboard::Modifiers,
     seed: Option<Scroll>,
 }
@@ -1334,7 +1334,7 @@ impl Anchor {
             // estimate, and the next pass would faithfully keep the estimate.
             self.active = Some(index);
             if switched {
-                self.pending_input = false;
+                self.pending_input = None;
             }
             return Placement::Estimated(next.travel() - position.top);
         }
@@ -1360,7 +1360,7 @@ impl Anchor {
         }
         self.active = Some(index);
         if switched {
-            self.pending_input = false;
+            self.pending_input = None;
         }
         Placement::Settled(
             (edge.is_some()
@@ -1380,15 +1380,25 @@ fn navigation_input(
     scroll: Scroll,
     wheel: Option<f32>,
     child_captured: bool,
-) -> bool {
+) -> Option<view::Page> {
     match wheel {
-        Some(y) => {
-            !child_captured
-                && ((y > 0.0 && scroll.at_top() && before.is_none_or(|old| top <= old))
-                    || (y < 0.0 && scroll.at_bottom() && before.is_none_or(|old| top >= old)))
+        Some(y) if !child_captured => {
+            if y > 0.0 && scroll.at_top() && before.is_none_or(|old| top <= old) {
+                Some(view::Page::Earlier)
+            } else if y < 0.0 && scroll.at_bottom() && before.is_none_or(|old| top >= old) {
+                Some(view::Page::Newer)
+            } else {
+                None
+            }
         }
-        None => before.is_some_and(|old| {
-            old != top && (!scroll.at_top() || top < old) && (!scroll.at_bottom() || top > old)
+        Some(_) => None,
+        None => before.and_then(|old| {
+            (old != top && (!scroll.at_top() || top < old) && (!scroll.at_bottom() || top > old))
+                .then_some(if top < old {
+                    view::Page::Earlier
+                } else {
+                    view::Page::Newer
+                })
         }),
     }
 }
@@ -1617,7 +1627,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
         let mut restore = std::mem::take(&mut state.restore);
         let mut anchor = state.memory.0.borrow_mut();
         if restore {
-            anchor.pending_input = false;
+            anchor.pending_input = None;
         }
         if !anchor
             .contexts
@@ -1893,13 +1903,14 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
             if !correction.corrected
                 && let Some((top, geometry)) = after.0.zip(anchor.geometry())
             {
-                anchor.pending_input |= navigation_input(
+                anchor.pending_input = navigation_input(
                     before.0,
                     top,
                     Scroll::new(top, geometry.content.height, geometry.viewport.height),
                     None,
                     false,
-                );
+                )
+                .or(anchor.pending_input);
             }
         }
     }
@@ -2077,9 +2088,9 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                         }),
                         _ => None,
                     };
-                    let user_input = navigation_input(Some(saved_top), top, scroll, wheel, false)
-                        || anchor.pending_input;
-                    anchor.pending_input = false;
+                    let direction = navigation_input(Some(saved_top), top, scroll, wheel, false)
+                        .or(anchor.pending_input);
+                    anchor.pending_input = None;
                     anchor.reported = Some(Report {
                         subagent: self.subagent.map(str::to_owned),
                         top,
@@ -2092,13 +2103,13 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                     }
                     if let Some(target) = self
                         .target
-                        .filter(|_| self.observations.is_none() || user_input)
+                        .filter(|_| self.observations.is_none() || direction.is_some())
                     {
                         shell.publish(action(Action::Scrolled(
                             target,
                             self.subagent.map(str::to_owned),
                             scroll,
-                            user_input,
+                            direction,
                         )));
                     }
                 }
@@ -2172,10 +2183,10 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 .captured
                 .as_ref()
                 .is_some_and(|captured| captured.get());
-            let user_input = navigation_input(before.0, top, scroll, wheel, child_captured)
-                || anchor.pending_input;
-            if changed || user_input {
-                anchor.pending_input = false;
+            let direction = navigation_input(before.0, top, scroll, wheel, child_captured)
+                .or(anchor.pending_input);
+            if changed || direction.is_some() {
+                anchor.pending_input = None;
                 anchor.reported = Some(Report {
                     subagent: self.subagent.map(str::to_owned),
                     top,
@@ -2191,13 +2202,13 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 // must not cause another complete update/view/layout cycle.
                 if let Some(target) = self
                     .target
-                    .filter(|_| self.observations.is_none() || user_input)
+                    .filter(|_| self.observations.is_none() || direction.is_some())
                 {
                     shell.publish(action(Action::Scrolled(
                         target,
                         self.subagent.map(str::to_owned),
                         Scroll::new(top, geometry.content.height, geometry.viewport.height),
-                        user_input,
+                        direction,
                     )));
                 }
             }
@@ -3017,7 +3028,7 @@ mod tests {
                 &viewport,
             );
             let reports: Vec<_> = messages.into_iter().filter(|message| matches!(message,
-                Message::ChatUi(Action::Scrolled(actual, None, _, true)) if *actual == target
+                Message::ChatUi(Action::Scrolled(actual, None, _, Some(_))) if *actual == target
             )).collect();
             assert_eq!(
                 reports.len(),
@@ -3043,6 +3054,344 @@ mod tests {
                 }),
                 "actual App consumes the emitted wheel intent and starts the matching provider page"
             );
+        }
+    }
+
+    fn history_reader(
+        target: Target,
+        observations: Observations,
+        memory: Memory,
+        entries: Vec<(u64, &'static str, f32)>,
+        follow_end: bool,
+    ) -> Element<'static, Message> {
+        let ids = entries
+            .iter()
+            .map(|(_, id, _)| (item_id(id), *id))
+            .collect();
+        let rows = entries
+            .into_iter()
+            .map(|(key, id, height)| {
+                let mut row = virtualized::Row::new(
+                    key,
+                    u64::from(height.to_bits()),
+                    height,
+                    Some(item_id(id)),
+                    move || item(id, widget::Space::new().width(Length::Fill).height(height)),
+                );
+                row.anchor = true;
+                row
+            })
+            .collect();
+        transcript_observed(
+            virtualized::column(rows, Default::default()),
+            target,
+            None,
+            vec![],
+            follow_end,
+            ids,
+            observations,
+            memory,
+            false,
+            HashSet::new(),
+            None,
+        )
+    }
+
+    #[test]
+    fn native_paging_shrinks_to_loaded_content_and_wheels_choose_each_edge() {
+        let renderer = crate::app::tests::headless_renderer();
+        let viewport = Rectangle::with_size(Size::new(720.0, 400.0));
+        let limits = layout::Limits::new(Size::ZERO, viewport.size());
+        for (height, top, wheel, expected) in [
+            (200.0, 0.0, 1.0, view::Page::Earlier),
+            (200.0, 0.0, -1.0, view::Page::Newer),
+            (2000.0, 20.0, 1.0, view::Page::Earlier),
+            (2000.0, 1580.0, -1.0, view::Page::Newer),
+        ] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let (_, target, handle) = super::super::tests::history_fixture(&mut app);
+            let mut snapshot = (*handle.snapshot()).clone();
+            snapshot.generation += 1;
+            snapshot.has_later = true;
+            handle.publish_snapshot_for_test(snapshot);
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.refresh();
+            let observations = runtime.observed_scroll.clone();
+            let memory = runtime.scroll_memory.clone();
+            let make = |height| {
+                history_reader(
+                    target,
+                    observations.clone(),
+                    memory.clone(),
+                    vec![(1, "loaded", height)],
+                    false,
+                )
+            };
+            let mut element = make(2000.0);
+            let mut tree = Tree::new(&element);
+            element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            // A byte-bounded older window may contain mostly collapsed tools.
+            // Its actual rendered extent must replace the tall previous page.
+            element = make(height);
+            tree.diff(element.as_widget_mut());
+            let node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            assert_eq!(node.children()[0].size().height, height);
+            element.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut SetBottom((height - viewport.height).max(0.0) - top),
+            );
+            let node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            // SetBottom positions this fixture; only the following real wheel
+            // is the reader gesture under test.
+            memory.0.borrow_mut().pending_input = None;
+            let mut messages = vec![];
+            let update = |event: Event, element: &mut Element<'_, Message>, tree: &mut Tree| {
+                let mut messages = vec![];
+                element.as_widget_mut().update(
+                    tree,
+                    &event,
+                    Layout::new(&node),
+                    mouse::Cursor::Available(iced::Point::new(50.0, 350.0)),
+                    &renderer,
+                    &mut iced::advanced::clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &viewport,
+                );
+                messages
+            };
+            messages.extend(update(
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                &mut element,
+                &mut tree,
+            ));
+            assert!(messages.is_empty(), "fitting geometry must not auto-page");
+            assert_eq!(observations.borrow()[&None].content(), height);
+            for _ in 0..2 {
+                messages.extend(update(
+                    Event::Mouse(mouse::Event::WheelScrolled {
+                        delta: mouse::ScrollDelta::Pixels { x: 0.0, y: wheel },
+                    }),
+                    &mut element,
+                    &mut tree,
+                ));
+                assert!(
+                    matches!(messages.as_slice(), [Message::ChatUi(Action::Scrolled(_, None, scroll, Some(page)))]
+                    if *page == expected && scroll.content() == height)
+                );
+                if height > viewport.height {
+                    let Message::ChatUi(Action::Scrolled(_, _, scroll, _)) = &messages[0] else {
+                        unreachable!()
+                    };
+                    assert!(
+                        scroll.from_top() > 0.0 && scroll.from_top() < height - viewport.height,
+                        "prefetch must start before the physical edge"
+                    );
+                }
+                drop(app.update(messages.pop().unwrap()));
+                let runtime = app.chat_runtime_mut(target).unwrap();
+                let pending = runtime
+                    .pending
+                    .as_ref()
+                    .expect("native wheel starts a page");
+                assert_eq!(pending.page, Some(expected));
+                let request = pending.id;
+                let mut snapshot = (*handle.snapshot()).clone();
+                snapshot.generation += 1;
+                handle.publish_snapshot_for_test(snapshot);
+                drop(app.update(Message::ChatUi(Action::CommandFinished(
+                    target,
+                    request,
+                    Ok(()),
+                ))));
+                assert!(
+                    app.chat_runtime_mut(target).unwrap().pending.is_none(),
+                    "arrival of an equal-height page must wait for the next gesture"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_newer_page_keeps_the_surviving_exchange_at_its_screen_position() {
+        let renderer = crate::app::tests::headless_renderer();
+        let limits = layout::Limits::new(Size::ZERO, Size::new(720.0, 400.0));
+        for (fitting, latest) in [(false, false), (false, true), (true, false), (true, true)] {
+            let memory = Memory::default();
+            let observations = Observations::default();
+            let target = Target {
+                card: CardId::new(),
+                generation: 0,
+            };
+            let entries = if fitting {
+                vec![(2, "boundary", 200.0)]
+            } else {
+                vec![(1, "older", 800.0), (2, "boundary", 500.0)]
+            };
+            let make = |entries, follow_end| {
+                history_reader(
+                    target,
+                    observations.clone(),
+                    memory.clone(),
+                    entries,
+                    follow_end,
+                )
+            };
+            let mut element = make(entries, false);
+            let mut tree = Tree::new(&element);
+            let node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            element.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut SetBottom(0.0),
+            );
+            element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            let screen_y = || {
+                let anchor = memory.0.borrow();
+                let context = &anchor.contexts[0];
+                context
+                    .rows
+                    .iter()
+                    .find(|row| row.id == "boundary")
+                    .unwrap()
+                    .bounds
+                    .y
+                    - context.top.unwrap()
+            };
+            let before = screen_y();
+            element = make(
+                vec![
+                    (2, "boundary", if fitting { 200.0 } else { 500.0 }),
+                    (3, "newer", 1200.0),
+                ],
+                latest,
+            );
+            tree.diff(element.as_widget_mut());
+            let node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            let mut top = ReadTop::default();
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut top);
+            assert_eq!(top.0, Some(if fitting { 0.0 } else { 100.0 }));
+            assert_eq!(
+                screen_y(),
+                before,
+                "newer history must not follow the new end"
+            );
+        }
+    }
+
+    #[test]
+    fn fitting_native_wheel_defers_its_direction_and_can_reverse_before_command_ack() {
+        let renderer = crate::app::tests::headless_renderer();
+        let viewport = Rectangle::with_size(Size::new(720.0, 400.0));
+        let limits = layout::Limits::new(Size::ZERO, viewport.size());
+        for first in [view::Page::Earlier, view::Page::Newer] {
+            for reverse in [false, true] {
+                let mut app = crate::app::tests::context_inspector_test_app(false);
+                let (_, target, handle) = super::super::tests::history_fixture(&mut app);
+                let mut snapshot = (*handle.snapshot()).clone();
+                snapshot.generation += 1;
+                snapshot.has_later = true;
+                handle.publish_snapshot_for_test(snapshot);
+                let runtime = app.chat_runtime_mut(target).unwrap();
+                runtime.refresh();
+                let mut element = history_reader(
+                    target,
+                    runtime.observed_scroll.clone(),
+                    runtime.scroll_memory.clone(),
+                    vec![(1, "collapsed", 200.0)],
+                    false,
+                );
+                let mut tree = Tree::new(&element);
+                let node = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+                drop(app.chat_send(
+                    target,
+                    Command::SetPermissionMode {
+                        mode: "manual".into(),
+                    },
+                    false,
+                ));
+                let request = app
+                    .chat_runtime_mut(target)
+                    .unwrap()
+                    .pending
+                    .as_ref()
+                    .unwrap()
+                    .id;
+                let opposite = if first == view::Page::Earlier {
+                    view::Page::Newer
+                } else {
+                    view::Page::Earlier
+                };
+                let directions = if reverse {
+                    vec![first, opposite]
+                } else {
+                    vec![first]
+                };
+                for direction in directions {
+                    let mut messages = vec![];
+                    element.as_widget_mut().update(
+                        &mut tree,
+                        &Event::Mouse(mouse::Event::WheelScrolled {
+                            delta: mouse::ScrollDelta::Lines {
+                                x: 0.0,
+                                y: if direction == view::Page::Earlier {
+                                    1.0
+                                } else {
+                                    -1.0
+                                },
+                            },
+                        }),
+                        Layout::new(&node),
+                        mouse::Cursor::Available(iced::Point::new(50.0, 350.0)),
+                        &renderer,
+                        &mut iced::advanced::clipboard::Null,
+                        &mut Shell::new(&mut messages),
+                        &viewport,
+                    );
+                    assert_eq!(messages.len(), 1);
+                    drop(app.update(messages.pop().unwrap()));
+                    assert_eq!(
+                        app.chat_runtime_mut(target).unwrap().deferred_page,
+                        Some(if direction == view::Page::Earlier {
+                            HistoryNavigation::EarlierEdge
+                        } else {
+                            HistoryNavigation::NewerEdge
+                        })
+                    );
+                }
+                drop(app.update(Message::ChatUi(Action::CommandFinished(
+                    target,
+                    request,
+                    Ok(()),
+                ))));
+                assert_eq!(
+                    app.chat_runtime_mut(target)
+                        .unwrap()
+                        .pending
+                        .as_ref()
+                        .unwrap()
+                        .page,
+                    Some(if reverse { opposite } else { first })
+                );
+            }
         }
     }
 
@@ -4148,7 +4497,7 @@ mod tests {
         );
         assert!(
             !messages.iter().any(|message| matches!(message,
-            Message::ChatUi(Action::Scrolled(target, _, _, true)) if *target == neighbor)),
+            Message::ChatUi(Action::Scrolled(target, _, _, Some(_))) if *target == neighbor)),
             "a correction cannot mark neighboring navigation as user input"
         );
         let mut own_marker = FindCorrection {
@@ -4591,7 +4940,7 @@ mod tests {
             assert!(
                 !messages.iter().any(|message| matches!(
                     message,
-                    Message::ChatUi(Action::Scrolled(_, _, _, true))
+                    Message::ChatUi(Action::Scrolled(_, _, _, Some(_)))
                 )),
                 "Find's own correction must not claim user input"
             );
@@ -4929,7 +5278,7 @@ mod tests {
         assert!(
             messages.iter().any(|message| matches!(
                 message,
-                Message::ChatUi(Action::Scrolled(_, None, _, true))
+                Message::ChatUi(Action::Scrolled(_, None, _, Some(_)))
             )),
             "wheel navigation toward the history edge still drives paging"
         );
@@ -4996,7 +5345,7 @@ mod tests {
             &bounds,
         );
         assert!(
-            matches!(messages.as_slice(), [Message::ChatUi(Action::Scrolled(actual, None, scroll, false))]
+            matches!(messages.as_slice(), [Message::ChatUi(Action::Scrolled(actual, None, scroll, None))]
             if *actual == target && *scroll == Scroll::new(0.0, 100.0, 400.0))
         );
 
@@ -5030,7 +5379,7 @@ mod tests {
         assert!(
             matches!(
                 messages.as_slice(),
-                [Message::ChatUi(Action::Scrolled(_, None, _, true))]
+                [Message::ChatUi(Action::Scrolled(_, None, _, Some(_)))]
             ),
             "a wheel gesture at a pinned edge must permit retry"
         );
@@ -5084,7 +5433,7 @@ mod tests {
             &bounds,
         );
         assert!(
-            matches!(messages.as_slice(), [Message::ChatUi(Action::Scrolled(_, None, scroll, false))]
+            matches!(messages.as_slice(), [Message::ChatUi(Action::Scrolled(_, None, scroll, None))]
             if *scroll == Scroll::new(900.0, 2500.0, 400.0))
         );
 
@@ -5107,7 +5456,7 @@ mod tests {
             &bounds,
         );
         assert!(
-            matches!(messages.as_slice(), [Message::ChatUi(Action::Scrolled(_, None, scroll, false))]
+            matches!(messages.as_slice(), [Message::ChatUi(Action::Scrolled(_, None, scroll, None))]
             if *scroll == Scroll::new(2100.0, 2500.0, 400.0))
         );
         let mut home = operation::scrollable::snap_to::<()>(
@@ -5132,7 +5481,7 @@ mod tests {
             &bounds,
         );
         assert!(
-            matches!(messages.as_slice(), [Message::ChatUi(Action::Scrolled(_, None, scroll, true))]
+            matches!(messages.as_slice(), [Message::ChatUi(Action::Scrolled(_, None, scroll, Some(_)))]
             if *scroll == Scroll::new(0.0, 2500.0, 400.0)),
             "Home's external operation is input"
         );
@@ -5275,50 +5624,56 @@ mod tests {
         );
         assert!(matches!(
             messages.as_slice(),
-            [Message::ChatUi(Action::Scrolled(_, None, _, true))]
+            [Message::ChatUi(Action::Scrolled(_, None, _, Some(_)))]
         ));
     }
 
     #[test]
     fn wheel_navigation_respects_direction_and_nested_capture() {
         let top = Scroll::new(10.0, 1000.0, 400.0);
-        assert!(navigation_input(Some(20.0), 10.0, top, Some(1.0), false));
-        assert!(!navigation_input(Some(0.0), 10.0, top, Some(-1.0), false));
-        assert!(!navigation_input(Some(10.0), 10.0, top, Some(1.0), true));
+        assert!(navigation_input(Some(20.0), 10.0, top, Some(1.0), false).is_some());
+        assert!(navigation_input(Some(0.0), 10.0, top, Some(-1.0), false).is_none());
+        assert!(navigation_input(Some(10.0), 10.0, top, Some(1.0), true).is_none());
         let bottom = Scroll::new(590.0, 1000.0, 400.0);
-        assert!(navigation_input(
-            Some(580.0),
-            590.0,
-            bottom,
-            Some(-1.0),
-            false
-        ));
-        assert!(!navigation_input(
-            Some(600.0),
-            590.0,
-            bottom,
-            Some(1.0),
-            false
-        ));
-        assert!(!navigation_input(
-            Some(590.0),
-            590.0,
-            bottom,
-            Some(-1.0),
-            true
-        ));
-        assert!(navigation_input(Some(100.0), 200.0, bottom, None, false));
-        assert!(!navigation_input(Some(10.0), 10.0, top, Some(0.0), false));
+        assert!(navigation_input(Some(580.0), 590.0, bottom, Some(-1.0), false).is_some());
+        assert!(navigation_input(Some(600.0), 590.0, bottom, Some(1.0), false).is_none());
+        assert!(navigation_input(Some(590.0), 590.0, bottom, Some(-1.0), true).is_none());
+        assert!(navigation_input(Some(100.0), 200.0, bottom, None, false).is_some());
+        assert!(navigation_input(Some(10.0), 10.0, top, Some(0.0), false).is_none());
+    }
+
+    #[test]
+    fn fitting_geometry_keeps_wheel_direction_without_inventing_input() {
+        let fitting = Scroll::new(0.0, 200.0, 400.0);
+        assert!(fitting.at_top() && fitting.at_bottom());
+        assert_eq!(
+            navigation_input(Some(0.0), 0.0, fitting, Some(1.0), false),
+            Some(view::Page::Earlier)
+        );
+        assert_eq!(
+            navigation_input(Some(0.0), 0.0, fitting, Some(-1.0), false),
+            Some(view::Page::Newer)
+        );
+        for wheel in [None, Some(0.0)] {
+            assert_eq!(
+                navigation_input(Some(0.0), 0.0, fitting, wheel, false),
+                None
+            );
+        }
+        assert_eq!(
+            navigation_input(Some(0.0), 0.0, fitting, Some(-1.0), true),
+            None
+        );
     }
 
     #[test]
     fn thumb_touch_and_keyboard_moves_away_from_edges_do_not_page() {
         let top = Scroll::new(10.0, 1000.0, 400.0);
-        assert!(!navigation_input(Some(0.0), 10.0, top, None, false));
-        assert!(navigation_input(Some(20.0), 10.0, top, None, false));
+        assert!(navigation_input(Some(0.0), 10.0, top, None, false).is_none());
+        assert!(navigation_input(Some(20.0), 10.0, top, None, false).is_some());
         let bottom = Scroll::new(590.0, 1000.0, 400.0);
-        assert!(!navigation_input(Some(600.0), 590.0, bottom, None, false));
-        assert!(navigation_input(Some(580.0), 590.0, bottom, None, false));
+        assert!(navigation_input(Some(600.0), 590.0, bottom, None, false).is_none());
+        assert!(navigation_input(Some(580.0), 590.0, bottom, None, false).is_some());
     }
 
     #[test]

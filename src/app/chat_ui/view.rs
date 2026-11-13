@@ -8712,7 +8712,7 @@ mod tests {
                     target,
                     child.then(|| "deep-child".into()),
                     Scroll::new(0.0, 10_000.0, 500.0),
-                    true,
+                    Some(Page::Earlier),
                 )));
                 assert!(
                     !intent.current(),

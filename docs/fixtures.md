@@ -16,6 +16,7 @@ person.
 | A chat that answers offline, with tools, subagents, errors or crashes | The synthetic Claude provider, [`tests/fixtures/chat-composer-claude.sh`](chat-composer-fixture.md) |
 | GitHub availability, project avatars or a worktree's pull request in the sidebar, offline | The fixture's forge, [`tests/fixtures/fixture-gh.sh`](#an-offline-github), switched on by `home/.config/fixture-forge` |
 | A saved Claude conversation damaged by a crash and a huge tool output, to resume | [`tests/fixtures/claude-damaged-history.py`](../tests/fixtures/claude-damaged-history.py)` PROJECT`, run in a session's fixture with `scripts/native-evidence env python3 ...`; it writes the transcript under the fixture HOME's `.claude` |
+| A long saved chat for paging backward and forward | [`tests/fixtures/claude-long-history.py`](../tests/fixtures/claude-long-history.py)` PROJECT`, run through `scripts/native-evidence env python3 ...`; 260 numbered exchanges exceed the retained history window |
 | A Codex chat that answers offline, with tool rows, subagent errors or terminal escapes | A [Codex peer](#an-offline-codex), installed by `native-evidence start SIDE --codex PEER` |
 | Real Codex app-server ownership, saved-history loading or socket behaviour | [An isolated real executable](#a-real-codex-in-the-fixture), selected by `native-evidence start SIDE --codex-executable /absolute/path/to/codex` |
 | Test a script's contract without a compositor or Cargo | The stubbed Python suites in `tests/*.py`, such as `tests/native_evidence.py` |
@@ -55,6 +56,31 @@ directories, so nothing reaches the real desktop, daemon or provider config:
 `stop` ends all of it: the daemon first, then every process whose environment
 names the task's runtime directory or fixture HOME, which is the proof that it
 belongs to the task.
+
+## A long paged chat
+
+On the build host, run this in a native-evidence session before opening the
+saved conversation:
+
+```sh
+scripts/native-evidence env python3 "$PWD/tests/fixtures/claude-long-history.py" \
+    "$CAGENTS_EVIDENCE_TASK/fixture/project" --tool-bytes 4194304
+scripts/native-evidence cli project open "$CAGENTS_EVIDENCE_TASK/fixture/project"
+```
+
+Choose **Resume conversation** from the new-tab menu and open **History paging
+checkpoints**. Its 260 numbered exchanges include a 4 MiB Bash result every 32
+turns. These results consume the transcript's byte budget while their collapsed
+command groups can fit inside the viewport. Page backward into one of these
+short rendered windows, then wheel downward to check that newer history loads
+without clicking its fallback button. Check that the visible checkpoint stays
+anchored when the next page arrives. No provider command is executed.
+
+Omit `--tool-bytes` for ordinary completed prose. `--scale 64` increases the
+paragraph count enough to exercise provider history paging with prose alone.
+The generator writes under `HOME/.claude`; always run it through
+`native-evidence env`, which supplies the private fixture HOME. Stop and
+`save-seed` after setup to reuse exactly the same conversation on both sides.
 
 ## An offline GitHub
 
