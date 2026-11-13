@@ -40,12 +40,18 @@
 #           task longer than a row shows and a message that never confirmed,
 #           for a session at --width 1200, whose side panels leave the chat
 #           its narrowest
+#   keys    the rows by keyboard, at --width 1200: keyboard-focus (the long
+#           message focused), keyboard-menu (its menu from the Menu key),
+#           keyboard-refused-open and keyboard-refused-closed (Enter twice
+#           on the refused message, its tool call opening and closing while
+#           the row keeps focus) and keyboard-enter (Enter on the started
+#           agent, which opens it)
 #
 # A state that does not appear within 30 seconds is logged and the scene goes
 # on, so a missing state is visible in the log and the shot.
 set -u
 
-scene=${1:?usage: message-card-scene.sh cards|narrow|long}
+scene=${1:?usage: message-card-scene.sh cards|narrow|long|keys}
 here=$(cd "$(dirname "$0")" && pwd)
 ne=$here/../../scripts/native-evidence
 : "${CAGENTS_EVIDENCE_TASK:?name the native-evidence task}"
@@ -131,11 +137,40 @@ prefix=
 [ "$scene" = narrow ] && prefix=narrow-
 [ "$scene" = long ] && prefix=long-
 case $scene in
-    cards | narrow | long) ;;
+    cards | narrow | long | keys) ;;
     *) log "unknown scene"; exit 2 ;;
 esac
 # The transcript opens at its end; the first message is above it.
 transcript=$(locate "$reply")
+if [ "$scene" = keys ]; then
+    key() {
+        "$ne" drive key "$1" >/dev/null 2>&1 || log "key failed: $1"
+        sleep 0.5
+    }
+    # The reply is plain text, so a click there leaves focus where the
+    # window's traversal starts again: one step back is the tab strip's new
+    # tab button, and the rows follow it after the conversation's tab and
+    # its terminal button.
+    "$ne" drive click "$transcript" >/dev/null 2>&1
+    sleep 1
+    key shift+Tab
+    for _ in 1 2 3 4 5; do key Tab; done
+    shot keyboard-focus
+    key Menu
+    shot keyboard-menu
+    key Escape
+    key Tab
+    key Return
+    shot keyboard-refused-open
+    key Return
+    shot keyboard-refused-closed
+    for _ in 1 2 3; do key shift+Tab; done
+    key Return
+    sleep 2
+    shot keyboard-enter
+    log done
+    exit 0
+fi
 scroll "$transcript" -6
 shot "${prefix}message-cards"
 if [ "$scene" = cards ]; then

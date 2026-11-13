@@ -991,20 +991,19 @@ impl Runtime {
             Kind::Spawn(spawn) => self.spawn_row(coordinated, spawn, status, output),
             Kind::Act(_) => return widget::Space::new().into(),
         };
-        let row = self.row_view(item, row);
-        match raw {
-            Some(raw) => widget::column::with_children(vec![
-                row,
-                widget::container(raw)
-                    .padding(iced::Padding::from([0.0, step::GAP_S]).bottom(step::GAP_S))
-                    .width(Length::Fill)
-                    .into(),
-            ])
+        // The row keeps its place in the widget tree whether or not its tool
+        // call is open, so the row pressed to open it keeps keyboard focus.
+        let mut children = vec![self.row_view(item, row)];
+        children.extend(raw.map(|raw| {
+            widget::container(raw)
+                .padding(iced::Padding::from([0.0, step::GAP_S]).bottom(step::GAP_S))
+                .width(Length::Fill)
+                .into()
+        }));
+        widget::column::with_children(children)
             .spacing(step::GAP_XS)
             .width(Length::Fill)
-            .into(),
-            None => row,
-        }
+            .into()
     }
 
     fn message_row(
