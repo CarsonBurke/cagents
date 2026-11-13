@@ -159,9 +159,16 @@ impl Reservation {
     /// automation work targets it, or an account operation is changing a
     /// credential directory inside it. Call outside HostState.
     pub(super) fn ensure_unoccupied(&self, host: &SharedHost) -> Result<(), String> {
+        // An agent observation admitted before this reservation may still run
+        // in the worktree; wait for it, and count one that outlasts that wait.
+        let probes = Arc::clone(&host.lock().unwrap_or_else(|p| p.into_inner()).agent_probes);
+        let probing = probes.settle();
         let hosted = {
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
-            let mut hosted: Vec<(&'static str, PathBuf)> = Vec::new();
+            let mut hosted: Vec<(&'static str, PathBuf)> = probing
+                .into_iter()
+                .map(|probe| ("An agent status check", probe.working_directory))
+                .collect();
             for record in state.terminals.values() {
                 if !record.handle.is_completed() {
                     hosted.push(("A terminal", record.current_directory().to_owned()));

@@ -86,6 +86,80 @@ impl Wake {
     }
 }
 
+/// How long an account or worktree reservation waits for provider listings
+/// already in flight, which end within the census timeout.
+const PROBE_PATIENCE: Duration = if cfg!(test) {
+    Duration::from_millis(500)
+} else {
+    Duration::from_secs(5)
+};
+
+/// Provider observations in flight. They run outside the control gate, so
+/// each is admitted under it the way a launch is: refused while an account or
+/// worktree reservation covers its process's homes or directory. A
+/// reservation, installed under the writer, then waits for the ones admitted
+/// before it and counts any still running as owners of their paths.
+#[derive(Default)]
+pub(super) struct Probes {
+    running: Mutex<BTreeMap<u64, Probe>>,
+    next: std::sync::atomic::AtomicU64,
+    finished: Condvar,
+}
+
+/// What an observation may touch: its process's directory and account homes.
+#[derive(Clone)]
+pub(super) struct Probe {
+    pub working_directory: std::path::PathBuf,
+    pub environment: BTreeMap<String, String>,
+    pub unset: BTreeSet<String>,
+}
+
+pub(super) struct ProbeLease {
+    probes: Arc<Probes>,
+    id: u64,
+}
+
+impl Drop for ProbeLease {
+    fn drop(&mut self) {
+        self.probes
+            .running
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.id);
+        self.probes.finished.notify_all();
+    }
+}
+
+impl Probes {
+    pub(super) fn admit(self: &Arc<Self>, probe: Probe) -> ProbeLease {
+        let id = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.running
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(id, probe);
+        ProbeLease {
+            probes: Arc::clone(self),
+            id,
+        }
+    }
+
+    /// Waits up to `PROBE_PATIENCE` for the observations running now, then
+    /// returns those still running, and any admitted since.
+    pub(super) fn settle(&self) -> Vec<Probe> {
+        let running = self.running.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(&last) = running.keys().next_back() else {
+            return Vec::new();
+        };
+        let (running, _) = self
+            .finished
+            .wait_timeout_while(running, PROBE_PATIENCE, |running| {
+                running.keys().next().is_some_and(|&first| first <= last)
+            })
+            .unwrap_or_else(|p| p.into_inner());
+        running.values().cloned().collect()
+    }
+}
+
 #[derive(Clone)]
 struct Candidate {
     id: TerminalId,
@@ -349,11 +423,12 @@ fn observe(host: &Weak<HostLock>, candidate: &Candidate) -> Outcome {
     let Some(host) = host.upgrade() else {
         return Outcome::Failed;
     };
-    let (gate, observer) = {
+    let (gate, observer, probes) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         (
             Arc::clone(&state.control_gate),
             Arc::clone(&state.agent_observer),
+            Arc::clone(&state.agent_probes),
         )
     };
     let current = || {
@@ -366,15 +441,43 @@ fn observe(host: &Weak<HostLock>, candidate: &Candidate) -> Outcome {
                 .is_some_and(|record| record.handle.same_worker(&candidate.handle))
             && candidate.handle.cached_agent_process().as_ref() == Some(&candidate.process)
     };
-    if !current() {
-        return Outcome::Failed;
-    }
-    // Provider I/O can take seconds, so it runs outside upgrade admission and
-    // shutdown or an upgrade never waits for it. Its effects are admitted:
-    // they apply under the gate, and only while the observed process is still
-    // current. HostState is never held during provider I/O or while waiting on
-    // the PTY owner.
-    let observation = observer.try_observe(&candidate.process);
+    // Provider I/O can take seconds, so it runs outside the control gate and
+    // shutdown or an upgrade never waits for it. It is admitted under the
+    // gate like a launch into the same homes and directory, and its effects
+    // apply under it only while the observed process is still current.
+    // HostState is never held during provider I/O or while waiting on the PTY
+    // owner.
+    let observation = {
+        let lease = {
+            let _control = gate.read().unwrap_or_else(|p| p.into_inner());
+            if !current() {
+                return Outcome::Failed;
+            }
+            let launch = &candidate.process.launch;
+            let unset = crate::account::launch_credential_overrides(launch);
+            if super::account_lifecycle::ensure_launch(
+                &host,
+                &launch.working_directory,
+                &launch.environment,
+                &unset,
+                false,
+            )
+            .is_err()
+            {
+                return Outcome::Failed;
+            }
+            probes.admit(Probe {
+                working_directory: launch.working_directory.clone(),
+                environment: launch.environment.clone(),
+                unset,
+            })
+        };
+        let observation = observer.try_observe(&candidate.process);
+        // Released before the gate is taken again: a reservation may hold the
+        // writer while it waits for this observation.
+        drop(lease);
+        observation
+    };
     let _control = gate.read().unwrap_or_else(|p| p.into_inner());
     if !current() {
         return Outcome::Failed;
@@ -608,6 +711,40 @@ mod tests {
         assert!(schedule.deadline().is_none(), "no agents means no timer");
         assert!(schedule.next(now).is_none());
         let _ = first.handle.shutdown();
+    }
+
+    #[test]
+    fn reservations_wait_for_earlier_observations_and_count_the_ones_that_outlast_them() {
+        let probes = Arc::new(Probes::default());
+        let probe = |directory: &str| Probe {
+            working_directory: directory.into(),
+            environment: BTreeMap::new(),
+            unset: BTreeSet::new(),
+        };
+        assert!(probes.settle().is_empty(), "nothing running, no wait");
+
+        let brief = probes.admit(probe("/brief"));
+        let releaser = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            drop(brief);
+        });
+        let started = Instant::now();
+        assert!(probes.settle().is_empty());
+        assert!(started.elapsed() >= Duration::from_millis(40));
+        assert!(started.elapsed() < PROBE_PATIENCE);
+        releaser.join().unwrap();
+
+        let stuck = probes.admit(probe("/stuck"));
+        let started = Instant::now();
+        let remaining = probes.settle();
+        assert!(started.elapsed() >= PROBE_PATIENCE);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(
+            remaining[0].working_directory,
+            std::path::Path::new("/stuck")
+        );
+        drop(stuck);
+        assert!(probes.settle().is_empty());
     }
 
     #[test]

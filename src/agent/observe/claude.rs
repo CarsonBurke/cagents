@@ -168,8 +168,8 @@ pub(super) fn session<'a>(census: &'a ProcessCensus, pid: i32, cwd: &Path) -> Op
         .flatten()
 }
 
-/// Session status files beyond this are not compared; the census is then
-/// listed again on every check, as it would be without them.
+/// A sessions directory with more entries than this is not compared; the
+/// census is then listed again on every check, as it would be without it.
 const MAX_SESSION_FILES: usize = 4096;
 
 /// The status files `claude agents --json` reads for an account: the CLI
@@ -194,7 +194,10 @@ impl Inputs {
     pub(super) fn read(home: &Path) -> Option<Self> {
         use std::os::unix::fs::MetadataExt;
         let mut files = BTreeMap::new();
-        for entry in std::fs::read_dir(home.join("sessions")).ok()? {
+        for (index, entry) in std::fs::read_dir(home.join("sessions")).ok()?.enumerate() {
+            if index == MAX_SESSION_FILES {
+                return None;
+            }
             let entry = entry.ok()?;
             let name = entry.file_name();
             if !Path::new(&name)
@@ -202,9 +205,6 @@ impl Inputs {
                 .is_some_and(|extension| extension == "json")
             {
                 continue;
-            }
-            if files.len() == MAX_SESSION_FILES {
-                return None;
             }
             // Not followed: a link's target can change without the link.
             let metadata = entry.metadata().ok()?;

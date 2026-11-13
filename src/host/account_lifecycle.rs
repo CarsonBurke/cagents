@@ -424,6 +424,10 @@ impl Reservation {
         // The installed token prevents new related startups. Copy only actual
         // execution-root metadata while holding HostState, then resolve paths
         // outside that lock and outside the global control writer.
+        // An agent observation admitted before the token may still be reading
+        // a home; wait for it, and count one that outlasts that wait.
+        let probes = Arc::clone(&host.lock().unwrap_or_else(|p| p.into_inner()).agent_probes);
+        let probing = probes.settle();
         let owners = {
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
             let mut owners = state
@@ -460,6 +464,14 @@ impl Reservation {
                         )
                     }),
             );
+            owners.extend(probing.into_iter().map(|probe| {
+                (
+                    probe.working_directory,
+                    probe.environment,
+                    probe.unset,
+                    false,
+                )
+            }));
             owners
         };
         for (cwd, environment, unset, inherit) in owners {
@@ -1754,5 +1766,54 @@ pub(crate) mod tests {
         drop(reservation);
         environment.insert("HOME".into(), "relative-home".into());
         ensure_launch(&host, &cwd, &environment, &unset, false).unwrap();
+    }
+    #[test]
+    fn a_reservation_waits_for_an_observation_reading_its_home_and_refuses_one_that_stays() {
+        let root = tempfile::tempdir().unwrap();
+        let homes = Homes::at(root.path().join("homes"));
+        let store = Store::at(root.path().join("registry"));
+        let home = root.path().join("claude-home");
+        std::fs::create_dir(&home).unwrap();
+        let account = Account::linked(Provider::Claude, uuid::Uuid::new_v4(), home.clone());
+        let host = host();
+        let probes = Arc::clone(&host.lock().unwrap().agent_probes);
+        let probe = || super::super::activity::Probe {
+            working_directory: root.path().to_path_buf(),
+            environment: BTreeMap::from([
+                ("HOME".into(), root.path().to_str().unwrap().into()),
+                ("CLAUDE_CONFIG_DIR".into(), home.to_str().unwrap().into()),
+            ]),
+            unset: BTreeSet::new(),
+        };
+
+        // A listing that ends soon is waited for.
+        let brief = probes.admit(probe());
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(brief);
+        });
+        let reservation =
+            Reservation::test_install(&host, &[account.clone()], store.clone(), &homes).unwrap();
+        releaser.join().unwrap();
+        // ...and while it holds the home, a new one is not admitted.
+        assert!(
+            ensure_launch(
+                &host,
+                &probe().working_directory,
+                &probe().environment,
+                &BTreeSet::new(),
+                false
+            )
+            .is_err()
+        );
+        drop(reservation);
+
+        // One that outlasts the wait still uses the home.
+        let stuck = probes.admit(probe());
+        assert!(
+            Reservation::test_install(&host, &[account.clone()], store.clone(), &homes).is_err()
+        );
+        drop(stuck);
+        Reservation::test_install(&host, &[account], store, &homes).unwrap();
     }
 }

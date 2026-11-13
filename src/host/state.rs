@@ -367,6 +367,8 @@ pub(crate) struct HostState {
     pub(super) native_adoption_failures: super::chat::AdoptionFailures,
     pub(crate) agent_observer: Arc<crate::agent::observe::Observer>,
     pub(super) agent_activity_wake: Arc<super::activity::Wake>,
+    /// Provider listings running outside the control gate.
+    pub(super) agent_probes: Arc<super::activity::Probes>,
     /// Exclusive upgrade barrier; ordinary client operations remain concurrent.
     pub(super) control_gate: Arc<RwLock<()>>,
     pub(super) account_lifecycle: super::account_lifecycle::Reservations,
@@ -500,6 +502,7 @@ impl HostState {
             native_adoption_failures: Default::default(),
             agent_observer: Arc::new(crate::agent::observe::Observer::new()),
             agent_activity_wake: Arc::new(super::activity::Wake::default()),
+            agent_probes: Arc::default(),
             control_gate: Arc::new(RwLock::new(())),
             upgrade: None,
             upgrade_chats: BTreeMap::new(),

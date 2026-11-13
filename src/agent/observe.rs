@@ -87,9 +87,11 @@ struct Entry {
 
 impl Entry {
     /// Whether a Claude census can answer for `pid` without listing again:
-    /// the CLI keeps a status file for it, and none changed since the census.
+    /// it lists the process, the CLI keeps a status file for it, and none
+    /// changed since. A census taken before the process was listed is taken
+    /// again at the next check, as before, however briefly the CLI lags.
     fn unchanged(&self, inputs: Option<&claude::Inputs>, pid: i32) -> bool {
-        self.census.is_some()
+        matches!(&self.census, Some(Inventory::Claude(census)) if census.contains_key(&pid))
             && self
                 .listed
                 .is_some_and(|listed| listed.elapsed() < UNCHANGED_TTL)
@@ -549,21 +551,35 @@ printf '%s\n' "$CAGENTS_OBSERVER_ROWS"
         let directory = tempfile::tempdir().unwrap();
         let script = directory.path().join("census-fixture");
         let marker = directory.path().join("queries");
+        let sessions = directory.path().join("sessions");
+        let arm = directory.path().join("rewrite-during-listing");
+        // Lists the fixture row; while armed, also changes the process's
+        // status file during the listing, as a CLI changing state would.
         std::fs::write(
             &script,
             r#"#!/bin/sh
 set -eu
 printf 'query\n' >> "$CAGENTS_OBSERVER_MARKER"
+if [ -e "$CAGENTS_OBSERVER_ARM" ]; then
+    rm "$CAGENTS_OBSERVER_ARM"
+    printf ' ' >> "$CAGENTS_OBSERVER_STATUS"
+fi
 printf '%s\n' "$CAGENTS_OBSERVER_ROWS"
 "#,
         )
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
         let mut process = process(directory.path(), script);
+        let status = sessions.join(format!("{}.json", process.pid));
         process.launch.environment.extend([
             (
                 "CAGENTS_OBSERVER_MARKER".into(),
                 marker.to_str().unwrap().into(),
+            ),
+            ("CAGENTS_OBSERVER_ARM".into(), arm.to_str().unwrap().into()),
+            (
+                "CAGENTS_OBSERVER_STATUS".into(),
+                status.to_str().unwrap().into(),
             ),
             (
                 "CAGENTS_OBSERVER_ROWS".into(),
@@ -586,67 +602,137 @@ printf '%s\n' "$CAGENTS_OBSERVER_ROWS"
             assert_eq!(observed.activity.unwrap().state, ActivityState::Idle);
             assert_eq!(observed.title.as_deref(), Some("Idle task"));
         };
-        let entry = || {
-            observer
+        // Age the cache as if time had passed: the check, and optionally the
+        // listing beyond its backstop.
+        let expire = |listing: bool| {
+            let entry = observer
                 .accounts
                 .lock()
                 .unwrap()
                 .get(&key(process.provider, &process.launch).unwrap())
                 .unwrap()
-                .clone()
-        };
-        // Age the cache as if time had passed: the check, and optionally the
-        // listing beyond its backstop.
-        let expire = |listing: bool| {
-            let entry = entry();
+                .clone();
             let mut entry = entry.lock().unwrap();
             entry.checked = entry.checked.map(|at| at - TTL);
             if listing {
                 entry.listed = entry.listed.map(|at| at - UNCHANGED_TTL);
             }
         };
+        // Each write changes the length, so no step relies on the clock's
+        // resolution to tell versions apart.
+        let rewrite = |path: &Path| {
+            let mut contents = std::fs::read(path).unwrap_or_default();
+            contents.push(b' ');
+            std::fs::write(path, contents).unwrap();
+        };
 
-        // Without a status file for the process, every check lists.
+        // Without a sessions directory, every check lists.
         observe();
         expire(false);
         observe();
         assert_eq!(queries(), 2);
 
-        let sessions = directory.path().join("sessions");
+        // Nor with one that keeps only other processes' files, which shows
+        // nothing about this one.
         std::fs::create_dir(&sessions).unwrap();
-        let status = sessions.join(format!("{}.json", process.pid));
-        std::fs::write(&status, r#"{"status":"idle"}"#).unwrap();
-        std::fs::write(sessions.join("1.json"), r#"{"status":"idle"}"#).unwrap();
+        std::fs::write(sessions.join("1.json"), "{}").unwrap();
+        for _ in 0..2 {
+            expire(false);
+            observe();
+        }
+        assert_eq!(queries(), 4, "a process without a status file lists");
+
+        std::fs::write(&status, "{}").unwrap();
         expire(false);
         observe();
-        assert_eq!(queries(), 3, "the first files seen are a baseline");
-
+        assert_eq!(queries(), 5, "the first files seen are a baseline");
         for _ in 0..5 {
             expire(false);
             observe();
         }
-        assert_eq!(queries(), 3, "an idle account is not listed again");
+        assert_eq!(queries(), 5, "an idle account is not listed again");
 
         // Any session's change, arrival or departure is a change.
-        std::fs::write(&status, r#"{"status":"busy"}"#).unwrap();
+        rewrite(&status);
         expire(false);
         observe();
-        assert_eq!(queries(), 4);
+        assert_eq!(queries(), 6);
         std::fs::write(sessions.join("2.json"), "{}").unwrap();
         expire(false);
         observe();
-        assert_eq!(queries(), 5);
+        assert_eq!(queries(), 7);
         std::fs::remove_file(sessions.join("1.json")).unwrap();
         expire(false);
         observe();
-        assert_eq!(queries(), 6);
+        assert_eq!(queries(), 8);
+
+        // A change made while listing is still a change at the next check:
+        // the files are read before the listing, not after it.
+        std::fs::write(&arm, "").unwrap();
+        expire(false);
+        rewrite(&status);
+        observe();
+        assert_eq!(queries(), 9);
+        assert!(!arm.exists(), "the listing changed the status file");
+        expire(false);
+        observe();
+        assert_eq!(queries(), 10);
+        expire(false);
+        observe();
+        assert_eq!(queries(), 10);
 
         // Within the TTL nothing is read at all; past the backstop it lists.
         observe();
-        assert_eq!(queries(), 6);
+        assert_eq!(queries(), 10);
         expire(true);
         observe();
-        assert_eq!(queries(), 7);
+        assert_eq!(queries(), 11);
+    }
+
+    #[test]
+    fn a_census_without_the_process_lists_again_at_the_next_check() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("census-fixture");
+        let marker = directory.path().join("queries");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf 'query\\n' >> \"$CAGENTS_OBSERVER_MARKER\"\nprintf '[]\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut process = process(directory.path(), script);
+        process.launch.environment.insert(
+            "CAGENTS_OBSERVER_MARKER".into(),
+            marker.to_str().unwrap().into(),
+        );
+        // The CLI has written its file but not yet listed it.
+        std::fs::create_dir(directory.path().join("sessions")).unwrap();
+        std::fs::write(
+            directory
+                .path()
+                .join(format!("sessions/{}.json", process.pid)),
+            "{}",
+        )
+        .unwrap();
+        let observer = Observer::new();
+        for _ in 0..3 {
+            assert!(matches!(
+                observer.try_observe(&process),
+                Err(ObserveError::Unavailable)
+            ));
+            let entry = observer
+                .accounts
+                .lock()
+                .unwrap()
+                .get(&key(process.provider, &process.launch).unwrap())
+                .unwrap()
+                .clone();
+            let mut entry = entry.lock().unwrap();
+            entry.checked = entry.checked.map(|at| at - TTL);
+        }
+        assert_eq!(std::fs::read_to_string(&marker).unwrap().lines().count(), 3);
     }
 
     #[test]
