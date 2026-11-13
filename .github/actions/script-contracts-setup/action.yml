@@ -1,0 +1,46 @@
+name: Set up script contracts
+description: Confirm the checked-out revision and install the pinned tools the contract suites use
+
+runs:
+  using: composite
+  steps:
+    - name: Confirm the tested revision
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Every job tests the event's own commit: a pull request's merge
+        # result, whose workflow and sources come from the same tree.
+        test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+        if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+          head=$(jq -r .pull_request.head.sha "$GITHUB_EVENT_PATH")
+          test "$(git rev-parse HEAD^2)" = "$head"
+          printf 'Testing merge %s of head %s into base %s\n' "$GITHUB_SHA" "$head" "$(git rev-parse HEAD^1)"
+        else
+          printf 'Testing %s\n' "$GITHUB_SHA"
+        fi
+        git rev-parse 'HEAD^{tree}'
+
+    - name: Install the pinned formatter
+      shell: bash
+      run: |
+        set -euo pipefail
+        rustup toolchain install 1.93.0 --profile minimal --component rustfmt
+        dirname "$(rustup which --toolchain 1.93.0 cargo)" >> "$GITHUB_PATH"
+
+    - name: Verify required tools
+      shell: bash
+      run: |
+        set -euo pipefail
+        for tool in git cargo rustc rustfmt rustup sh bash python3; do
+          command -v "$tool"
+        done
+        python3 -c 'import sys, tomllib; assert sys.version_info >= (3, 11), "Python 3.11+ is required for TOML contract coverage"; print(sys.version)'
+        case "$(cargo --version)" in
+          "cargo 1.93.0 "*) ;;
+          *) echo 'Cargo must use the pinned Rust 1.93.0 toolchain' >&2; exit 1 ;;
+        esac
+        case "$(rustc --version)" in
+          "rustc 1.93.0 "*) ;;
+          *) echo 'Rust must use the pinned 1.93.0 toolchain' >&2; exit 1 ;;
+        esac
+        rustfmt --version
