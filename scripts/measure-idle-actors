@@ -79,5 +79,5 @@ for pid in $(fixture_processes); do
 done
 printf 'build=%s actors=%s; settling 10 s\n' "$bin" "$actors"
 sleep 10
-python3 -I "$checkout/scripts/measure-idle-wakeups" --seconds "$seconds" \
+/usr/bin/python3 -I "$checkout/scripts/measure-idle-wakeups" --seconds "$seconds" \
     --environ "XDG_RUNTIME_DIR=$runtime"
