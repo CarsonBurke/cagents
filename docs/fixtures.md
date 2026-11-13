@@ -281,6 +281,30 @@ mid-turn, and `{"_end": true}` to end the turn on the frames' own result. A
 `fixture-slow-start` file holds a conversation's provider at start-up. See
 [the synthetic provider](chat-composer-fixture.md) for each.
 
+## Reasoning rows
+
+[`tests/fixtures/reasoning-row-scene.sh`](../tests/fixtures/reasoning-row-scene.sh)
+replays an offline Claude turn with reasoning interleaved with command groups,
+a finished empty block, an active empty block, and reasoning that gains a new
+last line. It captures the empty active state, opens the first thought to
+verify its full text, then collapses it and captures the updated live preview.
+The tool results are synthetic; their shell commands are not executed. The
+scene uses the offline provider fixture and contacts no live model.
+
+In a ready native-evidence session, run it with the session's task directory:
+
+```sh
+CAGENTS_EVIDENCE_TASK=$HOME/.local/state/cev/my-reasoning \
+    tests/fixtures/reasoning-row-scene.sh wide
+```
+
+Start each side at the same 1200x900 viewport. Repeat with `narrow` at 900x900
+for the narrow pane. For a remote `pair`, the steps file can invoke
+`CAGENTS_EVIDENCE_TASK=$task "$tool/tests/fixtures/reasoning-row-scene.sh" wide`.
+The scene writes only the task's private provider configuration. Stop the
+session afterward: its final thinking block deliberately stays active for
+300 seconds.
+
 ## Adding a scene to evidence
 
 Write the scene as steps, not as instructions in a PR comment, so the next
