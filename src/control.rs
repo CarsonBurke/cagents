@@ -4189,16 +4189,11 @@ fn stop_daemon_at(
         }
         Err(error) => return Err(protocol_error(error)),
     };
-    // Pin before sending any termination request. Neither a closed
-    // socket nor an unlocked lease proves this exact process exited.
-    let target = if no_wait {
-        None
-    } else {
-        Some(
-            crate::daemon::ShutdownTarget::pin(socket, client.proof())
-                .map_err(|error| AppError::new("daemon_process", error))?,
-        )
-    };
+    // Try to pin before requesting termination: neither a closed socket nor
+    // an unlocked lease proves this exact process exited. Older daemons may
+    // not expose a recognizable lease, so inability to wait must not prevent
+    // the authenticated shutdown request itself.
+    let target = (!no_wait).then(|| crate::daemon::ShutdownTarget::pin(socket, client.proof()));
     let outcome = match confirm {
         // A capability is already a counted, daemon-bound, expiring
         // authority over one observed inventory, so a script that
@@ -4257,11 +4252,21 @@ fn stop_daemon_at(
 
 fn finish_daemon_stop(
     outcome: ShutdownOutcome,
-    target: Option<crate::daemon::ShutdownTarget>,
+    target: Option<Result<crate::daemon::ShutdownTarget, crate::daemon::PlatformError>>,
     timeout: Duration,
 ) -> Result<CommandOutput, AppError> {
     let mut output = shutdown_output(outcome)?;
     if let Some(target) = target {
+        let target = match target {
+            Ok(target) => target,
+            Err(error) => {
+                output.data["stopped"] = Value::Null;
+                output.human = format!(
+                    "Shutdown accepted; could not identify the daemon process to wait for: {error}"
+                );
+                return Ok(output);
+            }
+        };
         if io::stderr().is_terminal() {
             eprintln!(
                 "Shutdown accepted; waiting up to {} seconds for the daemon to exit…",

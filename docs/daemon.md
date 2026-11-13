@@ -128,8 +128,12 @@ cagents daemon stop --confirm
   restart it after its listener and inventory lease drain. A timeout fails
   with `shutdown_timeout`; the daemon may still be draining. Check
   `cagents daemon status` before restarting. `--no-wait` returns at acceptance
-  instead, without confirming completion. Plain `daemon stop` without the
-  confirmation or empty-inventory flags requests a force stop.
+  instead, without confirming completion. If the daemon process cannot be
+  identified from its lease (for example, an older daemon's metadata), stop
+  still requests shutdown. After acceptance it succeeds with `stopped: null`
+  and explains why it could not wait; exit has not been confirmed.
+  Plain `daemon stop` without the confirmation or empty-inventory flags
+  requests a force stop.
 - Stopping the daemon ends each agent's provider process and any turn in
   progress, but does not close the agent. The agent keeps its ID, and its card
   stays in its channel, where its saved conversation can be resumed. A turn

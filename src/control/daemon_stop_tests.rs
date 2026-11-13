@@ -262,3 +262,33 @@ fn rejected_stop_returns_without_waiting_for_process_exit() {
     assert_eq!(error.details.as_ref().unwrap()["outcome"], "empty_required");
     assert!(peer.child.try_wait().unwrap().is_none());
 }
+
+#[test]
+fn pin_failure_still_requests_shutdown_without_claiming_completion() {
+    for reject in [false, true] {
+        let mut peer = Peer::start(reject);
+        // Simulate an older daemon whose lease cannot identify its process.
+        // The private peer still serves its authenticated shutdown protocol.
+        fs::write(paths(peer.root.path()).lock, b"legacy lock metadata\n").unwrap();
+        let result = stop_daemon_at(&peer.socket(), true, None, None, false, Duration::ZERO);
+        peer.wait_for("accepted"); // Peer only reaches this after receiving ShutdownV1.
+        if reject {
+            let error = result.err().unwrap();
+            assert_eq!(error.kind, "shutdown_rejected");
+            assert_eq!(error.details.as_ref().unwrap()["outcome"], "empty_required");
+        } else {
+            let output = result.unwrap();
+            assert_eq!(output.data["outcome"], "accepted");
+            assert_eq!(output.data["termination_requested"], true);
+            assert_eq!(output.data.get("stopped"), Some(&Value::Null));
+            let reason = output
+                .human
+                .strip_prefix(
+                    "Shutdown accepted; could not identify the daemon process to wait for: ",
+                )
+                .unwrap();
+            assert!(reason.contains("daemon lock metadata"));
+        }
+        assert!(peer.child.try_wait().unwrap().is_none());
+    }
+}
