@@ -655,6 +655,41 @@ fn scope_step(event: &Event) -> Option<bool> {
     }
 }
 
+/// An unmodified Space press restated as Enter, the key that presses a
+/// focused button.
+fn space_as_enter(event: &Event) -> Option<Event> {
+    use cosmic::iced::keyboard::{self, key::Named};
+    let Event::Keyboard(keyboard::Event::KeyPressed {
+        key: keyboard::Key::Character(character),
+        physical_key,
+        location,
+        modifiers,
+        repeat,
+        ..
+    }) = event
+    else {
+        return None;
+    };
+    if character.as_str() != " "
+        || modifiers.control()
+        || modifiers.alt()
+        || modifiers.logo()
+        || modifiers.shift()
+    {
+        return None;
+    }
+    let enter = keyboard::Key::Named(Named::Enter);
+    Some(Event::Keyboard(keyboard::Event::KeyPressed {
+        key: enter.clone(),
+        modified_key: enter,
+        physical_key: *physical_key,
+        location: *location,
+        modifiers: *modifiers,
+        text: None,
+        repeat: *repeat,
+    }))
+}
+
 /// Blocks click-through without hiding the child's accessibility tree.
 pub fn opaque<'a, Message: 'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
     Effect {
@@ -2065,6 +2100,24 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
                     shell.request_redraw();
                 }
                 // Even with nothing to focus, the key stays in the dialog.
+                shell.capture_event();
+            } else if !shell.is_event_captured()
+                && let Some(enter) = space_as_enter(event)
+            {
+                // Buttons here answer only Enter. Space, which every
+                // toolkit also uses to press a focused button or tick a
+                // checkbox, reaches them as Enter once no focused control,
+                // such as a text field, has taken it as text.
+                self.content.as_widget_mut().update(
+                    &mut tree.children[0],
+                    &enter,
+                    layout,
+                    cursor,
+                    renderer,
+                    clipboard,
+                    shell,
+                    viewport,
+                );
                 shell.capture_event();
             }
             return;

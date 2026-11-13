@@ -216,6 +216,28 @@ pub(super) mod tests {
         (focused, captured)
     }
 
+    pub(in crate::app) fn space() -> keyboard::Event {
+        let keyboard::Event::KeyPressed {
+            physical_key,
+            location,
+            modifiers,
+            repeat,
+            ..
+        } = key_press(keyboard::key::Named::Tab)
+        else {
+            unreachable!()
+        };
+        keyboard::Event::KeyPressed {
+            key: keyboard::Key::Character(" ".into()),
+            modified_key: keyboard::Key::Character(" ".into()),
+            physical_key,
+            location,
+            modifiers,
+            text: Some(" ".into()),
+            repeat,
+        }
+    }
+
     pub(in crate::app) fn shift_tab() -> keyboard::Event {
         let keyboard::Event::KeyPressed {
             key,

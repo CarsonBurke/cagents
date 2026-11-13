@@ -1500,6 +1500,29 @@ fn terminal_confirmation_owns_tab_navigation_and_restores_shell_setting() {
         assert_eq!(focused.as_ref(), Some(to));
         assert!(captured, "the dialog keeps its focus keys from the shell");
     }
+    // Space presses the focused control as Enter does: it ticks the
+    // checkbox and answers with the focused button.
+    let space = super::dialog_ui::tests::space();
+    for (focused, expected) in [
+        (
+            &dont_ask,
+            Message::DontAskAgain(settings::Confirmation::CloseActiveTerminal, true),
+        ),
+        (&cancel, Message::CancelTerminalClose),
+        (&close, Message::ConfirmTerminalClose),
+    ] {
+        let (messages, captured) = super::dialog_ui::tests::key_control(
+            app.terminal_close_dialog().unwrap(),
+            focused.clone(),
+            space.clone(),
+        );
+        assert_eq!(
+            format!("{messages:?}"),
+            format!("{:?}", [expected]),
+            "Space presses {focused:?}"
+        );
+        assert!(captured);
+    }
     let _ = app.update(Message::CancelTerminalClose);
     assert!(app.core.keyboard_nav());
 }
