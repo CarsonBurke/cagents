@@ -8,6 +8,7 @@
 - [Terminal search](#terminal-search)
 - [Busy terminals and the update tail](#busy-terminals-and-the-update-tail)
 - [Native chat viewport](#native-chat-viewport)
+- [Work board polling](#work-board-polling)
 - [Reference results](#reference-results)
 
 These workloads are opt-in, local, and non-gating. Never compare unoptimized
@@ -581,6 +582,39 @@ pressure; commands of at most 2,048 bytes can be excluded using the
 recognizer's existing program-name predicate. Full rich coordination parts are
 still reparsed on changed publications; off-thread ownership does not make this
 cost incremental.
+
+## Work board polling
+
+The daemon's Work board keeps each open project's Git facts current. The Git
+watcher covers projects within a budget of 8192 directory watches, and each
+checkout's tracked directories count against it, so a repository with
+hundreds of worktrees is polled instead. Each worktree of a polled project
+comes due on its own. A worktree with an edit or agent session in the active
+window is read every 15 s, and any other every 120 s; reads due within the
+next 15 s share one scan. Previously one recent edit anywhere made the whole
+project re-read every worktree every 15 s.
+
+`scripts/measure-work-polling BIN_DIR [WORKTREES] [SECONDS] [ACTIVE]` builds a
+private fixture from a matched `cagents` and `cagentsd`: a project of
+WORKTREES worktrees (default 250) with 40 tracked directories each, which it
+checks exceeds the watch budget, and ACTIVE (default 3) freshly edited
+worktrees. After the board has read every checkout once, it counts the
+`git status` reads the daemon starts and the CPU of its exited children over
+SECONDS (default 300). It removes everything it created on exit and refuses
+agent authority; run it from `ssh fw16`.
+
+Reference on fw16 (Ryzen 7 7840HS), `dev-runtime`, 250 worktrees, 3 active,
+300 s, `0ac78d249` (before) against `9b8523e9a` (after):
+
+| | Before | After |
+| --- | --- | --- |
+| `git status` per second | 15.79 | 2.47 |
+| Git CPU, % of one core | 7.22 | 1.71 |
+| Daemon CPU, % of one core | 1.83 | 0.45 |
+
+A fixture checkout holds 40 files. A real checkout costs more per read: on a
+347-worktree repository with 8 active worktrees, the scanner's Git processes
+took at least half a core before this change.
 
 ## Reference results
 
