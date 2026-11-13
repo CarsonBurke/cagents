@@ -1598,6 +1598,7 @@ mod tests {
                 passed: 10,
                 failed: 2,
                 pending: 0,
+                ..Default::default()
             }),
             review: Some(crate::work::Review::ChangesRequested),
             updated_at: String::new(),
@@ -1636,6 +1637,15 @@ mod tests {
         assert_eq!(names, ["Checks: 2 failing, 10 passed", "Changes requested"]);
         assert!(texts.is_empty(), "no words are drawn: {texts:?}");
         assert_eq!(height, f32::from(design::COMPACT_ICON_SIZE));
+        pull_request.checks = Some(crate::work::Checks {
+            cancelled: 1,
+            skipped: 2,
+            ..Default::default()
+        });
+        assert_eq!(
+            described(&pull_request).0,
+            ["Checks: 1 cancelled, 2 skipped", "Changes requested"]
+        );
         // A merged pull request's checks and review are history; its state
         // glyph says all a card needs.
         pull_request.state = PullRequestState::Merged;
@@ -1729,6 +1739,7 @@ mod tests {
                             passed: 40 + index as u32 % 7,
                             failed: index as u32 % 3,
                             pending: index as u32 % 2,
+                            ..Default::default()
                         }),
                         review: reviews[index % reviews.len()],
                         updated_at: String::new(),
