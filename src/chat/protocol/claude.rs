@@ -16570,8 +16570,8 @@ mod tests {
         );
         assert_eq!(
             agent,
-            Some(ToolStatus::Stopped),
-            "the earlier call ended with its process"
+            Some(ToolStatus::Succeeded),
+            "the launch acknowledgement completed, without proving the agent is still live"
         );
         // Only reading the history starts nothing, so it is left as it was.
         assert_eq!(statuses(true).1, Some(ToolStatus::Running));
