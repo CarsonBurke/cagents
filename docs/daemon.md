@@ -91,7 +91,7 @@ cagents daemon stop --confirm
 | `daemon start` | Start the daemon if it is not already running |
 | `daemon status` | Report whether the daemon runs, with `cli_version` and `daemon_version` |
 | `daemon upgrade [--yes] [--interrupt]` | Review a staged installation, save windows, replace the service when needed, and wait for completion |
-| `daemon stop` | Request daemon termination (see below) |
+| `daemon stop` | Stop the daemon and wait for exit (see below) |
 | `daemon preflight` | Print a short-lived shutdown capability for `daemon stop --confirm` |
 | `daemon prepare-upgrade --yes` | Checkpoint resumable sessions and stop for a full upgrade |
 | `daemon abandon-upgrade --yes` | Archive an interrupted upgrade checkpoint without resuming it |
@@ -123,8 +123,17 @@ cagents daemon stop --confirm
   `cagents daemon preflight` instead: `--confirm "$(cagents daemon preflight)"`.
   Either way the confirmation is bound to that daemon and inventory and is
   valid for 60 seconds; inventory changes require a new one.
-- A successful stop means **termination requested**, not that every PTY has
-  exited. Plain `daemon stop` without these flags is a force stop.
+- After shutdown is accepted, `daemon stop` waits up to 30 seconds for that
+  daemon process to exit, so `cagents daemon stop && cagents daemon start` can
+  restart it after its listener and inventory lease drain. A timeout fails
+  with `shutdown_timeout`; the daemon may still be draining. Check
+  `cagents daemon status` before restarting. `--no-wait` returns at acceptance
+  instead, without confirming completion. If the daemon process cannot be
+  identified from its lease (for example, an older daemon's metadata), stop
+  still requests shutdown. After acceptance it succeeds with `stopped: null`
+  and explains why it could not wait; exit has not been confirmed.
+  Plain `daemon stop` without the confirmation or empty-inventory flags
+  requests a force stop.
 - Stopping the daemon ends each agent's provider process and any turn in
   progress, but does not close the agent. The agent keeps its ID, and its card
   stays in its channel, where its saved conversation can be resumed. A turn
