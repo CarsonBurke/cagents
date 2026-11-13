@@ -1434,7 +1434,8 @@ impl Default for PanePresence {
 /// sidebar. Each save projects every shared view and copies the workspace and
 /// every chat draft on the UI thread, so a burst is saved once, at its first
 /// move plus this delay. Any other save in between carries it along, and
-/// nothing outside this window reads it before then.
+/// nothing outside this window reads it before then. A channel name another
+/// window gave, which the shared registry already holds, waits the same way.
 const NAVIGATION_SAVE_DELAY: Duration = Duration::from_secs(1);
 
 /// What an update changed in the durable workspace beside focus, which decides

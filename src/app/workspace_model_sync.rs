@@ -838,6 +838,12 @@ impl Cagents {
                     _ => None,
                 };
                 self.workspace_model.fold(sequence, &edit);
+                if let ModelEdit::RetitleChannel { id, .. }
+                | ModelEdit::SuggestChannelTitle { id, .. } = &edit
+                    && let Some(task) = self.absorb_channel_title(*id)
+                {
+                    return task;
+                }
                 let removed = closing.map_or_else(Task::none, |repository| {
                     self.close_shared_project(&repository)
                 });
@@ -911,6 +917,41 @@ impl Cagents {
                 Task::batch([closed, self.reconcile_workspace_model()])
             }
         }
+    }
+
+    /// Shows a channel's new name from an already folded title edge.
+    ///
+    /// A name changes no project, channel membership, view or agent, which
+    /// are everything [`Self::reconcile_workspace_model`] projects, so only
+    /// the channel itself is absorbed rather than every view the window
+    /// holds. Its save waits like a navigation save: the registry already
+    /// holds the name, and a burst of renames is saved once.
+    ///
+    /// `None` leaves a channel this window does not show as an ordinary
+    /// member, such as one it has yet to adopt or is deleting, to the full
+    /// reconciliation.
+    fn absorb_channel_title(&mut self, id: ChannelId) -> Option<Task<Message>> {
+        if self.channel_ui.is_deleting(id) || self.channel_ui.was_deleted(id) {
+            return None;
+        }
+        let index = self
+            .durable
+            .channels
+            .iter()
+            .position(|local| local.id == id)?;
+        let shared = self.workspace_model.channel(id)?.clone();
+        let mut tasks = Vec::new();
+        if self.absorb_shared_channel(index, &shared) {
+            self.sort_durable_channels();
+            self.refresh_sidebar_channels();
+            tasks.push(self.sync_chrome());
+            tasks.push(self.save_navigation_soon());
+        }
+        // A manual name ends a pending suggestion, and a name arriving can
+        // release one this window was holding back.
+        self.refresh_channel_title_suggestions();
+        self.restore_channel_names();
+        Some(Task::batch(tasks))
     }
 
     pub(super) fn apply_closed_project_tombstones(&mut self) -> Task<Message> {
