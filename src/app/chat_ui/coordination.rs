@@ -502,6 +502,25 @@ fn arrival(arrival: Arrival) -> &'static str {
     }
 }
 
+/// A confirmed message's row status: its word, and the full arrival behind it.
+fn received(arrival_of: Arrival) -> RowStatus {
+    RowStatus {
+        detail: Some(arrival(arrival_of).to_owned()),
+        ..match arrival_of {
+            Arrival::WhenIdle
+            | Arrival::NextSession
+            | Arrival::Queued
+            | Arrival::Behind
+            | Arrival::NoSlot => RowStatus::plain("Queued"),
+            // A run that ended had the message all the same.
+            Arrival::Inbox | Arrival::User | Arrival::Started | Arrival::Ended => {
+                RowStatus::plain("Delivered")
+            }
+            Arrival::Unknown => RowStatus::warning("Not confirmed"),
+        }
+    }
+}
+
 /// What became of a message a provider's own tool sent, in the card's
 /// status line.
 fn delivered(delivery: Delivery) -> &'static str {
@@ -993,13 +1012,7 @@ impl Runtime {
                 ..RowStatus::error("Not sent")
             },
             _ if answered => RowStatus::plain("Answered"),
-            (_, Some(receipt)) => RowStatus {
-                detail: Some(arrival(receipt.arrival).to_owned()),
-                ..RowStatus::plain(match receipt.arrival {
-                    Arrival::WhenIdle | Arrival::NextSession => "Queued",
-                    Arrival::Inbox | Arrival::User => "Delivered",
-                })
-            },
+            (_, Some(receipt)) => received(receipt.arrival),
             _ => match (reading.outcome.delivery, reading.outcome.run.as_ref()) {
                 (Some(delivery), _) => RowStatus {
                     detail: Some(delivered(delivery).to_owned()),
@@ -1553,6 +1566,25 @@ mod identity_tests {
         assert_eq!(
             agents_phrase(&reading(true), &agents(&["95fcd1b9e0aa"]), &listed),
             "95fcd1b9"
+        );
+    }
+
+    #[test]
+    fn a_message_taken_as_a_run_reads_as_queued_or_delivered_and_an_unknown_end_is_unconfirmed() {
+        let word = |arrival| {
+            let status = received(arrival);
+            (status.text, status.tone == Tone::Warning)
+        };
+        for waiting in [Arrival::Queued, Arrival::Behind, Arrival::NoSlot] {
+            assert_eq!(word(waiting), ("Queued", false));
+        }
+        for given in [Arrival::Started, Arrival::Ended] {
+            assert_eq!(word(given), ("Delivered", false));
+        }
+        assert_eq!(word(Arrival::Unknown), ("Not confirmed", true));
+        assert_eq!(
+            received(Arrival::Unknown).detail.as_deref(),
+            Some(arrival(Arrival::Unknown))
         );
     }
 
