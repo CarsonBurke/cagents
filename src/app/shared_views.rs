@@ -14,6 +14,35 @@ struct LocalViews {
     panes: HashMap<Scope, Vec<Pane>>,
 }
 
+/// Which scopes need local presentation projected. A selected pass still
+/// consults the complete canonical ownership set; it never treats a partial
+/// pane map as proof that a resource is unowned.
+#[derive(Clone, Copy)]
+enum ViewProjection<'a> {
+    All,
+    /// A repository load follows the complete affected ownership closure while
+    /// retaining structural admission, alias, notification and save semantics.
+    Structural(&'a HashSet<Scope>),
+    /// Proven presentation-only changes may defer local replica capture.
+    Selected(&'a [Scope]),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum ProjectionResource {
+    Terminal(TerminalId),
+    Chat(TerminalId),
+    Browser(crate::model::BrowserId),
+}
+
+fn projection_resource(kind: &CardKind) -> Option<ProjectionResource> {
+    match kind {
+        CardKind::Terminal(session) => Some(ProjectionResource::Terminal(session.id)),
+        CardKind::Chat(session) => Some(ProjectionResource::Chat(session.id)),
+        CardKind::Browser(session) => Some(ProjectionResource::Browser(session.id)),
+        _ => None,
+    }
+}
+
 /// Each open card's worktree during one projection, with how many cards
 /// each path holds, so a view no card resolves to is known without a scan.
 #[derive(Default)]
@@ -122,10 +151,37 @@ pub(super) struct State {
     // Full snapshots advance view/agent authority. Metadata-only folds advance
     // the outer model sequence without supplying either of these collections.
     pub(super) snapshot_sequence: u64,
+    pub(super) scope_absences: HashMap<Scope, u64>,
+    pub(super) view_sequences: HashMap<Scope, u64>,
+    pub(super) metadata_revisions: HashMap<super::workspace_model_sync::MetadataKey, u64>,
+    /// Exact closed pane identities, retained across reconnects to this registry.
+    pub(super) closed: HashSet<CardId>,
     #[cfg(test)]
     local_projection_count: std::cell::Cell<usize>,
     #[cfg(test)]
     view_projection_count: std::cell::Cell<usize>,
+    #[cfg(test)]
+    selected_projection_count: std::cell::Cell<usize>,
+    #[cfg(test)]
+    scope_discovery_count: std::cell::Cell<usize>,
+    #[cfg(test)]
+    pub(super) notification_attribution_count: std::cell::Cell<usize>,
+    #[cfg(test)]
+    pane_attachment_count: usize,
+    #[cfg(test)]
+    pub(super) structural_tail_count: usize,
+    #[cfg(test)]
+    pub(super) chrome_tail_count: usize,
+    #[cfg(test)]
+    pub(super) publisher_index_entries: usize,
+    #[cfg(test)]
+    publisher_scope_comparisons: usize,
+    #[cfg(test)]
+    pub(super) chrome_cards_visited: std::cell::Cell<usize>,
+    #[cfg(test)]
+    order_rewrites: usize,
+    #[cfg(test)]
+    held_descriptor_clones: std::cell::Cell<usize>,
     /// The daemon answered this window without a shared model to give.
     pub(super) registry_unavailable: bool,
     baseline: HashMap<Scope, Vec<Pane>>,
@@ -284,6 +340,17 @@ impl Cagents {
         {
             return Task::none();
         }
+        self.install_workspace_model_snapshot(model);
+        self.refuse_conflicting_view_change(scope, operation, change, error)
+    }
+
+    pub(super) fn refuse_conflicting_view_change(
+        &mut self,
+        scope: Scope,
+        operation: uuid::Uuid,
+        change: Change,
+        error: String,
+    ) -> Task<Message> {
         let repository = |model: &crate::workspace_model::WorkspaceModel, scope: &Scope| match scope
         {
             Scope::Channel(channel) => model
@@ -297,7 +364,6 @@ impl Cagents {
             .get(&operation)
             .filter(|(identity, _)| *identity == self.workspace_model.identity)
             .map(|(_, repository)| repository.clone());
-        self.install_workspace_model_snapshot(model);
         let Some(index) =
             self.shared_views
                 .pending
@@ -542,10 +608,6 @@ impl Cagents {
             return Task::none();
         }
         self.retire_startup_registry_waits();
-        // An unopened terminal is not asking to start, so it can wait until
-        // the view that may yet list it has been admitted.
-        let views_settled =
-            self.shared_views.registry_unavailable || self.shared_views_ready_for_startup();
         let held = self
             .durable
             .cards
@@ -554,8 +616,6 @@ impl Cagents {
                 CardKind::Terminal(session)
                     if !terminal_ended(session)
                         && card.existence.is_open()
-                        && (views_settled
-                            || matches!(self.residency(card.id), Residency::Hydrating { .. }))
                         && matches!(self.cards.get(&card.id), Some(CardRuntime::Loading))
                         && self.shared_views.attached.contains(&card.id)
                         && !self.shared_views.defaults.contains_key(&card.id)
@@ -564,20 +624,41 @@ impl Cagents {
                         && !self.terminal_retry_pending(card.id)
                         && !self.pane_close_owned(card.id) =>
                 {
-                    Some((
-                        card.id,
-                        self.exposure(card.id),
-                        matches!(self.residency(card.id), Residency::Hydrating { .. }),
-                        session.clone(),
-                    ))
+                    let opening = matches!(self.residency(card.id), Residency::Hydrating { .. });
+                    if !opening && self.listed_in_registry(card.id) {
+                        return None;
+                    }
+                    #[cfg(test)]
+                    self.shared_views
+                        .held_descriptor_clones
+                        .set(self.shared_views.held_descriptor_clones.get() + 1);
+                    Some((card.id, self.exposure(card.id), opening, session.clone()))
                 }
                 _ => None,
             })
             .collect::<Vec<_>>();
+        if held.is_empty() {
+            return Task::none();
+        }
+        // Only an unlisted unopened candidate can release its custody after
+        // global admission. Listed passive panes perform no release work, and
+        // opening panes already bypass this barrier. Resolve the proof before
+        // any release mutates attached custody.
+        let needs_scope_admission = held
+            .iter()
+            .any(|(card, _, opening, _)| !opening && !self.listed_in_registry(*card));
+        let views_settled = !needs_scope_admission
+            || self.shared_views.registry_unavailable
+            || self.shared_views_ready_for_startup();
         let confirmed = self.workspace_model.identity != crate::workspace_model::NO_REGISTRY;
         let mut tasks = Vec::new();
         let mut hydrate = false;
         for (card, exposure, opening, session) in held {
+            // An unopened terminal waits until the view that may yet list it
+            // has been admitted, exactly as before candidate collection.
+            if !views_settled && !opening {
+                continue;
+            }
             if !self.listed_in_registry(card) {
                 self.shared_views.attached.remove(&card);
                 if self.prepare_saved_terminal(card, &session) {
@@ -732,6 +813,10 @@ impl Cagents {
     /// historical worktrees, so each card and path is resolved by lookup
     /// rather than by comparing it with every root or project worktree.
     fn discover_view_scopes(&self) -> ScopeDiscovery<'_> {
+        #[cfg(test)]
+        self.shared_views
+            .scope_discovery_count
+            .set(self.shared_views.scope_discovery_count.get() + 1);
         let roots = self.indexed_worktree_roots();
         let channel_cards = self
             .durable
@@ -1013,6 +1098,235 @@ impl Cagents {
         }
     }
 
+    /// A selected projection is safe only while this window already holds the
+    /// same membership and sources. Presentation may differ because local
+    /// pending intent or a held reported title is layered over the shared row.
+    pub(super) fn presentation_projection_ready(
+        &self,
+        before: &View,
+        after: &View,
+        pending_operation: Option<uuid::Uuid>,
+    ) -> Result<(), &'static str> {
+        let Scope::Channel(channel) = &before.scope else {
+            return Err("derived worktree membership");
+        };
+        if before.scope != after.scope
+            || after.revision < before.revision
+            || (after.revision == before.revision && after != before)
+            || before.retired != after.retired
+            || before.panes.len() != after.panes.len()
+            || !before.panes.iter().zip(&after.panes).all(|(a, b)| {
+                a.id == b.id
+                    && a.kind == b.kind
+                    && a.scope == b.scope
+                    && a.pending_terminal_start == b.pending_terminal_start
+            })
+        {
+            return Err("scope structure or source changed");
+        }
+        if !self.shared_views.initialized.contains(&before.scope)
+            || self.shared_views.blocked.contains(&before.scope)
+            || self.shared_views.seeding.contains(&before.scope)
+            || self.channel_ui.is_deleting(*channel)
+            || self.channel_ui.was_deleted(*channel)
+        {
+            return Err("scope admission is unsettled");
+        }
+        let selected: HashSet<_> = before.panes.iter().map(|pane| pane.id).collect();
+        if self.navigation_save_pending
+            || self.shared_views.creating_default
+            || self.shared_views.deferred_default.is_some()
+            || !self.shared_views.requested_transfers.is_empty()
+            || self.shared_views.adoptions.iter().any(|adoption| {
+                selected.contains(&adoption.alias) || selected.contains(&adoption.canonical)
+            })
+            || self
+                .shared_views
+                .restorations
+                .iter()
+                .any(|restoration| selected.contains(&restoration.canonical))
+            || self
+                .shared_views
+                .chat_adoptions
+                .keys()
+                .any(|id| selected.contains(id))
+            || self
+                .durable
+                .pending_terminal_creations
+                .iter()
+                .any(|id| selected.contains(id))
+            || self
+                .restored_agent_attaches
+                .iter()
+                .any(|id| selected.contains(id))
+            || !self.channel_ui.retire_candidates.is_empty()
+            || !self.channel_ui.retiring.is_empty()
+            || !self.project_ui.closing.is_empty()
+            || !self.project_ui.removing.is_empty()
+            || !self.project_ui.reopening.is_empty()
+            || !self.queued_card_closes.is_empty()
+            || self.workspace.pending_close().is_some()
+        {
+            return Err("workspace lifecycle is unsettled");
+        }
+        // These local chats still need membership published. An unrelated
+        // draft explicitly retained by this window is not such an obligation.
+        if self.durable.cards.iter().any(|card| {
+            card.existence.is_open()
+                && matches!(card.kind, CardKind::Chat(_))
+                && !self.shared_views.attached.contains(&card.id)
+                && !self.shared_views.retained.contains(&card.id)
+                && !self.chat_is_unused_default(card.id)
+        }) {
+            return Err("an unpublished local conversation needs reconciliation");
+        }
+        match pending_operation {
+            Some(operation)
+                if self.shared_views.pending.len() == 1
+                    && self.shared_views.pending[0].0 == operation
+                    && self.shared_views.pending[0].1 == before.scope => {}
+            None if self.shared_views.pending.is_empty() => {}
+            _ => return Err("unrelated pending intent"),
+        }
+        let Some(baseline) = self.shared_views.baseline.get(&before.scope) else {
+            return Err("no settled publication baseline");
+        };
+        if baseline.len() != before.panes.len()
+            || !baseline
+                .iter()
+                .zip(&before.panes)
+                .all(|(a, b)| a.id == b.id && a.kind == b.kind && a.scope == b.scope)
+        {
+            return Err("publication membership is unsettled");
+        }
+        let Some(local) = self.durable.channels.iter().find(|row| row.id == *channel) else {
+            return Err("channel is not projected");
+        };
+        let Some(shared) = self.workspace_model.channel(*channel) else {
+            return Err("channel metadata is not held");
+        };
+        if !local.shared
+            || local.title != shared.title
+            || local.title_source != shared.title_source
+            || shared.ordinal == crate::workspace_model::PENDING_ORDINAL
+            || local.ordinal != shared.ordinal
+            || self.project_for_repository(&shared.repository) != Some(local.project_id)
+            || !self
+                .workspace_model
+                .projects
+                .iter()
+                .any(|project| project.repository == shared.repository)
+        {
+            return Err("channel metadata is unsettled");
+        }
+        // Canonical ownership alone cannot prove that an older local
+        // placement has already been cleared. The complete projector repairs
+        // that inconsistency before persisting; a selected pass must defer.
+        if self
+            .durable
+            .channels
+            .iter()
+            .any(|other| other.id != *channel && other.cards.iter().any(|id| selected.contains(id)))
+        {
+            return Err("local pane placement is ambiguous");
+        }
+        let current: Vec<_> = local
+            .cards
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.card_state(*id)
+                    .is_some_and(|card| card.existence.is_open() && !card.kind.is_utility())
+            })
+            .collect();
+        if current != before.panes.iter().map(|pane| pane.id).collect::<Vec<_>>() {
+            return Err("local membership is unsettled");
+        }
+        for pane in &before.panes {
+            let Some(card) = self.card_state(pane.id) else {
+                return Err("pane is not projected");
+            };
+            if !card.existence.is_open()
+                || views::shared_kind(&card.kind) != pane.kind
+                || self.durable.card_scopes.get(&pane.id) != pane.scope.as_ref()
+                || pane.pending_terminal_start
+                || self.shared_views.retained.contains(&pane.id)
+                || self.shared_views.defaults.contains_key(&pane.id)
+                || self.pane_move_lifecycle_pending(pane.id)
+                || self.chat_awaiting_admission(pane.id)
+                || self.saved_terminals.entries.contains_key(&pane.id)
+                || !self.cards.contains_key(&pane.id)
+                || matches!(self.cards.get(&pane.id), Some(CardRuntime::Loading))
+                // A retained browser failure is a settled presentation: the
+                // existing reducer preserves it while this exact source and
+                // runtime remain present. Other failed surfaces may still owe
+                // admission or recovery work.
+                || (matches!(self.cards.get(&pane.id), Some(CardRuntime::Failed(_)))
+                    && !matches!(pane.kind, CardKind::Browser(_)))
+            {
+                return Err("pane source or runtime is unsettled");
+            }
+        }
+        // This census deliberately covers every canonical scope. A selected
+        // channel cannot establish resource ownership or authorize alias
+        // retirement from its own pane list alone.
+        let mut owned = HashSet::new();
+        let mut resources = HashSet::new();
+        for pane in self
+            .workspace_model
+            .views
+            .iter()
+            .flat_map(|view| &view.panes)
+        {
+            if !owned.insert(pane.id)
+                || self.shared_views.closed.contains(&pane.id)
+                || projection_resource(&pane.kind)
+                    .is_some_and(|resource| !resources.insert(resource))
+            {
+                return Err("canonical ownership is ambiguous");
+            }
+        }
+        if self
+            .durable
+            .cards
+            .iter()
+            .filter(|card| card.existence.is_open() && !owned.contains(&card.id))
+            .any(|card| {
+                projection_resource(&card.kind)
+                    .is_some_and(|resource| resources.contains(&resource))
+            })
+        {
+            return Err("a local resource alias needs reconciliation");
+        }
+        Ok(())
+    }
+
+    fn local_views_for(&self, projection: ViewProjection<'_>) -> LocalViews {
+        match projection {
+            ViewProjection::All => self.local_views(),
+            ViewProjection::Structural(scopes) => self.local_views_in(Some(scopes)),
+            ViewProjection::Selected(scopes) => {
+                #[cfg(test)]
+                self.shared_views
+                    .selected_projection_count
+                    .set(self.shared_views.selected_projection_count.get() + 1);
+                let cards = scopes
+                    .iter()
+                    .map(|scope| (scope.clone(), self.local_view_cards(scope)))
+                    .collect();
+                let panes = scopes
+                    .iter()
+                    .map(|scope| (scope.clone(), self.local_view_panes(scope)))
+                    .collect();
+                LocalViews {
+                    scopes: scopes.to_vec(),
+                    cards,
+                    panes,
+                }
+            }
+        }
+    }
+
     fn pane_move_lifecycle_pending(&self, card: CardId) -> bool {
         self.pane_close_owned(card)
             || self.terminal_start_in_flight(card)
@@ -1268,6 +1582,9 @@ impl Cagents {
         {
             return true;
         }
+        if self.shared_views.closed.contains(&card) {
+            return true;
+        }
         let mut owners = self
             .workspace_model
             .views
@@ -1329,10 +1646,14 @@ impl Cagents {
         {
             return;
         }
-        self.publish_projected_view_changes(self.local_views());
+        self.publish_projected_view_changes(self.local_views(), ViewProjection::All);
     }
 
-    fn publish_projected_view_changes(&mut self, projected: LocalViews) {
+    fn publish_projected_view_changes(
+        &mut self,
+        projected: LocalViews,
+        projection: ViewProjection<'_>,
+    ) {
         if self.shared_views.applying
             || self.workspace_model.identity == crate::workspace_model::NO_REGISTRY
         {
@@ -1343,31 +1664,74 @@ impl Cagents {
             cards,
             mut panes,
         } = projected;
-        // Publishing only queues edits, so the model's views stay put: find
-        // each scope's first view by lookup rather than a scan per scope.
-        let mut needed = scopes.iter().collect::<HashSet<_>>();
-        let desired = panes
-            .values()
-            .flatten()
-            .map(|pane| pane.id)
-            .collect::<HashSet<_>>();
-        for (scope, previous) in &self.shared_views.baseline {
-            if previous.iter().any(|pane| desired.contains(&pane.id)) {
-                needed.insert(scope);
-            }
-        }
-        let mut view_indices = HashMap::new();
-        for (index, view) in self.workspace_model.views.iter().enumerate() {
-            if needed.contains(&view.scope) {
-                view_indices.entry(view.scope.clone()).or_insert(index);
-            }
-        }
+        // Ownership is global even when only one destination is published: a
+        // transfer's source can be outside the projected scopes.
         let previous_owners = self
             .shared_views
             .baseline
             .iter()
             .flat_map(|(scope, panes)| panes.iter().map(|pane| (pane.id, scope.clone())))
             .collect::<HashMap<_, _>>();
+        let needed = match projection {
+            ViewProjection::All => None,
+            ViewProjection::Structural(_) | ViewProjection::Selected(_) => {
+                let mut needed = scopes.iter().collect::<HashSet<_>>();
+                for pane in panes.values().flatten() {
+                    if let Some(source) = previous_owners.get(&pane.id) {
+                        needed.insert(source);
+                    }
+                }
+                Some(needed)
+            }
+        };
+        // A stable presentation or seed acknowledgment needs only a few
+        // equality lookups. Structural subsets can span many scopes, so index
+        // their required destinations and transfer sources in one model pass.
+        // Both preserve the first canonical view for each scope.
+        let mut view_indices = HashMap::new();
+        match needed {
+            None => {
+                for (index, view) in self.workspace_model.views.iter().enumerate() {
+                    #[cfg(test)]
+                    {
+                        self.shared_views.publisher_index_entries += 1;
+                    }
+                    view_indices.entry(view.scope.clone()).or_insert(index);
+                }
+            }
+            Some(needed) if matches!(projection, ViewProjection::Structural(_)) => {
+                for (index, view) in self.workspace_model.views.iter().enumerate() {
+                    #[cfg(test)]
+                    {
+                        self.shared_views.publisher_scope_comparisons += 1;
+                    }
+                    if needed.contains(&view.scope) {
+                        #[cfg(test)]
+                        {
+                            self.shared_views.publisher_index_entries += 1;
+                        }
+                        view_indices.entry(view.scope.clone()).or_insert(index);
+                    }
+                }
+            }
+            Some(needed) => {
+                for scope in needed {
+                    if let Some(index) = self.workspace_model.views.iter().position(|view| {
+                        #[cfg(test)]
+                        {
+                            self.shared_views.publisher_scope_comparisons += 1;
+                        }
+                        &view.scope == scope
+                    }) {
+                        #[cfg(test)]
+                        {
+                            self.shared_views.publisher_index_entries += 1;
+                        }
+                        view_indices.insert(scope.clone(), index);
+                    }
+                }
+            }
+        }
         for (destination, desired) in &panes {
             for (index, pane) in desired.iter().enumerate() {
                 if let Some(source) = previous_owners
@@ -1556,11 +1920,14 @@ impl Cagents {
             let cards = self.local_view_cards(&scope);
             let panes = self.local_view_panes(&scope);
             self.rebase_seeded_attachments(&scope, &panes);
-            self.publish_projected_view_changes(LocalViews {
-                scopes: vec![scope.clone()],
-                cards: HashMap::from([(scope.clone(), cards)]),
-                panes: HashMap::from([(scope, panes)]),
-            });
+            self.publish_projected_view_changes(
+                LocalViews {
+                    scopes: vec![scope.clone()],
+                    cards: HashMap::from([(scope.clone(), cards)]),
+                    panes: HashMap::from([(scope.clone(), panes)]),
+                },
+                ViewProjection::Selected(&[scope]),
+            );
         }
     }
 
@@ -1957,6 +2324,20 @@ impl Cagents {
         self.reconcile_shared_views_in(None)
     }
 
+    /// Called only after the presentation-only proof has established unchanged
+    /// global ownership, settled local membership and no admission obligations.
+    pub(super) fn reconcile_shared_presentation(&mut self, scopes: &[Scope]) -> Task<Message> {
+        // Channel membership is an explicit local row. Worktree membership is
+        // still derived from root discovery and requires the complete pass.
+        if scopes
+            .iter()
+            .any(|scope| !matches!(scope, Scope::Channel(_)))
+        {
+            return self.reconcile_shared_views();
+        }
+        self.reconcile_shared_views_for(ViewProjection::Selected(scopes))
+    }
+
     pub(super) fn reconcile_shared_views_for_repository(
         &mut self,
         repository: &Path,
@@ -1971,64 +2352,109 @@ impl Cagents {
     ) -> Task<Message> {
         self.publish_unpublished_local_chats();
         // A watcher snapshot can announce the destination before the explicit
-        // transfer response arrives. Rebase before either snapshot projects.
+        // transfer response arrives. Rebase before selecting either owner.
         self.retarget_transferred_pane_updates(None);
         let selected = repository
             .map(|(repository, adopted)| self.repository_view_scopes(repository, adopted));
-        let selected = selected.as_ref();
-        self.shared_views.prune_restoration_requests(&self.durable);
-        self.admit_existing_views_in(selected);
-        // A delayed tombstone must not borrow a newer local actor's identity.
-        // Record only raw authoritative panes, never the pending overlay below.
-        let local_cards = self
-            .durable
-            .cards
-            .iter()
-            .filter(|card| card.existence.is_open())
-            .map(|card| card.id)
-            .collect::<HashSet<_>>();
-        self.shared_views
-            .observed_chats
-            .retain(|id, _| local_cards.contains(id));
-        self.shared_views
-            .closed_chats
-            .retain(|id, _| local_cards.contains(id));
-        let mut seen = HashSet::new();
-        let mut ambiguous = HashSet::new();
-        for pane in self
-            .workspace_model
-            .views
-            .iter()
-            .flat_map(|view| &view.panes)
-            .filter(|pane| local_cards.contains(&pane.id))
-        {
-            if !seen.insert(pane.id) {
-                ambiguous.insert(pane.id);
+        self.reconcile_shared_views_for(
+            selected
+                .as_ref()
+                .map_or(ViewProjection::All, ViewProjection::Structural),
+        )
+    }
+
+    fn reconcile_shared_views_for(&mut self, projection: ViewProjection<'_>) -> Task<Message> {
+        let presentation = matches!(projection, ViewProjection::Selected(_));
+        let selected = match projection {
+            ViewProjection::Structural(scopes) => Some(scopes),
+            _ => None,
+        };
+        let mut phase = WorkspaceProjectionTiming::new(presentation);
+        if !presentation {
+            self.shared_views.prune_restoration_requests(&self.durable);
+            self.admit_existing_views_in(selected);
+            // A delayed tombstone must not borrow a newer local actor's identity.
+            // Record only raw authoritative panes, never the pending overlay below.
+            let local_cards = self
+                .durable
+                .cards
+                .iter()
+                .filter(|card| card.existence.is_open())
+                .map(|card| card.id)
+                .collect::<HashSet<_>>();
+            self.shared_views
+                .observed_chats
+                .retain(|id, _| local_cards.contains(id));
+            self.shared_views
+                .closed_chats
+                .retain(|id, _| local_cards.contains(id));
+            let mut seen = HashSet::new();
+            let mut ambiguous = HashSet::new();
+            for pane in self
+                .workspace_model
+                .views
+                .iter()
+                .flat_map(|view| &view.panes)
+                .filter(|pane| local_cards.contains(&pane.id))
+            {
+                if !seen.insert(pane.id) {
+                    ambiguous.insert(pane.id);
+                }
+                if let CardKind::Chat(session) = &pane.kind {
+                    if self.shared_views.observed_chats.get(&pane.id) != Some(session) {
+                        self.shared_views
+                            .observed_chats
+                            .insert(pane.id, session.clone());
+                    }
+                } else {
+                    self.shared_views.observed_chats.remove(&pane.id);
+                }
             }
-            if let CardKind::Chat(session) = &pane.kind {
-                if self.shared_views.observed_chats.get(&pane.id) != Some(session) {
+            for id in ambiguous {
+                self.shared_views.observed_chats.remove(&id);
+            }
+        } else if let ViewProjection::Selected(scopes) = projection {
+            // Preserve the same raw source evidence the complete pass records
+            // for a future close, without scanning unrelated local history.
+            for pane in self
+                .workspace_model
+                .views
+                .iter()
+                .filter(|view| scopes.contains(&view.scope))
+                .flat_map(|view| &view.panes)
+            {
+                if let CardKind::Chat(session) = &pane.kind {
                     self.shared_views
                         .observed_chats
                         .insert(pane.id, session.clone());
+                } else {
+                    self.shared_views.observed_chats.remove(&pane.id);
                 }
-            } else {
-                self.shared_views.observed_chats.remove(&pane.id);
             }
-        }
-        for id in ambiguous {
-            self.shared_views.observed_chats.remove(&id);
         }
         self.shared_views.applying = true;
         let mut tasks = Vec::new();
         // The first authoritative snapshot of an original scope still belongs
         // to startup even if the gate already reported incomplete recovery.
         // Capture before optimistic edits or alias projection add local panes.
-        for view in &self.workspace_model.views {
+        // A selected pass changed only its scopes; the rest were seen before.
+        let mut views = match projection {
+            ViewProjection::All | ViewProjection::Structural(_) => {
+                self.workspace_model.views.clone()
+            }
+            ViewProjection::Selected(scopes) => self
+                .workspace_model
+                .views
+                .iter()
+                .filter(|view| scopes.contains(&view.scope))
+                .cloned()
+                .collect(),
+        };
+        for view in &views {
             self.startup_gate
                 .initial_panes
                 .observe_initial_view(view, &self.durable.cards);
         }
-        let mut views = self.workspace_model.views.clone();
         for (_, source, change) in &self.shared_views.pending {
             if let Change::Transfer {
                 id,
@@ -2059,28 +2485,63 @@ impl Cagents {
                 let _ = view.apply(change);
             }
         }
-        let owned = views
-            .iter()
-            .flat_map(|view| view.panes.iter().map(|pane| pane.id))
-            .collect::<HashSet<_>>();
-        self.prepare_shared_aliases_in(&views, &owned, selected);
+        // A scoped read or a deferred receipt may prove a close beyond the
+        // snapshot that supplied a descriptor. Exact closed identity wins over
+        // both that older descriptor and a pending local insertion overlay.
+        for view in &mut views {
+            let closed: Vec<_> = view
+                .panes
+                .iter()
+                .filter(|pane| self.shared_views.closed.contains(&pane.id))
+                .map(|pane| pane.id)
+                .collect();
+            view.panes
+                .retain(|pane| !self.shared_views.closed.contains(&pane.id));
+            for id in closed {
+                if !view.retired.contains(&id) {
+                    view.retired.push(id);
+                }
+            }
+        }
+        let owned = if !presentation {
+            views
+                .iter()
+                .flat_map(|view| view.panes.iter().map(|pane| pane.id))
+                .collect::<HashSet<_>>()
+        } else {
+            self.workspace_model
+                .views
+                .iter()
+                .flat_map(|view| view.panes.iter().map(|pane| pane.id))
+                .collect::<HashSet<_>>()
+        };
+        if !presentation {
+            self.prepare_shared_aliases_in(&views, &owned, selected);
+        }
         // Root discovery is immutable during this projection, so index it once
         // over owned paths that outlive each mutable view update. Keep only
         // owned card paths too, and refresh the panes each view changes before
         // visiting the next one.
-        let root_paths = self.worktree_root_paths();
+        let root_paths = if !presentation {
+            self.worktree_root_paths()
+        } else {
+            Vec::new()
+        };
         let roots = worktree_ui::WorktreeRoots::new(root_paths.iter().map(PathBuf::as_path));
         let mut local_worktrees = CardWorktrees::default();
-        for card in self
-            .durable
-            .cards
-            .iter()
-            .filter(|card| card.existence.is_open())
-        {
-            if let Some(path) = self.unchanneled_card_worktree_indexed(card, &roots) {
-                local_worktrees.insert(card.id, path.to_owned());
+        if !presentation {
+            for card in self
+                .durable
+                .cards
+                .iter()
+                .filter(|card| card.existence.is_open())
+            {
+                if let Some(path) = self.unchanneled_card_worktree_indexed(card, &roots) {
+                    local_worktrees.insert(card.id, path.to_owned());
+                }
             }
         }
+        phase.mark("selected_prepare");
         let mut projected_scopes = Vec::new();
         for mut view in views {
             if selected.is_some_and(|selected| !selected.contains(&view.scope)) {
@@ -2138,31 +2599,39 @@ impl Cagents {
             }
             projected_scopes.push(view.scope);
         }
+        phase.mark("selected_project");
         self.shared_views.applying = false;
         // Capture after the active strip snapshot, then share this immutable
         // pass between settled baselines and publication. Uninitialized scopes
         // and local/default intentions still use the ordinary publisher.
         // Held reported titles stay held: publishing them on every view
         // acknowledgment would publish each title again as its own echo.
-        self.save_workspace_with_view_publication(|app| {
-            let projected = app.local_views_in(selected);
+        self.save_projected_workspace(presentation, |app| {
+            let projected = app.local_views_for(projection);
             for scope in projected_scopes {
                 app.shared_views.baseline.insert(
                     scope.clone(),
                     projected.panes.get(&scope).cloned().unwrap_or_default(),
                 );
             }
-            app.publish_projected_view_changes(projected);
+            app.publish_projected_view_changes(projected, projection);
         });
+        phase.mark("selected_save");
         if let Some(path) = self.shared_views.deferred_default.take() {
             if self.active_workspace.as_ref() == Some(&path) && self.workspace.cards().is_empty() {
                 tasks.push(self.add_default_pane(path, settings::DefaultPane::Terminal));
             }
         }
-        self.reproject_notification_unread();
+        // Presentation-only projection preserves every notification attribution
+        // input: source, membership, ownership, placement and project identity.
+        // Journal snapshots attribute their own new evidence independently.
+        if !presentation {
+            self.reproject_notification_unread();
+        }
         tasks.push(self.release_held_terminals());
         // Restored shared panes queued for an attach wait for the registry.
         tasks.push(self.attach_next_restored_agent());
+        phase.mark("selected_postlude");
         Task::batch(tasks)
     }
 
@@ -2274,8 +2743,25 @@ impl Cagents {
                 self.sidebar_state.transfer_card_update(alias, shared.id);
             }
             self.detach_shared_pane(alias);
-            for channel in &mut Arc::make_mut(&mut self.durable).channels {
-                channel.cards.retain(|id| *id != alias);
+            self.remove_shared_channel_member(alias);
+        }
+    }
+
+    /// Removing an alias or moving a pane to a worktree must leave a valid
+    /// saved channel even when its now-empty inactive view needs no projection.
+    fn remove_shared_channel_member(&mut self, id: CardId) {
+        if !self
+            .durable
+            .channels
+            .iter()
+            .any(|channel| channel.focused == Some(id) || channel.cards.contains(&id))
+        {
+            return;
+        }
+        for channel in &mut Arc::make_mut(&mut self.durable).channels {
+            channel.cards.retain(|card| *card != id);
+            if channel.focused == Some(id) {
+                channel.focused = channel.cards.first().copied();
             }
         }
     }
@@ -2451,9 +2937,7 @@ impl Cagents {
             if let Scope::Worktree { path, .. } = &view.scope {
                 projected.scope = Some(path.clone());
                 self.worktree_owners.insert(projected.id, path.clone());
-                for channel in &mut Arc::make_mut(&mut self.durable).channels {
-                    channel.cards.retain(|id| *id != projected.id);
-                }
+                self.remove_shared_channel_member(projected.id);
             }
 
             if let CardKind::Repository(repository) = &mut projected.kind {
@@ -2503,9 +2987,10 @@ impl Cagents {
             if accepted_default {
                 let automatic = self.shared_views.defaults.remove(&pane.id);
                 self.shared_views.default_requests.remove(&pane.id);
-                let explicit = Arc::make_mut(&mut self.durable)
-                    .pending_terminal_creations
-                    .remove(&pane.id);
+                let explicit = self.durable.pending_terminal_creations.contains(&pane.id)
+                    && Arc::make_mut(&mut self.durable)
+                        .pending_terminal_creations
+                        .remove(&pane.id);
                 if automatic.is_some() || explicit {
                     if let CardKind::Terminal(session) = &pane.kind {
                         self.shared_views.attached.insert(pane.id);
@@ -2699,13 +3184,15 @@ impl Cagents {
                     tasks.push(self.attach_shared_pane(pane));
                 }
             }
-            let durable = Arc::make_mut(&mut self.durable);
-            match &pane.scope {
-                Some(scope) => {
-                    durable.card_scopes.insert(pane.id, scope.clone());
-                }
-                None => {
-                    durable.card_scopes.remove(&pane.id);
+            if self.durable.card_scopes.get(&pane.id) != pane.scope.as_ref() {
+                let durable = Arc::make_mut(&mut self.durable);
+                match &pane.scope {
+                    Some(scope) => {
+                        durable.card_scopes.insert(pane.id, scope.clone());
+                    }
+                    None => {
+                        durable.card_scopes.remove(&pane.id);
+                    }
                 }
             }
         }
@@ -2726,18 +3213,18 @@ impl Cagents {
             .chain(retained)
             .collect::<Vec<_>>();
         if let Some(index) = index {
-            let channel = &mut Arc::make_mut(&mut self.durable).channels[index];
-            channel.cards = visible.clone();
-            if !channel
+            let channel = &self.durable.channels[index];
+            let focused = channel
                 .focused
-                .is_some_and(|id| channel.cards.contains(&id))
-            {
-                channel.focused = channel.cards.first().copied();
+                .filter(|id| visible.contains(id))
+                .or_else(|| visible.first().copied());
+            if channel.cards != visible || channel.focused != focused {
+                let channel = &mut Arc::make_mut(&mut self.durable).channels[index];
+                channel.cards = visible.clone();
+                channel.focused = focused;
             }
         }
-        Arc::make_mut(&mut self.durable)
-            .cards
-            .arrange_within(&visible);
+        self.normalize_projected_card_order(&visible);
         if active {
             tasks.push(self.project_shared_strip(&view.panes, &visible));
         }
@@ -2745,6 +3232,34 @@ impl Cagents {
             self.persist();
         }
         Task::batch(tasks)
+    }
+
+    /// Normalize the selected subsequence without moving unrelated history.
+    /// Local channel order alone is not proof of durable card order.
+    fn normalize_projected_card_order(&mut self, visible: &[CardId]) {
+        let mut previous = None;
+        let ordered = visible.iter().all(|id| {
+            let Some(index) = self.card_index(*id) else {
+                return true;
+            };
+            let follows = previous.is_none_or(|previous| previous < index);
+            previous = Some(index);
+            follows
+        });
+        if ordered {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.shared_views.order_rewrites += 1;
+        }
+        Arc::make_mut(&mut self.durable)
+            .cards
+            .arrange_within(visible);
+    }
+
+    pub(super) fn presentation_chrome_cards(&self, scope: &Scope) -> Vec<CardId> {
+        self.local_view_cards(scope)
     }
 
     /// Attaches draft `card` to the conversation another window started in the
@@ -2813,6 +3328,10 @@ impl Cagents {
     }
 
     fn attach_shared_pane(&mut self, pane: &Pane) -> Task<Message> {
+        #[cfg(test)]
+        {
+            self.shared_views.pane_attachment_count += 1;
+        }
         // Saved terminal outcomes are presentation, never a hydration request.
         // In particular, RelaunchAvailable retains an explicit restart action.
         if matches!(&pane.kind, CardKind::Terminal(session) if terminal_ended(session)) {
@@ -2865,7 +3384,8 @@ impl Cagents {
     /// `view` carries this window's pending edits over the canonical one, so a
     /// local close counts here as well as a peer's.
     fn pane_retired(&self, id: CardId, view: &View) -> bool {
-        view.retired.contains(&id)
+        self.shared_views.closed.contains(&id)
+            || view.retired.contains(&id)
             || self
                 .workspace_model
                 .views
@@ -3150,6 +3670,8 @@ fn same_attention_update_source(left: &CardKind, right: &CardKind) -> bool {
 mod tests {
     mod history_start;
     mod published_card_edits;
+    #[cfg(not(feature = "integrated-browser"))]
+    mod replica_capture;
     mod startup_admission;
     mod startup_terminals;
 
@@ -5284,6 +5806,1745 @@ mod tests {
         assert!(std::iter::from_fn(|| rx.try_recv().ok()).any(|edit| matches!(edit,
             ModelEdit::ChangeView { scope, change: Change::Update { pane: changed, .. }, .. }
             if scope == Scope::Channel(source) && changed.id == pane.id && changed.width_fraction == 0.68)));
+    }
+
+    /// Settled metadata and a ready browser are ordinary presentation state;
+    /// history and unrelated default drafts are deliberately not required.
+    #[cfg(not(feature = "integrated-browser"))]
+    fn presentation_fixture() -> (Cagents, ChannelId, ChannelId, Pane) {
+        let (mut app, source, destination, pane) = channel_move_fixture();
+        let repository = PathBuf::from("/repo/.git");
+        let project = app.durable.channels[0].project_id;
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "repo".into(),
+            repository.clone(),
+            vec![],
+            vec![],
+        ));
+        app.workspace_model
+            .projects
+            .push(crate::workspace_model::ModelProject {
+                repository,
+                name: "repo".into(),
+                kind: ProjectKind::Git,
+                ordinal: 0,
+            });
+        drop(app.reconcile_workspace_model());
+        let view = app
+            .workspace_model
+            .views
+            .iter()
+            .find(|view| view.scope == Scope::Channel(source))
+            .unwrap();
+        let mut next = view.clone();
+        next.revision += 1;
+        assert_eq!(app.presentation_projection_ready(view, &next, None), Ok(()));
+        (app, source, destination, pane)
+    }
+
+    #[cfg(not(feature = "integrated-browser"))]
+    fn presentation_managed_notice(
+        app: &mut Cagents,
+        channel: ChannelId,
+        card: CardId,
+    ) -> crate::notifications::Notice {
+        use crate::agent_execution::{Agent, HostedSession, Origin, Spec, Surface, Target};
+        let CardKind::Terminal(session) = moving_terminal_kind() else {
+            unreachable!()
+        };
+        let repository = app
+            .workspace_model
+            .channel(channel)
+            .unwrap()
+            .repository
+            .clone();
+        let state = CardState {
+            id: card,
+            generation: 0,
+            title: "Managed attention".into(),
+            width_fraction: 0.5,
+            existence: Existence::Open,
+            kind: CardKind::Terminal(session.clone()),
+        };
+        let durable = Arc::make_mut(&mut app.durable);
+        if let Some(existing) = durable.cards.iter_mut().find(|row| row.id == card) {
+            *existing = state.into();
+        } else {
+            durable.cards.push(state);
+        }
+        durable.card_scopes.remove(&card);
+        for row in &mut durable.channels {
+            row.cards.retain(|id| *id != card);
+            if row.id == channel {
+                row.cards.push(card);
+            }
+        }
+        let pane = Pane::from_card(app.card_state(card).unwrap(), None).unwrap();
+        for view in &mut app.workspace_model.views {
+            view.panes.retain(|pane| pane.id != card);
+        }
+        app.workspace_model
+            .views
+            .iter_mut()
+            .find(|view| view.scope == Scope::Channel(channel))
+            .unwrap()
+            .panes
+            .push(pane);
+        app.workspace_model.agents.push(Agent {
+            id: crate::model::AgentId::from_uuid(card.as_uuid()),
+            name: None,
+            origin: Origin::User,
+            spec: Spec {
+                provider: crate::agent::Provider::Claude,
+                account: None,
+                target: Target {
+                    repository,
+                    directory: session.launch.working_directory.clone(),
+                    placement: Some(Scope::Channel(channel)),
+                },
+                surface: Surface::Terminal,
+                model: None,
+                permission_mode: None,
+                reasoning_effort: None,
+            },
+            placement: Scope::Channel(channel),
+            session: Some(HostedSession::Terminal(session.clone())),
+            console: Some(session.clone()),
+            created_ms: 0,
+            closed: false,
+        });
+        app.cards.insert(card, CardRuntime::Loading);
+        app.register_presence(card, Exposure::Offscreen, Residency::Cold);
+        app.shared_views.attached.insert(card);
+        crate::notifications::Notice {
+            id: uuid::Uuid::new_v4(),
+            delivered: false,
+            acknowledged: false,
+            window: None,
+            event: crate::notifications::Event {
+                content: None,
+                target: crate::notifications::Target::Session(session.id),
+                source_session: Some(session.id),
+                provider: Some(crate::agent::Provider::Claude),
+                directory: Some(session.launch.working_directory),
+                destination: None,
+                evidence: crate::notifications::Evidence {
+                    key: format!("presentation-managed-{card}"),
+                    kind: crate::notifications::Kind::Failed,
+                },
+            },
+        }
+    }
+
+    #[cfg(not(feature = "integrated-browser"))]
+    fn presentation_edge(
+        app: &Cagents,
+        scope: Scope,
+        revision: u64,
+        title: &str,
+        width: f32,
+    ) -> super::super::workspace_model_sync::ModelUpdate {
+        use super::super::workspace_model_sync::{EdgeChanges, ModelUpdate};
+        use crate::workspace_model::delta::{EditEffects, ViewChanges, ViewRevision};
+        let mut view = app
+            .workspace_model
+            .views
+            .iter()
+            .find(|view| view.scope == scope)
+            .unwrap()
+            .clone();
+        let before = view.panes[0].clone();
+        view.panes[0].title = title.into();
+        view.panes[0].width_fraction = width;
+        let change = Change::Update {
+            before,
+            pane: view.panes[0].clone(),
+        };
+        let expected_revision = view.revision;
+        view.revision = revision;
+        ModelUpdate::Changed {
+            sequence: revision,
+            edit: ModelEdit::ChangeView {
+                scope: scope.clone(),
+                expected_revision,
+                operation: uuid::Uuid::new_v4(),
+                change,
+            },
+            changes: EdgeChanges {
+                identity: Some(app.workspace_model.identity),
+                views: ViewChanges {
+                    sequence: revision,
+                    views: vec![view],
+                    ..Default::default()
+                },
+                effects: EditEffects {
+                    views: vec![ViewRevision {
+                        scope,
+                        before: Some(expected_revision),
+                        after: Some(revision),
+                    }],
+                    ..Default::default()
+                },
+            },
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "integrated-browser"))]
+    fn presentation_edge_uses_the_selected_projector_and_chrome_update_tail() {
+        let (mut app, source, destination, pane) = presentation_fixture();
+        // Match the native bounded workload's saved history. Only 83 panes
+        // are open; historical roots/cards must not enter this edit's local
+        // discovery or projection budget.
+        for index in 1..1_769 {
+            let mut saved = app.card_state(pane.id).unwrap().clone();
+            saved.id = CardId::new();
+            if let CardKind::Browser(browser) = &mut saved.kind {
+                browser.id = BrowserId::new();
+            }
+            if index == 1 {
+                saved.kind = moving_terminal_kind();
+            }
+            if index < 83 {
+                let path = PathBuf::from(format!("/repo/open-{index}"));
+                let scope = Scope::Worktree {
+                    repository: PathBuf::from("/repo/.git"),
+                    path: path.clone(),
+                };
+                app.workspace_model.views.push(View {
+                    scope,
+                    revision: 1,
+                    panes: vec![Pane::from_card(&saved, Some(path.clone())).unwrap()],
+                    retired: vec![],
+                });
+                Arc::make_mut(&mut app.durable)
+                    .card_scopes
+                    .insert(saved.id, path);
+                if index == 1 {
+                    app.cards.insert(saved.id, CardRuntime::Loading);
+                    app.shared_views.attached.insert(saved.id);
+                } else {
+                    app.cards.insert(saved.id, CardRuntime::Completed);
+                }
+            } else {
+                saved.existence = super::super::project_ui::removed_existence("historical fixture");
+            }
+            let id = saved.id;
+            Arc::make_mut(&mut app.durable).cards.push(saved);
+            if index == 1 {
+                app.register_presence(id, Exposure::Offscreen, Residency::Cold);
+            }
+        }
+        while app.workspace_model.views.len() < 1_856 {
+            app.workspace_model.views.push(View::empty(Scope::Worktree {
+                repository: PathBuf::from("/repo/.git"),
+                path: PathBuf::from(format!("/repo/closed-{}", app.workspace_model.views.len())),
+            }));
+        }
+        let managed = app
+            .durable
+            .cards
+            .iter()
+            .skip(1)
+            .take(20)
+            .map(|card| card.id)
+            .collect::<Vec<_>>();
+        let managed_channel = destination;
+        let notices = managed
+            .iter()
+            .map(|card| presentation_managed_notice(&mut app, managed_channel, *card))
+            .collect::<Vec<_>>();
+        drop(app.update_notifications(notification_ui::Action::Snapshot(
+            crate::notifications::Snapshot {
+                notices,
+                diagnostic: None,
+            },
+        )));
+        assert!(
+            managed
+                .iter()
+                .all(|card| app.sidebar_state.has_card_update(*card))
+        );
+        let attention = managed
+            .iter()
+            .map(|card| app.sidebar_state.card_attention(*card))
+            .collect::<Vec<_>>();
+        // A settled window has already initialized historical chrome and
+        // terminal ordinals. Only selected members should be visited again.
+        drop(app.sync_chrome());
+        app.shared_views.chrome_cards_visited.set(0);
+        app.shared_views.publisher_index_entries = 0;
+        app.shared_views.publisher_scope_comparisons = 0;
+        app.shared_views.order_rewrites = 0;
+        app.shared_views.held_descriptor_clones.set(0);
+        app.shared_views.notification_attribution_count.set(0);
+        let failure = match app.cards.get(&pane.id) {
+            Some(CardRuntime::Failed(error)) => format!("{error:?}"),
+            _ => panic!("browserless unavailable surface"),
+        };
+        let residency = app.residency(pane.id).clone();
+        let exposure = app.exposure(pane.id);
+        app.shared_views.pane_attachment_count = 0;
+        let listed_passive = app.durable.cards[1].id;
+        let history = app
+            .durable
+            .cards
+            .iter()
+            .skip(1)
+            .cloned()
+            .collect::<Vec<_>>();
+        let views = app.workspace_model.views[2..].to_vec();
+        let update = presentation_edge(&app, Scope::Channel(source), 21, "Remote label", 0.72);
+        app.shared_views.scope_discovery_count.set(0);
+        app.shared_views.local_projection_count.set(0);
+        app.shared_views.selected_projection_count.set(0);
+        app.shared_views.structural_tail_count = 0;
+        app.shared_views.chrome_tail_count = 0;
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        drop(app.update(Message::WorkspaceModelObserved(update)));
+        assert_eq!(
+            app.shared_views.scope_discovery_count.get(),
+            0,
+            "settled presentation does not rediscover historical scopes in a release tail"
+        );
+        assert_eq!(
+            app.shared_views.notification_attribution_count.get(),
+            0,
+            "stable presentation does not rebuild managed notification ownership"
+        );
+        assert_eq!(
+            managed
+                .iter()
+                .map(|card| app.sidebar_state.card_attention(*card))
+                .collect::<Vec<_>>(),
+            attention
+        );
+        assert_eq!(app.shared_views.local_projection_count.get(), 0);
+        assert_eq!(app.shared_views.selected_projection_count.get(), 1);
+        assert_eq!(app.shared_views.structural_tail_count, 0);
+        assert_eq!(app.shared_views.chrome_tail_count, 1);
+        assert_eq!(app.shared_views.chrome_cards_visited.get(), 1);
+        assert_eq!(app.shared_views.publisher_index_entries, 1);
+        assert_eq!(app.shared_views.publisher_scope_comparisons, 1);
+        assert_eq!(app.shared_views.order_rewrites, 0);
+        assert_eq!(app.shared_views.held_descriptor_clones.get(), 0);
+        assert_eq!(app.card_state(pane.id).unwrap().title, "Remote label");
+        assert_eq!(app.card_state(pane.id).unwrap().width_fraction, 0.72);
+        assert!(
+            rx.try_recv().is_err(),
+            "a remote presentation is not republished"
+        );
+        assert!(app.durable.cards.iter().skip(1).eq(history.iter()));
+        assert_eq!(&app.workspace_model.views[2..], views.as_slice());
+        assert!(
+            matches!(app.cards.get(&pane.id), Some(CardRuntime::Failed(error)) if format!("{error:?}") == failure)
+        );
+        assert_eq!(app.residency(pane.id), &residency);
+        assert_eq!(app.exposure(pane.id), exposure);
+        assert_eq!(app.shared_views.pane_attachment_count, 0);
+        assert!(!app.terminal_start_in_flight(pane.id));
+        assert!(matches!(
+            app.cards.get(&listed_passive),
+            Some(CardRuntime::Loading)
+        ));
+        assert_eq!(app.residency(listed_passive), &Residency::Cold);
+        assert!(app.shared_views.attached.contains(&listed_passive));
+        assert!(!app.saved_terminals.entries.contains_key(&listed_passive));
+        assert!(!app.terminal_start_in_flight(listed_passive));
+    }
+
+    #[test]
+    fn presentation_selected_publication_finds_an_unprojected_transfer_source() {
+        let (mut app, source, destination, pane) = channel_move_fixture();
+        let source = Scope::Channel(source);
+        let destination = Scope::Channel(destination);
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        // Preserve first canonical-view semantics in the scoped lookup too.
+        let mut duplicate = app.workspace_model.views[0].clone();
+        duplicate.revision = 999;
+        app.workspace_model.views.push(duplicate);
+        for index in 0..100 {
+            app.workspace_model.views.push(View::empty(Scope::Worktree {
+                repository: PathBuf::from("/repo/.git"),
+                path: PathBuf::from(format!("/repo/history-{index}")),
+            }));
+        }
+        let baseline = app.shared_views.baseline.clone();
+        let project = || LocalViews {
+            scopes: vec![destination.clone()],
+            cards: HashMap::from([(destination.clone(), vec![pane.id])]),
+            panes: HashMap::from([(destination.clone(), vec![pane.clone()])]),
+        };
+        app.shared_views.publisher_index_entries = 0;
+        app.publish_projected_view_changes(
+            project(),
+            ViewProjection::Selected(std::slice::from_ref(&destination)),
+        );
+        assert_eq!(app.shared_views.publisher_index_entries, 2);
+        assert_eq!(app.shared_views.publisher_scope_comparisons, 3);
+        let scoped = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(scoped.len(), 1);
+        let ModelEdit::ChangeView {
+            scope,
+            expected_revision,
+            change,
+            ..
+        } = &scoped[0]
+        else {
+            panic!("transfer")
+        };
+        assert_eq!(scope, &source);
+        assert_eq!(*expected_revision, 17);
+        assert!(
+            matches!(change, Change::Transfer { id, destination: to, .. } if *id == pane.id && to == &destination)
+        );
+        let scoped_baseline = app.shared_views.baseline.clone();
+        app.shared_views.baseline = baseline.clone();
+        app.shared_views.pending.clear();
+        app.publish_projected_view_changes(project(), ViewProjection::All);
+        let full = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(full.len(), scoped.len());
+        let ModelEdit::ChangeView {
+            scope: full_scope,
+            expected_revision: full_revision,
+            change: full_change,
+            ..
+        } = &full[0]
+        else {
+            panic!("transfer")
+        };
+        assert_eq!(
+            (scope, expected_revision, change),
+            (full_scope, full_revision, full_change)
+        );
+        assert_eq!(app.shared_views.baseline, scoped_baseline);
+
+        app.shared_views.baseline = baseline;
+        app.shared_views.pending.clear();
+        app.shared_views.publisher_index_entries = 0;
+        app.shared_views.publisher_scope_comparisons = 0;
+        app.publish_projected_view_changes(
+            project(),
+            ViewProjection::Structural(&HashSet::from([destination.clone()])),
+        );
+        assert_eq!(
+            app.shared_views.publisher_scope_comparisons,
+            app.workspace_model.views.len(),
+            "a structural subset must index once rather than scan the model per required scope"
+        );
+        assert_eq!(
+            app.shared_views.publisher_index_entries, 3,
+            "only the two required scopes and duplicate first-match candidate are indexed"
+        );
+        let structural = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(structural.len(), scoped.len());
+        assert!(matches!(&structural[0], ModelEdit::ChangeView {
+            scope: structural_scope, expected_revision: structural_revision,
+            change: structural_change, ..
+        } if (structural_scope, structural_revision, structural_change) == (scope, expected_revision, change)));
+        assert_eq!(app.shared_views.baseline, scoped_baseline);
+    }
+
+    #[test]
+    fn presentation_order_normalization_checks_durable_order_and_keeps_history_in_place() {
+        let (mut app, _, _, pane) = channel_move_fixture();
+        let mut other = app.card_state(pane.id).unwrap().clone();
+        other.id = CardId::new();
+        let mut history = other.clone();
+        history.id = CardId::new();
+        history.existence = super::super::project_ui::removed_existence("history");
+        let first = app.card_state(pane.id).unwrap().clone();
+        Arc::make_mut(&mut app.durable).cards =
+            vec![first.clone(), history.clone(), other.clone()].into();
+        app.index_cards();
+        // COW leaves the old index cached; each lookup must validate its ID
+        // before using that index as durable ordering evidence.
+        Arc::make_mut(&mut app.durable).cards.swap(0, 2);
+        // Channel order is already right; the durable selected subsequence is
+        // deliberately reversed around an unrelated closed historical card.
+        Arc::make_mut(&mut app.durable).channels[0].cards = vec![first.id, other.id];
+        let before = app.durable.cards.clone();
+        app.normalize_projected_card_order(&[first.id, other.id]);
+        assert!(
+            app.durable.cards.copied_from(&before).is_empty(),
+            "reordering shares the original cards rather than copying their descriptors"
+        );
+        assert_eq!(app.durable.cards, vec![first, history, other].into());
+        assert_eq!(app.shared_views.order_rewrites, 1);
+        let held = app.durable.clone();
+        app.normalize_projected_card_order(&[pane.id, held.cards[2].id]);
+        assert!(
+            Arc::ptr_eq(&held, &app.durable),
+            "settled order never writes or clones history"
+        );
+        assert_eq!(app.shared_views.order_rewrites, 1);
+    }
+
+    #[test]
+    #[cfg(not(feature = "integrated-browser"))]
+    fn presentation_scoped_chrome_matches_full_and_initializes_missing_caches() {
+        let (mut app, source, _, pane) = presentation_fixture();
+        let mut history = app.card_state(pane.id).unwrap().clone();
+        history.id = CardId::new();
+        history.existence = super::super::project_ui::removed_existence("history");
+        Arc::make_mut(&mut app.durable).cards.push(history.clone());
+        drop(app.sync_chrome());
+        app.card_state_mut(pane.id).unwrap().title = "Canonical updated label".into();
+        app.chrome_ui
+            .user_titles
+            .insert(pane.id, "My explicit label".into());
+        app.shared_views.chrome_cards_visited.set(0);
+        let members = app.presentation_chrome_cards(&Scope::Channel(source));
+        assert_eq!(members, vec![pane.id]);
+        drop(app.sync_scoped_chrome(&members));
+        assert_eq!(app.shared_views.chrome_cards_visited.get(), 1);
+        let chrome = &app.card_chrome[&pane.id];
+        let observed = (
+            chrome.title.clone(),
+            chrome.caption.clone(),
+            chrome.tooltip.clone(),
+            chrome.focused_name.clone(),
+            chrome.title_width,
+        );
+        let header = app.core.window.header_title.clone();
+        let accessible = app.workspace.card(pane.id).unwrap().accessible_name.clone();
+        drop(app.sync_chrome());
+        let chrome = &app.card_chrome[&pane.id];
+        assert_eq!(
+            observed,
+            (
+                chrome.title.clone(),
+                chrome.caption.clone(),
+                chrome.tooltip.clone(),
+                chrome.focused_name.clone(),
+                chrome.title_width
+            )
+        );
+        assert_eq!(app.core.window.header_title, header);
+        assert_eq!(
+            app.workspace.card(pane.id).unwrap().accessible_name,
+            accessible
+        );
+        assert_eq!(accessible, "My explicit label");
+        app.card_chrome.remove(&pane.id);
+        app.shared_views.chrome_cards_visited.set(0);
+        drop(app.sync_scoped_chrome(&members));
+        assert_eq!(
+            app.shared_views.chrome_cards_visited.get(),
+            app.durable.cards.len()
+        );
+        assert!(app.card_chrome.contains_key(&pane.id));
+        assert!(app.card_chrome.contains_key(&history.id));
+    }
+
+    #[test]
+    fn presentation_missing_terminal_ordinal_uses_the_global_counter() {
+        let (mut app, _, _, pane) = channel_move_fixture_with_kind(Some(moving_terminal_kind()));
+        let mut history = app.card_state(pane.id).unwrap().clone();
+        history.id = CardId::new();
+        history.existence = super::super::project_ui::removed_existence("history");
+        Arc::make_mut(&mut app.durable).cards.push(history.clone());
+        drop(app.sync_chrome());
+        let existing = app.chrome_ui.terminal_ordinals[&history.id];
+        app.chrome_ui.terminal_ordinals.remove(&pane.id);
+        app.shared_views.chrome_cards_visited.set(0);
+        drop(app.sync_scoped_chrome(&[pane.id]));
+        assert_eq!(
+            app.shared_views.chrome_cards_visited.get(),
+            app.durable.cards.len()
+        );
+        assert!(app.chrome_ui.terminal_ordinals[&pane.id] > existing);
+        assert_eq!(app.chrome_ui.terminal_ordinals[&history.id], existing);
+        let chrome = &app.card_chrome[&pane.id];
+        assert!(chrome.compact_title.is_some());
+        assert!(chrome.terminal_title_source.is_some());
+    }
+
+    #[test]
+    #[cfg(not(feature = "integrated-browser"))]
+    fn presentation_noop_projection_does_not_copy_a_writer_held_workspace() {
+        let (mut app, source, destination, _) = presentation_fixture();
+        // Exercise the real shared reducer on an inactive, settled scope,
+        // where an unchanged receipt has no active-strip snapshot to save.
+        Arc::make_mut(&mut app.durable).active_channel = Some(destination);
+        let view = app
+            .workspace_model
+            .views
+            .iter()
+            .find(|view| view.scope == Scope::Channel(source))
+            .unwrap()
+            .clone();
+        let current = app.local_view_cards(&view.scope);
+        let owned = view.panes.iter().map(|pane| pane.id).collect();
+        let writer = app.durable.clone();
+        app.shared_views.applying = true;
+        drop(app.project_shared_view_with_cards(&view, &owned, current));
+        app.shared_views.applying = false;
+        assert!(Arc::ptr_eq(&writer, &app.durable));
+        assert_eq!(app.shared_views.order_rewrites, 0);
+    }
+
+    #[test]
+    #[cfg(not(feature = "integrated-browser"))]
+    fn presentation_settings_blur_keeps_the_complete_common_tail() {
+        let (mut app, source, _, _) = presentation_fixture();
+        let _directory = replica_capture::writer_fixture(&mut app);
+        let earlier = presentation_edge(&app, Scope::Channel(source), 21, "Earlier replica", 0.59);
+        drop(app.update(Message::WorkspaceModelObserved(earlier)));
+        assert!(app.replica_capture.pending.is_some());
+        let captures = app.replica_capture.captures;
+        drop(app.sync_chrome());
+        let update = presentation_edge(&app, Scope::Channel(source), 24, "After blur", 0.61);
+        // Focus has already left Settings, while its debounced draft still
+        // belongs to the common post-dispatch blur processing.
+        drop(app.queue_setting_input(SettingsField::TerminalFontSize, "18".into()));
+        app.settings_pane_focused = true;
+        app.shared_views.structural_tail_count = 0;
+        app.shared_views.selected_projection_count.set(0);
+        app.shared_views.local_projection_count.set(0);
+        drop(app.update(Message::WorkspaceModelObserved(update)));
+        assert_eq!(app.settings.terminal_font_size, 18.0);
+        assert!(app.replica_capture.pending.is_none());
+        assert!(app.replica_capture.captures > captures);
+        assert!(app.settings_pending.is_empty());
+        assert_eq!(app.shared_views.selected_projection_count.get(), 0);
+        assert_eq!(app.shared_views.local_projection_count.get(), 1);
+        assert_eq!(
+            app.shared_views.structural_tail_count, 1,
+            "a committed settings draft invalidates the scoped chrome proof"
+        );
+        drop(app);
+    }
+
+    #[test]
+    #[cfg(not(feature = "integrated-browser"))]
+    fn presentation_scoped_chrome_includes_retained_utility_and_keeps_focus() {
+        let (mut app, source, _, pane) = presentation_fixture();
+        drop(app.update(Message::Sidebar(SidebarAction::OpenSettings)));
+        let utility = app.workspace.focused().unwrap();
+        assert_eq!(app.card_state(utility).unwrap().kind, CardKind::Settings);
+        let utility_state = app.card_state(utility).unwrap().clone();
+        assert!(
+            app.presentation_chrome_cards(&Scope::Channel(source))
+                .contains(&utility)
+        );
+        drop(app.sync_chrome());
+        app.shared_views.chrome_cards_visited.set(0);
+        app.shared_views.selected_projection_count.set(0);
+        let update = presentation_edge(&app, Scope::Channel(source), 24, "Beside settings", 0.61);
+        drop(app.update(Message::WorkspaceModelObserved(update)));
+        assert_eq!(app.shared_views.selected_projection_count.get(), 1);
+        assert_eq!(app.shared_views.chrome_cards_visited.get(), 2);
+        assert_eq!(app.workspace.focused(), Some(utility));
+        assert_eq!(app.card_state(utility), Some(&utility_state));
+        assert_eq!(app.card_state(pane.id).unwrap().title, "Beside settings");
+        assert_eq!(app.card_chrome[&pane.id].title, browser_host::TITLE);
+        assert_eq!(app.card_chrome[&utility].title, "Settings");
+    }
+
+    #[test]
+    #[cfg(not(feature = "integrated-browser"))]
+    fn presentation_name_restoration_in_another_channel_refreshes_all_chrome() {
+        let (mut app, source, destination, pane) = presentation_fixture();
+        let mut other = app.card_state(pane.id).unwrap().clone();
+        other.id = CardId::new();
+        if let CardKind::Browser(browser) = &mut other.kind {
+            browser.id = BrowserId::new();
+        }
+        let other_pane = Pane::from_card(&other, None).unwrap();
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.cards.push(other.clone());
+        let channel = durable
+            .channels
+            .iter_mut()
+            .find(|row| row.id == destination)
+            .unwrap();
+        channel.cards.push(other.id);
+        channel.title.clear();
+        app.workspace_model
+            .channels
+            .iter_mut()
+            .find(|row| row.id == destination)
+            .unwrap()
+            .title
+            .clear();
+        app.workspace_model
+            .views
+            .iter_mut()
+            .find(|view| view.scope == Scope::Channel(destination))
+            .unwrap()
+            .panes
+            .push(other_pane.clone());
+        app.shared_views
+            .initialize(Scope::Channel(destination), vec![other_pane]);
+        app.cards.insert(other.id, CardRuntime::Completed);
+        let _directory = replica_capture::writer_fixture(&mut app);
+        let captures = app.replica_capture.captures;
+        app.remember_channel_name_for_test(destination, "Retained channel name".into());
+        drop(app.sync_chrome());
+        app.shared_views.chrome_cards_visited.set(0);
+        app.shared_views.selected_projection_count.set(0);
+        let update = presentation_edge(&app, Scope::Channel(source), 24, "Independent title", 0.61);
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        drop(app.update(Message::WorkspaceModelObserved(update)));
+        assert_eq!(app.shared_views.selected_projection_count.get(), 1);
+        assert!(app.replica_capture.pending.is_none());
+        assert_eq!(app.replica_capture.captures, captures + 1);
+        assert_eq!(
+            app.durable
+                .channels
+                .iter()
+                .find(|row| row.id == destination)
+                .unwrap()
+                .title,
+            "Retained channel name"
+        );
+        assert_eq!(
+            app.shared_views.chrome_cards_visited.get(),
+            app.durable.cards.len()
+        );
+        assert!(std::iter::from_fn(|| rx.try_recv().ok()).any(|edit| matches!(edit,
+            ModelEdit::SuggestChannelTitle { id, title, .. } if id == destination && title == "Retained channel name")));
+        drop(app);
+    }
+
+    #[test]
+    #[cfg(not(feature = "integrated-browser"))]
+    fn presentation_inactive_scope_refreshes_changed_active_primary_chrome() {
+        let (mut app, source, destination, pane) = presentation_fixture();
+        let make_chat = replica_capture::retained_chat;
+        let first = make_chat("First chat");
+        let second = make_chat("Second chat");
+        let chats = vec![
+            Pane::from_card(&first, None).unwrap(),
+            Pane::from_card(&second, None).unwrap(),
+        ];
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.cards.extend([first.clone(), second.clone()]);
+        let active = durable
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == destination)
+            .unwrap();
+        active.cards = vec![first.id, second.id];
+        active.title = "Manual conversation name".into();
+        active.title_source = crate::model::ChannelTitleSource::Manual;
+        durable.active_channel = Some(destination);
+        durable.focused = Some(second.id);
+        app.active_workspace = Some(PathBuf::from("/repo"));
+        let channel = app
+            .workspace_model
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == destination)
+            .unwrap();
+        channel.title = "Manual conversation name".into();
+        channel.title_source = crate::model::ChannelTitleSource::Manual;
+        app.workspace_model
+            .views
+            .iter_mut()
+            .find(|view| view.scope == Scope::Channel(destination))
+            .unwrap()
+            .panes = chats.clone();
+        app.shared_views
+            .initialize(Scope::Channel(destination), chats);
+        app.shared_views.attached.extend([first.id, second.id]);
+        app.cards.insert(first.id, CardRuntime::Completed);
+        app.cards.insert(second.id, CardRuntime::Completed);
+        let _directory = replica_capture::writer_fixture(&mut app);
+        let captures = app.replica_capture.captures;
+        let mut strip = (*app.durable).clone();
+        strip.cards = vec![second.clone(), first.clone()].into();
+        app.workspace = Cagents::rebuild_workspace(&strip);
+        drop(app.sync_chrome());
+        assert_eq!(app.card_chrome[&first.id].title, "Manual conversation name");
+        assert_eq!(app.card_chrome[&second.id].title, "Second chat");
+        app.shared_views.chrome_cards_visited.set(0);
+        app.shared_views.selected_projection_count.set(0);
+        app.reported_title_save.cards.insert(pane.id);
+        app.card_state_mut(pane.id).unwrap().title = "Held local title".into();
+        let update = presentation_edge(&app, Scope::Channel(source), 24, "Inactive browser", 0.61);
+        drop(app.update(Message::WorkspaceModelObserved(update)));
+        assert_eq!(app.shared_views.selected_projection_count.get(), 1);
+        assert!(app.replica_capture.pending.is_none());
+        assert_eq!(app.replica_capture.captures, captures + 1);
+        assert!(app.reported_title_save.cards.contains(&pane.id));
+        assert_eq!(app.shared_views.chrome_cards_visited.get(), 3);
+        assert_eq!(app.card_chrome[&first.id].title, "First chat");
+        assert_eq!(
+            app.card_chrome[&second.id].title,
+            "Manual conversation name"
+        );
+        assert_eq!(app.card_state(pane.id).unwrap().title, "Held local title");
+        assert_eq!(app.card_chrome[&pane.id].title, browser_host::TITLE);
+        let observed = (
+            app.card_chrome[&first.id].title.clone(),
+            app.card_chrome[&second.id].title.clone(),
+            app.core.window.header_title.clone(),
+        );
+        drop(app.sync_chrome());
+        assert_eq!(
+            observed,
+            (
+                app.card_chrome[&first.id].title.clone(),
+                app.card_chrome[&second.id].title.clone(),
+                app.core.window.header_title.clone()
+            )
+        );
+        drop(app);
+    }
+
+    #[test]
+    #[cfg(not(feature = "integrated-browser"))]
+    fn presentation_preserves_managed_attention_and_later_snapshot_marks_new_evidence() {
+        let (mut app, source, channel, _) = presentation_fixture();
+        let card = CardId::new();
+        let notice = presentation_managed_notice(&mut app, channel, card);
+        let first_notice = notice.id;
+        drop(app.update_notifications(notification_ui::Action::Snapshot(
+            crate::notifications::Snapshot {
+                notices: vec![notice.clone()],
+                diagnostic: None,
+            },
+        )));
+        assert!(app.sidebar_state.has_card_update(card));
+        let attention = app.sidebar_state.card_attention(card);
+        let runtime = app.cards.get(&card).unwrap() as *const CardRuntime;
+        app.shared_views.notification_attribution_count.set(0);
+        let update = presentation_edge(&app, Scope::Channel(source), 30, "Presentation", 0.7);
+        drop(app.update(Message::WorkspaceModelObserved(update)));
+        assert_eq!(app.shared_views.notification_attribution_count.get(), 0);
+        assert_eq!(app.sidebar_state.card_attention(card), attention);
+        assert_eq!(app.cards.get(&card).unwrap() as *const CardRuntime, runtime);
+        assert!(!app.notification_ui.acknowledged_for_test(first_notice));
+        app.sidebar_state.forget_card_attention(card);
+        let mut later = notice;
+        later.id = uuid::Uuid::new_v4();
+        later.event.evidence.key = "later-managed-failure".into();
+        let later_id = later.id;
+        drop(app.update_notifications(notification_ui::Action::Snapshot(
+            crate::notifications::Snapshot {
+                notices: vec![later],
+                diagnostic: None,
+            },
+        )));
+        assert_eq!(app.shared_views.notification_attribution_count.get(), 1);
+        assert!(app.sidebar_state.has_card_update(card));
+        assert_eq!(app.sidebar_state.card_attention(card), attention);
+        assert!(!app.notification_ui.acknowledged_for_test(later_id));
+    }
+
+    #[test]
+    #[cfg(not(feature = "integrated-browser"))]
+    fn presentation_keeps_duplicate_notification_owners_failclosed_until_full_metadata_repair() {
+        use super::super::workspace_model_sync::{EdgeChanges, ModelUpdate};
+        use crate::workspace_model::delta::EditEffects;
+        let (mut app, source, channel, _) = presentation_fixture();
+        let card = CardId::new();
+        let notice = presentation_managed_notice(&mut app, channel, card);
+        let notice_id = notice.id;
+        let mut duplicate = app.workspace_model.agents[0].clone();
+        duplicate.id = crate::model::AgentId::new();
+        let duplicate_id = duplicate.id;
+        app.workspace_model.agents.push(duplicate);
+        drop(app.update_notifications(notification_ui::Action::Snapshot(
+            crate::notifications::Snapshot {
+                notices: vec![notice],
+                diagnostic: None,
+            },
+        )));
+        assert!(!app.sidebar_state.has_card_update(card));
+        app.shared_views.notification_attribution_count.set(0);
+        let update = presentation_edge(
+            &app,
+            Scope::Channel(source),
+            31,
+            "No ownership change",
+            0.65,
+        );
+        drop(app.update(Message::WorkspaceModelObserved(update)));
+        assert_eq!(app.shared_views.notification_attribution_count.get(), 0);
+        assert!(!app.sidebar_state.has_card_update(card));
+        drop(
+            app.update(Message::WorkspaceModelObserved(ModelUpdate::Changed {
+                sequence: 32,
+                edit: ModelEdit::AgentsChanged,
+                changes: EdgeChanges {
+                    identity: Some(app.workspace_model.identity),
+                    effects: EditEffects {
+                        removed_agents: vec![duplicate_id],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            })),
+        );
+        assert!(
+            app.shared_views.notification_attribution_count.get() > 0,
+            "actual owner metadata repair retains full attribution"
+        );
+        assert!(
+            app.sidebar_state.has_card_update(card),
+            "retained notice is attributed without another journal delivery"
+        );
+        assert!(!app.notification_ui.acknowledged_for_test(notice_id));
+    }
+
+    fn listed_passive_release_fixture() -> (Cagents, ChannelId, ChannelId, Pane) {
+        let (mut app, channel, other, mut pane) = fixture();
+        pane.kind = moving_terminal_kind();
+        Arc::make_mut(&mut app.durable).cards.push(CardState {
+            id: pane.id,
+            generation: 0,
+            title: pane.title.clone(),
+            width_fraction: pane.width_fraction,
+            existence: Existence::Open,
+            kind: pane.kind.clone(),
+        });
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .iter_mut()
+            .find(|row| row.id == channel)
+            .unwrap()
+            .cards
+            .push(pane.id);
+        app.workspace_model.views.push(View {
+            scope: Scope::Channel(channel),
+            revision: 1,
+            panes: vec![pane.clone()],
+            retired: vec![],
+        });
+        app.cards.insert(pane.id, CardRuntime::Loading);
+        app.register_presence(pane.id, Exposure::Offscreen, Residency::Cold);
+        app.shared_views.attached.insert(pane.id);
+        app.shared_views
+            .initialized
+            .remove(&Scope::Channel(channel));
+        (app, channel, other, pane)
+    }
+
+    #[test]
+    fn presentation_release_of_a_listed_passive_terminal_needs_no_global_admission() {
+        for retired in [false, true] {
+            let (mut app, channel, _, pane) = listed_passive_release_fixture();
+            if retired {
+                app.workspace_model.views[0].retired.push(pane.id);
+            }
+            let durable = app.durable.clone();
+            let attached = app.shared_views.attached.clone();
+            let runtime = app.cards.get(&pane.id).unwrap() as *const CardRuntime;
+            app.shared_views.scope_discovery_count.set(0);
+            let task = app.release_held_terminals();
+            if let Some(mut stream) = cosmic::iced::runtime::task::into_stream(task) {
+                use cosmic::iced::futures::StreamExt;
+                assert!(cosmic::iced::futures::executor::block_on(stream.next()).is_none());
+            }
+            assert_eq!(app.shared_views.scope_discovery_count.get(), 0);
+            assert!(
+                !app.shared_views
+                    .initialized
+                    .contains(&Scope::Channel(channel))
+            );
+            assert!(Arc::ptr_eq(&durable, &app.durable));
+            assert_eq!(app.shared_views.attached, attached);
+            assert_eq!(
+                app.cards.get(&pane.id).unwrap() as *const CardRuntime,
+                runtime
+            );
+            assert!(matches!(
+                app.cards.get(&pane.id),
+                Some(CardRuntime::Loading)
+            ));
+            assert_eq!(app.residency(pane.id), &Residency::Cold);
+            assert!(app.saved_terminals.entries.is_empty());
+            assert!(app.restored_agent_attaches.is_empty());
+            assert!(!app.terminal_start_in_flight(pane.id));
+            assert!(app.durable.pending_terminal_creations.is_empty());
+        }
+    }
+
+    #[test]
+    fn presentation_listed_passive_terminal_does_not_bypass_an_unlisted_cold_barrier() {
+        let (mut app, channel, other, listed) = listed_passive_release_fixture();
+        let mut unlisted = listed.clone();
+        unlisted.id = CardId::new();
+        unlisted.kind = moving_terminal_kind();
+        Arc::make_mut(&mut app.durable).cards.push(CardState {
+            id: unlisted.id,
+            generation: 0,
+            title: unlisted.title.clone(),
+            width_fraction: unlisted.width_fraction,
+            existence: Existence::Open,
+            kind: unlisted.kind.clone(),
+        });
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .iter_mut()
+            .find(|row| row.id == other)
+            .unwrap()
+            .cards
+            .push(unlisted.id);
+        app.cards.insert(unlisted.id, CardRuntime::Loading);
+        app.register_presence(unlisted.id, Exposure::Offscreen, Residency::Cold);
+        app.shared_views.attached.insert(unlisted.id);
+        let listed_runtime = app.cards.get(&listed.id).unwrap() as *const CardRuntime;
+        app.shared_views.scope_discovery_count.set(0);
+        drop(app.release_held_terminals());
+        assert_eq!(app.shared_views.scope_discovery_count.get(), 1);
+        assert!(app.shared_views.attached.contains(&listed.id));
+        assert!(app.shared_views.attached.contains(&unlisted.id));
+        assert!(app.saved_terminals.entries.is_empty());
+        assert!(!app.terminal_start_in_flight(listed.id));
+        assert!(!app.terminal_start_in_flight(unlisted.id));
+
+        app.shared_views.initialized.insert(Scope::Channel(channel));
+        app.shared_views.scope_discovery_count.set(0);
+        drop(app.release_held_terminals());
+        assert_eq!(app.shared_views.scope_discovery_count.get(), 1);
+        assert!(app.shared_views.attached.contains(&listed.id));
+        assert!(!app.shared_views.attached.contains(&unlisted.id));
+        assert!(!app.saved_terminals.entries.contains_key(&listed.id));
+        assert!(app.saved_terminals.entries.contains_key(&unlisted.id));
+        assert_eq!(
+            app.cards.get(&listed.id).unwrap() as *const CardRuntime,
+            listed_runtime
+        );
+        assert_eq!(app.residency(listed.id), &Residency::Cold);
+        assert_eq!(app.residency(unlisted.id), &Residency::Hibernated);
+        assert!(!app.terminal_start_in_flight(listed.id));
+        assert!(app.durable.pending_terminal_creations.is_empty());
+        assert_eq!(app.card_state(listed.id).unwrap().kind, listed.kind);
+        assert_eq!(app.card_state(unlisted.id).unwrap().kind, unlisted.kind);
+    }
+
+    #[test]
+    fn presentation_release_of_a_held_terminal_still_requires_scope_admission() {
+        let (mut app, channel, _, mut pane) = fixture();
+        pane.kind = moving_terminal_kind();
+        Arc::make_mut(&mut app.durable).cards.push(CardState {
+            id: pane.id,
+            generation: 0,
+            title: pane.title.clone(),
+            width_fraction: pane.width_fraction,
+            existence: Existence::Open,
+            kind: pane.kind.clone(),
+        });
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .iter_mut()
+            .find(|row| row.id == channel)
+            .unwrap()
+            .cards
+            .push(pane.id);
+        app.cards.insert(pane.id, CardRuntime::Loading);
+        app.register_presence(pane.id, Exposure::Offscreen, Residency::Cold);
+        app.shared_views.attached.insert(pane.id);
+        app.shared_views
+            .initialized
+            .remove(&Scope::Channel(channel));
+        app.shared_views.scope_discovery_count.set(0);
+        drop(app.release_held_terminals());
+        assert_eq!(app.shared_views.scope_discovery_count.get(), 1);
+        assert!(app.shared_views.attached.contains(&pane.id));
+        assert!(!app.saved_terminals.entries.contains_key(&pane.id));
+        assert!(!app.terminal_start_in_flight(pane.id));
+        assert_eq!(app.residency(pane.id), &Residency::Cold);
+
+        app.shared_views.initialized.insert(Scope::Channel(channel));
+        app.shared_views.scope_discovery_count.set(0);
+        drop(app.release_held_terminals());
+        assert_eq!(app.shared_views.scope_discovery_count.get(), 1);
+        assert!(!app.shared_views.attached.contains(&pane.id));
+        assert!(
+            app.saved_terminals.entries.contains_key(&pane.id),
+            "admitted absence releases the existing read-only saved-terminal inspection"
+        );
+        assert_eq!(app.residency(pane.id), &Residency::Hibernated);
+        assert!(
+            app.durable.pending_terminal_creations.is_empty(),
+            "passive release never creates a new terminal launch intention"
+        );
+        assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
+    }
+
+    #[test]
+    fn presentation_release_of_an_opening_terminal_keeps_its_admission_bypass() {
+        let (mut app, channel, _, mut pane) = fixture();
+        pane.kind = moving_terminal_kind();
+        Arc::make_mut(&mut app.durable).cards.push(CardState {
+            id: pane.id,
+            generation: 0,
+            title: pane.title.clone(),
+            width_fraction: pane.width_fraction,
+            existence: Existence::Open,
+            kind: pane.kind.clone(),
+        });
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .iter_mut()
+            .find(|row| row.id == channel)
+            .unwrap()
+            .cards
+            .push(pane.id);
+        app.workspace_model.views.push(View {
+            scope: Scope::Channel(channel),
+            revision: 1,
+            panes: vec![pane.clone()],
+            retired: vec![],
+        });
+        app.cards.insert(pane.id, CardRuntime::Loading);
+        app.register_presence(
+            pane.id,
+            Exposure::Visible,
+            Residency::Hydrating { epoch: 1 },
+        );
+        app.shared_views.attached.insert(pane.id);
+        app.shared_views
+            .initialized
+            .remove(&Scope::Channel(channel));
+        app.shared_views.scope_discovery_count.set(0);
+        drop(app.release_held_terminals());
+        assert_eq!(
+            app.shared_views.scope_discovery_count.get(),
+            0,
+            "opening already bypasses global scope admission"
+        );
+        assert!(
+            !app.shared_views
+                .initialized
+                .contains(&Scope::Channel(channel))
+        );
+        assert_eq!(app.residency(pane.id), &Residency::Cold);
+        assert!(matches!(
+            app.cards.get(&pane.id),
+            Some(CardRuntime::Loading)
+        ));
+        assert!(app.shared_views.attached.contains(&pane.id));
+        assert!(!app.saved_terminals.entries.contains_key(&pane.id));
+        assert!(!app.terminal_start_in_flight(pane.id));
+        assert!(app.durable.pending_terminal_creations.is_empty());
+        assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
+    }
+
+    #[test]
+    #[cfg(not(feature = "integrated-browser"))]
+    fn presentation_projection_rejects_ahead_structure_aliases_metadata_and_transfer() {
+        use super::super::workspace_model_sync::ModelUpdate;
+        let (mut app, source, destination, pane) = presentation_fixture();
+        let scope = Scope::Channel(source);
+        let mut update = presentation_edge(&app, scope.clone(), 22, "Ahead", 0.7);
+        let ModelUpdate::Changed { changes, .. } = &mut update else {
+            unreachable!()
+        };
+        let mut added = pane.clone();
+        added.id = CardId::new();
+        if let CardKind::Browser(browser) = &mut added.kind {
+            browser.id = BrowserId::new();
+        }
+        changes.views.views[0].panes.push(added.clone());
+        app.shared_views.local_projection_count.set(0);
+        app.shared_views.selected_projection_count.set(0);
+        drop(app.update(Message::WorkspaceModelObserved(update)));
+        assert_eq!(app.shared_views.selected_projection_count.get(), 0);
+        assert_eq!(app.shared_views.local_projection_count.get(), 1);
+        assert!(
+            app.card_state(added.id).is_some(),
+            "an ahead scoped read projects its new member through the full path"
+        );
+
+        let before = app
+            .workspace_model
+            .views
+            .iter()
+            .find(|view| view.scope == scope)
+            .unwrap()
+            .clone();
+        let mut after = before.clone();
+        after.revision += 1;
+        app.workspace_model
+            .views
+            .iter_mut()
+            .find(|view| view.scope == Scope::Channel(destination))
+            .unwrap()
+            .panes
+            .push(pane.clone());
+        assert_eq!(
+            app.presentation_projection_ready(&before, &after, None),
+            Err("canonical ownership is ambiguous")
+        );
+        app.workspace_model
+            .views
+            .iter_mut()
+            .find(|view| view.scope == Scope::Channel(destination))
+            .unwrap()
+            .panes
+            .clear();
+        let mut alias = app.card_state(pane.id).unwrap().clone();
+        alias.id = CardId::new();
+        Arc::make_mut(&mut app.durable).cards.push(alias);
+        assert_eq!(
+            app.presentation_projection_ready(&before, &after, None),
+            Err("a local resource alias needs reconciliation")
+        );
+        let last = app.durable.cards.len() - 1;
+        Arc::make_mut(&mut app.durable).cards.remove(last);
+        let retained_failure = app.cards.remove(&pane.id).unwrap();
+        app.cards.insert(pane.id, CardRuntime::Loading);
+        assert_eq!(
+            app.presentation_projection_ready(&before, &after, None),
+            Err("pane source or runtime is unsettled")
+        );
+        app.cards.insert(pane.id, retained_failure);
+        app.shared_views
+            .requested_transfers
+            .insert(uuid::Uuid::new_v4(), pane.id);
+        assert_eq!(
+            app.presentation_projection_ready(&before, &after, None),
+            Err("workspace lifecycle is unsettled")
+        );
+        app.shared_views.requested_transfers.clear();
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .iter_mut()
+            .find(|row| row.id == source)
+            .unwrap()
+            .title = "Optimistic metadata".into();
+        assert_eq!(
+            app.presentation_projection_ready(&before, &after, None),
+            Err("channel metadata is unsettled")
+        );
+        let mut worktree = before;
+        worktree.scope = Scope::Worktree {
+            repository: PathBuf::from("/repo/.git"),
+            path: PathBuf::from("/repo"),
+        };
+        assert_eq!(
+            app.presentation_projection_ready(&worktree, &worktree, None),
+            Err("derived worktree membership")
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "integrated-browser"))]
+    fn presentation_projection_matches_full_projection_and_preserves_unrelated_runtime() {
+        let (mut selected, source, _, pane) = presentation_fixture();
+        let mut full = super::super::tests::context_inspector_test_app(false);
+        full.durable = selected.durable.clone();
+        full.workspace_model = selected.workspace_model.clone();
+        full.sidebar_model.projects = selected.sidebar_model.projects.clone();
+        full.workspace = Cagents::rebuild_workspace(&full.durable);
+        full.shared_views.initialized = selected.shared_views.initialized.clone();
+        drop(full.reconcile_workspace_model());
+        let (selected_tx, selected_rx) = async_channel::unbounded();
+        selected.workspace_model_tx = selected_tx;
+        let (full_tx, full_rx) = async_channel::unbounded();
+        full.workspace_model_tx = full_tx;
+        let failure = match selected.cards.get(&pane.id) {
+            Some(CardRuntime::Failed(error)) => format!("{error:?}"),
+            _ => panic!("browserless unavailable surface"),
+        };
+        let residency = selected.residency(pane.id).clone();
+        selected.shared_views.pane_attachment_count = 0;
+        full.shared_views.pane_attachment_count = 0;
+        let update = presentation_edge(
+            &selected,
+            Scope::Channel(source),
+            24,
+            "New remote title",
+            0.63,
+        );
+        // Force the reference through the complete path with an unchanged
+        // canonical metadata row. It carries the same accepted scope.
+        let mut reference = update.clone();
+        if let super::super::workspace_model_sync::ModelUpdate::Changed { changes, .. } =
+            &mut reference
+        {
+            changes
+                .effects
+                .channels
+                .push(full.workspace_model.channel(source).unwrap().clone());
+        }
+        let runtime = selected.cards.get(&pane.id).unwrap() as *const CardRuntime;
+        drop(selected.update(Message::WorkspaceModelObserved(update)));
+        drop(full.update(Message::WorkspaceModelObserved(reference)));
+        assert_eq!(selected.card_state(pane.id), full.card_state(pane.id));
+        let selected_chrome = &selected.card_chrome[&pane.id];
+        let full_chrome = &full.card_chrome[&pane.id];
+        assert_eq!(
+            (
+                selected_chrome.title.as_str(),
+                selected_chrome.caption.as_str(),
+                selected_chrome.focused_name.as_str(),
+                selected_chrome.title_width
+            ),
+            (
+                full_chrome.title.as_str(),
+                full_chrome.caption.as_str(),
+                full_chrome.focused_name.as_str(),
+                full_chrome.title_width
+            )
+        );
+        assert_eq!(
+            selected.core.window.header_title,
+            full.core.window.header_title
+        );
+        assert_eq!(
+            selected.workspace.card(pane.id).unwrap().accessible_name,
+            full.workspace.card(pane.id).unwrap().accessible_name
+        );
+        assert_eq!(
+            selected.workspace.order().collect::<Vec<_>>(),
+            full.workspace.order().collect::<Vec<_>>()
+        );
+        assert_eq!(selected.durable.channels, full.durable.channels);
+        assert_eq!(selected.shared_views.baseline, full.shared_views.baseline);
+        assert_eq!(
+            selected.cards.get(&pane.id).unwrap() as *const CardRuntime,
+            runtime
+        );
+        let published = |rx: async_channel::Receiver<ModelEdit>| {
+            std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>()
+        };
+        assert_eq!(published(selected_rx), published(full_rx));
+        assert!(
+            matches!(selected.cards.get(&pane.id), Some(CardRuntime::Failed(error)) if format!("{error:?}") == failure)
+        );
+        assert!(
+            matches!(full.cards.get(&pane.id), Some(CardRuntime::Failed(error)) if format!("{error:?}") == failure)
+        );
+        assert_eq!(selected.residency(pane.id), &residency);
+        assert_eq!(selected.residency(pane.id), full.residency(pane.id));
+        assert_eq!(selected.shared_views.pane_attachment_count, 0);
+        assert_eq!(full.shared_views.pane_attachment_count, 0);
+        assert!(!selected.terminal_start_in_flight(pane.id));
+    }
+
+    #[test]
+    #[cfg(not(feature = "integrated-browser"))]
+    fn presentation_projection_preserves_an_unrelated_draft_and_pending_history() {
+        let (mut app, source, destination, pane) = presentation_fixture();
+        drop(app.select_channel(destination));
+        assert_eq!(app.durable.active_channel, Some(destination));
+        assert!(app.workspace.order().next().is_none());
+        drop(app.add_default_pane(PathBuf::from("/repo"), settings::DefaultPane::NativeChat));
+        let draft = app.workspace.focused().unwrap();
+        app.retain_local_pane(draft);
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get(&draft) else {
+            panic!("draft runtime")
+        };
+        let target = runtime.target;
+        compose_default_chat(&mut app, target);
+        let draft_state = app.card_state(draft).unwrap().clone();
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get(&draft) else {
+            panic!("draft runtime")
+        };
+        let text = runtime.unsent_text();
+        let runtime_address = runtime.as_ref() as *const super::super::chat_ui::Runtime;
+        let historical = CardId::new();
+        app.shared_views
+            .restorations
+            .push(crate::persistence::TerminalPaneRestoration {
+                canonical: historical,
+                terminal: TerminalId::new(),
+            });
+        let update =
+            presentation_edge(&app, Scope::Channel(source), 25, "Independent update", 0.74);
+        app.shared_views.selected_projection_count.set(0);
+        drop(app.update(Message::WorkspaceModelObserved(update)));
+        assert_eq!(
+            app.shared_views.selected_projection_count.get(),
+            1,
+            "unrelated retained history is not a scope admission barrier"
+        );
+        assert_eq!(app.card_state(draft), Some(&draft_state));
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get(&draft) else {
+            panic!("draft runtime")
+        };
+        assert_eq!(
+            runtime.as_ref() as *const super::super::chat_ui::Runtime,
+            runtime_address
+        );
+        assert_eq!(runtime.unsent_text(), text);
+        assert!(
+            app.shared_views
+                .restorations
+                .iter()
+                .any(|row| row.canonical == historical)
+        );
+        assert_eq!(app.card_state(pane.id).unwrap().title, "Independent update");
+    }
+
+    #[test]
+    #[cfg(not(feature = "integrated-browser"))]
+    fn presentation_receipt_and_observer_echo_are_bounded_in_either_order() {
+        use super::super::workspace_model_sync::ModelUpdate;
+        use crate::workspace_model::delta::EditReceipt;
+        for observer_first in [false, true] {
+            let (mut app, source, _, pane) = presentation_fixture();
+            let observer =
+                presentation_edge(&app, Scope::Channel(source), 27, "My accepted label", 0.69);
+            let ModelUpdate::Changed {
+                sequence,
+                edit,
+                changes,
+            } = &observer
+            else {
+                unreachable!()
+            };
+            let ModelEdit::ChangeView {
+                scope,
+                operation,
+                change,
+                ..
+            } = edit
+            else {
+                unreachable!()
+            };
+            app.shared_views
+                .pending
+                .push((*operation, scope.clone(), change.clone()));
+            let operation = *operation;
+            let receipt = ModelUpdate::Committed {
+                receipt: EditReceipt {
+                    identity: app.workspace_model.identity,
+                    sequence: *sequence,
+                    effects: changes.effects.clone(),
+                },
+                edit: edit.clone(),
+                views: changes.views.clone(),
+            };
+            app.card_state_mut(pane.id).unwrap().title = "My accepted label".into();
+            app.card_state_mut(pane.id).unwrap().width_fraction = 0.69;
+            let _ = app
+                .workspace
+                .set_card_width(pane.id, CardWidth::Fraction(0.69));
+            let (tx, rx) = async_channel::unbounded();
+            app.workspace_model_tx = tx;
+            drop(app.sync_chrome());
+            app.shared_views.chrome_cards_visited.set(0);
+            app.shared_views.publisher_index_entries = 0;
+            app.shared_views.local_projection_count.set(0);
+            app.shared_views.selected_projection_count.set(0);
+            app.shared_views.structural_tail_count = 0;
+            app.shared_views.chrome_tail_count = 0;
+            let (first, second) = if observer_first {
+                (observer, receipt)
+            } else {
+                (receipt, observer)
+            };
+            drop(app.update(Message::WorkspaceModelObserved(first)));
+            assert_eq!(
+                app.shared_views
+                    .pending
+                    .iter()
+                    .any(|(id, _, _)| *id == operation),
+                observer_first,
+                "only the exact receipt acknowledges local intent"
+            );
+            drop(app.update(Message::WorkspaceModelObserved(second)));
+            assert!(
+                !app.shared_views
+                    .pending
+                    .iter()
+                    .any(|(id, _, _)| *id == operation)
+            );
+            assert_eq!(app.shared_views.local_projection_count.get(), 0);
+            assert_eq!(app.shared_views.selected_projection_count.get(), 2);
+            assert_eq!(app.shared_views.structural_tail_count, 0);
+            assert_eq!(app.shared_views.chrome_tail_count, 2);
+            assert_eq!(app.shared_views.chrome_cards_visited.get(), 2);
+            assert_eq!(app.shared_views.publisher_index_entries, 2);
+            assert_eq!(app.card_state(pane.id).unwrap().title, "My accepted label");
+            assert_eq!(app.card_state(pane.id).unwrap().width_fraction, 0.69);
+            assert!(rx.try_recv().is_err());
+            let held = app
+                .workspace_model
+                .views
+                .iter()
+                .find(|view| view.scope == Scope::Channel(source))
+                .unwrap();
+            let mut contradictory = held.clone();
+            contradictory.panes[0].title = "Different same revision".into();
+            assert_eq!(
+                app.presentation_projection_ready(held, &contradictory, None),
+                Err("scope structure or source changed")
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "integrated-browser"))]
+    fn presentation_duplicate_local_placement_uses_full_recovery_and_keeps_active_draft() {
+        let (mut app, source, destination, pane) = presentation_fixture();
+        drop(app.select_channel(destination));
+        assert_eq!(app.durable.active_channel, Some(destination));
+        assert!(app.workspace.order().next().is_none());
+        drop(app.add_default_pane(PathBuf::from("/repo"), settings::DefaultPane::NativeChat));
+        let draft = app.workspace.focused().unwrap();
+        app.retain_local_pane(draft);
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get(&draft) else {
+            panic!("draft runtime")
+        };
+        let target = runtime.target;
+        compose_default_chat(&mut app, target);
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get(&draft) else {
+            panic!("draft runtime")
+        };
+        let draft_address = runtime.as_ref() as *const super::super::chat_ui::Runtime;
+        let draft_text = runtime.unsent_text();
+        let draft_state = app.card_state(draft).unwrap().clone();
+        let failure = match app.cards.get(&pane.id) {
+            Some(CardRuntime::Failed(error)) => format!("{error:?}"),
+            _ => panic!("unavailable browser surface"),
+        };
+        let surface_address = app.cards.get(&pane.id).unwrap() as *const CardRuntime;
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .iter_mut()
+            .find(|row| row.id == destination)
+            .unwrap()
+            .cards
+            .push(pane.id);
+        let held = app
+            .workspace_model
+            .views
+            .iter()
+            .find(|view| view.scope == Scope::Channel(source))
+            .unwrap()
+            .clone();
+        let mut next = held.clone();
+        next.revision += 1;
+        assert_eq!(
+            app.presentation_projection_ready(&held, &next, None),
+            Err("local pane placement is ambiguous")
+        );
+        let update = presentation_edge(
+            &app,
+            Scope::Channel(source),
+            28,
+            "Recovered placement",
+            0.67,
+        );
+        app.shared_views.local_projection_count.set(0);
+        app.shared_views.selected_projection_count.set(0);
+        app.shared_views.pane_attachment_count = 0;
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        drop(app.update(Message::WorkspaceModelObserved(update)));
+        assert_eq!(app.shared_views.local_projection_count.get(), 1);
+        assert_eq!(app.shared_views.selected_projection_count.get(), 0);
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .find(|row| row.id == source)
+                .unwrap()
+                .cards
+                .contains(&pane.id)
+        );
+        assert_eq!(
+            app.durable
+                .channels
+                .iter()
+                .find(|row| row.id == destination)
+                .unwrap()
+                .cards,
+            vec![draft]
+        );
+        assert_eq!(app.durable.active_channel, Some(destination));
+        assert_eq!(app.workspace.focused(), Some(draft));
+        assert_eq!(
+            app.card_state(pane.id).unwrap().title,
+            "Recovered placement"
+        );
+        assert!(
+            matches!(app.cards.get(&pane.id), Some(CardRuntime::Failed(error)) if format!("{error:?}") == failure)
+        );
+        assert_eq!(
+            app.cards.get(&pane.id).unwrap() as *const CardRuntime,
+            surface_address
+        );
+        assert_eq!(app.shared_views.pane_attachment_count, 0);
+        assert_eq!(app.card_state(draft), Some(&draft_state));
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get(&draft) else {
+            panic!("draft runtime")
+        };
+        assert_eq!(
+            runtime.as_ref() as *const super::super::chat_ui::Runtime,
+            draft_address
+        );
+        assert_eq!(runtime.unsent_text(), draft_text);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    #[cfg(not(feature = "integrated-browser"))]
+    fn presentation_remote_width_with_a_pending_local_title_uses_the_full_overlay() {
+        let (mut app, source, _, pane) = presentation_fixture();
+        let scope = Scope::Channel(source);
+        let update = presentation_edge(&app, scope.clone(), 26, &pane.title, 0.76);
+        let mut local = pane.clone();
+        local.title = "My pending title".into();
+        let operation = uuid::Uuid::new_v4();
+        app.shared_views.pending.push((
+            operation,
+            scope,
+            Change::Update {
+                before: pane.clone(),
+                pane: local.clone(),
+            },
+        ));
+        app.card_state_mut(pane.id).unwrap().title = local.title.clone();
+        app.shared_views.local_projection_count.set(0);
+        app.shared_views.selected_projection_count.set(0);
+        drop(app.update(Message::WorkspaceModelObserved(update)));
+        assert_eq!(app.shared_views.local_projection_count.get(), 1);
+        assert_eq!(app.shared_views.selected_projection_count.get(), 0);
+        assert_eq!(app.card_state(pane.id).unwrap().title, "My pending title");
+        assert_eq!(app.card_state(pane.id).unwrap().width_fraction, 0.76);
+        assert!(
+            app.shared_views
+                .pending
+                .iter()
+                .any(|(id, _, _)| *id == operation)
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "integrated-browser"))]
+    fn committed_pending_view_edit_projects_once_after_acknowledgment() {
+        use super::super::workspace_model_sync::{EdgeChanges, ModelUpdate};
+        use crate::workspace_model::delta::{EditEffects, EditReceipt, ViewChanges, ViewRevision};
+        let (mut app, source, _, pane) = presentation_fixture();
+        let scope = Scope::Channel(source);
+        let operation = uuid::Uuid::new_v4();
+        let mut changed = pane.clone();
+        changed.title = "Accepted title".into();
+        changed.width_fraction = 0.68;
+        let change = Change::Update {
+            before: pane,
+            pane: changed.clone(),
+        };
+        app.shared_views
+            .pending
+            .push((operation, scope.clone(), change.clone()));
+        app.card_state_mut(changed.id).unwrap().title = changed.title.clone();
+        app.card_state_mut(changed.id).unwrap().width_fraction = changed.width_fraction;
+        let _ = app
+            .workspace
+            .set_card_width(changed.id, CardWidth::Fraction(changed.width_fraction));
+        let mut accepted = app
+            .workspace_model
+            .views
+            .iter()
+            .find(|view| view.scope == scope)
+            .unwrap()
+            .clone();
+        accepted.apply(&change).unwrap();
+        accepted.revision = 18;
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        app.shared_views.local_projection_count.set(0);
+        app.shared_views.selected_projection_count.set(0);
+        drop(app.apply_workspace_model_update(ModelUpdate::Committed {
+            receipt: EditReceipt {
+                identity: app.workspace_model.identity,
+                sequence: 18,
+                effects: EditEffects {
+                    views: vec![ViewRevision {
+                        scope: scope.clone(),
+                        before: Some(17),
+                        after: Some(18),
+                    }],
+                    ..Default::default()
+                },
+            },
+            edit: ModelEdit::ChangeView {
+                scope: scope.clone(),
+                expected_revision: 17,
+                operation,
+                change,
+            },
+            views: ViewChanges {
+                sequence: 18,
+                views: vec![accepted.clone()],
+                ..Default::default()
+            },
+        }));
+        assert_eq!(
+            app.shared_views.local_projection_count.get()
+                + app.shared_views.selected_projection_count.get(),
+            1,
+            "the receipt installs canonical state, acknowledges its overlay, then takes one real local projection"
+        );
+        assert_eq!(app.shared_views.local_projection_count.get(), 0);
+        assert_eq!(app.shared_views.selected_projection_count.get(), 1);
+        assert!(
+            !app.shared_views
+                .pending
+                .iter()
+                .any(|(id, _, _)| *id == operation)
+        );
+        assert_eq!(
+            app.workspace_model
+                .views
+                .iter()
+                .find(|view| view.scope == scope),
+            Some(&accepted)
+        );
+        assert_eq!(app.card_state(changed.id).unwrap().title, changed.title);
+        assert!(
+            !std::iter::from_fn(|| rx.try_recv().ok())
+                .any(|edit| matches!(edit, ModelEdit::ChangeView { .. })),
+            "acknowledged metadata is not published again"
+        );
+
+        accepted.revision = 19;
+        accepted.panes[0].title = "Peer title".into();
+        app.shared_views.local_projection_count.set(0);
+        app.shared_views.selected_projection_count.set(0);
+        drop(app.apply_workspace_model_update(ModelUpdate::Changed {
+            sequence: 19,
+            edit: ModelEdit::AgentsChanged,
+            changes: EdgeChanges {
+                identity: Some(app.workspace_model.identity),
+                views: ViewChanges {
+                    sequence: 19,
+                    views: vec![accepted],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        }));
+        assert_eq!(
+            app.shared_views.local_projection_count.get()
+                + app.shared_views.selected_projection_count.get(),
+            1,
+            "an observer change still projects once"
+        );
+        assert_eq!(app.card_state(changed.id).unwrap().title, "Peer title");
+        app.shared_views.local_projection_count.set(0);
+        app.shared_views.selected_projection_count.set(0);
+        drop(app.apply_workspace_model_update(ModelUpdate::Committed {
+            receipt: EditReceipt {
+                identity: uuid::Uuid::new_v4(),
+                sequence: 900,
+                effects: EditEffects::default(),
+            },
+            edit: ModelEdit::AgentsChanged,
+            views: ViewChanges::default(),
+        }));
+        assert_eq!(
+            app.shared_views.local_projection_count.get()
+                + app.shared_views.selected_projection_count.get(),
+            0,
+            "a foreign registry receipt never projects"
+        );
     }
 
     #[test]

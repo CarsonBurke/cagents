@@ -1106,13 +1106,15 @@ struct TerminalWakeup {
 /// terminals wake about once per frame each, so a wake that changed nothing a
 /// projection reads must not pay for every card's sidebar, chrome and
 /// protection bookkeeping.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Projection {
     /// Nothing any projection reads changed: grid output, repaint ticks.
     Unchanged,
     /// Only a runtime-reported card title changed. Card chrome and the window
     /// title are the only projections that read it.
     Chrome,
+    /// Stable shared presentation, including retained local scope members.
+    ScopedChrome(Vec<CardId>),
     /// Anything else, including every user action.
     Full,
 }
@@ -1157,6 +1159,74 @@ impl Eq for HostedTerminalSource {}
 impl std::hash::Hash for HostedTerminalSource {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         std::hash::Hash::hash(&"cagents-hosted-terminals", state);
+    }
+}
+
+/// Inclusive UI-thread wall time for a shared-model notification, including
+/// dispatch and projection. This does not measure rendering or presentation.
+struct WorkspaceUpdateTiming(std::time::Instant, &'static str);
+
+thread_local! {
+    static SNAPSHOT_CAPTURE_PARENT: std::cell::Cell<&'static str> = const { std::cell::Cell::new("outside_update") };
+}
+
+struct SnapshotCaptureParent(Option<&'static str>);
+impl SnapshotCaptureParent {
+    fn enter(message: &Message) -> Self {
+        if !tracing::enabled!(target: "cagents::workspace_pipeline", tracing::Level::DEBUG) {
+            return Self(None);
+        }
+        let parent = match message {
+            Message::WorkspaceModelObserved(_) => "observer",
+            Message::ReplicaCaptureDue(_) => "replica_timer",
+            _ => "other_update",
+        };
+        Self(Some(
+            SNAPSHOT_CAPTURE_PARENT.with(|active| active.replace(parent)),
+        ))
+    }
+}
+impl Drop for SnapshotCaptureParent {
+    fn drop(&mut self) {
+        if let Some(previous) = self.0 {
+            SNAPSHOT_CAPTURE_PARENT.with(|active| active.set(previous));
+        }
+    }
+}
+
+impl Drop for WorkspaceUpdateTiming {
+    fn drop(&mut self) {
+        tracing::debug!(
+            target: "cagents::workspace_pipeline",
+            stage = self.1,
+            elapsed_ns = self.0.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+            "Applied a shared workspace notification"
+        );
+    }
+}
+
+/// Opt-in phase timing for a selected projection. Disabled tracing does not
+/// read the clock or allocate, and phase fields do not replace inclusive time.
+struct WorkspaceProjectionTiming(Option<std::time::Instant>);
+
+impl WorkspaceProjectionTiming {
+    fn new(selected: bool) -> Self {
+        Self(
+            (selected
+                && tracing::enabled!(target: "cagents::workspace_pipeline", tracing::Level::DEBUG))
+            .then(std::time::Instant::now),
+        )
+    }
+
+    fn mark(&mut self, phase: &'static str) {
+        let Some(started) = self.0.as_mut() else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        tracing::debug!(target: "cagents::workspace_pipeline", stage = phase,
+            phase_us = now.duration_since(*started).as_micros().min(u64::MAX as u128) as u64,
+            "Projected shared presentation phase");
+        *started = now;
     }
 }
 
@@ -1436,6 +1506,25 @@ impl Default for PanePresence {
 /// move plus this delay. Any other save in between carries it along, and
 /// nothing outside this window reads it before then.
 const NAVIGATION_SAVE_DELAY: Duration = Duration::from_secs(1);
+
+#[derive(Default)]
+struct ReplicaCapture {
+    pending: Option<ReplicaSnapshotDebt>,
+    generation: u64,
+    timer_armed: bool,
+    rejected: bool,
+    #[cfg(test)]
+    captures: usize,
+    #[cfg(test)]
+    offers: usize,
+}
+
+struct ReplicaSnapshotDebt {
+    changes: crate::session::SnapshotChanges,
+    registry: uuid::Uuid,
+    workspace: crate::model::WorkspaceId,
+    writer: crate::session::WriterIdentity,
+}
 
 /// What an update changed in the durable workspace beside focus, which decides
 /// when [`Cagents::apply_viewport`] hands the workspace to the writer.
@@ -4504,6 +4593,7 @@ pub enum Message {
     /// The delay on saving a change of navigation alone has passed, for the
     /// save armed with this generation; a superseded one is discarded.
     NavigationSaveDue(u64),
+    ReplicaCaptureDue(u64),
     /// The delay on saving runtime-reported card titles has passed.
     ReportedTitleSaveDue,
     /// The hold that began at this instant has lasted long enough to draw the
@@ -5250,6 +5340,7 @@ pub struct Cagents {
     lifecycle_sweep_generation: u64,
     /// A save of navigation alone is scheduled; see [`NAVIGATION_SAVE_DELAY`].
     navigation_save_pending: bool,
+    replica_capture: ReplicaCapture,
     /// Which timer is the scheduled save's: one armed for a burst that a save
     /// already wrote must not cut the next burst short.
     navigation_save_generation: u64,
@@ -7727,6 +7818,10 @@ impl Cagents {
     /// Snapshot the active strip before publishing its exact pane projection.
     /// Shared reconciliation supplies an already projected publication pass.
     fn save_workspace_with_view_publication(&mut self, publish: impl FnOnce(&mut Self)) {
+        self.save_projected_workspace(false, publish);
+    }
+
+    fn save_projected_workspace(&mut self, replica: bool, publish: impl FnOnce(&mut Self)) {
         self.shared_views.prune_restoration_requests(&self.durable);
         if !self.durable.pending_terminal_creations.is_empty() {
             let open = self
@@ -7742,20 +7837,183 @@ impl Cagents {
                 .pending_terminal_creations
                 .retain(|id| open.contains(id));
         }
-        self.navigation_save_pending = false;
         #[cfg(test)]
         terminal_output_tests::record_persist();
-        let saved = self.shared_window_snapshot_with(publish);
-        if let Some(session) = &self.session {
-            let adoptions = std::mem::take(&mut self.shared_views.adoptions);
-            let restorations = std::mem::take(&mut self.shared_views.restorations);
-            if adoptions.is_empty() && restorations.is_empty() {
-                session.snapshot(saved);
-            } else {
-                session.snapshot_terminal_panes(saved, adoptions, restorations);
-            }
+        self.snapshot_workspace_scope();
+        publish(self);
+        // Ordered identity work needs its exact complete snapshot now. Scope
+        // projection alone is not authority to coalesce these checkpoints.
+        tracing::debug!(target: "cagents::workspace_pipeline", stage = "replica_snapshot_policy",
+            replica, has_writer = self.session.is_some(),
+            adoptions = self.shared_views.adoptions.len(), restorations = self.shared_views.restorations.len(),
+            chat_adoptions = self.shared_views.chat_adoptions.len(), "Considered replica snapshot capture");
+        if replica
+            && self.session.is_some()
+            && self.shared_views.adoptions.is_empty()
+            && self.shared_views.restorations.is_empty()
+            && self.shared_views.chat_adoptions.is_empty()
+        {
+            self.mark_replica_snapshot(Instant::now());
+        } else {
+            self.capture_prepared_workspace(true);
         }
     }
+
+    fn mark_replica_snapshot(&mut self, now: Instant) {
+        let Some(writer) = &self.session else {
+            return;
+        };
+        if let Some(pending) = &mut self.replica_capture.pending {
+            pending.changes = pending
+                .changes
+                .merge(crate::session::SnapshotChanges::at(now));
+        } else {
+            self.replica_capture.generation = self.replica_capture.generation.wrapping_add(1);
+            self.replica_capture.pending = Some(ReplicaSnapshotDebt {
+                changes: crate::session::SnapshotChanges::at(now),
+                registry: self.workspace_model.identity,
+                workspace: self.durable.id,
+                writer: writer.writer_identity(),
+            });
+            self.replica_capture.rejected = false;
+        }
+    }
+
+    fn snapshot_offer(
+        &self,
+        state: Arc<WorkspaceState>,
+        ordinary: bool,
+    ) -> crate::session::SnapshotOffer {
+        let changes = self.replica_capture.pending.as_ref().map(|pending| {
+            if ordinary {
+                pending
+                    .changes
+                    .merge(crate::session::SnapshotChanges::at(Instant::now()))
+            } else {
+                pending.changes
+            }
+        });
+        crate::session::SnapshotOffer { state, changes }
+    }
+
+    fn snapshot_offer_answered(&mut self, accepted: bool) {
+        if accepted {
+            #[cfg(test)]
+            {
+                self.replica_capture.offers += 1;
+            }
+            self.replica_capture.pending = None;
+            self.replica_capture.generation = self.replica_capture.generation.wrapping_add(1);
+            self.replica_capture.timer_armed = false;
+            self.replica_capture.rejected = false;
+            self.navigation_save_pending = false;
+        } else if self.replica_capture.pending.is_some() {
+            // A poisoned or closed queue cannot recover by spinning timers.
+            // Retain the debt for an explicit save/recovery or replacement.
+            self.replica_capture.rejected = true;
+            self.replica_capture.timer_armed = false;
+        }
+    }
+
+    fn capture_prepared_workspace(&mut self, ordinary: bool) {
+        let started =
+            tracing::enabled!(target: "cagents::workspace_pipeline", tracing::Level::DEBUG)
+                .then(Instant::now);
+        let had_replica_debt = self.replica_capture.pending.is_some();
+        let mut accepted = false;
+        #[cfg(test)]
+        {
+            self.replica_capture.captures += 1;
+        }
+        let saved = self.persistent_workspace();
+        self.record_shared_chat_identities();
+        let offer = self.snapshot_offer(saved, ordinary);
+        if let Some(writer) = &self.session {
+            let result = if self.shared_views.adoptions.is_empty()
+                && self.shared_views.restorations.is_empty()
+            {
+                writer.offer_snapshot(offer)
+            } else {
+                writer.offer_terminal_panes(
+                    offer,
+                    self.shared_views.adoptions.clone(),
+                    self.shared_views.restorations.clone(),
+                )
+            };
+            if result.is_ok() {
+                self.shared_views.adoptions.clear();
+                self.shared_views.restorations.clear();
+            }
+            accepted = result.is_ok();
+            self.snapshot_offer_answered(accepted);
+        } else if self.replica_capture.pending.is_none() {
+            // Memory-only windows retain their existing navigation bookkeeping;
+            // this is not an accepted offer and acknowledges no replica debt.
+            self.navigation_save_pending = false;
+        }
+        if let Some(started) = started {
+            let parent = SNAPSHOT_CAPTURE_PARENT.with(std::cell::Cell::get);
+            tracing::debug!(target: "cagents::workspace_pipeline", stage = "window_snapshot_capture",
+                elapsed_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                parent, had_replica_debt, accepted, "Prepared a local window snapshot");
+        }
+    }
+
+    fn materialize_replica_snapshot(&mut self) {
+        if self.replica_capture.pending.is_some() {
+            self.capture_prepared_workspace(false);
+        }
+    }
+
+    fn arm_replica_capture(&mut self) -> Task<Message> {
+        if self.replica_capture.timer_armed || self.replica_capture.rejected {
+            return Task::none();
+        }
+        let Some(pending) = &self.replica_capture.pending else {
+            return Task::none();
+        };
+        let delay = pending
+            .changes
+            .deadline()
+            .saturating_duration_since(Instant::now());
+        let generation = self.replica_capture.generation;
+        self.replica_capture.timer_armed = true;
+        cosmic::task::future(async move {
+            tokio::time::sleep(delay).await;
+            Message::ReplicaCaptureDue(generation)
+        })
+    }
+
+    fn replica_capture_due(&mut self, generation: u64, now: Instant) -> Task<Message> {
+        if generation != self.replica_capture.generation || !self.replica_capture.timer_armed {
+            tracing::debug!(target: "cagents::workspace_pipeline", stage = "replica_snapshot_wake", outcome = "stale", "Handled replica snapshot timer");
+            return Task::none();
+        }
+        self.replica_capture.timer_armed = false;
+        let Some(pending) = &self.replica_capture.pending else {
+            tracing::debug!(target: "cagents::workspace_pipeline", stage = "replica_snapshot_wake", outcome = "stale", "Handled replica snapshot timer");
+            return Task::none();
+        };
+        if pending.registry != self.workspace_model.identity
+            || pending.workspace != self.durable.id
+            || !self
+                .session
+                .as_ref()
+                .is_some_and(|writer| writer.owns_writer(&pending.writer))
+        {
+            tracing::debug!(target: "cagents::workspace_pipeline", stage = "replica_snapshot_wake", outcome = "owner_changed", "Handled replica snapshot timer");
+            self.replica_capture.rejected = true;
+            return Task::none();
+        }
+        if now < pending.changes.deadline() {
+            tracing::debug!(target: "cagents::workspace_pipeline", stage = "replica_snapshot_wake", outcome = "early", "Handled replica snapshot timer");
+            return self.arm_replica_capture();
+        }
+        tracing::debug!(target: "cagents::workspace_pipeline", stage = "replica_snapshot_wake", outcome = "capture", "Handled replica snapshot timer");
+        self.materialize_replica_snapshot();
+        Task::none()
+    }
+
     /// The window to save, after publishing this window's own edits to the
     /// shared views it shows. An edit saved but not published is undone by
     /// the next shared projection, and storage refuses the snapshot that
@@ -7797,8 +8055,10 @@ impl Cagents {
         match self.install_chat_session(card, session) {
             Some(true) => {
                 let saved = self.shared_window_snapshot();
+                let offer = self.snapshot_offer(saved, true);
                 if let Some(writer) = &self.session {
-                    writer.snapshot_conversion(saved);
+                    let accepted = writer.offer_conversion(offer).is_ok();
+                    self.snapshot_offer_answered(accepted);
                 }
             }
             Some(false) => self.persist(),
@@ -7869,8 +8129,12 @@ impl Cagents {
             return;
         }
         let saved = self.shared_window_snapshot();
+        let offer = self.snapshot_offer(saved, true);
         if let Some(writer) = &self.session {
-            writer.replace_chat_identity(card, expected, session, saved);
+            let accepted = writer
+                .offer_chat_identity(card, expected, session, offer)
+                .is_ok();
+            self.snapshot_offer_answered(accepted);
         }
     }
 
@@ -7898,8 +8162,10 @@ impl Cagents {
         self.cards.insert(card, CardRuntime::Loading);
         self.card_chrome.remove(&card);
         let saved = self.shared_window_snapshot();
+        let offer = self.snapshot_offer(saved, true);
         if let Some(writer) = &self.session {
-            writer.snapshot_conversion(saved);
+            let accepted = writer.offer_conversion(offer).is_ok();
+            self.snapshot_offer_answered(accepted);
         }
         self.pending_terminal_handoffs
             .insert(session.id, session.clone());
@@ -7936,6 +8202,7 @@ impl Cagents {
         {
             return Task::none();
         }
+        self.materialize_replica_snapshot();
         let Some(writer) = &self.session else {
             return Task::none();
         };
@@ -8455,53 +8722,13 @@ impl Cagents {
         }
         let mut presentation_updates = Vec::new();
         for card in &self.durable.cards {
-            let type_label = card_kind_labels(Some(&card.kind)).type_label;
-            let title = self.repository_chrome_with(card, || {
-                self.card_display_title_with_chat_title(card, || {
-                    self.chat_channel_title(card, titled_channels.get(&card.id).copied())
-                })
-            });
-            if matches!(card.kind, CardKind::Browser(_))
-                && self
-                    .workspace
-                    .card(card.id)
-                    .is_some_and(|pane| pane.accessible_name != title)
-            {
-                presentation_updates.push((card.id, title.to_string()));
-            }
-            let caption_source = self.card_caption_source(card);
-            if self
-                .card_chrome
-                .get(&card.id)
-                .is_none_or(|chrome| !chrome.describes(type_label, &title, &caption_source))
-            {
-                let caption = caption_source.caption();
-                let mut chrome = CardChrome::new(card.id, type_label, &title, &caption)
-                    .with_caption_source(caption_source.into_owned());
-                if matches!(card.kind, CardKind::Terminal(_))
-                    && !self.chrome_ui.user_titles.contains_key(&card.id)
-                    && let Some(ordinal) = self.chrome_ui.terminal_ordinals.get(&card.id)
-                {
-                    let suffix = format!(" ({ordinal})");
-                    let base = title.strip_suffix(&suffix).unwrap_or(&title);
-                    chrome.compact_title = Some(format!("{ordinal} {base}"));
-                    chrome.terminal_ordinal_suffix = Some(suffix);
-                    if let CardKind::Terminal(session) = &card.kind {
-                        let reported = self.card_display_title(card);
-                        let directory = self
-                            .terminal_working_directories
-                            .get(&card.id)
-                            .unwrap_or(&session.launch.working_directory);
-                        chrome.terminal_title_source = Some(TerminalTitleSource {
-                            reported: reported.to_owned(),
-                            directory: directory.clone(),
-                            program: session.launch.program.clone(),
-                            ordinal: *ordinal,
-                            fallback: TerminalTitleSource::fallback(reported),
-                        });
-                    }
-                }
+            let (chrome, title) =
+                self.project_card_chrome(card, titled_channels.get(&card.id).copied());
+            if let Some(chrome) = chrome {
                 self.card_chrome.insert(card.id, chrome);
+            }
+            if let Some(title) = title {
+                presentation_updates.push((card.id, title));
             }
         }
         for (id, title) in presentation_updates {
@@ -8514,6 +8741,119 @@ impl Cagents {
                 .terminal_ordinals
                 .retain(|id, _| self.card_indices.contains_key(id));
         }
+        self.sync_window_title()
+    }
+
+    /// Both projection paths share title precedence, caching, accessibility and
+    /// terminal presentation. Only the set of cards to visit differs.
+    fn project_card_chrome(
+        &self,
+        card: &CardState,
+        channel: Option<&crate::model::ProjectChannel>,
+    ) -> (Option<CardChrome>, Option<String>) {
+        #[cfg(test)]
+        self.shared_views
+            .chrome_cards_visited
+            .set(self.shared_views.chrome_cards_visited.get() + 1);
+        let type_label = card_kind_labels(Some(&card.kind)).type_label;
+        let title = self.repository_chrome_with(card, || {
+            self.card_display_title_with_chat_title(card, || self.chat_channel_title(card, channel))
+        });
+        let presentation = if matches!(card.kind, CardKind::Browser(_))
+            && self
+                .workspace
+                .card(card.id)
+                .is_some_and(|pane| pane.accessible_name != title)
+        {
+            Some(title.to_string())
+        } else {
+            None
+        };
+        let caption_source = self.card_caption_source(card);
+        let chrome = if self
+            .card_chrome
+            .get(&card.id)
+            .is_none_or(|chrome| !chrome.describes(type_label, &title, &caption_source))
+        {
+            let caption = caption_source.caption();
+            let mut chrome = CardChrome::new(card.id, type_label, &title, &caption)
+                .with_caption_source(caption_source.into_owned());
+            if matches!(card.kind, CardKind::Terminal(_))
+                && !self.chrome_ui.user_titles.contains_key(&card.id)
+                && let Some(ordinal) = self.chrome_ui.terminal_ordinals.get(&card.id)
+            {
+                let suffix = format!(" ({ordinal})");
+                let base = title.strip_suffix(&suffix).unwrap_or(&title);
+                chrome.compact_title = Some(format!("{ordinal} {base}"));
+                chrome.terminal_ordinal_suffix = Some(suffix);
+                if let CardKind::Terminal(session) = &card.kind {
+                    let reported = self.card_display_title(card);
+                    let directory = self
+                        .terminal_working_directories
+                        .get(&card.id)
+                        .unwrap_or(&session.launch.working_directory);
+                    chrome.terminal_title_source = Some(TerminalTitleSource {
+                        reported: reported.to_owned(),
+                        directory: directory.clone(),
+                        program: session.launch.program.clone(),
+                        ordinal: *ordinal,
+                        fallback: TerminalTitleSource::fallback(reported),
+                    });
+                }
+            }
+            Some(chrome)
+        } else {
+            None
+        };
+        (chrome, presentation)
+    }
+
+    fn install_card_chrome(
+        &mut self,
+        updates: Vec<(CardId, (Option<CardChrome>, Option<String>))>,
+    ) {
+        for (id, (chrome, title)) in updates {
+            if let Some(chrome) = chrome {
+                self.card_chrome.insert(id, chrome);
+            }
+            if let Some(title) = title {
+                let _ = self.workspace.rename_card(id, title);
+            }
+        }
+    }
+
+    fn sync_scoped_chrome(&mut self, cards: &[CardId]) -> Task<Message> {
+        // Ordinals require a global counter reconciliation; missing chrome can
+        // also mean this is the first projection after restoration.
+        if cards.iter().any(|id| {
+            self.card_state(*id).is_none_or(|card| {
+                !self.card_chrome.contains_key(id)
+                    || (matches!(card.kind, CardKind::Terminal(_))
+                        && !self.chrome_ui.terminal_ordinals.contains_key(id))
+            })
+        }) {
+            return self.sync_chrome();
+        }
+        #[cfg(test)]
+        terminal_output_tests::record_chrome();
+        self.terminal_working_directories
+            .retain(|card, _| self.cards.contains_key(card));
+        self.terminal_find
+            .retain(|card, _| self.cards.contains_key(card));
+        self.index_cards();
+        let updates = cards
+            .iter()
+            .filter_map(|id| {
+                let card = self.card_state(*id)?;
+                let channel = self
+                    .durable
+                    .channels
+                    .iter()
+                    .find(|channel| !channel.title.is_empty() && channel.cards.contains(id));
+                Some((*id, self.project_card_chrome(card, channel)))
+            })
+            .collect::<Vec<_>>();
+        self.install_card_chrome(updates);
         self.sync_window_title()
     }
 
@@ -13983,6 +14323,7 @@ impl Cagents {
     }
 
     fn capture_workspace_save(&mut self) -> Result<WorkspaceSave, String> {
+        self.materialize_replica_snapshot();
         let flush = self
             .session
             .as_ref()
@@ -14168,6 +14509,12 @@ impl Cagents {
             .remove(&field)
             .expect("matched pending draft");
         self.apply_setting_input(field, value)
+    }
+
+    fn settings_blur_pending(&self) -> bool {
+        self.settings_pane_focused
+            && !self.settings_card_focused()
+            && !self.settings_pending.is_empty()
     }
 
     /// Commits the pane's drafts when focus leaves it, so an edit is never
@@ -14868,6 +15215,7 @@ impl Application for Cagents {
             lifecycle_sweep_deadline: None,
             lifecycle_sweep_generation: 0,
             navigation_save_pending: false,
+            replica_capture: ReplicaCapture::default(),
             navigation_save_generation: 0,
             keyboard_owed: None,
             reported_title_save: ReportedTitleSave::default(),
@@ -14995,6 +15343,23 @@ impl Application for Cagents {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         let _trace = crate::performance::ui_trace::update(&message);
+        // Include dispatch and the shared projection tail. The trace is opt-in;
+        // an ordinary update does not read the clock or allocate.
+        let _capture_parent = SnapshotCaptureParent::enter(&message);
+        let timer_update = matches!(&message, Message::ReplicaCaptureDue(_));
+        let _workspace_timing = ((matches!(&message, Message::WorkspaceModelObserved(_))
+            || timer_update)
+            && tracing::enabled!(target: "cagents::workspace_pipeline", tracing::Level::DEBUG))
+        .then(|| {
+            WorkspaceUpdateTiming(
+                std::time::Instant::now(),
+                if timer_update {
+                    "replica_snapshot_timer"
+                } else {
+                    "ui_update"
+                },
+            )
+        });
         if let Some(settled) = self.settle_chat_close_confirm() {
             // An answer to the question that just ended must not answer the
             // next one, which the reader has not seen.
@@ -15143,7 +15508,8 @@ impl Application for Cagents {
                 | Message::FocusAdjacent(_)
                 | Message::WindowResized(..)
         );
-        let mut projection = if repaint_tick(&message) || self.navigation_save_is_stale(&message) {
+        let model_update = matches!(&message, Message::WorkspaceModelObserved(_));
+        let mut projection = if repaint_tick(&message) || matches!(message, Message::ReplicaCaptureDue(_)) || self.navigation_save_is_stale(&message) {
             Projection::Unchanged
         } else {
             Projection::Full
@@ -15207,10 +15573,8 @@ impl Application for Cagents {
                 self.observe_hosted_descriptors(terminals)
             }
             Message::WorkspaceModelObserved(update) => {
-                let (task, changed) = self.apply_workspace_model_update_effect(update);
-                if !changed {
-                    projection = Projection::Unchanged;
-                }
+                let (task, model_projection) = self.apply_workspace_model_update_projection(update);
+                projection = model_projection;
                 task
             }
             Message::TerminalStarted {
@@ -17260,6 +17624,7 @@ impl Application for Cagents {
                 self.chrome_ui.workspace_switcher_shown = true;
                 self.reveal_workspace_selection()
             }
+            Message::ReplicaCaptureDue(generation) => self.replica_capture_due(generation, Instant::now()),
             Message::NavigationSaveDue(generation) => {
                 if self.navigation_save_due(generation) {
                     self.persist();
@@ -18410,6 +18775,7 @@ impl Application for Cagents {
                 Task::none()
             }
             Message::RetrySessionSave => {
+                self.materialize_replica_snapshot();
                 if let (Some(session), Some(health)) = (&self.session, &mut self.save_health) {
                     health.request_retry(session);
                 }
@@ -18639,12 +19005,28 @@ impl Application for Cagents {
         // and it is the one place that can bound the history.
         // Before the notices drain, so one raised by a committed draft is
         // recorded with this update rather than the next.
+        // Scoped proof was established during dispatch. Settings commit and
+        // close processing can invalidate it before chrome is projected.
+        if matches!(projection, Projection::ScopedChrome(_))
+            && (self.settings_blur_pending()
+                || !self.queued_card_closes.is_empty() || self.workspace.pending_close().is_some())
+        {
+            projection = Projection::Full;
+        }
+        let scoped_source = matches!(projection, Projection::ScopedChrome(_))
+            .then(|| Arc::downgrade(&self.durable));
         self.reconcile_terminal_review_owner();
         let task = Task::batch([
             task,
             self.flush_settings_on_blur(),
             self.settle_close_queue(),
         ]);
+        if scoped_source.is_some_and(|source| source.as_ptr() != Arc::as_ptr(&self.durable)) {
+            projection = Projection::Full;
+        }
+        if model_update && matches!(projection, Projection::Full | Projection::Chrome) {
+            self.materialize_replica_snapshot();
+        }
         if projection == Projection::Full {
             self.sync_worktree_protections();
         }
@@ -18672,13 +19054,19 @@ impl Application for Cagents {
             }
             // A reported title reaches the tabs and window title; nothing in
             // the sidebar, worktree ownership or protections reads it.
-            Projection::Chrome => {
+            Projection::Chrome | Projection::ScopedChrome(_) => {
+                #[cfg(test)]
+                if model_update { self.shared_views.chrome_tail_count += 1; }
                 let notices = self.reconcile_notice_popup();
-                let chrome = self.sync_chrome();
+                let mut phase = WorkspaceProjectionTiming::new(_workspace_timing.is_some());
+                let chrome = match &projection {
+                    Projection::ScopedChrome(cards) => self.sync_scoped_chrome(cards),
+                    _ => self.sync_chrome(),
+                };
+                phase.mark("selected_chrome");
+                let snapshot = if matches!(projection, Projection::ScopedChrome(_)) { self.arm_replica_capture() } else { Task::none() };
                 return Task::batch([
-                    task,
-                    chrome,
-                    notices,
+                    task, chrome, notices, snapshot,
                     self.release_deferred_navigation_if_unblocked(),
                 ]);
             }
@@ -18689,6 +19077,8 @@ impl Application for Cagents {
         }
         #[cfg(test)]
         terminal_output_tests::record_projection();
+        #[cfg(test)]
+        if model_update { self.shared_views.structural_tail_count += 1; }
         let notices = self.reconcile_notice_popup();
         self.synchronize_sidebar_selection();
         self.refresh_sidebar_channels();
@@ -30821,6 +31211,7 @@ mod tests {
             lifecycle_sweep_deadline: None,
             lifecycle_sweep_generation: 0,
             navigation_save_pending: false,
+            replica_capture: ReplicaCapture::default(),
             navigation_save_generation: 0,
             keyboard_owed: None,
             reported_title_save: ReportedTitleSave::default(),
@@ -33516,7 +33907,7 @@ mod tests {
         app.github_availability.insert(
             project,
             GitHubAvailability::Ready {
-                repository_key: GitHubRepoKey::new("github.com", None, "o", "r").unwrap(),
+                repository_key: crate::pull_request_review::tests::target(1).repository,
                 pull_requests: numbers
                     .iter()
                     .map(|number| {
@@ -33557,7 +33948,7 @@ mod tests {
         Message::Sidebar(SidebarAction::OpenPullRequest {
             project_id,
             number,
-            url: Url::parse(&format!("https://github.com/o/r/pull/{number}")).unwrap(),
+            url: crate::pull_request_review::tests::pull_request(number).url,
         })
     }
 
