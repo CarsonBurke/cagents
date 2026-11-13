@@ -1354,20 +1354,31 @@ fn task_reports_hide_short_and_huge_bodies_without_losing_outcome_or_exact_copy(
         assert!(
             surface
                 .accessible
-                .contains(&format!("Show report details: {heading}"))
+                .contains(&format!("Show delivery details: {heading}"))
         );
-        assert!(
+        assert!(surface.accessible.contains(&"Copy this message".to_owned()));
+        let title = heading.strip_suffix(outcome).unwrap();
+        assert_eq!(
             surface
-                .accessible
-                .contains(&format!("Copy original report: {heading}"))
+                .text
+                .iter()
+                .filter(|text| text.as_str() == title)
+                .count(),
+            1,
+            "the single-line title keeps its source for overflow fading"
         );
-        assert!(!surface.text.iter().any(|text| text == &heading));
+        assert_eq!(
+            surface
+                .text
+                .iter()
+                .filter(|text| text.as_str() == outcome.trim())
+                .count(),
+            1,
+            "the outcome stays in its own trailing cell at narrow widths"
+        );
         assert!(
-            surface.text.iter().any(|text| text.ends_with(outcome)
-                && text.contains('…')
-                && text.chars().count() <= 73 + outcome.chars().count()),
-            "compact task identity must preserve {outcome}: {:?}",
-            surface.text
+            !surface.text.iter().any(|text| text == "Copy report"),
+            "closed reports use the message footer Copy action"
         );
         let marker = body.lines().next().unwrap();
         assert!(
@@ -1376,7 +1387,7 @@ fn task_reports_hide_short_and_huge_bodies_without_losing_outcome_or_exact_copy(
                 .iter()
                 .chain(&surface.accessible)
                 .any(|text| text.contains(marker)),
-            "even short report bodies stay behind Details"
+            "even short report bodies stay behind the disclosure"
         );
         let mut app = crate::app::tests::context_inspector_test_app(false);
         app.cards
@@ -1478,7 +1489,25 @@ fn report_details_and_late_find_prepare_original_markdown_and_restore_disclosure
             );
             assert!(!cached.source.provisional());
             let surface = report_surface(live, "disclosed-report");
-            assert!(surface.text.iter().any(|text| text == heading));
+            assert_eq!(
+                surface
+                    .text
+                    .iter()
+                    .filter(|text| text.as_str() == "Agent \"Detailed review\"")
+                    .count(),
+                1,
+                "expansion retains one title rather than repeating the full heading"
+            );
+            assert_eq!(
+                surface
+                    .text
+                    .iter()
+                    .filter(|text| text.as_str() == "finished")
+                    .count(),
+                1
+            );
+            assert!(surface.text.iter().any(|text| text == "Copy report"));
+            assert!(surface.accessible.contains(&"Copy this message".to_owned()));
             assert!(
                 surface.text.iter().any(|text| text.contains(needle)),
                 "the late body match must actually be rendered"
@@ -1486,7 +1515,7 @@ fn report_details_and_late_find_prepare_original_markdown_and_restore_disclosure
             assert!(
                 surface
                     .accessible
-                    .contains(&format!("Hide report details: {heading}"))
+                    .contains(&format!("Hide delivery details: {heading}"))
             );
             assert!(live.failure_ui.incidents.is_empty());
             if temporary_find {

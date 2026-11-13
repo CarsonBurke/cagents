@@ -5364,6 +5364,20 @@ impl Runtime {
         let (title, outcome) = if *kind == chat::DeliveryKind::Notice && !monitor {
             delivery_command_outcome(first)
                 .map_or((first, None), |(title, outcome)| (title, Some(outcome)))
+        } else if *kind == chat::DeliveryKind::Report
+            && from.is_empty()
+            && ["Agent ", "Workflow "]
+                .iter()
+                .any(|prefix| first.starts_with(prefix))
+        {
+            [" was stopped", " finished", " failed"]
+                .into_iter()
+                .find_map(|outcome| {
+                    first
+                        .strip_suffix(outcome)
+                        .map(|title| (title, Some(outcome.trim())))
+                })
+                .unwrap_or((first, None))
         } else {
             (first, None)
         };
