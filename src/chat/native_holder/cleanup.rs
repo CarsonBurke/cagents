@@ -68,6 +68,23 @@ pub(super) fn publish(
     save(&path, &receipt)
 }
 
+/// Publishes the receipt a holder of `record` writes as it closes `source`.
+#[cfg(test)]
+pub(crate) fn publish_closed_source(
+    record: &Record,
+    proof: &HostSessionProof,
+    source: &crate::chat::Session,
+) -> Result<(), String> {
+    let receipt = Receipt {
+        record: record.clone(),
+        proof: proof.clone(),
+        sources: vec![source_digest(source)?],
+        paired_closed: source.terminal.is_none(),
+        paired_holder: None,
+    };
+    save(&path(record.terminal, &record.holder)?, &receipt)
+}
+
 fn save(path: &std::path::Path, receipt: &Receipt) -> Result<(), String> {
     let parent = path
         .parent()
@@ -135,7 +152,7 @@ impl Detached {
         {
             return Err("Native cleanup caller no longer owns the daemon lease".into());
         }
-        if self.receipt(retain)? {
+        if self.receipt(retain)? || self.retire_exited() {
             return Ok(());
         }
         let (recovery, _) = super::transport::inspect(&self.record, &self.proof)?;
@@ -146,6 +163,17 @@ impl Detached {
         }
         let (mut holder, _) = super::transport::adopt(&self.record, &self.source, &self.proof)?;
         holder.close_inner(retain, detached)
+    }
+
+    /// Settles cleanup of an owner that ended without its receipt - killed,
+    /// crashed, or taken down with its provider - and so can neither be
+    /// adopted nor release anything. It has ended only when its holder and
+    /// provider are gone with everything in their process group and session,
+    /// the evidence an abandoned retained actor gives. Its record is then
+    /// retired as discovery would. Refusing instead would refuse the
+    /// conversation's Close for good, with nothing left a retry could stop.
+    pub(super) fn retire_exited(&self) -> bool {
+        retire_abandoned(&self.record).unwrap_or(false)
     }
 
     pub fn consume_receipt(&self) -> Result<bool, String> {
@@ -242,6 +270,40 @@ pub(crate) fn closed_source(
     proof: &HostSessionProof,
 ) -> Result<Option<(Record, bool)>, String> {
     Ok(find_source(source, proof)?.map(|receipt| (receipt.record, receipt.paired_closed)))
+}
+
+/// Retires `record` when it names an owner that has ended: its holder and
+/// provider are gone with everything in their process group and session. That
+/// is the evidence an abandoned retained actor gives, and discovery deletes
+/// such a record. Returns whether it did.
+pub(crate) fn retire_abandoned(record: &Record) -> Result<bool, String> {
+    if record.application != crate::instance::APPLICATION_ID
+        || !crate::chat::runtime::retained_actor_abandoned(&record.holder, &record.root)?
+    {
+        return Ok(false);
+    }
+    record.remove(&registry::directory(Kind::Native)?);
+    Ok(true)
+}
+
+/// Whether any close receipt names `terminal`, whichever conversation it
+/// matches. A receipt is evidence that the terminal's owner is accounted for;
+/// one that does not match a request is no permission to treat the request's
+/// owner as lost.
+pub(crate) fn has_receipt(terminal: TerminalId) -> Result<bool, String> {
+    let prefix = format!("{terminal}-");
+    for entry in
+        fs::read_dir(registry::directory(Kind::Native)?).map_err(|error| error.to_string())?
+    {
+        let name = entry.map_err(|error| error.to_string())?.file_name();
+        if name
+            .to_str()
+            .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".closed"))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub(crate) fn closed_pair_holder(

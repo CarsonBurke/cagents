@@ -82,7 +82,7 @@ const HOST_CHECK: Millis = 3_000;
 /// than a tick, so a focused window reads it on every one: a local read
 /// costs nobody's patience, and Omp records figures as it works.
 const OMP_REREAD: Millis = 20_000;
-const STATUS_BAR_HEIGHT: f32 = 24.0;
+pub(super) const STATUS_BAR_HEIGHT: f32 = 24.0;
 const CHIP_HEIGHT: f32 = 20.0;
 const CHIP_ICON_SIZE: u16 = 12;
 const POPOVER_WIDTH: f32 = 320.0;
@@ -4672,7 +4672,10 @@ impl Cagents {
     /// The longest known worktree or repository root containing `directory`
     /// determines its project. This is a short in-memory scan only when
     /// starting work or drawing the Accounts pane; no filesystem query is needed.
-    fn project_for_directory(&self, directory: &Path) -> Option<(ProjectId, &str, &Path)> {
+    pub(super) fn project_for_directory(
+        &self,
+        directory: &Path,
+    ) -> Option<(ProjectId, &str, &Path)> {
         self.sidebar_model
             .projects
             .iter()
@@ -4949,7 +4952,12 @@ impl Cagents {
         )
         .width(Length::Fill)
         .height(STATUS_BAR_HEIGHT - design::BORDER_WIDTH)
-        .padding(Padding::from([0.0, space::S]))
+        // The rule above runs to the window edge; the trailing control stays
+        // out of the resize border.
+        .padding(Padding {
+            right: space::S + self.trailing_edge_inset(),
+            ..Padding::from([0.0, space::S])
+        })
         .align_y(Alignment::Center);
         Some(
             widget::column::with_children(vec![design::horizontal_rule(), bar.into()])
@@ -5470,15 +5478,8 @@ impl Cagents {
 
     /// The Accounts pane: every account, as a table grouped by provider.
     pub(super) fn accounts_pane(&self) -> Element<'_, Message> {
-        table::view(self).map(pane_message)
+        table::view(self)
     }
-}
-
-/// Preserve every callback's pane origin, including responsive children and
-/// overlays. Shared global controls and accepted task completions are not
-/// wrapped: only these completed workspace pane views use this boundary.
-pub(super) fn pane_message(message: Message) -> Message {
-    Message::UtilityPaneUi(Box::new(message))
 }
 
 fn browser_login_available() -> Result<(), String> {

@@ -274,7 +274,7 @@ pub(super) fn in_flight(pull_request: &PullRequest) -> bool {
     }
 }
 
-/// How stale a listing may be while someone reads the board.
+/// How stale a listing may be while someone reads its project.
 pub(super) const WATCHED_INTERVAL: Duration = Duration::from_secs(30);
 /// Unread, a listing only keeps merge state and pins current.
 const UNWATCHED_INTERVAL: Duration = Duration::from_secs(10 * 60);
@@ -282,7 +282,7 @@ const UNWATCHED_INTERVAL: Duration = Duration::from_secs(10 * 60);
 /// is rare and the next read of the board notices it within the hour.
 pub(super) const NOT_GITHUB_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
-/// When the next poll is due: sooner while someone is reading the board,
+/// When the next poll is due: sooner while someone is reading the project,
 /// later after each consecutive failure.
 pub(super) fn interval(watched: bool, failures: u32) -> Duration {
     let base = if watched {

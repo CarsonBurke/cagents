@@ -8,10 +8,10 @@ mod browser_import_ui;
 #[cfg(test)]
 mod channel_open_workload;
 mod channel_ui;
-mod channel_work;
 mod chat_close;
 mod chat_ui;
 mod chrome_ui;
+mod context_sections;
 mod daemon_health_ui;
 mod daemon_recovery;
 mod daemon_stop;
@@ -47,6 +47,7 @@ mod settings_ui;
 mod shared_views;
 mod sidebar_selection_ui;
 mod startup_gate;
+mod startup_restore;
 mod terminal_adoption;
 mod terminal_close;
 mod terminal_end_ui;
@@ -116,21 +117,21 @@ use url::Url;
 
 use crate::{
     account::{self, Account},
-    design::{self, DockLayout, InspectorLayout, space},
+    design::{self, InspectorLayout, space},
     github::{
         CreatePullRequestRequest, GitHubAvailability, GitHubRepoKey, GitHubService,
-        ListPullRequestsRequest, PullRequestCreationOutcome, PullRequestStateFilter,
+        PullRequestCreationOutcome,
     },
-    inspector::{self, InspectorAction, RuntimeStatus as InspectorRuntimeStatus},
+    inspector::{self, InspectorAction},
     instance,
     lifecycle::{LifecycleAction, LifecycleBudget, LifecycleManager},
     location::SanitizedLocation,
     lsp::{LspCoordinates, LspDocumentId, LspError, LspEvent, LspManager, LspPosition, LspStatus},
     model::{
-        CardId, CardKind, CardState, ChannelId, Existence, Exposure, HostSessionProof,
-        LaunchRecipe, ProjectId, ProjectKind, ProjectState, RepositoryView, Residency,
-        RuntimeError, TerminalContinuity, TerminalExit, TerminalId, TerminalSession,
-        WorkspaceDestination, WorkspaceState, WorktreeState,
+        CardId, CardKind, CardState, Existence, Exposure, HostSessionProof, LaunchRecipe,
+        ProjectId, ProjectKind, ProjectState, RepositoryView, Residency, RuntimeError,
+        TerminalContinuity, TerminalExit, TerminalId, TerminalSession, WorkspaceDestination,
+        WorkspaceState, WorktreeState,
     },
     pull_request_review,
     repository::{
@@ -140,9 +141,7 @@ use crate::{
         RepositorySnapshot, StageRequest, StatusSnapshot, UnstageRequest, WorktreeCreationOutcome,
         WorktreeRecord,
     },
-    repository_widget::{
-        self, LspIntent, RepositoryAction, RepositoryRuntime, RepositoryRuntimeStatus,
-    },
+    repository_widget::{self, LspIntent, RepositoryAction, RepositoryRuntime},
     session::{
         QUARANTINE_GUIDANCE, QuarantinedWrite, ReplacedIdentity, SessionRuntime, SessionSaveHealth,
         SessionSaveHealthEvent, WriteSubject,
@@ -322,6 +321,8 @@ enum NoticeKey {
     GitCommit(ActiveWorktreeKey),
     /// Saving this chat's return to a terminal.
     ChatReturn(CardId),
+    /// Closing this chat, which the daemon refused.
+    ChatClose(CardId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -947,6 +948,9 @@ fn quarantined_write_line<'a>(
         1 => line.push_str(" · 1 worktree waits on it"),
         count => line.push_str(&format!(" · {count} worktrees wait on it")),
     }
+    // The rule is what to report; on its own line it stays apart from the
+    // remedies above, and from the next write's subject below.
+    line.push_str(&format!("\nRule: {}", write.check));
     line
 }
 
@@ -1446,12 +1450,28 @@ impl Default for PanePresence {
     }
 }
 
-/// How long a change of focus alone waits to be saved. Focus moves in bursts -
-/// a held navigation key, a pointer resting on one pane after another - and
-/// each save copies the workspace and every chat draft on the UI thread, so a
-/// burst is saved once, at its first move plus this delay. Any other save in
-/// between carries the focus with it.
-const FOCUS_SAVE_DELAY: Duration = Duration::from_secs(1);
+/// How long a change of where this window is - its focus, channel or
+/// worktree - waits to be saved. Navigation comes in bursts: a held key, a
+/// pointer resting on one pane after another, a person clicking down the
+/// sidebar. Each save projects every shared view and copies the workspace and
+/// every chat draft on the UI thread, so a burst is saved once, at its first
+/// move plus this delay. Any other save in between carries it along, and
+/// nothing outside this window reads it before then.
+const NAVIGATION_SAVE_DELAY: Duration = Duration::from_secs(1);
+
+/// What an update changed in the durable workspace beside focus, which decides
+/// when [`Cagents::apply_viewport`] hands the workspace to the writer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DurableChange {
+    /// Nothing: a change of focus alone is saved within
+    /// [`NAVIGATION_SAVE_DELAY`].
+    None,
+    /// The channel or worktree this window shows, saved within
+    /// [`NAVIGATION_SAVE_DELAY`] like focus.
+    Navigation,
+    /// Anything else, saved now.
+    Content,
+}
 
 /// How long the modifier is held before the workspace switcher is drawn. A
 /// tap that toggles between the two most recent workspaces ends sooner, and
@@ -1546,10 +1566,6 @@ fn lifecycle_sweep_timer(delay: Duration, generation: u64) -> Task<Message> {
 /// for whatever remains, so only an earlier deadline needs a new timer.
 fn sweep_needs_rearming(pending: Option<Instant>, requested: Instant) -> bool {
     pending.is_none_or(|deadline| requested < deadline)
-}
-
-fn should_show_card_navigator(total: usize) -> bool {
-    total > 1
 }
 
 fn card_control_id(id: CardId, control: &str) -> widget::Id {
@@ -2302,15 +2318,6 @@ impl PullRequestDialog {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum ContextTab {
-    #[default]
-    Files,
-    Changes,
-    PullRequest,
-    Details,
-}
-
 #[derive(serde::Serialize, serde::Deserialize)]
 struct WindowView {
     #[serde(default)]
@@ -2320,7 +2327,8 @@ struct WindowView {
     sidebar_width: f32,
     inspector_width: f32,
     context_inspector_open: bool,
-    context_tab: ContextTab,
+    #[serde(default)]
+    context_sections: context_sections::Sections,
     sidebar: sidebar::SidebarView,
     worktree_offsets: HashMap<PathBuf, f32>,
 }
@@ -2408,21 +2416,6 @@ async fn flush_workspace(
         let error = error.to_string();
         (Err(error.clone()), Err(error))
     })
-}
-
-impl ContextTab {
-    const ALL: [Self; 4] = [Self::Files, Self::Changes, Self::PullRequest, Self::Details];
-
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Files => "Files",
-            // The panel holds the Changes, Branch, and History views; naming
-            // it after the first of them said "Changes" twice.
-            Self::Changes => "Source control",
-            Self::PullRequest => "Pull request",
-            Self::Details => "Details",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2765,7 +2758,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::ReviewFilePanelToggle { .. }
         | Message::ReviewFilePanelResize { .. }
         | Message::ReviewFilePanelResizeFinished
-        | Message::SelectContextTab(_)
+        | Message::ContextSection(_)
         | Message::ContextInspector(_)
         // The settings pane sits under a dialog like any other card, so a
         // keystroke aimed at the dialog must not edit a setting behind it.
@@ -2784,8 +2777,6 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         Message::AccountUi(action) => action.blocked_while_modal(),
         Message::AutomationUi(action) => !action.background() && !action.answers_draft_dialog(),
         Message::WorkUi(action) => !action.background(),
-        Message::ChannelWork(action) => !action.background(),
-        Message::OpenChannelWork(_) | Message::ChannelWorkEscape | Message::ChannelWorkNavigation(_) => true,
         Message::UpdateUi(update_ui::Action::Apply) => true,
         Message::PullRequestUi(action) => !action.allowed_while_modal(),
         Message::PullRequestReview { action, .. } => !action.allowed_while_modal(),
@@ -2905,7 +2896,7 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
             | Message::PreviewLocalFile(_)
             | Message::ChatUi(chat_ui::Action::OpenUrl(_))
             | Message::PullRequestUi(
-                pull_request_ui::Action::OpenUrl(_) | pull_request_ui::Action::OpenMarkdownLink(_)
+                pull_request_ui::Action::Open { .. } | pull_request_ui::Action::OpenCheck(_)
             )
             | Message::ChromeUi(chrome_ui::Action::Launch(_))
             | Message::MovePaneToChannel { .. }
@@ -2919,8 +2910,6 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
                 ..
             }
             | Message::ToggleContextInspector
-            | Message::OpenChannelWork(_)
-            | Message::ChannelWorkNavigation(_)
             | Message::Repository(RepositoryAction::NewTerminal { .. })
             | Message::Repository(RepositoryAction::MarkdownLink { .. })
             | Message::Sidebar(
@@ -2937,22 +2926,6 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
                     | SidebarAction::OpenAutomations
                     | SidebarAction::OpenWork
             )
-    ) || matches!(
-        message,
-        Message::ContextInspector(action) if context_inspector_action_navigates(action)
-    )
-}
-
-fn context_inspector_action_navigates(action: &InspectorAction) -> bool {
-    matches!(
-        action,
-        InspectorAction::NewTerminalAt(_)
-            | InspectorAction::Retry(_)
-            | InspectorAction::ReloadBrowser(_)
-            | InspectorAction::OpenBrowser(_)
-            | InspectorAction::OpenLspHoverLink(_)
-            | InspectorAction::CreatePullRequest { .. }
-            | InspectorAction::FocusProjectSearch
     )
 }
 
@@ -3035,6 +3008,7 @@ pub enum SettingsField {
     ManagedWorktreeDirectory,
     AutoDeleteMergedWorktrees,
     WorktreeSort,
+    SidebarWorktrees,
     DefaultWorktreePane,
     DefaultChannelPane,
     DefaultColumnFraction,
@@ -3048,6 +3022,7 @@ pub enum SettingsField {
     DefaultNativePaneFraction,
     ShowStatusBar,
     ShowWorktreeChangesIcons,
+    ShowMentionedPullRequests,
     RelaunchAgentsOnUpgrade,
     CheckForUpdates,
     EditorSyntaxTheme,
@@ -3166,6 +3141,7 @@ impl SettingsField {
             Self::TerminalScrollbackMib => "Scrollback (MiB)",
             Self::ManagedWorktreeDirectory => "Managed worktree directory",
             Self::WorktreeSort => "Worktree order",
+            Self::SidebarWorktrees => "Worktrees in sidebar",
             Self::DefaultWorktreePane => "Default worktree pane",
             Self::DefaultChannelPane => "Default channel pane",
             Self::DefaultColumnFraction => "New pane width",
@@ -3204,6 +3180,7 @@ impl SettingsField {
             Self::ChatEnterSends => "Chat send key",
             Self::ShowStatusBar => "Status bar",
             Self::ShowWorktreeChangesIcons => "Worktree changes icons",
+            Self::ShowMentionedPullRequests => "Mentioned pull requests",
             Self::AutoDeleteMergedWorktrees => "Notify about merged worktrees",
             Self::RelaunchAgentsOnUpgrade => "Unresumable agents",
             Self::CheckForUpdates => "Automatic checks",
@@ -3240,6 +3217,7 @@ impl SettingsField {
             | Self::UiScale
             | Self::ShowStatusBar
             | Self::ShowWorktreeChangesIcons
+            | Self::ShowMentionedPullRequests
             | Self::AutoDeleteMergedWorktrees
             | Self::DefaultColumnFraction => SettingsCategory::Appearance,
             Self::TerminalLineHeight
@@ -3259,6 +3237,7 @@ impl SettingsField {
             | Self::WorkStaleAfterDays
             | Self::ManagedWorktreeDirectory
             | Self::WorktreeSort
+            | Self::SidebarWorktrees
             | Self::DefaultWorktreePane
             | Self::DefaultChannelPane
             | Self::FocusFollowsMouse => SettingsCategory::General,
@@ -3446,6 +3425,7 @@ struct SettingsDraft {
     managed_worktree_directory: String,
     auto_delete_merged_worktrees: bool,
     worktree_sort: String,
+    sidebar_worktrees: settings::SidebarWorktrees,
     default_worktree_pane: settings::DefaultPane,
     default_channel_pane: settings::DefaultPane,
     default_column_fraction: String,
@@ -3460,6 +3440,7 @@ struct SettingsDraft {
     default_native_pane_fraction: String,
     show_status_bar: bool,
     show_worktree_changes_icons: bool,
+    show_mentioned_pull_requests: bool,
     relaunch_agents_on_upgrade: bool,
     check_for_updates: bool,
     focus_follows_mouse: bool,
@@ -3507,6 +3488,7 @@ impl SettingsDraft {
                 settings::WorktreeSort::Alphabetical => "alphabetical",
             }
             .into(),
+            sidebar_worktrees: settings.sidebar_worktrees,
             default_column_fraction: settings.default_column_fraction.to_string(),
             default_worktree_pane: settings.default_worktree_pane,
             default_channel_pane: settings.default_channel_pane,
@@ -3522,6 +3504,7 @@ impl SettingsDraft {
             default_native_pane_fraction: settings.default_native_pane_fraction.to_string(),
             show_status_bar: settings.show_status_bar,
             show_worktree_changes_icons: settings.show_worktree_changes_icons,
+            show_mentioned_pull_requests: settings.show_mentioned_pull_requests,
             relaunch_agents_on_upgrade: settings.relaunch_agents_on_upgrade,
             check_for_updates: settings.check_for_updates,
             editor_syntax_theme: settings.editor_syntax_theme,
@@ -3559,6 +3542,11 @@ impl SettingsDraft {
                 self.auto_delete_merged_worktrees = value == "true"
             }
             SettingsField::WorktreeSort => self.worktree_sort = value,
+            SettingsField::SidebarWorktrees => {
+                if let Some(mode) = settings::SidebarWorktrees::from_key(&value) {
+                    self.sidebar_worktrees = mode;
+                }
+            }
             SettingsField::DefaultWorktreePane => {
                 if let Some(pane) = settings::DefaultPane::from_key(&value) {
                     self.default_worktree_pane = pane;
@@ -3581,6 +3569,9 @@ impl SettingsDraft {
             SettingsField::ShowStatusBar => self.show_status_bar = value == "true",
             SettingsField::ShowWorktreeChangesIcons => {
                 self.show_worktree_changes_icons = value == "true"
+            }
+            SettingsField::ShowMentionedPullRequests => {
+                self.show_mentioned_pull_requests = value == "true"
             }
             SettingsField::RelaunchAgentsOnUpgrade => {
                 self.relaunch_agents_on_upgrade = value == "true"
@@ -3833,6 +3824,10 @@ fn settings_update(
             .parse::<bool>()
             .map(|enabled| next.show_worktree_changes_icons = enabled)
             .map_err(|_| "Choose whether worktree changes icons are shown.".to_owned()),
+        SettingsField::ShowMentionedPullRequests => value
+            .parse::<bool>()
+            .map(|enabled| next.show_mentioned_pull_requests = enabled)
+            .map_err(|_| "Choose whether mentioned pull requests are listed.".to_owned()),
         SettingsField::AutoDeleteMergedWorktrees => value
             .parse::<bool>()
             .map(|enabled| next.auto_delete_merged_worktrees = enabled)
@@ -3845,6 +3840,9 @@ fn settings_update(
             .parse::<bool>()
             .map(|enabled| next.check_for_updates = enabled)
             .map_err(|_| "Choose whether to check for updates automatically.".to_owned()),
+        SettingsField::SidebarWorktrees => settings::SidebarWorktrees::from_key(value)
+            .map(|mode| next.sidebar_worktrees = mode)
+            .ok_or_else(|| "Choose Grouped, Expanded, or Hidden.".to_owned()),
         SettingsField::WorktreeSort => match value {
             "newest" => {
                 next.worktree_sort = settings::WorktreeSort::Newest;
@@ -4409,6 +4407,7 @@ pub enum Message {
         saved: Result<SettingsSaved, String>,
         result: Result<(), String>,
     },
+    SidebarPreferencesObserved(AppSettings),
     SettingsSaved {
         generation: u64,
         result: Result<SettingsSaved, String>,
@@ -4465,8 +4464,9 @@ pub enum Message {
     /// A sweep timer fired, carrying the generation it was armed for; a
     /// generation that has since been superseded is discarded.
     LifecycleSweepElapsed(u64),
-    /// The delay on saving a change of focus alone has passed.
-    FocusSaveDue,
+    /// The delay on saving a change of navigation alone has passed, for the
+    /// save armed with this generation; a superseded one is discarded.
+    NavigationSaveDue(u64),
     /// The delay on saving runtime-reported card titles has passed.
     ReportedTitleSaveDue,
     /// The hold that began at this instant has lasted long enough to draw the
@@ -4637,7 +4637,9 @@ pub enum Message {
         editor: bool,
     },
     ToggleContextInspector,
-    SelectContextTab(ContextTab),
+    ContextSection(context_sections::Action),
+    /// The inspector sections were laid out at this height.
+    ContextSectionsMeasured(f32),
     ContextInspector(InspectorAction),
     SelectSettingsCategory(SettingsCategory),
     SettingsSearchChanged(String),
@@ -4682,14 +4684,8 @@ pub enum Message {
     DaemonHealth(crate::daemon_health::State),
     DaemonHealthUi(daemon_health_ui::Action),
     AccountUi(account_ui::Action),
-    UtilityPaneUi(Box<Message>),
     AutomationUi(crate::automation_ui::Action),
     WorkUi(crate::work_ui::Action),
-    ChannelWork(crate::channel_work_ui::Action),
-    OpenChannelWork(ChannelId),
-    ChannelWorkNavigation(channel_work::Navigation),
-    ChannelWorkPoll,
-    ChannelWorkEscape,
     AutomationApproval(automation_approval::Action),
     /// The shell's light or dark mode changed, so a rendered document page no
     /// longer matches the surface it sits on.
@@ -5042,12 +5038,10 @@ impl CardChrome {
     }
 }
 
-/// Which position-addressed request the inspector asked for.
+/// Which position-addressed request the editor asked for.
 #[derive(Debug, Clone, Copy)]
 enum LspRequestKind {
     Completion,
-    Hover,
-    Definition,
     References,
 }
 
@@ -5109,7 +5103,6 @@ impl LspInspectorState {
     /// keystroke would make the list flicker empty while the user typed. They
     /// are refused at the point of use by version rather than erased here.
     fn invalidate_answers(&mut self) {
-        self.context.hover = None;
         self.context.locations = None;
         self.context.completions.clear();
         self.completion_request = None;
@@ -5207,8 +5200,11 @@ pub struct Cagents {
     // the stale delivery be dropped.
     lifecycle_sweep_deadline: Option<Instant>,
     lifecycle_sweep_generation: u64,
-    /// A save of the focus alone is scheduled; see [`FOCUS_SAVE_DELAY`].
-    focus_save_pending: bool,
+    /// A save of navigation alone is scheduled; see [`NAVIGATION_SAVE_DELAY`].
+    navigation_save_pending: bool,
+    /// Which timer is the scheduled save's: one armed for a burst that a save
+    /// already wrote must not cut the next burst short.
+    navigation_save_generation: u64,
     /// A focused chat pane whose message input was not drawn when the pane
     /// was focused, which takes the keyboard once it is; see
     /// [`Cagents::focus_pane_keyboard`].
@@ -5295,6 +5291,8 @@ pub struct Cagents {
     /// it has been mapped. The native Opened and Resized events replace it.
     window_width: f32,
     window_height: f32,
+    /// The inspector sections' laid-out height, once they have been shown.
+    context_sections_height: Option<f32>,
     /// Whether the main window is maximized or fullscreen, so the shell offers
     /// no resize border. Tracked here rather than read from `core`, which only
     /// learns it from Wayland window states.
@@ -5327,7 +5325,6 @@ pub struct Cagents {
     account_ui: account_ui::State,
     automation_ui: crate::automation_ui::State,
     work_ui: crate::work_ui::State,
-    channel_work: channel_work::State,
     automation_approval: automation_approval::State,
     chrome_ui: chrome_ui::State,
     pull_request_inspector: pull_request_ui::State,
@@ -5338,6 +5335,10 @@ pub struct Cagents {
     channel_offsets: HashMap<crate::model::ChannelId, f32>,
     worktree_owners: HashMap<CardId, PathBuf>,
     known_worktree_roots: HashSet<PathBuf>,
+    worktree_paths: worktree_ui::WorktreePathIndex,
+    /// What the projects list of pull requests, by repository and number,
+    /// which every chat labels its pull request links from.
+    pull_request_board: chat_ui::PullRequestBoard,
     workspace_view_generation: u64,
     workspace_scroll_id: widget::Id,
     github_availability: HashMap<ProjectId, GitHubAvailability>,
@@ -5408,8 +5409,7 @@ pub struct Cagents {
     latency_fixture_started: bool,
     context_inspector_open: bool,
     context_inspector_transition: Option<InspectorTransition>,
-    inspector_diagnostics_card: Option<CardId>,
-    context_tab: ContextTab,
+    context_sections: context_sections::Sections,
     /// The overlay state whose focus and native-surface transition has already
     /// been applied. The rendered mount also depends on workspace focus, so it
     /// cannot be derived solely from inspector-open and window-resize events.
@@ -5463,7 +5463,7 @@ impl Cagents {
 
     fn focus_workspace_card(&mut self, id: CardId) -> Task<Message> {
         match self.workspace.focus(id) {
-            Ok(update) => self.apply_viewport(update, true, false),
+            Ok(update) => self.apply_viewport(update, true, DurableChange::None),
             Err(error) => {
                 self.status = Some(TransientNotice::error(error.to_string()));
                 Task::none()
@@ -5472,6 +5472,10 @@ impl Cagents {
     }
 
     fn bootstrap(strict: bool) -> Result<Bootstrap, String> {
+        // Publish the stopped-pane display index before shared views arrive.
+        if let Err(error) = crate::upgrade::floor::load() {
+            tracing::warn!(%error, "Stopped update panes could not be indexed at startup");
+        }
         let mut settings_warnings = Vec::new();
         let (settings, settings_path, settings_write_blocked, status) =
             match settings::default_path() {
@@ -5732,6 +5736,12 @@ impl Cagents {
     }
 
     fn initialize_runtimes(&mut self) -> Task<Message> {
+        let initial_views = self.local_view_scopes();
+        self.startup_gate.initial_panes.capture(
+            instance::window_launch_restore_policy(),
+            &self.durable.cards,
+        );
+        self.startup_gate.initial_panes.capture_views(initial_views);
         let mut repository_tasks = Vec::new();
         let open_terminals_exposed = |exposure| {
             self.durable
@@ -5879,6 +5889,11 @@ impl Cagents {
         if !explicit_retry && self.saved_terminal_current(card).is_some() {
             return Task::none();
         }
+        let existing_only = !explicit_retry
+            && self
+                .startup_gate
+                .initial_panes
+                .existing_only(card, session.id);
         // Recovery can replace the identity this start ends up with, so
         // adoption has to know a start is outstanding before the task runs.
         self.begin_terminal_start(card);
@@ -5895,6 +5910,9 @@ impl Cagents {
             .any(|pane| pane.id == card && pane.pending_terminal_start);
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
+                if existing_only {
+                    return attach_initial_terminal(card, session, sender);
+                }
                 let mut created = false;
                 let (recovered, mode) = if shared && !explicit_retry {
                     let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
@@ -5951,8 +5969,15 @@ impl Cagents {
         let sender = self.terminal_wake_tx.clone();
         let terminal = session.id;
         let shared = self.attaches_as_shared(card);
+        let existing_only = self
+            .startup_gate
+            .initial_panes
+            .existing_only(card, session.id);
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
+                if existing_only {
+                    return attach_initial_terminal(card, session, sender).map(Some);
+                }
                 let connect = || {
                     let socket = crate::terminal::ensure_daemon_ready()
                         .map_err(|error| error.to_string())?;
@@ -6108,6 +6133,7 @@ impl Cagents {
             // is free to decide about it.
             return self.finish_terminal_start(card);
         }
+        self.startup_gate.initial_panes.settled(card, terminal);
         // A card still hibernated when its start lands is a restored agent
         // attached only for its row.
         let hibernated = matches!(self.lifecycle.state(card), Some((_, Residency::Hibernated)));
@@ -6262,6 +6288,18 @@ impl Cagents {
         } else {
             design::WINDOW_RESIZE_BORDER / self.settings.ui_scale
         }
+    }
+
+    /// The trailing padding the rightmost surface gives its interactive edge
+    /// content - its scrollbar rail, its trailing controls - so they stay out
+    /// of the window's resize border.
+    ///
+    /// Surfaces, rules and backgrounds still run flush to the window edge;
+    /// only what a press could land on is inset. The window controls' header,
+    /// the status bar, the workspace strip while nothing is docked beside it
+    /// and the docked inspector each apply it themselves.
+    pub(super) fn trailing_edge_inset(&self) -> f32 {
+        self.window_edge_inset()
     }
 
     /// The window width left to the interface beside the resize border.
@@ -6444,7 +6482,7 @@ impl Cagents {
         self.persist();
         Task::batch([
             self.start_terminal(card_id, session, true, false),
-            self.apply_viewport(update, true, false),
+            self.apply_viewport(update, true, DurableChange::None),
         ])
     }
 
@@ -6625,7 +6663,7 @@ impl Cagents {
             }
         };
         self.persist();
-        let viewport = self.apply_viewport(update, true, false);
+        let viewport = self.apply_viewport(update, true, DurableChange::None);
         let title = if save_title {
             self.save_settings_task(false)
         } else {
@@ -7018,7 +7056,10 @@ impl Cagents {
         let source = self.ensure_pull_request_source(card_id);
         (
             card_id,
-            Task::batch([self.apply_viewport(update, true, false), source]),
+            Task::batch([
+                self.apply_viewport(update, true, DurableChange::None),
+                source,
+            ]),
         )
     }
 
@@ -7479,7 +7520,7 @@ impl Cagents {
                 ViewportUpdate::unchanged()
             });
         self.persist();
-        Task::batch([self.apply_viewport(update, true, false), load])
+        Task::batch([self.apply_viewport(update, true, DurableChange::None), load])
     }
     fn open_link(&mut self, url: Url) -> Task<Message> {
         self.open_link_in(url, self.settings.link_open_destination)
@@ -7588,7 +7629,7 @@ impl Cagents {
                 ViewportUpdate::unchanged()
             });
         self.persist();
-        self.apply_viewport(update, true, false)
+        self.apply_viewport(update, true, DurableChange::None)
     }
 
     #[cfg(not(feature = "integrated-browser"))]
@@ -7653,7 +7694,7 @@ impl Cagents {
                 .pending_terminal_creations
                 .retain(|id| open.contains(id));
         }
-        self.focus_save_pending = false;
+        self.navigation_save_pending = false;
         #[cfg(test)]
         terminal_output_tests::record_persist();
         let saved = self.shared_window_snapshot_with(publish);
@@ -7671,6 +7712,9 @@ impl Cagents {
     /// shared views it shows. An edit saved but not published is undone by
     /// the next shared projection, and storage refuses the snapshot that
     /// projection saves when it reverts what storage already holds.
+    ///
+    /// Conversations the shared views re-pointed chat cards to are recorded
+    /// with it, ahead of whichever write the caller makes with it.
     fn shared_window_snapshot(&mut self) -> Arc<WorkspaceState> {
         self.shared_window_snapshot_with(Self::publish_view_changes)
     }
@@ -7681,7 +7725,24 @@ impl Cagents {
     ) -> Arc<WorkspaceState> {
         self.snapshot_workspace_scope();
         publish(self);
-        self.persistent_workspace()
+        let saved = self.persistent_workspace();
+        self.record_shared_chat_identities();
+        saved
+    }
+
+    /// Records the conversations shared views re-pointed chat cards to since
+    /// the last save, for the write of the window's state that has to follow:
+    /// storage refuses a write that re-points a chat card unless the change
+    /// is recorded, and that write queues them ahead of itself.
+    pub(super) fn record_shared_chat_identities(&mut self) {
+        if self.shared_views.chat_adoptions.is_empty() {
+            return;
+        }
+        let Some(writer) = &self.session else {
+            return;
+        };
+        let adoptions = std::mem::take(&mut self.shared_views.chat_adoptions);
+        writer.stage_chat_adoptions(adoptions.into_values());
     }
 
     fn commit_chat_session(&mut self, card: CardId, session: crate::chat::Session) {
@@ -8826,6 +8887,7 @@ impl Cagents {
         let surfaces_visible = self.workspace_surfaces_visible();
         match state.kind {
             CardKind::Terminal(session) => {
+                self.startup_gate.initial_panes.explicit_action(card);
                 self.terminal_recovery_attempts.remove(&session.id);
                 self.cards.insert(card, CardRuntime::Loading);
                 let task = self.start_terminal(
@@ -9279,7 +9341,7 @@ impl Cagents {
             });
         }
         // Runtime objects and focus never move out of their ID-indexed maps.
-        let viewport = self.apply_viewport(update, true, true);
+        let viewport = self.apply_viewport(update, true, DurableChange::Content);
         // Focus did not change, so nothing above follows the active tab to
         // wherever the new order put it. Dragging some other tab leaves the
         // strip where the drag has it.
@@ -9294,7 +9356,7 @@ impl Cagents {
         &mut self,
         update: ViewportUpdate,
         synchronize_scroll: bool,
-        additional_durable_change: bool,
+        durable_change: DurableChange,
     ) -> Task<Message> {
         let context_overlay_task = self.sync_context_overlay_state();
         let focused = self.workspace.focused();
@@ -9363,6 +9425,7 @@ impl Cagents {
                 VisibilityClass::Visible | VisibilityClass::Overscan => reconcile_now = true,
             }
         }
+        self.trim_warm_chats();
         if synchronize_scroll && update.offset_changed {
             tasks.push(self.synchronize_workspace_scroll());
         }
@@ -9379,27 +9442,50 @@ impl Cagents {
             let delay = Duration::from_millis(self.settings.hibernation_delay_ms);
             tasks.push(self.request_lifecycle_sweep(delay));
         }
-        if additional_durable_change {
-            self.persist();
-        } else if focus_changed {
-            // The durable state stays current; only handing it to the writer
-            // waits, and that is the expensive part.
-            self.snapshot_workspace_scope();
-            tasks.push(self.save_focus_soon());
+        match durable_change {
+            DurableChange::Content => self.persist(),
+            DurableChange::Navigation => {
+                // The durable state stays current; only handing it to the
+                // writer waits, and that is the expensive part.
+                self.snapshot_workspace_scope();
+                tasks.push(self.save_navigation_soon());
+            }
+            DurableChange::None if focus_changed => {
+                self.snapshot_workspace_scope();
+                tasks.push(self.save_navigation_soon());
+            }
+            DurableChange::None => {}
         }
         Task::batch(tasks)
     }
 
-    /// Saves a change of focus alone within [`FOCUS_SAVE_DELAY`], together
-    /// with whatever else changes by then.
-    fn save_focus_soon(&mut self) -> Task<Message> {
-        if std::mem::replace(&mut self.focus_save_pending, true) {
+    /// Saves a change of navigation alone, such as focus or the open channel
+    /// or worktree, within [`NAVIGATION_SAVE_DELAY`], together with whatever
+    /// else changes by then.
+    fn save_navigation_soon(&mut self) -> Task<Message> {
+        if std::mem::replace(&mut self.navigation_save_pending, true) {
             return Task::none();
         }
-        cosmic::task::future(async {
-            tokio::time::sleep(FOCUS_SAVE_DELAY).await;
-            Message::FocusSaveDue
+        self.navigation_save_generation = self.navigation_save_generation.wrapping_add(1);
+        let generation = self.navigation_save_generation;
+        cosmic::task::future(async move {
+            tokio::time::sleep(NAVIGATION_SAVE_DELAY).await;
+            Message::NavigationSaveDue(generation)
         })
+    }
+
+    /// Whether the navigation save timer armed for `generation` still has a
+    /// burst to save: another save may have carried it already, or a later
+    /// burst armed its own timer.
+    fn navigation_save_due(&self, generation: u64) -> bool {
+        self.navigation_save_pending && generation == self.navigation_save_generation
+    }
+
+    /// A navigation save timer with nothing left to save changes nothing a
+    /// projection reads, so it skips the sidebar and chrome rebuild.
+    fn navigation_save_is_stale(&self, message: &Message) -> bool {
+        matches!(message, Message::NavigationSaveDue(generation)
+            if !self.navigation_save_due(*generation))
     }
 
     /// Saves runtime-reported titles within [`REPORTED_TITLE_SAVE_DELAY`],
@@ -10932,6 +11018,16 @@ impl Cagents {
             }
         };
         if let Some(action) = action {
+            if let SidebarAction::OpenWorktree {
+                project_id,
+                worktree_id,
+                ..
+            } = &action
+                && let Some(project) = self.sidebar_model.project(*project_id)
+            {
+                self.sidebar_state
+                    .reveal_worktree(project, *worktree_id, false);
+            }
             self.sidebar_state.apply(&action);
         }
     }
@@ -11396,6 +11492,10 @@ impl Cagents {
     /// a session restoring, a project list arriving. Rebinding drops the
     /// previous worktree's model outright, so a stale row can never be pressed.
     fn rebind_source_control(&mut self) -> Task<Message> {
+        // Work chosen in the inspector binds the panel without moving the
+        // list's selection, which stays with the focused card.
+        self.sidebar_state
+            .pin_panel_worktree(self.inspector_panel_pin());
         let focus = self.sidebar_focus();
         let changed = self
             .sidebar_state
@@ -11424,13 +11524,6 @@ impl Cagents {
             self.sidebar_model.source_control = None;
             return Task::none();
         };
-        if self.folder_scope(&key)
-            && (self.context_tab == ContextTab::Changes
-                || (self.context_tab == ContextTab::PullRequest
-                    && !self.conversation_lists_pull_requests()))
-        {
-            self.context_tab = ContextTab::Files;
-        }
         let mut source = SourceControlModel::loading(key.clone());
         source.set_mutation(
             self.source_control_mutations
@@ -11554,7 +11647,7 @@ impl Cagents {
                 let focus = self
                     .workspace
                     .focus(card)
-                    .map(|update| self.apply_viewport(update, true, false))
+                    .map(|update| self.apply_viewport(update, true, DurableChange::None))
                     .unwrap_or_else(|_| Task::none());
                 Task::batch([
                     focus,
@@ -11953,14 +12046,11 @@ impl Cagents {
                 && let Some(state) = self.lsp_contexts.get_mut(card)
             {
                 state.context.status = Some(status);
-                state.context.live_servers = Arc::from(self.lsp.live_servers());
             }
             return;
         }
         if matches!(event, LspEvent::Resources { .. } | LspEvent::Status { .. }) {
-            let servers: Arc<[String]> = Arc::from(self.lsp.live_servers());
             for state in self.lsp_contexts.values_mut() {
-                state.context.live_servers = servers.clone();
                 if matches!(event, LspEvent::Resources { .. })
                     && let Some(doc) = state.document
                 {
@@ -12039,7 +12129,6 @@ impl Cagents {
                 {
                     runtime.set_editor_hover(markdown.as_deref(), Some(at));
                 }
-                state.context.hover = markdown;
             }
             LspEvent::Locations { kind, items, .. } => {
                 state.context.locations = Some((kind, items));
@@ -12120,18 +12209,6 @@ impl Cagents {
                 at,
                 coordinates,
             } => self.jump_to_lsp_location(card, path, at, coordinates),
-            InspectorAction::ApplyLspCompletion {
-                card,
-                index,
-                target,
-            } => self.apply_lsp_completion(card, index, &target),
-            InspectorAction::RequestLspHover(card) => self.request_lsp(card, LspRequestKind::Hover),
-            InspectorAction::GoToLspDefinition(card) => {
-                self.request_lsp(card, LspRequestKind::Definition)
-            }
-            InspectorAction::FindLspReferences(card) => {
-                self.request_lsp(card, LspRequestKind::References)
-            }
             InspectorAction::RestartLanguageServer(card) => {
                 let Some(doc) = self.lsp_document(card) else {
                     if self
@@ -12175,15 +12252,6 @@ impl Cagents {
                 }
                 Task::none()
             }
-            InspectorAction::OpenLspHoverLink(uri) => match Url::parse(&uri) {
-                Ok(url) => self.open_clicked_link(url),
-                Err(_) => {
-                    self.status = Some(TransientNotice::error(
-                        "could not open hover link: invalid absolute URL",
-                    ));
-                    Task::none()
-                }
-            },
             other => unreachable!("{other:?} is not a language-server action"),
         }
     }
@@ -12334,8 +12402,6 @@ impl Cagents {
                     .completion_request = Some((request, at));
                 request
             }
-            LspRequestKind::Hover => self.lsp.request_hover(doc, at),
-            LspRequestKind::Definition => self.lsp.request_definition(doc, at),
             LspRequestKind::References => self.lsp.request_references(doc, at),
         };
         Task::none()
@@ -12391,13 +12457,11 @@ impl Cagents {
                 Task::none()
             }
             Action::Diagnostics => {
-                self.context_tab = ContextTab::Details;
-                self.context_inspector_open = true;
+                self.reveal_context_section(context_sections::Section::Problems);
                 Task::none()
             }
             Action::References => {
-                self.context_tab = ContextTab::Details;
-                self.context_inspector_open = true;
+                self.reveal_context_section(context_sections::Section::Locations);
                 self.request_lsp(card, LspRequestKind::References)
             }
             Action::Choose { index, target } => self.apply_lsp_completion(card, index, &target),
@@ -12523,9 +12587,11 @@ impl Cagents {
         let untracked_changes = self.sidebar_state.section_expanded(PanelSection::Untracked);
         let options = crate::repository::SnapshotOptions {
             untracked_changes,
-            untracked_files: untracked_changes || self.context_tab == ContextTab::Files,
+            untracked_files: untracked_changes
+                || self.workspace_view_shown() == Some(context_sections::WorkspaceView::Files),
         };
-        let browse_files = self.context_tab == ContextTab::Files;
+        let browse_files =
+            self.workspace_view_shown() == Some(context_sections::WorkspaceView::Files);
         let previous_errors = self
             .sidebar_model
             .source_control
@@ -12695,10 +12761,13 @@ impl Cagents {
             .entries
             .iter()
             .filter_map(|entry| match entry.notice.key.as_ref() {
-                Some(key @ (NoticeKey::ChatAttach(card) | NoticeKey::ChatReturn(card)))
-                    if self
-                        .card_state(*card)
-                        .is_none_or(|state| !state.existence.is_open()) =>
+                Some(
+                    key @ (NoticeKey::ChatAttach(card)
+                    | NoticeKey::ChatReturn(card)
+                    | NoticeKey::ChatClose(card)),
+                ) if self
+                    .card_state(*card)
+                    .is_none_or(|state| !state.existence.is_open()) =>
                 {
                     Some(key.clone())
                 }
@@ -12734,6 +12803,15 @@ impl Cagents {
     }
 
     fn set_workspace_surfaces_visible(&mut self, workspace_visible: bool) {
+        self.apply_workspace_surface_visibility(workspace_visible);
+        self.trim_warm_chats();
+    }
+
+    /// [`Self::set_workspace_surfaces_visible`] without applying the warm
+    /// chat budget, for a caller that shows the next panes before the budget
+    /// is applied: hiding everything first must not cool the chats about to
+    /// be shown again.
+    fn apply_workspace_surface_visibility(&mut self, workspace_visible: bool) {
         let visible_cards = self
             .presence
             .iter()
@@ -12943,8 +13021,7 @@ impl Cagents {
     }
 
     fn context_inspector_visible(&self) -> bool {
-        !self.channel_work_is_main()
-            && (!self.sidebar_model.projects.is_empty() || !self.workspace.cards().is_empty())
+        (!self.sidebar_model.projects.is_empty() || !self.workspace.cards().is_empty())
             && (self.context_inspector_open || self.context_inspector_transition.is_some())
     }
 
@@ -13049,12 +13126,6 @@ impl Cagents {
     }
 
     fn workspace_inputs_blocked(&self) -> bool {
-        self.channel_work_is_main() || self.shell_inputs_blocked()
-    }
-
-    // Shell navigation remains usable over main Work without admitting input
-    // to the conversation panes it replaces.
-    fn shell_inputs_blocked(&self) -> bool {
         self.modal_is_open()
             || self.context_inspector_is_overlay()
             || self.chrome_ui.is_open()
@@ -13062,7 +13133,7 @@ impl Cagents {
     }
 
     fn workspace_surfaces_visible(&self) -> bool {
-        !self.channel_work_is_main() && !self.context_inspector_is_overlay()
+        !self.context_inspector_is_overlay()
     }
 
     fn enter_context_overlay(&mut self) -> Task<Message> {
@@ -13130,66 +13201,17 @@ impl Cagents {
         {
             self.context_inspector_transition = None;
             let sync = self.sync_context_overlay_state();
-            return Task::batch([sync, self.focus_context_overlay_if_exposed()]);
+            // A frame skips the rebind, and a closed inspector no longer pins
+            // the panels to the work it showed.
+            let binding = self.rebind_source_control();
+            return Task::batch([sync, binding, self.focus_context_overlay_if_exposed()]);
         }
         Task::none()
-    }
-
-    fn inspector_runtime_status(&self, card: CardId) -> InspectorRuntimeStatus {
-        if self.saved_terminal_current(card).is_some() {
-            return if self
-                .saved_terminal_status(card)
-                .is_some_and(|(_, busy)| busy)
-            {
-                InspectorRuntimeStatus::Starting
-            } else {
-                InspectorRuntimeStatus::Unavailable
-            };
-        }
-        match self.cards.get(&card) {
-            Some(CardRuntime::Loading) | None => InspectorRuntimeStatus::Starting,
-            Some(CardRuntime::Failed(_)) => InspectorRuntimeStatus::Unavailable,
-            #[cfg(feature = "integrated-browser")]
-            Some(CardRuntime::Browser(browser)) => match browser.lifecycle {
-                BrowserLifecycle::Restoring => InspectorRuntimeStatus::Restoring,
-                BrowserLifecycle::Hibernating => InspectorRuntimeStatus::Suspending,
-                BrowserLifecycle::Hibernated => InspectorRuntimeStatus::Suspended,
-                BrowserLifecycle::Closed => InspectorRuntimeStatus::Unavailable,
-                BrowserLifecycle::Visible | BrowserLifecycle::OffscreenHot
-                    if browser.load_state.is_some() =>
-                {
-                    InspectorRuntimeStatus::Loading
-                }
-                BrowserLifecycle::Visible | BrowserLifecycle::OffscreenHot => {
-                    InspectorRuntimeStatus::Ready
-                }
-            },
-            Some(CardRuntime::Chat(runtime)) => runtime.inspector_runtime_status(),
-            Some(CardRuntime::Completed)
-            | Some(CardRuntime::Terminal(_))
-            | Some(CardRuntime::PullRequests(_))
-            | Some(CardRuntime::Settings)
-            | Some(CardRuntime::Accounts)
-            | Some(CardRuntime::Automations)
-            | Some(CardRuntime::Work) => InspectorRuntimeStatus::Ready,
-            Some(CardRuntime::Repository(runtime)) => match runtime.inspector_runtime_status() {
-                RepositoryRuntimeStatus::Loading => InspectorRuntimeStatus::Loading,
-                RepositoryRuntimeStatus::Ready => InspectorRuntimeStatus::Ready,
-                RepositoryRuntimeStatus::Unavailable => InspectorRuntimeStatus::Attention,
-            },
-        }
     }
 
     fn handle_context_inspector_action(&mut self, action: InspectorAction) -> Task<Message> {
         match action {
             InspectorAction::Close => self.set_context_inspector_open(false),
-            InspectorAction::ToggleDiagnostics(card) => {
-                if self.workspace.focused() == Some(card) {
-                    self.inspector_diagnostics_card =
-                        (self.inspector_diagnostics_card != Some(card)).then_some(card);
-                }
-                Task::none()
-            }
             InspectorAction::Resize { width } => {
                 self.settings.inspector_width =
                     width.clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH);
@@ -13200,162 +13222,19 @@ impl Cagents {
                 chat_ui::invalidate_copy_intent();
                 iced::clipboard::write(diagnostic.copy_text()).map(cosmic::Action::App)
             }
-            // A request's answer is rendered by this very panel, so dismissing
-            // an overlay inspector on the way to asking for it would show the
-            // user nothing at all. These five stay put; the four below move the
-            // caret, edit the buffer, or leave the application, and for those
-            // an overlay covering the workspace is in the way.
-            action @ (InspectorAction::RequestLspHover(_)
-            | InspectorAction::GoToLspDefinition(_)
-            | InspectorAction::FindLspReferences(_)
-            | InspectorAction::RestartLanguageServer(_)
+            // Restarting a server or dismissing its results is answered in
+            // this very panel, so an overlay inspector stays put. A jump moves
+            // the caret, and an overlay covering the workspace is in the way.
+            action @ (InspectorAction::RestartLanguageServer(_)
             | InspectorAction::DismissLspResults(_)) => self.update_lsp(action),
             action @ (InspectorAction::JumpToLspDiagnostic { .. }
-            | InspectorAction::JumpToLspLocation { .. }
-            | InspectorAction::ApplyLspCompletion { .. }
-            | InspectorAction::OpenLspHoverLink(_)) => {
+            | InspectorAction::JumpToLspLocation { .. }) => {
                 let close_overlay = if self.context_inspector_is_overlay() {
                     self.set_context_inspector_open(false)
                 } else {
                     Task::none()
                 };
                 Task::batch([close_overlay, self.update_lsp(action)])
-            }
-            command => {
-                let close_overlay = if self.context_inspector_is_overlay() {
-                    self.set_context_inspector_open(false)
-                } else {
-                    Task::none()
-                };
-                let command =
-                    match command {
-                        InspectorAction::NewTerminalAt(path) => self.add_terminal(path),
-                        InspectorAction::Retry(card) => {
-                            cosmic::task::message(Message::RetryCard(card))
-                        }
-                        InspectorAction::ReloadBrowser(card) => {
-                            #[cfg(feature = "integrated-browser")]
-                            {
-                                cosmic::task::message(Message::BrowserReload(card))
-                            }
-                            #[cfg(not(feature = "integrated-browser"))]
-                            {
-                                cosmic::task::message(Message::RetryCard(card))
-                            }
-                        }
-                        InspectorAction::OpenBrowser(url) => self.open_clicked_link(url),
-                        InspectorAction::RefreshRepository(card) => cosmic::task::message(
-                            Message::Repository(RepositoryAction::RefreshFiles { card }),
-                        ),
-                        InspectorAction::BackToRepositoryFiles(card) => cosmic::task::message(
-                            Message::Repository(RepositoryAction::BackToFiles { card }),
-                        ),
-                        InspectorAction::SaveRepositoryFile(card) => {
-                            cosmic::task::message(Message::Repository(RepositoryAction::Save {
-                                card,
-                                overwrite: false,
-                            }))
-                        }
-                        InspectorAction::OverwriteRepositoryFile(card) => {
-                            cosmic::task::message(Message::Repository(RepositoryAction::Save {
-                                card,
-                                overwrite: true,
-                            }))
-                        }
-                        InspectorAction::ReloadRepositoryFile(card) => {
-                            cosmic::task::message(Message::Repository(RepositoryAction::Reload {
-                                card,
-                            }))
-                        }
-                        InspectorAction::DiscardRepositoryEdits(card) => cosmic::task::message(
-                            Message::Repository(RepositoryAction::DiscardEdits { card }),
-                        ),
-                        InspectorAction::ShowRepositoryEditor(card) => {
-                            cosmic::task::message(Message::Repository(
-                                RepositoryAction::ApplySourceSurface { card, diff: false },
-                            ))
-                        }
-                        InspectorAction::ShowRepositoryDiff(card) => {
-                            cosmic::task::message(Message::Repository(
-                                RepositoryAction::ApplySourceSurface { card, diff: true },
-                            ))
-                        }
-                        InspectorAction::ShowMarkdownEdit(card) => cosmic::task::message(
-                            Message::Repository(RepositoryAction::ApplyMarkdownMode {
-                                card,
-                                preview: false,
-                            }),
-                        ),
-                        InspectorAction::ShowMarkdownPreview(card) => cosmic::task::message(
-                            Message::Repository(RepositoryAction::ApplyMarkdownMode {
-                                card,
-                                preview: true,
-                            }),
-                        ),
-                        InspectorAction::ShowStagedDiff(card) => cosmic::task::message(
-                            Message::Repository(RepositoryAction::ApplyDiffBasis {
-                                card,
-                                basis: DiffBasis::HeadToIndex,
-                            }),
-                        ),
-                        InspectorAction::ShowUnstagedDiff(card) => cosmic::task::message(
-                            Message::Repository(RepositoryAction::ApplyDiffBasis {
-                                card,
-                                basis: DiffBasis::IndexToWorktree,
-                            }),
-                        ),
-                        InspectorAction::ShowInlineDiff(card) => {
-                            cosmic::task::message(Message::Repository(
-                                RepositoryAction::ApplyDiffMode { card, split: false },
-                            ))
-                        }
-                        InspectorAction::ShowSplitDiff(card) => {
-                            cosmic::task::message(Message::Repository(
-                                RepositoryAction::ApplyDiffMode { card, split: true },
-                            ))
-                        }
-                        InspectorAction::RetryRepositoryDiff(card) => cosmic::task::message(
-                            Message::Repository(RepositoryAction::RetryDiff { card }),
-                        ),
-                        InspectorAction::PreviousRepositoryChange(card) => cosmic::task::message(
-                            Message::Repository(RepositoryAction::PreviousChange { card }),
-                        ),
-                        InspectorAction::NextRepositoryChange(card) => cosmic::task::message(
-                            Message::Repository(RepositoryAction::NextChange { card }),
-                        ),
-                        InspectorAction::CreatePullRequest {
-                            project_id,
-                            worktree,
-                        } => cosmic::task::message(Message::Sidebar(
-                            SidebarAction::CreatePullRequest {
-                                project_id,
-                                worktree: Some(worktree),
-                            },
-                        )),
-                        InspectorAction::FocusProjectSearch => {
-                            cosmic::task::message(Message::FocusProjectSearch)
-                        }
-                        InspectorAction::CloseCard(card) => {
-                            cosmic::task::message(Message::CloseCard(card))
-                        }
-                        InspectorAction::Close
-                        | InspectorAction::ToggleDiagnostics(_)
-                        | InspectorAction::Resize { .. }
-                        | InspectorAction::ResizeFinished
-                        | InspectorAction::CopyLspDiagnostic(_)
-                        | InspectorAction::JumpToLspDiagnostic { .. }
-                        | InspectorAction::JumpToLspLocation { .. }
-                        | InspectorAction::ApplyLspCompletion { .. }
-                        | InspectorAction::RequestLspHover(_)
-                        | InspectorAction::GoToLspDefinition(_)
-                        | InspectorAction::FindLspReferences(_)
-                        | InspectorAction::RestartLanguageServer(_)
-                        | InspectorAction::DismissLspResults(_)
-                        | InspectorAction::OpenLspHoverLink(_) => {
-                            unreachable!("handled above")
-                        }
-                    };
-                Task::batch([close_overlay, command])
             }
         }
     }
@@ -13868,7 +13747,7 @@ impl Cagents {
         let focus = match self.workspace.focus(id) {
             // Focusing also hands the pane the keyboard, even when it was
             // already the focused card.
-            Ok(update) => self.apply_viewport(update, true, false),
+            Ok(update) => self.apply_viewport(update, true, DurableChange::None),
             Err(error) => {
                 self.status = Some(TransientNotice::error(error.to_string()));
                 Task::none()
@@ -13909,7 +13788,7 @@ impl Cagents {
         self.register_channel_card(id);
         self.cards.insert(id, runtime);
         self.persist();
-        self.apply_viewport(update, true, false)
+        self.apply_viewport(update, true, DurableChange::None)
     }
 
     /// Moves an open utility pane into the strip on screen, beside the
@@ -13954,7 +13833,7 @@ impl Cagents {
             }
         };
         self.persist();
-        self.apply_viewport(update, true, true)
+        self.apply_viewport(update, true, DurableChange::Content)
     }
 
     fn prune_pane_title_overrides(&mut self) {
@@ -13991,7 +13870,7 @@ impl Cagents {
             sidebar_width: self.settings.sidebar_width,
             inspector_width: self.settings.inspector_width,
             context_inspector_open: self.context_inspector_open,
-            context_tab: self.context_tab,
+            context_sections: self.context_sections,
             sidebar: self.sidebar_state.saved_view(),
             worktree_offsets: self.worktree_offsets.clone(),
         };
@@ -14412,6 +14291,10 @@ impl Cagents {
                 .set_worktree_sort(self.settings.worktree_sort);
         }
         self.sidebar_state
+            .set_sidebar_worktrees(self.settings.sidebar_worktrees);
+        self.sidebar_state
+            .set_worktree_overrides(self.settings.sidebar_worktree_overrides.clone());
+        self.sidebar_state
             .set_show_worktree_changes_icons(self.settings.show_worktree_changes_icons);
         if previous.app_theme != self.settings.app_theme
             || previous.ui_scale != self.settings.ui_scale
@@ -14441,6 +14324,7 @@ impl Cagents {
                     _ => {}
                 }
             }
+            self.chat_ui.set_parked_syntax_theme(syntax_theme);
         }
         if previous.diff_hide_unchanged != self.settings.diff_hide_unchanged {
             for runtime in self.cards.values_mut() {
@@ -14697,6 +14581,7 @@ impl Application for Cagents {
         let workspace = Self::rebuild_workspace(&durable);
         let chat_drafts = durable.chat_drafts.clone();
         let chat_draft_attachments = durable.chat_draft_attachments.clone();
+        let chat_waiting_messages = durable.chat_waiting_messages.clone();
         let (terminal_wake_tx, terminal_wake_rx) = async_channel::unbounded();
         // The daemon owns the terminal inventory; this window observes it for
         // the whole of its life, so the observer starts with the window rather
@@ -14804,6 +14689,7 @@ impl Application for Cagents {
             window_scale_factor,
             window_width: 1_600.0,
             window_height: 900.0,
+            context_sections_height: None,
             window_filled: false,
             window_state_observed: false,
             right_edge_tiled: false,
@@ -14816,7 +14702,8 @@ impl Application for Cagents {
             worktree_protections: Default::default(),
             channel_ui: channel_ui::State::default(),
             sidebar_selection_ui: sidebar_selection_ui::State::default(),
-            chat_ui: chat_ui::State::with_draft_attachments(chat_drafts, chat_draft_attachments),
+            chat_ui: chat_ui::State::with_draft_attachments(chat_drafts, chat_draft_attachments)
+                .with_waiting_messages(chat_waiting_messages),
             resume_ui: resume_ui::State::default(),
             update_ui: update_ui::State::new(),
             branch_ui: branch_ui::State::default(),
@@ -14828,7 +14715,6 @@ impl Application for Cagents {
             account_ui: account_ui::State::installation(),
             automation_ui: crate::automation_ui::State::default(),
             work_ui: crate::work_ui::State::default(),
-            channel_work: channel_work::State::default(),
             automation_approval: automation_approval::State::default(),
             chrome_ui: chrome_ui::State::default()
                 .with_user_titles(
@@ -14852,6 +14738,8 @@ impl Application for Cagents {
                 .iter()
                 .map(|worktree| worktree.path.clone())
                 .collect(),
+            worktree_paths: worktree_ui::WorktreePathIndex::default(),
+            pull_request_board: chat_ui::PullRequestBoard::default(),
             workspace_view_generation: 0,
             workspace_scroll_id: widget::Id::new("workspace-strip-0"),
             github_availability: HashMap::new(),
@@ -14895,13 +14783,14 @@ impl Application for Cagents {
             #[cfg(feature = "latency-harness")]
             latency_fixture_started: false,
             context_inspector_transition: None,
-            inspector_diagnostics_card: None,
             context_inspector_open: window_view
                 .as_ref()
                 .is_none_or(|view| view.context_inspector_open),
-            context_tab: window_view
+            context_sections: window_view
                 .as_ref()
-                .map_or(ContextTab::default(), |view| view.context_tab),
+                .map_or_else(context_sections::Sections::default, |view| {
+                    view.context_sections
+                }),
             context_inspector_overlay_active: false,
             // The initial estimate is wide, but the first compositor resize
             // can immediately mount the default-open inspector as a modal.
@@ -14924,7 +14813,8 @@ impl Application for Cagents {
             status: status.map(TransientNotice::error),
             lifecycle_sweep_deadline: None,
             lifecycle_sweep_generation: 0,
-            focus_save_pending: false,
+            navigation_save_pending: false,
+            navigation_save_generation: 0,
             keyboard_owed: None,
             reported_title_save: ReportedTitleSave::default(),
             lifecycle_sweep_destination: None,
@@ -14948,6 +14838,10 @@ impl Application for Cagents {
         app.sidebar_state
             .set_worktree_sort(app.settings.worktree_sort);
         app.sync_worktree_protections();
+        app.sidebar_state
+            .set_sidebar_worktrees(app.settings.sidebar_worktrees);
+        app.sidebar_state
+            .set_worktree_overrides(app.settings.sidebar_worktree_overrides.clone());
         app.sidebar_state
             .set_show_worktree_changes_icons(app.settings.show_worktree_changes_icons);
         // `view` lays the strip out against the width `Workspace` holds, which
@@ -15046,6 +14940,7 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        let _trace = crate::performance::ui_trace::update(&message);
         if let Some(settled) = self.settle_chat_close_confirm() {
             // An answer to the question that just ended must not answer the
             // next one, which the reader has not seen.
@@ -15057,12 +14952,6 @@ impl Application for Cagents {
             }
             return Task::batch([settled, self.update(message)]);
         }
-        // Pane callbacks retain their rendering origin while queued. Unwrap
-        // once before all message-dependent policy and completion bookkeeping.
-        let (message, pane_origin) = match message {
-            Message::UtilityPaneUi(message) => (*message, true),
-            message => (message, false),
-        };
         let notice_control = self.notice_control_severity();
         let attention_scope_changed = matches!(
             &message,
@@ -15075,9 +14964,6 @@ impl Application for Cagents {
         // through the lightweight visibility/presence postlude below.
         #[rustfmt::skip]
         let task = (|| {
-        if pane_origin && self.channel_work_is_main() {
-            return Task::none();
-        }
         self.reconcile_terminal_review_owner();
         self.cancel_stale_pr_creations();
         if let Some(notice) = crate::diagnostics::take_notice() {
@@ -15168,9 +15054,6 @@ impl Application for Cagents {
             self.deferred_navigation.push_back(message);
             return Task::none();
         }
-        if let Some(task) = self.intercept_channel_work_navigation(&message) {
-            return task;
-        }
         if !self.workspace.is_animating() && self.context_inspector_transition.is_none() {
             // Whatever this message starts is measured from now. Its first
             // frame then moves it by the time since the input that began it,
@@ -15206,7 +15089,7 @@ impl Application for Cagents {
                 | Message::FocusAdjacent(_)
                 | Message::WindowResized(..)
         );
-        let mut projection = if repaint_tick(&message) {
+        let mut projection = if repaint_tick(&message) || self.navigation_save_is_stale(&message) {
             Projection::Unchanged
         } else {
             Projection::Full
@@ -15298,6 +15181,9 @@ impl Application for Cagents {
                     // reports whatever still stands in the way; a startup gate
                     // reports it rather than waiting for that.
                     result => {
+                        if self.card_state(card).is_some_and(|state| matches!(&state.kind, CardKind::Terminal(session) if session.id == terminal)) {
+                            self.startup_gate.initial_panes.settled(card, terminal);
+                        }
                         let reason = result.err().unwrap_or_else(|| {
                             "the terminal service no longer hosts it; open it to relaunch".into()
                         });
@@ -15750,7 +15636,7 @@ impl Application for Cagents {
                             pending,
                             pr_enrichment,
                             self.project_avatar_task(project_id),
-                            self.reconcile_workspace_model(),
+                            self.reconcile_workspace_model_for_repository(&loaded.project.repository),
                         ]);
                     }
                     Err(error) => {
@@ -16099,7 +15985,7 @@ impl Application for Cagents {
                         } else {
                             saved.remove(&card);
                         }
-                        tasks.push(self.save_focus_soon());
+                        tasks.push(self.save_navigation_soon());
                     }
                 }
                 // A queued refresh discards this result and advances the list
@@ -16178,6 +16064,11 @@ impl Application for Cagents {
                     .is_some_and(|directory| self.refuse_in_deleting_worktree(&directory))
                 {
                     return Task::none();
+                }
+                if let SidebarAction::OpenWorktree { project_id, worktree_id, .. } = &action
+                    && let Some(project) = self.sidebar_model.project(*project_id)
+                {
+                    self.sidebar_state.reveal_worktree(project, *worktree_id, true);
                 }
                 self.sidebar_state.apply(&action);
                 // Opening a row, by pointer or keyboard, is navigation: it
@@ -16285,9 +16176,9 @@ impl Application for Cagents {
                         repository,
                     } => {
                         let directory = self.project_entry_directory(project_id, &repository);
-                        self.select_worktree(directory, true)
+                        self.navigate_to_worktree(directory)
                     }
-                    SidebarAction::OpenWorktree { path, .. } => self.select_worktree(path, true),
+                    SidebarAction::OpenWorktree { path, .. } => self.navigate_to_worktree(path),
                     SidebarAction::BrowsePullRequests { project_id } => self.browse_pull_requests(project_id),
                     SidebarAction::OpenPullRequest {
                         project_id,
@@ -16388,7 +16279,6 @@ impl Application for Cagents {
                     SidebarAction::OpenChannel { channel_id } => {
                         self.handle_channel_ui(channel_ui::Action::Open(channel_id))
                     }
-                    SidebarAction::OpenChannelWork { channel_id } => self.open_channel_work(channel_id),
                     SidebarAction::DeleteChannel { channel_id } => {
                         self.handle_channel_ui(channel_ui::Action::Delete(channel_id))
                     }
@@ -16652,7 +16542,17 @@ impl Application for Cagents {
                     }
                     SidebarAction::SearchChanged(_)
                     | SidebarAction::SetFilter(_)
-                    | SidebarAction::ToggleProject(_) => Task::none(),
+                    | SidebarAction::ToggleProject(_)
+                    | SidebarAction::ToggleWorktrees(_)
+                    => Task::none(),
+                    SidebarAction::SetWorktreeDisplay { project_id, mode } => {
+                        if let Some(mode) = mode {
+                            self.settings.sidebar_worktree_overrides.insert(project_id, mode);
+                        } else {
+                            self.settings.sidebar_worktree_overrides.remove(&project_id);
+                        }
+                        self.save_settings_task(false)
+                    },
                 }
             }
             Message::AcknowledgeVisiblePane { card, epoch } => {
@@ -16732,7 +16632,7 @@ impl Application for Cagents {
                         if let Some(state) = self.card_state_mut(card) {
                             state.width_fraction = fraction;
                         }
-                        self.apply_viewport(update, true, false)
+                        self.apply_viewport(update, true, DurableChange::None)
                     }
                     Err(error) => {
                         self.status = Some(TransientNotice::error(error.to_string()));
@@ -16744,11 +16644,7 @@ impl Application for Cagents {
                 let Some(card) = self.workspace.focused() else {
                     return Task::none();
                 };
-                let Some(width) = self
-                    .workspace
-                    .card(card)
-                    .map(|card| card.width.next_preset())
-                else {
+                let Some(width) = self.workspace.next_width_preset(card) else {
                     return Task::none();
                 };
                 match self.workspace.animate_card_width(card, width) {
@@ -16758,7 +16654,7 @@ impl Application for Cagents {
                         {
                             state.width_fraction = fraction;
                         }
-                        self.apply_viewport(update, true, true)
+                        self.apply_viewport(update, true, DurableChange::Content)
                     }
                     Err(error) => {
                         self.status = Some(TransientNotice::error(error.to_string()));
@@ -16767,11 +16663,11 @@ impl Application for Cagents {
                 }
             }
             Message::ResizeCardFinished(card) => {
-                self.workspace.finish_card_resize(card);
+                let update = self.workspace.finish_card_resize(card);
                 if self.card_state(card).is_some() {
                     self.persist();
                 }
-                Task::none()
+                self.apply_viewport(update, true, DurableChange::None)
             }
             Message::CloseCard(_) if self.dirty_repository_close.is_some() => Task::none(),
             Message::CloseCard(id) if matches!(self.cards.get(&id), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation()) => {
@@ -16805,6 +16701,7 @@ impl Application for Cagents {
                     if self.startup_gate.window_opened() {
                         // The updater may have timed out and retained this
                         // usable recovery window while closing its pipe.
+                        self.startup_report_failed();
                         self.status = Some(TransientNotice::warning(format!(
                             "The updater could not verify this window's recovery: {error}. Your chats and drafts remain available; verify them and save before updating again."
                         )));
@@ -16844,6 +16741,27 @@ impl Application for Cagents {
                     self.status = Some(TransientNotice::error(format!(
                         "Could not open a new window: {error}"
                     )));
+                }
+                Task::none()
+            }
+            Message::SidebarPreferencesObserved(settings) => {
+                // A local edit owns these fields until its save is acknowledged.
+                if self.settings_save_generation == self.settings_ack_generation {
+                    // Never wait for a disk save on the event loop. An in-flight
+                    // save's acknowledgment restarts this observation.
+                    let Ok(mut lane) = self.settings_save_lane.try_lock() else { return Task::none(); };
+                    if let Some(saved) = lane.as_mut() {
+                        saved.settings.sidebar_worktrees = settings.sidebar_worktrees;
+                        saved.settings.sidebar_worktree_overrides = settings.sidebar_worktree_overrides.clone();
+                    }
+                    drop(lane);
+                    self.settings.sidebar_worktrees = settings.sidebar_worktrees;
+                    self.settings.sidebar_worktree_overrides = settings.sidebar_worktree_overrides.clone();
+                    self.settings_base.sidebar_worktrees = settings.sidebar_worktrees;
+                    self.settings_base.sidebar_worktree_overrides = settings.sidebar_worktree_overrides.clone();
+                    self.settings_draft.sidebar_worktrees = settings.sidebar_worktrees;
+                    self.sidebar_state.set_sidebar_worktrees(settings.sidebar_worktrees);
+                    self.sidebar_state.set_worktree_overrides(settings.sidebar_worktree_overrides);
                 }
                 Task::none()
             }
@@ -17209,7 +17127,7 @@ impl Application for Cagents {
                 let previous_width = self.workspace.viewport_width();
                 let (update, synchronize_scroll) =
                     update_workspace_viewport(&mut self.workspace, event);
-                let task = self.apply_viewport(update, false, false);
+                let task = self.apply_viewport(update, false, DurableChange::None);
                 let keyboard = match event {
                     WorkspaceViewportEvent::PointerRested(card)
                         if self.workspace.focused() == Some(card) =>
@@ -17252,7 +17170,7 @@ impl Application for Cagents {
                     return inspector_task;
                 }
                 let update = self.workspace.tick(elapsed);
-                Task::batch([inspector_task, self.apply_viewport(update, true, false)])
+                Task::batch([inspector_task, self.apply_viewport(update, true, DurableChange::None)])
             }
             Message::LifecycleSweep => self.lifecycle_sweep(),
             Message::LifecycleSweepElapsed(generation) => self.lifecycle_sweep_elapsed(generation),
@@ -17288,8 +17206,8 @@ impl Application for Cagents {
                 self.chrome_ui.workspace_switcher_shown = true;
                 self.reveal_workspace_selection()
             }
-            Message::FocusSaveDue => {
-                if self.focus_save_pending {
+            Message::NavigationSaveDue(generation) => {
+                if self.navigation_save_due(generation) {
                     self.persist();
                 }
                 Task::none()
@@ -17950,7 +17868,7 @@ impl Application for Cagents {
                             .step(&available, self.workspace.focused(), backwards)
                         && let Ok(update) = self.workspace.focus(id)
                     {
-                        return self.apply_viewport(update, true, false);
+                        return self.apply_viewport(update, true, DurableChange::None);
                     }
                     return Task::none();
                 }
@@ -18211,7 +18129,7 @@ impl Application for Cagents {
                 let previous = self.workspace.focused();
                 match self.workspace.focus_adjacent(direction) {
                     Ok(update) => {
-                        let task = self.apply_viewport(update, true, false);
+                        let task = self.apply_viewport(update, true, DurableChange::None);
                         if previous != self.workspace.focused() {
                             self.latency.commit(crate::performance::Action::CardFocus);
                             self.latency_focus = self.workspace.focused();
@@ -18261,21 +18179,13 @@ impl Application for Cagents {
             Message::ToggleContextInspector => {
                 self.set_context_inspector_open(!self.context_inspector_open)
             }
-            Message::SelectContextTab(tab) => {
-                if self.active_folder_scope()
-                    && (tab == ContextTab::Changes
-                        || (tab == ContextTab::PullRequest
-                            && !self.conversation_lists_pull_requests()))
-                {
-                    return Task::none();
-                }
-                let changed = self.context_tab != tab;
-                self.context_tab = tab;
-                if changed && let Some(key) = self.sidebar_state.active_worktree().cloned() {
-                    self.reload_source_control(&key)
-                } else {
-                    Task::none()
-                }
+            Message::ContextSection(_) if self.modal_is_open() => Task::none(),
+            Message::ContextSection(action) => self.handle_context_section(action),
+            // Reported on the first layout and whenever the size changes,
+            // including the width while the inspector slides open.
+            Message::ContextSectionsMeasured(height) => {
+                self.context_sections_height = Some(height);
+                Task::none()
             }
             Message::ContextInspector(_) if self.modal_is_open() => Task::none(),
             Message::ContextInspector(action) => self.handle_context_inspector_action(action),
@@ -18346,15 +18256,9 @@ impl Application for Cagents {
             Message::SidebarSelection(action) => self.update_sidebar_selection(action),
             Message::BranchUi(action) => self.update_branch_ui(action),
             Message::AccountUi(action) => self.update_account_ui(action),
-            Message::UtilityPaneUi(_) => Task::none(),
             Message::ResumeConversation(action) => self.update_resume(action),
             Message::AutomationUi(action) => self.update_automation_ui(action),
             Message::WorkUi(action) => self.update_work_ui(action),
-            Message::ChannelWork(action) => self.update_channel_work(action),
-            Message::OpenChannelWork(channel) => self.open_channel_work(channel),
-            Message::ChannelWorkNavigation(navigation) => self.channel_navigation(navigation),
-            Message::ChannelWorkEscape => self.escape_channel_work(),
-            Message::ChannelWorkPoll => self.channel_work.view.refresh().map_or_else(Task::none, |effect| self.channel_work_effect(effect)),
             Message::GitUi(action) => self.update_git(action),
             Message::NotificationUi(action) => self.update_notifications(action),
             Message::ReviewRequests(action) => self.update_review_requests(action),
@@ -18429,8 +18333,7 @@ impl Application for Cagents {
                             locations[0].coordinates,
                         );
                     }
-                    self.context_tab = ContextTab::Details;
-                    self.context_inspector_open = true;
+                    self.reveal_context_section(context_sections::Section::Locations);
                 }
                 Task::none()
             }
@@ -18735,6 +18638,10 @@ impl Application for Cagents {
             self.prune_sidebar_row_selection();
         }
         self.refresh_sidebar_worktree_panes();
+        // Ahead of the rebind, which pins what the inspected conversation
+        // chose: a newly focused conversation must not inherit the last
+        // one's choice for a frame.
+        self.sync_pull_request_inspector();
         let binding = self.rebind_source_control();
         if let Some(source) = self.sidebar_model.source_control.as_ref() {
             let selected = self
@@ -18750,7 +18657,6 @@ impl Application for Cagents {
                 });
             self.sidebar_state.select_file(&source.key, selected);
         }
-        let pull_request = self.sync_pull_request_inspector();
         // `view` cannot rebuild the chrome cache itself, so refresh it here.
         let chrome = self.sync_chrome();
         let deferred = self.release_deferred_navigation_if_unblocked();
@@ -18760,7 +18666,6 @@ impl Application for Cagents {
             binding,
             chrome,
             deferred,
-            pull_request,
             notices,
             terminal_probes,
         ])
@@ -18769,6 +18674,7 @@ impl Application for Cagents {
         if attention_scope_changed {
             self.notification_ui.scope_changed();
         }
+        self.sync_pull_request_labels();
         let activation = self.retry_notification_activation();
         let visibility = self.sync_visible_attention();
         self.sync_notification_presence();
@@ -18777,6 +18683,8 @@ impl Application for Cagents {
     }
 
     fn subscription(&self) -> Subscription<Message> {
+        let _trace =
+            crate::performance::ui_trace::scope(crate::performance::ui_trace::Phase::Subscription);
         let operation_subscriptions = self.worktree_progress_subscriptions();
         let mut subscriptions = vec![
             self.chat_subscription(),
@@ -18790,7 +18698,6 @@ impl Application for Cagents {
             self.automation_subscription(),
             self.work_subscription(),
             self.conversation_pull_request_subscription(),
-            self.channel_work_subscription(),
             self.automation_approval_subscription(),
             self.document_tone_subscription(),
             self.update_subscription(),
@@ -18880,6 +18787,13 @@ impl Application for Cagents {
                     }
                     _ => None,
                 }),
+        );
+        subscriptions.push(
+            Subscription::run_with(
+                (self.settings_path.clone(), self.settings_ack_generation),
+                |(path, _)| settings_ui::sidebar_preferences_stream(path.clone()),
+            )
+            .map(Message::SidebarPreferencesObserved),
         );
         subscriptions.extend(operation_subscriptions);
         if let Some(window) = self.core.main_window_id()
@@ -19276,6 +19190,7 @@ impl Application for Cagents {
     }
 
     fn view(&self) -> Element<'_, Message> {
+        let _trace = crate::performance::ui_trace::scope(crate::performance::ui_trace::Phase::View);
         let content_width = self.content_width();
         let sidebar_mode = self.projects_sidebar_mode();
         let sidebar = sidebar::view_cached(
@@ -19286,8 +19201,10 @@ impl Application for Cagents {
             self.modal_is_open(),
             &self.navigation_cache,
             &self.settings.keyboard_shortcuts,
+            !self.core.window.sharp_corners,
         )
         .map(Message::Sidebar);
+        let sidebar = crate::performance::ui_trace::region("sidebar", sidebar);
 
         // The focused card's own name and path are the card header's job, and
         // the window's header bar already carries the name; see
@@ -19307,20 +19224,7 @@ impl Application for Cagents {
             .flatten();
         let has_multiple_panes = self.workspace.cards().len() > 1;
 
-        let workspace: Element<'_, Message> = if self.channel_work_is_main() {
-            // Do not build terminal/chat/browser widgets under an invisible
-            // Conversations layer. Their runtimes remain hosted and hidden.
-            crate::ui_controls::responsive(move |size| {
-                crate::interaction::focused_escape(
-                    self.channel_work
-                        .view
-                        .view(size.width, size.height)
-                        .map(Message::ChannelWork),
-                    || Message::ChannelWorkEscape,
-                )
-            })
-            .into()
-        } else if self.workspace.cards().is_empty() {
+        let workspace: Element<'_, Message> = if self.workspace.cards().is_empty() {
             let directory = self
                 .terminal_directory()
                 .unwrap_or_else(|| STARTING_DIRECTORY.clone());
@@ -19491,41 +19395,26 @@ impl Application for Cagents {
             )
         };
 
+        // The strip keeps its scrollbars and trailing controls out of the
+        // window's resize border while it is the rightmost surface. The wrapper
+        // is always mounted, so docking the inspector changes only its
+        // padding and never remounts the workspace.
+        let strip_is_rightmost = !matches!(
+            self.context_inspector_mount(),
+            Some(InspectorLayout::Docked)
+        );
+        let workspace: Element<'_, Message> = widget::container(workspace)
+            .padding(Padding::ZERO.right(if strip_is_rightmost {
+                self.trailing_edge_inset()
+            } else {
+                0.0
+            }))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into();
+        let workspace = crate::performance::ui_trace::region("workspace", workspace);
         let main_content = self.workspace_chrome(workspace);
 
-        let context_model = (self.context_inspector_visible()
-            && self.context_tab == ContextTab::Details)
-            .then(|| self.workspace.focused())
-            .flatten()
-            .and_then(|card| {
-                self.card_state(card).and_then(|state| {
-                    let repository = match self.cards.get(&card) {
-                        Some(CardRuntime::Repository(runtime)) => Some(runtime.inspector_context()),
-                        _ => None,
-                    };
-                    let model = inspector::model_for_card(
-                        state,
-                        self.inspector_runtime_status(card),
-                        self.residency(card),
-                        &self.sidebar_model.projects,
-                        repository.as_ref(),
-                    );
-                    let model = if self.inspector_diagnostics_card == Some(card) {
-                        match self.cards.get(&card) {
-                            Some(CardRuntime::Chat(runtime)) => {
-                                inspector::with_chat_memory(model, runtime.memory_diagnostics())
-                            }
-                            _ => model,
-                        }
-                    } else {
-                        model
-                    };
-                    Some(match self.lsp_context(card) {
-                        Some(lsp) => inspector::with_lsp(model, card, lsp),
-                        None => model,
-                    })
-                })
-            });
         let surface: Element<'_, Message> = if self.context_inspector_visible() {
             let width = self
                 .settings
@@ -19533,7 +19422,10 @@ impl Application for Cagents {
                 .clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH)
                 .min(content_width);
             let progress = self.context_inspector_progress();
-            let visible_width = width * progress;
+            // The panel runs flush to the window edge; the resize border's
+            // share of it is padding inside, not a gap outside.
+            let panel_width = width + self.trailing_edge_inset();
+            let visible_width = panel_width * progress;
             let splitter: Element<'_, Message> = Splitter::new(
                 widget::Id::new("context-inspector.resize-handle"),
                 inspector::RESIZE_HANDLE_NAME,
@@ -19547,11 +19439,8 @@ impl Application for Cagents {
             )
             .default_width(design::INSPECTOR_DEFAULT_WIDTH)
             .into();
-            let pane = crate::interaction::reveal_width(
-                self.context_panel(context_model, width),
-                width,
-                progress,
-            );
+            let pane =
+                crate::interaction::reveal_width(self.context_panel(width), panel_width, progress);
             match self
                 .context_inspector_mount()
                 .expect("an open contextual inspector with a model has a mount")
@@ -19649,11 +19538,6 @@ impl Application for Cagents {
         .width(Length::Fill)
         .height(Length::Fill)
         .into();
-        // Only the inset changes with the window state, so the tree, and
-        // every scroll offset and focus in it, survives a maximize.
-        let surface: Element<'_, Message> = widget::container(surface)
-            .padding(iced::Padding::ZERO.right(self.window_edge_inset()))
-            .into();
         let switcher = self
             .palette_surface()
             .or_else(|| self.pane_rename_surface())
@@ -19690,6 +19574,7 @@ impl Application for Cagents {
                 channel,
             },
         );
+        let surface = crate::performance::ui_trace::root(surface);
         #[cfg(feature = "latency-harness")]
         return latency_ui::instrument(
             surface,
@@ -19946,37 +19831,15 @@ fn load_repository_github(
             return Err(GitHubAvailability::Unauthenticated);
         }
         let mut pull_requests = github
-            .list(
-                &ListPullRequestsRequest {
-                    repository: key.clone(),
-                    state: PullRequestStateFilter::Open,
-                    limit: sidebar::PULL_REQUEST_LIST_LIMIT,
-                },
-                &cancellation,
-            )
+            .sidebar_open(&key, sidebar::PULL_REQUEST_LIST_LIMIT, &cancellation)
             .map_err(GitHubAvailability::from_error)?;
         // Closed history must not consume the open-PR page. Its failure also
         // must not discard successfully refreshed open conversation authority.
-        if let Ok(history) = github.list(
-            &ListPullRequestsRequest {
-                repository: key.clone(),
-                state: PullRequestStateFilter::All,
-                limit: sidebar::PULL_REQUEST_LIST_LIMIT,
-            },
-            &cancellation,
-        ) {
-            for entry in history {
-                if let Some(current) = pull_requests
-                    .iter_mut()
-                    .find(|current| current.number == entry.number)
-                {
-                    *current = entry;
-                } else {
-                    pull_requests.push(entry);
-                }
-            }
+        if let Ok(history) =
+            github.recent_history(&key, sidebar::PULL_REQUEST_LIST_LIMIT, &cancellation)
+        {
+            crate::github::append_recent_history(&mut pull_requests, history);
         }
-        crate::github::polling::succeeded(&key.host);
         Ok(GitHubAvailability::Ready {
             repository_key: key,
             pull_requests: pull_requests
@@ -19994,6 +19857,65 @@ fn load_repository_github(
 
 const SHARED_TERMINAL_DISCONNECTED: &str =
     "This terminal isn't connected. Use Retry or Close on its pane.";
+
+/// An initial recovered pane can only subscribe to an exact issued owner.
+/// Its captured endpoint remains read-only after the startup gate finishes.
+fn attach_initial_terminal(
+    card: CardId,
+    source: TerminalSession,
+    sender: async_channel::Sender<TerminalWakeup>,
+) -> Result<StartedTerminal, String> {
+    let socket =
+        crate::terminal::existing_daemon_socket_path().map_err(|error| error.to_string())?;
+    let mut client =
+        crate::control::ControlClient::connect(&socket).map_err(|error| error.to_string())?;
+    let proof = client.proof().clone();
+    let terminals = client.list().map_err(|error| error.to_string())?;
+    let session = initial_terminal_attachment(&source, &terminals, &proof)?
+        .ok_or("The recovered daemon no longer holds this terminal. Its saved pane is kept; use Retry explicitly to reconnect or relaunch it")?;
+    saved_terminal::attach_existing(
+        card,
+        daemon_recovery::RecoveredTerminal {
+            session,
+            expected_host: Some(proof.clone()),
+            attach_completed: false,
+            recovery_lease: None,
+        },
+        socket,
+        proof,
+        sender,
+    )
+}
+
+fn initial_terminal_attachment(
+    source: &TerminalSession,
+    terminals: &[crate::terminal::ipc::TerminalDescriptor],
+    proof: &HostSessionProof,
+) -> Result<Option<TerminalSession>, String> {
+    if terminals
+        .iter()
+        .any(|terminal| terminal.session.id == source.id)
+    {
+        return saved_terminal::attachment(source, terminals, proof);
+    }
+    let mut issued = terminals.iter().filter(|terminal| {
+        terminal.upgrade_sources.contains(source)
+            || terminal
+                .upgrade_relaunches
+                .iter()
+                .any(|relaunch| relaunch.source == *source)
+    });
+    let Some(terminal) = issued.next() else {
+        return Ok(None);
+    };
+    if issued.next().is_some()
+        || !proof.is_complete()
+        || !terminal.session.continuity.can_resume_live(proof)
+    {
+        return Err("The initial terminal has ambiguous or unconfirmed issued ownership".into());
+    }
+    Ok(Some(terminal.session.clone()))
+}
 
 /// Another client may own a shared terminal's recovery, so a shared pane only
 /// attaches the exact session its daemon hosts, under that daemon's proof.
@@ -20928,6 +20850,9 @@ mod tests {
         let refused = |subject| QuarantinedWrite {
             subject,
             category: crate::session::SaveFailureCategory::InvalidData,
+            check: crate::diagnostics::Check::new(
+                "chat card … changed conversation identity (identity)",
+            ),
             refused_at_unix_ms: 20,
             held_back: 0,
         };
@@ -20991,6 +20916,9 @@ mod tests {
         let write = |subject| QuarantinedWrite {
             subject,
             category: crate::session::SaveFailureCategory::InvalidData,
+            check: crate::diagnostics::Check::new(
+                "chat card … changed conversation identity (identity)",
+            ),
             refused_at_unix_ms: 20,
             held_back: 0,
         };
@@ -21018,6 +20946,11 @@ mod tests {
         assert!(line.contains("closing the pane clears it"), "{line}");
         let line = quarantined_write_line(&pane, &untitled);
         assert!(line.starts_with("Latest changes to a pane ("), "{line}");
+        assert!(line.contains("— saved state is invalid · since"), "{line}");
+        assert!(
+            line.ends_with("\nRule: chat card … changed conversation identity (identity)"),
+            "the rule storage refused it for is named on its own line: {line}"
+        );
 
         let relaunch = write(WriteSubject::CardIdentity {
             card,
@@ -21975,9 +21908,10 @@ mod tests {
         // the chrome header already believes the inspector is closed.
         draw_frames(&mut app, 4, |app, frame| match frame {
             0 => {
-                let _ = app.update(Message::ContextInspector(
-                    InspectorAction::ShowRepositoryEditor(card),
-                ));
+                let _ = app.update(Message::Repository(RepositoryAction::ApplySourceSurface {
+                    card,
+                    diff: false,
+                }));
             }
             1 => {
                 let _ = app.update(Message::ToggleContextInspector);
@@ -21997,7 +21931,7 @@ mod tests {
     /// in which two subtrees could claim one id. Drawn rather than reasoned
     /// about, because the abort is in `draw` and points at the wrong widget.
     #[test]
-    fn inspector_tabs_leave_every_widget_id_naming_one_node() {
+    fn inspector_sections_leave_every_widget_id_naming_one_node() {
         let mut app = context_inspector_test_app(true);
         let card = app.workspace.focused().unwrap();
         app.cards.insert(
@@ -22011,15 +21945,17 @@ mod tests {
             sidebar::bound_source_control(&app.sidebar_model, &app.sidebar_state).is_some(),
             "the fixture binds a worktree, or the panels draw their empty chrome and prove nothing"
         );
-        let tabs = [
-            ContextTab::Files,
-            ContextTab::Changes,
-            ContextTab::PullRequest,
-            ContextTab::Changes,
-            ContextTab::Files,
+        use context_sections::{Action, Section, WorkspaceView};
+        let steps = [
+            Action::Show(WorkspaceView::Files),
+            Action::Show(WorkspaceView::SourceControl),
+            Action::Toggle(Section::Work),
+            Action::Toggle(Section::Workspace),
+            Action::Show(WorkspaceView::Files),
+            Action::Toggle(Section::Work),
         ];
-        draw_frames(&mut app, tabs.len(), |app, frame| {
-            let _ = app.update(Message::SelectContextTab(tabs[frame]));
+        draw_frames(&mut app, steps.len(), |app, frame| {
+            let _ = app.update(Message::ContextSection(steps[frame]));
         });
     }
 
@@ -22392,7 +22328,7 @@ mod tests {
         let (first, second) = (panes[0].id, panes[1].id);
         let mut state = WorkspaceState {
             focused: Some(second),
-            cards: panes,
+            cards: panes.into(),
             ..WorkspaceState::default()
         };
         retire_duplicate_utility_cards(&mut state);
@@ -22410,7 +22346,7 @@ mod tests {
         let id = pane.id;
         app.durable = Arc::new(WorkspaceState {
             focused: Some(id),
-            cards: vec![pane],
+            cards: vec![pane].into(),
             ..WorkspaceState::default()
         });
         app.workspace = Cagents::rebuild_workspace(&app.durable);
@@ -24031,14 +23967,13 @@ mod tests {
                 crate::settings::LinkOpenGesture::ControlShiftClick,
             ),
             Message::ChatUi(chat_ui::Action::OpenUrl("https://example.com".into())),
-            Message::PullRequestUi(pull_request_ui::Action::OpenUrl(
+            Message::PullRequestUi(pull_request_ui::Action::Open {
+                repository: GitHubRepoKey::new("github.com", None, "o", "r").unwrap(),
+                number: 1,
+                url: Url::parse("https://github.com/o/r/pull/1").unwrap(),
+            }),
+            Message::PullRequestUi(pull_request_ui::Action::OpenCheck(
                 Url::parse("https://example.com").unwrap(),
-            )),
-            Message::PullRequestUi(pull_request_ui::Action::OpenMarkdownLink(
-                "https://example.com".into(),
-            )),
-            Message::ContextInspector(InspectorAction::OpenLspHoverLink(
-                "https://example.com".into(),
             )),
             Message::FocusCard(CardId::new()),
             Message::FocusAdjacent(crate::workspace::FocusDirection::Right),
@@ -24394,6 +24329,88 @@ mod tests {
             assert_eq!(app.pull_request_dialog.as_ref(), Some(&dialog));
             let _ = app.update(Message::CancelDialog);
             assert!(app.pull_request_dialog.is_none());
+        }
+    }
+
+    #[test]
+    fn surfaces_and_rules_reach_a_free_right_edge_while_controls_keep_out_of_its_border() {
+        use cosmic::iced::Size;
+        use cosmic::iced::advanced::{Layout, layout, mouse, widget::Tree};
+        use iced_accessibility::accesskit::Role;
+
+        fn rules(node: &layout::Node, origin: iced::Point, out: &mut Vec<iced::Rectangle>) {
+            let bounds = node.bounds() + iced::Vector::new(origin.x, origin.y);
+            if node.children().is_empty() && bounds.height == design::BORDER_WIDTH {
+                out.push(bounds);
+            }
+            for child in node.children() {
+                rules(child, bounds.position(), out);
+            }
+        }
+
+        let width = 1500.0;
+        let border = design::WINDOW_RESIZE_BORDER;
+        for inspector in [false, true] {
+            let mut app = context_inspector_test_app(true);
+            app.settings.ui_scale = 1.0;
+            app.window_width = width;
+            app.context_inspector_open = inspector;
+            assert_eq!(app.trailing_edge_inset(), border);
+            if inspector {
+                assert_eq!(app.context_inspector_mount(), Some(InspectorLayout::Docked));
+            }
+            let renderer = headless_renderer();
+            let mut element = app.view();
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(width, 900.0)),
+            );
+            let mut found = Vec::new();
+            rules(&node, iced::Point::ORIGIN, &mut found);
+            // Every rule that runs toward the edge reaches it, rather than
+            // stopping where the resize border begins: the header rule of the
+            // rightmost surface and the status bar rule, at least.
+            let toward_edge: Vec<_> = found
+                .iter()
+                .filter(|rule| rule.x + rule.width > width - border - 1.0)
+                .collect();
+            assert!(
+                toward_edge.len() >= 2,
+                "inspector {inspector}: expected the header and status bar rules: {found:?}"
+            );
+            for rule in toward_edge {
+                assert_eq!(
+                    rule.x + rule.width,
+                    width,
+                    "inspector {inspector}: a rule stops short of the window edge: {rule:?}"
+                );
+            }
+            let nodes = element.as_widget().a11y_nodes(
+                Layout::new(&node),
+                &tree,
+                mouse::Cursor::Unavailable,
+            );
+            let controls: Vec<_> = nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .filter(|node| {
+                    matches!(
+                        node.node().role(),
+                        Role::Button | Role::Splitter | Role::ScrollBar | Role::Slider
+                    )
+                })
+                .filter_map(|node| node.node().bounds())
+                .collect();
+            assert!(!controls.is_empty());
+            for bounds in controls {
+                assert!(
+                    bounds.x1 <= f64::from(width - border) + 0.5,
+                    "inspector {inspector}: a control reaches into the resize border: {bounds:?}"
+                );
+            }
         }
     }
 
@@ -24828,7 +24845,7 @@ mod tests {
         let active = cards[0].id;
         app.durable = Arc::new(WorkspaceState {
             focused: Some(active),
-            cards,
+            cards: cards.into(),
             ..WorkspaceState::default()
         });
         app.workspace = Cagents::rebuild_workspace(&app.durable);
@@ -24857,7 +24874,7 @@ mod tests {
         let moved = cards[12].id;
         app.durable = Arc::new(WorkspaceState {
             focused: Some(active),
-            cards,
+            cards: cards.into(),
             ..WorkspaceState::default()
         });
         app.workspace = Cagents::rebuild_workspace(&app.durable);
@@ -24883,7 +24900,7 @@ mod tests {
         let retarget = cards[5].id;
         app.durable = Arc::new(WorkspaceState {
             focused: Some(origin),
-            cards,
+            cards: cards.into(),
             ..WorkspaceState::default()
         });
         app.workspace = Cagents::rebuild_workspace(&app.durable);
@@ -24926,7 +24943,7 @@ mod tests {
         let target = cards[2].id;
         app.durable = Arc::new(WorkspaceState {
             focused: Some(cards[0].id),
-            cards,
+            cards: cards.into(),
             ..WorkspaceState::default()
         });
         app.workspace = Cagents::rebuild_workspace(&app.durable);
@@ -24976,7 +24993,7 @@ mod tests {
             let source = terminal.clone();
             app.durable = Arc::new(WorkspaceState {
                 focused: Some(first),
-                cards,
+                cards: cards.into(),
                 ..WorkspaceState::default()
             });
             app.workspace = Cagents::rebuild_workspace(&app.durable);
@@ -25008,7 +25025,7 @@ mod tests {
             assert_eq!(app.sidebar_state.has_card_update(target), !window_focused);
             assert!(app.sidebar_state.has_card_update(unrelated));
             let update = app.workspace.tick(Duration::from_secs(1));
-            let _ = app.apply_viewport(update, true, false);
+            let _ = app.apply_viewport(update, true, DurableChange::None);
             assert_eq!(
                 app.workspace.visibility(target),
                 Some(VisibilityClass::Visible)
@@ -25045,7 +25062,7 @@ mod tests {
         let terminal_id = terminal.id;
         app.durable = Arc::new(WorkspaceState {
             focused: Some(id),
-            cards: vec![card],
+            cards: vec![card].into(),
             ..WorkspaceState::default()
         });
         app.workspace = Cagents::rebuild_workspace(&app.durable);
@@ -25191,7 +25208,7 @@ mod tests {
         let other_id = other.id;
         app.workspace.add_card(other, 1, false).unwrap();
         let update = app.workspace.focus(other_id).unwrap();
-        drop(app.apply_viewport(update, true, false));
+        drop(app.apply_viewport(update, true, DurableChange::None));
         assert_eq!(app.terminal_review_card, None);
         assert_eq!(app.terminal_review_revision, acknowledged + 1);
     }
@@ -25490,13 +25507,6 @@ mod tests {
     }
 
     #[test]
-    fn column_navigator_appears_only_when_movement_is_possible() {
-        assert!(!should_show_card_navigator(0));
-        assert!(!should_show_card_navigator(1));
-        assert!(should_show_card_navigator(2));
-    }
-
-    #[test]
     fn context_overlay_update_captures_traps_and_restores_focus_across_startup_and_escape() {
         let mut app = context_inspector_test_app(true);
         let headerbar_enabled = app.core.window.show_headerbar;
@@ -25547,20 +25557,38 @@ mod tests {
         assert!(app.context_inspector_restore_focus.is_none());
         assert_eq!(app.core.window.show_headerbar, headerbar_enabled);
 
-        // Panel tabs change the tools, not workspace focus or the overlay
+        // Sections change the tools, not workspace focus or the overlay
         // boundary, and remain available in production builds.
         let focused = app.workspace.focused();
         let _ = app.update(Message::ToggleContextInspector);
-        for tab in [ContextTab::Changes, ContextTab::Files, ContextTab::Details] {
-            let _ = app.update(Message::SelectContextTab(tab));
-            assert_eq!(app.context_tab, tab);
+        use context_sections::{Action as SectionAction, Section, WorkspaceView};
+        for (action, shown) in [
+            (
+                SectionAction::Show(WorkspaceView::SourceControl),
+                Some(WorkspaceView::SourceControl),
+            ),
+            (
+                SectionAction::Show(WorkspaceView::Files),
+                Some(WorkspaceView::Files),
+            ),
+            // With no conversation sections above it, the workspace section
+            // stays shown.
+            (
+                SectionAction::Toggle(Section::Workspace),
+                Some(WorkspaceView::Files),
+            ),
+        ] {
+            let _ = app.update(Message::ContextSection(action));
+            assert_eq!(app.workspace_view_shown(), shown);
             assert_eq!(app.workspace.focused(), focused);
             assert!(app.context_inspector_overlay_active);
             assert_eq!(app.core.window.show_headerbar, headerbar_enabled);
         }
         app.settings_reset_confirm = true;
-        let _ = app.update(Message::SelectContextTab(ContextTab::Files));
-        assert_eq!(app.context_tab, ContextTab::Details);
+        let _ = app.update(Message::ContextSection(SectionAction::Show(
+            WorkspaceView::SourceControl,
+        )));
+        assert_eq!(app.workspace_view_shown(), Some(WorkspaceView::Files));
         app.settings_reset_confirm = false;
         let _ = app.update(Message::ContextInspector(InspectorAction::Close));
 
@@ -26101,7 +26129,7 @@ mod tests {
         ];
         app.durable = Arc::new(WorkspaceState {
             focused: Some(visible.id),
-            cards: cards.to_vec(),
+            cards: cards.to_vec().into(),
             ..WorkspaceState::default()
         });
         app.set_exposure(visible.id, Exposure::Visible);
@@ -26141,7 +26169,7 @@ mod tests {
         let terminals = ["/bin/sh", "/usr/bin/omp", "/fixture/custom-wrapper"]
             .map(|program| restored_live_terminal(program));
         app.durable = Arc::new(WorkspaceState {
-            cards: terminals.to_vec(),
+            cards: terminals.to_vec().into(),
             ..WorkspaceState::default()
         });
         app.workspace = Cagents::rebuild_workspace(&app.durable);
@@ -26168,7 +26196,7 @@ mod tests {
         let mut app = context_inspector_test_app(false);
         let agent = restored_live_terminal("/usr/bin/claude");
         app.durable = Arc::new(WorkspaceState {
-            cards: vec![agent.clone()],
+            cards: vec![agent.clone()].into(),
             ..WorkspaceState::default()
         });
         app.workspace = Cagents::rebuild_workspace(&app.durable);
@@ -26199,7 +26227,7 @@ mod tests {
         }
         let session = session.clone();
         app.durable = Arc::new(WorkspaceState {
-            cards: vec![agent.clone()],
+            cards: vec![agent.clone()].into(),
             ..WorkspaceState::default()
         });
         app.workspace = Cagents::rebuild_workspace(&app.durable);
@@ -26519,7 +26547,7 @@ mod tests {
             .collect();
         let channel_card = cards[2].id;
         let durable = Arc::make_mut(&mut app.durable);
-        durable.cards = cards;
+        durable.cards = cards.into();
         durable.channels.push(ProjectChannel {
             title_source: Default::default(),
             id: channel,
@@ -26892,23 +26920,6 @@ mod tests {
             node.node()
                 .supports_action(iced_accessibility::accesskit::Action::Click)
         }));
-    }
-
-    #[test]
-    fn pane_diagnostics_toggle_keeps_the_inspector_open_and_ignores_stale_cards() {
-        let mut app = context_inspector_test_app(true);
-        let id = app.workspace.focused().unwrap();
-        app.context_inspector_open = true;
-        drop(app.handle_context_inspector_action(InspectorAction::ToggleDiagnostics(id)));
-        assert_eq!(app.inspector_diagnostics_card, Some(id));
-        assert!(app.context_inspector_open);
-        drop(
-            app.handle_context_inspector_action(InspectorAction::ToggleDiagnostics(CardId::new())),
-        );
-        assert_eq!(app.inspector_diagnostics_card, Some(id));
-        drop(app.handle_context_inspector_action(InspectorAction::ToggleDiagnostics(id)));
-        assert_eq!(app.inspector_diagnostics_card, None);
-        assert!(app.context_inspector_open);
     }
 
     /// A killed session used to take its pane with it: `fail_runtime` replaced
@@ -27310,7 +27321,7 @@ mod tests {
 
     mod repository_clone_navigation {
         use super::*;
-        use crate::model::ProjectChannel;
+        use crate::model::{ChannelId, ProjectChannel};
 
         struct Fixture {
             _directory: tempfile::TempDir,
@@ -27945,31 +27956,37 @@ mod tests {
     }
 
     #[test]
-    fn editor_language_results_reveal_details_from_the_files_tab() {
+    fn editor_language_results_expand_their_section() {
+        use context_sections::Section;
         let mut app = lsp_test_app();
         let card = repository_card(&mut app, "/repo");
-        for action in [
-            repository_widget::EditorLspAction::Diagnostics,
-            repository_widget::EditorLspAction::References,
+        for (action, section) in [
+            (
+                repository_widget::EditorLspAction::Diagnostics,
+                Section::Problems,
+            ),
+            (
+                repository_widget::EditorLspAction::References,
+                Section::Locations,
+            ),
         ] {
-            app.context_tab = ContextTab::Files;
+            app.context_sections.set_open(section, false);
             app.context_inspector_open = false;
             let _ = app.update(Message::Repository(RepositoryAction::Language {
                 card,
                 action,
             }));
             assert!(app.context_inspector_open);
-            assert_eq!(
-                app.context_tab,
-                ContextTab::Details,
-                "opening the file tree hides the requested language results"
+            assert!(
+                app.context_sections.is_open(section),
+                "a collapsed section hides the requested language results"
             );
         }
         let doc = LspDocumentId(1);
         let request = crate::lsp::LspRequestId(1);
         app.lsp_documents.insert(doc, card);
         lsp_state(&mut app, card).editor_navigation = Some(request);
-        app.context_tab = ContextTab::Files;
+        app.context_sections.set_open(Section::Locations, false);
         app.context_inspector_open = false;
         let _ = app.update(Message::Lsp(LspEvent::Locations {
             doc,
@@ -27978,9 +27995,8 @@ mod tests {
             items: Vec::new(),
         }));
         assert!(app.context_inspector_open);
-        assert_eq!(
-            app.context_tab,
-            ContextTab::Details,
+        assert!(
+            app.context_sections.is_open(Section::Locations),
             "a definition response that cannot jump must expose its results"
         );
     }
@@ -28261,23 +28277,8 @@ mod tests {
             if reason.contains("limit (1) reached")));
         assert_eq!(app.lsp.status(doc), LspStatus::Disabled);
         assert_eq!(app.lsp.document_version(doc), Some(1));
-        let restart_action = |app: &Cagents| {
-            inspector::with_lsp(
-                inspector::InspectorModel {
-                    card_id: card,
-                    title: "Refused editor".into(),
-                    kind: "Repository",
-                    sections: Vec::new(),
-                    actions: Vec::new(),
-                },
-                card,
-                app.lsp_context(card).unwrap(),
-            )
-            .actions
-            .into_iter()
-            .find(|action| action.message == InspectorAction::RestartLanguageServer(card))
-            .map(|action| action.message)
-        };
+        let restart_action =
+            |app: &Cagents| inspector::restart_action(card, app.lsp_context(card).unwrap());
         // The first telemetry refresh occurs before any edit in the native
         // failure: another live server must not erase this document's refusal.
         app.apply_lsp_event(LspEvent::Resources { doc: holder.doc });
@@ -28516,13 +28517,13 @@ mod tests {
             doc,
             items: vec![completion_item("late")],
         });
-        drop(app.update(Message::ContextInspector(
-            InspectorAction::ApplyLspCompletion {
-                card,
+        drop(app.update_editor_lsp(
+            card,
+            repository_widget::EditorLspAction::Choose {
                 index: 0,
                 target: shown,
             },
-        )));
+        ));
         let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
             unreachable!()
         };
@@ -28542,13 +28543,10 @@ mod tests {
             items: vec![completion_item("fresh")],
         });
         let target = app.lsp_contexts[&card].context.completions[0].clone();
-        drop(app.update(Message::ContextInspector(
-            InspectorAction::ApplyLspCompletion {
-                card,
-                index: 0,
-                target,
-            },
-        )));
+        drop(app.update_editor_lsp(
+            card,
+            repository_widget::EditorLspAction::Choose { index: 0, target },
+        ));
         let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
             unreachable!()
         };
@@ -28606,13 +28604,13 @@ mod tests {
                 doc,
                 items: vec![completion_item("late")],
             });
-            drop(app.update(Message::ContextInspector(
-                InspectorAction::ApplyLspCompletion {
-                    card,
+            drop(app.update_editor_lsp(
+                card,
+                repository_widget::EditorLspAction::Choose {
                     index: 0,
                     target: shown[0].clone(),
                 },
-            )));
+            ));
             let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
                 unreachable!()
             };
@@ -28775,13 +28773,10 @@ mod tests {
             items: vec![completion_item("fresh")],
         });
         let target = app.lsp_contexts[&card].context.completions[0].clone();
-        drop(app.update(Message::ContextInspector(
-            InspectorAction::ApplyLspCompletion {
-                card,
-                index: 0,
-                target,
-            },
-        )));
+        drop(app.update_editor_lsp(
+            card,
+            repository_widget::EditorLspAction::Choose { index: 0, target },
+        ));
         let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
             unreachable!()
         };
@@ -28806,7 +28801,6 @@ mod tests {
             let version = app.lsp.document_version(doc);
             let pending = request_test_completion(&mut app, card);
             let state = app.lsp_contexts.get_mut(&card).unwrap();
-            state.context.hover = Some("retained hover".into());
             state.context.locations = Some((crate::lsp::LocationKind::References, Vec::new()));
             state.context.diagnostics = vec![diagnostic("standing diagnostic")];
             drop(
@@ -28819,7 +28813,6 @@ mod tests {
             let state = &app.lsp_contexts[&card];
             assert!(state.completion_request.is_none());
             assert!(state.context.completions.is_empty());
-            assert_eq!(state.context.hover.as_deref(), Some("retained hover"));
             assert!(state.context.locations.is_some());
             assert_eq!(state.context.diagnostics.len(), 1);
             app.apply_lsp_event(LspEvent::Completion {
@@ -28827,13 +28820,10 @@ mod tests {
                 doc,
                 items: vec![completion_item("late")],
             });
-            drop(app.update(Message::ContextInspector(
-                InspectorAction::ApplyLspCompletion {
-                    card,
-                    index: 0,
-                    target,
-                },
-            )));
+            drop(app.update_editor_lsp(
+                card,
+                repository_widget::EditorLspAction::Choose { index: 0, target },
+            ));
             let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
                 unreachable!()
             };
@@ -28879,13 +28869,10 @@ mod tests {
             runtime.editor_completion_targets(card),
             vec![target.clone()]
         );
-        drop(app.update(Message::ContextInspector(
-            InspectorAction::ApplyLspCompletion {
-                card,
-                index: 0,
-                target,
-            },
-        )));
+        drop(app.update_editor_lsp(
+            card,
+            repository_widget::EditorLspAction::Choose { index: 0, target },
+        ));
         let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
             unreachable!()
         };
@@ -28949,79 +28936,61 @@ mod tests {
             .build()
             .unwrap();
         let _entered = executor.enter();
-        for popup in [false, true] {
-            for replacement_kind in 0..3 {
-                let mut app = lsp_test_app();
-                // Register a real document without driving discovery or a server.
-                app.lsp = LspManager::new(AppSettings::default().language_servers);
-                let card = repository_card(&mut app, "/repo");
-                let (runtime, _) = RepositoryRuntime::open_fixture(card, "main.rs", "tail\n");
-                app.cards
-                    .insert(card, CardRuntime::Repository(Box::new(runtime)));
-                drop(app.drain_lsp_intents(card));
-                let held = publish_test_completions(&mut app, card, vec![completion_item("alpha")])
-                    .remove(0);
-                let mut replacement = completion_item(if replacement_kind == 0 {
-                    "beta"
-                } else {
-                    "alpha"
-                });
-                if replacement_kind == 1 {
-                    replacement.edit.new_text = "different-edit".into();
-                }
-                let expected = format!("{}tail\n", replacement.edit.new_text);
-                let fresh = publish_test_completions(&mut app, card, vec![replacement]).remove(0);
-                if popup {
-                    drop(app.update_editor_lsp(
-                        card,
-                        repository_widget::EditorLspAction::Choose {
-                            index: 0,
-                            target: held,
-                        },
-                    ));
-                } else {
-                    drop(app.update_lsp(InspectorAction::ApplyLspCompletion {
-                        card,
-                        index: 0,
-                        target: held,
-                    }));
-                }
-                assert_eq!(
-                    notice(&app),
-                    Some("the completion list changed; nothing was applied")
-                );
-                assert_eq!(app.lsp_contexts[&card].context.completions.len(), 1);
-                let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
-                    unreachable!()
-                };
-                assert_eq!(runtime.editor_text().as_deref(), Some("tail\n"));
-                assert_eq!(
-                    runtime.editor_completion_targets(card).len(),
-                    1,
-                    "rejecting an old action must not dismiss the fresh response"
-                );
-                app.status = None;
-                if popup {
-                    drop(app.update_editor_lsp(
-                        card,
-                        repository_widget::EditorLspAction::Choose {
-                            index: 0,
-                            target: fresh,
-                        },
-                    ));
-                } else {
-                    drop(app.update_lsp(InspectorAction::ApplyLspCompletion {
-                        card,
-                        index: 0,
-                        target: fresh,
-                    }));
-                }
-                let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
-                    unreachable!()
-                };
-                assert_eq!(runtime.editor_text().as_deref(), Some(expected.as_str()));
-                assert!(app.lsp_contexts[&card].context.completions.is_empty());
+        for replacement_kind in 0..3 {
+            let mut app = lsp_test_app();
+            // Register a real document without driving discovery or a server.
+            app.lsp = LspManager::new(AppSettings::default().language_servers);
+            let card = repository_card(&mut app, "/repo");
+            let (runtime, _) = RepositoryRuntime::open_fixture(card, "main.rs", "tail\n");
+            app.cards
+                .insert(card, CardRuntime::Repository(Box::new(runtime)));
+            drop(app.drain_lsp_intents(card));
+            let held =
+                publish_test_completions(&mut app, card, vec![completion_item("alpha")]).remove(0);
+            let mut replacement = completion_item(if replacement_kind == 0 {
+                "beta"
+            } else {
+                "alpha"
+            });
+            if replacement_kind == 1 {
+                replacement.edit.new_text = "different-edit".into();
             }
+            let expected = format!("{}tail\n", replacement.edit.new_text);
+            let fresh = publish_test_completions(&mut app, card, vec![replacement]).remove(0);
+            drop(app.update_editor_lsp(
+                card,
+                repository_widget::EditorLspAction::Choose {
+                    index: 0,
+                    target: held,
+                },
+            ));
+            assert_eq!(
+                notice(&app),
+                Some("the completion list changed; nothing was applied")
+            );
+            assert_eq!(app.lsp_contexts[&card].context.completions.len(), 1);
+            let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+                unreachable!()
+            };
+            assert_eq!(runtime.editor_text().as_deref(), Some("tail\n"));
+            assert_eq!(
+                runtime.editor_completion_targets(card).len(),
+                1,
+                "rejecting an old action must not dismiss the fresh response"
+            );
+            app.status = None;
+            drop(app.update_editor_lsp(
+                card,
+                repository_widget::EditorLspAction::Choose {
+                    index: 0,
+                    target: fresh,
+                },
+            ));
+            let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+                unreachable!()
+            };
+            assert_eq!(runtime.editor_text().as_deref(), Some(expected.as_str()));
+            assert!(app.lsp_contexts[&card].context.completions.is_empty());
         }
     }
 
@@ -29032,11 +29001,10 @@ mod tests {
         let card = repository_card(&mut app, "/repo");
         let target = completion_targets_for_test(card, vec![completion_item("alpha")]).remove(0);
         lsp_state(&mut app, card).context.completions = vec![target.clone()];
-        drop(app.update_lsp(InspectorAction::ApplyLspCompletion {
+        drop(app.update_editor_lsp(
             card,
-            index: 4,
-            target,
-        }));
+            repository_widget::EditorLspAction::Choose { index: 4, target },
+        ));
         assert_eq!(notice(&app), None);
         assert_eq!(app.lsp_contexts[&card].context.completions.len(), 1);
     }
@@ -29185,7 +29153,6 @@ mod tests {
         app.lsp_documents.insert(LspDocumentId(1), card);
         let state = lsp_state(&mut app, card);
         state.document = Some(LspDocumentId(1));
-        state.context.hover = Some("hover".into());
         state.context.completions = vec![target.clone()];
         state.context.locations = Some((crate::lsp::LocationKind::Definition, Vec::new()));
         state.context.diagnostics = vec![diagnostic("undefined name")];
@@ -29197,7 +29164,6 @@ mod tests {
         });
 
         let state = &app.lsp_contexts[&card];
-        assert!(state.context.hover.is_none());
         assert!(state.context.completions.is_empty());
         assert!(state.context.locations.is_none());
         // Diagnostics are the server's own standing answer, replaced on its
@@ -29295,16 +29261,10 @@ mod tests {
         app.lsp_documents.insert(doc, card);
         app.lsp.restart(doc);
         lsp_state(&mut app, card).context.status = Some(LspStatus::Starting);
-        let untouched: Arc<[String]> = Arc::from(["before delivery".to_owned()]);
-        lsp_state(&mut app, card).context.live_servers = untouched.clone();
         app.apply_lsp_event(publisher.ready.clone());
         assert_eq!(
             app.lsp_contexts[&card].context.status,
             Some(LspStatus::Starting)
-        );
-        assert!(
-            Arc::ptr_eq(&app.lsp_contexts[&card].context.live_servers, &untouched),
-            "reject before Status refreshes any visible state"
         );
         let events = app.lsp.events();
         loop {
@@ -30193,7 +30153,7 @@ mod tests {
             app.card_keyboard_focus(pane),
             repository_widget::editor_focus_id(pane)
         );
-        let startup = app.apply_viewport(update, false, false);
+        let startup = app.apply_viewport(update, false, DurableChange::None);
         assert_eq!(
             focused(&app, startup),
             Some(repository_widget::editor_focus_id(pane))
@@ -30221,12 +30181,12 @@ mod tests {
         app.window_width = 900.0;
         app.context_inspector_open = true;
         let update = app.workspace.resize_viewport(500.0);
-        let initial = app.apply_viewport(update, false, false);
+        let initial = app.apply_viewport(update, false, DurableChange::None);
         assert!(app.context_inspector_overlay_active);
         assert_eq!(focused(&app, initial), Some(context_inspector_toggle_id()));
         app.window_width = 1900.0;
         let update = app.workspace.resize_viewport(1200.0);
-        let ready = app.apply_viewport(update, false, false);
+        let ready = app.apply_viewport(update, false, DurableChange::None);
         assert!(!app.context_inspector_overlay_active);
         assert_eq!(
             focused(&app, ready),
@@ -30262,7 +30222,7 @@ mod tests {
             .insert(pane, CardRuntime::Repository(Box::new(runtime)));
         app.window_width = 1900.0;
         let update = app.workspace.resize_viewport(1200.0);
-        drop(app.apply_viewport(update, false, false));
+        drop(app.apply_viewport(update, false, DurableChange::None));
         assert!(app.card_holds_keyboard(pane));
         let placeholder = app.card_header_widget_id(pane);
         let (completed_read, tasks) = settle_repository_read(&mut app, pane, load);
@@ -30312,7 +30272,7 @@ mod tests {
         app.cards
             .insert(pane, CardRuntime::Repository(Box::new(runtime)));
         let update = app.workspace.resize_viewport(1200.0);
-        let initial = app.apply_viewport(update, false, false);
+        let initial = app.apply_viewport(update, false, DurableChange::None);
         assert_eq!(
             focused(&app, initial),
             Some(app.card_header_widget_id(pane))
@@ -30320,7 +30280,7 @@ mod tests {
         app.window_width = 900.0;
         app.context_inspector_open = true;
         let update = app.workspace.resize_viewport(500.0);
-        drop(app.apply_viewport(update, false, false));
+        drop(app.apply_viewport(update, false, DurableChange::None));
         assert!(!app.card_holds_keyboard(pane));
         let (completed_read, _) = settle_repository_read(&mut app, pane, load);
         assert!(
@@ -30329,7 +30289,7 @@ mod tests {
         );
         app.window_width = 1900.0;
         let update = app.workspace.resize_viewport(1200.0);
-        let ready = app.apply_viewport(update, false, false);
+        let ready = app.apply_viewport(update, false, DurableChange::None);
         assert_eq!(
             focused(&app, ready),
             Some(repository_widget::editor_focus_id(pane))
@@ -30665,6 +30625,74 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sidebar_worktree_collapse_survives_selection_synchronization() {
+        let mut app = context_inspector_test_app(true);
+        let project = ProjectId::new();
+        let selected = WorktreeId::new();
+        let other = WorktreeId::new();
+        let row = |id, path: &str| {
+            sidebar::SidebarWorktree::new(
+                id,
+                path.into(),
+                Some("topic".into()),
+                false,
+                false,
+                None,
+                None,
+                None,
+            )
+        };
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            RepositoryId(uuid::Uuid::new_v4()),
+            "Example".into(),
+            "/repo".into(),
+            vec![row(selected, "/tmp"), row(other, "/other")],
+            vec![],
+        ));
+        app.synchronize_sidebar_selection();
+        drop(app.rebind_source_control());
+        let other_row = sidebar::SelectionRow::Worktree(project, other);
+        assert!(
+            sidebar::visible_selection_rows(&app.sidebar_model, &app.sidebar_state, false)
+                .contains(&other_row)
+        );
+        drop(app.update(Message::Sidebar(SidebarAction::ToggleWorktrees(project))));
+        app.synchronize_sidebar_selection();
+        let visible =
+            sidebar::visible_selection_rows(&app.sidebar_model, &app.sidebar_state, false);
+        assert!(!visible.contains(&other_row));
+        assert!(visible.contains(&sidebar::SelectionRow::Worktree(project, selected)));
+    }
+
+    #[test]
+    fn sidebar_preferences_observed_after_local_save_can_reset_external_override() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(false);
+        app.settings_write_blocked = false;
+        app.settings_path = Some(path.clone());
+        app.save_settings_now().unwrap();
+        let project = ProjectId::new();
+        let mut external = settings::load(&path).unwrap();
+        external.sidebar_worktrees = settings::SidebarWorktrees::Hidden;
+        external
+            .sidebar_worktree_overrides
+            .insert(project, settings::SidebarWorktrees::Expanded);
+        settings::save(&path, &external).unwrap();
+        drop(app.update(Message::SidebarPreferencesObserved(external)));
+        assert_eq!(
+            app.sidebar_state.worktree_display(project),
+            settings::SidebarWorktrees::Expanded
+        );
+        app.settings.sidebar_worktree_overrides.remove(&project);
+        app.save_settings_now().unwrap();
+        let saved = settings::load(&path).unwrap();
+        assert_eq!(saved.sidebar_worktrees, settings::SidebarWorktrees::Hidden);
+        assert!(!saved.sidebar_worktree_overrides.contains_key(&project));
+    }
+
     pub(super) fn context_inspector_test_app(with_focused_card: bool) -> Cagents {
         let card = with_focused_card.then(terminal_card_state);
         let card_id = card.as_ref().map(|card| card.id);
@@ -30710,7 +30738,8 @@ mod tests {
             next_lsp_document: 0,
             lifecycle_sweep_deadline: None,
             lifecycle_sweep_generation: 0,
-            focus_save_pending: false,
+            navigation_save_pending: false,
+            navigation_save_generation: 0,
             keyboard_owed: None,
             reported_title_save: ReportedTitleSave::default(),
             lifecycle_sweep_destination: None,
@@ -30770,6 +30799,7 @@ mod tests {
             window_scale_factor: 1.0,
             window_width: 1_600.0,
             window_height: 900.0,
+            context_sections_height: None,
             window_filled: false,
             window_state_observed: false,
             right_edge_tiled: false,
@@ -30803,7 +30833,6 @@ mod tests {
             account_ui: account_ui::State::default(),
             automation_ui: crate::automation_ui::State::default(),
             work_ui: crate::work_ui::State::default(),
-            channel_work: channel_work::State::default(),
             automation_approval: automation_approval::State::default(),
             active_workspace: None,
             worktree_focus: HashMap::new(),
@@ -30811,6 +30840,8 @@ mod tests {
             worktree_offsets: HashMap::new(),
             worktree_owners: HashMap::new(),
             known_worktree_roots: HashSet::new(),
+            worktree_paths: worktree_ui::WorktreePathIndex::default(),
+            pull_request_board: chat_ui::PullRequestBoard::default(),
             workspace_view_generation: 0,
             workspace_scroll_id: widget::Id::new("workspace-strip-0"),
             github_availability: HashMap::new(),
@@ -30848,9 +30879,8 @@ mod tests {
             #[cfg(feature = "latency-harness")]
             latency_fixture_started: false,
             context_inspector_transition: None,
-            inspector_diagnostics_card: None,
             context_inspector_open: true,
-            context_tab: ContextTab::default(),
+            context_sections: context_sections::Sections::default(),
             context_inspector_overlay_active: false,
             context_inspector_restore_focus: Some(context_inspector_toggle_id()),
             settings_category: SettingsCategory::Appearance,
@@ -30943,8 +30973,8 @@ mod tests {
         app.workspace = Cagents::rebuild_workspace(&app.durable);
         // Every pane fits, so moving focus exposes nothing new.
         let update = app.workspace.resize_viewport(3_000.0);
-        let _ = app.apply_viewport(update, false, true);
-        assert!(!app.focus_save_pending);
+        let _ = app.apply_viewport(update, false, DurableChange::Content);
+        assert!(!app.navigation_save_pending);
 
         for card in [second_id, third_id] {
             let _ = app.update(Message::Viewport {
@@ -30952,19 +30982,19 @@ mod tests {
                 event: WorkspaceViewportEvent::PointerRested(card),
             });
             assert_eq!(app.durable.focused, Some(card));
-            assert!(app.focus_save_pending, "the save waits for the burst");
+            assert!(app.navigation_save_pending, "the save waits for the burst");
         }
-        let _ = app.update(Message::FocusSaveDue);
-        assert!(!app.focus_save_pending);
+        let _ = app.update(Message::NavigationSaveDue(app.navigation_save_generation));
+        assert!(!app.navigation_save_pending);
 
         // A change that must be saved now takes the pending focus with it.
         let _ = app.update(Message::Viewport {
             generation: app.workspace_view_generation,
             event: WorkspaceViewportEvent::PointerRested(second_id),
         });
-        assert!(app.focus_save_pending);
-        let _ = app.apply_viewport(ViewportUpdate::unchanged(), false, true);
-        assert!(!app.focus_save_pending);
+        assert!(app.navigation_save_pending);
+        let _ = app.apply_viewport(ViewportUpdate::unchanged(), false, DurableChange::Content);
+        assert!(!app.navigation_save_pending);
     }
 
     /// Seen means seen by the user. The focused pane of a window in the
@@ -31063,7 +31093,7 @@ mod tests {
         Arc::make_mut(&mut app.durable).cards.push(second);
         app.workspace = Cagents::rebuild_workspace(&app.durable);
         let update = app.workspace.focus(second_id).unwrap();
-        let _ = app.apply_viewport(update, false, false);
+        let _ = app.apply_viewport(update, false, DurableChange::None);
         assert_eq!(app.durable.focused, Some(second_id));
 
         // The strip closes the focused pane and its update goes unapplied.
@@ -31638,7 +31668,7 @@ mod tests {
         drop(app.select_worktree(root.clone(), false));
         assert_eq!(app.active_workspace.as_ref(), Some(&root));
         assert!(app.active_folder_scope());
-        assert_eq!(app.context_tab, ContextTab::Files);
+        assert_eq!(app.workspace_view(), context_sections::WorkspaceView::Files);
         let key = app.sidebar_model.worktree_at(&root).unwrap();
         assert!(app.sidebar_model.contains_worktree(&key));
         assert_eq!(key.project_id, project);
@@ -31656,8 +31686,12 @@ mod tests {
             matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime))
             if runtime.is_directory_only())
         );
-        drop(app.update(Message::SelectContextTab(ContextTab::Changes)));
-        assert_eq!(app.context_tab, ContextTab::Files);
+        drop(
+            app.update(Message::ContextSection(context_sections::Action::Show(
+                context_sections::WorkspaceView::SourceControl,
+            ))),
+        );
+        assert_eq!(app.workspace_view(), context_sections::WorkspaceView::Files);
 
         std::fs::create_dir(root.join(".git")).unwrap();
         let refreshed = load_project(
@@ -31748,7 +31782,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let card_ids = cards.iter().map(|card| card.id).collect::<Vec<_>>();
-        Arc::make_mut(&mut app.durable).cards = cards;
+        Arc::make_mut(&mut app.durable).cards = cards.into();
         let first_id = first.project.id;
         for loaded in [&first, &aliased, &linked_load] {
             app.repository_generations.insert(loaded.project.id, 1);
@@ -31802,7 +31836,7 @@ mod tests {
         card.width_fraction = 0.125;
         let card_id = card.id;
         let durable = WorkspaceState {
-            cards: vec![card],
+            cards: vec![card].into(),
             focused: Some(card_id),
             ..WorkspaceState::default()
         };
@@ -31913,7 +31947,10 @@ mod tests {
             app.card_state_mut(card).unwrap().kind = kind;
             app.card_state_mut(card).unwrap().width_fraction = 0.61;
             app.workspace = Cagents::rebuild_workspace(&app.durable);
-            app.workspace.resize_viewport(900.0);
+            // Wide enough that every preset resolves to a readable width, so
+            // the cycle visits all of them rather than skipping the narrow
+            // ones a smaller strip could not show.
+            app.workspace.resize_viewport(1500.0);
             for fraction in [2.0 / 3.0, 1.0, 1.0 / 3.0, 0.5, 2.0 / 3.0] {
                 let _ = app.update(Message::CyclePaneWidth);
                 let saved = serde_json::to_vec(app.durable.as_ref()).unwrap();
@@ -31926,7 +31963,7 @@ mod tests {
                     app.workspace.card(card).unwrap().width,
                     CardWidth::Fraction(fraction)
                 );
-                assert_eq!(app.workspace.geometry().card(card).unwrap().width(), 900.0);
+                assert_eq!(app.workspace.geometry().card(card).unwrap().width(), 1500.0);
             }
         }
     }
@@ -31948,7 +31985,7 @@ mod tests {
         );
         assert_eq!(app.workspace.focused(), Some(id));
         assert_eq!(app.workspace.take_widget_focus_request(), None);
-        let _ = app.apply_viewport(update, true, false);
+        let _ = app.apply_viewport(update, true, DurableChange::None);
         assert_ne!(app.workspace.focused(), Some(first));
     }
 
@@ -32164,7 +32201,7 @@ mod tests {
                 }],
             },
             false,
-            false,
+            DurableChange::None,
         ));
         assert_eq!(app.exposure(card), Exposure::Offscreen);
         assert!(Arc::ptr_eq(&held, &app.durable));
@@ -32176,7 +32213,7 @@ mod tests {
         let card = app.workspace.focused().unwrap();
         Arc::make_mut(&mut app.durable).focused = None;
         let held = Arc::clone(&app.durable);
-        drop(app.apply_viewport(ViewportUpdate::unchanged(), false, false));
+        drop(app.apply_viewport(ViewportUpdate::unchanged(), false, DurableChange::None));
         assert_eq!(app.durable.focused, Some(card));
         assert_eq!(held.focused, None);
     }
@@ -32509,7 +32546,7 @@ mod tests {
         let ids: Vec<_> = cards.iter().map(|card| card.id).collect();
         app.durable = Arc::new(WorkspaceState {
             focused: Some(ids[0]),
-            cards,
+            cards: cards.into(),
             ..WorkspaceState::default()
         });
         app.workspace = Cagents::rebuild_workspace(&app.durable);
@@ -32879,7 +32916,8 @@ mod tests {
                 repository(&"A".repeat(20_000_000)),
                 repository("safe\u{202e}gnitiops"),
                 repository("\u{202e}\u{7}"),
-            ],
+            ]
+            .into(),
             ..WorkspaceState::default()
         };
 
@@ -33464,7 +33502,7 @@ mod tests {
         };
         let feature = terminal("/repo/feature");
         let other = terminal("/repo/other");
-        Arc::make_mut(&mut app.durable).cards = vec![feature.clone(), other.clone()];
+        Arc::make_mut(&mut app.durable).cards = vec![feature.clone(), other.clone()].into();
         let rows = &mut app.sidebar_model.projects[0].worktrees;
         rows.extend(["/repo/feature", "/repo/other"].map(|path| {
             SidebarWorktree::from_durable(WorktreeId::new(), path.into(), Some("feature".into()))

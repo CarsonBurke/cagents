@@ -22,6 +22,60 @@ const SELECTOR: &str = "CAGENTS_PAIRED_PROJECTION_SELECTOR";
 const CLIENT: u64 = 7;
 const THREAD: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 
+/// A saved descriptor may predate the provider's durable confirmation. Its
+/// live holder must take ChatStart through adoption before any restart proof.
+#[test]
+fn codex_start_restores_this_boot_holder_found_by_has_native_owner() {
+    if isolated("codex_start_restores_this_boot_holder_found_by_has_native_owner") {
+        return;
+    }
+    let fixture = Fixture::new();
+    let source = fixture
+        .original
+        .previous_sources
+        .iter()
+        .find(|source| !source.native_continuity.retains_provider())
+        .expect("the holder retained its preconfirmation descriptor")
+        .clone();
+    assert!(!source.native_continuity.retains_provider());
+    assert_eq!(
+        source.proof.as_ref().unwrap().boot_id,
+        fixture.proof.boot_id
+    );
+    assert!(crate::host::chat::has_native_owner(&source).unwrap());
+    let ServerResponse::ChatAttached { session, snapshot } = crate::host::chat::process(
+        &fixture.host,
+        CLIENT,
+        ClientRequest::ChatStart {
+            session: source,
+            source: None,
+            terminate_source: false,
+            execution_environment: Default::default(),
+        },
+    )
+    .unwrap() else {
+        panic!("live holder was not restored by ChatStart");
+    };
+    assert_eq!(session.id, fixture.source.id);
+    assert_eq!(session.launch.session_id.as_deref(), Some(THREAD));
+    assert_eq!(snapshot.session_id.as_deref(), Some(THREAD));
+    let actor = fixture.host.lock().unwrap().chats[&session.id]
+        .handle
+        .clone();
+    wait_durable(&actor);
+    fixture.assert_one_provider();
+    // The adopted control stream owns the holder until it is preserved; let
+    // go before opening a separate read-only inspection connection.
+    actor.preserve_for_restart().unwrap();
+    let (recovery, exited) =
+        crate::chat::native_holder::inspect(&fixture.native, &fixture.proof).unwrap();
+    assert!(!exited);
+    assert_eq!(recovery.server_process, fixture.original.server_process);
+    assert_eq!(recovery.server_identity, fixture.original.server_identity);
+    assert!(fixture.native.holder.is_current());
+    assert!(fixture.native.root.is_current());
+}
+
 #[test]
 fn current_projection_rebinds_real_paired_native_owner_without_relaunch() {
     if isolated("current_projection_rebinds_real_paired_native_owner_without_relaunch") {
@@ -129,6 +183,244 @@ fn current_projection_rebinds_real_paired_native_owner_without_relaunch() {
         || !provider.is_current(),
         "ordinary close did not retire original provider",
     );
+}
+
+#[test]
+fn retained_pair_checkpoints_and_reattaches_across_multiple_upgrade_hops() {
+    if std::env::var(MODE).as_deref() == Ok("provider") {
+        return provider();
+    }
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
+    if std::env::var(MODE).as_deref() == Ok("upgrade-hop") {
+        return upgrade_hop();
+    }
+    if isolated("retained_pair_checkpoints_and_reattaches_across_multiple_upgrade_hops") {
+        return;
+    }
+    use crate::process::{CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor};
+    let mut fixture = Fixture::new();
+    // Retain an existing helper journal across real process generations. A
+    // same-process simulation would correctly block upgrade on the original
+    // helper's process-global child-reaper custody.
+    let published = fixture.acknowledged_for_retained_close();
+    let original_holder = fixture.worker.holder_identity().unwrap().clone();
+    let original_terminal = original_holder.root.clone();
+    fs::write(
+        fixture.root.join("terminal-holder.json"),
+        serde_json::to_vec(&original_holder).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        fixture.root.join("issued.json"),
+        serde_json::to_vec(&vec![fixture.source.clone(), published]).unwrap(),
+    )
+    .unwrap();
+    fixture.worker.preserve_for_restart().unwrap();
+    for hop in 1..=3 {
+        drop(fixture.lease.take());
+        let selector = fs::read_to_string(fixture.root.join("test-name")).unwrap();
+        let command = CommandSpec::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                selector.as_str(),
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(MODE, "upgrade-hop")
+            .env("CAGENTS_PAIRED_UPGRADE_HOP", hop.to_string())
+            .timeout(Duration::from_secs(60))
+            .output_limits(1024 * 1024, 1024 * 1024);
+        let result = SystemProcessExecutor.execute(&command, &CancellationToken::new());
+        // Reacquire exact cleanup authority before inspecting a fallible child
+        // result, so Fixture can retire its originals on every failure path.
+        fixture.lease = Some(
+            crate::daemon::HostLease::acquire(
+                &crate::daemon::RuntimePaths::discover().unwrap(),
+                &fixture.proof,
+            )
+            .unwrap(),
+        );
+        let output = result.unwrap();
+        fs::write(
+            fixture.root.join(format!("hop-{hop}.stdout")),
+            &output.stdout,
+        )
+        .unwrap();
+        fs::write(
+            fixture.root.join(format!("hop-{hop}.stderr")),
+            &output.stderr,
+        )
+        .unwrap();
+        assert!(
+            output.success,
+            "upgrade hop {hop} failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+        if hop < 3 {
+            fixture.assert_one_provider();
+            assert!(original_terminal.is_current());
+        }
+    }
+    wait_until(
+        || !fixture.native.root.is_current(),
+        "final close did not retire original provider",
+    );
+    wait_until(
+        || !original_terminal.is_current(),
+        "final close did not retire original paired terminal",
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("provider-launches")).unwrap(),
+        "launch\n"
+    );
+    let requests = fs::read_to_string(fixture.root.join("provider-requests")).unwrap();
+    assert_eq!(
+        requests
+            .lines()
+            .filter(|method| *method == "thread/start")
+            .count(),
+        1
+    );
+    assert!(!requests.lines().any(|method| method.starts_with("turn/")));
+}
+
+fn upgrade_hop() {
+    let root = PathBuf::from(std::env::var_os(ROOT).unwrap());
+    let hop: usize = std::env::var("CAGENTS_PAIRED_UPGRADE_HOP")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mut issued: Vec<Session> =
+        serde_json::from_slice(&fs::read(root.join("issued.json")).unwrap()).unwrap();
+    let mut proof = issued[0].proof.clone().unwrap();
+    proof.host_incarnation = HostIncarnation::new(format!("upgrade-hop-{hop}"));
+    let _lease = crate::daemon::HostLease::acquire(
+        &crate::daemon::RuntimePaths::discover().unwrap(),
+        &proof,
+    )
+    .unwrap();
+    let mut state = HostState::new(proof);
+    state.register_client(0);
+    state.register_client(CLIENT);
+    state.enable_holder_recovery();
+    state.install_model(crate::host::model::Registry::at(&root.join("registry.sqlite3")).unwrap());
+    let host = Arc::new(crate::host::state::HostLock::new(state));
+    if hop == 1 {
+        crate::host::state::restore_orphaned_holders(&host).unwrap();
+        restore(&host, CLIENT, &issued[0]).unwrap();
+    } else {
+        assert!(
+            crate::host::state::restore_upgrade(&host)
+                .unwrap()
+                .is_empty()
+        );
+    }
+    let expected_holder: registry::Record =
+        serde_json::from_slice(&fs::read(root.join("terminal-holder.json")).unwrap()).unwrap();
+    assert_eq!(
+        host.lock().unwrap().terminals[&issued[0].id]
+            .handle
+            .holder_identity(),
+        Some(&expected_holder)
+    );
+    let (published, actor) = {
+        let state = host.lock().unwrap();
+        let record = &state.chats[&issued[0].id];
+        (record.session.clone(), record.handle.clone())
+    };
+    wait_durable(&actor);
+    // Resolve and attach every genuinely issued pane through the public
+    // dispatcher, including the oldest pane left unopened over both upgrades.
+    for source in &issued {
+        let ServerResponse::UpgradeChatResolved { session } = crate::host::client::process_request(
+            &host,
+            CLIENT,
+            ClientRequest::ResolveUpgradeChat {
+                source: source.clone(),
+            },
+        )
+        .unwrap()
+        .0
+        else {
+            panic!("source did not resolve")
+        };
+        assert_eq!(session, published);
+        assert!(crate::chat::is_upgrade_recovery(source, &session));
+        let ServerResponse::ChatAttached { session, snapshot } =
+            crate::host::chat::process(&host, CLIENT, ClientRequest::ChatAttach { session })
+                .unwrap()
+        else {
+            panic!("resolved pane did not attach")
+        };
+        assert_eq!(session, published);
+        assert_eq!(snapshot.session_id.as_deref(), Some(THREAD));
+    }
+    for change in 0..3 {
+        let mut forged = issued[0].clone();
+        match change {
+            0 => forged.launch.session_id = Some("unissued-thread".into()),
+            1 => {
+                forged
+                    .launch
+                    .recipe
+                    .environment
+                    .insert("CODEX_HOME".into(), "/unissued-home".into());
+            }
+            _ => forged
+                .terminal
+                .as_mut()
+                .unwrap()
+                .launch
+                .arguments
+                .push("unissued-option".into()),
+        }
+        assert!(
+            crate::host::client::process_request(
+                &host,
+                CLIENT,
+                ClientRequest::ResolveUpgradeChat { source: forged }
+            )
+            .is_err()
+        );
+    }
+    issued.push(published);
+    if hop == 3 {
+        crate::host::chat::process(
+            &host,
+            CLIENT,
+            ClientRequest::ChatClose {
+                chat_id: issued[0].id,
+            },
+        )
+        .unwrap();
+        return;
+    }
+    let capability = host
+        .lock()
+        .unwrap()
+        .shutdown_preflight(Instant::now())
+        .unwrap()
+        .capability;
+    crate::host::state::prepare_preserving_upgrade(&host, capability, false).unwrap();
+    crate::host::state::finish_upgrade(&host).unwrap();
+    let checkpoint = crate::upgrade::handoff::Store::discover()
+        .unwrap()
+        .load()
+        .unwrap()
+        .unwrap();
+    checkpoint.require_ready().unwrap();
+    for alias in &checkpoint.chats[0].previous_sources {
+        crate::upgrade::handoff::validate_chat_source(&alias.source, &alias.launch).unwrap();
+    }
+    fs::write(
+        root.join("issued.json"),
+        serde_json::to_vec(&issued).unwrap(),
+    )
+    .unwrap();
 }
 
 #[test]
@@ -875,7 +1167,7 @@ struct Fixture {
     terminals: Vec<(TerminalSession, TerminalHandle)>,
     proof: HostSessionProof,
     old_proof: HostSessionProof,
-    _lease: crate::daemon::HostLease,
+    lease: Option<crate::daemon::HostLease>,
     root: PathBuf,
 }
 
@@ -1087,7 +1379,7 @@ impl Fixture {
             terminals: vec![(cleanup_source, worker)],
             proof,
             old_proof,
-            _lease: lease.take().unwrap(),
+            lease: lease.take(),
             root,
         }
     }
@@ -1312,6 +1604,7 @@ fn isolated(name: &str) -> bool {
     // Neither value enters the provider recipe, logs, or a replacement token.
     for (key, _) in std::env::vars_os() {
         if key != std::ffi::OsStr::new(crate::agent_execution::AUTHORITY_ENV)
+            && key != std::ffi::OsStr::new(crate::retained_fixture::OWNER_ENV)
             && key != std::ffi::OsStr::new("CAGENTS_TEST_RETAINED_ACTOR_HELPER")
         {
             command = command.env_remove(key);

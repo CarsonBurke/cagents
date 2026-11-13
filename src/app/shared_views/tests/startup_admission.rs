@@ -943,30 +943,9 @@ fn startup_gate_waits_for_shared_authority_and_requires_offscreen_attachment() {
     let authoritative = model(identity, active, hidden, view);
     let connected = app.apply_workspace_model_update(ModelUpdate::Connected(authoritative.clone()));
     settle(&mut app, connected);
-    assert_eq!(
-        app.startup_pane_check(),
-        Ok(false),
-        "Connected is not SeedView admission"
-    );
-    assert!(daemon.requests().is_empty());
-    let first = app.apply_workspace_model_update(ModelUpdate::ViewApplied {
-        scope: Scope::Channel(active),
-        operation: None,
-        model: authoritative.clone(),
-    });
-    settle(&mut app, first);
-    assert_eq!(
-        app.startup_pane_check(),
-        Ok(false),
-        "hidden scope must also acknowledge"
-    );
-    assert!(daemon.requests().is_empty());
-    let hidden_ack = app.apply_workspace_model_update(ModelUpdate::ViewApplied {
-        scope: Scope::Channel(hidden),
-        operation: None,
-        model: authoritative,
-    });
-    settle(&mut app, hidden_ack);
+    // Exact saved panes already have full authority in Connected. The
+    // authenticated resolution/attachment is still required, and its refusal
+    // below must retain the saved source and fail startup qualification.
     assert_eq!(daemon.requests().len(), 1);
     assert_eq!(daemon.requests()[0].launch, expected.launch);
     assert_eq!(daemon.requests()[0].id, expected.id);

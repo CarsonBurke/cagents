@@ -171,22 +171,8 @@ fn assert_manager_source(app: &Cagents, doc: LspDocumentId, text: &str) {
 }
 
 fn restart_action(app: &Cagents, card: CardId) -> InspectorAction {
-    inspector::with_lsp(
-        inspector::InspectorModel {
-            card_id: card,
-            title: "Independent cloned editor".into(),
-            kind: "Repository",
-            sections: Vec::new(),
-            actions: Vec::new(),
-        },
-        card,
-        app.lsp_context(card).unwrap(),
-    )
-    .actions
-    .into_iter()
-    .find(|action| action.message == InspectorAction::RestartLanguageServer(card))
-    .expect("the ordinary inspector exposes recovery")
-    .message
+    inspector::restart_action(card, app.lsp_context(card).unwrap())
+        .expect("the Problems section exposes recovery")
 }
 
 fn assert_blocked(app: &Cagents, card: CardId, owner: CardId, doc: LspDocumentId) {

@@ -7,8 +7,10 @@
 # used for a week, and native-evidence builds unused for half a day. Below
 # twice the floor it starts it at once, still in the background, and it also
 # removes removed workspaces' build directories without their usual grace
-# period, and native-evidence builds unused for an hour. Below the floor itself the build waits
-# for it, within a budget, then is refused if there is still too little
+# period, and native-evidence builds unused for an hour. Each of those runs
+# first has cargo-offload bound the offload build slots no lease holds, which
+# the pruner leaves to the leases. Below the floor itself the build waits
+# for both, within a budget, then is refused if there is still too little
 # room, so it fails with an explanation instead of filling the disk that
 # other builds, agents and their logs share. A guard that cannot tell how
 # much room there is lets the build run.
@@ -24,6 +26,13 @@ with an explanation, when it is below the floor even after reclaiming
 unused build directories with prune-build-dirs. Every
 CAGENTS_BUILD_PRUNE_INTERVAL_HOURS, or every hour below twice the floor, it
 also starts the pruner in the background.
+
+With the default pruner, each of its runs first has cargo-offload beside
+this guard trim this host's offload build slots that no lease holds, under
+their leases' locks, to the bound their leases keep
+(CAGENTS_BUILD_REMOTE_INCREMENTAL_GIB); a background run's goes in the
+pruner state's .slots.log. Below the floor, the build also waits, within
+the budget, for that trim and the removal of what it moved out.
 
 Environment:
   CAGENTS_BUILD_FREE_FLOOR_GIB  Free space below which builds are refused;
@@ -46,8 +55,12 @@ Environment:
                                 default: ~/.cache and ~/.local/state of the
                                 account's home and of HOME, and /var/tmp.
   CAGENTS_BUILD_PRUNE_STATE     Prefix of the pruner's schedule, lock, last
-                                output (.log) and removals (.tsv); default:
+                                output (.log), removals (.tsv) and slot trim
+                                (.slots.log); default:
                                 /var/tmp/cagents-prune-build-dirs-UID.
+  CAGENTS_BUILD_OFFLOAD_SLOTS   Directory of offload slots to trim; default:
+                                ~/.cache/cagents-offload of the account's
+                                home. Empty trims none.
 EOF
 }
 
@@ -115,7 +128,7 @@ prune=${CAGENTS_BUILD_PRUNE:-}
 urgent='--orphan-hours 0 --evidence-hours 1'
 # The pruner beside this guard can also run detached; a command given as
 # CAGENTS_BUILD_PRUNE runs only before a build, below twice the floor.
-pruner=
+pruner= offload=
 if [ -z "$prune" ] && [ -x "$here/prune-build-dirs" ]; then
     pruner="$(quote "$here/prune-build-dirs") --apply --max-idle $idle"
     pruner="$pruner --lock $(quote "$pruner_state.lock") --log $(quote "$pruner_state.tsv")"
@@ -133,6 +146,10 @@ if [ -z "$prune" ] && [ -x "$here/prune-build-dirs" ]; then
     # Out of room, a removed workspace's build directory goes at once, and
     # the build waits for the pruner, or one already running, only so long.
     prune="$pruner $urgent --budget $budget --wait"
+    # The pruner leaves the offload build slots here to their leases, which
+    # bound each slot as they take it. Those no lease holds now are trimmed
+    # the same way, under their leases' locks, by the helper beside this.
+    [ ! -x "$here/cargo-offload" ] || offload=$(quote "$here/cargo-offload")
 fi
 
 # Starts the pruner, with the arguments after the first three, detached and
@@ -156,6 +173,13 @@ detach() {
         exec </dev/null >/dev/null 2>&1
         command -v ionice >/dev/null 2>&1 && ionice="ionice $class" || ionice=
         command -v setsid >/dev/null 2>&1 && setsid=setsid || setsid=
+        # Beside the pruner, not before it: this shell then holds nothing
+        # of the build's for longer than it did, and the trim closes what
+        # it inherited as it starts.
+        if [ -n "$offload" ]; then
+            eval "exec $setsid nice -n $niceness $ionice $offload --trim-slots $floor" \
+                >"$pruner_state.slots.log" 2>&1 &
+        fi
         eval "exec $setsid nice -n $niceness $ionice $pruner --output $(quote "$pruner_state.log") $*"
     ) &
 }
@@ -203,7 +227,23 @@ if [ -n "$prune" ] && open7 "$state"; then
             printf '%s: %s GiB free on %s; reclaiming unused build directories\n' \
                 "$program" "$free" "$directory" >&2
             # A failed reclaim leaves the decision to the free space below.
+            # Idle offload slots are trimmed beside it, within the same budget.
+            trimming=
+            if [ -n "$offload" ]; then
+                # Without timeout, nothing bounds a wait, so it runs on its
+                # own like the scheduled one.
+                if command -v timeout >/dev/null 2>&1; then
+                    eval "timeout $budget $offload --trim-slots $floor --wait" >&2 &
+                    trimming=$!
+                else
+                    (
+                        exec </dev/null >>"$pruner_state.slots.log" 2>&1 7>&-
+                        eval "exec $offload --trim-slots $floor"
+                    ) &
+                fi
+            fi
             sh -c "$prune" >&2 || :
+            [ -z "$trimming" ] || wait "$trimming" || :
             touch -- "$state.done" 2>/dev/null || :
         fi
         exec 7>&-

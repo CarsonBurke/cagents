@@ -44,6 +44,22 @@ persistence evidence is complete. A missing final-flush record leaves that
 claim unknown; failed final persistence or settings makes it false. Inspect
 `persistence`/`final_flush` for the classified outcome.
 
+When storage refuses a write by construction (one that can only fail the same
+way again, so the window sets it aside), a `storage_refused` record names what
+was refused (`write`: workspace, pane, relaunched terminal, new conversation,
+project or worktree), its card, project or worktree `id`, and the `check` it
+broke. The check is static text: the template storage's own rule was written
+with, each interpolated value shown as `…`, or a SQLite constraint kind with
+its schema identifiers only, never a trigger message or `CHECK` expression. It
+is at most 160 bytes without control characters, and a record with more is
+invalid. A subject is recorded on its first refusal and again only when it is
+refused for a different rule, so repeated edits of one refused pane do not
+flood the ring. The human report lists the three newest distinct refusals, with
+how often each was recorded, and counts the rest; like the failure line they
+are historical, because the subject may have saved since. A reader older than
+this event cannot parse these records and reports that product's evidence as
+unreadable rather than guessing.
+
 JSON reports contain up to 256 redacted recent records per product and a
 `last_observed` summary for the most recently recorded run. Versions, protocol,
 and health are **last observed**, not live sibling executable or process checks.

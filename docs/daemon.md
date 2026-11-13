@@ -38,9 +38,12 @@ that an update superseded it. The daemon answers that CLI in its protocol's
 version. It refuses requests to stop, update or hand off the daemon, and requests whose
 reply the CLI couldn't read, such as `automation history`, `automation run` and
 `automation run-now` on protocols before 156. It withholds notifications the CLI couldn't read.
+What a later protocol only added detail to is sent as the CLI knew it: on
+protocols before 166, a subagent waiting on its own background work reads as
+running.
 Each protocol's postcard wire format is recorded under
 `tests/fixtures/wire-formats/`. A test checks that every listed older protocol
-encodes the same way, except for what is refused or withheld. It checks
+encodes the same way, except for what is refused, withheld or restated. It checks
 encoding, not meaning, and not JSON carried as text inside a message.
 
 When a daemon takes the runtime lease, it points `bin` in its runtime
@@ -87,12 +90,14 @@ cagents daemon stop --confirm
 | `ui [--new-window \| --window NAME]` | Launch the UI, open another window, or open a named window |
 | `daemon start` | Start the daemon if it is not already running |
 | `daemon status` | Report whether the daemon runs, with `cli_version` and `daemon_version` |
-| `daemon upgrade [--yes] [--interrupt] [--accept-unreopenable]` | Review a staged installation, save windows, replace the service when needed, and wait for completion |
+| `daemon upgrade [--yes] [--interrupt]` | Review a staged installation, save windows, replace the service when needed, and wait for completion |
 | `daemon stop` | Request daemon termination (see below) |
 | `daemon preflight` | Print a short-lived shutdown capability for `daemon stop --confirm` |
 | `daemon prepare-upgrade --yes` | Checkpoint resumable sessions and stop for a full upgrade |
 | `daemon abandon-upgrade --yes` | Archive an interrupted upgrade checkpoint without resuming it |
 | `daemon protocol-version` | Print this executable's wire protocol version without contacting a daemon |
+| `daemon store-schema` | Print the shared workspace store's schema on disk, or nothing if there is none; refuses while a daemon runs |
+| `daemon downgrade-store SCHEMA` | Convert the shared workspace store back to an older schema for an older release; refuses while a daemon runs |
 | `terminal list`, `spawn`, `write`, `close`, `snapshot`, `wait` | Inspect and drive daemon-hosted terminals |
 | `project open`, `list`, `close` | Manage the projects every window shares, with or without a window running |
 | `channel spawn`, `list`, `close` | Manage the channels every window shares |
@@ -189,14 +194,28 @@ launches and automation prechecks must settle first. Changed ownership or impact
 requires a fresh confirmation. The final check also waits behind previously
 accepted provider commands, so a queued prompt cannot masquerade as idle.
 
-`daemon upgrade` uses this same worker and confirmation. `--yes` skips the
+`daemon upgrade` uses the served candidate's worker and this same confirmation.
+The candidate drives qualified source daemons through a frozen lifecycle subset:
+protocol 156 (the `991daa43e` desktop build) and the matched current protocol 166.
+Other source protocols, including 160 and 165, are refused before preparation,
+shutdown or checkpoint changes. Use a cold installation instead: finish and close
+hosted sessions, quit every window, then use the installed build's matching CLI
+to run `cagents --no-start daemon stop --require-empty`. Confirm that its
+`cagents --no-start daemon status` reports stopped, run the verified installer
+without `--restart-daemon`, and reopen the application. For a newer service,
+choose a newer release. The update is never handed to an older build's worker.
+`--yes` skips the
 interactive prompt; `--interrupt` additionally permits native turn interruption.
-`--accept-unreopenable` carries saved panes whose ended actor never recorded
-its conversation; they stay in their windows without reopening it.
-It does not grant approval for a different inventory discovered afterward.
+Saved panes that cannot reconnect reopen stopped, with a reason and a recovery
+action in the review. A changed inventory requires another review.
 Unsaved window work blocks replacement, and failures remain visible in the
 application's update state. A compatible update closes and reopens windows
 without replacing the daemon or recovering sessions.
+
+Recovery windows first attach saved panes to existing work or display retained
+history, without starting replacement providers. Once startup finishes, new
+terminals and later reconnects use ordinary daemon startup behavior. Initial
+restores already in progress retain their attachment-only intent.
 
 ## Full daemon upgrades
 
@@ -336,6 +355,33 @@ version and starts its daemon against the durable handoff. A replacement startup
 failure rolls back only when its status proves it stopped; if startup state is
 ambiguous, the installer keeps the new installation and recovery state rather
 than risk a second writer. Inspect `cagents daemon status` before retrying.
+
+A replacement daemon that started may already have converted the shared
+workspace store (`workspace-model.sqlite3`) to a newer schema, which the
+previous daemon refuses to open. Once the previous daemon has stopped and
+before the replacement starts, the installer records the store's schema with
+the replacement's `cagents daemon store-schema`; that is the schema the
+previous daemon reads. A rollback then runs the replacement's
+`cagents daemon downgrade-store <schema>` (schema 22 for a store the
+replacement created), which converts the store back in one transaction,
+keeping every view, pane, retired id and applied pane change. Both commands
+run the matched `cagentsd --stored-schema` or `--downgrade-store`, and both
+refuse while a daemon runs.
+
+The installer only asks through the replacement's command line, and only when
+its `--help` shows these commands. It never gives a daemon an option it may
+not know: released daemons through v0.1.3 ignore their arguments and would start
+serving. A replacement without the commands predates every store downgrade a
+release ships, so the installer neither records the schema nor converts
+anything back.
+
+Installing an older release on purpose is not a rollback: its daemon cannot
+open a store a newer release converted, and runs without the shared model
+until the newer release is back. To keep it, stop the daemon and run the
+newer release's `cagents daemon downgrade-store SCHEMA` first, with the
+schema the older release reads (22 for releases before the conversion). If the schema cannot be read, the installation is not changed; if the
+conversion fails, the installer keeps the new installation, which reads the
+store, rather than restore a daemon that cannot.
 
 A retained native conversation that its provider refuses to reattach, for
 example because Codex no longer finds the thread's rollout in its account

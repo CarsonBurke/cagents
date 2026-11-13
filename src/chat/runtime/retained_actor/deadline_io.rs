@@ -101,22 +101,55 @@ pub(super) fn receive_until<T: DeserializeOwned>(
     control: &UnixStream,
     deadline: Instant,
 ) -> Result<T, String> {
-    remaining(deadline)?;
-    control
-        .set_nonblocking(true)
-        .map_err(|error| error.to_string())?;
-    let mut header = [0; 4];
-    read_exact_until(control, &mut header, deadline)?;
-    let size = u32::from_le_bytes(header) as usize;
-    if size > super::MAX_FRAME {
-        return Err("Retained actor frame exceeds the bounded protocol capacity".into());
-    }
-    let mut bytes = vec![0; size];
-    read_exact_until(control, &mut bytes, deadline)?;
+    let bytes = receive_bytes_until(control, deadline)?;
     remaining(deadline)?;
     let value = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
     remaining(deadline)?;
     Ok(value)
+}
+
+pub(super) fn receive_bytes_until(
+    control: &UnixStream,
+    deadline: Instant,
+) -> Result<Vec<u8>, String> {
+    remaining(deadline)?;
+    control.set_nonblocking(true).map_err(|e| e.to_string())?;
+    let mut header = [0; 4];
+    read_exact_until(control, &mut header, deadline)?;
+    let size = u32::from_le_bytes(header) as usize;
+    if size == 0 || size > super::MAX_FRAME {
+        return Err("Retained actor frame exceeds the bounded protocol capacity".into());
+    }
+    let mut bytes = vec![0; size];
+    read_exact_until(control, &mut bytes, deadline)?;
+    Ok(bytes)
+}
+pub(super) fn send_binary_until(
+    control: &UnixStream,
+    value: &impl Serialize,
+    deadline: Instant,
+) -> Result<(), String> {
+    struct Bounded(Vec<u8>);
+    impl Write for Bounded {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > super::MAX_FRAME.saturating_sub(self.0.len()) {
+                return Err(std::io::Error::other(
+                    "Retained binary frame exceeds capacity",
+                ));
+            }
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    remaining(deadline)?;
+    let mut bytes = Bounded(Vec::new());
+    postcard::to_io(value, &mut bytes).map_err(|e| e.to_string())?;
+    control.set_nonblocking(true).map_err(|e| e.to_string())?;
+    write_exact_until(control, &(bytes.0.len() as u32).to_le_bytes(), deadline)?;
+    write_exact_until(control, &bytes.0, deadline)
 }
 
 #[cfg(test)]

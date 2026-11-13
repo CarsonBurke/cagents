@@ -398,6 +398,175 @@ mod tests {
     }
 
     #[test]
+    fn pointer_opens_and_activates_folders_before_between_and_after_actions() {
+        use widget::menu::Item;
+
+        #[derive(Default)]
+        struct TextBounds(Vec<(String, Rectangle)>);
+        impl Operation for TextBounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&Id>, bounds: Rectangle, text: &str) {
+                self.0.push((text.to_owned(), bounds));
+            }
+        }
+
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let window = Size::new(1400.0, 900.0);
+        let viewport = Rectangle::with_size(window);
+        let anchor = Point::new(70.0, 108.0);
+        for folder_index in [0, 2, 5] {
+            for over_arrow in [false, true] {
+                let case = format!("folder index {folder_index}, arrow {over_arrow}");
+                let mut entries = vec![
+                    Item::Button("New terminal".to_owned(), None, RowAction(1)),
+                    Item::Button("New worktree".to_owned(), None, RowAction(2)),
+                    Item::Divider,
+                    Item::Button("Copy path".to_owned(), None, RowAction(3)),
+                    Item::Button("Remove project".to_owned(), None, RowAction(4)),
+                ];
+                entries.insert(
+                    folder_index,
+                    Item::Folder(
+                        "Worktrees in sidebar".to_owned(),
+                        ["Use default (Grouped)", "Grouped", "Expanded", "Hidden"]
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, label)| {
+                                Item::CheckBox(
+                                    label.to_owned(),
+                                    None,
+                                    index == 0,
+                                    RowAction(10 + index),
+                                )
+                            })
+                            .collect(),
+                    ),
+                );
+                let mut element = surface(widget::menu::items(
+                    &std::collections::HashMap::new(),
+                    entries,
+                ));
+                let widget = element.as_widget_mut();
+                let mut tree = Tree::new(&*widget);
+                widget.diff(&mut tree);
+                let row = widget.layout(&mut tree, &renderer, &layout::Limits::new(window, window));
+                let mut messages = Vec::new();
+                widget.update(
+                    &mut tree,
+                    &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)),
+                    Layout::new(&row),
+                    mouse::Cursor::Available(anchor),
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &viewport,
+                );
+                let mut popup = widget
+                    .overlay(
+                        &mut tree,
+                        Layout::new(&row),
+                        &renderer,
+                        &viewport,
+                        Vector::ZERO,
+                    )
+                    .expect("right click opens the native menu");
+                let initial = popup.as_overlay_mut().layout(&renderer, window);
+                popup.as_overlay_mut().update(
+                    &Event::Window(window::Event::RedrawRequested(Instant::now())),
+                    Layout::new(&initial),
+                    mouse::Cursor::Available(anchor),
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                );
+                let measured = popup.as_overlay_mut().layout(&renderer, window);
+                let mut texts = TextBounds::default();
+                popup
+                    .as_overlay_mut()
+                    .operate(Layout::new(&measured), &renderer, &mut texts);
+                let label = texts
+                    .0
+                    .iter()
+                    .find(|(text, _)| text == "Worktrees in sidebar")
+                    .expect("folder label is visible")
+                    .1;
+                let folder = Layout::new(&measured)
+                    .children()
+                    .next()
+                    .expect("root menu")
+                    .children()
+                    .nth(folder_index)
+                    .expect("folder row")
+                    .bounds();
+                let pointer = if over_arrow {
+                    Point::new(folder.x + folder.width - 24.0, folder.center_y())
+                } else {
+                    label.center()
+                };
+                assert!(
+                    folder.contains(pointer),
+                    "{case}: {pointer:?} outside {folder:?}"
+                );
+                // Match an absolute native pointer move, without clicking the folder.
+                popup.as_overlay_mut().update(
+                    &Event::Mouse(mouse::Event::CursorMoved { position: pointer }),
+                    Layout::new(&measured),
+                    mouse::Cursor::Available(pointer),
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                );
+                let measured = popup.as_overlay_mut().layout(&renderer, window);
+                let mut texts = TextBounds::default();
+                popup
+                    .as_overlay_mut()
+                    .operate(Layout::new(&measured), &renderer, &mut texts);
+                let hidden = texts
+                    .0
+                    .iter()
+                    .find(|(text, _)| text == "Hidden")
+                    .unwrap_or_else(|| panic!("{case}: hover did not open submenu: {:?}", texts.0))
+                    .1
+                    .center();
+                assert!(
+                    messages.is_empty(),
+                    "{case}: hover must not activate an action"
+                );
+                for event in [
+                    mouse::Event::CursorMoved { position: hidden },
+                    mouse::Event::ButtonPressed(mouse::Button::Left),
+                    mouse::Event::ButtonReleased(mouse::Button::Left),
+                ] {
+                    popup.as_overlay_mut().update(
+                        &Event::Mouse(event),
+                        Layout::new(&measured),
+                        mouse::Cursor::Available(hidden),
+                        &renderer,
+                        &mut clipboard::Null,
+                        &mut Shell::new(&mut messages),
+                    );
+                }
+                drop(popup);
+                assert_eq!(messages, [13], "{case}: click dispatches the child action");
+                assert!(
+                    widget
+                        .overlay(
+                            &mut tree,
+                            Layout::new(&row),
+                            &renderer,
+                            &viewport,
+                            Vector::ZERO,
+                        )
+                        .is_none(),
+                    "{case}: activating the child closes the menu"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn keyboard_menu_selects_enabled_actions_without_pointer_motion() {
         use cosmic::iced::keyboard::{self, key::Named};
         let renderer = crate::ui_controls::accessibility_probe::headless_renderer();

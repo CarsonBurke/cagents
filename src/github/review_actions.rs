@@ -260,7 +260,7 @@ mod tests {
         assert!(result.pull_requests.is_empty());
         assert!(result.next_cursor.is_none());
         assert!(
-            crate::github::polling::ready(&repo.host, false),
+            crate::github::polling::ready(&repo.authority(), false),
             "an answered lookup must not pause polling for the host"
         );
     }
@@ -328,6 +328,6 @@ mod tests {
                 .is_err(),
             "a renamed or inaccessible repository is not an empty result"
         );
-        crate::github::polling::succeeded(&repo.host);
+        crate::github::polling::succeeded(&repo.authority());
     }
 }

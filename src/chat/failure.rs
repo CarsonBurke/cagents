@@ -247,7 +247,7 @@ impl<'a> Failure<'a> {
         let (mut summary, action) = match kind {
             FailureKind::AccountLimit => (
                 format!("{name} {} limit reached", limit_name(reached)),
-                "Wait for the reported reset or choose another account.",
+                limit_action(limit_name(reached)),
             ),
             FailureKind::Authentication => (
                 format!("{name} sign-in needs attention"),
@@ -416,17 +416,40 @@ fn reached_limit(signal: &str) -> Option<&str> {
 }
 
 /// The name a summary gives a reached limit: a plain name of at most three
-/// words, such as "weekly" or "Opus", or else "usage".
+/// words, such as "weekly", "Opus" or "Fable 5.2", or else "usage".
 fn limit_name(reached: Option<&str>) -> &str {
     reached
         .filter(|name| {
             !name.is_empty()
                 && name.split(' ').count() <= 3
-                && name
-                    .split(' ')
-                    .all(|word| !word.is_empty() && word.chars().all(|c| c.is_ascii_alphabetic()))
+                && name.split(' ').all(|word| {
+                    !word.is_empty()
+                        && (word.chars().all(|c| c.is_ascii_alphabetic()) || is_version(word))
+                })
         })
         .unwrap_or("usage")
+}
+
+/// Whether `word` is a model version, such as "5" or "5.2".
+fn is_version(word: &str) -> bool {
+    word.split('.')
+        .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+/// What to do about the limit `limit_name` named. Claude names a model's
+/// limit by the model, capitalized - "Opus limit", "Fable limit" - and an
+/// account's in lower case - "weekly limit", "5-hour limit". A model's limit
+/// leaves the account's other models usable, and Fable's can be cleared at
+/// once with a Fable reset, which Claude Code offers through `/limit-reset`.
+fn limit_action(limit: &str) -> &'static str {
+    let model = limit.split(' ').next().unwrap_or_default();
+    if model.eq_ignore_ascii_case("fable") {
+        "Choose another model or account, or wait for the reported reset. If this account has a Fable reset, /limit-reset in a Claude Code terminal clears the Fable limit now."
+    } else if model.starts_with(|c: char| c.is_ascii_uppercase()) {
+        "Choose another model or account, or wait for the reported reset."
+    } else {
+        "Wait for the reported reset or choose another account."
+    }
 }
 
 /// Keep the actual provider message's reported clock/date/zone rather than
@@ -730,6 +753,14 @@ mod tests {
                 "Claude monthly spend limit reached · resets Dec 1",
             ),
             (
+                "You've hit your Fable limit · resets Nov 15, 8am (America/Vancouver)",
+                "Claude Fable limit reached · resets Nov 15, 8am (America/Vancouver)",
+            ),
+            (
+                "Agent terminated early due to an API error: You've hit your Fable 5.2 limit · resets Nov 15, 8am (America/Vancouver) (error type rate_limit, HTTP 429, request id req_012, model sent to the API: claude-fable-5-2)",
+                "Claude Fable 5.2 limit reached · resets Nov 15, 8am (America/Vancouver)",
+            ),
+            (
                 "You've hit your channel's monthly spend limit.",
                 "Claude usage limit reached",
             ),
@@ -782,6 +813,35 @@ mod tests {
         );
         let opus = Failure::parse(Provider::Claude, "You've hit your Opus limit · resets 3pm");
         assert_ne!(weekly.unwrap().key, opus.unwrap().key);
+    }
+
+    /// A model's limit leaves the account's other models usable, and only
+    /// Fable's can be cleared with a Fable reset; an account's limit leaves
+    /// waiting or another account.
+    #[test]
+    fn a_reached_limit_suggests_what_it_leaves_open() {
+        let action = |raw: &str| Failure::parse(Provider::Claude, raw).unwrap().action;
+        for raw in [
+            "You've hit your Fable limit · resets Nov 15, 8am",
+            "You've hit your Fable 5.2 limit · resets Nov 15, 8am",
+        ] {
+            assert!(action(raw).contains("/limit-reset"), "{raw}");
+            assert!(action(raw).contains("another model"), "{raw}");
+        }
+        let opus = action("You’ve hit your Opus limit · resets 3pm");
+        assert!(opus.contains("another model"));
+        assert!(!opus.contains("/limit-reset"));
+        for raw in [
+            "You've hit your weekly limit · resets Nov 8, 8am (America/Vancouver)",
+            "You've hit your limit · resets 2:30pm",
+            "You've hit your 5-hour limit · resets 2:30pm",
+        ] {
+            assert_eq!(
+                action(raw),
+                "Wait for the reported reset or choose another account.",
+                "{raw}"
+            );
+        }
     }
 
     #[test]

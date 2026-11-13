@@ -203,6 +203,23 @@ pub(super) struct Source {
     columns: u16,
 }
 
+#[cfg(test)]
+thread_local! {
+    static CAPTURE_BUDGET: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn with_capture_budget<T>(budget: usize, action: impl FnOnce() -> T) -> T {
+    struct Reset(Option<usize>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            CAPTURE_BUDGET.set(self.0);
+        }
+    }
+    let _reset = Reset(CAPTURE_BUDGET.replace(Some(budget)));
+    action()
+}
+
 impl History {
     /// Captures the current active screen before carry switches to primary.
     /// The budget accounts for owned capacities, including indices and styles.
@@ -211,6 +228,8 @@ impl History {
         _base: &RenderSnapshot,
         budget: usize,
     ) -> Result<Self, String> {
+        #[cfg(test)]
+        let budget = CAPTURE_BUDGET.get().unwrap_or(budget);
         let scroll = terminal.scrollbar().map_err(|e| e.to_string())?;
         let height = scroll.len.max(1);
         let mut visual = VisualResources::new().map_err(|e| e.to_string())?;

@@ -38,7 +38,40 @@ pub(super) struct Prepared {
     disposed: Option<std::sync::mpsc::Sender<std::thread::ThreadId>>,
 }
 impl Prepared {
-    pub(super) fn prepare(reading: Coordination, cancelled: &AtomicBool) -> Result<Self, String> {
+    /// The pull requests the texts this card parses link to.
+    pub(super) fn links(&self) -> Vec<crate::github_identity::PullRequestKey> {
+        let reading = &self.reading;
+        let prompts: Vec<&str> = match &reading.kind {
+            Kind::Message(message) => message.body.inline().into_iter().collect(),
+            Kind::Spawn(spawn) => std::iter::once(spawn.brief.as_str())
+                .chain(
+                    spawn
+                        .agents
+                        .iter()
+                        .filter_map(|agent| agent.prompt.inline()),
+                )
+                .collect(),
+            Kind::Act(_) => Vec::new(),
+        };
+        prompts
+            .into_iter()
+            .chain(
+                reading
+                    .outcome
+                    .messages
+                    .iter()
+                    .map(|message| message.body.as_str()),
+            )
+            .chain(reading.outcome.run.iter().map(|run| run.result.as_str()))
+            .flat_map(super::pull_request_links::named)
+            .collect()
+    }
+
+    pub(super) fn prepare(
+        reading: Coordination,
+        labels: &Arc<super::pull_request_links::Labels>,
+        cancelled: &AtomicBool,
+    ) -> Result<Self, String> {
         let check = || {
             if cancelled.load(Ordering::Relaxed) {
                 Err("Message loading was cancelled.".to_owned())
@@ -51,7 +84,7 @@ impl Prepared {
         PREPARATIONS.with(|count| count.set(count.get() + 1));
         let parse = |text: &str| {
             check()?;
-            Ok(markdown::Content::parse(text))
+            Ok(markdown::Content::parse_labelled(text, labels.clone()))
         };
         let inline = |text: &Text| text.inline().map(parse).transpose();
         let prompts = match &reading.kind {
@@ -110,7 +143,7 @@ impl Prepared {
     }
     #[cfg(test)]
     pub(super) fn new(reading: Coordination) -> Self {
-        Self::prepare(reading, &AtomicBool::new(false)).unwrap()
+        Self::prepare(reading, &Arc::default(), &AtomicBool::new(false)).unwrap()
     }
     pub(super) fn contents(&self) -> impl Iterator<Item = &markdown::Content> {
         self.prompts
@@ -576,6 +609,8 @@ enum Tone {
 enum BackgroundState {
     Working,
     Waiting,
+    /// Alive, with its result so far delivered: nothing is asked of anyone.
+    OnBackgroundWork,
     Failed,
     Stopped,
     Finished,
@@ -586,6 +621,7 @@ impl BackgroundState {
         match self {
             Self::Working => "Working",
             Self::Waiting => "Waiting for you",
+            Self::OnBackgroundWork => "Waiting on background work",
             Self::Failed => "Failed",
             Self::Stopped => "Stopped",
             Self::Finished => "Finished",
@@ -595,6 +631,7 @@ impl BackgroundState {
     fn tool_status(self) -> ToolStatus {
         match self {
             Self::Working | Self::Waiting => ToolStatus::Running,
+            Self::OnBackgroundWork => ToolStatus::Waiting,
             Self::Failed => ToolStatus::Failed,
             Self::Stopped => ToolStatus::Stopped,
             Self::Finished => ToolStatus::Succeeded,
@@ -863,6 +900,7 @@ impl Runtime {
             .filter(|_| matches!(status, ToolStatus::Running | ToolStatus::Succeeded))
         {
             Some(BackgroundState::Waiting) => muted_glyph(Icon::AgentWaiting),
+            Some(BackgroundState::OnBackgroundWork) => muted_glyph(Icon::AgentBackground),
             Some(state) => self.card_indicator(state.tool_status(), Icon::Agent),
             None => self.card_indicator(status, Icon::Agent),
         };
@@ -1018,6 +1056,8 @@ impl Runtime {
             Some(BackgroundState::Waiting)
         } else if any(ToolStatus::Running) {
             Some(BackgroundState::Working)
+        } else if any(ToolStatus::Waiting) {
+            Some(BackgroundState::OnBackgroundWork)
         } else if any(ToolStatus::Failed) {
             Some(BackgroundState::Failed)
         } else if any(ToolStatus::Stopped) || any(ToolStatus::Denied) {

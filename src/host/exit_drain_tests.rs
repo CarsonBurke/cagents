@@ -22,6 +22,67 @@ const ROOT: &str = "CAGENTS_EXIT_DRAIN_TEST_ROOT";
 const TEST: &str = "CAGENTS_EXIT_DRAIN_TEST_NAME";
 const SCOPE: &str = "CAGENTS_EXIT_DRAIN_INHERITED_SCOPE";
 static READY: OnceLock<mpsc::Sender<Result<SharedHost, String>>> = OnceLock::new();
+static STARTUP: OnceLock<std::sync::Mutex<StartupObservation>> = OnceLock::new();
+
+struct StartupObservation {
+    began: Instant,
+    phase: &'static str,
+    changed: Instant,
+    executable_bytes: Option<u64>,
+    error: Option<String>,
+}
+
+pub(super) fn observe_startup(phase: &'static str, error: Option<&str>) {
+    let Some(observation) = STARTUP.get() else {
+        return;
+    };
+    let mut observation = observation.lock().unwrap_or_else(|p| p.into_inner());
+    observation.phase = phase;
+    observation.changed = Instant::now();
+    if let Some(error) = error {
+        observation.error = Some(error.chars().take(4096).collect());
+    }
+}
+
+fn startup_diagnostic() -> String {
+    let mut diagnostic = match STARTUP.get() {
+        Some(observation) => {
+            let observation = observation.lock().unwrap_or_else(|p| p.into_inner());
+            format!(
+                "startup phase={} total={:?} phase_elapsed={:?} executable_bytes={:?} error_before_cleanup={:?}\n",
+                observation.phase,
+                observation.began.elapsed(),
+                observation.changed.elapsed(),
+                observation.executable_bytes,
+                observation.error,
+            )
+        }
+        None => "startup observer not registered\n".into(),
+    };
+    // Only this private fixture process is inspected. Bound diagnostics even
+    // if a failing service unexpectedly creates many threads.
+    if let Ok(tasks) = fs::read_dir("/proc/self/task") {
+        let mut tasks = tasks.filter_map(Result::ok).take(128).collect::<Vec<_>>();
+        tasks.sort_by_key(|entry| entry.file_name());
+        for task in tasks {
+            let read = |name| {
+                fs::read_to_string(task.path().join(name))
+                    .unwrap_or_else(|error| error.to_string())
+                    .trim()
+                    .chars()
+                    .take(128)
+                    .collect::<String>()
+            };
+            diagnostic.push_str(&format!(
+                "thread={} comm={} wchan={}\n",
+                task.file_name().to_string_lossy(),
+                read("comm"),
+                read("wchan"),
+            ));
+        }
+    }
+    diagnostic
+}
 
 pub(super) fn observe_ready(host: &SharedHost) {
     if let Some(ready) = READY.get() {
@@ -327,10 +388,25 @@ fn run_host() -> (
 ) {
     let (ready, observed) = mpsc::channel();
     READY.set(ready.clone()).unwrap();
+    let now = Instant::now();
+    STARTUP
+        .set(std::sync::Mutex::new(StartupObservation {
+            began: now,
+            phase: "acquire daemon admission",
+            changed: now,
+            executable_bytes: std::env::current_exe()
+                .and_then(fs::metadata)
+                .ok()
+                .map(|metadata| metadata.len()),
+            error: None,
+        }))
+        .unwrap_or_else(|_| panic!("startup observer already registered"));
     // A real private launch fence/HostLease is acquired; no daemon guard is
     // fabricated and no process-wide authority marker is removed or changed.
     let admission = DaemonAdmission {
+        lease: None,
         _guard: crate::instance::DaemonAdmissionGuard::acquire().unwrap(),
+        retirement_owned_by_updater: false,
     };
     let (complete, completion) = mpsc::channel();
     let thread = thread::spawn(move || {
@@ -346,7 +422,13 @@ fn run_host() -> (
     });
     let host = observed
         .recv_timeout(Duration::from_secs(8))
-        .expect("actual host::run ready");
+        .unwrap_or_else(|error| {
+            let diagnostic = startup_diagnostic();
+            if let Some(root) = std::env::var_os(ROOT) {
+                let _ = fs::write(PathBuf::from(root).join("startup-timeout.txt"), &diagnostic);
+            }
+            panic!("actual host::run ready: {error}; {diagnostic}");
+        });
     let host = match host {
         Ok(host) => host,
         Err(error) => {

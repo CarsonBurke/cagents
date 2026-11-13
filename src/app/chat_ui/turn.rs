@@ -207,6 +207,7 @@ impl Turn {
             Some(ToolStatus::Failed) => self.summary.push_str(" · failed"),
             Some(ToolStatus::Denied) => self.summary.push_str(" · denied"),
             Some(ToolStatus::Stopped) => self.summary.push_str(" · stopped"),
+            Some(ToolStatus::Waiting) => self.summary.push_str(" · waiting on background work"),
             Some(ToolStatus::Running) | Some(ToolStatus::Succeeded) | None => {}
         }
     }

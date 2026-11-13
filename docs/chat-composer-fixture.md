@@ -93,10 +93,29 @@ optional fixture behaviors are switched on by files in
 reply and error files are read for every prompt; the others take effect from
 the provider's next start.
 
+To reproduce resume branching, write an earlier main record's UUID to
+`fixture-resume-parent`. Each resumed provider then continues from that record,
+keeping the existing transcript and its full turn counter. Remove the file to
+resume from the last record again. A missing or private record is refused.
+This exercises transcript history and reopening; it does not reproduce why a
+live Claude Code process chooses an earlier parent.
+
 To check how an answer renders, copy a Markdown file to `fixture-reply.md`.
 Each later turn answers with that file's contents instead of the default
 sentence, so replacing the file changes the next answer. A few turns with a
 long file give a transcript long enough to scroll.
+
+Create `fixture-stream-reply` to send that answer in text deltas before its
+final record. Its first line may hold the delay between deltas in seconds
+(default `0.25`), and its second line the characters per delta (default
+`16384`). `0.03` and `24` approximate a live provider's streaming rate, so
+several fixture agents give a realistic concurrent load. While streaming,
+control requests still take effect and additional prompts receive the usual
+queued lifecycle. Interrupt stops the stream and settles the turn without
+recording an answer that was never fully sent. Closing stdin finishes the
+finite reply. The fixture requires Bash for timed input reads; `python3
+tests/chat_composer_streaming.py` checks this duplex protocol without the app
+or a live provider.
 
 For provider failure checks, write a diagnostic such as `Failed to
 authenticate: OAuth session expired and could not be refreshed` to
@@ -192,6 +211,27 @@ replays the same frames. Add `"_once": true` to exit only the first time a
 turn reaches that line: the fixture records each such line's number in
 `fixture-frames.exited`, so the reconnected provider goes on, and removing
 that file arms them all again.
+
+A Stop on an agent the frames started answers as Claude Code 2.1.296 does
+for an agent that already sent its notice and is waiting on its own
+background work: a `task_updated` frame patching the task `killed`, with no
+further notice. `tests/fixtures/waiting-agent-scene.sh` builds a scene on
+this: an agent that reports it is waiting, then is resumed, finishes, fails,
+is resumed elsewhere, or is stopped from its tab.
+
+To check model and usage reporting, copy a recorded `initialize` response to
+`fixture-models.json`, such as `fixtures/accounts/claude-initialize-models.json`,
+the list Claude Code 2.1.296 offered with Fable 5.2. Its `models` replace the
+default list, and from the provider's next start each turn's `init` names the
+full ID the chosen model resolves to, as Claude Code's does: `opus` runs
+`claude-opus-5-5`. The model chosen with `--model` or in the picker is the one
+resolved; without either, the conversation starts on the list's `default`
+entry, as Claude Code's does. To give the account check figures, write a
+`get_usage` control response's inner `response` to `fixture-usage.json`; the
+account check and each conversation read it whenever they ask. A live usage change is a
+`rate_limit_event` frame in `fixture-frames.jsonl`, such as
+`fixtures/accounts/claude-rate-limit-event-fable.json`, which a Fable turn
+reported.
 
 To hold a conversation's provider at start-up, as a cold start does, create
 `home/.claude/fixture-slow-start`. The provider then waits before it reads

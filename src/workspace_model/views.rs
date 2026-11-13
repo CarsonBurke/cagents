@@ -29,6 +29,13 @@ impl From<ChannelId> for Scope {
     }
 }
 
+/// How long the daemon remembers an applied `ChangeView` operation, so a
+/// client that lost the reply can resend it and be told it already happened.
+/// A client must stop resending well before this; the window's publisher stops
+/// after a day.
+pub const OPERATION_RETENTION: std::time::Duration =
+    std::time::Duration::from_secs(7 * 24 * 60 * 60);
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Pane {
     pub id: CardId,
@@ -422,7 +429,7 @@ pub(crate) fn managed_pane_matches(agent: &crate::agent_execution::Agent, pane: 
         }
         _ => return false,
     };
-    agent
+    if agent
         .session
         .as_ref()
         .is_some_and(|session| session.same_process(&current))
@@ -430,6 +437,18 @@ pub(crate) fn managed_pane_matches(agent: &crate::agent_execution::Agent, pane: 
             .console
             .as_ref()
             .is_some_and(|session| HostedSession::Terminal(session.clone()).same_process(&current))
+    {
+        return true;
+    }
+    // A stopped pane retains its managed identity while paging the captured
+    // transcript under the successor. This grants display membership only;
+    // the agent's execution descriptor and accepted run remain unchanged.
+    match (&agent.session, &current) {
+        (Some(HostedSession::Chat(original)), HostedSession::Chat(current)) => {
+            crate::upgrade::floor::display_snapshot().history_replacement(original, current)
+        }
+        _ => false,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

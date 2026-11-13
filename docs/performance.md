@@ -94,6 +94,29 @@ unfocused spinners instead of stopping them costs little: an earlier revision
 that stopped them entirely measured 1.0-1.6% with another window focused
 (3 wakeups/s).
 
+## UI thread trace
+
+Development UI builds started with `CAGENTS_UI_TRACE` set log, every five
+seconds, how much wall time the UI thread spent in `update` (by the message's
+outer two variant names, such as `ChatUi(Stream`), `view`, `subscription`, and
+the window content's layout, draw, event handling (by event kind), tree diff,
+widget operations, accessibility tree and overlay collection. Beneath each
+total, the sidebar's and the workspace's shares are broken out. Each call that
+takes 50 ms or more is logged as it returns, as `ui-trace slow PHASE LABEL MS`.
+A nested `update` counts toward the outermost one. Overlays' own layout and
+drawing, the libcosmic chrome around the application view, and the renderer's
+presentation run outside the measured root, so the thread's CPU time exceeds
+the traced total.
+`scripts/native-evidence start SIDE --ui-trace` sets the variable for a session;
+the lines go to its `logs/ui-SIDE.log`. Without the variable a scope reads one
+flag, and other builds compile the trace out.
+
+Use it to tell which work keeps the UI thread busy when the app stalls. Pair it
+with `/proc/PID/task/PID/syscall` sampling to see whether the thread is ever
+blocked rather than busy: a thread in `epoll_pwait` is idle, while `futex`,
+`read` or `wait4` on the UI thread is a stall that no amount of view caching
+fixes.
+
 ## Native chat stage attribution
 
 Development UI builds can record bounded, content-free **inclusive wall time**
@@ -395,9 +418,17 @@ geometry and build profile on both revisions. Record the exact commit and dirty
 state, process identity, sampled UI CPU/RSS/PSS, and time boundaries alongside
 raw samples. Exercise `huge 1024`, `stream 300 300`, 43 composer characters,
 40 wheel notches, Find, selection/copy, and a hidden `tools 300` child. Opening
-the 1 MiB answer has a 150 MB RSS growth budget; after switching away, the UI
-must return within 30 MB of its prior baseline. Repeat hide/reveal and close
-cycles, including Hide tab. Use the isolated development runner described in
+the 1 MiB answer has a 150 MB RSS growth budget. Switching away keeps the
+most recently hidden chats warm (`src/app/chat_ui/warm.rs`): at most 8, within
+an estimated 96 MiB of heap together, and none over 32 MiB, which goes cold as
+it hides. The estimate is calibrated against the heap cooling frees, measured
+by `frame_cost::what_a_warm_hidden_chat_holds`. After switching away from a
+chat that goes cold, the UI must return within 30 MB of its prior baseline;
+while chats are warm, within 30 MB of that baseline plus their estimate. Record
+RSS for 1, 4, 8 and 9 hidden chats, the ninth sending the first cold. Freed
+heap is not always returned to the system, so compare RSS after the repeat
+cycles too, not only after the first. Repeat hide/reveal and close cycles,
+including Hide tab. Use the isolated development runner described in
 [development.md](development.md), preserving existing sessions.
 
 Full-context shaping holds one output permit through UI consumption; queued

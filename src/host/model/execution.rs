@@ -256,6 +256,24 @@ impl Registry {
         retained: &[HostedSession],
         successor: &HostedSession,
     ) -> Result<bool, String> {
+        self.adopt_authenticated_agent_session_inner(retained, successor, None)
+    }
+
+    pub(in crate::host) fn adopt_authenticated_console_session(
+        &mut self,
+        retained: &[HostedSession],
+        successor: &HostedSession,
+        replacement: &super::console_relaunch::ConsoleRelaunch,
+    ) -> Result<bool, String> {
+        self.adopt_authenticated_agent_session_inner(retained, successor, Some(replacement))
+    }
+
+    fn adopt_authenticated_agent_session_inner(
+        &mut self,
+        retained: &[HostedSession],
+        successor: &HostedSession,
+        replacement: Option<&super::console_relaunch::ConsoleRelaunch>,
+    ) -> Result<bool, String> {
         if retained.is_empty() || retained.iter().any(|source| source.id() != successor.id()) {
             return Err("Agent adoption requires exact same-session holder lineage".into());
         }
@@ -263,6 +281,18 @@ impl Registry {
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
+        if let Some(intent) = replacement {
+            super::console_relaunch::require_current(&tx, intent)?;
+            if !matches!(successor, HostedSession::Chat(next) if
+                next.id == intent.source.id
+                && next.terminal.as_ref().is_some_and(|terminal| intent.recognizes_target(terminal)))
+                || intent.replacement_holder.is_none()
+            {
+                return Err(
+                    "The acknowledged console does not match its replacement intent".into(),
+                );
+            }
+        }
         let authority: Option<String> = tx
             .query_row(
                 "SELECT source FROM agent_authorities WHERE session_id = ?1",
@@ -278,11 +308,19 @@ impl Registry {
             return Err("The issuing capability belongs to another session lineage".into());
         }
         let row: Option<String> = tx.query_row("SELECT record FROM agents WHERE session_id = ?1 OR id = (SELECT agent FROM agent_launches WHERE session_id = ?1)", [successor.id().to_string()], |row| row.get(0)).optional().map_err(|error| error.to_string())?;
+        if replacement.is_some() && row.is_none() {
+            return Err("The console replacement's agent binding disappeared".into());
+        }
         let mut changed = false;
         if let Some(row) = row {
             let mut agent: Agent = decode(&row)?;
             if agent.closed {
                 return Err("A retired agent cannot regain process authority".into());
+            }
+            if replacement.is_some_and(|intent| {
+                agent.id != intent.agent || agent.console.as_ref() != Some(&intent.console)
+            }) {
+                return Err("The agent's console changed during its replacement".into());
             }
             if let Some(source) = &agent.session {
                 if !recognizes(source) {
@@ -296,16 +334,27 @@ impl Registry {
                         .terminal
                         .as_ref()
                         .filter(|terminal| {
-                            terminal.id == console.id && terminal.launch == console.launch
+                            terminal.id == console.id
+                                && (terminal.launch == console.launch || replacement.is_some())
                         })
                         .ok_or("The retained console does not match the durable provider pair")?;
                     agent.console = Some(terminal.clone());
                 }
                 changed = agent.session.as_ref() != Some(successor);
                 agent.session = Some(successor.clone());
-                changed |= super::views::adopt_authenticated_agent_pane(
-                    &tx, agent.id, retained, successor,
-                )?;
+                changed |= if let Some(intent) = replacement {
+                    super::views::adopt_authenticated_agent_pane_with_console(
+                        &tx,
+                        agent.id,
+                        retained,
+                        successor,
+                        Some(&intent.console),
+                    )?
+                } else {
+                    super::views::adopt_authenticated_agent_pane(
+                        &tx, agent.id, retained, successor,
+                    )?
+                };
                 tx.execute(
                     "UPDATE agents SET record = ?2 WHERE id = ?1",
                     params![agent.id.to_string(), encode(&agent)?],
@@ -333,6 +382,13 @@ impl Registry {
             tx.execute(
                 "UPDATE agent_authorities SET source = ?2 WHERE session_id = ?1",
                 params![successor.id().to_string(), encode(successor)?],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        if let Some(intent) = replacement {
+            tx.execute(
+                "DELETE FROM console_relaunches WHERE actor=?1",
+                [intent.actor.to_string()],
             )
             .map_err(|error| error.to_string())?;
         }
@@ -585,7 +641,7 @@ impl Registry {
         let blocked: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM agent_runs WHERE agent=?1 AND state IN ('accepted','running','waiting'))
              OR EXISTS(SELECT 1 FROM agent_launches WHERE agent=?1 OR session_id=?2)
-             OR EXISTS(SELECT 1 FROM shared_view_panes WHERE id=?1)",
+             OR EXISTS(SELECT 1 FROM panes WHERE id=?1)",
             params![agent.id.to_string(), source.id.to_string()], |row| row.get(0),
         ).map_err(|error| error.to_string())?;
         if blocked {
@@ -2183,12 +2239,10 @@ pub(super) fn require_placement(
                     "The worktree view belongs to another project or has an invalid path".into(),
                 );
             }
-            let scope = encode(placement)?;
-            let exists: bool = db.query_row(
-                "SELECT EXISTS(SELECT 1 FROM shared_views JOIN shared_view_scopes USING(scope) WHERE scope=?1 AND repository=?2)",
-                params![scope, repository_key(repository)?], |row| row.get(0),
-            ).map_err(|error|error.to_string())?;
-            if !exists {
+            let path = path
+                .to_str()
+                .ok_or("The worktree view has an invalid path")?;
+            if !super::views::store::worktree_exists(db, repository_key(repository)?, path)? {
                 return Err("The target worktree view is no longer open".into());
             }
             Ok(())
@@ -2408,6 +2462,7 @@ mod tests {
         for case in 0..13 {
             let (mut registry, directory, request) = fixture();
             let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+            let emptied = super::super::views::EmptiedView::plant(&mut registry);
             let HostedSession::Chat(mut current) = source() else {
                 unreachable!()
             };
@@ -2570,8 +2625,10 @@ mod tests {
             let authority = registry
                 .retained_agent_authority_source(current.id)
                 .unwrap();
-            let result =
-                registry.archive_previous_boot_execution(&ownership, &boot, &issued, &current);
+            // Archival looks for the conversation's pane in occupied views only.
+            let result = emptied.unreadable_during(&mut registry, |registry| {
+                registry.archive_previous_boot_execution(&ownership, &boot, &issued, &current)
+            });
             match case {
                 7 => assert!(
                     result.unwrap_err().contains("fixture archive failure"),
@@ -2650,6 +2707,7 @@ mod tests {
             for case in 0..9 {
                 let (mut registry, directory, request) = fixture();
                 let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+                let emptied = super::super::views::EmptiedView::plant(&mut registry);
                 let HostedSession::Chat(mut current) = source() else {
                     unreachable!()
                 };
@@ -2745,10 +2803,13 @@ mod tests {
                 registry
                     .retire_agent_process(&HostedSession::Chat(current.clone()), 4)
                     .unwrap();
-                let witness = registry
-                    .archived_history(&current, &ownership, &retirement, &boot)
-                    .unwrap()
-                    .unwrap();
+                // The lookup searches occupied views only for the history's pane.
+                let witness = emptied.unreadable_during(&mut registry, |registry| {
+                    registry
+                        .archived_history(&current, &ownership, &retirement, &boot)
+                        .unwrap()
+                        .unwrap()
+                });
                 assert!(witness.matches(&current, &ownership, &retirement));
                 match case {
                     0 => {}
@@ -3566,7 +3627,7 @@ mod tests {
             })
             .unwrap();
         let before = registry.model().unwrap();
-        registry.db.execute_batch("CREATE TRIGGER reject_ended_view BEFORE UPDATE ON shared_views BEGIN SELECT RAISE(FAIL,'fixture ended view failure'); END;").unwrap();
+        registry.db.execute_batch("CREATE TRIGGER reject_ended_view BEFORE UPDATE ON view_scopes BEGIN SELECT RAISE(FAIL,'fixture ended view failure'); END;").unwrap();
         assert!(publish_console(&mut registry, &scope, &pane, &ended_console(&pane)).is_err());
         assert_eq!(registry.model().unwrap(), before);
         let count: u64 = registry
@@ -4435,8 +4496,10 @@ mod tests {
         registry
             .db
             .execute(
-                "DELETE FROM shared_views WHERE scope=?1",
-                [encode(&scope).unwrap()],
+                "DELETE FROM view_scopes WHERE id=?1",
+                [super::super::views::store::scope_id(&registry.db, &scope)
+                    .unwrap()
+                    .unwrap()],
             )
             .unwrap();
         assert!(

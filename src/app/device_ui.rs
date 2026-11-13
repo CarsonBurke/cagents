@@ -40,6 +40,8 @@ pub(super) fn supports_sidebar_action(action: &SidebarAction) -> bool {
             | SidebarAction::RefreshProject { .. }
             | SidebarAction::ToggleProjects
             | SidebarAction::ToggleProject(_)
+            | SidebarAction::ToggleWorktrees(_)
+            | SidebarAction::SetWorktreeDisplay { .. }
             | SidebarAction::DragWindow
             | SidebarAction::MaximizeWindow
             | SidebarAction::WindowMenu

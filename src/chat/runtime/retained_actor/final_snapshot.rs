@@ -512,6 +512,155 @@ pub(crate) fn remove(record: &Record) -> Result<(), String> {
     }
 }
 
+/// Runtime receipts of actors that no helper or provider backs, for the
+/// daemon's receipt collection tests. Each is published through the same
+/// writers a helper uses, so every reader validates it as it would a real one.
+#[cfg(test)]
+pub(crate) mod fixture {
+    use super::*;
+
+    /// How far an actor got toward a retirement its receipts can prove.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Stage {
+        /// The helper is still running.
+        Running,
+        /// The helper ended, but its provider may still be running.
+        ExitedUnproved,
+        /// Both ended, but the helper's discovery record was never retired.
+        DiscoveryPending,
+        /// Both ended and the retirement is proved; the transcript is whole.
+        Verified,
+        /// As `Verified`, with the transcript already released.
+        Compacted,
+    }
+
+    /// One published actor: its exact holder record and issued conversation.
+    pub(crate) struct Actor {
+        pub(crate) record: Record,
+        pub(crate) source: chat::Session,
+        pub(crate) final_receipt: PathBuf,
+        pub(crate) retirement_receipt: PathBuf,
+    }
+
+    /// Publishes `stage`'s receipts for actor `instance` of the lease `proof`.
+    ///
+    /// `ended` is a process that has exited and been reaped; the calling
+    /// process stands in for anything `stage` says is still running.
+    pub(crate) fn publish(
+        instance: uuid::Uuid,
+        proof: &HostSessionProof,
+        ended: &registry::Process,
+        stage: Stage,
+    ) -> Actor {
+        let live = registry::Process::read(std::process::id() as i32).unwrap();
+        let (holder, root) = match stage {
+            Stage::Running => (live, ended.clone()),
+            Stage::ExitedUnproved => (ended.clone(), live),
+            Stage::DiscoveryPending | Stage::Verified | Stage::Compacted => {
+                (ended.clone(), ended.clone())
+            }
+        };
+        let mut build = registry::BuildIdentity::current(Kind::Native);
+        build
+            .capabilities
+            .push(registry::RETAINED_CLAUDE_CAPABILITY.into());
+        let terminal = crate::model::TerminalId::new();
+        let identity = ActorIdentity {
+            instance,
+            record: Record {
+                version: 4,
+                build: Some(build),
+                kind: Kind::Native,
+                application: crate::instance::APPLICATION_ID.into(),
+                boot: proof.boot_id.clone(),
+                terminal,
+                holder,
+                root,
+            },
+        };
+        let session = uuid::Uuid::new_v4().to_string();
+        let mut source = super::super::transport::fixture_source();
+        source.id = terminal;
+        source.proof = Some(proof.clone());
+        source.launch.session_id = Some(session.clone());
+        source.native_continuity =
+            chat::NativeContinuity::RetainedClaudeActor { protocol: PROTOCOL };
+        let directory = registry::directory(Kind::Native).unwrap();
+        std::fs::create_dir_all(&directory).unwrap();
+        let snapshot = Snapshot {
+            exited: true,
+            session_id: Some(session.clone()),
+            title: Some("A retired conversation".into()),
+            items: vec![std::sync::Arc::new(chat::Item {
+                started_at: None,
+                id: "answer".into(),
+                role: chat::Role::Assistant,
+                content: chat::ItemContent::Text {
+                    text: "a long final answer ".repeat(512),
+                    thinking: false,
+                    phase: Default::default(),
+                },
+                at: None,
+            })],
+            ..Default::default()
+        };
+        let scope: Result<&crate::account::scope::LaunchAccountScope, &str> =
+            Err("fixture has no account scope");
+        save(
+            true,
+            &identity,
+            proof,
+            &source,
+            &[],
+            None,
+            scope,
+            Some(&session),
+            &snapshot,
+        )
+        .unwrap();
+        publish_retirement(RetirementReceipt {
+            installed: true,
+            identity: identity.clone(),
+            proof: proof.clone(),
+            source: source.clone(),
+            previous_sources: Vec::new(),
+            launch_account_scope: scope.map(Clone::clone).map_err(str::to_owned),
+            confirmed_session: Some(session),
+            paired_holder: None,
+        })
+        .unwrap();
+        if stage == Stage::DiscoveryPending {
+            identity.record.create(&directory).unwrap();
+        }
+        let expected = match stage {
+            Stage::Running => "Running",
+            Stage::ExitedUnproved | Stage::DiscoveryPending => "ExitedUnproved",
+            Stage::Verified | Stage::Compacted => "Verified",
+        };
+        let actual = match inspect_retirement(&identity.record, proof).unwrap() {
+            RetirementInspection::Running => "Running",
+            RetirementInspection::ExitedUnproved => "ExitedUnproved",
+            RetirementInspection::Verified(_) => "Verified",
+        };
+        assert_eq!(actual, expected, "{stage:?} receipts inspect as {actual}");
+        if stage == Stage::Compacted {
+            assert!(compact_retired(&identity.record, proof).unwrap() > 0);
+        }
+        Actor {
+            final_receipt: path(&identity.record).unwrap(),
+            retirement_receipt: retirement_path(&identity.record).unwrap(),
+            record: identity.record,
+            source,
+        }
+    }
+
+    /// Whether the final receipt at `path` was compacted.
+    pub(crate) fn compacted(path: &std::path::Path) -> bool {
+        let receipt: Receipt = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        receipt.compacted
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

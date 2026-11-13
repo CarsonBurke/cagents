@@ -1,0 +1,184 @@
+#!/usr/bin/python3
+"""Check every new first-parent main commit, serially, through the fw16 gate."""
+import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+import socket
+import subprocess
+import time
+
+TITLE = "Main Rust build sentinel: compilation failure"
+LANES = ("cli", "host", "ui")
+
+
+def run(*command, **kwargs):
+    return subprocess.run(command, check=True, text=True, **kwargs)
+
+
+def save(path, state):
+    temporary = path.with_suffix(".new")
+    temporary.write_text(json.dumps(state, indent=2) + "\n")
+    temporary.replace(path)
+
+
+def git(repository, *args):
+    return run("git", "-C", str(repository), *args, stdout=subprocess.PIPE).stdout.strip()
+
+
+def report(repository, directory, state):
+    """Persist each successful report step; a failed API call never loses a result."""
+    pending = state["pending"]
+    repo = state["github_repository"]
+
+    def gh(*args):
+        result = subprocess.run(["gh", *args, "--repo", repo], text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if result.returncode:
+            # Do not retry into a shared rate limit. Ask for its actual reset once.
+            if "rate limit" in result.stderr.lower():
+                limits = run("gh", "api", "rate_limit", stdout=subprocess.PIPE)
+                resources = json.loads(limits.stdout)["resources"]
+                resets = [entry["reset"] for entry in resources.values()
+                          if entry.get("remaining") == 0]
+                state["retry_after"] = max([time.time() + 120, *resets])
+                save(directory / "state.json", state)
+            raise RuntimeError(result.stderr.strip())
+        return result.stdout.strip()
+
+    failed = [lane for lane, status in pending["lanes"].items() if status]
+    if not failed:
+        if state.get("failing"):
+            gh("issue", "comment", str(state["issue"]), "--body",
+               f"Recovered at `{pending['sha']}`: CLI, host and UI all-targets checks passed on fw16.")
+        state["failing"] = False
+        return
+    if not state.get("issue"):
+        matches = json.loads(gh("issue", "list", "--state", "all", "--search",
+                                f'"{TITLE}" in:title', "--json", "number,title"))
+        matches = [item for item in matches if item["title"] == TITLE]
+        if matches:
+            state["issue"] = matches[0]["number"]
+            save(directory / "state.json", state)
+    sha = pending["sha"]
+    details = git(repository, "show", "-s", "--format=%H%n%P%n%s", sha)
+    body = (f"Main fails to compile at `{sha}` on fw16.\n\n"
+            f"Last passing commit: `{state.get('last_good', 'none recorded')}`.\n\n"
+            f"Commit, parents and subject:\n```text\n{details}\n```\n\n"
+            "Checks use `scripts/cargo-gate check --locked --no-default-features --all-targets` "
+            "in separate CLI, host and UI lanes.\n\n")
+    for lane, status in pending["lanes"].items():
+        body += f"- {lane}: exit {status}\n"
+    for lane in failed:
+        log = directory / "logs" / f"{sha}-{lane}.log"
+        tail = log.read_text(errors="replace")[-5000:].replace("```", "'''")
+        body += f"\n{lane} diagnostics (tail; complete log on fw16 at `{log}`):\n```text\n{tail}\n```\n"
+    body_file = directory / "issue.md"
+    body_file.write_text(body)
+    if not state.get("issue"):
+        url = gh("issue", "create", "--title", TITLE, "--body-file", str(body_file))
+        state["issue"] = int(url.rsplit("/", 1)[1])
+        save(directory / "state.json", state)
+    else:
+        gh("issue", "edit", str(state["issue"]), "--body-file", str(body_file))
+        # Reopen is idempotent, including when the issue is already open.
+        gh("issue", "reopen", str(state["issue"]))
+    state["failing"] = True
+
+
+def tick(repository, directory, github_repository):
+    # The checkout is shared even when callers select different state directories.
+    worktrees = repository / ".worktrees"
+    worktrees.mkdir(exist_ok=True)
+    with (worktrees / ".main-build-sentinel.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        tick_locked(repository, directory, github_repository)
+
+
+def tick_locked(repository, directory, github_repository):
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / "lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        path = directory / "state.json"
+        state = json.loads(path.read_text()) if path.exists() else {}
+        if state.get("github_repository", github_repository) != github_repository:
+            raise RuntimeError("state belongs to another GitHub repository")
+        state["github_repository"] = github_repository
+        if time.time() < state.get("retry_after", 0):
+            return
+        # The timestamp also bounds restart/manual invocations and failed Git fetches.
+        if time.time() - state.get("last_fetch", 0) < 120 and not state.get("pending"):
+            return
+        if not state.get("pending"):
+            state["last_fetch"] = time.time()
+            save(path, state)
+            git(repository, "fetch", "--no-tags", "origin", "main")
+            tip = git(repository, "rev-parse", "origin/main")
+            previous = state.get("checked")
+            if previous:
+                # A force push needs a fresh baseline; never traverse unrelated history.
+                ancestor = subprocess.run(["git", "-C", str(repository), "merge-base",
+                                           "--is-ancestor", previous, tip]).returncode
+                commits = (git(repository, "rev-list", "--first-parent", "--reverse",
+                               f"{previous}..{tip}").splitlines() if ancestor == 0 else [tip])
+            else:
+                commits = [tip]
+            state["queue"] = commits
+            save(path, state)
+        while state.get("pending") or state.get("queue"):
+            if not state.get("pending"):
+                sha = state["queue"][0]
+                checkout = repository / ".worktrees" / "main-build-sentinel"
+                if checkout.exists():
+                    if git(checkout, "status", "--porcelain"):
+                        raise RuntimeError(f"sentinel checkout is dirty: {checkout}")
+                    git(checkout, "checkout", "--detach", sha)
+                else:
+                    git(repository, "worktree", "add", "--detach", str(checkout), sha)
+                (directory / "logs").mkdir(exist_ok=True)
+                statuses = {}
+                for lane in LANES:
+                    command = [str(checkout / "scripts/cargo-gate"), "check", "--locked",
+                               "--no-default-features", "--all-targets"]
+                    if lane != "cli":
+                        command += ["--features", lane]
+                    print(f"main-build-sentinel: {sha} {lane}", flush=True)
+                    with (directory / "logs" / f"{sha}-{lane}.log").open("w") as log:
+                        # No priority bypass, held lease, or local compilation override.
+                        environment = dict(os.environ, CAGENTS_BUILD_REMOTE="fw16")
+                        statuses[lane] = subprocess.run(command, cwd=checkout, env=environment,
+                                                        stdout=log, stderr=subprocess.STDOUT).returncode
+                state["pending"] = {"sha": sha, "lanes": statuses}
+                save(path, state)
+            state["retry_after"] = time.time() + 120
+            save(path, state)
+            report(repository, directory, state)
+            state.pop("retry_after", None)
+            pending = state.pop("pending")
+            state["checked"] = pending["sha"]
+            if not any(pending["lanes"].values()):
+                state["last_good"] = pending["sha"]
+            state["queue"].pop(0)
+            save(path, state)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repository", type=Path, required=True)
+    parser.add_argument("--state", type=Path, default=Path.home() / ".local/state/cagents-main-sentinel")
+    parser.add_argument("--github-repository", default="CarsonBurke/cagents")
+    args = parser.parse_args()
+    if socket.gethostname().split(".")[0] != "fw16":
+        parser.error("run this watcher on fw16; builds still go through scripts/cargo-gate")
+    tick(args.repository.resolve(), args.state.resolve(), args.github_repository)
+
+
+if __name__ == "__main__":
+    main()

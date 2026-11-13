@@ -284,6 +284,7 @@ impl Project {
                     || relative.starts_with("refs")
             }) {
                 change.references = true;
+                change.configuration |= common == Some(Path::new("config"));
                 change.membership |= common == Some(Path::new("refs"));
                 continue;
             }
@@ -377,10 +378,14 @@ fn access_only(event: &Event) -> bool {
 pub(crate) struct Change {
     /// Worktrees whose own files, index or `HEAD` changed.
     pub worktrees: BTreeSet<WorktreeId>,
-    /// Shared refs or configuration changed: a commit, fetch or branch
-    /// update. Any worktree's comparison may have moved, but its status only
-    /// where its own `HEAD` did, which a consumer can tell from the refs.
+    /// Shared refs changed: a commit, fetch or branch update. Any
+    /// worktree's comparison may have moved, but its status only where its
+    /// own `HEAD` did, which a consumer can tell from the refs.
     pub references: bool,
+    /// The shared configuration changed, so what a branch resolves to
+    /// through it — its remote and that remote's URLs — may have moved even
+    /// where no ref did.
+    pub configuration: bool,
     pub topology: bool,
     pub membership: bool,
     pub error: Option<String>,
@@ -391,6 +396,7 @@ impl Change {
     pub fn merge(&mut self, other: Self) {
         self.worktrees.extend(other.worktrees);
         self.references |= other.references;
+        self.configuration |= other.configuration;
         self.topology |= other.topology;
         self.membership |= other.membership;
         if let Some(coverage) = other.coverage {
@@ -1069,11 +1075,17 @@ mod tests {
             .change(&modified(project.common_dir.join("refs/heads/main")))
             .unwrap();
         assert!(change.references);
+        assert!(!change.configuration);
         assert!(
             change.worktrees.is_empty(),
             "no worktree's own files changed"
         );
         assert!(!change.topology);
+        let change = project
+            .change(&modified(project.common_dir.join("config")))
+            .unwrap();
+        assert!(change.references);
+        assert!(change.configuration);
         assert!(
             project
                 .change(&modified(project.common_dir.join("worktrees/new/gitdir")))

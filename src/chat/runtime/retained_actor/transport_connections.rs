@@ -67,6 +67,8 @@ impl Delivery {
 
 pub(super) enum Answer {
     Value(Result<Value, String>),
+    Watch(Result<UnixStream, String>),
+    Binary(Result<crate::terminal_ipc::ServerResponse, String>),
     /// `pinned_directory` sends its directory descriptor beside the frame.
     Directory(Result<(DirectoryIdentity, Arc<File>), String>),
 }
@@ -227,6 +229,30 @@ fn connection(control: UnixStream, calls: &Sender<Call>, wakeup: &UnixStream) {
     match answered.recv() {
         Ok(Answer::Value(response)) => {
             let _ = send(&control, &response, TIMEOUT);
+        }
+        Ok(Answer::Binary(response)) => {
+            let _ = super::deadline_io::send_binary_until(
+                &control,
+                &response,
+                Instant::now() + TIMEOUT,
+            );
+        }
+        Ok(Answer::Watch(watch)) => {
+            let response = watch.as_ref().map(|_| ()).map_err(Clone::clone);
+            let fds: Vec<_> = watch
+                .as_ref()
+                .ok()
+                .map(|watch| vec![watch.as_fd()])
+                .unwrap_or_default();
+            let _ = crate::descriptor_frame::send_json_with_fds_until(
+                &control,
+                &response,
+                &fds,
+                Instant::now() + TIMEOUT,
+                MAX_FRAME,
+                1,
+                crate::descriptor_frame::FrameByteOrder::LittleEndian,
+            );
         }
         Ok(Answer::Directory(pin)) => {
             let response = pin

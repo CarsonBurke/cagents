@@ -49,7 +49,7 @@ pub(super) struct Pattern {
 impl Pattern {
     pub(super) fn prepare(query: &str, current: &impl Fn() -> bool) -> Option<Self> {
         let mut needle = Vec::new();
-        for (index, character) in query.case_fold().enumerate() {
+        for (index, character) in query.chars().map(spaced).case_fold().enumerate() {
             if index % 1024 == 0 && !current() {
                 return None;
             }
@@ -133,6 +133,15 @@ impl<'a> Matcher<'a> {
         false
     }
 }
+/// A space that only keeps words on one line, such as those joining a pull
+/// request link's label, reads as the space a reader types.
+fn spaced(character: char) -> char {
+    match character {
+        '\u{a0}' | '\u{2007}' | '\u{202f}' => ' ',
+        character => character,
+    }
+}
+
 fn matched_ranges(text: &str, query: &str, limit: usize) -> Highlights {
     matched_ranges_checked(text, query, limit, &|| true).unwrap_or_else(Highlights::empty)
 }
@@ -162,12 +171,19 @@ pub(super) fn matched_pattern_checked(
         if index % 1024 == 0 && !current() {
             return None;
         }
+        let width = character.len_utf8();
+        // A label's word joiners take no room and are never typed.
+        if character == super::pull_request_links::WORD_JOINER {
+            continue;
+        }
+        let character = spaced(character);
         if character.is_ascii() {
             if matcher.push(
                 character.to_ascii_lowercase(),
                 Boundary {
                     start: Some(offset),
-                    end: Some(offset + 1),
+                    // A no-break space reads as ASCII but is wider.
+                    end: Some(offset + width),
                 },
             ) {
                 break;
@@ -179,10 +195,7 @@ pub(super) fn matched_pattern_checked(
         while let Some(folded) = expansion.next() {
             let boundary = Boundary {
                 start: first.then_some(offset),
-                end: expansion
-                    .peek()
-                    .is_none()
-                    .then_some(offset + character.len_utf8()),
+                end: expansion.peek().is_none().then_some(offset + width),
             };
             first = false;
             if matcher.push(folded, boundary) {
@@ -325,6 +338,16 @@ mod tests {
         assert_eq!(opened, HashMap::from([("live-turn".to_owned(), false)]));
     }
 
+    #[test]
+    fn a_match_ending_in_a_no_break_space_ends_after_it() {
+        let text = "#12\u{a0}Group\u{a0}the";
+        for query in ["#12 ", "#12 group "] {
+            for range in ranges(text, query) {
+                assert!(text.is_char_boundary(range.end), "{query:?} {range:?}");
+            }
+        }
+        assert_eq!(ranges(text, "#12 "), [0..5]);
+    }
     #[test]
     fn matching_uses_unicode_fold_and_preserves_original_byte_boundaries() {
         assert_eq!(ranges("Straße CAFÉ", "STRASSE"), vec![0..7]);

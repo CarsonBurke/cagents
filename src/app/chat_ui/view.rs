@@ -1375,6 +1375,7 @@ impl Runtime {
     pub(super) fn native_child_status(agent: &chat::Subagent) -> &'static str {
         match agent.status {
             chat::ToolStatus::Running if agent.waiting => "Waiting",
+            chat::ToolStatus::Waiting => "Waiting on background work",
             chat::ToolStatus::Running => "Working",
             chat::ToolStatus::Succeeded => "Finished",
             chat::ToolStatus::Failed => "Failed",
@@ -1463,6 +1464,11 @@ impl Runtime {
             .iter()
             .filter(|child| child.status == chat::ToolStatus::Running && child.waiting)
             .count();
+        let on_background_work = snapshot
+            .subagents
+            .iter()
+            .filter(|child| child.status == chat::ToolStatus::Waiting)
+            .count();
         let failed = snapshot
             .subagents
             .iter()
@@ -1505,12 +1511,13 @@ impl Runtime {
         } else if snapshot.busy
             || snapshot.waiting
             || !snapshot.requests.is_empty()
-            || (working == 0 && waiting == 0)
+            || (working == 0 && waiting == 0 && on_background_work == 0)
         {
             parts.push(Self::short_description(label, 72));
         }
         if failure_label.is_some()
             || snapshot.subagents.len() > 1
+            || on_background_work > 0
             || ((snapshot.waiting || !snapshot.requests.is_empty()) && working > 0)
         {
             let subagents = |count: usize| {
@@ -1526,6 +1533,12 @@ impl Runtime {
             if waiting > 0 {
                 parts.push(format!("{} waiting", subagents(waiting)));
             }
+            if on_background_work > 0 {
+                parts.push(format!(
+                    "{} waiting on background work",
+                    subagents(on_background_work)
+                ));
+            }
             if failed > 0 {
                 parts.push(format!("{} failed", subagents(failed)));
             }
@@ -1535,6 +1548,10 @@ impl Runtime {
                         Some(Icon::AgentWorking)
                     } else if failure_label.is_some() || failed > 0 {
                         Some(Icon::Warning)
+                    } else if on_background_work > 0 {
+                        // Not a finished check: a subagent's background work
+                        // goes on, though nothing is asked of the reader.
+                        None
                     } else {
                         glyph
                     },
@@ -1567,6 +1584,12 @@ impl Runtime {
             return None;
         }
         if let Some(agent) = selected {
+            if agent.status == chat::ToolStatus::Waiting {
+                return Some((
+                    Icon::AgentBackground,
+                    Self::native_child_status(agent).to_owned(),
+                ));
+            }
             return (agent.status == chat::ToolStatus::Running).then(|| {
                 if agent.waiting {
                     (Icon::AgentWaiting, "Waiting for you".to_owned())
@@ -1597,6 +1620,15 @@ impl Runtime {
                     .any(|agent| agent.waiting && agent.status == chat::ToolStatus::Running) =>
             {
                 Some((Icon::AgentWaiting, label))
+            }
+            // Nothing is asked of the reader, but the finished stamp alone
+            // would read as everything being done.
+            _ if snapshot
+                .subagents
+                .iter()
+                .any(|agent| agent.status == chat::ToolStatus::Waiting) =>
+            {
+                Some((Icon::AgentBackground, label))
             }
             _ => None,
         }
@@ -2118,8 +2150,9 @@ impl Runtime {
                 .width(Length::Fill)
                 .into();
             selected_identity = Some(
-                if agent.status == chat::ToolStatus::Running && snapshot.capabilities.stop_subagent
-                {
+                // One waiting on its own background work is still going, and
+                // stopping it is how that work ends.
+                if agent.status.is_live() && snapshot.capabilities.stop_subagent {
                     widget::row::with_children(vec![
                         heading.into(),
                         crate::ui_controls::button::quiet("Stop")
@@ -2659,6 +2692,9 @@ impl Runtime {
                 _ => "Switching or closing this session… Editing and session controls are disabled. You can still read and copy the conversation.",
             }));
         }
+        if let Some(refusal) = self.close_refusal_view() {
+            content.push(refusal);
+        }
         if self.closed_elsewhere {
             content.push(self.closed_draft_controls(transitioning));
         } else if self.capacity_refused {
@@ -3172,14 +3208,17 @@ impl Runtime {
         content.push(crate::interaction::composer_popover(
             widget::container(
                 widget::column::with_children(vec![
-                    widget::column::with_children(self.queue_view().into_iter().chain(
-                        (!attachment_chips.is_empty()).then(|| {
-                            widget::column::with_children(attachment_chips)
-                                .spacing(step::GAP_XS)
-                                .padding([0, step::GAP_M as u16])
-                                .into()
-                        }),
-                    ))
+                    widget::column::with_children(
+                        self.queue_view()
+                            .into_iter()
+                            .chain(self.restored_waiting_notice())
+                            .chain((!attachment_chips.is_empty()).then(|| {
+                                widget::column::with_children(attachment_chips)
+                                    .spacing(step::GAP_XS)
+                                    .padding([0, step::GAP_M as u16])
+                                    .into()
+                            })),
+                    )
                     .spacing(step::GAP_XS)
                     .into(),
                     widget::row::with_children(row)
@@ -4676,6 +4715,36 @@ impl Runtime {
         } else {
             description
         }
+    }
+
+    /// Says, where the queue was, that what a provider which did not come
+    /// back was holding is now the reader's draft, and was not sent again.
+    fn restored_waiting_notice(&self) -> Option<Element<'_, Message>> {
+        let restored = self.restored_waiting?;
+        let text = restored.caption();
+        Some(
+            widget::container(
+                widget::row::with_children(vec![
+                    crate::ui_controls::passive_icon(Icon::History, design::COMPACT_ICON_SIZE),
+                    design::caption(text).width(Length::Fill).into(),
+                    small_icon(
+                        Icon::Close,
+                        "Dismiss",
+                        Action::DismissRestoredWaiting(self.target),
+                    ),
+                ])
+                .spacing(step::GAP_S)
+                .align_y(Alignment::Center),
+            )
+            .width(Length::Fill)
+            .padding(step::GAP_S)
+            .class(design::surface(
+                Some(design::sunken),
+                [design::RADIUS_M, design::RADIUS_M, 0.0, 0.0],
+                false,
+            ))
+            .into(),
+        )
     }
 
     /// The messages waiting to be sent, docked on the composer.
@@ -6252,6 +6321,13 @@ pub(super) fn prepared_runtime_for_test(items: &[chat::Item]) -> (Runtime, Arc<C
     frame_cost::live_runtime(items)
 }
 
+/// A prepared live chat whose `turns` answers each link to three pull
+/// requests, from #1000 up in `acme/widgets`.
+#[cfg(test)]
+pub(super) fn linked_runtime_for_test(turns: usize) -> Runtime {
+    frame_cost::live_runtime(&frame_cost::linked_transcript(turns)).0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7571,6 +7647,43 @@ mod tests {
     }
 
     #[test]
+    fn an_agent_on_its_background_work_is_reported_without_asking_for_the_user() {
+        let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
+        let mut child = native_child_fixture();
+        child.status = chat::ToolStatus::Waiting;
+        assert_eq!(
+            Runtime::native_child_status(&child),
+            "Waiting on background work"
+        );
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.subagents.push(child);
+        snapshot.finished_at = Some(42);
+        let (glyph, label) = runtime.conversation_status(false);
+        assert!(
+            label.contains("1 subagent waiting on background work"),
+            "{label}"
+        );
+        assert!(!label.contains("Waiting for you"), "{label}");
+        assert!(!label.contains("Finished"), "{label}");
+        // Neither working, asking, nor done.
+        assert_eq!(glyph, None);
+        // The row outlasts the card scrolling away, and the same quiet glyph as
+        // the card says nothing is asked of the reader.
+        assert_eq!(
+            runtime.timeline_activity(false, None),
+            Some((
+                Icon::AgentBackground,
+                "1 subagent waiting on background work".into()
+            ))
+        );
+        let child = runtime.snapshot.subagents[0].clone();
+        assert_eq!(
+            runtime.timeline_activity(false, Some(&child)),
+            Some((Icon::AgentBackground, "Waiting on background work".into()))
+        );
+    }
+
+    #[test]
     fn native_child_identity_uses_its_reported_model_and_waiting_state() {
         let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
         Arc::make_mut(&mut runtime.snapshot).selected_model = Some("parent-model".into());
@@ -7976,6 +8089,62 @@ mod tests {
     fn actual_find_current_target_appends_keep_pending_geometry_through_parser_publications() {
         drive_deep_find(true);
     }
+    #[test]
+    fn actual_find_navigation_keeps_its_thirty_second_expiry() {
+        use iced::futures::{FutureExt, StreamExt};
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        let (runtime, _handle) = frame_cost::live_runtime(&[]);
+        let target = runtime.target;
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.cards
+            .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+        let mut stream = iced::runtime::task::into_stream(app.begin_find_navigation(target, None))
+            .expect("navigation owns its production deadline");
+        executor.block_on(async {
+            // Iced tasks yield before polling their futures. Receiving the
+            // actual resume proves both batched timers have started.
+            let started = tokio::time::Instant::now();
+            assert!(matches!(
+                stream.next().await,
+                Some(iced::runtime::Action::Output(cosmic::Action::App(
+                    Message::ChatUi(Action::FindResume(..))
+                )))
+            ));
+            tokio::time::advance(started + Duration::from_secs(29) - tokio::time::Instant::now())
+                .await;
+            assert!(stream.next().now_or_never().is_none());
+            assert!(
+                app.chat_runtime_mut(target)
+                    .unwrap()
+                    .find_navigation
+                    .pending()
+            );
+            tokio::time::advance(Duration::from_secs(1)).await;
+            let Some(iced::runtime::Action::Output(cosmic::Action::App(
+                message @ Message::ChatUi(Action::FindExpired(..)),
+            ))) = stream.next().await
+            else {
+                panic!("the production deadline must expire navigation at thirty seconds");
+            };
+            assert_eq!(
+                tokio::time::Instant::now(),
+                started + Duration::from_secs(30)
+            );
+            drop(app.update(message));
+            assert!(
+                !app.chat_runtime_mut(target)
+                    .unwrap()
+                    .find_navigation
+                    .pending()
+            );
+        });
+        executor.shutdown_background();
+    }
+
     fn drive_deep_find(append_target: bool) {
         use iced::advanced::{
             Layout, Shell, layout, mouse,
@@ -8072,8 +8241,11 @@ mod tests {
             }
         }
         let renderer = crate::app::tests::headless_renderer();
+        // This fixture holds geometry through 24 real parser publications; use
+        // simulated frame time for its functional navigation deadline.
         let executor = tokio::runtime::Builder::new_current_thread()
             .enable_all()
+            .start_paused(append_target)
             .build()
             .unwrap();
         let shortcuts = crate::settings::KeyboardShortcuts::default();
@@ -8213,7 +8385,8 @@ mod tests {
             let mut tree = Tree::empty();
             let viewport = iced::Rectangle::with_size(iced::Size::new(600.0, 500.0));
             let limits = layout::Limits::new(iced::Size::ZERO, viewport.size());
-            let deadline = Instant::now() + Duration::from_secs(30);
+            let deadline =
+                executor.block_on(async { tokio::time::Instant::now() }) + Duration::from_secs(30);
             let mut seen = false;
             let mut passes = 0;
             let mut last_geometry = None;
@@ -8222,7 +8395,7 @@ mod tests {
             let mut buffered_reply = None;
             let mut target_publications = 0;
             let mut accepted_publications = 0;
-            while Instant::now() < deadline {
+            while executor.block_on(async { tokio::time::Instant::now() }) < deadline {
                 passes += 1;
                 // Materialize the actual admitted parser subscriptions once per
                 // recipe, including their real spawn_blocking worker/results.
@@ -8476,6 +8649,12 @@ mod tests {
                             );
                         }
                     }
+                }
+                if append_target {
+                    // All UI borrows have ended. Acknowledge retired output
+                    // admission before the next paused-clock tick across this
+                    // handoff to the process-owned std reclaimer.
+                    preparation::retirement_barrier();
                 }
                 if !pending && visible.found && (!append_target || accepted_publications == 24) {
                     seen = true;
@@ -8899,6 +9078,7 @@ mod tests {
             .unwrap()
             .set_visible(false)
             .unwrap();
+        app.chat_runtime_mut(target).unwrap().cool();
         preparation::retirement_barrier();
         assert!(runtime(&app, target).cache.is_empty());
         app.chat_runtime_mut(target)
@@ -9127,6 +9307,7 @@ mod tests {
                 .unwrap()
                 .set_visible(false)
                 .unwrap();
+            app.chat_runtime_mut(target).unwrap().cool();
             preparation::retirement_barrier();
             assert!(runtime(&app, target).cache.is_empty());
             app.chat_runtime_mut(target)
@@ -10093,6 +10274,7 @@ mod tests {
                 .unwrap()
                 .set_visible(false)
                 .unwrap();
+            app.chat_runtime_mut(target).unwrap().cool();
             preparation::retirement_barrier();
             assert!(runtime(&app, target).cache.is_empty());
             app.chat_runtime_mut(target)

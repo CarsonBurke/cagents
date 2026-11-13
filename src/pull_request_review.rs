@@ -1013,7 +1013,7 @@ impl State {
             Action::BrowserFocused => {
                 if self.target.is_none()
                     && self.source.as_ref().is_some_and(|source| {
-                        crate::github::polling::ready(&source.repository.host, false)
+                        crate::github::polling::ready(&source.repository.authority(), false)
                     })
                 {
                     let open = if self.list_request.loading {
@@ -1141,9 +1141,6 @@ impl State {
                             });
                         self.force_conversation = false;
                         self.loaded_snapshot = Some(loaded.clone());
-                        if let Some(target) = &self.target {
-                            crate::github::polling::succeeded(&target.repository.host);
-                        }
                         self.adopt(&loaded);
                         if unchanged_conversation {
                             return ActionTask::none();
@@ -1164,7 +1161,7 @@ impl State {
             Action::RefreshIfDue(now) => {
                 if self.target.is_none()
                     && self.source.as_ref().is_some_and(|source| {
-                        crate::github::polling::ready(&source.repository.host, false)
+                        crate::github::polling::ready(&source.repository.authority(), false)
                     })
                 {
                     // Both lists refresh, so a row that closed leaves the
@@ -1184,7 +1181,7 @@ impl State {
                 if !self.refreshing
                     && !self.discussion_is_busy()
                     && self.target.as_ref().is_some_and(|target| {
-                        crate::github::polling::ready(&target.repository.host, false)
+                        crate::github::polling::ready(&target.repository.authority(), false)
                     })
                     && self.last_refresh.is_some_and(|last| {
                         now.saturating_duration_since(last) >= Duration::from_secs(30)
@@ -1510,9 +1507,6 @@ impl State {
                 return ActionTask::none();
             }
         };
-        if let Some(source) = &self.source {
-            crate::github::polling::succeeded(&source.repository.host);
-        }
         self.list_cursor = page.next_cursor;
         let mut rows = if self.list_request.appending {
             match std::mem::replace(&mut self.list, ListState::Idle) {
@@ -1562,9 +1556,6 @@ impl State {
                 return;
             }
         };
-        if let Some(source) = &self.source {
-            crate::github::polling::succeeded(&source.repository.host);
-        }
         let mut rows = match self.search.take() {
             Some(search) if self.search_request.appending && search.query == query => search.rows,
             _ => Vec::new(),
@@ -1713,15 +1704,15 @@ impl State {
         if self.target.is_none() || self.discussion_is_busy() {
             return ActionTask::none();
         }
-        if !self
-            .target
-            .as_ref()
-            .is_some_and(|target| crate::github::polling::ready(&target.repository.host, manual))
-        {
+        if !self.target.as_ref().is_some_and(|target| {
+            crate::github::polling::ready(&target.repository.authority(), manual)
+        }) {
             self.notice = self
                 .target
                 .as_ref()
-                .and_then(|target| crate::github::polling::rate_limit(&target.repository.host))
+                .and_then(|target| {
+                    crate::github::polling::rate_limit(&target.repository.authority())
+                })
                 .map(|limit| limit.to_string());
             return ActionTask::none();
         }
@@ -1759,22 +1750,6 @@ impl State {
                         previous.as_deref(),
                         &cancellation,
                     );
-                    match &result {
-                        Ok(_) => {}
-                        Err(message)
-                            if !cancellation.is_cancelled()
-                                && crate::github::polling::ready(
-                                    &target.repository.host,
-                                    false,
-                                ) =>
-                        {
-                            crate::github::polling::failed(
-                                &target.repository.host,
-                                &crate::github::GitHubError::Inspection(message.clone()),
-                            )
-                        }
-                        Err(_) => {}
-                    }
                     result.map(Arc::new)
                 })
                 .await
@@ -2148,7 +2123,7 @@ impl State {
                                 });
                             }
                         }
-                        if refused.is_none() && !crate::github::polling::ready(&repository.host, false) {
+                        if refused.is_none() && !crate::github::polling::ready(&repository.authority(), false) {
                             refused = Some("GitHub polling is paused after a failure or rate limit. Retry after the reset.".into());
                         }
                         let results: Vec<(RepoPath, bool, ViewedOutcome)> = if let Some(message) = &refused {
@@ -2201,22 +2176,11 @@ impl State {
         };
         let pull_request = &target.pull_request;
         let state = WorktreePullRequestState::from_github(pull_request);
-        let (icon, state_label) = match state {
-            Some(WorktreePullRequestState::Merged) => (Icon::MergedPullRequest, "Merged"),
-            Some(WorktreePullRequestState::Closed) => (Icon::ClosedPullRequest, "Closed"),
-            Some(WorktreePullRequestState::Draft) => (Icon::PullRequest, "Draft"),
-            Some(WorktreePullRequestState::Open) | None => (Icon::PullRequest, "Open"),
-        };
-        let tone = match state {
-            Some(WorktreePullRequestState::Merged) => design::Tone::Themed(design::accent_color),
-            Some(WorktreePullRequestState::Closed) => {
-                design::Tone::Themed(design::destructive_color)
-            }
-            Some(WorktreePullRequestState::Draft) | None => {
-                design::Tone::Themed(design::muted_icon_color)
-            }
-            Some(WorktreePullRequestState::Open) => design::Tone::Themed(design::success_color),
-        };
+        let shown = state.unwrap_or(WorktreePullRequestState::Open);
+        let (icon, state_label) = (shown.icon(), shown.label());
+        let tone = design::Tone::Themed(
+            state.map_or(design::muted_icon_color, WorktreePullRequestState::tone),
+        );
         let identity = crate::interaction::tooltip(
             widget::row::with_children(vec![
                 widget::icon::icon(icon.handle())
@@ -3100,8 +3064,8 @@ impl State {
 
 /// Why the browser may not ask GitHub now, if the host's budget forbids it.
 fn browser_paused(source: &ReviewSource) -> Option<String> {
-    (!crate::github::polling::ready(&source.repository.host, true)).then(|| {
-        crate::github::polling::rate_limit(&source.repository.host)
+    (!crate::github::polling::ready(&source.repository.authority(), true)).then(|| {
+        crate::github::polling::rate_limit(&source.repository.authority())
             .map(|limit| limit.to_string())
             .unwrap_or_else(|| "GitHub refresh is paused. Try again shortly.".into())
     })
@@ -3174,37 +3138,29 @@ pub fn browser_row<'a>(
 ) -> Element<'a, Action> {
     let state = WorktreePullRequestState::from_github(pull_request);
     let checks = CheckStatus::from_checks(&pull_request.check_summaries());
-    let icon = Icon::handle(match state {
-        Some(WorktreePullRequestState::Merged) => Icon::MergedPullRequest,
-        Some(WorktreePullRequestState::Closed) => Icon::ClosedPullRequest,
-        _ => Icon::PullRequest,
-    });
-    let tone: fn(&cosmic::Theme) -> iced::Color = match (state, checks) {
-        (Some(WorktreePullRequestState::Merged), _) => design::accent_color,
-        (Some(WorktreePullRequestState::Closed), _) | (_, CheckStatus::Failing) => {
-            design::destructive_color
-        }
-        (_, CheckStatus::Pending) => design::warning_color,
-        (Some(WorktreePullRequestState::Draft), _) => design::muted_icon_color,
-        (_, CheckStatus::Passing) => design::success_color,
-        (_, CheckStatus::Unknown) => design::muted_icon_color,
-    };
+    let icon = state
+        .map_or(Icon::PullRequest, WorktreePullRequestState::icon)
+        .handle();
+    // The glyph says the state alone, as it does in every list; the checks
+    // have their own words beneath.
+    let tone = state.map_or(
+        design::muted_icon_color as fn(&cosmic::Theme) -> iced::Color,
+        WorktreePullRequestState::tone,
+    );
     let mut detail = vec![format!("#{}", pull_request.number)];
     if let Some(author) = &pull_request.author {
         detail.push(author.login.clone());
     }
-    if pull_request.is_draft {
-        detail.push("Draft".into());
-    }
     if let Some(label) = review_request {
         detail.push(label.into());
     }
-    match checks {
-        CheckStatus::Passing => detail.push("Checks passing".into()),
-        CheckStatus::Pending => detail.push("Checks pending".into()),
-        CheckStatus::Failing => detail.push("Checks failing".into()),
-        CheckStatus::Unknown => {}
-    }
+    // The checks keep their tone on their words, now the glyph has the state.
+    let checks: Option<(&str, fn(&cosmic::Theme) -> iced::widget::text::Style)> = match checks {
+        CheckStatus::Passing => Some(("Checks passing", design::success_text)),
+        CheckStatus::Pending => Some(("Checks pending", design::warning_text)),
+        CheckStatus::Failing => Some(("Checks failing", design::destructive_text)),
+        CheckStatus::Unknown => None,
+    };
     let one_line = |text: widget::text::Text<'a, cosmic::Theme, cosmic::Renderer>| {
         text.wrapping(iced::widget::text::Wrapping::None)
             .ellipsize(iced::widget::text::Ellipsize::End(
@@ -3224,7 +3180,26 @@ pub fn browser_row<'a>(
         .into(),
         widget::column::with_children(vec![
             one_line(design::body(pull_request.title.as_str())).into(),
-            one_line(design::caption(detail.join(" · "))).into(),
+            {
+                let mut facts = vec![
+                    design::caption(detail.join(" · "))
+                        .wrapping(iced::widget::text::Wrapping::None)
+                        .ellipsize(iced::widget::text::Ellipsize::End(
+                            EllipsizeHeightLimit::Lines(1),
+                        ))
+                        .into(),
+                ];
+                if let Some((label, tone)) = checks {
+                    facts.push(
+                        one_line(
+                            design::caption(format!(" · {label}"))
+                                .class(cosmic::theme::Text::Custom(tone)),
+                        )
+                        .into(),
+                    );
+                }
+                widget::row::with_children(facts).into()
+            },
         ])
         .width(Length::Fill)
         .into(),
@@ -3239,8 +3214,13 @@ pub fn browser_row<'a>(
             button::custom(content)
                 .class(sidebar_button_style(selected))
                 .name(format!(
-                    "Review pull request #{} {}",
-                    pull_request.number, pull_request.title
+                    "Review {} pull request #{} {}",
+                    state
+                        .unwrap_or(WorktreePullRequestState::Open)
+                        .label()
+                        .to_lowercase(),
+                    pull_request.number,
+                    pull_request.title
                 ))
                 .selected(selected)
                 .padding([space::XS, space::S])
@@ -4699,9 +4679,9 @@ pub(crate) mod tests {
             (
                 "review-server-limit.invalid",
                 crate::github::GitHubError::RateLimited {
-                    limit: crate::github::polling::RateLimit {
-                        retry_at: crate::github::polling::now() + 120,
-                    },
+                    limit: crate::github::polling::RateLimit::secondary(
+                        crate::github::polling::now() + 120,
+                    ),
                 },
                 false,
             ),
@@ -4738,10 +4718,11 @@ pub(crate) mod tests {
                 assert!(state.notice.as_deref().unwrap().contains("Retrying at"));
             }
 
-            // A successful in-flight load clears transient failures, while a
-            // server deadline learned by another poller remains authoritative.
+            // A UI completion has no credential authority. Only the service
+            // that completed the request may clear its captured host budget;
+            // a late callback must not alter another account's current budget.
             finish_load(&mut state, loaded(vec![], vec![]));
-            assert_eq!(crate::github::polling::ready(host, false), manual_allowed);
+            assert!(!crate::github::polling::ready(host, false));
             assert!(!state.refreshing);
         }
     }
@@ -4758,11 +4739,11 @@ pub(crate) mod tests {
         state.list = ListState::Ready(vec![Arc::new(pull_request(1))]);
         let before = state.browser_generation;
         crate::github::polling::failed(
-            &repository.host,
+            &repository.authority(),
             &crate::github::GitHubError::RateLimited {
-                limit: crate::github::polling::RateLimit {
-                    retry_at: crate::github::polling::now() + 120,
-                },
+                limit: crate::github::polling::RateLimit::secondary(
+                    crate::github::polling::now() + 120,
+                ),
             },
         );
 

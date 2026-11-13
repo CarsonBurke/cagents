@@ -12,10 +12,7 @@ use std::{
 #[cfg(feature = "host")]
 use std::{
     fs::{File, OpenOptions},
-    os::{
-        fd::AsRawFd,
-        unix::fs::{DirBuilderExt, OpenOptionsExt},
-    },
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
 };
 
 #[cfg(feature = "host")]
@@ -53,24 +50,18 @@ fn private_file(path: &Path) -> io::Result<File> {
 }
 
 #[cfg(feature = "host")]
-fn lock(file: &File, operation: i32) -> io::Result<()> {
-    // SAFETY: the descriptor remains live and flock accepts scalar flags.
-    if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-#[cfg(feature = "host")]
-pub(crate) fn create(root: &Path) -> io::Result<(PathBuf, File)> {
-    let gate = private_file(&root.join("transcript-cache.lock"))?;
-    lock(&gate, libc::LOCK_SH)?;
+pub(crate) fn create(root: &Path) -> io::Result<(PathBuf, crate::instance::OwnedLock)> {
+    let _gate = crate::instance::owned_file_lock(
+        private_file(&root.join("transcript-cache.lock"))?,
+        libc::LOCK_SH,
+    )?;
     let directory = root.join(format!("chat-{}", uuid::Uuid::new_v4()));
     fs::DirBuilder::new().mode(0o700).create(&directory)?;
     let result = (|| {
-        let lease = private_file(&directory.join(LEASE))?;
-        lock(&lease, libc::LOCK_EX | libc::LOCK_NB)?;
+        let lease = crate::instance::owned_file_lock(
+            private_file(&directory.join(LEASE))?,
+            libc::LOCK_EX | libc::LOCK_NB,
+        )?;
         Ok((directory.clone(), lease))
     })();
     if result.is_err() {
@@ -216,8 +207,10 @@ fn sweep_with_procfs(root: &Path, proc_root: &Path) -> io::Result<Usage> {
 
 #[cfg(feature = "host")]
 fn sweep_at(root: &Path, proc_root: &Path, now: std::time::SystemTime) -> io::Result<Usage> {
-    let gate = private_file(&root.join("transcript-cache.lock"))?;
-    lock(&gate, libc::LOCK_EX)?;
+    let _gate = crate::instance::owned_file_lock(
+        private_file(&root.join("transcript-cache.lock"))?,
+        libc::LOCK_EX,
+    )?;
     let directories = cache_directories(root)?;
     let legacy_open = if directories.iter().any(|path| !path.join(LEASE).exists()) {
         // Failure is conservative: leave legacy caches for a later startup.
@@ -239,11 +232,11 @@ fn sweep_at(root: &Path, proc_root: &Path, now: std::time::SystemTime) -> io::Re
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error),
         };
-        match lock(&lease, libc::LOCK_EX | libc::LOCK_NB) {
-            Ok(()) => {}
+        let _lease = match crate::instance::owned_file_lock(lease, libc::LOCK_EX | libc::LOCK_NB) {
+            Ok(lease) => lease,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
             Err(error) => return Err(error),
-        }
+        };
         // The lease is ours, so no helper or store owns this cache now.
         if !actor_journal::reclaimable(&directory)?
             && !actor_journal::orphan_expired(&directory, now, ORPHANED_JOURNAL_RETENTION)?
@@ -278,67 +271,6 @@ fn sweep_at(root: &Path, proc_root: &Path, now: std::time::SystemTime) -> io::Re
     Ok(removed)
 }
 
-/// Sweeps until the dropped lease's cache is reclaimed. A concurrent test's
-/// fork duplicates every descriptor, close-on-exec or not, until its child
-/// execs, and that copy keeps the dropped lease locked. Each attempt first
-/// waits until the last copy closes; a fork can also copy that probe, so a
-/// lost race retries rather than failing. A lease that stays held fails
-/// after a hang guard instead of blocking the test forever.
-#[cfg(all(test, feature = "host"))]
-pub(crate) fn sweep_reclaiming(root: &Path, proc_root: &Path, directory: &Path) -> Usage {
-    sweep_reclaiming_at(root, proc_root, directory, std::time::SystemTime::now)
-}
-
-/// Waits until no descriptor holds `directory`'s lease, failing after a hang
-/// guard. A fork can copy the lease again afterwards, so this only makes a
-/// keep caused by a stray copy unlikely; it does not exclude it.
-#[cfg(all(test, feature = "host"))]
-pub(crate) fn wait_unleased(directory: &Path) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    let probe = private_file(&directory.join(LEASE)).unwrap();
-    while let Err(error) = lock(&probe, libc::LOCK_EX | libc::LOCK_NB) {
-        assert_eq!(error.raw_os_error(), Some(libc::EWOULDBLOCK), "{error}");
-        assert!(
-            std::time::Instant::now() < deadline,
-            "{} stayed leased",
-            directory.display()
-        );
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
-}
-
-/// [`sweep_reclaiming`] with the sweep's clock supplied by `now`.
-#[cfg(all(test, feature = "host"))]
-pub(crate) fn sweep_reclaiming_at(
-    root: &Path,
-    proc_root: &Path,
-    directory: &Path,
-    now: impl Fn() -> std::time::SystemTime,
-) -> Usage {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    let mut swept = Usage::default();
-    for _ in 0..100 {
-        let probe = private_file(&directory.join(LEASE)).unwrap();
-        while let Err(error) = lock(&probe, libc::LOCK_EX | libc::LOCK_NB) {
-            assert_eq!(error.raw_os_error(), Some(libc::EWOULDBLOCK), "{error}");
-            assert!(
-                std::time::Instant::now() < deadline,
-                "{} stayed leased",
-                directory.display()
-            );
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        drop(probe);
-        let attempt = sweep_at(root, proc_root, now()).unwrap();
-        swept.count += attempt.count;
-        swept.bytes += attempt.bytes;
-        if !directory.exists() {
-            return swept;
-        }
-    }
-    panic!("{} was never reclaimed", directory.display());
-}
-
 #[cfg(all(test, feature = "host"))]
 mod tests {
     use super::*;
@@ -364,7 +296,7 @@ mod tests {
             fd.join("4"),
         )
         .unwrap();
-        let removed = sweep_reclaiming(root.path(), proc_root.path(), &orphan);
+        let removed = sweep_with_procfs(root.path(), proc_root.path()).unwrap();
         assert_eq!(removed.count, 1);
         assert!(!orphan.exists());
         assert!(legacy.exists());
@@ -438,7 +370,9 @@ mod tests {
         let unavailable_procfs = root.path().join("not-a-proc-directory");
         fs::write(&unavailable_procfs, b"inaccessible scan fixture").unwrap();
         assert_eq!(
-            sweep_reclaiming(root.path(), &unavailable_procfs, &orphan).count,
+            sweep_with_procfs(root.path(), &unavailable_procfs)
+                .unwrap()
+                .count,
             1
         );
         assert!(legacy.exists());
@@ -461,10 +395,7 @@ mod tests {
         });
         assert!(directory.exists());
         drop(lease);
-        assert_eq!(
-            sweep_reclaiming(root.path(), Path::new("/proc"), &directory).count,
-            1
-        );
+        assert_eq!(sweep(root.path()).unwrap().count, 1);
     }
 
     #[test]

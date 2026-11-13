@@ -570,9 +570,9 @@ fn queued_rendered_row_refuses_changed_identity_target_host_backend_registry_or_
 }
 
 #[test]
-fn current_row_refusal_during_modal_draft_or_work_retains_attention_for_explicit_reclick() {
+fn current_row_refusal_during_modal_or_draft_retains_attention_for_explicit_reclick() {
     let mut renderer = super::super::tests::headless_renderer();
-    for blocked in ["modal", "draft", "work"] {
+    for blocked in ["modal", "draft"] {
         let mut app = fixture(1);
         open(&mut app);
         let message = click(&app, &mut renderer, notice(0).id);
@@ -580,20 +580,6 @@ fn current_row_refusal_during_modal_draft_or_work_retains_attention_for_explicit
             "modal" => app.settings_reset_confirm = true,
             "draft" => {
                 drop(app.update_automation_ui(crate::automation_ui::Action::New));
-            }
-            "work" => {
-                let channel = ChannelId::new();
-                app.workspace_model
-                    .channels
-                    .push(crate::workspace_model::ModelChannel {
-                        id: channel,
-                        repository: "/attention-work-fixture".into(),
-                        title: "Original".into(),
-                        title_source: Default::default(),
-                        ordinal: 1,
-                    });
-                drop(app.open_channel_work(channel));
-                assert!(app.channel_work_is_main());
             }
             _ => unreachable!(),
         }
@@ -608,10 +594,6 @@ fn current_row_refusal_during_modal_draft_or_work_retains_attention_for_explicit
             "modal" => app.settings_reset_confirm = false,
             "draft" => {
                 drop(app.update_automation_ui(crate::automation_ui::Action::CancelEdit));
-            }
-            "work" => {
-                drop(app.escape_channel_work());
-                assert!(!app.channel_work_is_main());
             }
             _ => unreachable!(),
         }
@@ -1003,7 +985,7 @@ fn public_attention_row_closes_only_its_popup_and_starts_exact_read_after_existi
 
     // An exception for the owned Attention popup must not dismiss or bypass
     // other input owners. Existing focused-save parent stays unchanged too.
-    for blocked in ["modal", "draft", "work"] {
+    for blocked in ["modal", "draft"] {
         let mut app = fixture(1);
         let snapshot = app.notification_ui.snapshot.clone();
         drop(app.update(Message::NotificationUi(Action::Snapshot(snapshot))));
@@ -1016,20 +998,6 @@ fn public_attention_row_closes_only_its_popup_and_starts_exact_read_after_existi
             "draft" => {
                 drop(app.update_automation_ui(crate::automation_ui::Action::New));
                 assert!(app.automation_ui.has_draft());
-            }
-            "work" => {
-                let channel = ChannelId::new();
-                app.workspace_model
-                    .channels
-                    .push(crate::workspace_model::ModelChannel {
-                        id: channel,
-                        repository: "/attention-work-fixture".into(),
-                        title: "Original".into(),
-                        title_source: Default::default(),
-                        ordinal: 1,
-                    });
-                drop(app.open_channel_work(channel));
-                assert!(app.channel_work_is_main());
             }
             _ => unreachable!(),
         }
@@ -1046,7 +1014,6 @@ fn public_attention_row_closes_only_its_popup_and_starts_exact_read_after_existi
         match blocked {
             "modal" => assert!(app.settings_reset_confirm),
             "draft" => assert!(app.automation_ui.has_draft()),
-            "work" => assert!(app.channel_work_is_main()),
             _ => unreachable!(),
         }
         no_ack(&app, notice(0).id);

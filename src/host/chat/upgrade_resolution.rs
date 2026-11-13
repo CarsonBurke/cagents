@@ -143,7 +143,11 @@ pub(in crate::host) fn resolve(
     if cleanup {
         super::retained_actor::recover_cleanup_attachment(host, source).map_err(unavailable)?;
     }
-    if missing {
+    if missing
+        && crate::upgrade::floor::load().is_ok_and(|ledger| ledger.resume_source(source).is_some())
+    {
+        super::floor_history::recover(host, source).map_err(unavailable)?;
+    } else if missing {
         // Client zero is the existing unattached startup-adoption mode.
         // Resolve must not subscribe this connection before its Attach.
         if let Err(native_error) = super::native_recovery::restore(host, 0, source) {

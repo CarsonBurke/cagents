@@ -12,6 +12,32 @@ mod image_references;
 pub mod omp;
 mod terminal_output;
 
+/// Startup recovery for the same card and exact conversation. Unavailable
+/// means another attempt may succeed after an external condition changes;
+/// it promises neither immediate success nor automatic replay of uncertain
+/// writes. Existing ownership and idempotency reconciliation still run first.
+/// Invalid is reserved for known immutable identity/recipe or structural
+/// failures. An opaque operational String is not evidence of permanence:
+/// preserve retry conservatively at legacy boundaries, and classify explicit
+/// decisions here rather than inferring authority from diagnostic wording.
+#[derive(Debug)]
+pub enum SetupError {
+    Invalid(String),
+    Unavailable(String),
+}
+impl std::fmt::Display for SetupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(message) | Self::Unavailable(message) => message.fmt(f),
+        }
+    }
+}
+impl From<&str> for SetupError {
+    fn from(message: &str) -> Self {
+        Self::Invalid(message.into())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum TransportSpec {
     /// Page an exact provider transcript without starting a provider process.

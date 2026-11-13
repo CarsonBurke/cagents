@@ -34,7 +34,7 @@ fi
 # checkout whose gate is older than the installed one runs the installed one,
 # so a worktree that has fallen behind main does not keep main's fixes from its
 # builds.
-gate_version=21
+gate_version=28
 installed=${CAGENTS_BUILD_INSTALLED_GATE-/var/tmp/cagents-cargo-gate}
 # The helpers this gate runs are the ones beside the file it is, so an
 # installed gate keeps its own while a newer installation takes its name.
@@ -79,10 +79,21 @@ fail() {
     exit 2
 }
 
+# Urgency changes only which already-overdue room waiter gets the next ramp.
+build_priority=${CAGENTS_BUILD_PRIORITY-normal}
+case $build_priority in
+    normal|urgent) ;;
+    *) fail 'CAGENTS_BUILD_PRIORITY must be normal or urgent' ;;
+esac
+
 usage() {
     cat <<'EOF'
 Usage: scripts/cargo-gate [cargo] SUBCOMMAND [ARGS...]
        scripts/cargo-gate exec [--hold] COMMAND [ARGS...]
+
+CAGENTS_BUILD_PRIORITY=urgent ranks an already-overdue room waiter ahead of
+ordinary overdue waiters (default: normal). It bypasses neither the slot FIFO,
+ordinary resource admission, the overdue age nor the single-overdue ramp.
 
 Rust compiles only on the build host in CAGENTS_BUILD_REMOTE, through
 scripts/cargo-offload: in one of its build slots, with this checkout's
@@ -120,7 +131,9 @@ from the main checkout's with scripts/seed-build-dir. Every few hours, and
 at once when the file system holding build directories runs low,
 scripts/build-disk-guard runs scripts/prune-build-dirs, which removes Cargo
 build output nothing has used for a week, and native-evidence builds unused
-for 12 hours; below a floor it refuses the build.
+for 12 hours, and has scripts/cargo-offload bound the offload build slots
+here that no lease holds, as their leases do. Below a floor it refuses the
+build.
 
 Environment:
   CAGENTS_BUILD_REMOTE   Host that compiles (default fw16); `local` builds here
@@ -131,6 +144,10 @@ Environment:
                          memory and CPU allow), Cargo jobs for each (default:
                          its CPUs shared among the running builds), and the
                          free space below which it builds nothing (40 GiB)
+  CAGENTS_BUILD_REMOTE_INCREMENTAL_GIB
+                         Most incremental compilation state each slot there
+                         keeps, its builds' latest first (default 20; a
+                         quarter of it below twice the floor)
   CAGENTS_BUILD_REMOTE_LOOPBACK=1
                          On the build host itself, build in its shared
                          slots, as another host would, rather than here
@@ -608,14 +625,15 @@ record_refusal() {
     [ -z "$refused_written" ] || [ $((now - refused_written)) -ge 2 ] || return 0
     refused_written=$now
     entry=$(wait_entry)
-    if { printf '%s %s %s %s\n' "$$" "$(start_time "$$")" "$refused_since" "$now" >"$entry.new" &&
-        mv -f -- "$entry.new" "$entry"; } 2>/dev/null; then
-        wait_recorded=yes
-    fi
+    # This family still owns the queue lock. Establish cleanup ownership
+    # before publishing: a signal trap can run as soon as mv returns.
+    wait_recorded=yes
+    { printf '%s %s %s %s\n%s\n' "$$" "$(start_time "$$")" "$refused_since" "$now" "$build_priority" >"$entry.new" &&
+        mv -f -- "$entry.new" "$entry"; } 2>/dev/null || :
 }
 
 forget_wait() {
-    [ -z "$wait_recorded" ] || rm -f -- "$(wait_entry)" 2>/dev/null || :
+    [ -z "$wait_recorded" ] || rm -f -- "$(wait_entry)" "$(wait_entry).new" 2>/dev/null || :
     wait_recorded=
 }
 
@@ -652,8 +670,15 @@ overdue() {
         read -r pid started since last <"$entry" 2>/dev/null || continue
         case $pid:$started:$since:$last in *[!0-9:]*|*::*|:*|*:) continue ;; esac
         [ $((now - last)) -le "$wait_fresh" ] || continue
-        [ "$since" -lt "$refused_since" ] ||
-            { [ "$since" -eq "$refused_since" ] && [ "$pid" -lt "$$" ]; } || continue
+        [ $((now - since)) -ge "$priority_secs" ] || continue
+        other_priority=$(sed -n 2p "$entry" 2>/dev/null) || other_priority=normal
+        case $other_priority in normal|urgent) ;; *) other_priority=normal ;; esac
+        if [ "$other_priority" != "$build_priority" ]; then
+            [ "$other_priority" = urgent ] || continue
+        else
+            [ "$since" -lt "$refused_since" ] ||
+                { [ "$since" -eq "$refused_since" ] && [ "$pid" -lt "$$" ]; } || continue
+        fi
         [ "$(start_time "$pid")" = "$started" ] || continue
         return 1
     done
@@ -670,6 +695,7 @@ overdue() {
 # number of other builds. Only gated waiters take the extra slots, and they
 # hold the queue lock while choosing one.
 fits() {
+    room_notice=
     running=0
     claims=
     newest=
@@ -720,7 +746,22 @@ memory_fits() {
             print total
         }') || outstanding=
     [ -n "$outstanding" ] || outstanding=$((running * 9 * gib))
-    [ $(($(available_kib) - outstanding)) -ge "$cost" ]
+    room_available=$(available_kib)
+    [ $((room_available - outstanding)) -lt "$cost" ] || return 0
+    room_notice="$room_available $outstanding $cost"
+    return 1
+}
+
+name_memory_wait() {
+    if [ -n "${room_notice:-}" ]; then
+        if [ "${room_announced:-}" != yes ]; then
+            printf '%s\n' "$room_notice" | awk -v host="$(hostname)" -v program="$program" '
+                { printf "%s: waiting for memory on %s: %.1f GiB available, running builds reserve %.1f GiB, this build expects %.1f GiB\n", program, host, $1/1048576, $2/1048576, $3/1048576 }' >&2
+            room_announced=yes
+        fi
+    else
+        room_announced=
+    fi
 }
 
 # Holds a slot on descriptor 9 until release. Gated waiters line up on a
@@ -786,6 +827,7 @@ acquire() {
             fi
             record_refusal
             decided
+            name_memory_wait
             flock -u 9
             exec 9>&-
             name_culprits
@@ -828,6 +870,7 @@ acquire() {
         done
         [ "$fit" != no ] || record_refusal
         decided
+        name_memory_wait
         name_culprits
         announce
         sleep 0.2
@@ -884,7 +927,11 @@ admitted() {
     fi
     decided
     if [ -n "$late" ]; then
-        printf '%s: refused room longest on this host; starting beside the running builds\n' "$program" >&2
+        if [ "$build_priority" = urgent ]; then
+            printf '%s: urgent build is overdue; starting beside the running builds\n' "$program" >&2
+        else
+            printf '%s: refused room longest on this host; starting beside the running builds\n' "$program" >&2
+        fi
     fi
     exec 8>&-
     # Each build gets a share of the CPUs among the builds running once it
@@ -982,6 +1029,26 @@ build_phase() {
         held "$cargo" build "$@"
     else
         held "$cargo" "$subcommand" --no-run "$@"
+    fi
+}
+
+# Library tests cannot use Cargo's integration-only CARGO_BIN_EXE_* variables.
+# Build their real daemon in the same admitted slot and pass its reported path.
+prepare_test_helper() {
+    case ${1-} in test|t|+*) ;; *) return 0 ;; esac
+    [ -z "${CAGENTS_TEST_RETAINED_ACTOR_HELPER-}" ] || return 0
+    [ -f "$here/cargo-host-test-helper.py" ] || return 0
+    helper_output=$(mktemp "${TMPDIR:-/tmp}/cagents-test-helper.XXXXXX") || return "$?"
+    helper_status=0
+    # Keep supervision in this shell: a command-substitution subshell would
+    # own the cancellation traps while the gate that holds the slot has none.
+    held /usr/bin/python3 "$here/cargo-host-test-helper.py" "$cargo" "$@" >"$helper_output" || helper_status=$?
+    test_helper=$(cat -- "$helper_output") || helper_status=$?
+    rm -f -- "$helper_output"
+    [ "$helper_status" -eq 0 ] || return "$helper_status"
+    if [ -n "$test_helper" ]; then
+        CAGENTS_TEST_RETAINED_ACTOR_HELPER=$test_helper
+        export CAGENTS_TEST_RETAINED_ACTOR_HELPER
     fi
 }
 
@@ -1222,6 +1289,7 @@ if inside_gate || inherits_slot || started_by_flock; then
     fi
     if [ "$mode" = cargo ]; then
         stamp_command "$@"
+        prepare_test_helper "$@" || exit "$?"
         subcommand=$1
         case $subcommand in
             run|test|bench)
@@ -1307,6 +1375,11 @@ acquire
 stamp_command "$subcommand" "$@"
 status=0
 if [ "$runs_separately" = true ]; then
+    prepare_test_helper "$subcommand" "$@" || status=$?
+    if [ "$status" -ne 0 ]; then
+        release
+        exit "$status"
+    fi
     build_phase "$@" || status=$?
     release
     [ "$status" -eq 0 ] || exit "$status"

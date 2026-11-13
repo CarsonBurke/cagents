@@ -1362,8 +1362,9 @@ pub(super) fn paragraph(
             flow,
         );
     }
-    leaf_text(
+    selectable_prose::labelled_text(
         text.spans(settings.style),
+        text.inlines(),
         settings.text_size,
         settings.style.font,
         target,
@@ -2625,7 +2626,7 @@ mod tests {
             code: raw.clone(),
             source: display.clone(),
             lines: vec![],
-            reader_source: reader_source::Source::new(&display),
+            reader_source: Box::new(reader_source::Source::new(&display)),
         };
         let mut element = items_for_test(&cached, &[item], target);
         let renderer = crate::app::tests::headless_renderer();

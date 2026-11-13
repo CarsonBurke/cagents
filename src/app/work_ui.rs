@@ -6,26 +6,21 @@ use cosmic::iced::futures::SinkExt;
 const CLOCK: Duration = Duration::from_secs(30);
 
 impl Cagents {
-    /// The board subscription runs while this window shows a Work pane, so a
-    /// closed pane stops the daemon assembling boards for it.
+    /// Only a Work pane the user can see keeps the daemon's listings fresh.
     pub(super) fn work_subscription(&self) -> Subscription<Message> {
-        let open = self
-            .durable
-            .cards
-            .iter()
-            .any(|card| card.kind == CardKind::Work && card.existence.is_open());
-        if !open {
+        let visible = self.durable.cards.iter().any(|card| {
+            card.kind == CardKind::Work
+                && card.existence.is_open()
+                && self.workspace.visibility(card.id) == Some(VisibilityClass::Visible)
+        });
+        if !self.refresh_ui.focused || !visible {
             return Subscription::none();
         }
         let watch = Subscription::run(watch_board).map(Message::WorkUi);
-        if self.refresh_ui.focused {
-            Subscription::batch([
-                watch,
-                cosmic::iced::time::every(CLOCK).map(|_| Message::WorkUi(Action::Tick)),
-            ])
-        } else {
-            watch
-        }
+        Subscription::batch([
+            watch,
+            cosmic::iced::time::every(CLOCK).map(|_| Message::WorkUi(Action::Tick)),
+        ])
     }
 
     pub(super) fn update_work_ui(&mut self, action: Action) -> Task<Message> {
@@ -132,7 +127,7 @@ fn control(
 
 /// The daemon's boards, from a thread that holds the subscription.
 ///
-/// Dropping the stream, which iced does when the last Work pane closes, hangs
+/// Dropping the stream, when Work is hidden or the window loses focus, hangs
 /// up the connection: the thread's blocking read then fails, it finds no one
 /// listening, and the daemon forgets the watcher.
 fn watch_board() -> impl cosmic::iced::futures::Stream<Item = Action> {
@@ -221,5 +216,61 @@ impl Drop for HangUpOnDrop {
         if let Some(hangup) = self.0.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
             hangup.hang_up();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn subscriptions(app: &Cagents) -> usize {
+        cosmic::iced::advanced::subscription::into_recipes(app.work_subscription()).len()
+    }
+
+    #[test]
+    fn work_polling_requires_a_visible_pane_in_the_focused_window() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let work = CardState {
+            id: CardId::new(),
+            generation: 0,
+            title: "Work".into(),
+            width_fraction: 1.0,
+            existence: Existence::Open,
+            kind: CardKind::Work,
+        };
+        Arc::make_mut(&mut app.durable).cards.push(work.clone());
+        app.refresh_ui.focused = true;
+        // A durable Work pane in another channel/window is not on this strip.
+        assert_eq!(subscriptions(&app), 0);
+
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.workspace.resize_viewport(1200.0);
+        app.workspace.native_scroll(0.0, 1200.0);
+        assert_eq!(
+            app.workspace.visibility(work.id),
+            Some(VisibilityClass::Visible)
+        );
+        assert_eq!(subscriptions(&app), 2, "watch and relative-time clock");
+        app.refresh_ui.focused = false;
+        assert_eq!(subscriptions(&app), 0, "background windows detach");
+        app.refresh_ui.focused = true;
+        assert_eq!(subscriptions(&app), 2, "returning to Work reconnects");
+
+        // The same open pane, outside the viewport, also releases its watch.
+        let mut other = work.clone();
+        other.id = CardId::new();
+        other.kind = CardKind::Settings;
+        Arc::make_mut(&mut app.durable)
+            .cards
+            .insert(0, other.clone());
+        Arc::make_mut(&mut app.durable).focused = Some(other.id);
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.workspace.resize_viewport(600.0);
+        app.workspace.native_scroll(0.0, 600.0);
+        assert_ne!(
+            app.workspace.visibility(work.id),
+            Some(VisibilityClass::Visible)
+        );
+        assert_eq!(subscriptions(&app), 0);
     }
 }

@@ -165,6 +165,13 @@ pub fn selection_wash(theme: &Theme) -> Color {
     mix(base(theme), theme.cosmic().accent.base.into(), 0.4)
 }
 
+/// The tray a project's rows share in the navigation rail: one step off the
+/// Primary layer the rail is drawn on, enough to group without boxing.
+pub fn rail_tray(theme: &Theme) -> Color {
+    let primary = theme.cosmic().primary(theme.transparent);
+    mix(primary.base.into(), primary.on.into(), 0.06)
+}
+
 pub fn accent_color(theme: &Theme) -> Color {
     theme.cosmic().accent.base.into()
 }
@@ -235,6 +242,11 @@ pub fn warning_text(theme: &Theme) -> text::Style {
 /// Text that reports an error the reader has to correct.
 pub fn destructive_text(theme: &Theme) -> text::Style {
     ink(destructive_color(theme))
+}
+
+/// Text that reports something finished well, such as passing checks.
+pub fn success_text(theme: &Theme) -> text::Style {
+    ink(success_color(theme))
 }
 
 /// The gutter marker on an added or removed patch line.

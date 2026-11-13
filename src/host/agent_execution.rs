@@ -1223,10 +1223,17 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
                                 return Err("Startup teardown remains unconfirmed; its exact cleanup owner was retained".into());
                             }
                         }
-                    } else if session.closes_without_hosted_actor() {
+                    } else if session.closes_without_hosted_actor()
+                        || matches!(
+                            session.native_continuity,
+                            chat::NativeContinuity::RetainedClaudeActor { .. }
+                        )
+                    {
                         // Missing history can prevent actor restoration while
                         // its authenticated provider holder is still alive.
-                        // Only the holder's exact receipt releases ownership.
+                        // Only the holder's exact receipt releases ownership,
+                        // or, for an owner that died without one, proof that
+                        // nothing of it can still run.
                         super::chat::close_retained_native(host, session)?;
                     } else {
                         // A lost actor is not proof that its process has exited.
@@ -1984,6 +1991,7 @@ fn console_line(item: &chat::Item, now: u64) -> Option<String> {
         ToolStatus::Failed => " (failed)",
         ToolStatus::Denied => " (denied)",
         ToolStatus::Stopped => " (stopped)",
+        ToolStatus::Waiting => " (waiting on its own background work)",
     };
     let first_line = |text: &str| text.trim().lines().next().unwrap_or_default().to_owned();
     let line = match &item.content {

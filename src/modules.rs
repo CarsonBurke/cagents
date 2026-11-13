@@ -34,8 +34,6 @@ pub mod browser;
 pub mod capability;
 pub mod channel_work;
 pub mod channel_work_api;
-#[cfg(feature = "ui")]
-pub mod channel_work_ui;
 pub mod chat;
 pub mod companion;
 pub mod control;
@@ -72,6 +70,7 @@ pub mod file_manager;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub(crate) mod file_url;
 mod filesystem_recovery_context;
+mod flock;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod fixture_workspace;
 pub mod fs_safety;
@@ -80,6 +79,8 @@ pub(crate) mod git_watch;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod github;
 pub mod github_identity;
+pub(crate) mod github_rate_limit;
+pub mod github_status;
 #[cfg(feature = "host")]
 pub mod host;
 #[cfg(feature = "ui")]
@@ -95,6 +96,8 @@ pub mod latency_fixture;
 pub mod layout_metrics;
 #[cfg(feature = "ui")]
 pub mod lifecycle;
+#[cfg(any(feature = "ui", feature = "host"))]
+pub(crate) mod lineage_birth;
 pub mod linear;
 pub mod location;
 #[cfg(feature = "ui")]

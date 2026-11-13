@@ -72,6 +72,69 @@ mod tests {
     use super::*;
     use crate::ui_controls::accessibility_probe::headless_renderer;
 
+    /// A Work card's actions menu is a popover inside the card's
+    /// `button::custom`; it must open beneath its anchor, not displaced by
+    /// the card's origin.
+    #[test]
+    fn popovers_inside_an_offset_button_open_beneath_their_anchor() {
+        use cosmic::iced::advanced::{Layout, layout, widget::Tree};
+        use cosmic::iced::{Padding, Point, Rectangle, Size, Vector};
+
+        let renderer = headless_renderer();
+        let screen = Size::new(600.0, 400.0);
+        let anchor = Size::new(24.0, 24.0);
+        let mut element: Element<'_, ()> = widget::container(
+            widget::button::custom(
+                widget::row::with_children(vec![
+                    iced::widget::Space::new().width(100).height(24).into(),
+                    popover(
+                        iced::widget::Space::new()
+                            .width(anchor.width)
+                            .height(anchor.height),
+                        Some(iced::widget::Space::new().width(120).height(60).into()),
+                        widget::popover::Position::Bottom,
+                        (),
+                    ),
+                ])
+                .spacing(8),
+            )
+            .padding(10)
+            .on_press(()),
+        )
+        .padding(Padding {
+            left: 140.0,
+            top: 90.0,
+            ..Padding::ZERO
+        })
+        .into();
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, screen),
+        );
+        let anchor = Rectangle::new(Point::new(140.0 + 10.0 + 100.0 + 8.0, 90.0 + 10.0), anchor);
+        let viewport = Rectangle::with_size(screen);
+        for camera in [Vector::ZERO, Vector::new(-60.0, 35.0)] {
+            let mut overlay = element
+                .as_widget_mut()
+                .overlay(&mut tree, Layout::new(&node), &renderer, &viewport, camera)
+                .expect("an open popover raises its surface");
+            // An overlay group spans the screen; the surface is its child.
+            let surface = overlay
+                .as_overlay_mut()
+                .layout(&renderer, screen)
+                .children()[0]
+                .bounds();
+            let anchor = anchor + camera;
+            assert!(
+                (surface.center_x() - anchor.center_x()).abs() <= 1.0
+                    && (surface.y - (anchor.y + anchor.height)).abs() <= 1.0,
+                "popover {surface:?} is not beneath its anchor {anchor:?}"
+            );
+        }
+    }
+
     #[test]
     fn queued_overlay_clicks_use_the_position_before_later_motion() {
         use cosmic::iced::advanced::clipboard;

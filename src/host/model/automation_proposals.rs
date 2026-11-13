@@ -232,6 +232,17 @@ pub(super) fn published_fixture_from_rows(source: &Registry, version: u32) -> st
             .open(&path)
             .unwrap(),
     );
+    // Rows come from a copy converted back to the oldest schema the converter
+    // reaches, whose tables have every predecessor's columns.
+    let converted = source
+        .path
+        .with_file_name(format!("published-schema-{version}-source.sqlite3"));
+    source
+        .db
+        .execute("VACUUM INTO ?1", [converted.to_str().unwrap()])
+        .unwrap();
+    super::schema::downgrade(&converted, super::schema::OLDEST_DOWNGRADE).unwrap();
+    let converted = Connection::open(&converted).unwrap();
     let mut legacy = Connection::open(&path).unwrap();
     legacy.execute_batch("PRAGMA foreign_keys=ON").unwrap();
     let tx = legacy.transaction().unwrap();
@@ -271,8 +282,7 @@ pub(super) fn published_fixture_from_rows(source: &Registry, version: u32) -> st
             .collect::<Vec<_>>()
             .join(",");
         let rows = {
-            let mut statement = source
-                .db
+            let mut statement = converted
                 .prepare(&format!("SELECT {selected} FROM {table}"))
                 .unwrap();
             statement

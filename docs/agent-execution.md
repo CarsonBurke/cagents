@@ -37,9 +37,10 @@ cagents agent interrupt 1a2b
 cagents agent close 1a2b
 ```
 
-An interrupt may also stop the provider's running background subagents (Claude
-does this). The daemon refuses that interrupt unless you pass
-`--including-subagents`. It checks the current tasks at provider dispatch, so a
+An interrupt may also stop the provider's background subagents, including one
+waiting on its own background work (Claude does this). The daemon refuses that
+interrupt unless you pass `--including-subagents`, and names the subagents it
+would stop by their tasks. It checks the current tasks at provider dispatch, so a
 background task that starts after your status check remains protected. To stop
 just one task, use its subagent Stop action in chat instead. The provider console
 uses `/interrupt` with the same safeguard; `/interrupt --including-subagents`
@@ -60,10 +61,15 @@ These cases stop everything the provider started instead:
 - a close that hands the chat elsewhere, such as returning it to its terminal,
   closing it with its paired terminal, or switching accounts.
 
-Daemon Stop confirmation counts running background subagents as well as hosted
-sessions. If those tasks change before confirmation is accepted, refresh the
-preview and confirm again. An update with **When idle** waits for background work
-to finish; **Interrupt** previews which background tasks will stop. New affected
+Daemon Stop confirmation counts background subagents, running or waiting on their
+own background work, as well as hosted sessions. If those tasks change before
+confirmation is accepted, refresh the preview and confirm again. An update with
+**When idle** waits for background work to finish. A subagent waiting on its own
+background work, such as a dev server it started, may never finish while its
+conversation looks done, so the preview names it: stop it from its tab, or
+choose **Interrupt**, which previews which background tasks will stop. Automatic
+cleanup of an automation's agent is refused for the same reason, naming the
+subagent. New affected
 tasks require fresh update confirmation.
 
 Stopping the daemon does not close its agents. Each agent's provider and any

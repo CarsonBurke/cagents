@@ -78,7 +78,8 @@ pub struct CommandSpec {
     pub timeout: Option<Duration>,
     pub stdout_limit: usize,
     pub stderr_limit: usize,
-    // Borrowed only during execute; the journal service holds the owning file.
+    // Borrowed only during execute; the journal holds a scoped SH lock. The
+    // child opens its independent SH description after fork and retains it across exec.
     pub(crate) inherited_lease: Option<i32>,
     inherited_files: Vec<InheritedFile>,
 }
@@ -161,12 +162,20 @@ impl CommandSpec {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
             if let Some(lease) = self.inherited_lease {
-                // SAFETY: fcntl is async-signal-safe; only the child clears CLOEXEC
-                // on a duplicate. Descendants retain the flock across parent death.
+                let path = std::ffi::CString::new(format!("/proc/self/fd/{lease}")).unwrap();
+                // SAFETY: the path is prepared before fork. Only Linux open,
+                // flock and close syscalls run here; the child alone creates
+                // its independent, non-CLOEXEC shared lease description.
                 unsafe {
                     command.pre_exec(move || {
-                        if libc::fcntl(lease, libc::F_DUPFD, 3) == -1 {
+                        let child_lease = libc::open(path.as_ptr(), libc::O_RDWR);
+                        if child_lease == -1 {
                             return Err(io::Error::last_os_error());
+                        }
+                        if libc::flock(child_lease, libc::LOCK_SH | libc::LOCK_NB) != 0 {
+                            let error = io::Error::last_os_error();
+                            libc::close(child_lease);
+                            return Err(error);
                         }
                         Ok(())
                     });
@@ -295,7 +304,7 @@ impl ProcessFailure {
     ///
     /// [`ProcessFailureKind::Exit`] is the one kind whose own `message` says
     /// nothing: `Display` renders it as `{program}: process exited with status
-    /// Some(4)`, a number standing in for the two sentences `gh` wrote about
+    /// 4`, a number standing in for the two sentences `gh` wrote about
     /// how to log in, or for `fatal: not a git repository`. So it is the one
     /// kind whose stderr is preferred, and only when there is some.
     ///
@@ -352,7 +361,11 @@ impl ProcessOutput {
                 signal: self.signal,
                 stdout: self.stdout,
                 stderr: self.stderr,
-                message: format!("process exited with status {:?}", self.exit_code),
+                message: match (self.exit_code, self.signal) {
+                    (Some(code), _) => format!("process exited with status {code}"),
+                    (None, Some(signal)) => format!("process was terminated by signal {signal}"),
+                    (None, None) => "process exited unsuccessfully".to_owned(),
+                },
                 started: true,
             })
         }
@@ -878,6 +891,28 @@ fn failure_excerpt(mut output: Vec<u8>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_exit_names_its_status_or_signal_rather_than_an_option() {
+        let failure = |exit_code, signal| {
+            ProcessOutput {
+                exit_code,
+                signal,
+                success: false,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            }
+            .require_success(Path::new("gh"))
+            .unwrap_err()
+            .to_string()
+        };
+        assert_eq!(failure(Some(1), None), "gh: process exited with status 1");
+        assert_eq!(
+            failure(None, Some(9)),
+            "gh: process was terminated by signal 9"
+        );
+        assert_eq!(failure(None, None), "gh: process exited unsuccessfully");
+    }
 
     #[test]
     #[cfg(target_os = "linux")]

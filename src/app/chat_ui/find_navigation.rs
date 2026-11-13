@@ -674,6 +674,8 @@ struct RawStamp {
     provider: Provider,
     handle: Option<SourceProof<ClientHandle>>,
     session: Option<String>,
+    // New pull request labels change what a message reads as.
+    labels: SourceProof<pull_request_links::Labels>,
     query: (u64, usize, usize),
     groups: Vec<(
         String,
@@ -708,6 +710,7 @@ struct RawInput {
     query: String,
     groups: Vec<(String, Vec<RawItem>)>,
     provider: Provider,
+    labels: Arc<pull_request_links::Labels>,
     // Captured on the UI thread; the scan charges it from a worker.
     metadata: MetadataCapacity,
 }
@@ -885,6 +888,7 @@ fn raw_stamp(runtime: &Runtime) -> RawStamp {
             .handle()
             .map(|handle| SourceProof(Arc::downgrade(handle))),
         session: runtime.snapshot.session_id.clone(),
+        labels: SourceProof(Arc::downgrade(&runtime.pull_request_labels)),
         query: runtime.find.as_ref().map_or(
             (runtime.find_navigation.search.load(Ordering::Acquire), 0, 0),
             |query| {
@@ -1172,7 +1176,23 @@ fn raw_scan_inner(
                 return None;
             }
             let item = &raw.item;
-            let matched = contains_checked(&item.content, &pattern, current)?;
+            // A message reads its pull request addresses as their labels.
+            let labelled = |text: &str| match pull_request_links::rendition(text, &input.labels) {
+                Some(read) => matches_checked(&read, &pattern, current),
+                None => Some(false),
+            };
+            let matched = contains_checked(&item.content, &pattern, current)?
+                || match &item.content {
+                    ItemContent::Text { text, .. } => labelled(text)?,
+                    // A notice's body is drawn verbatim; other deliveries
+                    // are prose with labelled links.
+                    ItemContent::Delivery { kind, body, .. }
+                        if *kind != chat::DeliveryKind::Notice =>
+                    {
+                        labelled(body)?
+                    }
+                    _ => false,
+                };
             let coordinated = chat::coordination::recognize(item, input.provider);
             if !current() {
                 return None;
@@ -1212,7 +1232,7 @@ fn raw_scan_inner(
                         .map(|run| ("result".into(), run.result.as_str())),
                 );
                 for (part, text) in texts {
-                    if matches_checked(text, &pattern, current)? {
+                    if matches_checked(text, &pattern, current)? || labelled(text)? {
                         charge(item.id.len().checked_add(part.len())?.checked_add(128)?)?;
                         parts.push(format!("{}#{part}", item.id));
                     }
@@ -1254,7 +1274,9 @@ fn raw_scan_inner(
                     &pattern,
                     current,
                 )?,
-                ItemContent::Delivery { body, .. } => matches_checked(body, &pattern, current)?,
+                ItemContent::Delivery { body, .. } => {
+                    matches_checked(body, &pattern, current)? || labelled(body)?
+                }
                 _ => false,
             };
             if matched || !parts.is_empty() {
@@ -1833,6 +1855,7 @@ fn capture_raw(runtime: &Runtime) -> RawInput {
         query: runtime.find.clone().unwrap_or_default(),
         groups,
         provider: runtime.session.launch.provider,
+        labels: runtime.pull_request_labels.clone(),
         metadata: metadata_capacity(),
     }
 }
@@ -2557,6 +2580,7 @@ mod tests {
         let input = RawInput {
             query: query.into(),
             provider: Provider::Claude,
+            labels: Arc::default(),
             metadata: metadata_capacity(),
             groups: vec![(
                 "group".into(),
@@ -2579,6 +2603,44 @@ mod tests {
             vec![2]
         );
         assert_eq!(groups[0].1[0].source.as_ptr(), Arc::as_ptr(&item));
+    }
+    #[test]
+    fn find_reaches_a_message_through_the_labels_of_its_pull_request_links() {
+        let item = Arc::new(chat::Item {
+            id: "answer".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Text {
+                text: "Opened https://github.com/acme/tools/pull/4 today.".into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+            at: None,
+            started_at: None,
+        });
+        let scan = |labels: Arc<pull_request_links::Labels>, query: &str| {
+            let input = RawInput {
+                query: query.into(),
+                provider: Provider::Claude,
+                labels,
+                metadata: metadata_capacity(),
+                groups: vec![(
+                    "group".into(),
+                    vec![RawItem {
+                        item: item.clone(),
+                        raw_disclosure: false,
+                        tools: Vec::new(),
+                    }],
+                )],
+            };
+            raw_scan(&input, query, &|| true).unwrap().0.len()
+        };
+        let labels = Arc::new(pull_request_links::fixture::fixture());
+        assert_eq!(scan(labels.clone(), "acme/tools#4 old sidebar"), 1);
+        // The address itself is still what the message says.
+        assert_eq!(scan(labels.clone(), "github.com/acme/tools/pull/4"), 1);
+        // Without a title the label is the reference alone.
+        assert_eq!(scan(Arc::default(), "old sidebar"), 0);
+        assert_eq!(scan(Arc::default(), "acme/tools#4 today"), 1);
     }
     #[test]
     fn find_opens_a_notice_whose_match_folded_from_its_heading_into_its_body() {
@@ -2610,6 +2672,7 @@ mod tests {
             let input = RawInput {
                 query: "NEEDLE".into(),
                 provider: Provider::Claude,
+                labels: Arc::default(),
                 metadata: metadata_capacity(),
                 groups: vec![(
                     "group".into(),

@@ -1,4 +1,27 @@
 //! The type scale and the text roles built on it.
+//!
+//! A surface picks text by role, never by size. The roles, from the top of a
+//! page down, and the fixed air between them:
+//!
+//! | Role              | Builder         | Size / line box | Weight  |
+//! |-------------------|-----------------|-----------------|---------|
+//! | Page title        | [`display`]     | 20 / 26         | Bold    |
+//! | Section title     | [`title`]       | 16 / 22         | Bold    |
+//! | Label             | [`heading`]     | 13 / 18         | Medium  |
+//! | Value, row, prose | [`body`]        | 13 / 18         | Regular |
+//! | Description       | [`description`] | 12 / 16         | Regular, muted |
+//! | Caption, metadata | [`caption`]     | 11              | Regular, muted |
+//!
+//! A label names one thing the reader can change or inspect. Its description
+//! explains it in sentences, so it is set one step above captions: an 11px
+//! paragraph under every setting was hard to read at length. Captions stay
+//! for short metadata beside or under a row: counts, times, states.
+//!
+//! The vertical rhythm between the roles is in [`rhythm`]. Every step is on
+//! the spacing scale, and each one is fixed by the pair of roles it separates
+//! rather than chosen by the surface, so two settings, two sections or a
+//! label and its description sit the same distance apart wherever they
+//! appear.
 
 use std::borrow::Cow;
 
@@ -89,11 +112,53 @@ pub fn title_font() -> Font {
     weighted(Weight::Bold)
 }
 
+/// The line box display-sized text sits in.
+pub const LINE_DISPLAY: f32 = 26.0;
+
+/// The size of a description: sentences explaining a label above them.
+pub const TEXT_DESCRIPTION: f32 = 12.0;
+/// The line box a description's lines sit in. Generous for its size, because
+/// a description is read as a paragraph rather than glanced at.
+pub const LINE_DESCRIPTION: f32 = 16.0;
+
+/// Sentences that explain the label or control above them. Wraps at word
+/// boundaries and fills the width it is given.
+pub fn description<'a>(text: impl Into<Cow<'a, str>> + 'a) -> ShellText<'a> {
+    cosmic::widget::text::body(text)
+        .size(TEXT_DESCRIPTION)
+        .line_height(LineHeight::Absolute(LINE_DESCRIPTION.into()))
+        .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
+        .width(cosmic::iced::Length::Fill)
+        .class(cosmic::theme::Text::Custom(muted_text))
+}
+
+/// The fixed air between the text roles, from the top of a page down.
+pub mod rhythm {
+    use super::space;
+
+    /// From a page title to the first section beneath it.
+    pub const PAGE_TO_SECTION: f32 = space::XL;
+    /// Between two sections of a page.
+    pub const SECTION_TO_SECTION: f32 = space::XXL;
+    /// From a section title to the description that introduces it.
+    pub const TITLE_TO_DESCRIPTION: f32 = space::XXS;
+    /// From a section's header to its first item.
+    pub const HEADER_TO_ITEM: f32 = space::L;
+    /// Between two items of a section, such as two settings.
+    pub const ITEM_TO_ITEM: f32 = space::L;
+    /// From a label to the control it names, and from a control to the
+    /// description under it.
+    pub const LABEL_TO_CONTROL: f32 = space::XS;
+    /// From a label to the description directly under it, when the control
+    /// sits beside the label rather than below it.
+    pub const LABEL_TO_DESCRIPTION: f32 = space::XXS;
+}
+
 /// The name of a whole page or an otherwise empty pane.
 pub fn display<'a>(text: impl Into<Cow<'a, str>> + 'a) -> ShellText<'a> {
     cosmic::widget::text::body(text)
         .size(TEXT_DISPLAY)
-        .line_height(LineHeight::Absolute(26.0.into()))
+        .line_height(LineHeight::Absolute(LINE_DISPLAY.into()))
         .font(weighted(Weight::Bold))
 }
 

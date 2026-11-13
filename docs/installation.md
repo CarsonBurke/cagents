@@ -251,13 +251,10 @@ Changed session ownership or impact requires another confirmation. A compatible
 replacement reopens windows while keeping the daemon and sessions alive.
 Newer matched sets already installed under the same managed installation,
 including local builds, use this same flow. Whichever window you update
-from, the newer build's own updater performs the update whenever it can carry
-the running sessions, so its checks decide what continues. When it cannot,
-such as across an incompatible protocol, an older updater (the running
-daemon's or the window's own) performs it and may refuse sessions the newer
-build would carry. Windows from builds that predate this behavior always use
-their own updater; run `cagents daemon upgrade` to start the update from the
-newer build instead. Source trees and OS packages retain their own update
+from, the newer build's own updater performs the update, so its checks decide
+what continues. Supported source protocols are wire-proven for the updater's
+lifecycle operations. If the running daemon is too old, update it to an
+intermediate build first. Source trees and OS packages retain their own update
 method; browserless builds do not download full releases.
 
 The detached updater rechecks the selected release, verifies and seals the
@@ -282,21 +279,11 @@ matching UI. Finish the staged update with `cagents daemon upgrade`, or with
 the application's update control (see [In-app updates](#in-app-updates)). The
 command displays the same impact, asks for approval, and waits for completion.
 `--yes` skips the prompt; `--interrupt` additionally permits active native
-turns to stop. `--accept-unreopenable`
-carries saved panes whose ended Claude actor never recorded its conversation:
-the update otherwise refuses them, naming each pane. They stay in their windows
-but, unless their conversation can still be proved, will not resume or start
-one; a conversation one began stays on disk and can be reopened with Resume.
-The flag accepts this for every such pane found during the update, not only the
-ones a previous refusal named. It also ends conversations the running daemon
-reports it cannot carry: a Codex chat whose server can no longer be reached,
-and a chat whose provider stopped without confirming its work finished. The
-command lists each with what ending it loses, asks before ending them unless
-`--yes` is given, ends them through the daemon's own close, and then shows the
-impact that remains. Their conversations stay on disk and can be reopened with
-Resume. If anything else blocks the update, nothing is ended and it stops. If
-the daemon cannot end one, the others are still ended, and the update stops
-without starting.
+turns to stop. The review groups panes by what happens after the update. Panes
+that cannot reconnect reopen stopped; each lists how to reopen its conversation
+or restart its terminal. The update keeps the saved panes and their files.
+If the running service still reports an item that needs attention, resolve it
+before updating. A changed inventory requires another review.
 
 To make a verified build available without saving or closing running windows,
 append `--stage-only` to the installer invocation. It publishes the complete

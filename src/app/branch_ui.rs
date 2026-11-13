@@ -354,7 +354,7 @@ impl Cagents {
             Some(card) => self
                 .workspace
                 .focus(card)
-                .map(|update| self.apply_viewport(update, true, false))
+                .map(|update| self.apply_viewport(update, true, DurableChange::None))
                 .unwrap_or_else(|_| Task::none()),
             None => self.add_repository_card(
                 key.project_id,

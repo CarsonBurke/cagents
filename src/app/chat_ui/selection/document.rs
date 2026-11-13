@@ -133,6 +133,12 @@ impl Catalog {
     pub fn copy(&self, anchor: Endpoint, end: Endpoint) -> Option<String> {
         Some(self.read.copy(&self.read.ranges(anchor, end)?))
     }
+    /// What parts of `identity`'s text copy as instead.
+    pub fn copies(&self, identity: u64) -> Option<Arc<markdown::Inlines>> {
+        self.read.blocks[*self.positions.get(&identity)?]
+            .copies
+            .clone()
+    }
     pub fn text(&self, identity: u64) -> Option<Arc<str>> {
         Some(
             self.read.blocks[*self.positions.get(&identity)?]
@@ -156,15 +162,33 @@ pub(in crate::app::chat_ui) struct Builder {
 }
 impl Builder {
     pub fn logical(&mut self, identity: u64, text: Arc<str>) {
+        self.logical_copying(identity, text, None);
+    }
+    fn logical_copying(
+        &mut self,
+        identity: u64,
+        text: Arc<str>,
+        copies: Option<Arc<markdown::Inlines>>,
+    ) {
         let mut logical = LogicalText {
             identity,
             plain: text,
+            copies,
         };
         self.read.custom(None, Rectangle::default(), &mut logical);
     }
     pub fn plain(&mut self, item: &str, path: &[u32], text: Arc<str>) {
+        self.plain_copying(item, path, text, None);
+    }
+    fn plain_copying(
+        &mut self,
+        item: &str,
+        path: &[u32],
+        text: Arc<str>,
+        copies: Option<Arc<markdown::Inlines>>,
+    ) {
         let identity = identity(item, path);
-        self.logical(identity, text);
+        self.logical_copying(identity, text, copies);
         let owner = self
             .owner_pool
             .entry(item.to_owned())
@@ -181,6 +205,13 @@ impl Builder {
         let key = identity(item, path);
         self.plain(item, path, text);
         self.prefixes.insert(key, prefixes);
+    }
+    /// Rendered Markdown text, which may copy other than it reads: a pull
+    /// request link shown by its label copies as its address.
+    fn rendered(&mut self, item: &str, path: &[u32], text: &markdown::Text) {
+        let key = identity(item, path);
+        self.plain_copying(item, path, text.plain(), text.inlines());
+        self.prefixes.insert(key, text.plain_prefixes());
     }
     fn enter(&mut self, item: &str, path: &[u32], kind: Kind) {
         self.read.custom(
@@ -202,7 +233,7 @@ impl Builder {
             key.push(index as u32);
             match node {
                 markdown::Item::Heading(_, text) | markdown::Item::Paragraph(text) => {
-                    self.indexed(item, &key, text.plain(), text.plain_prefixes())
+                    self.rendered(item, &key, text)
                 }
                 markdown::Item::CodeBlock {
                     source,

@@ -1,16 +1,7 @@
 //! Both shells consume the same per-viewer discovery and history authority.
 pub mod monitor;
 use super::*;
-use crate::github::review_requests::{
-    HistoryPage, Page,
-    scan::{History, Scan, Work},
-};
-
-#[derive(Debug, Clone)]
-pub enum Reply {
-    Page(Page),
-    History(HistoryPage),
-}
+use crate::github::review_requests::scan::History;
 
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
@@ -59,31 +50,6 @@ impl State {
             }
         })
     }
-}
-
-pub(crate) fn execute(
-    api: &dyn GitHubReviewApi,
-    repository: &GitHubRepoKey,
-    work: &Work,
-    cancellation: &CancellationToken,
-) -> Result<Reply, String> {
-    match work {
-        Work::Page { cursor } => api
-            .review_request_page(repository, cursor.as_deref(), cancellation)
-            .map(Reply::Page),
-        Work::History { number, before, .. } => api
-            .review_request_history_page(
-                &PullRequestKey {
-                    repository: repository.clone(),
-                    number: *number,
-                },
-                before.as_deref(),
-                cancellation,
-            )
-            .map(Reply::History),
-    }
-    // The GitHub service already charged this failure to the host budget.
-    .map_err(|error| error.to_string())
 }
 
 impl super::State {

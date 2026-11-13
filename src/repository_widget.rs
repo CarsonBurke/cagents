@@ -2397,13 +2397,6 @@ pub struct RepositoryInspectorContext {
     pub can_back: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RepositoryRuntimeStatus {
-    Loading,
-    Ready,
-    Unavailable,
-}
-
 impl RepositoryRuntime {
     fn protect_editor_worktree(&mut self, directory: &Path) -> std::io::Result<()> {
         if self
@@ -4336,8 +4329,8 @@ impl RepositoryRuntime {
                 if let Some((entered, release)) = pause {
                     let _ = entered.send(());
                     release
-                        .recv_timeout(std::time::Duration::from_secs(5))
-                        .map_err(|_| "Replacement fixture pause expired.".to_string())?;
+                        .recv()
+                        .map_err(|_| "Replacement fixture pause disconnected.".to_string())?;
                 }
                 let result = snapshot.replace_matches_with_cancellation(
                     &matches,
@@ -5582,34 +5575,6 @@ impl RepositoryRuntime {
             can_back: selected
                 && self.descriptor.selected_file.is_none()
                 && !self.blocks_navigation(),
-        }
-    }
-
-    pub fn inspector_runtime_status(&self) -> RepositoryRuntimeStatus {
-        match &self.files {
-            FileListState::Loading => return RepositoryRuntimeStatus::Loading,
-            FileListState::Failed(_) => return RepositoryRuntimeStatus::Unavailable,
-            FileListState::Ready(_) => {}
-        }
-        match &self.document {
-            DocumentState::Loading { .. } => RepositoryRuntimeStatus::Loading,
-            DocumentState::Failed { .. } => RepositoryRuntimeStatus::Unavailable,
-            _ if self.source_surface == SourceSurface::Diff => match &self.basis_resolution {
-                Some(BasisResolution::Resolving(_)) => RepositoryRuntimeStatus::Loading,
-                Some(
-                    BasisResolution::NeedsBase(_)
-                    | BasisResolution::NoCommits
-                    | BasisResolution::Unavailable(_),
-                ) => RepositoryRuntimeStatus::Unavailable,
-                None => match self.diff_state(&self.diff_basis) {
-                    Some(DiffState::Loading { .. }) => RepositoryRuntimeStatus::Loading,
-                    Some(DiffState::Ready(RenderedDiff::Error(_), _)) => {
-                        RepositoryRuntimeStatus::Unavailable
-                    }
-                    _ => RepositoryRuntimeStatus::Ready,
-                },
-            },
-            _ => RepositoryRuntimeStatus::Ready,
         }
     }
 
@@ -16218,10 +16183,6 @@ mod tests {
             worktree: PathBuf::from("/repo"),
         };
         let mut runtime = RepositoryRuntime::new(view);
-        assert_eq!(
-            runtime.inspector_runtime_status(),
-            RepositoryRuntimeStatus::Loading
-        );
         assert_eq!(runtime.inspector_context().file_list, "Loading");
 
         let file = RepositoryFile {
@@ -16286,17 +16247,9 @@ mod tests {
                 cancellation: CancellationToken::new(),
             },
         );
-        assert_eq!(
-            runtime.inspector_runtime_status(),
-            RepositoryRuntimeStatus::Loading
-        );
         runtime.set_diff_state(
             DiffBasis::HeadToIndex,
             DiffState::ready(RenderedDiff::Error("diff failed".into())),
-        );
-        assert_eq!(
-            runtime.inspector_runtime_status(),
-            RepositoryRuntimeStatus::Unavailable
         );
         assert_eq!(
             runtime.inspector_context().diff_error.as_deref(),
@@ -22434,6 +22387,11 @@ mod tests {
     fn large_replace_planning_keeps_edits_live_and_rejects_obsolete_output() {
         let (card, mut runtime, original) = large_unicode_replacement_fixture();
         use cosmic::iced::futures::{FutureExt, StreamExt};
+        // Drop the pause sender before the executor on unwind so its blocking
+        // worker always leaves the pause before runtime teardown waits for it.
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         runtime.find_replacement_pause = Some((entered_tx, release_rx));
@@ -22446,9 +22404,6 @@ mod tests {
             "admission must capture immutable lines without serializing on UI"
         );
         assert_eq!(buffer_text(&runtime), original);
-        let executor = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
         let mut stream = iced::runtime::task::into_stream(held).unwrap();
         let admitted = Instant::now();
         executor.block_on(std::future::poll_fn(|cx| {
@@ -22479,8 +22434,19 @@ mod tests {
                 .is_cancelled()
         );
         release_tx.send(()).unwrap();
-        let iced::runtime::Action::Output(callback) = executor.block_on(stream.next()).unwrap()
-        else {
+        let released = Instant::now();
+        let completion = executor.block_on(std::future::poll_fn(|cx| {
+            if let std::task::Poll::Ready(completion) = stream.next().poll_unpin(cx) {
+                return std::task::Poll::Ready(completion);
+            }
+            assert!(
+                released.elapsed() < std::time::Duration::from_secs(5),
+                "replacement fixture did not complete after release"
+            );
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }));
+        let iced::runtime::Action::Output(callback) = completion.unwrap() else {
             panic!("replacement completion");
         };
         assert!(matches!(

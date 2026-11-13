@@ -184,9 +184,28 @@ pub fn segmented_controls<'a, Message: 'a>(
 /// navigation entry - presses the same treatment as the icon controls beside
 /// it instead of reaching for a stock button class.
 pub fn control_style(selected: bool, tone: Option<Tone>) -> cosmic::theme::Button {
+    styled_control(selected, tone, false)
+}
+
+/// [`control_style`] with a resting outline, for a control set among text
+/// that would otherwise read as more text, such as a chip inside a row.
+pub fn outlined_control_style(selected: bool) -> cosmic::theme::Button {
+    styled_control(selected, None, true)
+}
+
+fn styled_control(selected: bool, tone: Option<Tone>, outlined: bool) -> cosmic::theme::Button {
     let appearance = move |focused: bool, theme: &cosmic::Theme| {
         let component = &theme.current_container().component;
         let raised = selected || focused;
+        let border = if outlined {
+            widget::button::Style {
+                border_width: design::BORDER_WIDTH,
+                border_color: component.divider.into(),
+                ..design::button_style()
+            }
+        } else {
+            design::button_style()
+        };
         widget::button::Style {
             background: raised
                 .then(|| iced::Background::Color(component.selected_state_color().into())),
@@ -195,7 +214,7 @@ pub fn control_style(selected: bool, tone: Option<Tone>) -> cosmic::theme::Butto
                 None if raised => component.on.into(),
                 None => design::muted_icon_color(theme),
             }),
-            ..design::button_style()
+            ..border
         }
     };
     cosmic::theme::Button::Custom {

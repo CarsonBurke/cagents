@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 mod claude;
 #[cfg(feature = "host")]
 pub(crate) use claude::transcript as claude_transcript;
+#[cfg(feature = "host")]
+pub(crate) use claude::transcript_exists as claude_transcript_exists;
 mod codex;
 #[cfg(feature = "host")]
 pub(crate) use codex::{archived_rollout as codex_archived_rollout, rollout as codex_rollout};
@@ -181,7 +183,7 @@ impl Provider {
     }
 
     /// Read only the canonical selector position in an already normalized recipe.
-    #[cfg(any(feature = "host", feature = "ui", test))]
+    /// Shared checkpoint validation uses this parser before any daemon starts.
     pub(crate) fn resume_id(self, arguments: &[String]) -> Option<&str> {
         let (selector, id) = if self.adapter().resume_precedes_options {
             match arguments {

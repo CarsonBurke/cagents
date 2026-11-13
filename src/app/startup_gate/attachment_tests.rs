@@ -292,7 +292,7 @@ fn oversized_terminal_refusal_fits_the_startup_handshake_without_losing_recovery
     let mut card = crate::app::tests::terminal_card_state();
     card.kind = CardKind::Terminal(session.clone());
     app.cards.insert(card.id, CardRuntime::Loading);
-    Arc::make_mut(&mut app.durable).cards = vec![card.clone()];
+    Arc::make_mut(&mut app.durable).cards = vec![card.clone()].into();
     let raw = format!("exact terminal refused\n\t{}", "多字\r\n  ".repeat(3000));
     app.startup_gate.opened = Some(Instant::now());
     for _ in 0..2 {
@@ -360,7 +360,7 @@ fn the_budget_does_not_shrink_as_panes_settle() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
     let card = crate::app::tests::terminal_card_state();
     app.cards.insert(card.id, CardRuntime::Loading);
-    Arc::make_mut(&mut app.durable).cards = vec![card];
+    Arc::make_mut(&mut app.durable).cards = vec![card].into();
     let elapsed = launcher_budget(1) + Duration::from_secs(5);
     app.startup_gate = State::fixture_opened();
     app.startup_gate.budget = Some(launcher_budget(3));

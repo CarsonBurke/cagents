@@ -89,6 +89,20 @@ exit 83
         self.assertFalse(self.shim_calls.exists(), "mise shim was executed")
         return result, calls
 
+    def test_in_session_rejects_lifecycle_options_and_the_login_desktop(self):
+        for flags in ([], ["--keep"], ["--fresh-daemon"], ["--ttl", "60"],
+                      ["--stop-instance", "review2571"]):
+            with self.subTest(flags=flags):
+                result = subprocess.run(
+                    [str(self.runner), "--in-session", "--instance", "review2571", *flags],
+                    env=(self.env if not flags else self.env | {
+                        "XDG_RUNTIME_DIR": str(self.root / "nh-evidence"),
+                        "DISPLAY": "", "NIRI_SOCKET": "private-niri.sock",
+                    }), capture_output=True, text=True, timeout=3,
+                )
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertFalse(self.cargo_calls.exists())
+
     def test_isolated_home_finds_pinned_zig_for_zon_and_json(self):
         for format_name in ("zon", "json"):
             with self.subTest(format=format_name):
@@ -314,6 +328,22 @@ exit 83
             self.assertNotIn(f"lock={self.env['CAGENTS_BUILD_LOCK']} ", line)
             self.assertIn(f"lock={self.target}/dev-runtime/.native-lock-gate ", line)
             self.assertIn("seed=0 remote=local slots=1 held=", line)
+
+    def test_named_instance_runs_in_the_current_session_without_a_compositor(self):
+        self.fake_cargo_reports_its_guard()
+        app_environment = self.root / "app-environment"
+        harness_calls = self.root / "harness-calls"
+        harness = self.root / "bin/niri-harness"
+        harness.write_text(f'#!/bin/sh\nprintf called >> "{harness_calls}"\nexit 99\n')
+        harness.chmod(0o755)
+        log = self.root / "ui.log"
+        self.launch("--browserless", "--instance", "review2571", "--in-session",
+                    "--log-file", str(log),
+                    XDG_RUNTIME_DIR=str(self.root / "nh-evidence"),
+                    DISPLAY="", NIRI_SOCKET="private-niri.sock", APP_ENV=str(app_environment))
+        self.assertIn("CAGENTS_DEVELOPMENT_INSTANCE=review2571", app_environment.read_text())
+        self.assertFalse(harness_calls.exists(), "the runner started another compositor")
+        self.assertTrue(log.exists())
 
     def test_a_launch_below_the_lock_holder_cannot_compile(self):
         guard_calls = self.fake_cargo_reports_its_guard()
@@ -596,6 +626,27 @@ exit 83
         program = words.index(str(limit))
         self.assertEqual(words[program + 1:program + 3], ["--name", "cagents-ui"])
         self.assertTrue(words[program + 3].endswith("/cagents-ui"), words)
+
+    def test_an_instance_daemon_log_is_chosen_by_the_flag_alone(self):
+        started = self.root / "started"
+        harness = self.root / "bin/niri-harness"
+        harness.write_text(
+            '#!/bin/sh\ncase " $* " in *" start "*) printf "%s|%s\\n" '
+            f'"${{CAGENTS_DEVELOPMENT_DAEMON_LOG-unset}}" "${{CAGENTS_LOCAL_DEBUG-unset}}" >"{started}" ;;'
+            ' *) exit 1 ;; esac\n'
+        )
+        harness.chmod(0o755)
+        caller = self.root / "caller"
+        caller.mkdir()
+        result = subprocess.run(
+            [str(self.runner), "--browserless", "--instance", "logged", "--daemon-log", "daemon.log"],
+            cwd=caller, env=self.env, capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(started.read_text(), f"{caller / 'daemon.log'}|1\n")
+        self.launch("--browserless", "--instance", "unlogged",
+                    CAGENTS_DEVELOPMENT_DAEMON_LOG="/inherited.log")
+        self.assertEqual(started.read_text(), "unset|unset\n")
 
     def test_the_memory_limit_speaks_to_the_terminal_and_the_app_to_the_log(self):
         limit = self.runner.with_name("memory-capped")

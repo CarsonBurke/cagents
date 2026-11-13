@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt::Write as _,
     fs::{self, DirBuilder, File, OpenOptions},
     io::{self, Read, Write},
@@ -901,6 +901,40 @@ pub enum WorktreeSort {
     Alphabetical,
 }
 
+/// How additional worktrees appear beside a project's channels.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SidebarWorktrees {
+    #[default]
+    Grouped,
+    Expanded,
+    Hidden,
+}
+
+impl SidebarWorktrees {
+    pub const ALL: [Self; 3] = [Self::Grouped, Self::Expanded, Self::Hidden];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Grouped => "Grouped",
+            Self::Expanded => "Expanded",
+            Self::Hidden => "Hidden",
+        }
+    }
+
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Grouped => "grouped",
+            Self::Expanded => "expanded",
+            Self::Hidden => "hidden",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.key() == key)
+    }
+}
+
 /// Syntax colors for native editors and diffs. `Auto` follows the app theme.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1048,6 +1082,10 @@ pub struct AppSettings {
     #[serde(default)]
     pub worktree_sort: WorktreeSort,
     #[serde(default)]
+    pub sidebar_worktrees: SidebarWorktrees,
+    #[serde(default)]
+    pub sidebar_worktree_overrides: BTreeMap<crate::model::ProjectId, SidebarWorktrees>,
+    #[serde(default)]
     pub default_worktree_pane: DefaultPane,
     #[serde(default)]
     pub default_channel_pane: DefaultPane,
@@ -1100,6 +1138,11 @@ pub struct AppSettings {
     /// source-control data and agent activity indicators intact.
     #[serde(default = "default_show_worktree_changes_icons")]
     pub show_worktree_changes_icons: bool,
+    /// Whether the inspector lists the pull requests a channel only
+    /// mentioned, below those it worked on. Off, because a mention says
+    /// little about what the channel did.
+    #[serde(default)]
+    pub show_mentioned_pull_requests: bool,
     /// Whether a daemon upgrade relaunches an agent whose conversation cannot
     /// be resumed exactly - into its provider's resume picker, or a fresh
     /// conversation when it had none yet - rather than refusing to upgrade
@@ -1186,6 +1229,8 @@ impl Default for AppSettings {
             managed_worktree_directory: default_managed_worktree_directory(),
             auto_delete_merged_worktrees: false,
             worktree_sort: WorktreeSort::default(),
+            sidebar_worktrees: SidebarWorktrees::default(),
+            sidebar_worktree_overrides: BTreeMap::new(),
             default_worktree_pane: DefaultPane::default(),
             default_channel_pane: DefaultPane::default(),
             editor_auto_save: default_editor_auto_save(),
@@ -1204,6 +1249,7 @@ impl Default for AppSettings {
             show_status_bar: default_show_status_bar(),
             usage_preview_rows: HashMap::new(),
             show_worktree_changes_icons: default_show_worktree_changes_icons(),
+            show_mentioned_pull_requests: false,
             relaunch_agents_on_upgrade: default_relaunch_agents_on_upgrade(),
             check_for_updates: default_check_for_updates(),
             work_stale_after_days: default_work_stale_after_days(),
@@ -2160,8 +2206,7 @@ pub fn default_path() -> Result<PathBuf, SettingsError> {
     instance::settings_path().ok_or(SettingsError::DirectoryUnavailable)
 }
 
-fn settings_lock(path: &Path) -> Result<File, SettingsError> {
-    use std::os::fd::AsRawFd;
+fn settings_lock(path: &Path) -> Result<crate::instance::OwnedLock, SettingsError> {
     let parent = settings_parent(path)?;
     prepare_private_directory(parent)?;
     let lock_path = path.with_extension("toml.lock");
@@ -2174,11 +2219,9 @@ fn settings_lock(path: &Path) -> Result<File, SettingsError> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&lock_path)?;
     validate_owned_regular_file(&lock_path, &lock.metadata()?)?;
-    // SAFETY: the returned file owns the locked descriptor until dropped.
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(io::Error::last_os_error().into());
-    }
-    Ok(lock)
+    // The returned lock unlocks as its scope ends, even if a concurrent fork
+    // copied the descriptor before exec; closing the file alone would not.
+    Ok(crate::instance::owned_file_lock(lock, libc::LOCK_EX)?)
 }
 
 /// Applies only fields this window changed since its last successful save.
@@ -3422,6 +3465,33 @@ mod tests {
     }
 
     #[test]
+    fn settings_lock_releases_despite_a_copied_descriptor() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let lock_path = path.with_extension("toml.lock");
+        let probe = || {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .unwrap();
+            crate::instance::owned_file_lock(file, libc::LOCK_EX | libc::LOCK_NB)
+        };
+        let lock = settings_lock(&path).unwrap();
+        // A fork that has not reached exec yet holds a copy of this
+        // description; closing the owner's file alone would leave the lock
+        // held by that copy until the child execs or exits.
+        let copied = lock.try_clone().unwrap();
+        assert!(probe().is_err(), "the held lock must refuse a probe");
+        drop(lock);
+        assert!(
+            probe().is_ok(),
+            "ending the scope must release the lock despite the copied descriptor"
+        );
+        drop(copied);
+    }
+
+    #[test]
     fn palette_recents_survive_save_and_old_settings_default_to_empty() {
         let directory = tempfile::tempdir().unwrap();
         let path = path_in(&directory);
@@ -3546,6 +3616,55 @@ mod tests {
         let restored = load(&path).unwrap();
         assert_eq!(restored.terminal_font_size, 19.0);
         assert_eq!(restored.app_theme, AppTheme::Light);
+    }
+
+    #[test]
+    fn sidebar_worktree_preferences_round_trip_default_and_merge_per_project() {
+        use SidebarWorktrees::*;
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let first = crate::model::ProjectId::new();
+        let second = crate::model::ProjectId::new();
+        let base = AppSettings::default();
+        let mut legacy = toml::Value::try_from(&base).unwrap();
+        legacy.as_table_mut().unwrap().remove("sidebar_worktrees");
+        legacy
+            .as_table_mut()
+            .unwrap()
+            .remove("sidebar_worktree_overrides");
+        let legacy: AppSettings = legacy.try_into().unwrap();
+        assert_eq!(legacy.sidebar_worktrees, Grouped);
+        assert!(legacy.sidebar_worktree_overrides.is_empty());
+        save(&path, &base).unwrap();
+        let mut one = base.clone();
+        one.sidebar_worktrees = Hidden;
+        one.sidebar_worktree_overrides.insert(first, Expanded);
+        save_merged(&path, &base, &one).unwrap();
+        let mut two = base.clone();
+        two.sidebar_worktree_overrides.insert(second, Grouped);
+        save_merged(&path, &base, &two).unwrap();
+        let saved = load(&path).unwrap();
+        assert_eq!(saved.sidebar_worktrees, Hidden);
+        assert_eq!(
+            saved.sidebar_worktree_overrides.get(&first),
+            Some(&Expanded)
+        );
+        assert_eq!(
+            saved.sidebar_worktree_overrides.get(&second),
+            Some(&Grouped)
+        );
+        one.sidebar_worktree_overrides.remove(&first);
+        let mut one_base = base.clone();
+        one_base.sidebar_worktrees = Hidden;
+        one_base.sidebar_worktree_overrides.insert(first, Expanded);
+        save_merged(&path, &one_base, &one).unwrap();
+        let saved = load(&path).unwrap();
+        assert!(!saved.sidebar_worktree_overrides.contains_key(&first));
+        assert_eq!(
+            saved.sidebar_worktree_overrides.get(&second),
+            Some(&Grouped)
+        );
+        assert_eq!(saved.sidebar_worktrees, Hidden);
     }
 
     #[test]

@@ -348,7 +348,8 @@ pub(super) struct Verb {
 impl Verb {
     pub(super) fn said(&self, status: ToolStatus) -> &'static str {
         match status {
-            ToolStatus::Running => self.doing,
+            // An agent waiting on its own background work has not finished.
+            ToolStatus::Running | ToolStatus::Waiting => self.doing,
             ToolStatus::Succeeded => self.done,
             ToolStatus::Failed | ToolStatus::Denied | ToolStatus::Stopped => self.tried,
         }

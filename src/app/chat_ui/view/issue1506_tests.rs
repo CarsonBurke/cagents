@@ -1908,6 +1908,7 @@ fn hidden_diagnostic_metadata_releases_exact_source_and_restores_disclosure_on_r
     assert!(runtime.failure_preview(&key).is_some());
     drop(original);
     runtime.set_visible(false).unwrap();
+    runtime.cool();
     preparation::retirement_barrier();
     assert!(runtime.failure_ui.incidents.is_empty());
     assert!(runtime.failure_preview(&key).is_none());

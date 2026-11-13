@@ -789,12 +789,13 @@ pub(super) fn logical_bounds(
 
 /// Fine-grained anchors include the visible window and previously anchored
 /// rows even when corrected estimates moved them outside the current window.
-/// No hidden row is realized to answer this geometry request.
+/// No hidden row is realized to answer this geometry request, so each anchor
+/// says whether it is mounted: an unmounted one has only its estimate.
 pub(super) fn anchor_points(
     state: &mut dyn std::any::Any,
     bounds: Rectangle,
     wanted: &HashSet<u64>,
-) -> Vec<(u64, Rectangle)> {
+) -> Vec<(u64, Rectangle, bool)> {
     let Some(state) = state.downcast_ref::<State>() else {
         return vec![];
     };
@@ -828,7 +829,8 @@ pub(super) fn anchor_points(
                     height: bounds.height,
                 },
             };
-            Some((key, rectangle))
+            let mounted = state.mounted.iter().any(|(_, mounted)| *mounted == key);
+            Some((key, rectangle, mounted))
         })
         .collect()
 }
