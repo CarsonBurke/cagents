@@ -4667,6 +4667,17 @@ pub(in crate::host) mod tests {
             gate.try_write().is_ok(),
             "a provider listing in flight must not hold the control gate"
         );
+        // ...but it holds the lease that account and worktree reservations
+        // wait for.
+        let probes = host.lock().unwrap().agent_probes.clone();
+        assert_eq!(
+            probes
+                .running()
+                .into_iter()
+                .map(|(_, probe)| probe.working_directory)
+                .collect::<Vec<_>>(),
+            [directory.path().to_path_buf()]
+        );
 
         // Compatibility refreshes read the cache immediately; none schedules a
         // probe or creates a per-connection worker. Input shares this socket.

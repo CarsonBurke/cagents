@@ -24,6 +24,8 @@ enum Outcome {
     Observed,
     Failed,
     Busy,
+    /// An account or worktree operation holds the paths it would touch.
+    Deferred,
 }
 
 #[derive(Default)]
@@ -87,18 +89,14 @@ impl Wake {
 }
 
 /// How long an account or worktree reservation waits for provider listings
-/// already in flight, which end within the census timeout.
-const PROBE_PATIENCE: Duration = if cfg!(test) {
-    Duration::from_millis(500)
-} else {
-    Duration::from_secs(5)
-};
+/// already in flight on its paths, which end within the census timeout.
+const PROBE_PATIENCE: Duration = Duration::from_secs(5);
 
 /// Provider observations in flight. They run outside the control gate, so
 /// each is admitted under it the way a launch is: refused while an account or
 /// worktree reservation covers its process's homes or directory. A
-/// reservation, installed under the writer, then waits for the ones admitted
-/// before it and counts any still running as owners of their paths.
+/// reservation, installed under the writer, then waits for the ones on its
+/// paths, which were all admitted before it.
 #[derive(Default)]
 pub(super) struct Probes {
     running: Mutex<BTreeMap<u64, Probe>>,
@@ -143,21 +141,58 @@ impl Probes {
         }
     }
 
-    /// Waits up to `PROBE_PATIENCE` for the observations running now, then
-    /// returns those still running, and any admitted since.
-    pub(super) fn settle(&self) -> Vec<Probe> {
-        let running = self.running.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(&last) = running.keys().next_back() else {
+    /// The observations running now.
+    pub(super) fn running(&self) -> Vec<(u64, Probe)> {
+        self.running
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .map(|(id, probe)| (*id, probe.clone()))
+            .collect()
+    }
+
+    /// Waits up to `PROBE_PATIENCE` for the observations `ids` to end, and
+    /// returns those that have not.
+    pub(super) fn wait_for(&self, ids: &BTreeSet<u64>) -> Vec<Probe> {
+        self.wait_within(ids, PROBE_PATIENCE)
+    }
+
+    fn wait_within(&self, ids: &BTreeSet<u64>, patience: Duration) -> Vec<Probe> {
+        if ids.is_empty() {
             return Vec::new();
-        };
+        }
+        let running = self.running.lock().unwrap_or_else(|p| p.into_inner());
         let (running, _) = self
             .finished
-            .wait_timeout_while(running, PROBE_PATIENCE, |running| {
-                running.keys().next().is_some_and(|&first| first <= last)
+            .wait_timeout_while(running, patience, |running| {
+                ids.iter().any(|id| running.contains_key(id))
             })
             .unwrap_or_else(|p| p.into_inner());
-        running.values().cloned().collect()
+        ids.iter()
+            .filter_map(|id| running.get(id).cloned())
+            .collect()
     }
+}
+
+/// Admits an observation of `process`, as a launch into its directory and
+/// homes would be, unless a reservation covers them. The caller holds the
+/// control gate, which orders this against every reservation's install.
+fn admit(host: &SharedHost, probes: &Arc<Probes>, process: &AgentProcess) -> Option<ProbeLease> {
+    let launch = &process.launch;
+    let unset = crate::account::launch_credential_overrides(launch);
+    super::account_lifecycle::ensure_launch(
+        host,
+        &launch.working_directory,
+        &launch.environment,
+        &unset,
+        false,
+    )
+    .ok()?;
+    Some(probes.admit(Probe {
+        working_directory: launch.working_directory.clone(),
+        environment: launch.environment.clone(),
+        unset,
+    }))
 }
 
 #[derive(Clone)]
@@ -243,6 +278,7 @@ impl Schedule {
                     (INTERVAL * (1 << entry.failures.min(4))).min(MAX_BACKOFF)
                 }
                 Outcome::Busy => Duration::from_millis(500),
+                Outcome::Deferred => INTERVAL,
             };
             entry.due = now + delay;
         }
@@ -453,28 +489,16 @@ fn observe(host: &Weak<HostLock>, candidate: &Candidate) -> Outcome {
             if !current() {
                 return Outcome::Failed;
             }
-            let launch = &candidate.process.launch;
-            let unset = crate::account::launch_credential_overrides(launch);
-            if super::account_lifecycle::ensure_launch(
-                &host,
-                &launch.working_directory,
-                &launch.environment,
-                &unset,
-                false,
-            )
-            .is_err()
-            {
-                return Outcome::Failed;
-            }
-            probes.admit(Probe {
-                working_directory: launch.working_directory.clone(),
-                environment: launch.environment.clone(),
-                unset,
-            })
+            // An account or worktree operation holds the paths; look again
+            // once it is likely done, without counting this as a failure.
+            let Some(lease) = admit(&host, &probes, &candidate.process) else {
+                return Outcome::Deferred;
+            };
+            lease
         };
         let observation = observer.try_observe(&candidate.process);
-        // Released before the gate is taken again: a reservation may hold the
-        // writer while it waits for this observation.
+        // Released as soon as the listing ends, so a reservation waiting for
+        // it is not also held up while its effects apply.
         drop(lease);
         observation
     };
@@ -713,38 +737,91 @@ mod tests {
         let _ = first.handle.shutdown();
     }
 
-    #[test]
-    fn reservations_wait_for_earlier_observations_and_count_the_ones_that_outlast_them() {
-        let probes = Arc::new(Probes::default());
-        let probe = |directory: &str| Probe {
+    fn probe(directory: &str) -> Probe {
+        Probe {
             working_directory: directory.into(),
             environment: BTreeMap::new(),
             unset: BTreeSet::new(),
-        };
-        assert!(probes.settle().is_empty(), "nothing running, no wait");
+        }
+    }
 
+    #[test]
+    fn waiting_for_observations_returns_only_those_that_outlast_it() {
+        let probes = Arc::new(Probes::default());
+        assert!(
+            probes
+                .wait_within(&BTreeSet::new(), Duration::ZERO)
+                .is_empty()
+        );
+
+        // Released while the wait runs: generous patience, so load cannot
+        // turn the release into a timeout.
         let brief = probes.admit(probe("/brief"));
+        let (waiting, started) = crossbeam_channel::bounded(1);
         let releaser = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(50));
+            started.recv().unwrap();
+            thread::sleep(Duration::from_millis(20));
             drop(brief);
         });
-        let started = Instant::now();
-        assert!(probes.settle().is_empty());
-        assert!(started.elapsed() >= Duration::from_millis(40));
-        assert!(started.elapsed() < PROBE_PATIENCE);
+        let ids = probes.running().into_iter().map(|(id, _)| id).collect();
+        waiting.send(()).unwrap();
+        assert!(probes.wait_within(&ids, Duration::from_secs(60)).is_empty());
         releaser.join().unwrap();
 
+        // One not asked about is neither waited for nor returned.
         let stuck = probes.admit(probe("/stuck"));
-        let started = Instant::now();
-        let remaining = probes.settle();
-        assert!(started.elapsed() >= PROBE_PATIENCE);
+        let ids: BTreeSet<_> = probes.running().into_iter().map(|(id, _)| id).collect();
+        let unrelated = probes.admit(probe("/unrelated"));
+        let remaining = probes.wait_within(&ids, Duration::from_millis(10));
         assert_eq!(remaining.len(), 1);
         assert_eq!(
             remaining[0].working_directory,
             std::path::Path::new("/stuck")
         );
         drop(stuck);
-        assert!(probes.settle().is_empty());
+        assert!(probes.wait_within(&ids, Duration::ZERO).is_empty());
+        drop(unrelated);
+        assert!(probes.running().is_empty());
+    }
+
+    #[test]
+    fn an_observation_is_admitted_only_outside_reserved_homes_and_holds_a_lease() {
+        use crate::account::{Account, home::Homes, registry::Store};
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("claude-home");
+        std::fs::create_dir(&home).unwrap();
+        let candidate = candidate();
+        let mut process = candidate.process.clone();
+        process.launch.working_directory = root.path().into();
+        process.launch.environment = BTreeMap::from([
+            ("HOME".into(), root.path().to_str().unwrap().into()),
+            ("CLAUDE_CONFIG_DIR".into(), home.to_str().unwrap().into()),
+        ]);
+        let host = super::super::account_lifecycle::tests::host();
+        let probes = Arc::clone(&host.lock().unwrap().agent_probes);
+
+        let lease = admit(&host, &probes, &process).expect("no reservation");
+        assert_eq!(probes.running().len(), 1);
+        drop(lease);
+        assert!(probes.running().is_empty());
+
+        let reservation = super::super::account_lifecycle::Reservation::test_install(
+            &host,
+            &[Account::linked(
+                Provider::Claude,
+                uuid::Uuid::new_v4(),
+                home.clone(),
+            )],
+            Store::at(root.path().join("registry")),
+            &Homes::at(root.path().join("homes")),
+        )
+        .unwrap();
+        assert!(admit(&host, &probes, &process).is_none());
+        assert!(probes.running().is_empty());
+        drop(reservation);
+        assert!(admit(&host, &probes, &process).is_some());
+        let _ = candidate.handle.shutdown();
     }
 
     #[test]

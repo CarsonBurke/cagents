@@ -424,10 +424,31 @@ impl Reservation {
         // The installed token prevents new related startups. Copy only actual
         // execution-root metadata while holding HostState, then resolve paths
         // outside that lock and outside the global control writer.
-        // An agent observation admitted before the token may still be reading
-        // a home; wait for it, and count one that outlasts that wait.
+        // An agent observation reading a reserved home was admitted before the
+        // token, since later ones are refused. Wait for it to end.
         let probes = Arc::clone(&host.lock().unwrap_or_else(|p| p.into_inner()).agent_probes);
-        let probing = probes.settle();
+        let reading = probes
+            .running()
+            .into_iter()
+            .filter(|(_, probe)| {
+                ensure_credential_roots(
+                    host,
+                    &probe.working_directory,
+                    &probe.environment,
+                    &probe.unset,
+                    false,
+                )
+                .is_err()
+            })
+            .map(|(id, _)| id)
+            .collect();
+        if !probes.wait_for(&reading).is_empty() {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::InvalidRequest,
+                "Cagents is still checking an agent that uses this account. Try again in a moment.",
+                true,
+            ));
+        }
         let owners = {
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
             let mut owners = state
@@ -464,14 +485,6 @@ impl Reservation {
                         )
                     }),
             );
-            owners.extend(probing.into_iter().map(|probe| {
-                (
-                    probe.working_directory,
-                    probe.environment,
-                    probe.unset,
-                    false,
-                )
-            }));
             owners
         };
         for (cwd, environment, unset, inherit) in owners {
@@ -1777,7 +1790,7 @@ pub(crate) mod tests {
         let account = Account::linked(Provider::Claude, uuid::Uuid::new_v4(), home.clone());
         let host = host();
         let probes = Arc::clone(&host.lock().unwrap().agent_probes);
-        let probe = || super::super::activity::Probe {
+        let probe = |home: &Path| super::super::activity::Probe {
             working_directory: root.path().to_path_buf(),
             environment: BTreeMap::from([
                 ("HOME".into(), root.path().to_str().unwrap().into()),
@@ -1786,8 +1799,12 @@ pub(crate) mod tests {
             unset: BTreeSet::new(),
         };
 
-        // A listing that ends soon is waited for.
-        let brief = probes.admit(probe());
+        // A listing that ends soon is waited for; one reading another home
+        // is not, however long it runs.
+        let elsewhere = root.path().join("other-home");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let unrelated = probes.admit(probe(&elsewhere));
+        let brief = probes.admit(probe(&home));
         let releaser = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(50));
             drop(brief);
@@ -1795,25 +1812,23 @@ pub(crate) mod tests {
         let reservation =
             Reservation::test_install(&host, &[account.clone()], store.clone(), &homes).unwrap();
         releaser.join().unwrap();
-        // ...and while it holds the home, a new one is not admitted.
-        assert!(
-            ensure_launch(
-                &host,
-                &probe().working_directory,
-                &probe().environment,
-                &BTreeSet::new(),
-                false
-            )
-            .is_err()
-        );
         drop(reservation);
 
-        // One that outlasts the wait still uses the home.
-        let stuck = probes.admit(probe());
+        // One that outlasts the wait refuses the reservation, as retryable.
+        let stuck = probes.admit(probe(&home));
+        let error =
+            match Reservation::test_install(&host, &[account.clone()], store.clone(), &homes) {
+                Ok(_) => panic!("a listing reading the home must refuse its reservation"),
+                Err(error) => error,
+            };
+        assert!(error.retryable, "{}", error.message);
         assert!(
-            Reservation::test_install(&host, &[account.clone()], store.clone(), &homes).is_err()
+            error.message.contains("still checking"),
+            "{}",
+            error.message
         );
         drop(stuck);
         Reservation::test_install(&host, &[account], store, &homes).unwrap();
+        drop(unrelated);
     }
 }
