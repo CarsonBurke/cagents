@@ -628,6 +628,49 @@ while True:
         self.assert_reaped(pidfd)
         self.assertTrue(self.slot_is_free())
 
+    def test_an_orphan_that_exits_mid_run_is_reaped_before_the_command_ends(self):
+        # The subshell exits at once, so the supervisor adopts the orphan, as
+        # it does an ssh ControlPersist master. When the orphan exits, it must
+        # be reaped while the command still runs, not left a zombie until then.
+        orphan = self.root / "orphan.py"
+        orphan.write_text("""
+import os, pathlib, sys, time
+root = pathlib.Path(sys.argv[1])
+(root / 'ready.tmp').write_text(str(os.getpid()))
+(root / 'ready.tmp').rename(root / 'ready')
+while not (root / 'orphan-exit').exists():
+    time.sleep(0.01)
+""")
+        child = subprocess.Popen(
+            [str(self.gate), "exec", "/bin/sh", "-c",
+             '("$1" "$2" "$3" &); while [ ! -f "$3/release" ]; do sleep 0.01; done',
+             "fixture", sys.executable, str(orphan), str(self.root)],
+            env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        self.children.append(child)
+        self.wait_for((self.root / "ready").exists, "orphan ready")
+        pid = int((self.root / "ready").read_text())
+        pidfd = os.pidfd_open(pid)
+        self.descendants.append((pid, pidfd))
+
+        def reaped():
+            # A zombie still accepts signals; only a reaped process does not.
+            try:
+                signal.pidfd_send_signal(pidfd, 0)
+            except ProcessLookupError:
+                return True
+            return False
+
+        (self.root / "orphan-exit").touch()
+        self.wait_for(lambda: select.select([pidfd], [], [], 0)[0], "orphan exit")
+        self.wait_for(reaped, "the supervisor to reap its exited orphan")
+        self.assertIsNone(child.poll(), "the command must still be running")
+        self.assertFalse(self.slot_is_free(), "the running command keeps its slot")
+        (self.root / "release").touch()
+        self.assertEqual(child.wait(timeout=5), 0)
+        self.assertTrue(self.slot_is_free())
+
     def run_gate(self, *arguments, **options):
         return subprocess.run(
             [str(self.gate), *arguments], env=self.env,
