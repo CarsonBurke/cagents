@@ -1017,6 +1017,11 @@ mod tests {
             (0..PROBE_PAGE).map(|_| issue(THIRD)).collect(),
         ));
         assert!(!listing(&[], THIRD).reflects(&busy));
+        // One whose oldest change search has had time for shows the rest.
+        let mut rows = (1..PROBE_PAGE).map(|_| issue(THIRD)).collect::<Vec<_>>();
+        rows.push(issue(FIRST));
+        let ending_settled = recent(serde_json::Value::Array(rows));
+        assert!(listing(&[], "2026-01-03T00:01:00Z").reflects(&ending_settled));
         assert!(!listing(&[(1, SECOND)], THIRD).reflects(&recent(serde_json::json!([]))));
         assert!(listing(&[], THIRD).reflects(&recent(serde_json::json!([]))));
         assert_eq!(
