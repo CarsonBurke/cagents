@@ -5,7 +5,9 @@
 //! top-right corner, so it takes no row of its own. Open, the inspector docks
 //! beside the pane's content, unless the pane is too narrow for both: such a
 //! pane closes its inspector by itself, and one reopened there covers the
-//! pane's content instead of squeezing it.
+//! pane's content instead of squeezing it. A pane closed only for being too
+//! narrow remembers that its inspector was open, so the inspector comes back
+//! when the pane widens and a restart in a smaller window loses nothing.
 //!
 //! The window binds source control and files to one worktree at a time, so
 //! only one open inspector draws them: the focused pane's, or, while the
@@ -24,11 +26,21 @@ const TOGGLE_INSET: f32 = space::XS;
 /// One pane's inspector.
 #[derive(Debug, Clone, Copy, Default)]
 struct PaneState {
+    /// Whether the user left the inspector open. This is what is saved.
     open: bool,
+    /// Open, but closed for now because the pane is too narrow for it.
+    narrowed: bool,
     transition: Option<InspectorTransition>,
     /// Opened while the pane was too narrow for it, so it covers the pane's
     /// content, and narrowness does not close it again.
     opened_narrow: bool,
+}
+
+impl PaneState {
+    /// Whether the inspector is open on screen.
+    fn shown(&self) -> bool {
+        self.open && !self.narrowed
+    }
 }
 
 /// Every pane's inspector, and which of them draws source control.
@@ -87,21 +99,22 @@ impl PaneInspectors {
         }
     }
 
+    /// Whether the pane's inspector is open on screen.
     pub(super) fn is_open(&self, card: CardId) -> bool {
-        self.panes.get(&card).is_some_and(|pane| pane.open)
+        self.panes.get(&card).is_some_and(PaneState::shown)
     }
 
     /// Whether the pane draws its inspector: open, or closing.
     pub(super) fn is_visible(&self, card: CardId) -> bool {
         self.panes
             .get(&card)
-            .is_some_and(|pane| pane.open || pane.transition.is_some())
+            .is_some_and(|pane| pane.shown() || pane.transition.is_some())
     }
 
     pub(super) fn visible(&self) -> impl Iterator<Item = CardId> + '_ {
         self.panes
             .iter()
-            .filter(|(_, pane)| pane.open || pane.transition.is_some())
+            .filter(|(_, pane)| pane.shown() || pane.transition.is_some())
             .map(|(card, _)| *card)
     }
 
@@ -119,7 +132,7 @@ impl PaneInspectors {
             return 0.0;
         };
         pane.transition
-            .map_or(if pane.open { 1.0 } else { 0.0 }, |transition| {
+            .map_or(if pane.shown() { 1.0 } else { 0.0 }, |transition| {
                 transition.progress(frame.unwrap_or(transition.started_at))
             })
     }
@@ -137,10 +150,11 @@ impl PaneInspectors {
         let from = self.progress(card, frame);
         let pane = self.panes.entry(card).or_default();
         self.restored_open.remove(&card);
-        if pane.open == open {
+        if pane.shown() == open {
             return false;
         }
         pane.open = open;
+        pane.narrowed = false;
         pane.opened_narrow = open && narrow;
         pane.transition = Some(InspectorTransition {
             started_at: now,
@@ -171,8 +185,9 @@ impl PaneInspectors {
 
     /// Catches the inspectors up with the workspace: a pane seen for the
     /// first time opens as it was saved, or as the pane it was split from
-    /// was; a pane `narrow` says is too narrow closes, unless it was opened
-    /// there; and source control follows the focused pane's open inspector,
+    /// was; an open pane `narrow` says is too narrow closes until it widens,
+    /// unless it was opened there; and source control follows the focused
+    /// pane's open inspector,
     /// or stays with the one that last drew it, else goes to the first
     /// open one on screen. `cards` is every pane in the window, `focused`
     /// the focused one, and `on_screen` says which the strip shows.
@@ -208,18 +223,23 @@ impl PaneInspectors {
             pane.open = true;
             self.legacy_open = false;
         }
-        for card in cards {
-            let narrow = narrow(*card);
-            if let Some(pane) = self.panes.get_mut(card) {
-                if !narrow {
-                    pane.opened_narrow = false;
-                } else if pane.open && !pane.opened_narrow {
-                    *pane = PaneState::default();
-                }
+        // Only open inspectors care how wide their panes are.
+        for (card, pane) in &mut self.panes {
+            if !pane.open {
+                continue;
+            }
+            if !narrow(*card) {
+                pane.narrowed = false;
+                pane.opened_narrow = false;
+            } else if !pane.opened_narrow && !pane.narrowed {
+                // At once, without a slide.
+                pane.narrowed = true;
+                pane.transition = None;
             }
         }
-        // Panes closed for good, here or in another window.
-        if !cards.is_empty() {
+        // Panes closed for good, here or in another window. Every pane in
+        // `cards` is known by now, so any more are gone.
+        if !cards.is_empty() && self.panes.len() > cards.len() {
             let present: HashSet<CardId> = cards.iter().copied().collect();
             self.panes.retain(|card, _| present.contains(card));
         }
@@ -237,32 +257,25 @@ impl PaneInspectors {
 
 impl Cagents {
     /// The width a pane gives its inspector: the one width every inspector
-    /// shares, never more than the pane.
+    /// shares, narrowed as far as the inspector's minimum to leave the
+    /// pane's content its own, and never more than the pane.
     pub(super) fn pane_inspector_width(&self, card: CardId) -> f32 {
         let width = self
             .settings
             .inspector_width
             .clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH);
-        self.pane_width(card).map_or(width, |pane| width.min(pane))
-    }
-
-    fn pane_width(&self, card: CardId) -> Option<f32> {
-        self.workspace
-            .geometry()
-            .card(card)
-            .map(|geometry| geometry.width())
-            .filter(|width| *width > 0.0)
+        pane_width(&self.workspace, card).map_or(width, |pane| {
+            width
+                .min(pane - PANE_CONTENT_MIN_WIDTH)
+                .max(design::INSPECTOR_MIN_WIDTH)
+                .min(pane)
+        })
     }
 
     /// Whether the pane is too narrow for its content and a docked
     /// inspector together.
     pub(super) fn pane_too_narrow(&self, card: CardId) -> bool {
-        let inspector = self
-            .settings
-            .inspector_width
-            .clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH);
-        self.pane_width(card)
-            .is_some_and(|pane| pane < inspector + PANE_CONTENT_MIN_WIDTH)
+        pane_too_narrow(&self.workspace, card)
     }
 
     /// How the pane draws its open inspector: beside its content, or, in a
@@ -305,7 +318,15 @@ impl Cagents {
         self.frame_clock.reset();
         self.sync_pane_inspectors();
         let binding = self.rebind_source_control();
-        Task::batch([binding, self.save_settings_task(false)])
+        // An inspector opened over the pane's content takes the keyboard
+        // from it, so typing never lands in content it hides.
+        let focus = if open && self.pane_inspector_layout(card) == Some(InspectorLayout::Overlay) {
+            iced::widget::operation::focus(self.pane_inspector_toggle_id(card))
+                .map(cosmic::Action::App)
+        } else {
+            Task::none()
+        };
+        Task::batch([binding, self.save_settings_task(false), focus])
     }
 
     pub(super) fn toggle_pane_inspector(&mut self, card: CardId) -> Task<Message> {
@@ -328,16 +349,11 @@ impl Cagents {
     pub(super) fn sync_pane_inspectors(&mut self) {
         let cards: Vec<CardId> = self.durable.cards.iter().map(|card| card.id).collect();
         let focused = self.workspace.focused();
-        let narrow: HashSet<CardId> = cards
-            .iter()
-            .copied()
-            .filter(|card| self.pane_too_narrow(*card))
-            .collect();
         let workspace = &self.workspace;
         self.pane_inspectors.sync(
             &cards,
             focused,
-            |card| narrow.contains(&card),
+            |card| pane_too_narrow(workspace, card),
             |card| {
                 workspace
                     .visibility(card)
@@ -352,6 +368,13 @@ impl Cagents {
         self.pane_inspectors.source_control() == Some(card)
     }
 
+    fn pane_inspector_toggle_id(&self, card: CardId) -> widget::Id {
+        self.card_chrome.get(&card).map_or_else(
+            || card_control_id(card, "inspector.toggle"),
+            |chrome| chrome.inspector_toggle_id.clone(),
+        )
+    }
+
     /// The toggle of the pane's inspector. It is mounted once per pane, so
     /// it keeps its identity, its focus and its tooltip whether it floats
     /// over the pane's content or sits in the open inspector.
@@ -360,10 +383,7 @@ impl Cagents {
             workspace_widget::GlobalShortcut::ToggleInspector,
             &self.settings.keyboard_shortcuts,
         );
-        let id = self.card_chrome.get(&card).map_or_else(
-            || card_control_id(card, "inspector.toggle"),
-            |chrome| chrome.inspector_toggle_id.clone(),
-        );
+        let id = self.pane_inspector_toggle_id(card);
         let mut toggle = crate::ui_controls::icon_button(Icon::SplitPanel, label)
             .selected(open)
             .on_press_maybe((!self.modal_is_open()).then_some(Message::TogglePaneInspector(card)))
@@ -393,12 +413,20 @@ impl Cagents {
         let progress = self.pane_inspector_progress(card);
         let open = self.pane_inspectors.is_open(card);
         let space = || -> Element<'a, Message> { iced::widget::Space::new().into() };
+        // The splitter's layer sizes the layer in front of it, so where
+        // there is no splitter it still spans the pane.
+        let no_splitter = || -> Element<'a, Message> {
+            iced::widget::Space::new()
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        };
         let (docked, splitter, front): (
             Element<'a, Message>,
             Element<'a, Message>,
             Element<'a, Message>,
         ) = match layout {
-            None if toolbar_hosts_toggle => (space(), space(), space()),
+            None if toolbar_hosts_toggle => (space(), no_splitter(), space()),
             None => {
                 let toggle = widget::container(
                     widget::container(self.pane_inspector_toggle(card, false))
@@ -409,7 +437,7 @@ impl Cagents {
                 .align_y(Alignment::Start)
                 .width(Length::Fill)
                 .height(Length::Shrink);
-                (space(), space(), toggle.into())
+                (space(), no_splitter(), toggle.into())
             }
             Some(InspectorLayout::Docked) => {
                 let visible = width * progress;
@@ -435,7 +463,7 @@ impl Cagents {
                     .align_x(Alignment::End)
                     .width(Length::Fill)
                     .height(Length::Fill);
-                (space(), space(), panel.into())
+                (space(), no_splitter(), panel.into())
             }
         };
         let row = widget::row::with_children(vec![content, docked])
@@ -449,12 +477,19 @@ impl Cagents {
             || card_control_id(card, "inspector.resize"),
             |chrome| chrome.inspector_resize_id.clone(),
         );
+        // Dragged no wider than this pane leaves room for, so the width
+        // every inspector shares is one this pane can show.
+        let maximum =
+            pane_width(&self.workspace, card).map_or(design::INSPECTOR_MAX_WIDTH, |pane| {
+                (pane - PANE_CONTENT_MIN_WIDTH)
+                    .clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH)
+            });
         Splitter::new(
             id,
             inspector::RESIZE_HANDLE_NAME,
             width,
             design::INSPECTOR_MIN_WIDTH,
-            design::INSPECTOR_MAX_WIDTH,
+            maximum,
             SplitterEdge::Leading,
             self.modal_is_open(),
             |width| Message::ContextInspector(InspectorAction::Resize { width }),
@@ -485,6 +520,22 @@ impl Cagents {
         .height(Length::Fill)
         .into()
     }
+}
+
+/// The width the strip gives the pane, once it has measured it.
+fn pane_width(workspace: &crate::workspace::Workspace, card: CardId) -> Option<f32> {
+    workspace
+        .card_geometry(card)
+        .map(|geometry| geometry.width())
+        .filter(|width| *width > 0.0)
+}
+
+/// Whether the pane is too narrow for its content beside the narrowest
+/// inspector. A wider inspector narrows itself to fit instead, so dragging
+/// one wider never closes another.
+fn pane_too_narrow(workspace: &crate::workspace::Workspace, card: CardId) -> bool {
+    pane_width(workspace, card)
+        .is_some_and(|pane| pane < design::INSPECTOR_MIN_WIDTH + PANE_CONTENT_MIN_WIDTH)
 }
 
 /// The floating toggle's surface: the pane's background, so the content it
@@ -607,6 +658,16 @@ mod tests {
         inspectors.sync(&panes, Some(pane), |_| true, |_| true);
         assert!(!inspectors.is_open(pane), "narrowing closes it");
         assert!(!inspectors.is_visible(pane), "at once, without a slide");
+        assert_eq!(
+            inspectors.saved(|_| true),
+            vec![pane],
+            "a restart in a wider window brings it back"
+        );
+        // Widening brings it back.
+        inspectors.sync(&panes, Some(pane), |_| false, |_| true);
+        assert!(inspectors.is_open(pane));
+        inspectors.sync(&panes, Some(pane), |_| true, |_| true);
+        assert!(!inspectors.is_open(pane));
 
         // Reopened while narrow, it stays open, over the content.
         assert!(inspectors.set_open(pane, true, true, None, Instant::now()));
@@ -617,6 +678,120 @@ mod tests {
         assert!(inspectors.is_open(pane) && !inspectors.opened_narrow(pane));
         inspectors.sync(&panes, Some(pane), |_| true, |_| true);
         assert!(!inspectors.is_open(pane));
+
+        // Closed by the user, it stays closed when the pane widens.
+        let now = Instant::now();
+        assert!(inspectors.set_open(pane, true, true, None, now));
+        assert!(inspectors.set_open(pane, false, true, None, now));
+        inspectors.sync(&panes, Some(pane), |_| false, |_| true);
+        assert!(!inspectors.is_open(pane));
+        assert!(inspectors.saved(|_| true).is_empty());
+    }
+
+    #[test]
+    fn a_wider_inspector_narrows_itself_to_its_pane_rather_than_closing() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        drop(app.workspace.resize_viewport(800.0));
+        app.open_pane_inspector_now(card);
+        // Another pane's inspector dragged to the widest.
+        app.settings.inspector_width = design::INSPECTOR_MAX_WIDTH;
+        app.sync_pane_inspectors();
+        assert!(app.pane_inspectors.is_open(card));
+        assert_eq!(
+            app.pane_inspector_width(card),
+            800.0 - PANE_CONTENT_MIN_WIDTH
+        );
+        assert_eq!(
+            app.pane_inspector_layout(card),
+            Some(InspectorLayout::Docked)
+        );
+
+        // Too narrow for even the narrowest, it closes, and comes back as
+        // the pane widens.
+        drop(app.workspace.resize_viewport(600.0));
+        app.sync_pane_inspectors();
+        assert!(!app.pane_inspectors.is_open(card));
+        drop(app.workspace.resize_viewport(1200.0));
+        app.sync_pane_inspectors();
+        assert!(app.pane_inspectors.is_open(card));
+        assert_eq!(app.pane_inspector_width(card), design::INSPECTOR_MAX_WIDTH);
+    }
+
+    /// Where the pane's view lays out its inspector toggle.
+    fn toggle_bounds(app: &Cagents, card: CardId, size: iced::Size) -> iced::Rectangle {
+        use cosmic::iced::advanced::widget::{Operation, Tree, operation::Focusable};
+        use cosmic::iced::advanced::{Layout, layout};
+
+        struct Find(widget::Id, Option<iced::Rectangle>);
+        impl Operation for Find {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: iced::Rectangle,
+                _: &mut dyn Focusable,
+            ) {
+                if id == Some(&self.0) {
+                    self.1 = Some(bounds);
+                }
+            }
+        }
+
+        let renderer = super::super::tests::headless_renderer();
+        let mut element = app.card_view(card, true, false);
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, size),
+        );
+        let mut find = Find(app.pane_inspector_toggle_id(card), None);
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut find);
+        find.1.expect("the pane mounts its inspector toggle")
+    }
+
+    #[test]
+    fn the_toggle_sits_in_the_panes_top_right_corner_however_the_inspector_is_drawn() {
+        // Within the inset of the floating toggle or the header's gutter.
+        const CORNER: f32 = 2.0 * space::S;
+        let size = iced::Size::new(600.0, 800.0);
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        drop(app.workspace.resize_viewport(size.width));
+        assert!(app.pane_too_narrow(card));
+        let in_corner = |bounds: iced::Rectangle, state: &str| {
+            assert!(
+                bounds.width > 0.0 && bounds.height > 0.0,
+                "{state}: the toggle is drawn: {bounds:?}"
+            );
+            assert!(
+                size.width - bounds.x - bounds.width <= CORNER,
+                "{state}: at the pane's right edge: {bounds:?}"
+            );
+            assert!(bounds.y <= CORNER, "{state}: at its top: {bounds:?}");
+        };
+        in_corner(toggle_bounds(&app, card, size), "closed");
+        // Reopened in the narrow pane, over its content.
+        app.open_pane_inspector_now(card);
+        assert_eq!(
+            app.pane_inspector_layout(card),
+            Some(InspectorLayout::Overlay)
+        );
+        in_corner(toggle_bounds(&app, card, size), "over the content");
+        // Docked beside the content of a wider pane.
+        let size = iced::Size::new(1200.0, 800.0);
+        drop(app.workspace.resize_viewport(size.width));
+        app.sync_pane_inspectors();
+        assert_eq!(
+            app.pane_inspector_layout(card),
+            Some(InspectorLayout::Docked)
+        );
+        in_corner(toggle_bounds(&app, card, size), "docked");
     }
 
     #[test]

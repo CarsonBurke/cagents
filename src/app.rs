@@ -10909,11 +10909,6 @@ impl Cagents {
                 .class(cosmic::theme::Container::custom(move |theme| {
                     iced::widget::container::Style {
                         background: Some(iced::Background::Color(theme.cosmic().bg_color().into())),
-                        border: iced::Border {
-                            color: design::warning_color(theme),
-                            width: if attention { design::BORDER_WIDTH } else { 0.0 },
-                            ..Default::default()
-                        },
                         ..Default::default()
                     }
                 }))
@@ -10940,6 +10935,27 @@ impl Cagents {
         } else {
             surface
         };
+        // The attention border goes around the whole pane, its inspector
+        // included, and over both, so the inspector's surface cannot hide
+        // it. It is always mounted, so attention coming and going never
+        // remounts the pane.
+        let surface = crate::interaction::layer(
+            surface,
+            widget::container(iced::widget::Space::new())
+                .class(cosmic::theme::Container::custom(move |theme| {
+                    iced::widget::container::Style {
+                        border: iced::Border {
+                            color: design::warning_color(theme),
+                            width: if attention { design::BORDER_WIDTH } else { 0.0 },
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }
+                }))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into(),
+        );
         let edge: Element<'a, Message> = if card.is_some() {
             if show_resize_splitter {
                 let limits = self.workspace.card_resize_limits(id);
@@ -21836,6 +21852,36 @@ mod tests {
                     }
                 }
             });
+    }
+
+    #[test]
+    fn a_window_view_saves_each_open_inspector_and_reads_one_from_before_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = context_inspector_test_app(true);
+        app.settings_path = Some(directory.path().join("settings.toml"));
+        app.settings_write_blocked = false;
+        let card = app.workspace.focused().unwrap();
+        app.open_pane_inspector_now(card);
+        let view = app.capture_settings_save().unwrap().view;
+        assert_eq!(view.open_inspectors, Some(vec![card]));
+        assert!(
+            view.context_inspector_open,
+            "an older version reads the focused pane's as the window's"
+        );
+
+        let mut json = serde_json::to_value(&view).unwrap();
+        let read: WindowView = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(read.open_inspectors, Some(vec![card]));
+        // A view saved before each pane had its own inspector.
+        json.as_object_mut().unwrap().remove("open_inspectors");
+        let legacy: WindowView = serde_json::from_value(json).unwrap();
+        assert_eq!(legacy.open_inspectors, None);
+        let mut inspectors = pane_inspector::PaneInspectors::restore(
+            legacy.open_inspectors,
+            legacy.context_inspector_open,
+        );
+        inspectors.sync(&[card], Some(card), |_| false, |_| true);
+        assert!(inspectors.is_open(card));
     }
 
     #[test]
