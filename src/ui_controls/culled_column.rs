@@ -30,6 +30,8 @@
 //!   or last built row, not the first or last row.
 //! - Rows are laid out at the column's width with unbounded height, so a row
 //!   must not fill its height.
+//! - A repeated key shares its row state with the first row that has it, so
+//!   the second loses hover, focus and tooltip state on every layout.
 //!
 //! Rows outside the window have no widgets, so they are absent from the
 //! accessibility tree and from pointer and keyboard operations until they come
@@ -308,10 +310,6 @@ impl<Message> Widget<Message, Theme, Renderer> for CulledColumn<'_, Message> {
         renderer: &Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
-        debug_assert!(
-            self.keys.iter().collect::<HashSet<_>>().len() == self.keys.len(),
-            "culled_column keys must be unique"
-        );
         let width = limits.max().width;
         let state = tree.state.downcast_mut::<State>();
         // The row at the top of the viewport, as the last layout placed it.
@@ -623,8 +621,8 @@ impl<'a, Message: 'a> From<CulledColumn<'a, Message>> for Element<'a, Message, T
 /// the row at the top of its viewport whenever a layout moves that row, so
 /// rows measured or added above it never move what is on screen.
 ///
-/// While a mouse button is held, as when dragging the scrollbar's thumb, the
-/// pointer decides the position and the scrollable is left where it is.
+/// While the scrollbar's thumb is dragged, the pointer decides the position,
+/// so the scrollable is left where it is and the shift is dropped.
 pub fn keep_in_place<'a, Message: 'a>(
     scrollable: impl Into<Element<'a, Message, Theme, Renderer>>,
 ) -> Element<'a, Message, Theme, Renderer> {
@@ -637,7 +635,8 @@ struct KeepInPlace<'a, Message> {
     content: Element<'a, Message, Theme, Renderer>,
 }
 
-/// Whether a mouse button went down over the scrollable and is still held.
+/// Whether the left button went down on the scrollbar's rail, along the
+/// scrollable's right edge, and is still held.
 #[derive(Default)]
 struct Held(bool);
 
@@ -738,10 +737,17 @@ impl<Message> Widget<Message, Theme, Renderer> for KeepInPlace<'_, Message> {
     ) {
         let held = &mut tree.state.downcast_mut::<Held>().0;
         match event {
-            Event::Mouse(mouse::Event::ButtonPressed(_)) if cursor.is_over(layout.bounds()) => {
-                *held = true;
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                let bounds = layout.bounds();
+                let rail = Rectangle {
+                    x: bounds.x + bounds.width - crate::design::SCROLLBAR_GUTTER,
+                    width: crate::design::SCROLLBAR_GUTTER,
+                    ..bounds
+                };
+                *held = cursor.is_over(rail);
             }
-            Event::Mouse(mouse::Event::ButtonReleased(_)) => {
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
+            | Event::Window(cosmic::iced::window::Event::Unfocused) => {
                 *held = false;
             }
             _ => {}
