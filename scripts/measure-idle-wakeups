@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""Measure how often matching processes wake while idle, read-only.
+
+Counts context switches and on-CPU time per thread name over a window, from
+/proc alone: no signals, ptrace or perf. Threads that start during the window
+count from zero; those that exit are left out.
+
+    scripts/measure-idle-wakeups --seconds 60
+    scripts/measure-idle-wakeups --pattern cagentsd --seconds 10
+    scripts/measure-idle-wakeups --environ XDG_RUNTIME_DIR=/run/user/1000/x
+
+The default pattern matches retained Claude actors
+(`cagents-native --cagents-native-actor FD`).
+"""
+import argparse
+import collections
+import os
+import sys
+import time
+
+
+def matching(pattern, environ):
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as file:
+                command = file.read().replace(b"\0", b" ").decode(errors="replace")
+        except OSError:
+            continue
+        if pattern not in command or int(pid) == os.getpid():
+            continue
+        if environ is not None:
+            try:
+                with open(f"/proc/{pid}/environ", "rb") as file:
+                    if environ.encode() not in file.read().split(b"\0"):
+                        continue
+            except OSError:
+                continue
+        yield pid
+
+
+def snapshot(pids):
+    threads = {}
+    for pid in pids:
+        try:
+            tasks = os.listdir(f"/proc/{pid}/task")
+        except OSError:
+            continue
+        for tid in tasks:
+            base = f"/proc/{pid}/task/{tid}"
+            try:
+                with open(f"{base}/comm") as file:
+                    name = file.read().strip()
+                with open(f"{base}/status") as file:
+                    switches = sum(
+                        int(line.split()[1])
+                        for line in file
+                        if line.startswith(("voluntary_ctxt", "nonvoluntary_ctxt"))
+                    )
+                with open(f"{base}/schedstat") as file:
+                    on_cpu = int(file.read().split()[0])
+            except (OSError, ValueError, IndexError):
+                continue
+            threads[(pid, tid)] = (name, switches, on_cpu)
+    return threads
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--pattern", default="--cagents-native-actor")
+    parser.add_argument("--seconds", type=float, default=60)
+    parser.add_argument(
+        "--environ",
+        metavar="NAME=VALUE",
+        help="only processes whose environment holds exactly this entry",
+    )
+    arguments = parser.parse_args()
+    pids = sorted(set(matching(arguments.pattern, arguments.environ)), key=int)
+    if not pids:
+        sys.exit(f"no process command line contains {arguments.pattern!r}")
+    before = snapshot(pids)
+    time.sleep(arguments.seconds)
+    after = snapshot(pids)
+    seconds = arguments.seconds
+    by_name = collections.defaultdict(lambda: [0, 0, 0])
+    for key, (name, switches, on_cpu) in after.items():
+        _, old_switches, old_cpu = before.get(key, (name, 0, 0))
+        total = by_name[name]
+        total[0] += 1
+        total[1] += switches - old_switches
+        total[2] += on_cpu - old_cpu
+    print(f"processes={len(pids)} seconds={seconds:g}")
+    print(f"{'thread':16} {'threads':>7} {'wakeups/s':>10} {'per process':>11} {'cpu % core':>10}")
+    for name, (count, switches, on_cpu) in sorted(by_name.items(), key=lambda item: -item[1][1]):
+        print(
+            f"{name:16} {count:7} {switches / seconds:10.2f}"
+            f" {switches / seconds / len(pids):11.3f} {100 * on_cpu / 1e9 / seconds:10.3f}"
+        )
+    switches = sum(total[1] for total in by_name.values())
+    on_cpu = sum(total[2] for total in by_name.values())
+    print(
+        f"{'total':16} {sum(total[0] for total in by_name.values()):7}"
+        f" {switches / seconds:10.2f} {switches / seconds / len(pids):11.3f}"
+        f" {100 * on_cpu / 1e9 / seconds:10.3f}"
+    )
+
+
+if __name__ == "__main__":
+    main()

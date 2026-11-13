@@ -1,0 +1,80 @@
+#!/bin/bash
+# Start COUNT idle retained Claude actors from one matched build, in a private
+# fixture, and measure how often they wake. See "Idle retained actors" in
+# docs/performance.md.
+#
+#   scripts/measure-idle-actors BIN_DIR [COUNT] [SECONDS]
+#
+# BIN_DIR holds a matched `cagents` and `cagentsd`, such as a native-evidence
+# side's target. Each agent is the offline fixture provider
+# (tests/fixtures/chat-composer-claude.sh), whose first turn finishes by
+# itself, so every actor ends up idle with a settled conversation. Nothing
+# outside the fixture is touched: its processes are found, measured and
+# stopped by the fixture's private runtime directory in their environment.
+set -euo pipefail
+
+if [ "${CAGENTS_AGENT_AUTHORITY+x}" ]; then
+    printf '%s\n' 'This fixture requires a genuine User shell; inherited agent authority was not modified.' >&2
+    exit 77
+fi
+if [ $# -lt 1 ] || [ $# -gt 3 ]; then
+    sed -n '2,13p' "$0" >&2
+    exit 2
+fi
+bin=$(realpath "$1")
+count=${2:-45}
+seconds=${3:-60}
+[ -x "$bin/cagents" ] && [ -x "$bin/cagentsd" ] || {
+    printf 'No matched cagents and cagentsd in %s\n' "$bin" >&2
+    exit 2
+}
+command -v jq >/dev/null || { printf '%s\n' 'The fixture provider needs jq' >&2; exit 2; }
+checkout=$(cd "$(dirname "$0")/.." && pwd)
+root=$(mktemp -d "$HOME/.local/state/idle-actors.XXXXXX")
+# Unix socket paths are short: keep the runtime beneath the real one.
+runtime=$(mktemp -d "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/ia.XXXXXX")
+mkdir -p "$root"/{home/.claude,data,config,cache,bin,project}
+ln -s "$checkout/tests/fixtures/chat-composer-claude.sh" "$root/bin/claude"
+printf '1\n' > "$root/home/.claude/fixture-first-turn-seconds"
+git init -q --initial-branch=main "$root/project"
+git -C "$root/project" -c user.name=fixture -c user.email=fixture@example.test \
+    commit -q --allow-empty -m fixture
+
+fixture() {
+    env -u CLAUDE_CONFIG_DIR -u CAGENTS_SESSION_ID \
+        HOME="$root/home" XDG_RUNTIME_DIR="$runtime" \
+        XDG_DATA_HOME="$root/data" XDG_CONFIG_HOME="$root/config" \
+        XDG_CACHE_HOME="$root/cache" PATH="$root/bin:$PATH" "$@"
+}
+# Every process the fixture started carries its runtime directory.
+fixture_processes() {
+    grep -lzx "XDG_RUNTIME_DIR=$runtime" /proc/[0-9]*/environ 2>/dev/null |
+        cut -d/ -f3 | grep -vx "$$" || true
+}
+cleanup() {
+    fixture "$bin/cagents" --no-start daemon stop >/dev/null 2>&1 || true
+    local pids
+    pids=$(fixture_processes)
+    [ -z "$pids" ] || kill $pids 2>/dev/null || true
+    sleep 1
+    pids=$(fixture_processes)
+    [ -z "$pids" ] || kill -9 $pids 2>/dev/null || true
+    rm -rf "$runtime" "$root"
+}
+trap cleanup EXIT
+
+fixture "$bin/cagents" project open "$root/project" >/dev/null
+names=()
+for i in $(seq 1 "$count"); do
+    names+=("idle-$i")
+    fixture "$bin/cagents" agent spawn --provider claude --name "idle-$i" \
+        --repository "$root/project" 'Say hello.' >/dev/null
+done
+fixture "$bin/cagents" agent wait --timeout 300 "${names[@]}" >/dev/null
+actors=$(for pid in $(fixture_processes); do
+    tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q -- '--cagents-native-actor' && echo "$pid"
+done | wc -l)
+printf 'build=%s actors=%s; settling 10 s\n' "$bin" "$actors"
+sleep 10
+python3 -I "$checkout/scripts/measure-idle-wakeups" --seconds "$seconds" \
+    --environ "XDG_RUNTIME_DIR=$runtime"
