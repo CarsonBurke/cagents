@@ -32,6 +32,7 @@ faithfully is refused with the reason.
 import base64
 import contextlib
 import fcntl
+import filecmp
 import hashlib
 import ipaddress
 import json
@@ -595,7 +596,7 @@ def real_cargo(environment):
 # command ends with what it started when its standard input closes: the
 # connection to this host dropped or the gate here was cancelled.
 REMOTE_AGENT = r'''
-import collections, fcntl, glob, hashlib, json, os, re, resource, shutil, signal, stat, subprocess, sys, threading, time
+import base64, collections, fcntl, glob, hashlib, json, os, re, resource, shutil, signal, stat, subprocess, sys, threading, time
 command, base = sys.argv[1], os.path.expanduser(sys.argv[2])
 DIRECTORIES_MARKER = "cargo-offload-directories "
 
@@ -1894,6 +1895,52 @@ def registered(base):
     return found
 
 
+CHECKOUT_BEFORE = "checkout-before.json"
+
+def checkout_state(source, skip):
+    """Each file and link of the slot's checkout outside the directories in
+    `skip`, by its path in bytes, with what writing it changes: its size,
+    times and inode. A write that keeps the old modification time, as a
+    copy that preserves it does, still changes the status-change time."""
+    root = os.fsencode(source)
+    skip = {os.fsencode(os.path.realpath(path)) for path in skip}
+    state = {}
+    for directory, names, files in os.walk(root):
+        links = [name for name in names if os.path.islink(os.path.join(directory, name))]
+        names[:] = [name for name in names if name not in links
+                    and os.path.realpath(os.path.join(directory, name)) not in skip]
+        for name in files + links:
+            path = os.path.join(directory, name)
+            try:
+                status = os.lstat(path)
+            except FileNotFoundError:
+                continue
+            state[os.path.relpath(path, root)] = [
+                status.st_size, status.st_mtime_ns, status.st_ctime_ns, status.st_ino]
+    return state
+
+def record_checkout(slot, skip):
+    """What the slot's checkout holds as a command starts, for `written`."""
+    record = {"skip": list(skip), "files": {
+        base64.b64encode(name).decode(): state
+        for name, state in checkout_state(os.path.join(slot, "src"), skip).items()}}
+    with open(os.path.join(slot, CHECKOUT_BEFORE + ".new"), "w") as file:
+        json.dump(record, file)
+    os.replace(os.path.join(slot, CHECKOUT_BEFORE + ".new"), os.path.join(slot, CHECKOUT_BEFORE))
+
+def written_since(slot):
+    """The files the last command added to the slot's checkout or wrote in
+    it, by base64 path, each with whether it is new."""
+    try:
+        with open(os.path.join(slot, CHECKOUT_BEFORE)) as file:
+            record = json.load(file)
+    except (OSError, ValueError):
+        return []
+    before = {base64.b64decode(name): state for name, state in record["files"].items()}
+    return [[base64.b64encode(name).decode(), name not in before]
+            for name, state in sorted(checkout_state(os.path.join(slot, "src"), record["skip"]).items())
+            if before.get(name) != state]
+
 def enclosing_checkout(path):
     """A Git marker above `path`, under which tests that check Git ancestry
     fail, or None."""
@@ -2201,37 +2248,11 @@ elif command == "prune":
             os.rmdir(directory)
 
 elif command == "written":
-    # The files the last command wrote in the slot's checkout, as JSON: the
-    # listed ones on standard input it may have changed, and those it added.
-    # Prune left only the listed files beside the target directories, so a
-    # file not listed is new; a listed one is a candidate when it is no older
-    # than the command's start, which the caller compares by content.
-    source = os.path.join(base, "src")
-    keep = set(filter(None, sys.stdin.buffer.read().split(b"\0")))
-    skip = {os.path.realpath(os.path.join(source, "target"))}
-    skip.update(os.path.realpath(path) for path in sys.argv[3:])
-    # Once the command and whatever it left running have ended.
+    # What the last command wrote in the slot's checkout, once it and
+    # whatever it left running have ended: see record_checkout.
     running = open(os.path.join(base, "running"), "a")
     fcntl.flock(running, fcntl.LOCK_EX)
-    try:
-        since = os.stat(os.path.join(base, "started")).st_mtime_ns
-    except OSError:
-        since = None
-    root = os.fsencode(source)
-    changed, added = [], []
-    for directory, names, files in os.walk(root):
-        names[:] = [name for name in names
-                    if os.path.realpath(os.path.join(directory, name)) not in skip]
-        links = [name for name in names if os.path.islink(os.path.join(directory, name))]
-        names[:] = [name for name in names if name not in links]
-        for name in files + links:
-            path = os.path.join(directory, name)
-            relative = os.path.normpath(os.path.relpath(path, root))
-            if relative not in keep:
-                added.append(os.fsdecode(relative))
-            elif since is not None and os.lstat(path).st_mtime_ns >= since:
-                changed.append(os.fsdecode(relative))
-    print(json.dumps({"changed": changed, "added": added}))
+    print(json.dumps(written_since(base)))
 
 elif command == "busiest":
     # For scripts/cargo-gate's own wait on this host; `base` is unused. After
@@ -2292,10 +2313,6 @@ elif command == "run":
         resource.setrlimit(resource.RLIMIT_CORE, (0, resource.getrlimit(resource.RLIMIT_CORE)[1]))
     running = open(os.path.join(base, "running"), "a")
     fcntl.flock(running, fcntl.LOCK_EX)
-    # What the command writes in the checkout is newer than this: see `written`.
-    started = os.path.join(base, "started")
-    open(started, "a").close()
-    os.utime(started)
     # Builds admitted later price this one by what its processes hold. Under
     # a hold, a command before this one may have repriced the claim for its
     # tests and been killed before restoring it, so each starts from what the
@@ -2364,6 +2381,11 @@ elif command == "run":
             directories = {}
         sys.stdout.write(DIRECTORIES_MARKER + json.dumps(directories) + "\n")
         sys.stdout.flush()
+    # Outside its build output, as the command starts: what it writes comes back.
+    outputs = [os.path.join(base, "src", "target"), *request.get("outputs", [])]
+    if request.get("directories") is not None:
+        outputs += directories.values()
+    record_checkout(base, outputs)
     if request.get("host_test_helper") is not None:
         # The helper build and test run share this lease, source copy and Cargo
         # environment. Keep it beneath the supervised child, so cancellation
@@ -2490,6 +2512,60 @@ def sweep_connections(directory, age=120):
         finally:
             probe.close()
         shutil.rmtree(path, ignore_errors=True)
+
+
+def file_state(path):
+    """What writing a file here changes, as the build host's checkout_state
+    records it there, or None when there is nothing at `path`."""
+    try:
+        status = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    return [status.st_size, status.st_mtime_ns, status.st_ctime_ns, status.st_ino]
+
+
+def same_content(first, second):
+    if os.path.islink(first) or os.path.islink(second):
+        return (os.path.islink(first) and os.path.islink(second)
+                and os.readlink(first) == os.readlink(second))
+    return filecmp.cmp(first, second, shallow=False)
+
+
+def install(staged, path, expected):
+    """Puts the staged copy of a file at `path`: a new one only while nothing
+    is there, an existing one only while it is still as it was sent,
+    `expected`. Returns "taken", "same", "changed" or "appeared"."""
+    if expected is not None:
+        if file_state(path) != expected:
+            return "changed"
+        if same_content(staged, path):
+            return "same"
+    directory = os.path.dirname(path)
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except OSError:
+        return "appeared"  # Something other than a directory is in the way.
+    temporary = os.path.join(directory, b".cagents-offload-" + os.urandom(8).hex().encode())
+    if os.path.islink(staged):
+        os.symlink(os.readlink(staged), temporary)
+    else:
+        shutil.copy2(staged, temporary)
+    try:
+        if expected is None:
+            # Linking, unlike renaming, never replaces what is there.
+            try:
+                os.link(temporary, path, follow_symlinks=False)
+            except FileExistsError:
+                return "appeared"
+            return "taken"
+        if file_state(path) != expected:
+            return "changed"
+        os.replace(temporary, path)
+        temporary = None
+        return "taken"
+    finally:
+        if temporary is not None:
+            os.unlink(temporary)
 
 
 class Offload:
@@ -2950,10 +3026,7 @@ class Offload:
         shell = " ".join(shlex.quote(word) for word in self.ssh)
         # What each file was as sent, so that one edited here meanwhile keeps
         # that edit over what the command writes there.
-        sent = {}
-        for name in files:
-            status = os.lstat(os.path.join(os.fsencode(top), name))
-            sent[os.fsdecode(name)] = (status.st_size, status.st_mtime_ns)
+        sent = {name: file_state(os.path.join(os.fsencode(top), name)) for name in files}
         # Files are compared by content and a changed one is written with
         # the time it arrives, not the time it has here. Cargo judges path
         # crates, such as the vendored patches, by modification time: a
@@ -3004,7 +3077,9 @@ class Offload:
         )
         try:
             request = {"environment": environment,
-                       "core_dumps": self.environment.get("CAGENTS_BUILD_REMOTE_CORE_DUMPS") == "1"}
+                       "core_dumps": self.environment.get("CAGENTS_BUILD_REMOTE_CORE_DUMPS") == "1",
+                       # Build output in the checkout, which does not come back as written.
+                       "outputs": sorted({remote_target, *(remote for remote, _ in directories.values())})}
             if plan.runs_tests:
                 request["memory_cap"] = self.memory_cap
             if plan.subcommand == "test":
@@ -3057,8 +3132,7 @@ class Offload:
         # What the command left for this host, whether or not it succeeded:
         # what it wrote in the checkout, such as fixes it applied before
         # failing or a test's recording, and a failed build's timings.
-        back = self.take_written(slot, source, top, listing, sent, shell,
-                                 {remote_target, remote_build, *(remote for remote, _ in directories.values())})
+        back = self.take_written(slot, source, top, sent, shell)
         if plan.timings:
             back = back or self.fetch(f"{remote_target}/cargo-timings/",
                                       os.path.join(local_target, "cargo-timings") + "/", shell,
@@ -3155,64 +3229,63 @@ class Offload:
             back.wait()
         return 0 if self.cancelled else back.returncode
 
-    def take_written(self, slot, source, top, listing, sent, shell, outputs):
+    def take_written(self, slot, source, top, sent, shell):
         """Brings back what the command wrote in the slot's checkout, as it
         would have written it here: Cargo's fixes, a test's recording, an
         updated lockfile. A file here that changed after it was sent, or a new
-        one that appeared meanwhile, is newer and is kept; a new file this
-        checkout ignores is left there. `outputs` are the build's directories,
-        which are not looked at."""
-        found = subprocess.run(self.remote("written", slot, *sorted(outputs)),
-                               input=listing, capture_output=True)
+        one that appears here meanwhile, is newer and is kept; a new file this
+        checkout ignores is left there."""
+        found = subprocess.run(self.remote("written", slot), stdin=subprocess.DEVNULL,
+                               capture_output=True)
         if found.returncode:
             return found.returncode
-        written = json.loads(found.stdout)
-        changed = written["changed"]
-        if changed:
-            # Candidates by time, which a copy arriving as the command started
-            # shares; only a difference in content is a change.
-            differing = subprocess.run(
-                ["rsync", "-a", "-c", "-n", "--from0", "--files-from=-", "--out-format=%n",
-                 "-e", shell, f"{self.host}:{source}/", top + "/"],
-                input=b"".join(os.fsencode(name) + b"\0" for name in changed), capture_output=True)
-            if differing.returncode:
-                return differing.returncode
-            changed = [name for name in os.fsdecode(differing.stdout).splitlines()
-                       if name and not name.endswith("/")]
-        added = written["added"]
+        written = [(base64.b64decode(name), new) for name, new in json.loads(found.stdout)]
+        here = os.fsencode(top)
+        added = [name for name, new in written if new]
+        ignored = set()
         if added:
-            ignored = subprocess.run(["git", "-C", top, "check-ignore", "-z", "--stdin"],
-                                     input=b"".join(os.fsencode(name) + b"\0" for name in added),
-                                     capture_output=True)
-            if ignored.returncode not in (0, 1):
-                say(f"cannot tell which of the files the command added are ignored here; "
-                    f"left on {self.host}: {', '.join(added)}")
-                added = []
+            check = subprocess.run(["git", "-C", top, "check-ignore", "-z", "--stdin"],
+                                   input=b"".join(name + b"\0" for name in added),
+                                   capture_output=True)
+            if check.returncode in (0, 1):
+                ignored = set(check.stdout.split(b"\0"))
             else:
-                skipped = set(os.fsdecode(ignored.stdout).split("\0"))
-                added = [name for name in added if name not in skipped]
-        taken = []
-        for name in changed:
-            try:
-                status = os.lstat(os.path.join(top, name))
-                now = (status.st_size, status.st_mtime_ns)
-            except OSError:
-                now = None
-            if now == sent.get(name):
-                taken.append(name)
+                say("cannot tell which files the command added are ignored here; left on "
+                    f"{self.host}: {', '.join(map(os.fsdecode, added))}")
+                ignored = set(added)
+        wanted = []
+        for name, new in written:
+            path = os.path.join(here, name)
+            if new and name in ignored:
+                continue
+            if new and os.path.lexists(path):
+                say(f"not taking {os.fsdecode(name)} from {self.host}: it appeared here "
+                    "while the command ran")
+            elif not new and file_state(path) != sent.get(name):
+                say(f"not taking {os.fsdecode(name)} from {self.host}: it changed here "
+                    "while the command ran")
             else:
-                say(f"not taking {name} from {self.host}: it changed here while the command ran")
-        for name in added:
-            if os.path.lexists(os.path.join(top, name)):
-                say(f"not taking {name} from {self.host}: it appeared here while the command ran")
-            else:
-                taken.append(name)
-        if not taken:
+                wanted.append((name, new))
+        if not wanted:
             return 0
-        status = self.fetch(f"{source}/", top + "/", shell, files=taken)
-        if not status:
+        # Copied beside the checkout first, so that nothing here is written
+        # until each file is installed with its own check.
+        with tempfile.TemporaryDirectory(prefix="cagents-offload-written-") as staging:
+            status = self.fetch(f"{source}/", staging + "/", shell, files=[name for name, _ in wanted])
+            if status or self.cancelled:
+                return status
+            taken = []
+            for name, new in wanted:
+                outcome = install(os.path.join(os.fsencode(staging), name), os.path.join(here, name),
+                                  None if new else sent[name])
+                if outcome == "taken":
+                    taken.append(os.fsdecode(name))
+                elif outcome != "same":
+                    say(f"not taking {os.fsdecode(name)} from {self.host}: it {outcome} here "
+                        "while the command ran")
+        if taken:
             say(f"took back what the command wrote here: {', '.join(taken)}")
-        return status
+        return 0
 
     def triple(self, plan):
         """The target `cargo run` builds for: the one given, or this host's."""

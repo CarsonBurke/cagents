@@ -1363,10 +1363,19 @@ fn bounded_allocation() {
             fn main() {}
             #[test]
             fn records() {
+                use std::os::unix::ffi::OsStrExt;
                 if std::env::var_os("CAGENTS_PROBE_RECORD").is_none() {
                     return;
                 }
                 let there = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+                // Rewritten in place at its old size and time, as a copy keeping them is.
+                let kept = there.join("kept-time.txt");
+                let time = std::fs::metadata(&kept).unwrap().modified().unwrap();
+                std::fs::write(&kept, "modified\\n").unwrap();
+                std::fs::File::options().write(true).open(&kept).unwrap().set_modified(time).unwrap();
+                let odd = std::ffi::OsStr::from_bytes(b"odd\\xffname\\nline.txt");
+                std::fs::create_dir_all(there.join("fixtures")).unwrap();
+                std::fs::write(there.join("fixtures").join(odd), "odd\\n").unwrap();
                 let here = std::path::Path::new(HERE);
                 std::fs::create_dir_all(there.join("fixtures/wire")).unwrap();
                 std::fs::write(there.join("fixtures/wire/129.json"), "recorded\\n").unwrap();
@@ -1382,6 +1391,7 @@ fn bounded_allocation() {
         (self.crate / ".gitignore").write_text("/target\n*.log\n")
         (self.crate / "notes.txt").write_text("original\n")
         (self.crate / "edited.txt").write_text("original\n")
+        (self.crate / "kept-time.txt").write_text("original\n")
         # Cargo writes the lockfile it makes, as it would here.
         result = self.gate_run("test", env=self.remote_env())
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -1402,14 +1412,23 @@ fn bounded_allocation() {
                         (self.crate / name).unlink()
                 (self.crate / "notes.txt").write_text("original\n")
                 (self.crate / "edited.txt").write_text("original\n")
+                (self.crate / "kept-time.txt").write_text("original\n")
                 env = self.remote_env() | {"CAGENTS_PROBE_RECORD": "1"}
                 if failing:
                     env["CAGENTS_PROBE_FAIL"] = "1"
-                result = self.gate_run("test", env=env)
+                # Build output in the checkout, which this checkout does not ignore.
+                result = self.gate_run("test", "--target-dir", "build-out", env=env)
                 self.assertEqual(result.returncode, 101 if failing else 0,
                                  result.stdout + result.stderr)
                 self.assertEqual((self.crate / "fixtures/wire/129.json").read_text(), "recorded\n")
                 self.assertEqual((self.crate / "notes.txt").read_text(), "updated\n")
+                self.assertEqual((self.crate / "kept-time.txt").read_text(), "modified\n")
+                odd = os.path.join(os.fsencode(self.crate), b"fixtures", b"odd\xffname\nline.txt")
+                with open(odd, "rb") as file:
+                    self.assertEqual(file.read(), b"odd\n")
+                self.assertFalse((self.crate / "build-out").exists())
+                self.assertEqual([path.name for path in self.crate.iterdir()
+                                  if path.name.startswith(".cagents-offload-")], [])
                 self.assertIn("took back what the command wrote here", result.stderr)
                 # Ignored here, so left there.
                 self.assertFalse((self.crate / "scratch.log").exists())
@@ -2889,6 +2908,93 @@ class Trim(unittest.TestCase):
                                 env=environment | {"CAGENTS_BUILD_REMOTE_INCREMENTAL_GIB": "-1"})
         self.assertEqual(result.returncode, 2)
         self.assertIn("must be a nonnegative integer", result.stderr)
+
+
+class WrittenInTheCheckout(unittest.TestCase):
+    """What a command writes in the slot's checkout, as the build host finds
+    it, and how each file is installed here."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="cagents-written-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.agent = agent_scope()
+
+    def written(self, slot):
+        return {(base64.b64decode(name), new) for name, new in self.agent["written_since"](str(slot))}
+
+    def test_writes_are_found_by_bytes_outside_the_build_output(self):
+        slot = self.root / "slot"
+        source = slot / "src"
+        for name in ("src/main.rs", "kept.txt", "target/debug/old", "out/old", "Cargo.lock"):
+            (source / name).parent.mkdir(parents=True, exist_ok=True)
+            (source / name).write_text("before\n")
+        (source / "link").symlink_to("kept.txt")
+        self.agent["record_checkout"](str(slot), [str(source / "target"), str(source / "out")])
+        self.assertEqual(self.written(slot), set())
+        # Same size and modification time, as a copy that keeps them writes.
+        kept = source / "kept.txt"
+        status = kept.stat()
+        kept.write_text("after!\n")
+        os.utime(kept, ns=(status.st_atime_ns, status.st_mtime_ns))
+        odd = os.path.join(os.fsencode(source), b"odd\xffname\nline.txt")
+        with open(odd, "wb") as file:
+            file.write(b"new\n")
+        # Build output, which never comes back as written.
+        for name in ("target/debug/new", "out/new", "out/old"):
+            (source / name).write_text("built\n")
+        (source / "link").unlink()
+        (source / "link").symlink_to("src/main.rs")
+        self.assertEqual(self.written(slot), {
+            (b"kept.txt", False), (b"odd\xffname\nline.txt", True), (b"link", False)})
+
+    def test_nothing_is_written_without_a_record(self):
+        (self.root / "slot/src").mkdir(parents=True)
+        self.assertEqual(self.written(self.root / "slot"), set())
+
+    def staged(self, content):
+        staged = self.root / "staged"
+        staged.write_text(content)
+        return os.fsencode(staged)
+
+    def leftovers(self, directory):
+        return [path.name for path in Path(directory).iterdir()
+                if path.name.startswith(".cagents-offload-")]
+
+    def test_a_new_file_never_replaces_one_that_appeared_here(self):
+        checkout = self.root / "checkout"
+        target = checkout / "fixtures/new.json"
+        self.assertEqual(offload.install(self.staged("there\n"), os.fsencode(target), None), "taken")
+        self.assertEqual(target.read_text(), "there\n")
+        # Appearing after the caller looked: the install itself refuses.
+        target.write_text("made here\n")
+        self.assertEqual(offload.install(self.staged("there\n"), os.fsencode(target), None),
+                         "appeared")
+        self.assertEqual(target.read_text(), "made here\n")
+        self.assertEqual(self.leftovers(target.parent), [])
+
+    def test_an_existing_file_is_replaced_only_while_it_is_as_sent(self):
+        target = self.root / "notes.txt"
+        target.write_text("original\n")
+        sent = offload.file_state(os.fsencode(target))
+        self.assertEqual(offload.install(self.staged("original\n"), os.fsencode(target), sent), "same")
+        # Edited here at the same size and time: still a change here.
+        status = target.stat()
+        target.write_text("edited!!\n")
+        os.utime(target, ns=(status.st_atime_ns, status.st_mtime_ns))
+        self.assertEqual(offload.install(self.staged("there\n"), os.fsencode(target), sent), "changed")
+        self.assertEqual(target.read_text(), "edited!!\n")
+        sent = offload.file_state(os.fsencode(target))
+        self.assertEqual(offload.install(self.staged("there\n"), os.fsencode(target), sent), "taken")
+        self.assertEqual(target.read_text(), "there\n")
+        self.assertEqual(self.leftovers(self.root), [])
+
+    def test_links_are_installed_as_links(self):
+        staged = self.root / "staged-link"
+        staged.symlink_to("elsewhere")
+        target = self.root / "checkout/link"
+        self.assertEqual(offload.install(os.fsencode(staged), os.fsencode(target), None), "taken")
+        self.assertEqual(os.readlink(target), "elsewhere")
 
 
 class Prune(unittest.TestCase):
