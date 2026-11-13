@@ -622,6 +622,9 @@ fn spawn_details(reading: &Coordination, spawn: &Spawn, observed_model: Option<&
 
 /// How many characters of an agent's name a row shows.
 const LABEL_CHARS: usize = 40;
+/// The width an openable row's arrow takes beside it: the glyph, its
+/// padding and the gap before it.
+const ARROW_ROOM: f32 = 14.0 + 3.0 * step::GAP_XS;
 /// How much of a message a row's tooltip shows.
 const TIP_CHARS: usize = 600;
 const TIP_LINES: usize = 12;
@@ -1088,9 +1091,13 @@ impl Runtime {
                 .wrapping(iced::widget::text::Wrapping::None)
                 .into(),
             chat_title(label)
+                .size(design::TEXT_BODY)
                 .wrapping(iced::widget::text::Wrapping::None)
                 .into(),
-            step::one_line(design::caption(row.preview.clone())),
+            step::one_line(
+                design::body(row.preview.clone())
+                    .class(cosmic::theme::Text::Custom(design::muted_text)),
+            ),
         ];
         if row.state.live {
             line.push(crate::ui_controls::activity_spinner(
@@ -1098,10 +1105,10 @@ impl Runtime {
                 design::accent_color,
             ));
         }
-        let status = design::caption(row.state.text).wrapping(iced::widget::text::Wrapping::None);
+        let status = design::body(row.state.text).wrapping(iced::widget::text::Wrapping::None);
         line.push(
             match row.state.tone {
-                Tone::Plain => status,
+                Tone::Plain => status.class(cosmic::theme::Text::Custom(design::muted_text)),
                 Tone::Warning => status.class(cosmic::theme::Text::Custom(design::warning_text)),
                 Tone::Error => status.class(cosmic::theme::Text::Custom(design::destructive_text)),
             }
@@ -1111,7 +1118,10 @@ impl Runtime {
         // reason first, then the message or prompt.
         let mut tip = Vec::new();
         if let Some(detail) = &row.state.detail {
-            tip.push(format!("{}: {detail}", row.state.text));
+            tip.push(match row.state.tone {
+                Tone::Error => format!("{}: {detail}", row.state.text),
+                _ => detail.clone(),
+            });
         }
         if !row.full.is_empty() {
             tip.push(bounded(&row.full));
@@ -1168,18 +1178,26 @@ impl Runtime {
                     .padding([step::GAP_XS as u16, step::GAP_S as u16])
                     .width(Length::Fill)
                     .on_press(open.clone());
-                // The way in, shown where the pointer or focus is.
-                let arrow = widget::button::custom(muted_glyph(Icon::Jump))
-                    .name("Open agent")
-                    .class(crate::ui_controls::control_style(false, None))
-                    .padding(step::GAP_XS as u16)
-                    .on_press(open);
+                // The way in, shown where the pointer or focus is. It only
+                // marks the row as one that opens: the row is the control, so
+                // keyboard traversal and screen readers meet it once.
+                let arrow = iced::widget::mouse_area(
+                    widget::container(muted_glyph(Icon::Jump)).padding(step::GAP_XS as u16),
+                )
+                .interaction(iced::mouse::Interaction::Pointer)
+                .on_press(open);
                 hover::view(tipped(button.into()), arrow, step::GAP_XS)
             }
-            // An agent this conversation cannot open is only described.
+            // An agent this conversation cannot open is only described. It
+            // keeps the arrow's room, so every row's status ends in line.
             None => tipped(
                 widget::container(content)
-                    .padding([step::GAP_XS as u16, step::GAP_S as u16])
+                    .padding(iced::Padding {
+                        top: step::GAP_XS,
+                        bottom: step::GAP_XS,
+                        left: step::GAP_S,
+                        right: step::GAP_S + ARROW_ROOM,
+                    })
                     .width(Length::Fill)
                     .into(),
             ),

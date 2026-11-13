@@ -122,7 +122,7 @@ if [ "$scene" = cards ]; then
     # The long message, by the start of its text.
     long=$(locate 'The checkout moved')
     if [ -n "$long" ]; then
-        "$ne" drive hover "$long" >/dev/null 2>&1 || log "hover failed"
+        "$ne" drive move "$long" >/dev/null 2>&1 || log "hover failed"
         sleep 3
         "$ne" shot message-hover >/dev/null && log "shot message-hover" || log "shot failed: message-hover"
         "$ne" drive click --button right "$long" >/dev/null 2>&1 || log "right click failed"
