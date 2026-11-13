@@ -400,6 +400,11 @@ pub enum Action {
     /// A Markdown image came near the viewport and may need loading.
     LoadFigure(Target, u64),
     FigureLoaded(Target, u64, u64, images::figure::Outcome),
+    /// A while after a Markdown image could not be shown: it is looked at
+    /// again if it is still near the viewport.
+    RecheckFigure(Target, u64),
+    /// A Markdown image left the viewport, so coming back asks for it again.
+    FigureOutOfSight,
     /// A click or context menu entry acting on a Markdown image.
     Figure(Target, u64, images::figure::Command),
     ThumbnailLoaded(Target, Arc<PathBuf>, images::Loaded),
@@ -783,6 +788,8 @@ impl Action {
             Self::ImageLoaded(..) => "ImageLoaded",
             Self::LoadFigure(..) => "LoadFigure",
             Self::FigureLoaded(..) => "FigureLoaded",
+            Self::RecheckFigure(..) => "RecheckFigure",
+            Self::FigureOutOfSight => "FigureOutOfSight",
             Self::Figure(..) => "Figure",
             Self::ThumbnailLoaded(..) => "ThumbnailLoaded",
             Self::RetryThumbnails(..) => "RetryThumbnails",
@@ -902,6 +909,8 @@ impl Action {
                 | Self::ImageLoaded(..)
                 | Self::LoadFigure(..)
                 | Self::FigureLoaded(..)
+                | Self::RecheckFigure(..)
+                | Self::FigureOutOfSight
                 | Self::MarkdownPrepared(..)
                 | Self::LocalPromptPrepared(..)
                 | Self::ThumbnailLoaded(..)
@@ -13862,6 +13871,12 @@ impl Cagents {
                     return images::figure::complete(runtime, id, attempt, outcome);
                 }
             }
+            Action::RecheckFigure(target, id) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    images::figure::recheck(runtime, id);
+                }
+            }
+            Action::FigureOutOfSight => {}
             Action::Figure(target, id, command) => {
                 return self.figure_command(target, id, command);
             }

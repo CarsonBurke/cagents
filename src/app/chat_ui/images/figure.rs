@@ -16,8 +16,6 @@ use super::*;
 use iced::advanced::image::Id;
 use std::time::{Instant, SystemTime};
 
-/// The tallest a preview is drawn; its width keeps to the reading measure.
-const MAX_HEIGHT: f32 = 360.0;
 /// Decoded previews a conversation keeps. The least recently seen beyond
 /// these give their pixels back and are decoded again if they are reached.
 const READY: usize = 24;
@@ -77,6 +75,7 @@ pub(in crate::app) enum Outcome {
     Failed {
         reason: Reason,
         detail: String,
+        stamp: Option<Stamp>,
     },
     Deferred(Pressure),
 }
@@ -107,6 +106,9 @@ enum State {
     Failed {
         reason: Reason,
         detail: String,
+        /// The file a supported image could not be decoded from, so a look
+        /// again reads it only once it changes.
+        stamp: Option<Stamp>,
         at: Instant,
     },
     /// Waiting for image memory another preview holds.
@@ -115,12 +117,16 @@ enum State {
 
 struct Entry {
     key: Key,
+    kind: Kind,
     state: State,
     /// The request whose answer is awaited; answers to any other are stale.
     attempt: u64,
     /// A check of a shown preview or failure is in flight.
     checking: bool,
     used: u64,
+    /// Changes when the image must be asked for again wherever it is drawn,
+    /// so a mark already near the viewport asks once more.
+    sight: u64,
 }
 
 #[derive(Default)]
@@ -133,6 +139,8 @@ struct Store {
     /// Changes whenever what any image draws changes.
     version: u64,
     tick: u64,
+    /// The conversation was hidden when last synced.
+    hidden: bool,
 }
 
 impl Store {
@@ -146,11 +154,13 @@ impl Store {
         self.entries.insert(
             id,
             Entry {
+                kind: kind(&key.url),
                 key,
                 state: State::Unseen { size: None },
                 attempt: 0,
                 checking: false,
                 used: 0,
+                sight: 0,
             },
         );
         id
@@ -161,7 +171,9 @@ impl Store {
     }
 
     /// Gives back the pixels of the least recently seen previews beyond
-    /// [`READY`].
+    /// [`READY`]. A released preview keeps its room and is decoded again the
+    /// next time it comes near the viewport, rather than at once: were more
+    /// than [`READY`] previews in view, each would release the next.
     fn trim(&mut self) {
         let mut ready: Vec<(u64, u64)> = self
             .entries
@@ -192,13 +204,30 @@ fn release(entry: &mut Entry) {
     }
 }
 
+/// Makes any answer in flight for `entry` stale, and asks for it again
+/// wherever it is drawn.
+fn unanswered(entry: &mut Entry) {
+    entry.checking = false;
+    entry.attempt = entry.attempt.wrapping_add(1);
+    entry.sight = entry.sight.wrapping_add(1);
+}
+
+/// What an image needs once a worker's answer is recorded.
+enum Next {
+    Nothing,
+    /// To load again once memory another preview holds is given back.
+    Wait(Pressure),
+    /// To be looked at again after [`RETRY`], should it still be in view.
+    Recheck,
+}
+
 /// A conversation's Markdown images.
 #[derive(Clone, Default)]
 pub(in crate::app) struct Figures(Arc<std::sync::Mutex<Store>>);
 
 /// What one request asks a worker to do.
 struct Request {
-    path: PathBuf,
+    url: markdown::Uri,
     attempt: u64,
     known: Option<Stamp>,
 }
@@ -232,21 +261,48 @@ impl Figures {
             if forget {
                 for entry in store.entries.values_mut() {
                     entry.state = State::Unseen { size: None };
-                    entry.checking = false;
-                    entry.attempt = entry.attempt.wrapping_add(1);
+                    unanswered(entry);
                 }
                 store.changed();
             }
         }
+        let hidden = std::mem::replace(&mut store.hidden, !visible);
         if !visible {
-            let mut released = false;
+            // Pixels are given back, and a load in flight or waiting for
+            // memory is dropped: each is asked for again once it is seen,
+            // as is an image that could not be shown, whose look again
+            // waits for the conversation to be shown.
+            let mut changed = false;
             for entry in store.entries.values_mut() {
-                released |= matches!(entry.state, State::Ready { .. });
-                release(entry);
+                match entry.state {
+                    State::Ready { .. } => release(entry),
+                    State::Loading | State::Waiting => {
+                        entry.state = State::Unseen { size: None };
+                        entry.checking = false;
+                        entry.attempt = entry.attempt.wrapping_add(1);
+                    }
+                    State::Failed { .. } if !hidden => {}
+                    State::Unseen { .. } | State::Failed { .. } => continue,
+                }
+                entry.sight = entry.sight.wrapping_add(1);
+                changed = true;
             }
-            if released {
+            if changed {
                 store.changed();
             }
+        }
+    }
+
+    /// Asks again for an image that could not be shown, wherever it is drawn
+    /// near the viewport, once [`RETRY`] has passed.
+    fn recheck(&self, id: u64) {
+        let mut store = self.store();
+        let Some(entry) = store.entries.get_mut(&id) else {
+            return;
+        };
+        if matches!(entry.state, State::Failed { .. }) {
+            entry.sight = entry.sight.wrapping_add(1);
+            store.changed();
         }
     }
 
@@ -261,9 +317,9 @@ impl Figures {
             return None;
         }
         entry.used = tick;
-        let Kind::Local(path) = kind(&entry.key.url) else {
+        if entry.kind != Kind::Local {
             return None;
-        };
+        }
         let known = match &entry.state {
             State::Unseen { .. } | State::Waiting => {
                 entry.state = State::Loading;
@@ -277,32 +333,36 @@ impl Figures {
                 entry.checking = true;
                 *stamp
             }
-            State::Failed { at, .. } if at.elapsed() >= RETRY => {
+            State::Failed { at, stamp, .. } if at.elapsed() >= RETRY => {
                 entry.checking = true;
-                None
+                *stamp
             }
             State::Ready { .. } | State::Failed { .. } => return None,
         };
         entry.attempt = entry.attempt.wrapping_add(1);
         Some(Request {
-            path,
+            url: entry.key.url.clone(),
             attempt: entry.attempt,
             known,
         })
     }
 
-    /// Records a worker's answer. Returns the memory a deferred load waits on.
-    fn complete(&self, id: u64, attempt: u64, outcome: Outcome) -> Option<Pressure> {
+    /// Records a worker's answer, and says what the image needs next.
+    fn complete(&self, id: u64, attempt: u64, outcome: Outcome) -> Next {
         let mut store = self.store();
-        let entry = store.entries.get_mut(&id)?;
+        let Some(entry) = store.entries.get_mut(&id) else {
+            return Next::Nothing;
+        };
         if entry.attempt != attempt {
-            return None;
+            return Next::Nothing;
         }
         let checking = std::mem::take(&mut entry.checking);
         let changed = match outcome {
             Outcome::Unchanged => {
-                if let State::Ready { checked, .. } = &mut entry.state {
-                    *checked = Instant::now();
+                match &mut entry.state {
+                    State::Ready { checked, .. } => *checked = Instant::now(),
+                    State::Failed { at, .. } => *at = Instant::now(),
+                    _ => {}
                 }
                 false
             }
@@ -319,7 +379,11 @@ impl Figures {
                 };
                 true
             }
-            Outcome::Failed { reason, detail } => {
+            Outcome::Failed {
+                reason,
+                detail,
+                stamp,
+            } => {
                 let same = matches!(
                     &entry.state,
                     State::Failed { reason: was, detail: had, .. } if *was == reason && *had == detail
@@ -327,6 +391,7 @@ impl Figures {
                 entry.state = State::Failed {
                     reason,
                     detail,
+                    stamp,
                     at: Instant::now(),
                 };
                 !same
@@ -337,14 +402,15 @@ impl Figures {
             Outcome::Deferred(pressure) => {
                 entry.state = State::Waiting;
                 store.changed();
-                return Some(pressure);
+                return Next::Wait(pressure);
             }
         };
+        let failed = matches!(entry.state, State::Failed { .. });
         if changed {
             store.changed();
             store.trim();
         }
-        None
+        if failed { Next::Recheck } else { Next::Nothing }
     }
 
     /// Starts loading image `id` of a parent conversation, as a worker would.
@@ -399,11 +465,11 @@ pub(in crate::app) struct Shared {
 }
 
 /// How an image's destination is reached.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
     /// A path, absolute or relative to the conversation's working directory,
     /// or a `file:` URL.
-    Local(PathBuf),
+    Local,
     Web,
     /// Inline data or another scheme, which is not previewed.
     Other,
@@ -411,82 +477,101 @@ enum Kind {
 
 fn kind(url: &str) -> Kind {
     if Path::new(url).is_absolute() {
-        return Kind::Local(PathBuf::from(url));
+        return Kind::Local;
     }
     match Url::parse(url) {
         Ok(parsed) => match parsed.scheme() {
             "http" | "https" => Kind::Web,
-            "file" => parsed
-                .to_file_path()
-                .map_or(Kind::Other, |path| Kind::Local(path)),
+            "file" if parsed.to_file_path().is_ok() => Kind::Local,
             _ => Kind::Other,
         },
         Err(_) if url.is_empty() => Kind::Other,
-        Err(_) => Kind::Local(PathBuf::from(url)),
+        Err(_) => Kind::Local,
     }
 }
 
-/// The file a request names, as the reader would copy it: a relative path
-/// joined to the working directory, which a child conversation does not have.
-fn absolute(path: &Path, root: &Path, child: bool) -> Option<PathBuf> {
-    if path.is_absolute() {
-        Some(path.to_owned())
+/// Whether image `url` names a file, which is drawn as a preview where it can
+/// be read, rather than a one-line link.
+pub(in crate::app::chat_ui) fn previewed(url: &str) -> bool {
+    kind(url) == Kind::Local
+}
+
+/// The file image `url` names, found as a link in the same answer is, so the
+/// preview, Copy image path and Open image source agree: relative to the
+/// working directory, which a child conversation does not have, and
+/// percent-decoded, without a query or fragment.
+fn located(url: &str, root: &Path, child: bool) -> Option<PathBuf> {
+    let base = if Path::new(url).is_absolute() || Url::parse(url).is_ok() {
+        PathBuf::from("/.chat")
+    } else if !child && root.is_absolute() {
+        root.join(".chat")
     } else {
-        (!child && root.is_absolute()).then(|| root.join(path))
+        return None;
+    };
+    match crate::document_link::resolve(&base, url) {
+        Ok(crate::document_link::DocumentLink::Local { path, .. }) => Some(path),
+        _ => None,
     }
 }
 
 /// Reads and decodes one image on an image worker.
-fn read(path: PathBuf, origin: Origin, known: Option<Stamp>) -> Outcome {
-    let Some(shown) = absolute(&path, &origin.root, origin.child) else {
+fn read(url: &str, origin: Origin, known: Option<Stamp>) -> Outcome {
+    let Some(shown) = located(url, &origin.root, origin.child) else {
         return Outcome::Failed {
             reason: Reason::Unavailable,
             detail: format!(
-                "Cannot preview {path:?}: this conversation has no verified working directory. Ask for an absolute image path."
+                "Cannot preview {}: this conversation has no verified working directory. Ask for an absolute image path.",
+                clipped(url, TIP)
             ),
+            stamp: None,
         };
     };
     // Another device's files are read by its daemon, which reports no
     // modification time; a local file is identified before it is read.
     let stamp = if origin.device.is_none() {
+        let failed = |reason, detail| Outcome::Failed {
+            reason,
+            detail,
+            stamp: None,
+        };
         match std::fs::metadata(&shown) {
             Ok(metadata) if metadata.is_file() => Some(Stamp {
                 modified: metadata.modified().ok(),
                 len: metadata.len(),
             }),
             Ok(_) => {
-                return Outcome::Failed {
-                    reason: Reason::NotImage,
-                    detail: format!("{} is not a regular file.", shown.display()),
-                };
+                return failed(
+                    Reason::NotImage,
+                    format!("{} is not a regular file.", shown.display()),
+                );
             }
             // The reason already says what went wrong; the detail names the
             // file, and why it can't be read without the OS error number.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Outcome::Failed {
-                    reason: Reason::Missing,
-                    detail: shown.display().to_string(),
-                };
+                return failed(Reason::Missing, shown.display().to_string());
             }
             Err(error) => {
-                return Outcome::Failed {
-                    reason: Reason::Unreadable,
-                    detail: format!("{}: {}", shown.display(), error.kind()),
-                };
+                return failed(
+                    Reason::Unreadable,
+                    format!("{}: {}", shown.display(), error.kind()),
+                );
             }
         }
     } else {
         None
     };
+    // A file already shown, or already found not to be an image, is read
+    // again only once it changes.
     if stamp.is_some() && stamp == known {
         return Outcome::Unchanged;
     }
-    let bytes = match file_bytes_with_request(&path, &origin, crate::device_service::request) {
+    let bytes = match file_bytes_with_request(&shown, &origin, crate::device_service::request) {
         Ok(bytes) => bytes,
         Err(detail) => {
             return Outcome::Failed {
                 reason: Reason::Unavailable,
                 detail,
+                stamp,
             };
         }
     };
@@ -503,10 +588,12 @@ fn read(path: PathBuf, origin: Origin, known: Option<Stamp>) -> Outcome {
                 "Cannot preview {}: unsupported, damaged or oversized image.",
                 shown.display()
             ),
+            stamp,
         },
         Loaded::Failed(detail) => Outcome::Failed {
             reason: Reason::Unavailable,
             detail,
+            stamp,
         },
     }
 }
@@ -526,36 +613,55 @@ pub(in crate::app::chat_ui) fn load(runtime: &mut Runtime, id: u64) -> Task<Mess
     };
     let target = runtime.target;
     let Request {
-        path,
+        url,
         attempt,
         known,
     } = request;
     cosmic::task::future(async move {
-        let outcome = run_worker(move || read(path, origin, known))
+        let outcome = run_worker(move || read(&url, origin, known))
             .await
             .unwrap_or_else(|detail| Outcome::Failed {
                 reason: Reason::Unavailable,
                 detail,
+                stamp: None,
             });
         action(Action::FigureLoaded(target, id, attempt, outcome))
     })
 }
 
-/// Records a worker's answer, and waits for memory for one deferred.
+/// Records a worker's answer, and schedules what the image needs next.
 pub(in crate::app::chat_ui) fn complete(
     runtime: &mut Runtime,
     id: u64,
     attempt: u64,
     outcome: Outcome,
 ) -> Task<Message> {
-    let Some(pressure) = runtime.figures.complete(id, attempt, outcome) else {
+    let next = runtime.figures.complete(id, attempt, outcome);
+    // A conversation hidden while its image was read keeps no pixels and
+    // waits for nothing; it asks again once it is shown.
+    sync(runtime);
+    if !runtime.visible.load(Ordering::Relaxed) {
         return Task::none();
-    };
+    }
     let target = runtime.target;
-    cosmic::task::future(async move {
-        pressure.available().await;
-        action(Action::LoadFigure(target, id))
-    })
+    match next {
+        Next::Nothing => Task::none(),
+        Next::Wait(pressure) => cosmic::task::future(async move {
+            pressure.available().await;
+            action(Action::LoadFigure(target, id))
+        }),
+        Next::Recheck => cosmic::task::future(async move {
+            tokio::time::sleep(RETRY).await;
+            action(Action::RecheckFigure(target, id))
+        }),
+    }
+}
+
+/// Looks again at an image that could not be shown, if it is still in view.
+pub(in crate::app::chat_ui) fn recheck(runtime: &mut Runtime, id: u64) {
+    if runtime.visible.load(Ordering::Relaxed) {
+        runtime.figures.recheck(id);
+    }
 }
 
 /// Keeps a conversation's images to its current working directory and
@@ -634,59 +740,53 @@ impl Shared {
     }
 
     /// Image `url` as an answer shows it: a preview, or a compact link to its
-    /// source. `alt` names it for the tooltip and assistive technology;
-    /// `title` is shown beneath a preview only when the answer gives one.
+    /// source. `alt` names it for the tooltip and assistive technology; the
+    /// answer draws a title beneath it.
     pub(in crate::app::chat_ui) fn view(
         &self,
         target: Target,
         url: &markdown::Uri,
         alt: &str,
-        title: &str,
     ) -> Element<'static, Message> {
-        let kind = kind(url);
-        let (id, shown) = {
+        let (id, kind, sight, shown) = {
             let mut store = self.figures.store();
             let id = store.id(Key {
                 url: url.clone(),
                 child: self.child,
             });
-            let shown = match &store.entries[&id].state {
+            let entry = &store.entries[&id];
+            let shown = match &entry.state {
                 State::Ready { handle, .. } => Shown::Ready(handle.clone()),
                 State::Failed { reason, detail, .. } => Shown::Failed(*reason, detail.clone()),
                 State::Waiting => Shown::Waiting,
                 State::Unseen { size } => Shown::Pending(*size),
                 State::Loading => Shown::Pending(None),
             };
-            (id, shown)
+            (id, entry.kind, entry.sight, shown)
         };
-        let local = matches!(kind, Kind::Local(_));
-        let name: String = if alt.trim().is_empty() {
-            match &kind {
-                Kind::Local(path) => path
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| url.to_string()),
-                _ => url.to_string(),
+        let name = if alt.trim().is_empty() {
+            match kind {
+                Kind::Local => url.rsplit('/').find(|part| !part.is_empty()).unwrap_or(url),
+                _ => url,
             }
         } else {
-            alt.to_owned()
+            alt
         };
-        let open = action(Action::Figure(target, id, Command::Open));
-        let element = match (local, shown) {
-            (true, Shown::Ready(handle)) => {
+        let name = clipped(name, NAME).into_owned();
+        let mark = || sighted(target, id, sight);
+        let line = |glyph, tip: Option<String>, note| {
+            line(url, glyph, name.clone(), tip, note, target, id, kind)
+        };
+        match (kind, shown) {
+            (Kind::Local, Shown::Ready(handle)) => {
                 let image = handle.id();
-                let preview = iced::widget::image(handle.clone())
-                    .width(Length::Shrink)
-                    .height(Length::Shrink)
-                    .content_fit(iced::ContentFit::Contain);
-                let preview =
-                    widget::button::custom(widget::container(preview).max_height(MAX_HEIGHT))
-                        .class(crate::ui_controls::control_style(false, None))
-                        .padding(0)
-                        .name(name.clone())
-                        .on_press(open);
+                let preview = widget::button::custom(super::preview::image(handle))
+                    .class(crate::ui_controls::control_style(false, None))
+                    .padding(0)
+                    .name(name.clone())
+                    .on_press(action(Action::Figure(target, id, Command::Open)));
                 let preview = crate::interaction::context_menu_lazy(
-                    crate::interaction::tooltip(preview, name),
+                    crate::interaction::tooltip(preview, name.clone()),
                     move || {
                         menu(
                             target,
@@ -700,84 +800,51 @@ impl Shared {
                         )
                     },
                 );
-                let mut rows = vec![preview];
-                if !title.trim().is_empty() {
-                    rows.push(design::caption(title.to_owned()).into());
-                }
                 // Seeing a preview again checks that its file is unchanged.
-                rows.push(sighted(target, id, url));
-                widget::column::with_children(rows)
-                    .spacing(step::GAP_XS)
+                widget::column::with_children(vec![preview, mark()]).into()
+            }
+            (Kind::Local, Shown::Pending(Some((width, height)))) => {
+                widget::column::with_children(vec![super::preview::room(width, height), mark()])
                     .into()
             }
-            (true, Shown::Pending(Some((width, height)))) => widget::column::with_children(vec![
-                widget::container(iced::widget::Space::new())
-                    .width(Length::Fixed(width as f32))
-                    .height(Length::Fixed((height as f32).min(MAX_HEIGHT)))
-                    .max_width(width as f32)
-                    .class(design::surface(
-                        Some(design::sunken),
-                        [design::RADIUS_S; 4],
-                        false,
-                    ))
-                    .into(),
-                sighted(target, id, url),
+            (Kind::Local, Shown::Pending(None)) => widget::column::with_children(vec![
+                line(Icon::Image, None, Some("Loading image…")),
+                mark(),
             ])
             .into(),
-            (true, Shown::Pending(None)) => widget::column::with_children(vec![
-                line(
-                    url,
-                    Icon::Image,
-                    name,
-                    None,
-                    Some("Loading image…"),
-                    target,
-                    id,
-                    true,
-                ),
-                sighted(target, id, url),
-            ])
-            .into(),
-            (true, Shown::Waiting) => line(
-                url,
-                Icon::Image,
-                name,
-                None,
-                Some("Waiting for image memory…"),
-                target,
-                id,
-                true,
-            ),
-            (true, Shown::Failed(reason, detail)) => widget::column::with_children(vec![
-                line(
-                    url,
-                    Icon::Warning,
-                    name,
-                    Some(detail),
-                    Some(reason.label()),
-                    target,
-                    id,
-                    true,
-                ),
+            (Kind::Local, Shown::Waiting) => {
+                line(Icon::Image, None, Some("Waiting for image memory…"))
+            }
+            (Kind::Local, Shown::Failed(reason, detail)) => widget::column::with_children(vec![
+                line(Icon::Warning, Some(detail), Some(reason.label())),
                 // A file linked before it is written shows once it exists.
-                sighted(target, id, url),
+                mark(),
             ])
             .into(),
-            (false, _) => line(
-                url,
+            (Kind::Web | Kind::Other, _) => line(
                 Icon::Image,
-                name,
-                Some(url.to_string()),
-                Some(match kind {
-                    Kind::Web => "Web image, not downloaded",
-                    _ => "Not previewed",
+                Some(clipped(url, TIP).into_owned()),
+                Some(if kind == Kind::Web {
+                    "Web image, not downloaded"
+                } else {
+                    "Not previewed"
                 }),
-                target,
-                id,
-                false,
             ),
-        };
-        element
+        }
+    }
+}
+
+/// The most of an image's name a link shows, and of its address a tooltip.
+const NAME: usize = 80;
+const TIP: usize = 400;
+
+/// `text`, cut to fewer than `limit` characters and an ellipsis if longer.
+fn clipped(text: &str, limit: usize) -> std::borrow::Cow<'_, str> {
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut starts = text.grapheme_indices(true).map(|(at, _)| at);
+    match (starts.nth(limit - 1), starts.next()) {
+        (Some(cut), Some(_)) => format!("{}…", &text[..cut]).into(),
+        _ => text.into(),
     }
 }
 
@@ -788,19 +855,23 @@ enum Shown {
     Pending(Option<(u32, u32)>),
 }
 
-/// Asks for image `id` once its place comes near the viewport. A row is
-/// told of a redraw only where it meets the viewport, so the mark is a pixel
-/// square rather than empty.
-fn sighted(target: Target, id: u64, url: &markdown::Uri) -> Element<'static, Message> {
+/// Asks for image `id` whenever its place comes near the viewport, and again
+/// wherever it is drawn when `sight` changes. A row is told of a redraw only
+/// where it meets the viewport, so the mark is a pixel square rather than
+/// empty.
+fn sighted(target: Target, id: u64, sight: u64) -> Element<'static, Message> {
     iced::widget::sensor(iced::widget::Space::new().width(1).height(1))
-        .key(url.to_string())
+        .key((id, sight))
         .anticipate(ANTICIPATE)
         .on_show(move |_| action(Action::LoadFigure(target, id)))
+        // Leaving the viewport is what lets coming back ask again.
+        .on_hide(action(Action::FigureOutOfSight))
         .into()
 }
 
 /// One compact line for an image without a preview: a glyph, a link to its
 /// source named for the image, and why it shows no preview.
+#[allow(clippy::too_many_arguments)]
 fn line(
     url: &markdown::Uri,
     glyph: Icon,
@@ -809,7 +880,7 @@ fn line(
     note: Option<&'static str>,
     target: Target,
     id: u64,
-    local: bool,
+    kind: Kind,
 ) -> Element<'static, Message> {
     // The surface around the transcript binds this to the working directory
     // the image was shown from, as it does every link in an answer.
@@ -831,7 +902,7 @@ fn line(
         .spacing(step::GAP_S)
         .align_y(iced::Alignment::Center);
     crate::interaction::context_menu_lazy(row, move || {
-        let copy = if local {
+        let copy = if kind == Kind::Local {
             ("Copy image path", MenuEntry::Figure(Command::CopyPath))
         } else {
             ("Copy image link", MenuEntry::Figure(Command::CopyLink))
@@ -879,9 +950,10 @@ impl Cagents {
                 self.open_document_link_from(Some(target.card), document.as_deref(), &url)
             }
             Command::CopyPath => {
-                let path = ready.map(|(_, path)| path).or_else(|| match kind(&url) {
-                    Kind::Local(path) => absolute(&path, &root, child),
-                    _ => None,
+                let path = ready.map(|(_, path)| path).or_else(|| {
+                    (kind(&url) == Kind::Local)
+                        .then(|| located(&url, &root, child))
+                        .flatten()
                 });
                 match path {
                     Some(path) => {

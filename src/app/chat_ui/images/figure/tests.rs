@@ -45,15 +45,9 @@ fn ready(path: &str) -> Outcome {
 
 #[test]
 fn destinations_are_local_files_web_addresses_or_neither() {
-    assert_eq!(
-        kind("/var/tmp/mockup/x.png"),
-        Kind::Local("/var/tmp/mockup/x.png".into())
-    );
-    assert_eq!(kind("docs/x.png"), Kind::Local("docs/x.png".into()));
-    assert_eq!(
-        kind("file:///var/tmp/a%20b.png"),
-        Kind::Local("/var/tmp/a b.png".into())
-    );
+    assert_eq!(kind("/var/tmp/mockup/x.png"), Kind::Local);
+    assert_eq!(kind("docs/x.png"), Kind::Local);
+    assert_eq!(kind("file:///var/tmp/a%20b.png"), Kind::Local);
     assert_eq!(kind("https://example.com/x.png"), Kind::Web);
     assert_eq!(kind("HTTP://example.com/x.png"), Kind::Web);
     assert_eq!(kind("data:image/png;base64,AAAA"), Kind::Other);
@@ -62,17 +56,38 @@ fn destinations_are_local_files_web_addresses_or_neither() {
 }
 
 #[test]
-fn a_child_conversation_has_no_directory_for_relative_paths() {
+fn an_image_names_the_file_a_link_in_the_answer_would_open() {
     let root = Path::new("/work");
-    assert_eq!(
-        absolute(Path::new("docs/x.png"), root, false),
-        Some("/work/docs/x.png".into())
-    );
-    assert_eq!(absolute(Path::new("docs/x.png"), root, true), None);
-    assert_eq!(
-        absolute(Path::new("/abs/x.png"), root, true),
-        Some("/abs/x.png".into())
-    );
+    for (url, child, file) in [
+        ("docs/x.png", false, Some("/work/docs/x.png")),
+        ("./docs/../x.png", false, Some("/work/x.png")),
+        ("my%20mockup.png", false, Some("/work/my mockup.png")),
+        ("x.png?raw=1#top", false, Some("/work/x.png")),
+        ("file:///var/tmp/a%20b.png", true, Some("/var/tmp/a b.png")),
+        ("/abs/x.png", true, Some("/abs/x.png")),
+        ("docs/x.png", true, None),
+    ] {
+        assert_eq!(
+            located(url, root, child),
+            file.map(PathBuf::from),
+            "{url} in a child conversation: {child}"
+        );
+        if let Some(file) = file {
+            let opened = crate::document_link::resolve(
+                if child {
+                    Path::new("/.chat")
+                } else {
+                    Path::new("/work/.chat")
+                },
+                url,
+            );
+            assert!(
+                matches!(opened, Ok(crate::document_link::DocumentLink::Local { path, .. }) if path == Path::new(file)),
+                "Open image source opens the file previewed for {url}"
+            );
+        }
+    }
+    assert_eq!(located("docs/x.png", Path::new("relative"), false), None);
 }
 
 #[test]
@@ -84,7 +99,7 @@ fn a_local_image_is_read_once_then_only_checked_until_its_file_changes() {
         handle,
         path: shown,
         stamp,
-    } = read("mockup.png".into(), origin(directory.path()), None)
+    } = read("mockup.png", origin(directory.path()), None)
     else {
         panic!("a readable image decodes");
     };
@@ -98,13 +113,13 @@ fn a_local_image_is_read_once_then_only_checked_until_its_file_changes() {
         }
     ));
     assert!(matches!(
-        read(path.clone(), origin(directory.path()), stamp),
+        read(path.to_str().unwrap(), origin(directory.path()), stamp),
         Outcome::Unchanged
     ));
     std::fs::write(&path, png(4, 4)).unwrap();
     assert!(
         matches!(
-            read(path.clone(), origin(directory.path()), stamp),
+            read(path.to_str().unwrap(), origin(directory.path()), stamp),
             Outcome::Ready { .. }
         ),
         "a file rewritten under the same name is decoded again"
@@ -115,7 +130,7 @@ fn a_local_image_is_read_once_then_only_checked_until_its_file_changes() {
 fn images_that_cannot_be_shown_say_why() {
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(directory.path().join("notes.png"), b"not an image").unwrap();
-    let reason = |path: &str, origin: Origin| match read(path.into(), origin, None) {
+    let reason = |path: &str, origin: Origin| match read(path, origin, None) {
         Outcome::Failed { reason, .. } => reason,
         _ => panic!("{path} should not decode"),
     };
@@ -123,7 +138,7 @@ fn images_that_cannot_be_shown_say_why() {
         reason("missing.png", self::origin(directory.path())),
         Reason::Missing
     );
-    match read("missing.png".into(), self::origin(directory.path()), None) {
+    match read("missing.png", self::origin(directory.path()), None) {
         Outcome::Failed { detail, .. } => assert_eq!(
             detail,
             directory.path().join("missing.png").display().to_string(),
@@ -145,6 +160,16 @@ fn images_that_cannot_be_shown_say_why() {
         ..self::origin(directory.path())
     };
     assert_eq!(reason("notes.png", child), Reason::Unavailable);
+    let Outcome::Failed { stamp, .. } = read("notes.png", origin(directory.path()), None) else {
+        panic!("notes.png should not decode");
+    };
+    assert!(
+        matches!(
+            read("notes.png", origin(directory.path()), stamp),
+            Outcome::Unchanged
+        ),
+        "a file that is not an image is read again only once it changes"
+    );
 }
 
 #[test]
@@ -281,11 +306,10 @@ fn memory_pressure_waits_without_hiding_a_shown_preview() {
     let Loaded::Deferred(pressure) = super::super::deferred_for_test() else {
         unreachable!()
     };
-    assert!(
-        figures
-            .complete(id, request.attempt, Outcome::Deferred(pressure.clone()))
-            .is_some()
-    );
+    assert!(matches!(
+        figures.complete(id, request.attempt, Outcome::Deferred(pressure.clone())),
+        Next::Wait(_)
+    ));
     assert!(matches!(figures.store().entries[&id].state, State::Waiting));
     let request = figures
         .begin(id, false, false)
@@ -295,11 +319,10 @@ fn memory_pressure_waits_without_hiding_a_shown_preview() {
         *checked -= REVALIDATE;
     }
     let check = figures.begin(id, false, false).unwrap();
-    assert!(
-        figures
-            .complete(id, check.attempt, Outcome::Deferred(pressure))
-            .is_none()
-    );
+    assert!(matches!(
+        figures.complete(id, check.attempt, Outcome::Deferred(pressure)),
+        Next::Nothing
+    ));
     assert!(matches!(
         figures.store().entries[&id].state,
         State::Ready { .. }
@@ -335,7 +358,7 @@ fn laid_out(
     target: Target,
     url: &str,
 ) -> (Element<'static, Message>, Tree, layout::Node) {
-    let mut element = shared.view(target, &uri(url), "Mockup", "Step two");
+    let mut element = shared.view(target, &uri(url), "Mockup");
     let renderer = crate::app::tests::headless_renderer();
     let mut tree = Tree::new(element.as_widget());
     let node = element.as_widget_mut().layout(
@@ -421,11 +444,153 @@ fn a_preview_keeps_to_the_reading_measure_and_its_height_cap() {
         let (_, _, node) = laid_out(&shared, target, url);
         let preview = node.children()[0].bounds();
         assert!(preview.width <= 600.0, "{url} fits the measure");
-        assert!(preview.height <= MAX_HEIGHT + 0.5, "{url} keeps to the cap");
+        assert!(
+            preview.height <= super::super::preview::MAX_HEIGHT + 0.5,
+            "{url} keeps to the cap"
+        );
         let ratio = preview.width / preview.height;
         assert!(
             (ratio - width as f32 / height as f32).abs() < 0.05,
             "{url} keeps its aspect ratio: {preview:?}"
         );
     }
+}
+
+fn asks(messages: &[Message], target: Target) -> bool {
+    matches!(
+        messages,
+        [Message::ChatUi(Action::LoadFigure(found, _))] if *found == target
+    )
+}
+
+/// `shared`'s element for `url` drawn again, as a kept row's next view is,
+/// over the widget state the last one left.
+fn drawn_again(
+    shared: &Shared,
+    target: Target,
+    url: &str,
+    tree: &mut Tree,
+) -> (Element<'static, Message>, layout::Node) {
+    let mut element = shared.view(target, &uri(url), "Mockup");
+    tree.diff(element.as_widget_mut());
+    let renderer = crate::app::tests::headless_renderer();
+    let node = element.as_widget_mut().layout(
+        tree,
+        &renderer,
+        &layout::Limits::new(Size::ZERO, Size::new(600.0, 800.0)),
+    );
+    (element, node)
+}
+
+#[test]
+fn an_image_coming_back_into_view_asks_again() {
+    let target = Target {
+        card: CardId::new(),
+        generation: 3,
+    };
+    let shared = Figures::default().shared(false);
+    let (mut element, mut tree, node) = laid_out(&shared, target, "/x.png");
+    let near = Rectangle::new(iced::Point::ORIGIN, Size::new(600.0, 800.0));
+    let far = Rectangle::new(iced::Point::new(0.0, 5_000.0), Size::new(600.0, 800.0));
+    assert!(asks(&redraw(&mut element, &mut tree, &node, near), target));
+    assert!(redraw(&mut element, &mut tree, &node, near).is_empty());
+    assert!(matches!(
+        redraw(&mut element, &mut tree, &node, far).as_slice(),
+        [Message::ChatUi(Action::FigureOutOfSight)]
+    ));
+    assert!(
+        asks(&redraw(&mut element, &mut tree, &node, near), target),
+        "scrolled back, a preview checks its file again"
+    );
+}
+
+#[test]
+fn an_image_that_could_not_be_shown_is_looked_at_again_while_in_view() {
+    let target = Target {
+        card: CardId::new(),
+        generation: 3,
+    };
+    let figures = Figures::default();
+    let shared = figures.shared(false);
+    let (mut element, mut tree, node) = laid_out(&shared, target, "/x.png");
+    let near = Rectangle::new(iced::Point::ORIGIN, Size::new(600.0, 800.0));
+    assert!(asks(&redraw(&mut element, &mut tree, &node, near), target));
+    let id = figures.store().ids[&Key {
+        url: uri("/x.png"),
+        child: false,
+    }];
+    let request = figures.begin(id, false, false).unwrap();
+    let failed = Outcome::Failed {
+        reason: Reason::Missing,
+        detail: "/x.png".into(),
+        stamp: None,
+    };
+    assert!(matches!(
+        figures.complete(id, request.attempt, failed),
+        Next::Recheck
+    ));
+    let (mut element, node) = drawn_again(&shared, target, "/x.png", &mut tree);
+    assert!(
+        redraw(&mut element, &mut tree, &node, near).is_empty(),
+        "the failure is shown without asking again at once"
+    );
+    let before = figures.version();
+    figures.recheck(id);
+    assert_ne!(figures.version(), before, "the line draws again");
+    let (mut element, node) = drawn_again(&shared, target, "/x.png", &mut tree);
+    assert!(
+        asks(&redraw(&mut element, &mut tree, &node, near), target),
+        "the line still in view asks again"
+    );
+    if let State::Failed { at, .. } = &mut figures.store().entries.get_mut(&id).unwrap().state {
+        *at -= RETRY;
+    }
+    assert!(
+        figures.begin(id, false, false).is_some(),
+        "and the file is looked for again"
+    );
+}
+
+#[test]
+fn hiding_a_conversation_drops_loads_in_flight_and_asks_again_once_shown() {
+    let target = Target {
+        card: CardId::new(),
+        generation: 3,
+    };
+    let figures = Figures::default();
+    figures.sync(Path::new("/work"), None, true);
+    let shared = figures.shared(false);
+    let (mut element, mut tree, node) = laid_out(&shared, target, "/x.png");
+    let near = Rectangle::new(iced::Point::ORIGIN, Size::new(600.0, 800.0));
+    assert!(asks(&redraw(&mut element, &mut tree, &node, near), target));
+    let id = figures.store().ids[&Key {
+        url: uri("/x.png"),
+        child: false,
+    }];
+    let request = figures.begin(id, false, false).unwrap();
+    figures.sync(Path::new("/work"), None, false);
+    assert!(matches!(
+        figures.store().entries[&id].state,
+        State::Unseen { .. }
+    ));
+    assert!(
+        matches!(
+            figures.complete(id, request.attempt, ready("/x.png")),
+            Next::Nothing
+        ),
+        "an answer for the hidden conversation is stale"
+    );
+    figures.sync(Path::new("/work"), None, true);
+    let (mut element, node) = drawn_again(&shared, target, "/x.png", &mut tree);
+    assert!(
+        asks(&redraw(&mut element, &mut tree, &node, near), target),
+        "shown again, the image still in view asks once more"
+    );
+}
+
+#[test]
+fn long_names_and_addresses_are_cut_with_an_ellipsis() {
+    assert_eq!(clipped("mockup", 6), "mockup");
+    assert_eq!(clipped("mockups", 6), "mocku…");
+    assert_eq!(clipped(&"é".repeat(500), TIP).chars().count(), TIP);
 }

@@ -774,8 +774,36 @@ impl Renderer {
             Item::Rule => iced::widget::rule::horizontal(2).into(),
             Item::Table { columns, rows } => self.table(settings, columns, rows),
             Item::Image {
-                url, title, alt, ..
-            } => self.figures.view(self.target, url, &alt.plain(), title),
+                url,
+                title,
+                title_text,
+                alt,
+            } => {
+                let figure = self.figures.view(self.target, url, &alt.plain());
+                if title.is_empty() {
+                    return figure;
+                }
+                // The title is the image's caption, beneath its preview or
+                // link, and selectable and found as the answer's other text.
+                let caption = paragraph(
+                    markdown::Settings {
+                        text_size: design::TEXT_CAPTION.into(),
+                        style: markdown::Style {
+                            font: iced::Font::default(),
+                            ..settings.style
+                        },
+                        ..settings
+                    },
+                    title_text,
+                    self.target,
+                    self.find.map(|_| ""),
+                    Some(self.child(1).logical_identity(0)),
+                    Some(&self.flow_cache),
+                );
+                widget::column::with_children(vec![figure, caption])
+                    .spacing(step::GAP_XS)
+                    .into()
+            }
         }
     }
 
