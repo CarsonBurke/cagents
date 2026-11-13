@@ -560,6 +560,7 @@ pub(super) struct ProjectionInputs {
     scope: Option<std::path::PathBuf>,
     activity: Option<crate::agent::Activity>,
     attention: sidebar::AttentionSummary,
+    attention_stale: bool,
     update: bool,
     preview: Option<usize>,
     cards: usize,
@@ -601,6 +602,8 @@ impl ProjectionInputs {
             attention: card.map_or_else(Default::default, |card| {
                 app.sidebar_state.card_attention(card)
             }),
+            // Attention can change owner without changing its summary.
+            attention_stale: app.sidebar_state.attention_projection_stale(),
             update: card.is_some_and(|card| app.sidebar_state.has_card_update(card)),
             preview: session
                 .and_then(|session| app.notification_ui.previews.get(&session))
@@ -633,6 +636,7 @@ impl ProjectionInputs {
             && self.scope == after.scope
             && self.activity == after.activity
             && self.attention == after.attention
+            && self.attention_stale == after.attention_stale
             && self.update == after.update
             && self.preview == after.preview
             && self.cards == after.cards
@@ -16763,6 +16767,28 @@ mod tests {
             ))));
         }
         assert_eq!(chat_runtime(&app, card).composer.text(), "next");
+        assert_eq!(projections(), before);
+        // Nothing the skipped projections would have shown is missing.
+        let sidebar = app.sidebar_model.clone();
+        app.refresh_sidebar_channels();
+        app.refresh_sidebar_worktree_panes();
+        assert_eq!(app.sidebar_model, sidebar);
+        // A pane name the provider reports reaches the tab through the
+        // chrome alone.
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.title = Some("Renamed by the provider".into());
+        handle.publish_snapshot_for_test(snapshot);
+        drop(app.update(Message::ChatUi(Action::Wake(target, Wake::Changed))));
+        assert_eq!(
+            app.card_state(card).unwrap().title,
+            "Renamed by the provider"
+        );
+        assert!(
+            app.card_chrome[&card]
+                .tooltip
+                .contains("Renamed by the provider")
+        );
         assert_eq!(projections(), before);
         // Every delta still reached the conversation.
         assert_eq!(

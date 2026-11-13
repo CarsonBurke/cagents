@@ -3596,6 +3596,14 @@ impl SidebarState {
         }
     }
 
+    /// Whether an attention change since the last projection moved a count
+    /// between rows, so the listed rows await a refresh.
+    pub fn attention_projection_stale(&self) -> bool {
+        self.attention_projection
+            .as_ref()
+            .is_some_and(|projection| projection.dirty)
+    }
+
     fn worktree_attention_map(&self) -> &BTreeMap<(ProjectId, WorktreeId), AttentionSummary> {
         self.attention_projection
             .as_ref()

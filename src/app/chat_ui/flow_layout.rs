@@ -2431,6 +2431,33 @@ fn queued_none_flow_results_hold_admission_through_cancellation_error_and_worker
     executor.shutdown_background();
 }
 
+/// Slot availability is subscribed only while a chat's layout waits for one.
+#[test]
+fn only_a_deferred_layout_waits_for_slot_availability() {
+    let target = Target {
+        card: CardId::new(),
+        generation: 0,
+    };
+    let cache = Cache::default();
+    let entry = cache.entry(92, vec![Span::new("waiting reader")].into());
+    entry.borrow_mut().bind_target(target);
+    entry
+        .borrow_mut()
+        .configure(400.0, iced::Pixels(16.0), iced::Font::DEFAULT);
+    let request = entry.borrow_mut().request().unwrap();
+    assert!(!has_deferred(target));
+    entry.borrow_mut().defer(&request, 1);
+    assert!(has_deferred(target));
+    assert!(!has_deferred(Target {
+        card: CardId::new(),
+        generation: 0,
+    }));
+    drop(request);
+    drop(entry);
+    drop(cache);
+    assert!(!has_deferred(target));
+}
+
 #[test]
 fn stale_output_reclamation_wakes_a_deferred_idle_reader_after_actual_permit_release() {
     use iced::futures::StreamExt;
