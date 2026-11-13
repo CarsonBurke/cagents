@@ -718,6 +718,10 @@ struct Claude {
     /// Historical runs with no live process evidence yet. A fresh child
     /// carrier or API stream can prove that this occurrence resumed.
     unconfirmed_agents: HashSet<String>,
+    /// Current failure notices, retired only by an accepted human prompt.
+    recent_failed_agents: VecDeque<String>,
+    /// Consumed human inputs; replay acknowledgements must not advance scope.
+    accepted_user_prompts: VecDeque<String>,
     models: Vec<Model>,
     /// The full model ID each listed model resolves to, where Claude Code
     /// said: `opus` to `claude-opus-5-5`, `fable` to `claude-fable-5-1`.
@@ -875,6 +879,25 @@ impl Claude {
             ..Capabilities::default()
         }
     }
+    fn accept_user_prompt(&mut self, id: &str, step: &mut Step) {
+        if self.accepted_user_prompts.iter().any(|known| known == id) {
+            return;
+        }
+        self.accepted_user_prompts.push_back(id.into());
+        if self.accepted_user_prompts.len() > 2048 {
+            self.accepted_user_prompts.pop_front();
+        }
+        for id in self.recent_failed_agents.drain(..) {
+            self.unconfirmed_agents.insert(id.clone());
+            step.events.push(subagent_status(
+                id,
+                ToolStatus::Ended,
+                Some("Failed before the current prompt; see its transcript"),
+                false,
+            ));
+        }
+    }
+
     fn start_turn(&mut self, step: &mut Step) {
         if self.started_generation != Some(self.attention_generation) {
             self.suggestion_turn = None;
@@ -3000,6 +3023,8 @@ impl Adapter for Claude {
                     self.ended_agents.push_back((id.clone(), *status));
                 } else if *status == ToolStatus::Ended {
                     self.unconfirmed_agents.insert(id.clone());
+                } else if *status == ToolStatus::Failed {
+                    self.recent_failed_agents.push_back(id.clone());
                 }
                 history_step.events.push(Event::Subagent {
                     model: None,
@@ -3302,6 +3327,22 @@ impl Adapter for Claude {
                 *detail = Some("Superseded by a later run of this agent".into());
             }
         }
+        for event in &step.events {
+            if let Event::Subagent {
+                id,
+                status: Some(status),
+                ..
+            } = event
+            {
+                self.recent_failed_agents.retain(|known| known != id);
+                if *status == ToolStatus::Failed {
+                    self.recent_failed_agents.push_back(id.clone());
+                    if self.recent_failed_agents.len() > MAX_TOOLS {
+                        self.recent_failed_agents.pop_front();
+                    }
+                }
+            }
+        }
         self.reconcile_waiting_agents(&mut step);
         Ok(step)
     }
@@ -3425,6 +3466,8 @@ impl Claude {
                 self.ended_agents.clear();
                 self.superseded_agents.clear();
                 self.unconfirmed_agents.clear();
+                self.recent_failed_agents.clear();
+                self.accepted_user_prompts.clear();
                 self.handed_back.clear();
                 self.submissions.clear();
                 self.queued.clear();
@@ -3651,6 +3694,15 @@ impl Claude {
                             .is_some_and(|submission| submission.deferred.is_some())
                     });
                 if !awaiting_delivery {
+                    if actual_user_prompt(&frame)
+                        && frame["parent_tool_use_id"]
+                            .as_str()
+                            .is_none_or(str::is_empty)
+                        && let Some(id) = frame["uuid"].as_str()
+                        && !self.submissions.contains_key(id)
+                    {
+                        self.accept_user_prompt(id, &mut step);
+                    }
                     self.message(&frame, &mut step)?;
                 }
             }
@@ -3922,6 +3974,11 @@ impl Claude {
                             self.queued.push(message.preview.clone());
                         }
                     } else if matches!(state, "started" | "completed" | "cancelled" | "discarded") {
+                        if matches!(state, "started" | "completed")
+                            && self.submissions.contains_key(id)
+                        {
+                            self.accept_user_prompt(id, &mut step);
+                        }
                         if state == "started" && self.submissions.contains_key(id) {
                             self.start_turn(&mut step);
                             self.status(true, "Claude is working", &mut step);
@@ -13795,6 +13852,79 @@ mod tests {
         assert_eq!(activity.failed.len(), 1);
         assert_eq!(activity.failed[0].id, "recent-failure");
         assert!(activity.failed[0].detail.contains("could not validate"));
+    }
+
+    #[test]
+    fn recent_failure_retires_only_when_human_input_is_consumed() {
+        for queued in [false, true] {
+            let mut adapter = Claude {
+                ready: true,
+                async_input: true,
+                ..Default::default()
+            };
+            let mut state = chat::Snapshot::default();
+            for frame in [
+                scoped_call(
+                    None,
+                    "failure-call",
+                    "failed-worker",
+                    "Agent",
+                    json!({"description":"Validate release"}),
+                ),
+                json!({"type":"user","uuid":"failed-result","message":{"content":[{"type":"tool_result","tool_use_id":"failed-worker","is_error":true,"content":"Validation failed"}]}}),
+            ] {
+                crate::chat::runtime::project_events_for_test(
+                    &mut state,
+                    adapter.receive(frame).unwrap().events,
+                );
+            }
+            assert_eq!(state.subagent_activity().failed.len(), 1);
+            if queued {
+                let submitted = adapter
+                    .send_prompt("Next task".into(), vec![], PromptMode::Queue)
+                    .unwrap();
+                crate::chat::runtime::project_events_for_test(&mut state, submitted.events);
+                let echo = submitted.writes[0].clone();
+                let id = echo["uuid"].clone();
+                crate::chat::runtime::project_events_for_test(
+                    &mut state,
+                    adapter.receive(echo.clone()).unwrap().events,
+                );
+                crate::chat::runtime::project_events_for_test(
+                    &mut state,
+                    adapter
+                        .receive(
+                            json!({"type":"command_lifecycle","command_uuid":id,"state":"queued"}),
+                        )
+                        .unwrap()
+                        .events,
+                );
+                assert_eq!(
+                    state.subagent_activity().failed.len(),
+                    1,
+                    "queued input is not yet a new failure scope"
+                );
+                crate::chat::runtime::project_events_for_test(
+                    &mut state,
+                    adapter
+                        .receive(
+                            json!({"type":"command_lifecycle","command_uuid":id,"state":"started"}),
+                        )
+                        .unwrap()
+                        .events,
+                );
+            } else {
+                crate::chat::runtime::project_events_for_test(&mut state, adapter.receive(json!({"type":"user","uuid":"actual-next-prompt","origin":{"kind":"human"},"message":{"content":"Next task"}})).unwrap().events);
+            }
+            assert!(state.subagent_activity().failed.is_empty());
+            let old = state
+                .subagents
+                .iter()
+                .find(|agent| agent.id == "failed-worker")
+                .unwrap();
+            assert_eq!(old.status, ToolStatus::Ended);
+            assert!(old.detail.contains("before the current prompt"));
+        }
     }
 
     #[test]
