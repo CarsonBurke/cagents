@@ -434,7 +434,7 @@ impl Cagents {
                 };
                 self.browser_factory = Some(binding.factory);
                 self.browser_backend.phase = Phase::Available;
-                self.reload_settled_browsers();
+                self.browser_recovered();
                 self.register_deferred_browsers();
                 self.lifecycle_sweep()
             }
@@ -464,7 +464,9 @@ impl Cagents {
         for card in failed {
             self.settle_unavailable_browser(card, reason);
         }
-        self.status = Some(TransientNotice::error(reason.to_string()));
+        self.status = Some(
+            TransientNotice::error(reason.to_string()).with_key(NoticeKey::BrowserUnavailable),
+        );
         Task::none()
     }
 
@@ -477,10 +479,11 @@ impl Cagents {
         }
     }
 
-    /// Returns the panes an earlier check gave up on to waiting, so they load
-    /// as panes that were waiting for this check do. A pane closed since
-    /// stays closed.
-    fn reload_settled_browsers(&mut self) {
+    /// Withdraws an earlier check's report that the browser is unavailable,
+    /// and returns the panes it gave up on to waiting, so they load as panes
+    /// that were waiting for this check do. A pane closed since stays closed.
+    fn browser_recovered(&mut self) {
+        self.resolve_notice(NoticeKey::BrowserUnavailable);
         for card in std::mem::take(&mut self.browser_backend.settled) {
             if matches!(self.cards.get(&card), Some(CardRuntime::Failed(_)))
                 && self.browser_system_request(card).is_some()
@@ -706,14 +709,19 @@ mod action_tests {
     }
 
     #[test]
-    fn a_check_that_succeeds_loads_the_panes_an_earlier_one_gave_up_on() {
+    fn a_check_that_succeeds_withdraws_the_report_and_loads_the_panes_an_earlier_one_gave_up_on() {
         let (mut app, card, parent) = app();
         app.browser_backend.begin(parent, Instant::now()).unwrap();
         let _ = app.browser_factory_unavailable(BrowserUnavailable::TimedOut);
         assert!(matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))));
         let closed = CardId::new();
         app.browser_backend.settled.push(closed);
-        app.reload_settled_browsers();
+        // The report the window has drained into its notices goes too.
+        let report = app.status.take().unwrap();
+        app.report_notice(report);
+        assert!(app.notice_stands(NoticeKey::BrowserUnavailable));
+        app.browser_recovered();
+        assert!(!app.notice_stands(NoticeKey::BrowserUnavailable));
         assert!(matches!(app.cards.get(&card), Some(CardRuntime::Loading)));
         assert!(!app.cards.contains_key(&closed));
         assert!(app.browser_backend.settled.is_empty());

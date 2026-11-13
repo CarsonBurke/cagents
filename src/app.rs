@@ -301,6 +301,8 @@ enum NoticeKey {
     ChatReturn(CardId),
     /// Closing this chat, which the daemon refused.
     ChatClose(CardId),
+    /// Finding the integrated browser, which the last check could not.
+    BrowserUnavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
