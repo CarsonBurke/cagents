@@ -272,11 +272,18 @@ fn poll_with(
                 if stored.failures == 0 && now.saturating_sub(stored.census_at) < CENSUS_AFTER =>
             {
                 validate_context()?;
-                stored.due = clock().saturating_add(REFRESH);
+                stored.probe_refused_at = None;
+                // Not past the census due at CENSUS_AFTER, however the ticks fall.
+                stored.due = clock()
+                    .saturating_add(REFRESH)
+                    .min(stored.census_at.saturating_add(CENSUS_AFTER));
                 pr_status::store(&path, &stored).map_err(|error| error.to_string())?;
                 return Ok(stored.result(now));
             }
-            Ok(Revalidation::Modified { etag, .. }) => etag,
+            Ok(Revalidation::Modified { etag, .. }) => {
+                stored.probe_refused_at = None;
+                etag
+            }
             Ok(Revalidation::Refused) => {
                 stored.probe_refused_at = Some(now);
                 None
@@ -521,6 +528,13 @@ pub(crate) mod tests {
         fails.set(false);
         assert_eq!(poll(due + 240), (5, due + 240 + REFRESH));
         assert_eq!(poll(due + 300), (5, due + 300 + REFRESH));
+        // A census that failed is read again though nothing changed.
+        let due = due + 240 + CENSUS_AFTER;
+        fails.set(true);
+        assert_eq!(poll(due).0, 6);
+        fails.set(false);
+        assert_eq!(poll(due + 600), (7, due + 600 + REFRESH));
+        assert_eq!(poll(due + 660), (7, due + 660 + REFRESH));
         // A repository GitHub refuses to probe is censused as before probes,
         // and asked again only after a while.
         let probes = std::cell::Cell::new(0);
