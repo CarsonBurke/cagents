@@ -15509,7 +15509,10 @@ impl Application for Cagents {
                 | Message::WindowResized(..)
         );
         let model_update = matches!(&message, Message::WorkspaceModelObserved(_));
-        let mut projection = if repaint_tick(&message) || matches!(message, Message::ReplicaCaptureDue(_)) || self.navigation_save_is_stale(&message) {
+        let mut projection = if repaint_tick(&message)
+            || matches!(message, Message::ReplicaCaptureDue(_))
+            || self.navigation_save_is_stale(&message)
+        {
             Projection::Unchanged
         } else {
             Projection::Full
@@ -17624,7 +17627,9 @@ impl Application for Cagents {
                 self.chrome_ui.workspace_switcher_shown = true;
                 self.reveal_workspace_selection()
             }
-            Message::ReplicaCaptureDue(generation) => self.replica_capture_due(generation, Instant::now()),
+            Message::ReplicaCaptureDue(generation) => {
+                self.replica_capture_due(generation, Instant::now())
+            }
             Message::NavigationSaveDue(generation) => {
                 if self.navigation_save_due(generation) {
                     self.persist();
@@ -18999,22 +19004,23 @@ impl Application for Cagents {
                 Task::batch(refreshes)
             }
         };
+        // Scoped proof was established during dispatch. Settings commit and
+        // close processing can invalidate it before chrome is projected.
+        if matches!(projection, Projection::ScopedChrome(_))
+            && (self.settings_blur_pending()
+                || !self.queued_card_closes.is_empty()
+                || self.workspace.pending_close().is_some())
+        {
+            projection = Projection::Full;
+        }
+        let scoped_source = matches!(projection, Projection::ScopedChrome(_))
+            .then(|| Arc::downgrade(&self.durable));
         // `status` is the shell's write channel: ninety-odd call sites raise a
         // notice by assigning it. Draining it here is what makes those notices
         // survive the next assignment instead of silently replacing each other,
         // and it is the one place that can bound the history.
         // Before the notices drain, so one raised by a committed draft is
         // recorded with this update rather than the next.
-        // Scoped proof was established during dispatch. Settings commit and
-        // close processing can invalidate it before chrome is projected.
-        if matches!(projection, Projection::ScopedChrome(_))
-            && (self.settings_blur_pending()
-                || !self.queued_card_closes.is_empty() || self.workspace.pending_close().is_some())
-        {
-            projection = Projection::Full;
-        }
-        let scoped_source = matches!(projection, Projection::ScopedChrome(_))
-            .then(|| Arc::downgrade(&self.durable));
         self.reconcile_terminal_review_owner();
         let task = Task::batch([
             task,
@@ -19056,7 +19062,9 @@ impl Application for Cagents {
             // the sidebar, worktree ownership or protections reads it.
             Projection::Chrome | Projection::ScopedChrome(_) => {
                 #[cfg(test)]
-                if model_update { self.shared_views.chrome_tail_count += 1; }
+                if model_update {
+                    self.shared_views.chrome_tail_count += 1;
+                }
                 let notices = self.reconcile_notice_popup();
                 let mut phase = WorkspaceProjectionTiming::new(_workspace_timing.is_some());
                 let chrome = match &projection {
@@ -19064,9 +19072,16 @@ impl Application for Cagents {
                     _ => self.sync_chrome(),
                 };
                 phase.mark("selected_chrome");
-                let snapshot = if matches!(projection, Projection::ScopedChrome(_)) { self.arm_replica_capture() } else { Task::none() };
+                let snapshot = if matches!(projection, Projection::ScopedChrome(_)) {
+                    self.arm_replica_capture()
+                } else {
+                    Task::none()
+                };
                 return Task::batch([
-                    task, chrome, notices, snapshot,
+                    task,
+                    chrome,
+                    notices,
+                    snapshot,
                     self.release_deferred_navigation_if_unblocked(),
                 ]);
             }
@@ -19078,7 +19093,9 @@ impl Application for Cagents {
         #[cfg(test)]
         terminal_output_tests::record_projection();
         #[cfg(test)]
-        if model_update { self.shared_views.structural_tail_count += 1; }
+        if model_update {
+            self.shared_views.structural_tail_count += 1;
+        }
         let notices = self.reconcile_notice_popup();
         self.synchronize_sidebar_selection();
         self.refresh_sidebar_channels();
@@ -33907,7 +33924,7 @@ mod tests {
         app.github_availability.insert(
             project,
             GitHubAvailability::Ready {
-                repository_key: crate::pull_request_review::tests::target(1).repository,
+                repository_key: GitHubRepoKey::new("github.com", None, "o", "r").unwrap(),
                 pull_requests: numbers
                     .iter()
                     .map(|number| {
@@ -33948,7 +33965,7 @@ mod tests {
         Message::Sidebar(SidebarAction::OpenPullRequest {
             project_id,
             number,
-            url: crate::pull_request_review::tests::pull_request(number).url,
+            url: Url::parse(&format!("https://github.com/o/r/pull/{number}")).unwrap(),
         })
     }
 
