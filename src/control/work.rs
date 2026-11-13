@@ -758,6 +758,8 @@ fn row(item: &Item, now_ms: u64) -> [String; 9] {
                         CheckOutcome::Passing => "checks pass",
                         CheckOutcome::Pending => "checks pending",
                         CheckOutcome::Failing => "checks fail",
+                        CheckOutcome::Cancelled => "checks cancelled",
+                        CheckOutcome::Skipped => "checks skipped",
                     }
                     .into(),
                 );
@@ -863,6 +865,7 @@ mod tests {
                     passed: 3,
                     failed: 1,
                     pending: 0,
+                    ..Default::default()
                 }),
                 review: Some(Review::Approved),
                 updated_at: "2026-10-01T00:00:00Z".into(),

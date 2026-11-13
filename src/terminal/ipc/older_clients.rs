@@ -57,7 +57,7 @@ pub struct OlderClient {
 /// across an update to this release and keep running its CLI.
 const CANDIDATE_LINE: OlderClient = OlderClient {
     protocol: CANDIDATE_LINE_PROTOCOL,
-    proven_at: 175,
+    proven_at: 176,
     client_requests: 74,
     server_messages: 17,
     server_responses: 40,
@@ -83,6 +83,11 @@ const MODEL_EDGES_WITH_EFFECTS: u16 = 175;
 /// [`MODEL_EDGES_WITH_EFFECTS`]. The wire format proof skips exactly these.
 // Wire shape tracing uses Serde variant names, including rename_all.
 const MODEL_EDGES: &[&str] = &["workspace_model_edited"];
+
+/// Work boards include the expanded check counts from this protocol onward.
+const WORK_CHECK_COUNTS: u16 = 176;
+const WORK_CHECK_REPLIES: &[&str] = &["Board", "Pinned", "Watching"];
+const WORK_BOARD_MESSAGES: &[&str] = &["work_board"];
 
 /// The first protocol with `ToolStatus::Waiting`. An older client is told such
 /// an agent is running, which is what it was before: it hasn't finished.
@@ -161,6 +166,20 @@ impl OlderClient {
             && !changes_the_daemon(request)
             && !self.cannot_read_the_firing_for(request)
             && !self.cannot_read_model_edges_for(request)
+            && !self.cannot_read_work_checks_for(request)
+    }
+
+    /// Refuse before execution: an older CLI must not pin a card and then
+    /// discover it cannot decode the result.
+    fn cannot_read_work_checks_for(&self, request: &ClientRequest) -> bool {
+        self.protocol < WORK_CHECK_COUNTS
+            && matches!(
+                request,
+                ClientRequest::WatchWork
+                    | ClientRequest::Work(
+                        crate::work::Request::Board { .. } | crate::work::Request::Pin { .. }
+                    )
+            )
     }
 
     /// A watch would only deliver edges the client cannot read.
@@ -199,6 +218,9 @@ impl OlderClient {
                 let nested = match response {
                     ServerResponse::Work(work) => {
                         variant_index(work).is_some_and(|index| index < self.work_responses)
+                            && (self.protocol >= WORK_CHECK_COUNTS
+                                || !variant_name(work)
+                                    .is_some_and(|name| WORK_CHECK_REPLIES.contains(&name)))
                     }
                     ServerResponse::Automation(automation) => {
                         self.protocol >= FIRING_WITH_SKIPPED_OCCURRENCES
@@ -211,6 +233,7 @@ impl OlderClient {
                 };
                 nested && variant_index(response).is_some_and(|index| index < self.server_responses)
             }
+            ServerMessage::WorkBoard { .. } => self.protocol >= WORK_CHECK_COUNTS,
             ServerMessage::WorkspaceModelEdited { .. } => self.protocol >= MODEL_EDGES_WITH_EFFECTS,
             _ => true,
         }
@@ -585,6 +608,86 @@ mod tests {
                 }),
             }))
         );
+    }
+
+    #[test]
+    fn expanded_work_counts_require_a_matching_client_before_reading_or_pinning() {
+        use crate::work::{Board, Request, Response, Scope};
+        let client = older_client(CANDIDATE_LINE_PROTOCOL).unwrap();
+        let current = OlderClient {
+            protocol: WORK_CHECK_COUNTS,
+            ..client
+        };
+        for request in [
+            ClientRequest::WatchWork,
+            ClientRequest::Work(Request::Board {
+                scope: Scope::All,
+                fresh: false,
+            }),
+            ClientRequest::Work(Request::Pin {
+                scope: Scope::All,
+                item: "branch".into(),
+                column: None,
+            }),
+        ] {
+            assert!(!client.admits_request(&request));
+            assert!(current.admits_request(&request));
+        }
+        for request in [
+            ClientRequest::Work(Request::RemovalPlan {
+                scope: Scope::All,
+                item: "branch".into(),
+                fetch: false,
+            }),
+            ClientRequest::Work(Request::Snapshots { scope: Scope::All }),
+        ] {
+            assert!(client.admits_request(&request));
+        }
+        let board = Board {
+            generated_at_unix_ms: 0,
+            stale_after_days: 7,
+            projects: Vec::new(),
+            items: Vec::new(),
+            linear_unavailable: None,
+        };
+        for message in [
+            ServerMessage::WorkBoard {
+                revision: 1,
+                board: Box::new(board.clone()),
+            },
+            ServerMessage::Response {
+                response: ServerResponse::Work(Response::Board(board.clone())),
+            },
+            ServerMessage::Response {
+                response: ServerResponse::Work(Response::Watching {
+                    revision: 1,
+                    board: Box::new(board),
+                }),
+            },
+        ] {
+            assert!(!client.admits_message(&message));
+            assert!(current.admits_message(&message));
+        }
+        assert!(!client.admits_message(&ServerMessage::Response {
+            response: ServerResponse::Work(Response::Pinned(Box::new(crate::work::Item {
+                project: "/repo".into(),
+                project_name: "repo".into(),
+                key: crate::work::ItemKey::Branch("branch".into()),
+                branch: None,
+                worktree: None,
+                head: None,
+                comparison: None,
+                dirty: None,
+                pull_request: None,
+                linear: None,
+                sessions: Vec::new(),
+                last_activity: None,
+                error: None,
+                column: crate::work::Column::InProgress,
+                derived: crate::work::Column::InProgress,
+                pinned: false,
+            }))),
+        }));
     }
 
     #[test]
