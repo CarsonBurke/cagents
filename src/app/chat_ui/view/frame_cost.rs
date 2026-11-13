@@ -1048,10 +1048,22 @@ fn retained_coordination_cards_refresh_child_model_and_waiting_metadata() {
         labels.0
     };
     let initial = labels(&runtime, &mut tree);
+    // One row: what was done to whom, and how it stands. Its tool call and
+    // the agent's transcript are reached from the row, not a footer.
     assert!(
-        initial
+        initial.iter().any(|label| label == "Started"),
+        "{initial:?}"
+    );
+    assert!(initial.iter().any(|label| label == "Scout"), "{initial:?}");
+    assert!(
+        !initial
             .iter()
-            .any(|label| label.contains("Model not reported")),
+            .any(|label| label == "Transcript" || label.ends_with("tool call")),
+        "{initial:?}"
+    );
+    // An unreported model is not printed at all.
+    assert!(
+        !initial.iter().any(|label| label.contains("not reported")),
         "{initial:?}"
     );
     assert!(
@@ -1059,24 +1071,15 @@ fn retained_coordination_cards_refresh_child_model_and_waiting_metadata() {
         "{initial:?}"
     );
     assert!(
-        !initial.iter().any(|label| label == "Starting…"),
+        !initial.iter().any(|label| label == "Starting"),
         "{initial:?}"
     );
     let unrelated = runtime.turn_fingerprint(&runtime.turns[1], dark);
+    // A model reported later reaches the row's tooltip, so the retained
+    // exchange is drawn again.
+    let before = runtime.turn_fingerprint(&runtime.turns[0], dark);
     Arc::make_mut(&mut runtime.snapshot).subagents[0].model = Some("gpt-child-reported".into());
-    let hydrated = labels(&runtime, &mut tree);
-    assert!(
-        hydrated
-            .iter()
-            .any(|label| label.contains("gpt-child-reported")),
-        "{hydrated:?}"
-    );
-    assert!(
-        !hydrated
-            .iter()
-            .any(|label| label.contains("Model not reported")),
-        "{hydrated:?}"
-    );
+    assert_ne!(runtime.turn_fingerprint(&runtime.turns[0], dark), before);
     assert_eq!(runtime.turn_fingerprint(&runtime.turns[1], dark), unrelated);
     Arc::make_mut(&mut runtime.snapshot).subagents[0].waiting = true;
     let waiting = labels(&runtime, &mut tree);
@@ -1100,7 +1103,7 @@ fn retained_coordination_cards_refresh_child_model_and_waiting_metadata() {
     assert!(
         !stopped
             .iter()
-            .any(|label| label == "Starting…" || label == "Working" || label == "Waiting for you"),
+            .any(|label| label == "Starting" || label == "Working" || label == "Waiting for you"),
         "{stopped:?}"
     );
     assert_eq!(runtime.turn_fingerprint(&runtime.turns[1], dark), unrelated);

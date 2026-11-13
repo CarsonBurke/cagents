@@ -28,9 +28,11 @@
 #
 # Scenes, each shooting with the side's prefix as native-evidence does:
 #
-#   cards   message-cards (the short message and the start of the long one),
-#           message-unfolded (the long message opened) and message-failed
-#           (the refused message and the one to an unlisted agent)
+#   cards   message-cards (the started agent and the first messages),
+#           message-hover (the pointer on the long message, its tooltip
+#           open), message-menu (that message's context menu) and
+#           message-failed (the refused message and the one to an unlisted
+#           agent)
 #   narrow  narrow-message-cards and narrow-message-failed, for a session
 #           started at --width 900, the narrowest window the app allows
 #
@@ -117,9 +119,20 @@ transcript=$(locate 'where the repo went')
 scroll "$transcript" -6
 shot "${prefix}message-cards"
 if [ "$scene" = cards ]; then
-    click 'Show full' || :
-    shot message-unfolded
-    click 'Show less' || :
+    # The long message, by the start of its text.
+    long=$(locate 'The checkout moved')
+    if [ -n "$long" ]; then
+        "$ne" drive hover "$long" >/dev/null 2>&1 || log "hover failed"
+        sleep 3
+        "$ne" shot message-hover >/dev/null && log "shot message-hover" || log "shot failed: message-hover"
+        "$ne" drive click --button right "$long" >/dev/null 2>&1 || log "right click failed"
+        sleep 2
+        "$ne" shot message-menu >/dev/null && log "shot message-menu" || log "shot failed: message-menu"
+        "$ne" drive key Escape >/dev/null 2>&1 || :
+        sleep 1
+    else
+        log "not found: the long message"
+    fi
 fi
 scroll "$transcript" 30
 shot "${prefix}message-failed"

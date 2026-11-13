@@ -2229,10 +2229,6 @@ impl Runtime {
                 };
                 let footer = if (item.role == chat::Role::User && !item.content.is_step())
                     || matches!(item.content, ItemContent::Text { .. })
-                    || cached
-                        .coordination
-                        .as_deref()
-                        .is_some_and(Coordinated::is_card)
                 {
                     MESSAGE_ACTION_FOOTER
                 } else {
@@ -2281,13 +2277,7 @@ impl Runtime {
                                     let raw = self
                                         .item_expanded(&item.id)
                                         .then(|| self.step_detail(item, cached, markdown_settings));
-                                    self.coordination_card(
-                                        item,
-                                        cached,
-                                        coordinated,
-                                        markdown_settings,
-                                        raw,
-                                    )
+                                    self.coordination_card(item, coordinated, raw)
                                 } else {
                                     match &item.content {
                                         ItemContent::Text { .. } => self.prose_view(
@@ -4402,7 +4392,7 @@ impl Runtime {
                     let raw = self
                         .item_expanded(&item.id)
                         .then(|| self.step_detail(item, cached, settings));
-                    self.coordination_card(item, cached, coordinated, settings, raw)
+                    self.coordination_card(item, coordinated, raw)
                 },
                 settings,
             )
@@ -4560,10 +4550,10 @@ impl Runtime {
         hasher.finish()
     }
 
-    fn prose_action_footer(item: &chat::Item, cached: &CachedItem, slot: turn::Slot) -> f32 {
-        if matches!(item.content, ItemContent::Text { .. })
-            || (slot == turn::Slot::Card && cached.coordination.is_some())
-        {
+    /// The room a prose row leaves under it for its hover actions. A
+    /// coordination row carries its actions in its context menu instead.
+    fn prose_action_footer(item: &chat::Item) -> f32 {
+        if matches!(item.content, ItemContent::Text { .. }) {
             MESSAGE_ACTION_FOOTER
         } else {
             0.0
@@ -4575,9 +4565,9 @@ impl Runtime {
         // parsing, using the same footer classification as turn_rows.
         for placed in turn.prose.iter().rev() {
             if let Some(item) = self.snapshot.items.get(placed.index)
-                && let Some(cached) = self.cache.get(&item.id)
+                && self.cache.contains_key(&item.id)
             {
-                return Self::prose_action_footer(item, cached, placed.slot);
+                return Self::prose_action_footer(item);
             }
         }
         if !turn.steps.is_empty() {
@@ -4671,6 +4661,9 @@ impl Runtime {
             }
             rows.push(strip);
         }
+        // A run of coordination rows reads as one list, as the step strip's
+        // rows do, rather than as blocks set apart from one another.
+        let mut after_card = false;
         for prose in &turn.prose {
             let Some((item, cached)) = placed(prose.index) else {
                 continue;
@@ -4681,12 +4674,16 @@ impl Runtime {
             if let Some(coordinated) = cached.coordination.as_deref()
                 && prose.slot == turn::Slot::Card
             {
-                rows.message(
+                let gap = if after_card { step::GAP_XS } else { rows.gap };
+                rows.push_with_gap(
                     scroll::item(&item.id, card(item, cached, coordinated)),
-                    Self::prose_action_footer(item, cached, prose.slot),
+                    gap,
+                    0.0,
                 );
+                after_card = true;
                 continue;
             }
+            after_card = false;
             rows.message(
                 scroll::item(
                     &item.id,
@@ -4700,7 +4697,7 @@ impl Runtime {
                         _ => step(item, cached),
                     },
                 ),
-                Self::prose_action_footer(item, cached, prose.slot),
+                Self::prose_action_footer(item),
             );
         }
         widget::container(widget::column::with_children(rows.children).width(Length::Fill))

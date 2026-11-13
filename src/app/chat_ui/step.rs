@@ -43,7 +43,7 @@ const THREAD_RAIL_OFFSET: f32 =
 /// heading is held in a clipped box of exactly that width, so the duration
 /// and status beside it keep their place whatever width the shaped text
 /// reports; the whole of what was cut is in the open row.
-fn one_line<'a>(
+pub(super) fn one_line<'a>(
     text: cosmic::iced::widget::Text<'a, cosmic::Theme, cosmic::Renderer>,
 ) -> Element<'a, Message> {
     widget::container(
