@@ -119,9 +119,10 @@ struct State {
     mounted: Vec<u64>,
     /// Where the last layout put each mounted row: its top and bottom.
     placed: Vec<(f32, f32)>,
-    /// How far the row at the top of the viewport has moved in layouts since
-    /// [`keep_in_place`] last scrolled to follow it.
-    shift: f32,
+    /// Where, from the column's top, the viewport's top must be for the row
+    /// at its top to stay where it was drawn, when a layout since
+    /// [`keep_in_place`] last scrolled has moved that row.
+    follow: Option<f32>,
     /// The span of content, from the column's top, that the mounted rows
     /// cover; a viewport inside it needs no new layout.
     covered: Range<f32>,
@@ -312,7 +313,8 @@ impl<Message> Widget<Message, Theme, Renderer> for CulledColumn<'_, Message> {
     ) -> layout::Node {
         let width = limits.max().width;
         let state = tree.state.downcast_mut::<State>();
-        // The row at the top of the viewport, as the last layout placed it.
+        // The row at the top of the viewport, as the last layout placed it,
+        // or the first below it that is still listed, as after a filter.
         // Away from the top of the list, it is what the user is looking at,
         // and it stays put however the rows above it change.
         let anchor = state
@@ -320,13 +322,15 @@ impl<Message> Widget<Message, Theme, Renderer> for CulledColumn<'_, Message> {
             .get()
             .filter(|(top, _)| *top > 0.0)
             .and_then(|(top, _)| {
-                let (key, (placed, _)) = state
+                state
                     .mounted
                     .iter()
                     .zip(&state.placed)
-                    .find(|(_, (_, bottom))| *bottom > top)?;
-                let index = self.keys.iter().position(|row| row == key)?;
-                Some((index, *placed))
+                    .filter(|(_, (_, bottom))| *bottom > top)
+                    .find_map(|(key, (placed, _))| {
+                        let index = self.keys.iter().position(|row| row == key)?;
+                        Some((index, *placed))
+                    })
             });
         let moved = |tops: &[f32]| anchor.map_or(0.0, |(index, placed)| tops[index] - placed);
         if (state.width - width).abs() > 0.5 {
@@ -387,13 +391,16 @@ impl<Message> Widget<Message, Theme, Renderer> for CulledColumn<'_, Message> {
         let tops = self.tops(state);
         let shift = moved(&tops);
         if shift != 0.0 {
-            state.shift += shift;
-            state.viewport.set(
-                state
-                    .viewport
-                    .get()
-                    .map(|(top, height)| (top + shift, height)),
-            );
+            let viewport = state
+                .viewport
+                .get()
+                .map(|(top, height)| (top + shift, height));
+            state.viewport.set(viewport);
+            // A target rather than a distance: the content may have shrunk
+            // under a viewport the scrollable has since clamped, as when a
+            // filter leaves fewer rows, and a distance from the clamped
+            // offset would land elsewhere.
+            state.follow = viewport.map(|(top, _)| top);
         }
         state.placed = rows
             .iter()
@@ -622,7 +629,7 @@ impl<'a, Message: 'a> From<CulledColumn<'a, Message>> for Element<'a, Message, T
 /// rows measured or added above it never move what is on screen.
 ///
 /// While the scrollbar's thumb is dragged, the pointer decides the position,
-/// so the scrollable is left where it is and the shift is dropped.
+/// so the scrollable is left where it is and the row is not followed.
 pub fn keep_in_place<'a, Message: 'a>(
     scrollable: impl Into<Element<'a, Message, Theme, Renderer>>,
 ) -> Element<'a, Message, Theme, Renderer> {
@@ -640,27 +647,33 @@ struct KeepInPlace<'a, Message> {
 #[derive(Default)]
 struct Held(bool);
 
-/// Takes the shift the first culled column has noted, without visiting rows.
+/// Takes where the first culled column wants its viewport, without visiting
+/// rows: the target from the column's top, and the column's own top.
 #[derive(Default)]
-struct TakeShift(Option<f32>);
-impl Operation for TakeShift {
+struct TakeFollow {
+    found: bool,
+    follow: Option<(f32, f32)>,
+}
+impl Operation for TakeFollow {
     fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
-        if self.0.is_none() {
+        if !self.found {
             operate(self);
         }
     }
-    fn custom(&mut self, _id: Option<&Id>, _bounds: Rectangle, state: &mut dyn std::any::Any) {
-        if self.0.is_none()
+    fn custom(&mut self, _id: Option<&Id>, bounds: Rectangle, state: &mut dyn std::any::Any) {
+        if !self.found
             && let Some(state) = state.downcast_mut::<State>()
         {
-            self.0 = Some(std::mem::take(&mut state.shift));
+            self.found = true;
+            self.follow = state.follow.take().map(|top| (top, bounds.y));
         }
     }
 }
 
-/// Scrolls the outermost scrollable by `0` vertically, and nothing inside it.
-struct ScrollBy(Option<f32>);
-impl Operation for ScrollBy {
+/// Scrolls the outermost scrollable, and nothing inside it, so that the
+/// column whose top is at `.1` shows its content from `.0` at the top.
+struct ScrollTo(Option<(f32, f32)>);
+impl Operation for ScrollTo {
     fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
         if self.0.is_some() {
             operate(self);
@@ -674,8 +687,13 @@ impl Operation for ScrollBy {
         _translation: Vector,
         state: &mut dyn operation::Scrollable,
     ) {
-        if let Some(y) = self.0.take() {
-            state.scroll_by(AbsoluteOffset { x: 0.0, y }, bounds, content_bounds);
+        if let Some((top, column)) = self.0.take() {
+            let end = (content_bounds.height - bounds.height).max(0.0);
+            let y = (column - content_bounds.y + top).clamp(0.0, end);
+            state.scroll_to(AbsoluteOffset {
+                x: None,
+                y: Some(y),
+            });
         }
     }
 }
@@ -755,16 +773,16 @@ impl<Message> Widget<Message, Theme, Renderer> for KeepInPlace<'_, Message> {
         let held = *held;
         // Follow the anchor before the event, so the column under it judges
         // the viewport where it will be drawn.
-        let mut take = TakeShift::default();
+        let mut take = TakeFollow::default();
         self.content
             .as_widget_mut()
             .operate(&mut tree.children[0], layout, renderer, &mut take);
-        if let Some(shift) = take.0.filter(|shift| *shift != 0.0 && !held) {
+        if let Some(follow) = take.follow.filter(|_| !held) {
             self.content.as_widget_mut().operate(
                 &mut tree.children[0],
                 layout,
                 renderer,
-                &mut ScrollBy(Some(shift)),
+                &mut ScrollTo(Some(follow)),
             );
             shell.request_redraw();
         }
@@ -972,16 +990,17 @@ mod tests {
             );
         }
 
-        /// Takes the shift the column has noted for [`keep_in_place`].
-        fn take_shift(&mut self) -> f32 {
-            let mut take = TakeShift::default();
+        /// Takes where the column wants its viewport's top, as
+        /// [`keep_in_place`] does.
+        fn take_follow(&mut self) -> Option<f32> {
+            let mut take = TakeFollow::default();
             self.element.as_widget_mut().operate(
                 &mut self.tree,
                 Layout::new(&self.node),
                 &self.renderer,
                 &mut take,
             );
-            take.0.unwrap_or_default()
+            take.follow.map(|(top, _)| top)
         }
 
         /// Where the row with `key` was placed, from the column's top.
@@ -1004,12 +1023,12 @@ mod tests {
         }
 
         /// Scrolls to `top`, lays out if the column asks to, and follows the
-        /// shift as [`keep_in_place`] would; returns the new top.
+        /// row on screen as [`keep_in_place`] would; returns the new top.
         fn follow(&mut self, top: f32) -> f32 {
             if self.scroll_to(top) {
                 self.relayout();
             }
-            top + self.take_shift()
+            self.take_follow().unwrap_or(top)
         }
 
         /// Delivers a redraw with the column scrolled to `top`; returns
@@ -1247,7 +1266,7 @@ mod tests {
         let on_screen = harness.top_of(key).unwrap() - top;
         // Every measured height is forgotten at a new width.
         harness.relayout_at(SCREEN.width - 20.0);
-        let top = top + harness.take_shift();
+        let top = harness.take_follow().unwrap_or(top);
         assert_eq!(harness.top_of(key).unwrap() - top, on_screen);
     }
 
@@ -1265,14 +1284,14 @@ mod tests {
         harness.element = keyed(more, built, uneven, []);
         harness.tree.diff(harness.element.as_widget_mut());
         harness.relayout();
-        let top = top + harness.take_shift();
+        let top = harness.take_follow().unwrap_or(top);
         assert_eq!(harness.top_of(key).unwrap() - top, on_screen);
         // At the very top, the new rows show instead.
         let mut harness = Harness::new(keyed((100..3100).collect(), Rc::default(), uneven, []));
         harness.follow(0.0);
         harness.element = keyed((0..3100).collect(), Rc::default(), uneven, []);
         harness.relayout();
-        assert_eq!(harness.take_shift(), 0.0);
+        assert_eq!(harness.take_follow(), None);
         assert_eq!(harness.mounted().first(), Some(&0));
     }
 
@@ -1289,67 +1308,112 @@ mod tests {
         );
     }
 
-    #[test]
-    fn keep_in_place_scrolls_to_follow_the_row_on_screen_through_the_runtime() {
-        use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
-        /// The vertical translation of the scrollable, and the content-space
-        /// top of each named row.
-        #[derive(Default)]
-        struct Positions(f32, HashMap<String, f32>);
-        impl Operation for Positions {
-            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
-                operate(self);
-            }
-            fn scrollable(
-                &mut self,
-                _id: Option<&Id>,
-                _bounds: Rectangle,
-                _content_bounds: Rectangle,
-                translation: Vector,
-                _state: &mut dyn operation::Scrollable,
-            ) {
-                self.0 = translation.y;
-            }
-            fn focusable(
-                &mut self,
-                id: Option<&Id>,
-                bounds: Rectangle,
-                _state: &mut dyn operation::Focusable,
-            ) {
-                if let Some(id) = id {
-                    self.1.insert(format!("{id:?}"), bounds.y);
-                }
+    use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+
+    /// The vertical translation of the scrollable, and the content-space
+    /// top of each named row.
+    #[derive(Default)]
+    struct Positions(f32, HashMap<String, f32>);
+    impl Operation for Positions {
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+            operate(self);
+        }
+        fn scrollable(
+            &mut self,
+            _id: Option<&Id>,
+            _bounds: Rectangle,
+            _content_bounds: Rectangle,
+            translation: Vector,
+            _state: &mut dyn operation::Scrollable,
+        ) {
+            self.0 = translation.y;
+        }
+        fn focusable(
+            &mut self,
+            id: Option<&Id>,
+            bounds: Rectangle,
+            _state: &mut dyn operation::Focusable,
+        ) {
+            if let Some(id) = id {
+                self.1.insert(format!("{id:?}"), bounds.y);
             }
         }
-        let mut renderer = super::super::accessibility_probe::headless_renderer();
-        let id = Id::new("lane");
-        let view = || -> cosmic::Element<'static, ()> {
-            keep_in_place(
-                cosmic_widget::scrollable(column_of(3000, Rc::default(), uneven))
-                    .id(Id::new("lane"))
-                    .height(Length::Fill),
-            )
-        };
+    }
+
+    impl Positions {
+        fn of(ui: &mut UserInterface<'_, (), Theme, Renderer>, renderer: &Renderer) -> Self {
+            let mut positions = Self::default();
+            ui.operate(renderer, &mut positions);
+            positions
+        }
+
+        /// Where `row` is on screen, if it is built.
+        fn on_screen(&self, row: &str) -> Option<f32> {
+            self.1.get(row).map(|top| top - self.0)
+        }
+
+        /// The key of the row named `name`.
+        fn key(name: &str) -> u64 {
+            name.split("row-")
+                .nth(1)
+                .unwrap()
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse()
+                .unwrap()
+        }
+
+        /// The first row wholly on screen, and where it is.
+        fn first_on_screen(&self) -> (String, f32) {
+            self.1
+                .iter()
+                .map(|(name, top)| (name.clone(), top - self.0))
+                .filter(|(_, top)| *top >= 0.0)
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .unwrap()
+        }
+    }
+
+    /// A lane as Work builds one: the column of uneven rows with `keys`, in
+    /// a scrollable that keeps what is on screen in place.
+    fn lane<'a>(keys: Vec<u64>) -> cosmic::Element<'a, ()> {
+        keep_in_place(
+            cosmic_widget::scrollable(keyed(keys, Rc::default(), uneven, std::iter::empty()))
+                .id(Id::new("lane"))
+                .height(Length::Fill),
+        )
+    }
+
+    /// Redraws as the runtime does, again while layout keeps changing.
+    fn settle(
+        ui: &mut UserInterface<'_, (), Theme, Renderer>,
+        renderer: &mut Renderer,
+        cursor: mouse::Cursor,
+    ) {
         let redraw = Event::Window(window::Event::RedrawRequested(
             cosmic::iced::time::Instant::now(),
         ));
+        for _ in 0..3 {
+            let (state, _) = ui.update(
+                std::slice::from_ref(&redraw),
+                cursor,
+                renderer,
+                &mut clipboard::Null,
+                &mut Vec::new(),
+            );
+            if !state.has_layout_changed() {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn keep_in_place_scrolls_to_follow_the_row_on_screen_through_the_runtime() {
+        let mut renderer = super::super::accessibility_probe::headless_renderer();
+        let id = Id::new("lane");
+        let view = || lane((0..3000).collect());
         let mut ui = UserInterface::build(view(), SCREEN, Cache::new(), &mut renderer);
-        // Redraw as the runtime does, again while layout keeps changing.
-        let settle =
-            |ui: &mut UserInterface<'_, (), Theme, Renderer>, renderer: &mut Renderer, cursor| {
-                for _ in 0..3 {
-                    let (state, _) = ui.update(
-                        std::slice::from_ref(&redraw),
-                        cursor,
-                        renderer,
-                        &mut clipboard::Null,
-                        &mut Vec::new(),
-                    );
-                    if !state.has_layout_changed() {
-                        break;
-                    }
-                }
-            };
         settle(&mut ui, &mut renderer, mouse::Cursor::Unavailable);
         ui.operate(
             &renderer,
@@ -1366,8 +1430,7 @@ mod tests {
         let cursor = mouse::Cursor::Available(pointer);
         let mut followed = 0;
         for _ in 0..30 {
-            let mut before = Positions::default();
-            ui.operate(&renderer, &mut before);
+            let before = Positions::of(&mut ui, &renderer);
             let _ = ui.update(
                 &[
                     Event::Mouse(mouse::Event::CursorMoved { position: pointer }),
@@ -1381,8 +1444,7 @@ mod tests {
                 &mut Vec::new(),
             );
             settle(&mut ui, &mut renderer, cursor);
-            let mut after = Positions::default();
-            ui.operate(&renderer, &mut after);
+            let after = Positions::of(&mut ui, &renderer);
             // Every row on screen before and after moved down by the wheel's
             // 100 px, though rows above it were measured in between.
             let moved = ((before.0 - after.0) - 100.0).abs() > 0.5;
@@ -1401,5 +1463,54 @@ mod tests {
             followed += usize::from(moved);
         }
         assert!(followed > 0, "no layout moved the rows on screen");
+    }
+
+    #[test]
+    fn a_filter_typed_and_cleared_far_down_leaves_the_row_on_screen_in_place() {
+        let mut renderer = super::super::accessibility_probe::headless_renderer();
+        let all: Vec<u64> = (0..3000).collect();
+        let mut ui = UserInterface::build(lane(all.clone()), SCREEN, Cache::new(), &mut renderer);
+        settle(&mut ui, &mut renderer, mouse::Cursor::Unavailable);
+        ui.operate(
+            &renderer,
+            &mut operation::scrollable::scroll_to(
+                Id::new("lane"),
+                AbsoluteOffset {
+                    x: None,
+                    y: Some(1500.0 * (ROW + SPACING)),
+                },
+            ),
+        );
+        settle(&mut ui, &mut renderer, mouse::Cursor::Unavailable);
+        let (row, _) = Positions::of(&mut ui, &renderer).first_on_screen();
+        let key = Positions::key(&row);
+        // A filter that keeps one row in ten, the first row wholly on screen
+        // among them, leaves far less to scroll through than the old offset.
+        // Clearing it brings the other nine back around what is on screen.
+        let matching: Vec<u64> = all.iter().copied().filter(|k| k % 10 == key % 10).collect();
+        for keys in [matching, all] {
+            // The row at the top of the view, or the first below it that the
+            // change keeps, is what the user is looking at.
+            let before = Positions::of(&mut ui, &renderer);
+            let (row, was) = before
+                .1
+                .keys()
+                .filter(|name| keys.contains(&Positions::key(name)))
+                .filter_map(|name| {
+                    let top = before.on_screen(name)?;
+                    (top + uneven(Positions::key(name) as usize) > 0.0).then(|| (name.clone(), top))
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .unwrap();
+            let cache = ui.into_cache();
+            ui = UserInterface::build(lane(keys), SCREEN, cache, &mut renderer);
+            settle(&mut ui, &mut renderer, mouse::Cursor::Unavailable);
+            let is = Positions::of(&mut ui, &renderer).on_screen(&row);
+            // The scrollable draws at a whole-pixel offset.
+            assert!(
+                is.is_some_and(|is| (is - was).abs() <= 0.5),
+                "{row} was at {was}, is at {is:?}"
+            );
+        }
     }
 }
