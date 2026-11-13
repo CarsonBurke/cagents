@@ -59,6 +59,18 @@ impl Summary {
         }
     }
 
+    /// What the Attention list puts in front of the user: an agent waiting
+    /// for input, an unread failure, a usage limit, or unread news. Work in
+    /// progress alone is not; it waits in its own section.
+    pub fn needs_attention(self) -> bool {
+        self.waiting != 0 || self.failed != 0 || self.limited != 0 || self.unread != 0
+    }
+
+    /// Agents working, and nothing the user has to act on.
+    pub fn only_working(self) -> bool {
+        self.working != 0 && !self.needs_attention()
+    }
+
     pub fn activity(self) -> Option<ActivityState> {
         if self.waiting != 0 {
             Some(ActivityState::Waiting)

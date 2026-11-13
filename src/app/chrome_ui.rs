@@ -1984,6 +1984,7 @@ impl Cagents {
                     .map(|card| self.card_display_title(card).to_owned())
                     .unwrap_or(title);
                 let _ = self.workspace.rename_card(id, presentation);
+                self.refresh_attention_card_rows();
                 self.persist();
                 restore.chain(self.save_settings_task(false))
             }
@@ -2041,7 +2042,18 @@ impl Cagents {
                 let overlay = self.sync_context_overlay_state();
                 self.synchronize_sidebar_selection();
                 let destination = self.active_workspace_destination();
+                // The Attention list draws no checkout rows; it names the
+                // pane itself when it lists it.
+                let pane = self
+                    .sidebar_state
+                    .attention_card_row(id)
+                    .filter(|_| self.sidebar_state.filter() == sidebar::SidebarFilter::Attention);
                 let target = self.sidebar_model.projects.iter().find_map(|project| {
+                    if let Some(card) = pane
+                        && project.attention_cards.iter().any(|row| row.id == card)
+                    {
+                        return Some((project.id, sidebar::SelectionRow::Card(card)));
+                    }
                     let row = match destination {
                         Some(WorkspaceDestination::Channel(id))
                             if project.channels.iter().any(|channel| channel.id == id) =>
