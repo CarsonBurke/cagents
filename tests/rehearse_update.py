@@ -662,6 +662,27 @@ class ChatViews(unittest.TestCase):
             write(after,{**status,'phase':'Cancelled'})
             self.assertTrue(scenario.expected_refusal(root,'cancel','old'))
 
+            # The current installer's --stage-only selects the candidate before the
+            # update; a refusal must keep that staged current and its deferred owner.
+            (prefix/'versions/new').mkdir()
+            (prefix/'current').unlink()
+            (prefix/'current').symlink_to('versions/new')
+            write(after,status)
+            self.assertIn('refusal changed the installed current version',
+                          scenario.expected_refusal(root,'interrupt','old'))
+            (root/'staged-candidate.json').write_text(json.dumps({'current':str((prefix/'versions/new').resolve())}))
+            owner = prefix/'versions/new/.deferred-owner.json'
+            owner.write_text(json.dumps({'version':1,'owner_version':'old'}))
+            self.assertEqual(scenario.expected_refusal(root,'interrupt','old'),[])
+            owner.write_text(json.dumps({'version':1,'owner_version':'new'}))
+            self.assertEqual(scenario.expected_refusal(root,'interrupt','old'),
+                             ['refusal lost the deferred owner of the running service'])
+            owner.unlink()
+            (prefix/'current').unlink()
+            (prefix/'current').symlink_to('versions/old')
+            self.assertIn('refusal changed the installed current version',
+                          scenario.expected_refusal(root,'interrupt','old'))
+
     def test_restart_presentation_rejects_third_owner_and_zombie_provider(self):
         spec = importlib.util.spec_from_file_location('rehearsal_restart',REPOSITORY/'scripts/rehearse_update_restart.py')
         restart = importlib.util.module_from_spec(spec)
