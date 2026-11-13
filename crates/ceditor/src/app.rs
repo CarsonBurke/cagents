@@ -4222,14 +4222,17 @@ impl Application for Editor {
                     }
                     let options = self.settings.editor_find_options;
                     let preserve = self.settings.editor_replace_preserve_case;
-                    let find_tasks = self
+                    let runtime_tasks = self
                         .tabs
                         .iter_mut()
                         .map(|tab| {
-                            repository_task(
-                                tab.runtime
-                                    .update_find_preferences(tab.id, options, preserve),
-                            )
+                            Task::batch([
+                                repository_task(
+                                    tab.runtime
+                                        .update_find_preferences(tab.id, options, preserve),
+                                ),
+                                repository_task(tab.runtime.refresh_diff_presentation(tab.id)),
+                            ])
                         })
                         .collect::<Vec<_>>();
                     let shortcuts =
@@ -4239,7 +4242,7 @@ impl Application for Editor {
                         self.appearance(),
                         self.save_settings(),
                         preference_task(shortcuts),
-                        Task::batch(find_tasks),
+                        Task::batch(runtime_tasks),
                     ])
                 }
                 Message::ShortcutChanged(action, value) => {
@@ -4392,17 +4395,29 @@ impl Application for Editor {
                     }
                     self.settings.terminal_line_height = line_height;
                     self.line_height_draft = line_height.to_string();
-                    for tab in &mut self.tabs {
-                        tab.runtime.set_line_height(line_height);
-                    }
-                    self.save_settings()
+                    // Diff rows are editor lines: move each mounted
+                    // comparison to the row its reader was on.
+                    let relaid = self
+                        .tabs
+                        .iter_mut()
+                        .map(|tab| {
+                            tab.runtime.set_line_height(line_height);
+                            repository_task(tab.runtime.refresh_diff_presentation(tab.id))
+                        })
+                        .collect::<Vec<_>>();
+                    Task::batch([self.save_settings(), Task::batch(relaid)])
                 }
                 Message::SyntaxTheme(theme) => {
                     self.settings.editor_syntax_theme = theme;
-                    for tab in &mut self.tabs {
-                        tab.runtime.set_syntax_theme(theme);
-                    }
-                    self.save_settings()
+                    let recoloured = self
+                        .tabs
+                        .iter_mut()
+                        .map(|tab| {
+                            tab.runtime.set_syntax_theme(theme);
+                            repository_task(tab.runtime.refresh_diff_presentation(tab.id))
+                        })
+                        .collect::<Vec<_>>();
+                    Task::batch([self.save_settings(), Task::batch(recoloured)])
                 }
                 Message::LanguageServerAssistance(enabled) => {
                     self.set_language_server_assistance(enabled)
@@ -6201,6 +6216,16 @@ mod tests {
     /// Execute actual application tasks, including mutation completion and
     /// subsequent snapshot/file refreshes, without a window or network remote.
     fn run_tasks(app: &mut Editor, task: Task<Message>) {
+        run_tasks_observing(app, task, |_| {});
+    }
+
+    /// Runs `task` and everything it leads to, showing `observe` each
+    /// message before the editor handles it.
+    fn run_tasks_observing(
+        app: &mut Editor,
+        task: Task<Message>,
+        mut observe: impl FnMut(&Message),
+    ) {
         use cosmic::iced::futures::StreamExt;
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -6214,6 +6239,7 @@ mod tests {
                             if let iced::runtime::Action::Output(cosmic::Action::App(message)) =
                                 action
                             {
+                                observe(&message);
                                 pending.push(app.update(message));
                             }
                         }
@@ -6236,6 +6262,38 @@ mod tests {
         );
         run_tasks(app, task);
         app.active.unwrap()
+    }
+
+    /// A palette change drops the comparison styled the old way; the
+    /// handler must request it again, or Diff reads "Nothing to compare".
+    #[test]
+    fn a_syntax_theme_change_requests_the_diff_on_screen_again() {
+        let directory = git_fixture();
+        let root = directory.path();
+        std::fs::write(root.join("tracked.txt"), "changed\n").unwrap();
+        let mut app = editor();
+        let id = open_real_git(&mut app, root, Some("tracked.txt"));
+        let task = app.update(Message::Repository(RepositoryAction::ApplySourceSurface {
+            card: id,
+            diff: true,
+        }));
+        run_tasks(&mut app, task);
+        assert!(app.tab(id).unwrap().runtime.shows_diff());
+
+        let task = app.update(Message::SyntaxTheme(
+            cagents::settings::EditorSyntaxTheme::Mocha,
+        ));
+        let mut requested = false;
+        run_tasks_observing(&mut app, task, |message| {
+            requested |= matches!(
+                message,
+                Message::Repository(
+                    RepositoryAction::DiffLoaded { .. }
+                        | RepositoryAction::WorkingDiffLoaded { .. }
+                )
+            );
+        });
+        assert!(requested, "the recoloured comparison is requested again");
     }
 
     fn sidebar_action(app: &mut Editor, action: SidebarAction) {

@@ -649,18 +649,20 @@ fn check_cancelled(cancellation: &CancellationToken) -> Result<(), Cancelled> {
 /// Uses the same rows, syntax, and native metrics as repository comparisons,
 /// without invoking Git. `None` means cancellation; no partial model is exposed.
 /// Pass an existing `Arc<str>` to retain the baseline without copying its bytes.
+/// Widths are measured in `font`'s family, which the surface renders with.
 pub fn build_document_diff(
     before: impl Into<Arc<str>>,
     after: &str,
     path: &Path,
     theme: crate::settings::EditorSyntaxTheme,
+    font: cosmic::iced::Font,
     cancellation: &CancellationToken,
 ) -> Option<DiffModel> {
     check_cancelled(cancellation).ok()?;
     let before = before.into();
     let mut model = build_diff_rows(&before, after, cancellation).ok()?;
     model.syntax = highlight_comparison(&before, after, path, theme, cancellation).ok()?;
-    measure_diff(&mut model, cancellation).ok()?;
+    measure_diff(&mut model, font, cancellation).ok()?;
     check_cancelled(cancellation).ok()?;
     Some(model)
 }
@@ -674,7 +676,9 @@ struct ShapeKey<'a> {
 }
 
 impl<'a> ShapeKey<'a> {
-    fn new(text: &'a str, syntax: &[SyntaxSpan]) -> Self {
+    /// Syntax keeps its weight and style; every span takes `font`'s family,
+    /// as the rendered row does.
+    fn new(text: &'a str, syntax: &[SyntaxSpan], font: cosmic::iced::Font) -> Self {
         let mut fonts: Vec<(Range<usize>, cosmic::iced::Font)> = Vec::new();
         let mut append = |range: Range<usize>, font| {
             if range.is_empty() {
@@ -694,16 +698,17 @@ impl<'a> ShapeKey<'a> {
             let start = span.range.start.min(text.len());
             let end = span.range.end.min(text.len());
             if cursor < start {
-                append(cursor..start, cosmic::iced::Font::MONOSPACE);
+                append(cursor..start, font);
             }
-            append(
-                start..end,
-                span.font.unwrap_or(cosmic::iced::Font::MONOSPACE),
-            );
+            let styled = span.font.map_or(font, |styled| cosmic::iced::Font {
+                family: font.family,
+                ..styled
+            });
+            append(start..end, styled);
             cursor = end;
         }
         if cursor < text.len() {
-            append(cursor..text.len(), cosmic::iced::Font::MONOSPACE);
+            append(cursor..text.len(), font);
         }
         Self { text, fonts }
     }
@@ -789,7 +794,11 @@ fn plain_line_width(line: &str, font: cosmic::iced::Font) -> f32 {
     paragraph.min_bounds().width
 }
 
-fn measure_diff(model: &mut DiffModel, cancellation: &CancellationToken) -> Result<(), Cancelled> {
+fn measure_diff(
+    model: &mut DiffModel,
+    font: cosmic::iced::Font,
+    cancellation: &CancellationToken,
+) -> Result<(), Cancelled> {
     let palettes = if model
         .syntax
         .old
@@ -815,7 +824,7 @@ fn measure_diff(model: &mut DiffModel, cancellation: &CancellationToken) -> Resu
                 for (palette, width) in widths.iter_mut().enumerate().take(palettes) {
                     check_cancelled(cancellation)?;
                     let syntax = model.syntax.line(old, line, palette == 1);
-                    let key = ShapeKey::new(text, syntax);
+                    let key = ShapeKey::new(text, syntax, font);
                     let shaped = if let Some(width) = measured.get(&key) {
                         *width
                     } else {
@@ -860,6 +869,55 @@ impl DiffModel {
             DiffMode::Inline => self.inline_rows.len(),
             DiffMode::Split => self.split_rows.len(),
         }
+    }
+
+    /// The new-side source line at logical `row`, or the nearest one after
+    /// it, then before it: a deleted row has none of its own.
+    pub fn new_line_at_row(&self, mode: DiffMode, row: usize) -> Option<u32> {
+        fn nearest(
+            lines: impl DoubleEndedIterator<Item = Option<u32>> + Clone,
+            row: usize,
+        ) -> Option<u32> {
+            lines
+                .clone()
+                .skip(row)
+                .flatten()
+                .next()
+                .or_else(|| lines.take(row).flatten().last())
+        }
+        match mode {
+            DiffMode::Inline => nearest(self.inline_rows.iter().map(|row| row.new_line), row),
+            DiffMode::Split => nearest(self.split_rows.iter().map(|row| row.new_line), row),
+        }
+    }
+
+    /// The logical row that shows new-side source `line`: the first row at
+    /// or after it, moved up over the deleted rows directly above so a
+    /// change to the line stays in view. Past the end it is the last row,
+    /// and the top when the new side has no lines. `None` without rows.
+    pub fn row_at_new_line(&self, mode: DiffMode, line: u32) -> Option<usize> {
+        fn row(lines: &[Option<u32>], line: u32) -> Option<usize> {
+            if lines.is_empty() {
+                return None;
+            }
+            let Some(at) = lines
+                .iter()
+                .position(|new| new.is_some_and(|new| new >= line))
+            else {
+                return Some(if lines.iter().any(Option::is_some) {
+                    lines.len() - 1
+                } else {
+                    0
+                });
+            };
+            let deleted = lines[..at].iter().rev().take_while(|new| new.is_none());
+            Some(at - deleted.count())
+        }
+        let lines: Vec<Option<u32>> = match mode {
+            DiffMode::Inline => self.inline_rows.iter().map(|row| row.new_line).collect(),
+            DiffMode::Split => self.split_rows.iter().map(|row| row.new_line).collect(),
+        };
+        row(&lines, line)
     }
 
     /// The syntax theme this model's spans were coloured with, so a cached
@@ -912,6 +970,7 @@ impl RenderedDiff {
         content: DiffContent,
         path: &Path,
         theme: crate::settings::EditorSyntaxTheme,
+        font: cosmic::iced::Font,
         cancellation: &CancellationToken,
     ) -> Self {
         if cancellation.is_cancelled() {
@@ -937,6 +996,7 @@ impl RenderedDiff {
                     new.text().unwrap_or_default(),
                     path,
                     theme,
+                    font,
                     cancellation,
                 ) {
                     Some(model) => model,
@@ -970,6 +1030,7 @@ pub fn load_repository_diff(
     basis: &DiffBasis,
     previous_path: Option<&Path>,
     theme: crate::settings::EditorSyntaxTheme,
+    font: cosmic::iced::Font,
     cancellation: &CancellationToken,
 ) -> RenderedDiff {
     // `RepoPath` *is* the path validation: it rejects an absolute path, `.`,
@@ -990,7 +1051,9 @@ pub fn load_repository_diff(
         old_path,
     };
     match RepositoryService::system("git").diff(&request, cancellation) {
-        Ok(content) => RenderedDiff::from_content(content, relative_path, theme, cancellation),
+        Ok(content) => {
+            RenderedDiff::from_content(content, relative_path, theme, font, cancellation)
+        }
         Err(error) => RenderedDiff::Error(error.to_string()),
     }
 }
@@ -1000,7 +1063,8 @@ pub fn build_diff(before: &str, after: &str) -> DiffModel {
     let before = Arc::from(before);
     let mut model =
         build_diff_rows(&before, after, &cancellation).expect("local token is not cancelled");
-    measure_diff(&mut model, &cancellation).expect("local token is not cancelled");
+    measure_diff(&mut model, cosmic::iced::Font::MONOSPACE, &cancellation)
+        .expect("local token is not cancelled");
     model
 }
 
@@ -1238,8 +1302,12 @@ fn build_diff_rows(
     })
 }
 
-pub(crate) const DIFF_FONT_SIZE: f32 = 13.0;
-pub(crate) const DIFF_LINE_HEIGHT: f32 = 24.0;
+/// The reference size widths are measured at: the default editor font size.
+/// The surface scales them to the editor's actual size, since glyph advances
+/// scale with it; a different family is measured again instead.
+pub(crate) const DIFF_FONT_SIZE: f32 = 14.0;
+/// The default editor line: [`DIFF_FONT_SIZE`] at the editor's 1.5 spacing.
+pub(crate) const DIFF_LINE_HEIGHT: f32 = 21.0;
 
 /// Use the same native paragraph, advanced shaping, font and no-wrap policy as
 /// Rich text. Character counts are not pixel advances: combining marks, tabs,
@@ -1647,6 +1715,7 @@ mod tests {
     /// The default syntax theme, spelled once for the call sites that only
     /// need *a* theme rather than a particular one.
     const AUTO: crate::settings::EditorSyntaxTheme = crate::settings::EditorSyntaxTheme::Auto;
+    const MONO: cosmic::iced::Font = cosmic::iced::Font::MONOSPACE;
 
     #[test]
     fn syntax_job_shares_892_real_parsers_and_releases_grammar_after_last_owner() {
@@ -1908,6 +1977,106 @@ mod tests {
     }
 
     #[test]
+    fn source_lines_map_to_rows_across_deleted_rows_in_both_layouts() {
+        let model = build_diff("one\ndeleted\ntwo\n", "one\ntwo\n");
+        for mode in [DiffMode::Inline, DiffMode::Split] {
+            let second = model.row_at_new_line(mode, 2).unwrap();
+            assert_eq!(model.new_line_at_row(mode, second), Some(2));
+            // The deleted row directly above line 2 stays in view.
+            assert_eq!(second, 1, "{mode:?}");
+            assert_eq!(model.row_at_new_line(mode, 1), Some(0));
+            assert_eq!(model.new_line_at_row(mode, 1), Some(2), "{mode:?}");
+            assert_eq!(model.new_line_at_row(mode, usize::MAX), Some(2));
+            assert_eq!(
+                model.row_at_new_line(mode, 99),
+                Some(model.row_count(mode) - 1)
+            );
+        }
+        assert_eq!(
+            build_diff("", "").row_at_new_line(DiffMode::Inline, 1),
+            None
+        );
+        // An emptied file has no new-side lines: it opens at the top.
+        let emptied = build_diff("one\ntwo\n", "");
+        for mode in [DiffMode::Inline, DiffMode::Split] {
+            assert_eq!(emptied.row_at_new_line(mode, 1), Some(0), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn widths_are_measured_in_the_editor_family_with_syntax_weight_and_style() {
+        use cosmic::iced::{Font, font};
+        let selected = Font {
+            family: font::Family::SansSerif,
+            ..Font::MONOSPACE
+        };
+        let bold_italic = Font {
+            weight: font::Weight::Bold,
+            style: font::Style::Italic,
+            ..Font::MONOSPACE
+        };
+        let key = ShapeKey::new(
+            "bold tail",
+            &[SyntaxSpan {
+                range: 0..4,
+                color: None,
+                font: Some(bold_italic),
+            }],
+            selected,
+        );
+        assert!(
+            key.fonts
+                .iter()
+                .all(|(_, font)| font.family == selected.family)
+        );
+        assert_eq!(
+            (key.fonts[0].1.weight, key.fonts[0].1.style),
+            (font::Weight::Bold, font::Style::Italic)
+        );
+        assert_eq!(key.fonts[1].1, selected);
+
+        let before = "fn family() { let iii = \"WWWW café\"; }\n";
+        let after = "fn family() { let iii = \"WWWW changed café\"; }\n";
+        let build = |font| {
+            build_document_diff(
+                before,
+                after,
+                Path::new("family.rs"),
+                AUTO,
+                font,
+                &CancellationToken::new(),
+            )
+            .unwrap()
+        };
+        let (mono, model) = (build(MONO), build(selected));
+        assert_ne!(
+            mono.max_line_width, model.max_line_width,
+            "the fixture's advances must differ between the families"
+        );
+        for (palette, extent) in model.max_line_width.into_iter().enumerate() {
+            let mut expected = 0.0_f32;
+            for row in &model.split_rows {
+                for (old, line, text) in [
+                    (true, row.old_line, row.old_text.as_deref()),
+                    (false, row.new_line, row.new_text.as_deref()),
+                ] {
+                    let Some(text) = text else { continue };
+                    let syntax = model.syntax.line(old, line, palette == 1);
+                    let mut spans = line_spans(text, &[], syntax, cosmic::iced::Color::TRANSPARENT);
+                    for span in &mut spans {
+                        span.font = Some(span.font.map_or(selected, |styled| Font {
+                            family: selected.family,
+                            ..styled
+                        }));
+                    }
+                    expected = expected.max(shaped_spans_width(&spans));
+                }
+            }
+            assert_eq!(extent, expected.ceil() as u32, "palette {palette}");
+        }
+    }
+
+    #[test]
     fn cached_measurement_matches_every_native_paragraph_in_both_palettes() {
         let before = "/*\nlet office = \"ffi 雪 e\u{301}\";\n*/\n\tlet repeated = 42;\n\tlet repeated = 42;\n";
         let after = "//\nlet office = \"ffl 雪 e\u{301}\";\n//\n\tlet repeated = 42;\n\tlet repeated = 42;\n";
@@ -1916,6 +2085,7 @@ mod tests {
             after,
             Path::new("sample.rs"),
             AUTO,
+            MONO,
             &CancellationToken::new(),
         )
         .unwrap();
@@ -1971,6 +2141,7 @@ mod tests {
             },
             Path::new("sample.rs"),
             AUTO,
+            MONO,
             &cancellation,
         );
         assert!(matches!(result, RenderedDiff::Error(_)));
@@ -1990,11 +2161,15 @@ mod tests {
                 "new\n",
                 Path::new("sample.rs"),
                 AUTO,
+                MONO,
                 &cancellation
             )
             .is_none()
         );
-        assert!(build_document_diff("", "", Path::new("sample.rs"), AUTO, &cancellation).is_none());
+        assert!(
+            build_document_diff("", "", Path::new("sample.rs"), AUTO, MONO, &cancellation)
+                .is_none()
+        );
     }
 
     #[test]
@@ -2005,6 +2180,7 @@ mod tests {
             "/* changed\n雪 e\u{301}\n*/\n\nlast\n",
             Path::new("sample.rs"),
             AUTO,
+            MONO,
             &CancellationToken::new(),
         )
         .unwrap();
@@ -2013,6 +2189,7 @@ mod tests {
             before,
             Path::new("sample.rs"),
             AUTO,
+            MONO,
             &CancellationToken::new(),
         )
         .unwrap();
@@ -2122,6 +2299,7 @@ mod tests {
             after,
             Path::new("kernel.cu"),
             AUTO,
+            MONO,
             &CancellationToken::new(),
         )
         .unwrap();
@@ -2508,6 +2686,7 @@ mod tests {
                 },
                 Path::new("sample.txt"),
                 AUTO,
+                MONO,
                 &CancellationToken::new(),
             )
         };
@@ -2575,6 +2754,7 @@ mod tests {
                 },
                 Path::new("sample.txt"),
                 AUTO,
+                MONO,
                 &CancellationToken::new(),
             ),
             RenderedDiff::NoText(DiffContent::Unmerged { .. })
@@ -2599,6 +2779,7 @@ mod tests {
                 &DiffBasis::IndexToWorktree,
                 previous,
                 AUTO,
+                MONO,
                 &CancellationToken::new(),
             );
             assert!(
@@ -2626,6 +2807,7 @@ mod tests {
             &DiffBasis::IndexToWorktree,
             None,
             AUTO,
+            MONO,
             &CancellationToken::new(),
         )
         else {
@@ -2777,6 +2959,7 @@ mod tests {
             &DiffBasis::IndexToWorktree,
             None,
             AUTO,
+            MONO,
             &CancellationToken::new(),
         );
         let RenderedDiff::NoText(DiffContent::Unmerged {
@@ -2833,6 +3016,7 @@ mod tests {
             &DiffBasis::IndexToWorktree,
             None,
             AUTO,
+            MONO,
             &CancellationToken::new(),
         );
         let RenderedDiff::NoText(DiffContent::Comparison { old, new, .. }) = &content else {
@@ -3036,6 +3220,7 @@ mod tests {
             basis,
             previous_path,
             AUTO,
+            MONO,
             &CancellationToken::new(),
         );
         let RenderedDiff::Text {
@@ -3058,6 +3243,7 @@ mod tests {
             &DiffBasis::IndexToWorktree,
             None,
             AUTO,
+            MONO,
             &CancellationToken::new(),
         );
         let RenderedDiff::NoText(DiffContent::Comparison { new, .. }) = content else {
@@ -3143,7 +3329,7 @@ mod tests {
             model.syntax =
                 highlight_comparison(&before, &after, &path, AUTO, &cancellation).unwrap();
             let highlighted = started.elapsed();
-            measure_diff(&mut model, &cancellation).unwrap();
+            measure_diff(&mut model, MONO, &cancellation).unwrap();
             eprintln!(
                 "diff bench {iteration}: {} lines; rows={rows:?}, syntax={:?}, measure={:?}, total={:?}",
                 text.lines().count(),
@@ -3202,7 +3388,7 @@ mod tests {
                 ];
                 let changed = vec![0..split];
                 let native = shaped_line_width(text, &changed, &syntax);
-                let cached = ShapeKey::new(text, &syntax).width(&mut words);
+                let cached = ShapeKey::new(text, &syntax, MONO).width(&mut words);
                 assert!(
                     (native - cached).abs() < 0.02,
                     "{text:?}: native {native}, cached {cached}, font {font:?}"

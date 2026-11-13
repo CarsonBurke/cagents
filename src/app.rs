@@ -14309,12 +14309,14 @@ impl Cagents {
         {
             let font = crate::terminal::monospace_font(self.settings.editor_font_family());
             let size = self.settings.editor_font_size();
-            for runtime in self.cards.values_mut() {
-                match runtime {
-                    CardRuntime::Repository(runtime) => runtime.set_editor_font(font, size),
-                    CardRuntime::PullRequests(pane) => pane.runtime.set_editor_font(font, size),
-                    _ => {}
-                }
+            for (&card, runtime) in self.cards.iter_mut() {
+                let runtime = match runtime {
+                    CardRuntime::Repository(runtime) => runtime,
+                    CardRuntime::PullRequests(pane) => &mut pane.runtime,
+                    _ => continue,
+                };
+                runtime.set_editor_font(font, size);
+                tasks.push(repository_task(runtime.refresh_diff_presentation(card)));
             }
         }
         if previous.editor_find_options != self.settings.editor_find_options
@@ -14364,19 +14366,21 @@ impl Cagents {
         );
         if previous.editor_wrap_lines != wrap_lines || previous.editor_syntax_theme != syntax_theme
         {
-            for runtime in self.cards.values_mut() {
-                match runtime {
-                    CardRuntime::Repository(runtime) => {
-                        runtime.set_wrap_lines(wrap_lines);
+            for (&card, runtime) in self.cards.iter_mut() {
+                let runtime = match runtime {
+                    CardRuntime::Repository(runtime) => runtime,
+                    CardRuntime::PullRequests(pane) => &mut pane.runtime,
+                    CardRuntime::Chat(runtime) => {
                         runtime.set_syntax_theme(syntax_theme);
+                        continue;
                     }
-                    CardRuntime::PullRequests(pane) => {
-                        pane.runtime.set_wrap_lines(wrap_lines);
-                        pane.runtime.set_syntax_theme(syntax_theme);
-                    }
-                    CardRuntime::Chat(runtime) => runtime.set_syntax_theme(syntax_theme),
-                    _ => {}
-                }
+                    _ => continue,
+                };
+                runtime.set_wrap_lines(wrap_lines);
+                runtime.set_syntax_theme(syntax_theme);
+                // A comparison recoloured in the new palette is requested
+                // again rather than left empty until the next refresh.
+                tasks.push(repository_task(runtime.refresh_diff_presentation(card)));
             }
             self.chat_ui.set_parked_syntax_theme(syntax_theme);
         }
@@ -22503,6 +22507,30 @@ mod tests {
 
         assert_eq!(app.notification_ui.pending_preferences(), None);
         assert_eq!(app.settings, AppSettings::default());
+    }
+
+    /// A palette or font family change drops comparisons styled the old
+    /// way; whichever settings path makes it must request them again, or
+    /// the diff on screen reads "Nothing to compare".
+    #[test]
+    fn presentation_settings_request_the_comparison_on_screen_again() {
+        let fields = [
+            (SettingsField::EditorSyntaxTheme, "mocha"),
+            (SettingsField::EditorFontFamily, "DejaVu Serif"),
+        ];
+        for (field, value) in fields {
+            let mut app = context_inspector_test_app(false);
+            let card = CardId::new();
+            app.cards.insert(
+                card,
+                CardRuntime::Repository(Box::new(RepositoryRuntime::shown_diff_fixture(card))),
+            );
+            drop(app.apply_setting_input(field, value.into()));
+            let CardRuntime::Repository(runtime) = &app.cards[&card] else {
+                unreachable!()
+            };
+            assert!(runtime.requests_shown_diff(), "{field:?}");
+        }
     }
 
     #[test]

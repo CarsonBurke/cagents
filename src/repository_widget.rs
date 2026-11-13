@@ -1952,6 +1952,8 @@ struct WorkingDiffJob {
     revision: u64,
     ticket: u64,
     before: Arc<str>,
+    /// The [`RepositoryRuntime::diff_presentation`] its rows are styled in.
+    presentation: u64,
     cancellation: CancellationToken,
 }
 
@@ -1967,6 +1969,9 @@ struct WorkingDiffRefresh {
     next_ticket: u64,
     desired: Option<(u64, u64, Arc<str>)>,
     applied: Option<(u64, u64, Arc<str>)>,
+    /// The presentation the applied comparison was styled in. Its line
+    /// markers hold in any presentation; its rows are rebuilt in a new one.
+    presentation: u64,
     deadline: Option<Instant>,
     active: Option<WorkingDiffJob>,
     error: Option<String>,
@@ -2058,10 +2063,24 @@ impl DiffViewportAnchor {
     };
 }
 
+/// A position in the new-side source, shared by the editor and the diff.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SourceLineAnchor {
+    /// One-based source line, as diff rows number it.
+    line: u32,
+    /// How far into that line, in line heights.
+    fraction: f64,
+    horizontal: f32,
+}
+
 /// Scroll coordinates only: the selected document remains the sole live buffer.
 #[derive(Debug, Clone, Copy, Default)]
 struct FileViewportAnchors {
     editor: text_editor::ScrollPosition,
+    /// Whether the reader has moved the editor since it was last placed for
+    /// them, on opening or on following the comparison back to Edit. Until
+    /// they do, entering Diff keeps the comparison's own place.
+    editor_moved: bool,
     preview: f32,
     diff: [Option<DiffViewportAnchor>; 2],
 }
@@ -2076,7 +2095,9 @@ struct VisibleRows {
     bottom_space: f32,
 }
 
-const DIFF_ROW_HEIGHT: f32 = 30.0;
+/// A diff row at the default editor typography: one editor line. A runtime
+/// uses [`RepositoryRuntime::diff_typography`], which follows the editor.
+const DIFF_ROW_HEIGHT: f32 = DIFF_LINE_HEIGHT;
 const VISIBLE_ROW_OVERSCAN: usize = 6;
 const INITIAL_VIEWPORT_HEIGHT: f32 = 900.0;
 /// Room for the widest zoom step the viewer's label can hold, so the controls
@@ -2225,8 +2246,12 @@ pub struct RepositoryRuntime {
     file_list_refresh_queued: bool,
     background_file_refresh: bool,
     mutation_refresh_pending: bool,
-    /// Last comparison stays readable while Git refreshes this file.
+    /// Last comparison stays readable while Git refreshes this file, or
+    /// while it is rebuilt in a new presentation.
     stale_diff: Option<(PathBuf, DiffBasis, DiffState)>,
+    /// Advances whenever comparisons must be styled or measured again: a
+    /// syntax palette or editor font family change.
+    diff_presentation: u64,
     diff_hide_unchanged: bool,
     files: FileListState,
     selected: Option<RepositoryFile>,
@@ -2306,6 +2331,10 @@ pub struct RepositoryRuntime {
     /// Retained logical position while a reopened comparison has no geometry.
     /// Kept through the first uniform layout until measurement or user scroll.
     pending_diff_anchor: Option<DiffViewportAnchor>,
+    /// The editor line Diff was entered from, held until rows that describe
+    /// the current buffer place it: a stale working comparison's rows cannot
+    /// name that line after edits above it.
+    pending_diff_source: Option<SourceLineAnchor>,
     diff_layout_revision: u64,
     review_line_anchor: Option<(
         AsyncIdentity,
@@ -2436,6 +2465,7 @@ impl RepositoryRuntime {
             background_file_refresh: false,
             mutation_refresh_pending: false,
             stale_diff: None,
+            diff_presentation: 0,
             diff_hide_unchanged: true,
             files: FileListState::Loading,
             selected: None,
@@ -2495,6 +2525,7 @@ impl RepositoryRuntime {
             diff_scroll_id: widget::Id::new(format!("repository.diff.{identity}")),
             diff_viewport: ListViewport::default(),
             pending_diff_anchor: None,
+            pending_diff_source: None,
             diff_layout_revision: 0,
             review_line_anchor: None,
             diff_horizontal: 0.0,
@@ -2619,11 +2650,12 @@ impl RepositoryRuntime {
     pub fn set_line_height(&mut self, line_height: f32) {
         if line_height.is_finite() {
             self.line_height = line_height.clamp(1.0, 2.0);
+            self.update_diff_typography();
         }
     }
 
     /// Installs the syntax palette and drops every comparison coloured with
-    /// the old one.
+    /// the old one; [`Self::refresh_diff_presentation`] requests them again.
     ///
     /// The Edit surface re-derives its highlighter in `view` and repaints at
     /// once; a [`DiffModel`] carries baked spans and would keep showing the
@@ -2633,9 +2665,31 @@ impl RepositoryRuntime {
             return;
         }
         self.syntax_theme = theme;
+        self.discard_rendered_diffs();
+    }
+
+    /// Drops every comparison built with a previous presentation.
+    ///
+    /// The one on screen stays readable until its successor arrives, which
+    /// keeps what the reader unfolded and the row they are on, and keeps the
+    /// editor's added-line markers: those name source lines, which no
+    /// presentation changes. A working comparison already in flight is
+    /// styled the old way, so it is cancelled and started again.
+    fn discard_rendered_diffs(&mut self) {
+        self.diff_presentation = self.diff_presentation.wrapping_add(1);
+        if let Some(active) = &self.working_diff.active {
+            active.cancellation.cancel();
+        }
+        if let Some(path) = self.selected.as_ref().map(|file| file.path.clone())
+            && let Some(index) = self.diffs.iter().position(|(basis, state)| {
+                *basis == self.diff_basis && matches!(state, DiffState::Ready(..))
+            })
+        {
+            let (basis, state) = self.diffs.remove(index);
+            self.stale_diff = Some((path, basis, state));
+        }
         self.diffs.clear();
-        self.working_diff.applied = None;
-        self.working_diff.additions.clear();
+        self.diff_layout_revision = self.diff_layout_revision.wrapping_add(1);
     }
 
     pub fn set_diff_hide_unchanged(&mut self, enabled: bool) -> Task<RepositoryAction> {
@@ -3108,6 +3162,32 @@ impl RepositoryRuntime {
         let (mut runtime, identity) = Self::open_fixture(card, "notes.txt", text);
         runtime.set_lsp_document(Some(LspDocumentId(0)));
         (runtime, identity)
+    }
+
+    /// An unstaged file with its comparison on screen, for callers that
+    /// change the settings comparisons are presented in.
+    #[cfg(test)]
+    pub(crate) fn shown_diff_fixture(card: CardId) -> Self {
+        let (mut runtime, _) = Self::open_fixture(card, "notes.txt", "added\nkept\n");
+        runtime.source_surface = SourceSurface::Diff;
+        runtime.set_diff_state(
+            DiffBasis::IndexToWorktree,
+            DiffState::ready(RenderedDiff::Text {
+                model: crate::diff_view::build_diff("removed\nkept\n", "added\nkept\n"),
+                old_label: "Index".into(),
+                new_label: "Working tree".into(),
+            }),
+        );
+        runtime
+    }
+
+    /// Whether the comparison on screen has been requested and is loading.
+    #[cfg(test)]
+    pub(crate) fn requests_shown_diff(&self) -> bool {
+        matches!(
+            self.diff_state(&self.diff_basis),
+            Some(DiffState::Loading { .. })
+        )
     }
 
     /// The same, under a chosen file name.
@@ -5072,6 +5152,7 @@ impl RepositoryRuntime {
     /// would drop the close of a document opened and abandoned between two
     /// drains, and leak that session.
     fn push_lsp_close(&mut self) {
+        self.pending_diff_source = None;
         self.push_lsp_close_notification();
         // The buffer the strip was searching is going away, and a strip left
         // mounted over the next one would hold it in search mode while
@@ -5108,6 +5189,13 @@ impl RepositoryRuntime {
         ))
     }
 
+    /// Whether the live-buffer comparison wanted is the one applied, styled
+    /// in the current presentation.
+    fn working_diff_settled(&self) -> bool {
+        same_diff_revision(&self.working_diff.desired, &self.working_diff.applied)
+            && self.working_diff.presentation == self.diff_presentation
+    }
+
     fn working_annotations_current(&self) -> bool {
         self.editable_working_diff()
             && same_diff_revision(&self.working_diff.applied, &self.wanted_working_diff())
@@ -5142,7 +5230,7 @@ impl RepositoryRuntime {
         if self.working_diff.active.is_some()
             || self.working_diff.timer.is_some()
             || self.working_diff.desired.is_none()
-            || same_diff_revision(&self.working_diff.desired, &self.working_diff.applied)
+            || self.working_diff_settled()
         {
             return Task::none();
         }
@@ -5176,9 +5264,7 @@ impl RepositoryRuntime {
         let Some((_, revision, before)) = self.wanted_working_diff() else {
             return Task::none();
         };
-        if self.working_diff.active.is_some()
-            || same_diff_revision(&self.working_diff.desired, &self.working_diff.applied)
-        {
+        if self.working_diff.active.is_some() || self.working_diff_settled() {
             return Task::none();
         }
         let DocumentState::Editable(document) = &self.document else {
@@ -5194,22 +5280,25 @@ impl RepositoryRuntime {
         let after = document.content.text();
         if after.len() as u64 > MAX_DIFF_SIDE_BYTES {
             self.working_diff.applied = self.working_diff.desired.clone();
+            self.working_diff.presentation = self.diff_presentation;
             self.working_diff.error = Some("The unsaved buffer exceeds the diff size limit. Editing and safe saving remain available.".into());
             return Task::none();
         }
         let cancellation = CancellationToken::new();
         let syntax_theme = self.syntax_theme;
+        let font = self.editor_font;
         self.working_diff.active = Some(WorkingDiffJob {
             identity: identity.clone(),
             revision,
             ticket,
             before: Arc::clone(&before),
+            presentation: self.diff_presentation,
             cancellation: cancellation.clone(),
         });
         cosmic::task::future(async move {
             let baseline = Arc::clone(&before);
             let result = tokio::task::spawn_blocking(move || {
-                build_document_diff(baseline, &after, &source, syntax_theme, &cancellation)
+                build_document_diff(baseline, &after, &source, syntax_theme, font, &cancellation)
             })
             .await
             .map_err(|error| format!("Diff worker failed: {error}"));
@@ -5240,11 +5329,12 @@ impl RepositoryRuntime {
         if !matches_active {
             return Task::none();
         }
-        let cancelled = self
-            .working_diff
-            .active
-            .as_ref()
-            .is_some_and(|active| active.cancellation.is_cancelled());
+        // A job styled in a superseded presentation is cancelled when that
+        // presentation is dropped; checking both keeps a result already
+        // queued from installing the old palette or measurements.
+        let cancelled = self.working_diff.active.as_ref().is_some_and(|active| {
+            active.cancellation.is_cancelled() || active.presentation != self.diff_presentation
+        });
         self.working_diff.active = None;
         let mut installed = false;
         let completed = Some((identity.generation, revision, Arc::clone(&before)));
@@ -5268,6 +5358,7 @@ impl RepositoryRuntime {
                             .collect();
                     }
                     self.working_diff.applied = completed;
+                    self.working_diff.presentation = self.diff_presentation;
                     self.working_diff.error = None;
                     self.set_diff_state(
                         DiffBasis::IndexToWorktree,
@@ -5283,6 +5374,7 @@ impl RepositoryRuntime {
                 Ok(None) => {}
                 Err(error) => {
                     self.working_diff.applied = completed;
+                    self.working_diff.presentation = self.diff_presentation;
                     self.working_diff.error = Some(error);
                 }
             }
@@ -5614,9 +5706,59 @@ impl RepositoryRuntime {
         }
     }
 
+    /// Diff rows are editor lines: they follow the editor's family, size and
+    /// line height, keeping the reader's logical position.
+    ///
+    /// A size change scales the measured line widths. Another family has
+    /// other advances, so its comparisons are dropped like a palette change
+    /// and measured again; [`Self::refresh_diff_presentation`] requests them.
     pub fn set_editor_font(&mut self, font: Font, size: f32) {
+        if self.editor_font == font && self.editor_font_size == size {
+            return;
+        }
+        let family_changed = self.editor_font.family != font.family;
         self.editor_font = font;
         self.editor_font_size = size;
+        if family_changed {
+            self.discard_rendered_diffs();
+        }
+        self.update_diff_typography();
+    }
+
+    /// Requests the comparisons a presentation change dropped, the Git one
+    /// on screen and the live buffer's, and moves the mounted surface to its
+    /// retained position.
+    pub fn refresh_diff_presentation(&mut self, card: CardId) -> Task<RepositoryAction> {
+        Task::batch([
+            self.ensure_current_diff(card),
+            self.working_diff_task(card),
+            self.restore_visible_scroll(),
+        ])
+    }
+
+    fn diff_typography(&self) -> DiffTypography {
+        DiffTypography {
+            font: self.editor_font,
+            size: self.editor_font_size,
+            line_height: self.editor_font_size * self.line_height,
+        }
+    }
+
+    /// Re-lays every retained comparison at the current row height, keeping
+    /// the logical row the reader is on.
+    fn update_diff_typography(&mut self) {
+        let anchor = self.current_diff_viewport();
+        let height = self.diff_typography().line_height;
+        for (_, state) in &mut self.diffs {
+            if let DiffState::Ready(_, layout) = state {
+                layout.set_row_height(height);
+            }
+        }
+        if let Some((_, _, DiffState::Ready(_, layout))) = &mut self.stale_diff {
+            layout.set_row_height(height);
+        }
+        self.diff_layout_revision = self.diff_layout_revision.wrapping_add(1);
+        self.apply_diff_viewport(anchor);
     }
 
     fn auto_save_revision(&self) -> Option<u64> {
@@ -6346,6 +6488,8 @@ impl RepositoryRuntime {
                             vertical: editor.scroll_vertical,
                             horizontal: editor.scroll_horizontal,
                         };
+                        // A navigation names the place to read.
+                        self.viewports.editor_moved = true;
                     }
                     document
                         .content
@@ -6588,9 +6732,6 @@ impl RepositoryRuntime {
                 );
                 if self.accepts_selected(&identity) && current_request {
                     let current = basis == self.diff_basis;
-                    if current {
-                        self.stale_diff = None;
-                    }
                     self.set_diff_state(basis, DiffState::ready(content));
                     if current {
                         self.diff_change =
@@ -6889,6 +7030,8 @@ impl RepositoryRuntime {
                 self.capture_native_viewport();
                 if surface == SourceSurface::Editor {
                     self.align_editor_to_diff();
+                } else {
+                    self.align_diff_to_editor();
                 }
                 self.source_surface = surface;
                 self.restore_native_viewport();
@@ -7184,6 +7327,7 @@ impl RepositoryRuntime {
             } => {
                 if user_initiated {
                     self.pending_diff_anchor = None;
+                    self.pending_diff_source = None;
                 }
                 self.diff_viewport = ListViewport { offset, height };
                 self.diff_horizontal = horizontal;
@@ -7201,6 +7345,7 @@ impl RepositoryRuntime {
                 Task::none()
             }
             RepositoryAction::PreviousChange { .. } => {
+                self.pending_diff_source = None;
                 if !self.can_navigate_diff() {
                     return Task::none();
                 }
@@ -7211,6 +7356,7 @@ impl RepositoryRuntime {
                 self.scroll_to_change()
             }
             RepositoryAction::NextChange { .. } => {
+                self.pending_diff_source = None;
                 if !self.can_navigate_diff() {
                     return Task::none();
                 }
@@ -7393,14 +7539,22 @@ impl RepositoryRuntime {
     }
 
     fn set_diff_state(&mut self, basis: DiffBasis, mut state: DiffState) {
+        if let DiffState::Ready(_, layout) = &mut state {
+            layout.set_row_height(self.diff_typography().line_height);
+        }
         self.diff_layout_revision = self.diff_layout_revision.wrapping_add(1);
         let restores_current = basis == self.diff_basis && matches!(&state, DiffState::Ready(_, _));
         // The rows on screen before a rebuild, which a rebuild must not move:
         // display rows and pixel offsets both change meaning with the model.
+        // They may be a stale comparison kept on screen while this one loaded.
         let mut rebuilt = None;
         if restores_current
-            && let Some(previous) = self.diff_model()
-            && let Some(DiffState::Ready(_, previous_layout)) = self.diff_state(&basis)
+            && let Some(DiffState::Ready(
+                RenderedDiff::Text {
+                    model: previous, ..
+                },
+                previous_layout,
+            )) = self.displayed_diff_state()
             && let DiffState::Ready(RenderedDiff::Text { model, .. }, layout) = &mut state
         {
             // What the reader unfolded survives whatever the viewport awaits.
@@ -7423,6 +7577,9 @@ impl RepositoryRuntime {
         }
         if let DiffState::Ready(RenderedDiff::Text { model, .. }, layout) = &mut state {
             layout.set_folding(model, self.diff_hide_unchanged);
+        }
+        if restores_current {
+            self.stale_diff = None;
         }
         match self
             .diffs
@@ -7448,6 +7605,9 @@ impl RepositoryRuntime {
             if !anchor.first_change {
                 self.pending_diff_anchor = Some(anchor);
             }
+        }
+        if restores_current && self.source_surface == SourceSurface::Diff {
+            self.settle_pending_diff_source();
         }
     }
 
@@ -7535,6 +7695,7 @@ impl RepositoryRuntime {
             old_path,
             pathspec,
             self.syntax_theme,
+            self.editor_font,
             cancellation,
         )
     }
@@ -7833,6 +7994,7 @@ impl RepositoryRuntime {
     }
 
     fn reset_diff_viewports(&mut self) {
+        self.pending_diff_source = None;
         self.viewports.diff = [None; 2];
         self.apply_diff_viewport(DiffViewportAnchor::FIRST_CHANGE);
     }
@@ -7844,7 +8006,9 @@ impl RepositoryRuntime {
             return;
         }
         if let DocumentState::Editable(document) = &self.document {
-            self.viewports.editor = document.content.scroll_position();
+            let position = document.content.scroll_position();
+            self.viewports.editor_moved |= position != self.viewports.editor;
+            self.viewports.editor = position;
         }
     }
 
@@ -7858,52 +8022,131 @@ impl RepositoryRuntime {
         }
     }
 
+    /// The editor line `source` (one-based) starts on. The native buffer
+    /// also breaks lines at a bare CR, which the comparison's rows do not.
+    fn editor_line_for_source(&self, source: u32) -> usize {
+        let line = source.saturating_sub(1) as usize;
+        let DocumentState::Editable(document) = &self.document else {
+            return line;
+        };
+        if document.content.text_snapshot().protocol_compatible_lines() {
+            return line;
+        }
+        document.content.source_line_ranges().get(line).map_or_else(
+            || document.content.line_count().saturating_sub(1),
+            |range| range.start,
+        )
+    }
+
+    /// The one-based source line holding editor line `line`.
+    fn source_for_editor_line(&self, line: usize) -> u32 {
+        let source = |line: usize| u32::try_from(line.saturating_add(1)).unwrap_or(u32::MAX);
+        let DocumentState::Editable(document) = &self.document else {
+            return source(line);
+        };
+        if document.content.text_snapshot().protocol_compatible_lines() {
+            return source(line);
+        }
+        let ranges = document.content.source_line_ranges();
+        source(
+            ranges
+                .partition_point(|range| range.end <= line)
+                .min(ranges.len().saturating_sub(1)),
+        )
+    }
+
+    fn editor_line_height(&self) -> f32 {
+        self.editor_font_size * self.line_height
+    }
+
     fn align_editor_to_diff(&mut self) {
         if self.source_surface != SourceSurface::Diff {
             return;
         }
-        let Some(diff_layout::Anchor::Row { row, fraction }) = self.current_diff_viewport().row
-        else {
-            return;
-        };
-        let Some(model) = self.diff_model() else {
-            return;
-        };
-        let line = match self.diff_mode {
-            DiffMode::Inline => model
-                .inline_rows
-                .iter()
-                .skip(row)
-                .find_map(|row| row.new_line)
-                .or_else(|| {
-                    model
-                        .inline_rows
-                        .iter()
-                        .take(row)
-                        .rev()
-                        .find_map(|row| row.new_line)
-                }),
-            DiffMode::Split => model
-                .split_rows
-                .iter()
-                .skip(row)
-                .find_map(|row| row.new_line)
-                .or_else(|| {
-                    model
-                        .split_rows
-                        .iter()
-                        .take(row)
-                        .rev()
-                        .find_map(|row| row.new_line)
-                }),
-        };
-        if let Some(line) = line {
-            self.viewports.editor = text_editor::ScrollPosition {
-                line: (line as usize).saturating_sub(1),
-                vertical: fraction as f32 * self.editor_font_size * self.line_height,
-                horizontal: self.diff_horizontal,
+        // Rows have not yet placed the line Diff was entered from: return
+        // to exactly that line.
+        let source = self.pending_diff_source.take().or_else(|| {
+            let Some(diff_layout::Anchor::Row { row, fraction }) = self.current_diff_viewport().row
+            else {
+                return None;
             };
+            let line = self.diff_model()?.new_line_at_row(self.diff_mode, row)?;
+            Some(SourceLineAnchor {
+                line,
+                fraction,
+                horizontal: self.diff_horizontal,
+            })
+        });
+        if let Some(source) = source {
+            self.viewports.editor = text_editor::ScrollPosition {
+                line: self.editor_line_for_source(source.line),
+                vertical: source.fraction as f32 * self.editor_line_height(),
+                horizontal: source.horizontal,
+            };
+            self.viewports.editor_moved = false;
         }
+    }
+
+    /// Entering Diff from the editor shows the line the reader was on.
+    ///
+    /// An editor nobody has moved since it was placed says nothing about
+    /// where to read: a freshly opened file keeps the first change, and a
+    /// return from Diff keeps the comparison where it was left.
+    fn align_diff_to_editor(&mut self) {
+        if !self.editable_surface_visible() || !self.viewports.editor_moved {
+            return;
+        }
+        let position = self.viewports.editor;
+        self.pending_diff_source = Some(SourceLineAnchor {
+            line: self.source_for_editor_line(position.line),
+            fraction: f64::from((position.vertical / self.editor_line_height()).clamp(0.0, 1.0)),
+            horizontal: position.horizontal,
+        });
+        self.settle_pending_diff_source();
+    }
+
+    /// Places the pending source line, and lets it go once the rows it was
+    /// placed in describe the current buffer. A working comparison behind
+    /// the buffer keeps it until the rebuild for the current revision.
+    fn settle_pending_diff_source(&mut self) {
+        let current = self.diff_basis != DiffBasis::IndexToWorktree
+            || !matches!(self.document, DocumentState::Editable(_))
+            || self.working_annotations_current();
+        if self.place_pending_diff_source() && current {
+            self.pending_diff_source = None;
+        }
+    }
+
+    /// Scrolls the comparison to the pending source line, unfolding it if
+    /// it is hidden. False while there are no rows to place it in.
+    fn place_pending_diff_source(&mut self) -> bool {
+        let Some(source) = self.pending_diff_source else {
+            return false;
+        };
+        let Some(row) = self
+            .diff_model()
+            .and_then(|model| model.row_at_new_line(self.diff_mode, source.line))
+        else {
+            return false;
+        };
+        self.reveal_diff_row(row);
+        // A deleted row shown above the line starts at its top; only the
+        // line itself carries the editor's offset within it.
+        let fraction = self
+            .diff_model()
+            .is_some_and(|model| diff_row_lines(model, self.diff_mode, row).1 == Some(source.line))
+            .then_some(source.fraction)
+            .unwrap_or_default();
+        // The other layout's saved place predates this line; switching
+        // layouts now keeps the line on screen.
+        self.viewports.diff = [None; 2];
+        self.apply_diff_viewport(DiffViewportAnchor {
+            row: Some(diff_layout::Anchor::Row { row, fraction }),
+            horizontal: source.horizontal,
+            first_change: false,
+            ..self.current_diff_viewport()
+        });
+        true
     }
 
     fn retain_viewports(&mut self) {
@@ -8167,6 +8410,21 @@ impl RepositoryRuntime {
         )
     }
 
+    /// Opens just enough of the fold hiding model `row` to show it.
+    fn reveal_diff_row(&mut self, row: usize) {
+        let (basis, mode) = (self.diff_basis.clone(), self.diff_mode);
+        let Some((_, DiffState::Ready(RenderedDiff::Text { model, .. }, layout))) = self
+            .diffs
+            .iter_mut()
+            .find(|(candidate, _)| *candidate == basis)
+        else {
+            return;
+        };
+        if layout.reveal_row(model, mode, row) {
+            self.diff_layout_revision = self.diff_layout_revision.wrapping_add(1);
+        }
+    }
+
     /// Reveals rows of fold `fold` while keeping the rows on screen where
     /// they are: the viewport is anchored in model rows across the change.
     fn expand_diff_fold(
@@ -8376,6 +8634,7 @@ fn diff_task(
     old_path: Option<PathBuf>,
     pathspec: PathBuf,
     syntax_theme: crate::settings::EditorSyntaxTheme,
+    font: Font,
     cancellation: CancellationToken,
 ) -> Task<RepositoryAction> {
     let worktree = identity.worktree.clone();
@@ -8388,6 +8647,7 @@ fn diff_task(
                 &requested,
                 old_path.as_deref(),
                 syntax_theme,
+                font,
                 &cancellation,
             )
         })
@@ -10792,10 +11052,9 @@ fn diff_model_view<'a>(
         crate::ui_controls::responsive(move |size| {
             // One native two-axis scrollable owns both coordinates. The canvas
             // counter-translates the fixed gutters/center; only code moves in X.
-            let gutter =
-                (model.row_count(DiffMode::Inline).max(1).ilog10() + 1).max(4) as f32 * 8.0 + 12.0;
-            let code_width =
-                (model.max_line_width[usize::from(cosmic::theme::is_dark())] as f32).max(1.0);
+            let typography = runtime.diff_typography();
+            let gutter = typography.gutter_width(model.row_count(DiffMode::Inline));
+            let code_width = typography.code_width(model);
             let geometry = DiffScrollGeometry::new(size.width, gutter, runtime.diff_mode);
             let viewport_width = geometry.viewport_width;
             let overflow = geometry.overflow(code_width);
@@ -10882,6 +11141,7 @@ fn diff_model_view<'a>(
                         code_width,
                         horizontal,
                         context.and_then(|ctx| ctx.line_action(old, new)),
+                        typography,
                     ),
                     DiffMode::Split => split_diff_row_with_review(
                         &model.split_rows[row],
@@ -10890,6 +11150,7 @@ fn diff_model_view<'a>(
                         code_width,
                         horizontal,
                         context.map(|ctx| (ctx.line_action(old, None), ctx.line_action(None, new))),
+                        typography,
                     ),
                 };
                 if let Some(ctx) =
@@ -10934,6 +11195,7 @@ fn diff_model_view<'a>(
                     mode: runtime.diff_mode,
                     layout_revision: runtime.diff_layout_revision,
                     review_revision: ctx.review.annotation_revision(),
+                    row_height: typography.line_height,
                     expected_leading: rows.leading_height(),
                     expected: rows.annotations().clone(),
                     retained,
@@ -11218,7 +11480,7 @@ fn diff_fold_row<'a>(
         }
     }))
     .padding([0.0, DIFF_ROW_PADDING])
-    .height(DIFF_ROW_HEIGHT)
+    .height(runtime.diff_typography().line_height)
     .width(width)
     .align_y(Alignment::Center)
     .clip(true)
@@ -11236,6 +11498,47 @@ fn review_begin_anchor(
         Some(anchor)
     } else {
         None
+    }
+}
+
+/// The editor's family, size and line height, which every diff row uses.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct DiffTypography {
+    font: Font,
+    size: f32,
+    line_height: f32,
+}
+
+impl Default for DiffTypography {
+    fn default() -> Self {
+        Self {
+            font: Font::MONOSPACE,
+            size: DIFF_FONT_SIZE,
+            line_height: DIFF_LINE_HEIGHT,
+        }
+    }
+}
+
+impl DiffTypography {
+    /// The widest line at this size. The model measured its own family at
+    /// [`DIFF_FONT_SIZE`], and advances scale linearly with the size.
+    fn code_width(self, model: &DiffModel) -> f32 {
+        (model.max_line_width[usize::from(cosmic::theme::is_dark())] as f32 * self.size
+            / DIFF_FONT_SIZE)
+            .max(1.0)
+    }
+
+    /// Line numbers keep their proportion to the code: 12 px beside the
+    /// default 14 px editor font.
+    fn gutter_size(self) -> f32 {
+        self.size * 12.0 / DIFF_FONT_SIZE
+    }
+
+    /// A line-number column wide enough for `rows`' numbers at
+    /// [`Self::gutter_size`], and never fewer than four digits.
+    fn gutter_width(self, rows: usize) -> f32 {
+        let digits = (rows.max(1).ilog10() + 1).max(4) as f32;
+        digits * self.gutter_size() * 2.0 / 3.0 + 12.0
     }
 }
 
@@ -11278,7 +11581,15 @@ fn inline_diff_row<'a>(
     code_width: f32,
     horizontal: f32,
 ) -> Element<'a, RepositoryAction> {
-    inline_diff_row_with_review(row, syntax, gutter, code_width, horizontal, None)
+    inline_diff_row_with_review(
+        row,
+        syntax,
+        gutter,
+        code_width,
+        horizontal,
+        None,
+        DiffTypography::default(),
+    )
 }
 
 fn inline_diff_row_with_review<'a>(
@@ -11288,6 +11599,7 @@ fn inline_diff_row_with_review<'a>(
     code_width: f32,
     horizontal: f32,
     action: Option<RepositoryAction>,
+    typography: DiffTypography,
 ) -> Element<'a, RepositoryAction> {
     let marker = match row.kind {
         DiffRowKind::Addition => "+",
@@ -11304,15 +11616,17 @@ fn inline_diff_row_with_review<'a>(
                 } else {
                     None
                 },
+                typography,
             ),
             diff_review_gutter(
                 row.new_line,
                 gutter,
                 if row.new_line.is_some() { action } else { None },
+                typography,
             ),
             widget::text::body(marker)
-                .size(DIFF_FONT_SIZE)
-                .font(Font::MONOSPACE)
+                .size(typography.size)
+                .font(typography.font)
                 .width(DIFF_MARKER_WIDTH)
                 .into(),
             diff_text(
@@ -11327,11 +11641,13 @@ fn inline_diff_row_with_review<'a>(
                 code_width,
                 horizontal,
                 (row.old_line, row.new_line),
+                typography,
             ),
         ])
         .align_y(Alignment::Center),
         row.kind,
         Length::FillPortion(1),
+        typography,
     )
 }
 
@@ -11343,7 +11659,15 @@ fn split_diff_row<'a>(
     code_width: f32,
     horizontal: f32,
 ) -> Element<'a, RepositoryAction> {
-    split_diff_row_with_review(row, syntax, gutter, code_width, horizontal, None)
+    split_diff_row_with_review(
+        row,
+        syntax,
+        gutter,
+        code_width,
+        horizontal,
+        None,
+        DiffTypography::default(),
+    )
 }
 
 fn split_diff_row_with_review<'a>(
@@ -11353,6 +11677,7 @@ fn split_diff_row_with_review<'a>(
     code_width: f32,
     horizontal: f32,
     actions: Option<(Option<RepositoryAction>, Option<RepositoryAction>)>,
+    typography: DiffTypography,
 ) -> Element<'a, RepositoryAction> {
     let (old_action, new_action) = actions.unwrap_or_default();
     let old_kind = if row.kind != DiffRowKind::Context && row.old_text.is_some() {
@@ -11376,10 +11701,11 @@ fn split_diff_row_with_review<'a>(
             code_width,
             horizontal,
             old_action,
+            typography,
         ),
         widget::container(iced::widget::Space::new())
             .width(DIFF_SPLIT_DIVIDER)
-            .height(DIFF_ROW_HEIGHT)
+            .height(typography.line_height)
             .class(cosmic::theme::Container::custom(|theme| {
                 let mut color: iced::Color = theme.current_container().on.into();
                 color.a = crate::design::DIFF_DIVIDER_ALPHA;
@@ -11399,9 +11725,10 @@ fn split_diff_row_with_review<'a>(
             code_width,
             horizontal,
             new_action,
+            typography,
         ),
     ])
-    .height(DIFF_ROW_HEIGHT)
+    .height(typography.line_height)
     .into()
 }
 
@@ -11415,15 +11742,19 @@ fn diff_half<'a>(
     code_width: f32,
     horizontal: f32,
     action: Option<RepositoryAction>,
+    typography: DiffTypography,
 ) -> Element<'a, RepositoryAction> {
     diff_container(
         widget::row::with_children(vec![
-            diff_review_gutter(lines.0.or(lines.1), gutter, action),
-            diff_text(text, changed, syntax, kind, code_width, horizontal, lines),
+            diff_review_gutter(lines.0.or(lines.1), gutter, action, typography),
+            diff_text(
+                text, changed, syntax, kind, code_width, horizontal, lines, typography,
+            ),
         ])
         .align_y(Alignment::Center),
         kind,
         Length::FillPortion(1),
+        typography,
     )
 }
 
@@ -11431,15 +11762,16 @@ fn diff_review_gutter(
     line: Option<u32>,
     width: f32,
     action: Option<RepositoryAction>,
+    typography: DiffTypography,
 ) -> Element<'static, RepositoryAction> {
-    let label = diff_gutter(line, width);
+    let label = diff_gutter(line, width, typography);
     match action {
         Some(action) => crate::interaction::tooltip(
             widget::button::custom(label)
                 .on_press(action)
                 .padding(0)
                 .width(width)
-                .height(DIFF_ROW_HEIGHT - 6.0)
+                .height(typography.line_height)
                 .class(cosmic::theme::Button::Text),
             "Comment on this line · Shift-click to select a range",
         )
@@ -11448,11 +11780,15 @@ fn diff_review_gutter(
     }
 }
 
-fn diff_gutter(line: Option<u32>, width: f32) -> Element<'static, RepositoryAction> {
+fn diff_gutter(
+    line: Option<u32>,
+    width: f32,
+    typography: DiffTypography,
+) -> Element<'static, RepositoryAction> {
     widget::container(
         crate::design::caption(line.map_or_else(String::new, |line| line.to_string()))
-            .font(Font::MONOSPACE)
-            .size(12)
+            .font(typography.font)
+            .size(typography.gutter_size())
             .align_x(Alignment::End)
             .width(Length::Fill)
             .class(cosmic::theme::Text::Custom(|theme| {
@@ -11557,6 +11893,7 @@ fn diff_text<'a>(
     code_width: f32,
     horizontal: f32,
     lines: (Option<u32>, Option<u32>),
+    typography: DiffTypography,
 ) -> Element<'a, RepositoryAction> {
     let theme = cosmic::theme::active();
     let row_background = diff_row_background(&theme, kind);
@@ -11578,6 +11915,11 @@ fn diff_text<'a>(
         ),
     );
     for span in &mut spans {
+        // Syntax keeps its weight and style in the editor's family, as the
+        // model measured it.
+        if let Some(font) = &mut span.font {
+            font.family = typography.font.family;
+        }
         let background = match span
             .highlight
             .as_mut()
@@ -11597,10 +11939,10 @@ fn diff_text<'a>(
     Element::new(DiffHorizontalContent {
         content: widget::container(
             iced::widget::rich_text(spans)
-                .size(DIFF_FONT_SIZE)
-                .font(Font::MONOSPACE)
+                .size(typography.size)
+                .font(typography.font)
                 .line_height(iced::widget::text::LineHeight::Absolute(iced::Pixels(
-                    DIFF_LINE_HEIGHT,
+                    typography.line_height,
                 )))
                 .wrapping(iced::widget::text::Wrapping::None)
                 .width(code_width),
@@ -11626,6 +11968,7 @@ fn diff_container<'a>(
     content: impl Into<Element<'a, RepositoryAction>>,
     kind: DiffRowKind,
     width: Length,
+    typography: DiffTypography,
 ) -> Element<'a, RepositoryAction> {
     widget::container(content)
         .class(cosmic::theme::Container::custom(move |theme| {
@@ -11634,8 +11977,7 @@ fn diff_container<'a>(
                 ..Default::default()
             }
         }))
-        .padding([3.0, 0.0])
-        .height(DIFF_ROW_HEIGHT)
+        .height(typography.line_height)
         .width(width)
         .clip(true)
         .into()
@@ -11822,6 +12164,8 @@ struct DiffAnnotationMeasure<'a> {
     mode: DiffMode,
     layout_revision: u64,
     review_revision: (u64, u64),
+    /// The code row's own height; the rest of a slot is its annotation.
+    row_height: f32,
     expected_leading: f32,
     expected: BTreeMap<usize, f32>,
     retained: BTreeMap<usize, f32>,
@@ -11896,7 +12240,7 @@ impl Widget<RepositoryAction, cosmic::Theme, cosmic::Renderer> for DiffAnnotatio
                 let height = child.bounds().height;
                 match row {
                     Some(row) => {
-                        rows.insert(*row, (height - DIFF_ROW_HEIGHT).max(0.0));
+                        rows.insert(*row, (height - self.row_height).max(0.0));
                     }
                     None => leading = height,
                 }
@@ -13480,7 +13824,7 @@ mod tests {
     }
 
     #[test]
-    fn mode_switches_keep_independent_viewports_and_the_dirty_editor() {
+    fn mode_switches_keep_the_dirty_editor_and_diff_follows_its_line() {
         let card = CardId::new();
         let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "notes.md", "# Notes\n");
         let editor_position = text_editor::ScrollPosition {
@@ -13535,15 +13879,24 @@ mod tests {
         assert!(document.dirty);
         assert_eq!(document.content.text(), "# Notes\n");
         assert_eq!(document.content.scroll_position(), editor_position);
+        // Returning from the editor follows the line the reader was on.
         drop(runtime.update(RepositoryAction::ApplySourceSurface { card, diff: true }));
+        let row = runtime.diff_typography().line_height;
         assert_eq!(
             (runtime.diff_viewport.offset, runtime.diff_horizontal),
-            (1500.0, 80.0)
+            (
+                12.0 * row + editor_position.vertical,
+                editor_position.horizontal
+            )
         );
+        // The other layout's older place does not take the line away.
         drop(runtime.update(RepositoryAction::ApplyDiffMode { card, split: false }));
         assert_eq!(
             (runtime.diff_viewport.offset, runtime.diff_horizontal),
-            (900.0, 40.0)
+            (
+                12.0 * row + editor_position.vertical,
+                editor_position.horizontal
+            )
         );
         drop(runtime.update(RepositoryAction::ApplyMarkdownMode {
             card,
@@ -13686,7 +14039,8 @@ mod tests {
         }));
         assert_eq!(runtime.diff_viewport.offset, 1200.0);
         let visible = visible_rows(1000, runtime.diff_viewport, DIFF_ROW_HEIGHT);
-        assert!(visible.start <= 40 && visible.end > 40);
+        let restored = (1200.0 / DIFF_ROW_HEIGHT) as usize;
+        assert!(visible.start <= restored && visible.end > restored);
     }
 
     #[test]
@@ -14029,6 +14383,7 @@ mod tests {
                 },
                 Path::new("kernel.cu"),
                 crate::settings::EditorSyntaxTheme::Auto,
+                Font::MONOSPACE,
                 &CancellationToken::new(),
             ) else {
                 panic!("text comparison must produce rows");
@@ -16528,7 +16883,11 @@ mod tests {
             DIFF_ROW_HEIGHT,
         );
         assert!(top.end - top.start <= 34);
-        assert!(middle.end - middle.start <= 43);
+        // A partial row at each edge plus the overscan on both sides.
+        assert!(
+            middle.end - middle.start
+                <= (900.0 / DIFF_ROW_HEIGHT).ceil() as usize + 1 + 2 * VISIBLE_ROW_OVERSCAN
+        );
         assert_eq!(
             top.top_space + (top.end - top.start) as f32 * ROW_HEIGHT + top.bottom_space,
             100_000.0 * ROW_HEIGHT
@@ -16566,6 +16925,7 @@ mod tests {
             mode: DiffMode::Inline,
             layout_revision: 4,
             review_revision: (2, 3),
+            row_height: DIFF_ROW_HEIGHT,
             expected_leading: 0.0,
             expected: BTreeMap::from([(8, 99.0), (20, 80.0)]),
             // Row 8's removed discussion is deliberately absent. An offscreen
@@ -16657,7 +17017,10 @@ mod tests {
             );
         }
         assert_eq!(runtime.diff_rows().unwrap().leading_height(), 40.0);
-        assert_eq!(runtime.diff_rows().unwrap().height(0), 110.0);
+        assert_eq!(
+            runtime.diff_rows().unwrap().height(0),
+            runtime.diff_typography().line_height + 80.0
+        );
     }
 
     #[test]
@@ -16727,23 +17090,29 @@ mod tests {
             DiffBasis::IndexToWorktree,
             DiffState::ready(staged_text_diff(model)),
         );
+        let row = runtime.diff_typography().line_height;
+        // Halfway through row 3, before any annotation is measured.
         runtime.diff_viewport = ListViewport {
-            offset: 105.0,
+            offset: 3.5 * row,
             height: 120.0,
         };
         runtime.diff_horizontal = 44.0;
         drop(runtime.set_diff_annotation_heights(DiffMode::Inline, 60.0, &[(1, 90.0), (3, 30.0)]));
-        assert_eq!(runtime.diff_viewport.offset, 270.0);
+        // Still halfway through row 3, which now carries its 30px block.
+        assert_eq!(
+            runtime.diff_viewport.offset,
+            60.0 + 3.0 * row + 90.0 + 0.5 * (row + 30.0)
+        );
         assert_eq!(runtime.diff_horizontal, 44.0);
         let unchanged = runtime.diff_viewport.offset;
         drop(runtime.set_diff_annotation_heights(DiffMode::Inline, 60.0, &[(1, 90.0), (3, 30.0)]));
         assert_eq!(runtime.diff_viewport.offset, unchanged);
         drop(runtime.update(RepositoryAction::NextChange { card }));
-        assert_eq!(runtime.diff_viewport.offset, 390.0);
+        assert_eq!(runtime.diff_viewport.offset, 60.0 + 7.0 * row + 90.0 + 30.0);
         drop(runtime.update(RepositoryAction::PreviousChange { card }));
-        assert_eq!(runtime.diff_viewport.offset, 210.0);
+        assert_eq!(runtime.diff_viewport.offset, 60.0 + 2.0 * row + 90.0);
         drop(runtime.set_diff_annotation_heights(DiffMode::Inline, 0.0, &[]));
-        assert_eq!(runtime.diff_viewport.offset, 60.0);
+        assert_eq!(runtime.diff_viewport.offset, 2.0 * row);
     }
 
     #[test]
@@ -17140,6 +17509,577 @@ mod tests {
         crate::diff_view::build_diff(&before, &after)
     }
 
+    /// The new-side source line the comparison's viewport is on.
+    fn diff_source_line(runtime: &RepositoryRuntime) -> Option<u32> {
+        let Some(diff_layout::Anchor::Row { row, .. }) = runtime.current_diff_viewport().row else {
+            return None;
+        };
+        runtime
+            .diff_model()?
+            .new_line_at_row(runtime.diff_mode, row)
+    }
+
+    #[test]
+    fn entering_diff_follows_the_editor_line_and_unfolds_it() {
+        let card = CardId::new();
+        let before = (0..200)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        let after = before
+            .replace("line 20\n", "changed 20\n")
+            .replace("line 180\n", "changed 180\n");
+        for mode in [DiffMode::Inline, DiffMode::Split] {
+            let (mut runtime, _) = working_diff_runtime(card, &before, &after);
+            runtime.diff_mode = mode;
+            runtime.source_surface = SourceSurface::Editor;
+            let position = text_editor::ScrollPosition {
+                line: 100,
+                vertical: 3.0,
+                horizontal: 12.0,
+            };
+            let DocumentState::Editable(document) = &mut runtime.document else {
+                unreachable!()
+            };
+            document.content.restore_scroll_position(position);
+            drop(runtime.update(RepositoryAction::ApplySourceSurface { card, diff: true }));
+            assert_eq!(diff_source_line(&runtime), Some(101), "{mode:?}");
+            // Line 101 sat in the fold between the changes: it is revealed.
+            let Some(diff_layout::Anchor::Row { row, .. }) = runtime.current_diff_viewport().row
+            else {
+                unreachable!()
+            };
+            let folded = runtime.diff_layout().unwrap().folded(mode);
+            assert!(matches!(
+                folded.row(folded.display(row)),
+                DisplayRow::Code(_)
+            ));
+            // Only the part of the fold up to the line and a step past it
+            // opens: the rest stays folded, keeping the next change near.
+            let model = runtime.diff_model().unwrap();
+            let next_change = model.change_starts(mode)[1];
+            let between = folded.display(next_change) - folded.display(row);
+            assert!(
+                between <= diff_layout::FOLD_STEP + diff_layout::FOLD_CONTEXT + 2,
+                "{mode:?}: {between} rows to the next change"
+            );
+            assert!(matches!(
+                folded.row(folded.display(row) + diff_layout::FOLD_STEP + 1),
+                DisplayRow::Fold { .. }
+            ));
+            assert!(runtime.pending_diff_source.is_none(), "rows are current");
+            // And back: the editor returns to exactly where it was.
+            drop(runtime.update(RepositoryAction::ApplySourceSurface { card, diff: false }));
+            let DocumentState::Editable(document) = &runtime.document else {
+                unreachable!()
+            };
+            let restored = document.content.scroll_position();
+            assert_eq!((restored.line, restored.horizontal), (100, 12.0));
+            assert!((restored.vertical - 3.0).abs() < 0.01);
+        }
+    }
+
+    #[test]
+    fn switching_layouts_after_entering_diff_keeps_the_editor_line() {
+        let card = CardId::new();
+        let before = (0..200)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        let after = before.replace("line 20\n", "changed 20\n");
+        let (mut runtime, _) = working_diff_runtime(card, &before, &after);
+        runtime.diff_mode = DiffMode::Inline;
+        runtime.source_surface = SourceSurface::Diff;
+        // Both layouts have been visited, so each has a saved place.
+        drop(runtime.update(RepositoryAction::ApplyDiffMode { card, split: true }));
+        drop(runtime.update(RepositoryAction::ApplyDiffMode { card, split: false }));
+        assert!(runtime.viewports.diff.iter().all(Option::is_some));
+        drop(runtime.update(RepositoryAction::ApplySourceSurface { card, diff: false }));
+        let DocumentState::Editable(document) = &mut runtime.document else {
+            unreachable!()
+        };
+        document
+            .content
+            .restore_scroll_position(text_editor::ScrollPosition {
+                line: 150,
+                vertical: 0.0,
+                horizontal: 0.0,
+            });
+        drop(runtime.update(RepositoryAction::ApplySourceSurface { card, diff: true }));
+        assert_eq!(diff_source_line(&runtime), Some(151));
+        for split in [true, false] {
+            drop(runtime.update(RepositoryAction::ApplyDiffMode { card, split }));
+            assert_eq!(diff_source_line(&runtime), Some(151), "split: {split}");
+        }
+    }
+
+    #[test]
+    fn an_editor_nobody_moved_keeps_the_comparisons_own_place() {
+        let card = CardId::new();
+        let before = (0..200)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        let after = before
+            .replace("line 20\n", "changed 20\n")
+            .replace("line 180\n", "changed 180\n");
+        for mode in [DiffMode::Inline, DiffMode::Split] {
+            // A file just opened in Edit: Diff starts at its first change.
+            let (mut runtime, _) = working_diff_runtime(card, &before, &after);
+            runtime.diff_mode = mode;
+            runtime.diff_viewport.height = 300.0;
+            runtime.source_surface = SourceSurface::Editor;
+            runtime.reset_diff_viewports();
+            let folded = runtime.diff_layout().unwrap().folded(mode).clone();
+            drop(runtime.update(RepositoryAction::ApplySourceSurface { card, diff: true }));
+            assert_eq!(
+                Some(runtime.diff_viewport.offset),
+                runtime.first_change_offset(),
+                "{mode:?}"
+            );
+            assert!(runtime.pending_diff_source.is_none());
+            assert_eq!(
+                runtime.diff_layout().unwrap().folded(mode),
+                &folded,
+                "{mode:?}: line 1 is not unfolded in place of the first change"
+            );
+
+            // Back to Edit from the top fold and straight back: the
+            // comparison stays where it was left, with nothing unfolded.
+            drop(runtime.update(RepositoryAction::DiffViewport {
+                card,
+                offset: 0.0,
+                height: 300.0,
+                horizontal: 0.0,
+                user_initiated: true,
+            }));
+            assert!(matches!(folded.row(0), DisplayRow::Fold { .. }));
+            drop(runtime.update(RepositoryAction::ApplySourceSurface { card, diff: false }));
+            drop(runtime.update(RepositoryAction::ApplySourceSurface { card, diff: true }));
+            assert_eq!(runtime.diff_viewport.offset, 0.0, "{mode:?}");
+            assert_eq!(runtime.diff_layout().unwrap().folded(mode), &folded);
+        }
+    }
+
+    #[tokio::test]
+    async fn entering_diff_holds_the_editor_line_until_stale_rows_rebuild() {
+        for mode in [DiffMode::Inline, DiffMode::Split] {
+            let card = CardId::new();
+            let before = (0..100)
+                .map(|line| format!("line {line}\n"))
+                .collect::<String>();
+            let (mut runtime, _) = working_diff_runtime(card, &before, &before);
+            runtime.diff_mode = mode;
+            runtime.source_surface = SourceSurface::Editor;
+            // Five lines inserted above the reader; the comparison is now
+            // behind the buffer until its debounced rebuild.
+            drop(runtime.update(RepositoryAction::EditorAction {
+                card,
+                action: text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(
+                    "inserted\n".repeat(5),
+                ))),
+            }));
+            let DocumentState::Editable(document) = &mut runtime.document else {
+                unreachable!()
+            };
+            document
+                .content
+                .restore_scroll_position(text_editor::ScrollPosition {
+                    line: 80,
+                    vertical: 2.0,
+                    horizontal: 9.0,
+                });
+            drop(runtime.update(RepositoryAction::ApplySourceSurface { card, diff: true }));
+            assert!(!runtime.working_annotations_current());
+            assert!(runtime.pending_diff_source.is_some(), "{mode:?}");
+            drop(runtime.working_diff_task(card));
+            runtime.working_diff.deadline = Some(Instant::now());
+            let ticket = runtime.working_diff.timer.unwrap();
+            let task = runtime.start_working_diff(card, ticket);
+            finish_navigation_task(&mut runtime, task).await;
+            assert!(runtime.working_annotations_current());
+            assert!(runtime.pending_diff_source.is_none(), "{mode:?}");
+            assert_eq!(diff_source_line(&runtime), Some(81), "{mode:?}");
+            runtime.align_editor_to_diff();
+            assert_eq!(runtime.viewports.editor.line, 80);
+            assert!((runtime.viewports.editor.vertical - 2.0).abs() < 0.01);
+            assert_eq!(runtime.viewports.editor.horizontal, 9.0);
+        }
+    }
+
+    #[test]
+    fn entering_a_loading_diff_places_the_editor_line_when_rows_arrive() {
+        let card = CardId::new();
+        let text = (0..100)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        let (mut runtime, _) = working_diff_runtime(card, &text, &text);
+        runtime.source_surface = SourceSurface::Editor;
+        runtime.diff_basis = DiffBasis::HeadToIndex;
+        runtime.viewports.editor = text_editor::ScrollPosition {
+            line: 70,
+            vertical: 3.0,
+            horizontal: 8.0,
+        };
+        runtime.viewports.editor_moved = true;
+        runtime.align_diff_to_editor();
+        assert!(
+            runtime.pending_diff_source.is_some(),
+            "no rows to place it in yet"
+        );
+        runtime.source_surface = SourceSurface::Diff;
+        runtime.set_diff_state(
+            DiffBasis::HeadToIndex,
+            DiffState::ready(staged_text_diff(crate::diff_view::build_diff(&text, &text))),
+        );
+        assert!(runtime.pending_diff_source.is_none());
+        assert_eq!(diff_source_line(&runtime), Some(71));
+        runtime.align_editor_to_diff();
+        assert_eq!(runtime.viewports.editor.line, 70);
+        assert!((runtime.viewports.editor.vertical - 3.0).abs() < 0.01);
+        assert_eq!(runtime.viewports.editor.horizontal, 8.0);
+    }
+
+    #[test]
+    fn diff_and_editor_lines_reconcile_native_bare_cr_breaks() {
+        let card = CardId::new();
+        let text = "first\rsecond\nthird\nlast";
+        let (mut runtime, _) = working_diff_runtime(card, text, text);
+        runtime.source_surface = SourceSurface::Editor;
+        // Editor line 2 is "third": the bare CR splits source line 1 natively.
+        runtime.viewports.editor = text_editor::ScrollPosition {
+            line: 2,
+            vertical: 0.0,
+            horizontal: 0.0,
+        };
+        runtime.viewports.editor_moved = true;
+        runtime.align_diff_to_editor();
+        runtime.source_surface = SourceSurface::Diff;
+        assert_eq!(diff_source_line(&runtime), Some(2));
+        runtime.align_editor_to_diff();
+        assert_eq!(runtime.viewports.editor.line, 2);
+    }
+
+    #[test]
+    fn diff_rows_follow_the_editor_typography_and_keep_the_reading_row() {
+        let card = CardId::new();
+        let (mut runtime, identity) = diff_runtime(card);
+        load_fresh_diff(&mut runtime, card, two_change_model());
+        // The default editor line is the default row.
+        assert_eq!(runtime.diff_typography().line_height, DIFF_ROW_HEIGHT);
+        drop(runtime.update(RepositoryAction::DiffViewport {
+            card,
+            offset: 10.5 * DIFF_ROW_HEIGHT,
+            // Short enough that the reading row stays reachable at both sizes.
+            height: 40.0,
+            horizontal: 0.0,
+            user_initiated: true,
+        }));
+        let reading = |runtime: &RepositoryRuntime| match runtime.current_diff_viewport().row {
+            Some(diff_layout::Anchor::Row { row, fraction }) => (row, (fraction * 1e3).round()),
+            other => panic!("a code row is being read: {other:?}"),
+        };
+        let read = reading(&runtime);
+        assert_eq!(read.1, 500.0);
+        let baseline = Arc::clone(&runtime.diff_model().unwrap().before);
+
+        runtime.set_editor_font(Font::MONOSPACE, 20.0);
+        runtime.set_line_height(1.25);
+        let typography = runtime.diff_typography();
+        assert_eq!((typography.size, typography.line_height), (20.0, 25.0));
+        let rows = runtime.diff_rows().unwrap();
+        assert!((rows.offset(2) - rows.offset(1) - 25.0).abs() < 0.01);
+        assert!(
+            Arc::ptr_eq(&runtime.diff_model().unwrap().before, &baseline),
+            "a size change scales the measured widths instead of rebuilding"
+        );
+        assert_eq!(reading(&runtime), read);
+        assert!((runtime.diff_viewport.offset - 10.5 * 25.0).abs() < 0.01);
+
+        // Another family has other advances: its rows are measured again,
+        // the old ones staying readable until they arrive, and the reader
+        // stays on the same logical row throughout.
+        let family = Font {
+            family: iced::font::Family::SansSerif,
+            ..Font::MONOSPACE
+        };
+        runtime.set_editor_font(family, 20.0);
+        assert!(runtime.stale_diff.is_some());
+        assert!(runtime.diff_state(&DiffBasis::IndexToWorktree).is_none());
+        assert_eq!(reading(&runtime), read);
+        drop(runtime.refresh_diff_presentation(card));
+        let Some(DiffState::Loading { request, .. }) =
+            runtime.diff_state(&DiffBasis::IndexToWorktree)
+        else {
+            panic!("the dropped comparison is requested again");
+        };
+        let request = *request;
+        drop(runtime.update(RepositoryAction::DiffLoaded {
+            identity,
+            basis: DiffBasis::IndexToWorktree,
+            request,
+            content: staged_text_diff(two_change_model()),
+        }));
+        assert_eq!(reading(&runtime), read);
+        assert!((runtime.diff_viewport.offset - 10.5 * 25.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_syntax_theme_change_requests_the_comparison_again_on_the_same_row() {
+        let card = CardId::new();
+        let (mut runtime, identity) = diff_runtime(card);
+        load_fresh_diff(&mut runtime, card, two_change_model());
+        drop(runtime.update(RepositoryAction::DiffViewport {
+            card,
+            offset: 10.5 * DIFF_ROW_HEIGHT,
+            height: 40.0,
+            horizontal: 0.0,
+            user_initiated: true,
+        }));
+        let reading = |runtime: &RepositoryRuntime| match runtime.current_diff_viewport().row {
+            Some(diff_layout::Anchor::Row { row, fraction }) => (row, (fraction * 1e3).round()),
+            other => panic!("a code row is being read: {other:?}"),
+        };
+        let read = reading(&runtime);
+
+        runtime.set_syntax_theme(crate::settings::EditorSyntaxTheme::Mocha);
+        // The old rows stay readable while their successor is requested.
+        assert!(runtime.diff_model().is_some());
+        drop(runtime.refresh_diff_presentation(card));
+        let Some(DiffState::Loading { request, .. }) =
+            runtime.diff_state(&DiffBasis::IndexToWorktree)
+        else {
+            panic!("the recoloured comparison is requested again");
+        };
+        let request = *request;
+        drop(runtime.update(RepositoryAction::DiffLoaded {
+            identity,
+            basis: DiffBasis::IndexToWorktree,
+            request,
+            content: staged_text_diff(two_change_model()),
+        }));
+        assert_eq!(reading(&runtime), read);
+        assert!((runtime.diff_viewport.offset - 10.5 * DIFF_ROW_HEIGHT).abs() < 0.01);
+        assert!(runtime.stale_diff.is_none());
+    }
+
+    #[test]
+    fn a_presentation_change_keeps_what_was_unfolded_and_the_reading_row() {
+        let theme = |runtime: &mut RepositoryRuntime| {
+            runtime.set_syntax_theme(crate::settings::EditorSyntaxTheme::Ocean);
+        };
+        let family = |runtime: &mut RepositoryRuntime| {
+            runtime.set_editor_font(
+                Font {
+                    family: cosmic::iced::font::Family::Serif,
+                    ..runtime.editor_font
+                },
+                runtime.editor_font_size,
+            );
+        };
+        for change in [theme, family] {
+            let card = CardId::new();
+            let (mut runtime, identity) = diff_runtime(card);
+            runtime.diff_viewport.height = 300.0;
+            load_fresh_diff(&mut runtime, card, two_change_model());
+            drop(runtime.update(RepositoryAction::ExpandDiffFold {
+                identity: identity.clone(),
+                basis: DiffBasis::IndexToWorktree,
+                mode: DiffMode::Inline,
+                fold: 1,
+                run: 51..150,
+                expansion: FoldExpansion::Down,
+            }));
+            // The reader is inside the rows they unfolded.
+            let opened = runtime
+                .diff_layout()
+                .unwrap()
+                .folded(DiffMode::Inline)
+                .display(60);
+            drop(runtime.update(RepositoryAction::DiffViewport {
+                card,
+                offset: opened as f32 * DIFF_ROW_HEIGHT,
+                height: 300.0,
+                horizontal: 0.0,
+                user_initiated: true,
+            }));
+            let folded = runtime
+                .diff_layout()
+                .unwrap()
+                .folded(DiffMode::Inline)
+                .clone();
+            assert_eq!(folded.row(opened), DisplayRow::Code(60));
+            let reading = |runtime: &RepositoryRuntime| match runtime.current_diff_viewport().row {
+                Some(diff_layout::Anchor::Row { row, fraction }) => (row, (fraction * 1e3).round()),
+                other => panic!("a code row is being read: {other:?}"),
+            };
+            let read = reading(&runtime);
+
+            change(&mut runtime);
+            assert_eq!(
+                runtime.diff_layout().unwrap().folded(DiffMode::Inline),
+                &folded,
+                "the comparison on screen stays as it was while it reloads"
+            );
+            drop(runtime.refresh_diff_presentation(card));
+            let Some(DiffState::Loading { request, .. }) =
+                runtime.diff_state(&DiffBasis::IndexToWorktree)
+            else {
+                panic!("the comparison is requested again");
+            };
+            let request = *request;
+            drop(runtime.update(RepositoryAction::DiffLoaded {
+                identity,
+                basis: DiffBasis::IndexToWorktree,
+                request,
+                content: staged_text_diff(two_change_model()),
+            }));
+            assert!(runtime.stale_diff.is_none());
+            assert_eq!(
+                runtime.diff_layout().unwrap().folded(DiffMode::Inline),
+                &folded,
+                "the rebuilt comparison keeps what was unfolded"
+            );
+            assert_eq!(reading(&runtime), read);
+            assert_eq!(
+                runtime.diff_viewport.offset,
+                opened as f32 * DIFF_ROW_HEIGHT
+            );
+        }
+    }
+
+    #[test]
+    fn a_presentation_change_restyles_the_live_comparison_and_keeps_its_markers() {
+        let card = CardId::new();
+        let text = "added\nkept\n";
+        let (mut runtime, identity) = working_diff_runtime(card, "removed\nkept\n", text);
+        runtime.source_surface = SourceSurface::Editor;
+        runtime.working_diff.applied = None;
+        drop(runtime.working_diff_task(card));
+        let ticket = runtime.working_diff.timer.unwrap();
+        runtime.working_diff.deadline = Some(Instant::now());
+        drop(runtime.start_working_diff(card, ticket));
+        let active = runtime.working_diff.active.as_ref().unwrap();
+        let (revision, before) = (active.revision, Arc::clone(&active.before));
+        let cancellation = active.cancellation.clone();
+
+        // The palette changes while a job styled the old way is running.
+        runtime.set_syntax_theme(crate::settings::EditorSyntaxTheme::Mocha);
+        drop(runtime.refresh_diff_presentation(card));
+        assert!(cancellation.is_cancelled());
+        drop(runtime.finish_working_diff(
+            identity.clone(),
+            revision,
+            ticket,
+            Arc::clone(&before),
+            Ok(Some(crate::diff_view::build_diff(&before, text))),
+        ));
+        assert!(
+            runtime.working_diff.applied.is_none(),
+            "a comparison in the old palette is not installed"
+        );
+        let next = runtime
+            .working_diff
+            .timer
+            .expect("restarted in the new palette");
+        runtime.working_diff.deadline = Some(Instant::now());
+        drop(runtime.start_working_diff(card, next));
+        let active = runtime.working_diff.active.as_ref().unwrap();
+        assert_eq!(active.presentation, runtime.diff_presentation);
+        let revision = active.revision;
+        drop(runtime.finish_working_diff(
+            identity.clone(),
+            revision,
+            next,
+            Arc::clone(&before),
+            Ok(Some(crate::diff_view::build_diff(&before, text))),
+        ));
+        assert!(runtime.working_annotations_current());
+
+        // An applied comparison: its added-line markers name source lines,
+        // which no palette or font changes, so they stay while it rebuilds.
+        let family = Font {
+            family: cosmic::iced::font::Family::Serif,
+            ..runtime.editor_font
+        };
+        runtime.set_editor_font(family, runtime.editor_font_size);
+        drop(runtime.refresh_diff_presentation(card));
+        assert!(runtime.working_annotations_current());
+        assert_eq!(runtime.working_diff.additions, vec![0]);
+        let rebuild = runtime.working_diff.timer.expect("rows are measured again");
+        runtime.working_diff.deadline = Some(Instant::now());
+        drop(runtime.start_working_diff(card, rebuild));
+        let revision = runtime.working_diff.active.as_ref().unwrap().revision;
+        drop(runtime.finish_working_diff(
+            identity,
+            revision,
+            rebuild,
+            Arc::clone(&before),
+            Ok(Some(crate::diff_view::build_diff(&before, text))),
+        ));
+        assert!(runtime.working_annotations_current());
+        assert!(runtime.working_diff.timer.is_none());
+        assert!(runtime.working_diff.active.is_none());
+    }
+
+    #[test]
+    fn diff_rows_lay_out_at_the_editor_size_and_line_height() {
+        use cosmic::iced::advanced::{Layout, layout, widget::Tree};
+        let renderer = headless_renderer();
+        let model = crate::diff_view::build_diff(
+            "let value = 1;\n",
+            "let value = 2; // a much longer replacement line\n",
+        );
+        let typography = DiffTypography {
+            font: Font::MONOSPACE,
+            size: 20.0,
+            line_height: 30.0,
+        };
+        let code_width = typography.code_width(&model);
+        let measured = model.max_line_width[usize::from(cosmic::theme::is_dark())] as f32;
+        assert!((code_width - measured * 20.0 / DIFF_FONT_SIZE).abs() < 0.01);
+        // Line numbers keep the default 12 px, 8 px a digit, beside the
+        // default font, and grow with the editor's size.
+        let default = DiffTypography::default();
+        assert_eq!(default.gutter_size(), 12.0);
+        assert_eq!(default.gutter_width(50_000), 5.0 * 8.0 + 12.0);
+        assert!(typography.gutter_width(50_000) > default.gutter_width(50_000));
+        for mode in [DiffMode::Inline, DiffMode::Split] {
+            let mut row = match mode {
+                DiffMode::Inline => inline_diff_row_with_review(
+                    model.inline_rows.last().unwrap(),
+                    &model.syntax,
+                    44.0,
+                    code_width,
+                    0.0,
+                    None,
+                    typography,
+                ),
+                DiffMode::Split => split_diff_row_with_review(
+                    model.split_rows.last().unwrap(),
+                    &model.syntax,
+                    44.0,
+                    code_width,
+                    0.0,
+                    None,
+                    typography,
+                ),
+            };
+            let mut tree = Tree::new(row.as_widget());
+            let node = row.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(1200.0, 1000.0)),
+            );
+            assert_eq!(node.size().height, 30.0, "{mode:?} row is one editor line");
+            let root = Layout::new(&node);
+            let half = match mode {
+                DiffMode::Inline => root,
+                DiffMode::Split => root.children().last().unwrap(),
+            };
+            let code = half.children().next().unwrap().children().last().unwrap();
+            let shaped = code.children().next().unwrap().children().next().unwrap();
+            assert_eq!(shaped.bounds().height, 30.0, "{mode:?} text uses the line");
+        }
+    }
+
     #[test]
     fn a_first_visit_opens_at_the_first_change_with_context() {
         let card = CardId::new();
@@ -17179,9 +18119,10 @@ mod tests {
         );
 
         // A position the reader chose is theirs: a reload keeps it.
+        let chosen = 2.5 * DIFF_ROW_HEIGHT;
         drop(runtime.update(RepositoryAction::DiffViewport {
             card,
-            offset: 150.0,
+            offset: chosen,
             height: 300.0,
             horizontal: 0.0,
             user_initiated: true,
@@ -17202,7 +18143,7 @@ mod tests {
             request,
             content: staged_text_diff(two_change_model()),
         }));
-        assert_eq!(runtime.diff_viewport.offset, 150.0);
+        assert_eq!(runtime.diff_viewport.offset, chosen);
     }
 
     #[test]
@@ -20162,6 +21103,7 @@ mod tests {
             &DiffBasis::IndexToWorktree,
             None,
             crate::settings::EditorSyntaxTheme::Auto,
+            Font::MONOSPACE,
             &token,
         );
         assert!(
@@ -20174,6 +21116,7 @@ mod tests {
             &DiffBasis::IndexToWorktree,
             None,
             crate::settings::EditorSyntaxTheme::Auto,
+            Font::MONOSPACE,
             &token,
         );
         let RenderedDiff::Text { model, .. } = target else {
