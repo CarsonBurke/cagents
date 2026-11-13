@@ -14,7 +14,7 @@ use super::*;
 use crate::agent_execution::State;
 use crate::chat::ToolStatus;
 use crate::chat::coordination::{
-    Act, Arrival, Coordination, Kind, Outbound, OutboundKind, Run, Spawn, Text,
+    Act, Arrival, Coordination, Delivery, Kind, Outbound, OutboundKind, Run, Spawn, Text,
 };
 
 #[cfg(test)]
@@ -301,20 +301,15 @@ impl Coordinated {
     }
 
     /// The step's verb and what it acted on, `listed` naming an agent this
-    /// conversation lists by its ID; any other is named by its short ID.
+    /// conversation lists, by its listed ID or its provider's address for it.
     pub(super) fn line(&self, listed: &dyn Fn(&str) -> Option<String>) -> (String, String) {
-        let name = &|id: &str| listed(id).unwrap_or_else(|| short_id(id).to_owned());
-        let names = |agents: &[String]| {
-            agents
-                .iter()
-                .map(|agent| name(agent))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        let (verb, label): (&str, String) = match &self.reading.kind {
+        let reading = &self.reading;
+        let names = |agents: &[String]| agents_phrase(reading, agents, listed);
+        let name = |agent: &String| names(std::slice::from_ref(agent));
+        let (verb, label): (&str, String) = match &reading.kind {
             Kind::Message(message) => (
                 message_verb(message.kind),
-                recipient(message, &self.reading, name).plain(),
+                recipient(message, reading, listed).plain(),
             ),
             // The started agent goes by its tab's name once it has one.
             Kind::Spawn(spawn) => (
@@ -347,8 +342,16 @@ impl Coordinated {
                 Act::Interrupt { agent } => ("Interrupted", name(agent)),
                 Act::Close { agents } => ("Closed", names(agents)),
                 Act::Resume { agents } => ("Resumed", names(agents)),
-                Act::Stop { task } => ("Stopped", format!("background task {task}")),
-                Act::Output { task } => ("Read the output of", format!("task {task}")),
+                // A task is an agent where this conversation lists one by it,
+                // and otherwise a shell, whose ID says nothing to a reader.
+                Act::Stop { task } => (
+                    "Stopped",
+                    listed(task).unwrap_or_else(|| "a background task".into()),
+                ),
+                Act::Output { task } => (
+                    "Read the output of",
+                    listed(task).unwrap_or_else(|| "a background task".into()),
+                ),
                 Act::Linear { verb, subject } => (verb, subject.clone()),
                 Act::Cli(path) => ("Ran", format!("cagents {path}").trim_end().to_owned()),
             },
@@ -356,10 +359,16 @@ impl Coordinated {
         (verb.to_owned(), label)
     }
 
-    /// The step's line with agents named by their IDs, for a summary formed
-    /// where the conversation's subagents are not to hand.
+    /// The step's line where the conversation's subagents are not to hand,
+    /// for a summary formed without them.
     pub(super) fn summary(&self) -> String {
-        let (verb, label) = self.line(&|_| None);
+        self.summary_naming(&|_| None)
+    }
+
+    /// The step's line as one string, `listed` naming the agents this
+    /// conversation lists.
+    pub(super) fn summary_naming(&self, listed: &dyn Fn(&str) -> Option<String>) -> String {
+        let (verb, label) = self.line(listed);
         if label.is_empty() {
             verb
         } else {
@@ -398,6 +407,35 @@ fn started(spawn: &Spawn) -> String {
     }
 }
 
+/// A phrase for `agents`, as a step names them: by the names their tabs show
+/// where this conversation lists them. A `cagents` agent it does not list goes
+/// by the short ID the CLI prints; a provider's own agent, whose IDs the app
+/// shows nowhere, is only counted.
+fn agents_phrase(
+    reading: &Coordination,
+    agents: &[String],
+    listed: &dyn Fn(&str) -> Option<String>,
+) -> String {
+    let mut names = Vec::new();
+    let mut unknown = 0;
+    for agent in agents {
+        match listed(agent) {
+            Some(name) => names.push(name),
+            None if reading.cli || !is_identifier(agent) => names.push(short_id(agent).to_owned()),
+            None => unknown += 1,
+        }
+    }
+    let names = names.join(", ");
+    match (names.is_empty(), unknown) {
+        (true, 0) => "agents".to_owned(),
+        (true, 1) => "an agent".to_owned(),
+        (true, count) => format!("{count} agents"),
+        (false, 0) => names,
+        (false, 1) => format!("{names} and another agent"),
+        (false, count) => format!("{names} and {count} other agents"),
+    }
+}
+
 /// A message's recipient: a name, and the session ID that tells it apart.
 struct Recipient {
     name: String,
@@ -422,7 +460,7 @@ impl Recipient {
 fn recipient(
     message: &Outbound,
     reading: &Coordination,
-    name: &dyn Fn(&str) -> String,
+    listed: &dyn Fn(&str) -> Option<String>,
 ) -> Recipient {
     if let Some(receipt) = &reading.outcome.receipt {
         // `session 95fcd1b9 "Title"`, `session 95fcd1b9`, or `the user`.
@@ -447,18 +485,10 @@ fn recipient(
         session: None,
         live: false,
     };
+    let phrase = |agents: &[String]| named(agents_phrase(reading, agents, listed));
     match message.kind {
         OutboundKind::Report => named("the conversation that started it".into()),
         OutboundKind::Reply => named(format!("message {}", short_id(&message.to))),
-        OutboundKind::Prompt if !reading.subagents.is_empty() => named(
-            reading
-                .subagents
-                .iter()
-                .map(|agent| name(agent))
-                .collect::<Vec<_>>()
-                .join(", "),
-        ),
-        OutboundKind::Prompt => named(format!("agent {}", message.to)),
         _ if message.to == "parent" => named("the session that started it".into()),
         // A `cagents` recipient is a session ID, or a prefix of one.
         _ if reading.cli && is_identifier(&message.to) => Recipient {
@@ -466,7 +496,18 @@ fn recipient(
             session: Some(message.to.clone()),
             live: true,
         },
-        _ => named(name(&message.to)),
+        // The agents a provider's own tool reached, which a name the agent
+        // gave them stands in for until the tool says which.
+        _ if !reading.subagents.is_empty() => match reading.subagents.as_slice() {
+            [agent] if listed(agent).is_none() && !is_identifier(&message.to) => {
+                named(message.to.clone())
+            }
+            agents => phrase(agents),
+        },
+        _ if message.to == "*" => named("every teammate".into()),
+        _ if message.to.contains(':') => named("another session".into()),
+        _ if message.to.is_empty() => named("an agent".into()),
+        _ => phrase(std::slice::from_ref(&message.to)),
     }
 }
 
@@ -481,6 +522,17 @@ fn arrival(arrival: Arrival) -> &'static str {
         Arrival::Inbox => "Left in their inbox",
         Arrival::NextSession => "Held for their next session",
         Arrival::User => "Left in your inbox",
+    }
+}
+
+/// What became of a message a provider's own tool sent, in the card's
+/// status line.
+fn delivered(delivery: Delivery) -> &'static str {
+    match delivery {
+        Delivery::Queued => "Queued for its next step",
+        Delivery::Resumed => "Resumed it with this message",
+        Delivery::Inbox => "Left in that session's inbox",
+        Delivery::Sent => "Sent",
     }
 }
 
@@ -653,20 +705,43 @@ fn status_caption(text: String, tone: Tone) -> Element<'static, Message> {
 }
 
 impl Runtime {
-    /// What an agent of this conversation is called: the name its tab shows
-    /// where this conversation lists it, else its short ID.
-    pub(super) fn agent_name(&self, id: &str) -> String {
-        self.listed_agent_name(id)
-            .unwrap_or_else(|| short_id(id).to_owned())
-    }
-
-    /// The name an agent's tab shows, where this conversation lists it.
-    pub(super) fn listed_agent_name(&self, id: &str) -> Option<String> {
+    /// The subagent of this conversation that `address` names: the ID it is
+    /// listed under, or the one its provider addresses it by.
+    pub(super) fn subagent(&self, address: &str) -> Option<&chat::Subagent> {
+        let listed = self
+            .agent_addresses
+            .get(address)
+            .map_or(address, String::as_str);
         self.snapshot
             .subagents
             .iter()
-            .find(|agent| agent.id == id)
+            .find(|agent| agent.id == listed)
+    }
+
+    /// The name an agent's tab shows, where this conversation lists it.
+    pub(super) fn listed_agent_name(&self, address: &str) -> Option<String> {
+        self.subagent(address)
             .map(|agent| self.child_label(agent, 80).into_owned())
+    }
+
+    /// The agents a step names that this conversation lists, each once.
+    fn listed_subagents<'a>(
+        &'a self,
+        coordinated: &'a Coordinated,
+    ) -> impl Iterator<Item = &'a chat::Subagent> {
+        let mut seen = Vec::new();
+        coordinated
+            .reading
+            .subagents
+            .iter()
+            .filter_map(|address| self.subagent(address))
+            .filter(move |agent| {
+                let new = !seen.contains(&agent.id);
+                if new {
+                    seen.push(agent.id.clone());
+                }
+                new
+            })
     }
 
     /// A message or a started agent, drawn as a card that shows its text.
@@ -799,8 +874,7 @@ impl Runtime {
         settings: markdown::Settings,
     ) {
         let reading = &coordinated.reading;
-        let name = |id: &str| self.agent_name(id);
-        let recipient = recipient(message, reading, &name);
+        let recipient = recipient(message, reading, &|id| self.listed_agent_name(id));
         let mut heading = vec![
             self.card_indicator(status, Icon::Send),
             design::caption(message_verb(message.kind)).into(),
@@ -813,8 +887,26 @@ impl Runtime {
                 .wrap()
                 .into(),
         );
-        if !message.summary.is_empty() {
-            rows.push(design::caption(message.summary.clone()).into());
+        // An agent's tab names it by its type, which several agents share;
+        // the task it was given tells this one apart. It sits under the
+        // heading so a long task never crowds the recipient out of it.
+        // Where no task does, the sender's own summary of the body says
+        // what the message is about.
+        let task = match self
+            .listed_subagents(coordinated)
+            .collect::<Vec<_>>()
+            .as_slice()
+        {
+            [agent] => Some(agent.description.trim())
+                .filter(|task| !task.is_empty() && *task != recipient.name),
+            _ => None,
+        };
+        let caption = match task {
+            Some(task) => Self::short_description(task, 80),
+            None => message.summary.trim().to_owned(),
+        };
+        if !caption.is_empty() {
+            rows.push(design::caption(caption).into());
         }
         rows.extend(self.text_block(
             item,
@@ -865,7 +957,11 @@ impl Runtime {
                 Some((arrival(receipt.arrival).to_owned(), Tone::Plain))
             }
             // A prompt to an agent starts a run of it.
-            _ => reading.outcome.run.as_ref().and_then(run_line),
+            _ => reading
+                .outcome
+                .delivery
+                .map(|delivery| (delivered(delivery).to_owned(), Tone::Plain))
+                .or_else(|| reading.outcome.run.as_ref().and_then(run_line)),
         };
         if let Some((text, tone)) = line {
             rows.push(status_caption(text, tone));
@@ -939,12 +1035,7 @@ impl Runtime {
         );
         let observed_model = if !reading.cli {
             match reading.subagents.as_slice() {
-                [id] => self
-                    .snapshot
-                    .subagents
-                    .iter()
-                    .find(|agent| &agent.id == id)
-                    .and_then(|agent| agent.model.as_deref()),
+                [id] => self.subagent(id).and_then(|agent| agent.model.as_deref()),
                 _ => None,
             }
         } else {
@@ -1040,12 +1131,7 @@ impl Runtime {
         if spawn.waits || coordinated.reading.cli {
             return None;
         }
-        let agents: Vec<&chat::Subagent> = coordinated
-            .reading
-            .subagents
-            .iter()
-            .filter_map(|id| self.snapshot.subagents.iter().find(|agent| &agent.id == id))
-            .collect();
+        let agents: Vec<&chat::Subagent> = self.listed_subagents(coordinated).collect();
         let any = |wanted: ToolStatus| agents.iter().any(|agent| agent.status == wanted);
         if agents.is_empty() {
             None
@@ -1214,14 +1300,12 @@ impl Runtime {
         overruled: bool,
     ) -> Element<'static, Message> {
         let mut controls: Vec<Element<'static, Message>> = Vec::new();
-        for id in &coordinated.reading.subagents {
-            let Some(agent) = self.snapshot.subagents.iter().find(|agent| &agent.id == id) else {
-                continue;
-            };
-            let label = if coordinated.reading.subagents.len() == 1 {
+        let listed: Vec<&chat::Subagent> = self.listed_subagents(coordinated).collect();
+        for agent in &listed {
+            let label = if listed.len() == 1 {
                 "Transcript".to_owned()
             } else {
-                format!("Open {}", self.agent_name(&agent.id))
+                format!("Open {}", self.child_label(agent, 80))
             };
             controls.push(
                 widget::button::custom(
@@ -1306,6 +1390,122 @@ impl Runtime {
 #[cfg(test)]
 mod identity_tests {
     use super::*;
+
+    fn claude_step(name: &str, input: serde_json::Value, output: &str) -> Coordinated {
+        let item = chat::Item {
+            id: "toolu_step".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Tool {
+                name: name.into(),
+                input: input.to_string(),
+                output: output.into(),
+                status: ToolStatus::Succeeded,
+            },
+            started_at: None,
+            at: None,
+        };
+        Coordinated::new(chat::coordination::recognize(&item, Provider::Claude).unwrap())
+    }
+
+    /// Claude addresses an agent by the agent ID it gave it, never by the
+    /// call that started it: the card names the agent as its tab does, and
+    /// one the conversation does not list without showing its ID.
+    #[test]
+    fn a_message_names_its_recipient_as_the_agent_tab_does() {
+        let (mut runtime, _handle) = super::super::view::prepared_runtime_for_test(&[]);
+        std::sync::Arc::make_mut(&mut runtime.snapshot).subagents = vec![chat::Subagent {
+            id: "toolu_relocate".into(),
+            kind: "general-purpose".into(),
+            description: "Relocate the repo".into(),
+            status: ToolStatus::Running,
+            model: None,
+            waiting: false,
+            detail: String::new(),
+            background: true,
+            items: Vec::new(),
+        }];
+        // As the daemon says the provider addresses it.
+        runtime.agent_addresses =
+            std::sync::Arc::new([("a1892b93e88999a7d".into(), "toolu_relocate".into())].into());
+        let listed = |id: &str| runtime.listed_agent_name(id);
+        let send = |to: &str, output: &str| {
+            claude_step(
+                "SendMessage",
+                serde_json::json!({"to": to, "message": "The repo moved", "summary": "repo moved"}),
+                output,
+            )
+        };
+        let line = |coordinated: &Coordinated| {
+            let (verb, label) = coordinated.line(&listed);
+            format!("{verb} {label}")
+        };
+        let matched = send("a1892b93e88999a7d", "");
+        assert_eq!(line(&matched), "Message to general-purpose");
+        assert_eq!(
+            runtime
+                .listed_subagents(&matched)
+                .map(|agent| agent.id.as_str())
+                .collect::<Vec<_>>(),
+            ["toolu_relocate"],
+            "the card links the transcript of the agent it reached"
+        );
+        // An agent from an earlier transcript, or one this conversation does
+        // not list, is not named by its ID.
+        let unmatched = send("a77f00d1e2b3c4d5a", "");
+        assert_eq!(line(&unmatched), "Message to an agent");
+        assert_eq!(runtime.listed_subagents(&unmatched).count(), 0);
+        // A name is the agent's own word for it, until the result pins it.
+        assert_eq!(line(&send("release-notes", "")), "Message to release-notes");
+        let pinned = send(
+            "relocate",
+            r#"{"success":true,"message":"Message queued for delivery to relocate at its next tool round.","pin":{"id":"a1892b93e88999a7d","name":"relocate"}}"#,
+        );
+        assert_eq!(line(&pinned), "Message to general-purpose");
+        assert_eq!(line(&send("*", "")), "Message to every teammate");
+        assert_eq!(
+            line(&send("uds:/run/user/1000/cc-socks/1.sock", "")),
+            "Message to another session"
+        );
+        // A background agent's task is its agent ID; a shell's says nothing.
+        let stop = |task: &str| {
+            line(&claude_step(
+                "TaskStop",
+                serde_json::json!({"task_id": task}),
+                "",
+            ))
+        };
+        assert_eq!(stop("a1892b93e88999a7d"), "Stopped general-purpose");
+        assert_eq!(stop("bq3x9k2f1"), "Stopped a background task");
+    }
+
+    #[test]
+    fn agents_a_step_cannot_name_are_counted() {
+        let reading = |cli| Coordination {
+            kind: Kind::Act(Act::Agents),
+            outcome: Default::default(),
+            subagents: Vec::new(),
+            cli,
+        };
+        let listed = |id: &str| (id == "thread-a").then(|| "reviewer".to_owned());
+        let agents = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect::<Vec<_>>();
+        let native = reading(false);
+        let phrase = |ids: &[&str]| agents_phrase(&native, &agents(ids), &listed);
+        assert_eq!(phrase(&["thread-a"]), "reviewer");
+        assert_eq!(
+            phrase(&["thread-a", "019a4c2e-7f10-7c3e-9b1d-2f5e8a6c4d01"]),
+            "reviewer and another agent"
+        );
+        assert_eq!(
+            phrase(&["019a4c2e-7f10", "019a4c2e-7f11", "thread-a"]),
+            "reviewer and 2 other agents"
+        );
+        assert_eq!(phrase(&["019a4c2e-7f10", "019a4c2e-7f11"]), "2 agents");
+        // A `cagents` agent goes by the short ID the CLI prints for it.
+        assert_eq!(
+            agents_phrase(&reading(true), &agents(&["95fcd1b9e0aa"]), &listed),
+            "95fcd1b9"
+        );
+    }
 
     #[test]
     fn launches_distinguish_native_children_and_separate_sessions_without_guessing() {

@@ -181,6 +181,10 @@ pub(crate) struct Resident {
     #[serde(default)]
     work_hold: Option<chat::WorkHold>,
     pub account_reports: Vec<Update>,
+    /// How the provider addresses the conversation's subagents. A helper
+    /// that predates them reports none.
+    #[serde(default)]
+    pub agent_addresses: Vec<chat::AgentAddress>,
     next_input: u64,
     acknowledged_input_count: usize,
     pub continuity_loss: Option<ContinuityLoss>,
@@ -480,6 +484,7 @@ impl RemoteActor {
             interrupt_subagents: Vec::new(),
             work_hold: None,
             account_reports: Vec::new(),
+            agent_addresses: Vec::new(),
             next_input: 1,
             acknowledged_input_count: 0,
             continuity_loss: None,
@@ -1417,6 +1422,9 @@ impl RemoteActor {
                     .filter(|report| !state.account_reports.contains(report))
                     .cloned(),
             );
+            if resident.agent_addresses != state.agent_addresses {
+                updates.push(Update::AgentAddresses(resident.agent_addresses.clone()));
+            }
             *state = Arc::new(resident);
             updates
         };
@@ -2801,6 +2809,7 @@ impl Server {
             interrupt_subagents,
             work_hold: Some(work_hold),
             account_reports,
+            agent_addresses: self.actor.agent_addresses(),
             next_input: journal.next_input()?,
             acknowledged_input_count: journal.acknowledged_input_count(),
             continuity_loss,
@@ -6316,6 +6325,20 @@ exec /bin/sleep 60
             observed_at: 123,
         };
         next.account_reports.push(usage.clone());
+        let addresses = vec![chat::AgentAddress {
+            address: "a1892b93e88999a7d".into(),
+            subagent: "toolu_relocate".into(),
+        }];
+        next.agent_addresses = addresses.clone();
+        // A helper that predates them reports none.
+        let mut predating = serde_json::to_value(&old).unwrap();
+        predating.as_object_mut().unwrap().remove("agent_addresses");
+        assert!(
+            serde_json::from_value::<Resident>(predating)
+                .unwrap()
+                .agent_addresses
+                .is_empty()
+        );
         let delayed = old.clone();
         let expected = vec![
             Update::Observed {
@@ -6330,6 +6353,7 @@ exec /bin/sleep 60
             Update::PromptAvailable,
             Update::RetainedOutcomes,
             usage,
+            Update::AgentAddresses(addresses),
         ];
         let (observed_poll, poll_started) = crossbeam_channel::bounded(1);
         let (release, wait_release) = crossbeam_channel::bounded(1);

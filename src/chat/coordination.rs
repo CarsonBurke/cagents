@@ -25,8 +25,10 @@ pub struct Coordination {
     pub kind: Kind,
     /// What the step's output says about how it went.
     pub outcome: Outcome,
-    /// Subagents, by the ID this conversation's snapshot lists them under,
-    /// that the step started or addressed. A view offers only those it finds.
+    /// Subagents that the step started or addressed, by an ID a subagent of
+    /// this conversation's snapshot answers to: the one it is listed under,
+    /// or the one its provider addresses it by. A view offers only those it
+    /// finds.
     pub subagents: Vec<String>,
     /// Whether the step is a `cagents` command, which addresses sessions,
     /// rather than a provider's own tool, which addresses its agents.
@@ -171,6 +173,8 @@ pub enum Act {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Outcome {
     pub receipt: Option<Receipt>,
+    /// What a provider's own message tool said became of the message.
+    pub delivery: Option<Delivery>,
     /// Messages the command printed: the answers an `ask` waited for, or
     /// what an inbox held.
     pub messages: Vec<Received>,
@@ -191,6 +195,19 @@ pub struct Receipt {
 }
 
 pub use crate::control::Arrival;
+
+/// What became of a message a provider's own tool sent to one of its agents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// Accepted for the agent to read at its next step.
+    Queued,
+    /// The agent had stopped, and the message started it again.
+    Resumed,
+    /// Left in another session's inbox for it to read.
+    Inbox,
+    /// Accepted, in words this reading does not know.
+    Sent,
+}
 
 /// A message as the CLI prints one it received.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -312,8 +329,10 @@ impl Coordination {
     /// said so and confirmed nothing.
     pub fn status(&self, reported: ToolStatus) -> ToolStatus {
         let outcome = &self.outcome;
-        let confirmed =
-            outcome.receipt.is_some() || outcome.run.is_some() || !outcome.messages.is_empty();
+        let confirmed = outcome.receipt.is_some()
+            || outcome.delivery.is_some()
+            || outcome.run.is_some()
+            || !outcome.messages.is_empty();
         match (&self.kind, reported) {
             (Kind::Message(_) | Kind::Spawn(_), ToolStatus::Succeeded)
                 if outcome.error.is_some() && !confirmed =>
@@ -470,78 +489,156 @@ fn claude(id: &str, name: &str, input: &str, output: &str) -> Option<Coordinatio
     let input: Value = serde_json::from_str(input).ok()?;
     let mut subagents = Vec::new();
     let mut outcome = Outcome::default();
-    let kind = match name {
-        // `Task` is the tool's name before Claude Code renamed it.
-        "Agent" | "Task" => {
-            // The tool call's ID is the subagent's: Claude reports its
-            // progress under the call that started it.
-            subagents.push(id.to_owned());
-            // Claude Code may background an agent it was not asked to, and
-            // says so in place of a report.
-            let waits = input["run_in_background"].as_bool() != Some(true)
-                && !output.trim_start().starts_with("Async agent launched");
-            // A foreground agent's result is its report. A background one's
-            // is the harness acknowledging the launch, and its report comes
-            // later as a delivery of its own.
-            if waits && let Some(result) = claude_report(output) {
-                outcome.run = Some(Run {
-                    agent: String::new(),
-                    state: None,
-                    timed_out: false,
-                    result,
-                    ..Run::default()
-                });
+    let kind =
+        match name {
+            // `Task` is the tool's name before Claude Code renamed it.
+            "Agent" | "Task" => {
+                // The tool call's ID is the subagent's: Claude reports its
+                // progress under the call that started it.
+                subagents.push(id.to_owned());
+                // Claude Code may background an agent it was not asked to, and
+                // says so in place of a report.
+                let waits = input["run_in_background"].as_bool() != Some(true)
+                    && !output.trim_start().starts_with("Async agent launched");
+                // A foreground agent's result is its report. A background one's
+                // is the harness acknowledging the launch, and its report comes
+                // later as a delivery of its own.
+                if waits && let Some(result) = claude_report(output) {
+                    outcome.run = Some(Run {
+                        agent: String::new(),
+                        state: None,
+                        timed_out: false,
+                        result,
+                        ..Run::default()
+                    });
+                }
+                Kind::Spawn(Spawn {
+                    agents: vec![Delegate {
+                        name: field(&input, "name").into(),
+                        kind: field(&input, "subagent_type").into(),
+                        description: field(&input, "description").into(),
+                        prompt: Text::Inline(field(&input, "prompt").into()),
+                    }],
+                    model: field(&input, "model").into(),
+                    waits,
+                    ..Spawn::default()
+                })
             }
-            Kind::Spawn(Spawn {
-                agents: vec![Delegate {
-                    name: field(&input, "name").into(),
-                    kind: field(&input, "subagent_type").into(),
-                    description: field(&input, "description").into(),
-                    prompt: Text::Inline(field(&input, "prompt").into()),
-                }],
-                model: field(&input, "model").into(),
-                waits,
-                ..Spawn::default()
-            })
-        }
-        "SendMessage" => Kind::Message(Outbound {
-            kind: OutboundKind::Send,
-            to: field(&input, "to").into(),
-            body: Text::Inline(match &input["message"] {
-                Value::String(text) => text.clone(),
-                Value::Null => String::new(),
-                // A structured protocol message, such as a shutdown request.
-                other => other.to_string(),
+            "SendMessage" => {
+                let to = field(&input, "to");
+                let result = claude_sent(output);
+                outcome.delivery = result.delivery;
+                outcome.error = result.error;
+                // The agent the result pinned is the one it reached, whatever
+                // name the call gave it. Every teammate (`*`) and another
+                // session (`uds:…`) are none of this conversation's agents.
+                subagents.extend(result.agent.or_else(|| {
+                    (!to.is_empty() && to != "*" && !to.contains(':')).then(|| to.into())
+                }));
+                Kind::Message(Outbound {
+                    kind: OutboundKind::Send,
+                    to: to.into(),
+                    body: Text::Inline(match &input["message"] {
+                        Value::String(text) => text.clone(),
+                        Value::Null => String::new(),
+                        // A structured protocol message, such as a shutdown request.
+                        other => other.to_string(),
+                    }),
+                    summary: field(&input, "summary").into(),
+                    waits: false,
+                })
+            }
+            "SubagentHandback" => Kind::Message(Outbound {
+                kind: OutboundKind::Report,
+                to: String::new(),
+                body: Text::Inline(field(&input, "message").into()),
+                summary: String::new(),
+                waits: false,
             }),
-            summary: field(&input, "summary").into(),
-            waits: false,
-        }),
-        "SubagentHandback" => Kind::Message(Outbound {
-            kind: OutboundKind::Report,
-            to: String::new(),
-            body: Text::Inline(field(&input, "message").into()),
-            summary: String::new(),
-            waits: false,
-        }),
-        "TaskStop" | "KillShell" => Kind::Act(Act::Stop {
-            task: ["task_id", "shell_id"]
-                .into_iter()
-                .map(|key| field(&input, key))
-                .find(|task| !task.is_empty())
-                .unwrap_or_default()
-                .into(),
-        }),
-        "TaskOutput" => Kind::Act(Act::Output {
-            task: field(&input, "task_id").into(),
-        }),
-        _ => return None,
-    };
+            // A background agent's task is its agent ID, so the task may be
+            // one of this conversation's agents as well as a shell.
+            "TaskStop" | "KillShell" => {
+                let task: String = ["task_id", "shell_id"]
+                    .into_iter()
+                    .map(|key| field(&input, key))
+                    .find(|task| !task.is_empty())
+                    .unwrap_or_default()
+                    .into();
+                subagents.extend((!task.is_empty()).then(|| task.clone()));
+                Kind::Act(Act::Stop { task })
+            }
+            "TaskOutput" => {
+                let task: String = field(&input, "task_id").into();
+                subagents.extend((!task.is_empty()).then(|| task.clone()));
+                Kind::Act(Act::Output { task })
+            }
+            _ => return None,
+        };
     Some(Coordination {
         kind,
         outcome,
         subagents,
         cli: false,
     })
+}
+
+/// What Claude Code's `SendMessage` result says of a message.
+#[derive(Default)]
+struct Sent {
+    delivery: Option<Delivery>,
+    error: Option<String>,
+    /// The agent ID of the agent it reached.
+    agent: Option<String>,
+}
+
+/// `SendMessage` answers with JSON: whether it went, a sentence on how, and
+/// the agent it went to, as `{"success":true,"message":"Message queued for
+/// delivery to reviewer at its next tool round.","pin":{"id":"a03…",
+/// "name":"reviewer"}}`. Nothing is read from a result in another shape.
+fn claude_sent(output: &str) -> Sent {
+    let Ok(result) = serde_json::from_str::<Value>(output.trim()) else {
+        return Sent::default();
+    };
+    let said = field(&result, "message");
+    let agent = ["resumedAgentId", "revivedAgentId"]
+        .into_iter()
+        .map(|key| field(&result, key))
+        .chain([field(&result["pin"], "id")])
+        .find(|agent| !agent.is_empty())
+        .map(str::to_owned);
+    match result["success"].as_bool() {
+        Some(true) => Sent {
+            delivery: Some(
+                if result["resumedAgentId"].is_string()
+                    || result["revivedAgentId"].is_string()
+                    || said.starts_with("Resuming agent")
+                {
+                    Delivery::Resumed
+                } else if said.contains("inbox") {
+                    Delivery::Inbox
+                } else if said.contains("queued") {
+                    Delivery::Queued
+                } else {
+                    Delivery::Sent
+                },
+            ),
+            error: None,
+            agent,
+        },
+        Some(false) => Sent {
+            delivery: None,
+            // Its first line; the rest tells the model what to try next.
+            error: Some(
+                said.lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty())
+                    .unwrap_or("Claude did not send it")
+                    .to_owned(),
+            ),
+            agent,
+        },
+        None => Sent::default(),
+    }
 }
 
 /// A foreground agent's report, without the usage Claude Code appends to it.
@@ -836,6 +933,74 @@ mod tests {
         );
         assert!(!sent.cli, "a provider's own tool addresses its agents");
         assert!(native(Provider::Claude, "toolu_4", "Bash", "{}", "").is_none());
+    }
+
+    /// Claude's `SendMessage` names its recipient by agent ID or by name, and
+    /// answers with JSON saying whether it went and which agent it reached.
+    #[test]
+    fn claude_messages_read_whom_they_reached_and_how_it_went() {
+        let send = |to: &str, output: &str| {
+            native(
+                Provider::Claude,
+                "toolu_send",
+                "SendMessage",
+                &serde_json::json!({"to": to, "message": "The repo moved", "summary": "repo moved"})
+                    .to_string(),
+                output,
+            )
+            .unwrap()
+        };
+        let queued = send(
+            "a1892b93e88999a7d",
+            r#"{"success":true,"message":"Message queued for delivery to a1892b93e88999a7d at its next tool round.","pin":{"id":"a1892b93e88999a7d","name":"a1892b93e88999a7d","ref":"68cf75"}}"#,
+        );
+        assert_eq!(queued.subagents, ["a1892b93e88999a7d"]);
+        assert_eq!(queued.outcome.delivery, Some(Delivery::Queued));
+        assert_eq!(queued.status(ToolStatus::Succeeded), ToolStatus::Succeeded);
+        // A name resolves to the agent ID the result pinned.
+        let named = send(
+            "reviewer",
+            r#"{"success":true,"message":"Resuming agent reviewer","revivedAgentId":"a0aac0bb27f14ac7e","pin":{"id":"a0aac0bb27f14ac7e","name":"reviewer","ref":"04aad4"}}"#,
+        );
+        assert_eq!(named.subagents, ["a0aac0bb27f14ac7e"]);
+        assert_eq!(named.outcome.delivery, Some(Delivery::Resumed));
+        // Claude reports a refusal as a successful call.
+        let refused = send(
+            "persist-ui-state",
+            r#"{"success":false,"message":"No agent named 'persist-ui-state' is reachable.\nUse ListAgents to see everyone you can message."}"#,
+        );
+        assert_eq!(refused.status(ToolStatus::Succeeded), ToolStatus::Failed);
+        assert_eq!(
+            refused.outcome.error.as_deref(),
+            Some("No agent named 'persist-ui-state' is reachable.")
+        );
+        assert_eq!(refused.subagents, ["persist-ui-state"]);
+        // Until the result arrives, the recipient is as the call named it.
+        assert_eq!(
+            send("a1892b93e88999a7d", "").subagents,
+            ["a1892b93e88999a7d"]
+        );
+        assert_eq!(send("a1892b93e88999a7d", "").outcome, Outcome::default());
+        let inbox = send(
+            "uds:/run/user/1000/cc-socks/1.sock",
+            r#"{"success":true,"message":"Sent; in that session's inbox, not yet read by its Claude"}"#,
+        );
+        assert!(
+            inbox.subagents.is_empty(),
+            "another session is not an agent of this one"
+        );
+        assert_eq!(inbox.outcome.delivery, Some(Delivery::Inbox));
+        assert!(send("*", "").subagents.is_empty());
+        // A background agent's task is its agent ID.
+        let stopped = native(
+            Provider::Claude,
+            "toolu_stop",
+            "TaskStop",
+            r#"{"task_id":"a1892b93e88999a7d"}"#,
+            "",
+        )
+        .unwrap();
+        assert_eq!(stopped.subagents, ["a1892b93e88999a7d"]);
     }
 
     #[test]

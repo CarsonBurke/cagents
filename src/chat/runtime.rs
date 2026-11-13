@@ -1,6 +1,6 @@
 //! Daemon-owned, non-PTY provider actor. Detaching never stops its transport.
 use super::{
-    Command, Event, Item, ItemContent, Phase, Snapshot, Subagent, ToolStatus,
+    AgentAddress, Command, Event, Item, ItemContent, Phase, Snapshot, Subagent, ToolStatus,
     protocol::{Adapter, ProcessSpec, Step, TransportSpec},
 };
 use crate::account::LiveReport;
@@ -183,6 +183,10 @@ pub(crate) enum Update {
         /// Unix milliseconds at which the runtime read the report.
         observed_at: u64,
     },
+    /// The provider said how it addresses another of the conversation's
+    /// subagents. Every address known so far, which only accumulate; the
+    /// snapshot, whose layout older peers share, holds none.
+    AgentAddresses(Vec<AgentAddress>),
 }
 
 #[derive(Clone)]
@@ -209,11 +213,42 @@ pub(crate) enum TitleUnavailable {
     Poisoned,
 }
 
+/// How the provider addresses a conversation's subagents, shared between its
+/// actor, which learns them, and its handle, which reports them.
+#[derive(Clone, Default)]
+struct AgentAddresses(Arc<Mutex<BTreeMap<String, String>>>);
+
+impl AgentAddresses {
+    /// Records an address, and says whether it was news. An address keeps
+    /// the agent it first named.
+    fn learn(&self, address: AgentAddress) -> bool {
+        let mut known = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if known.contains_key(&address.address) {
+            return false;
+        }
+        known.insert(address.address, address.subagent);
+        true
+    }
+
+    fn list(&self) -> Vec<AgentAddress> {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .map(|(address, subagent)| AgentAddress {
+                address: address.clone(),
+                subagent: subagent.clone(),
+            })
+            .collect()
+    }
+}
+
 struct Inner {
     commands: crossbeam_channel::Sender<CommandRequest>,
     wake: Mutex<UnixStream>,
     state: Arc<Mutex<Snapshot>>,
     confirmed_session: Arc<Mutex<Option<String>>>,
+    agent_addresses: AgentAddresses,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
@@ -483,6 +518,7 @@ impl LocalHandle {
         let failure = Arc::new(Mutex::new(None));
         let store = Arc::new(Mutex::new(store));
         let confirmed_session = Arc::new(Mutex::new(None));
+        let agent_addresses = AgentAddresses::default();
         let preserve_native = Arc::new(AtomicBool::new(false));
         let release_native = Arc::new(AtomicBool::new(false));
         let retain_cleanup_receipt = Arc::new(AtomicBool::new(false));
@@ -495,6 +531,7 @@ impl LocalHandle {
             wake: Mutex::new(wake),
             state: state.clone(),
             confirmed_session: confirmed_session.clone(),
+            agent_addresses: agent_addresses.clone(),
             visible: visible.clone(),
             observe_next: observe_next.clone(),
             stop: stop.clone(),
@@ -543,6 +580,7 @@ impl LocalHandle {
                     adapter,
                     state,
                     confirmed_session,
+                    agent_addresses,
                     store,
                     visible,
                     observe_next,
@@ -1428,6 +1466,11 @@ impl LocalHandle {
             .unwrap_or_else(|p| p.into_inner())
             .work_hold()
     }
+    /// How the provider addresses this conversation's subagents, where that
+    /// is not by the IDs its snapshot lists them under.
+    pub(crate) fn agent_addresses(&self) -> Vec<AgentAddress> {
+        self.0.agent_addresses.list()
+    }
     pub(crate) fn background_subagents(&self) -> Vec<String> {
         let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
         state
@@ -2136,6 +2179,7 @@ struct Actor {
     adapter: Box<dyn Adapter>,
     state: Arc<Mutex<Snapshot>>,
     confirmed_session: Arc<Mutex<Option<String>>>,
+    agent_addresses: AgentAddresses,
     store: Arc<Mutex<Store>>,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
@@ -3078,7 +3122,7 @@ impl Actor {
         let observed = step
             .events
             .iter()
-            .any(|event| !matches!(event, Event::AccountUsage(_)));
+            .any(|event| !matches!(event, Event::AccountUsage(_) | Event::AgentAddress(_)));
         let identity = step.events.iter().rev().find_map(|event| match event {
             Event::Session { id, .. } => Some(Some(id.clone())),
             Event::Reset { .. } => Some(None),
@@ -3218,6 +3262,12 @@ impl Actor {
                     report,
                     observed_at: observed_at().unwrap_or_default(),
                 });
+                continue;
+            }
+            if let Event::AgentAddress(address) = event {
+                if self.agent_addresses.learn(address) {
+                    (self.notify)(Update::AgentAddresses(self.agent_addresses.list()));
+                }
                 continue;
             }
             let fatal = match &event {
@@ -3765,6 +3815,7 @@ fn apply_projected_event(
         // About the account rather than the conversation: `step` forwards it
         // to the surfaces before the store, so it never reaches a snapshot.
         Event::AccountUsage(_)
+        | Event::AgentAddress(_)
         | Event::LoginRecovered { .. }
         | Event::LoginVerificationFailed { .. } => {}
         Event::Capabilities(value) => state.capabilities = value,
@@ -7819,6 +7870,90 @@ mod tests {
         assert!(handle.snapshot(None).unwrap().items.is_empty());
         handle.close().unwrap();
     }
+    /// How the provider addresses a subagent reaches the surfaces as every
+    /// address known so far, once each is learned, and never the snapshot,
+    /// whose layout older peers share.
+    #[test]
+    fn an_agent_address_reaches_the_surfaces_once_and_never_the_snapshot() {
+        fn address(address: &str, subagent: &str) -> Event {
+            Event::AgentAddress(AgentAddress {
+                address: address.into(),
+                subagent: subagent.into(),
+            })
+        }
+        struct Addresser;
+        impl Adapter for Addresser {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step {
+                    suppress_current_notification: false,
+                    notification_preview: None,
+                    writes: vec![json!({})],
+                    // As a reopened history says of the agents it started.
+                    events: vec![address("a1892b93e88999a7d", "toolu_relocate")],
+                })
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Err("fixture takes no commands".into())
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                Ok(Step {
+                    suppress_current_notification: false,
+                    notification_preview: None,
+                    writes: Vec::new(),
+                    events: vec![
+                        // Said again, and a later agent's first word.
+                        address("a1892b93e88999a7d", "toolu_relocate"),
+                        address("a77f00d1e2b3c4d5a", "toolu_review"),
+                    ],
+                })
+            }
+        }
+        let spec = ProcessSpec {
+            stdout_noise: None,
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: std::env::temp_dir(),
+            environment: BTreeMap::new(),
+        };
+        let mut adapter: Box<dyn Adapter> = Box::new(Addresser);
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let (notify, notified) = crossbeam_channel::unbounded();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, move |update| {
+            if let Update::AgentAddresses(addresses) = update {
+                let _ = notify.send(addresses);
+            }
+        })
+        .unwrap();
+        let listed = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(address, subagent)| AgentAddress {
+                    address: (*address).into(),
+                    subagent: (*subagent).into(),
+                })
+                .collect::<Vec<_>>()
+        };
+        let first = listed(&[("a1892b93e88999a7d", "toolu_relocate")]);
+        let both = listed(&[
+            ("a1892b93e88999a7d", "toolu_relocate"),
+            ("a77f00d1e2b3c4d5a", "toolu_review"),
+        ]);
+        let timeout = Duration::from_secs(2);
+        assert_eq!(notified.recv_timeout(timeout).unwrap(), first);
+        assert_eq!(notified.recv_timeout(timeout).unwrap(), both);
+        assert!(
+            notified.recv_timeout(Duration::from_millis(200)).is_err(),
+            "an address already known is not news"
+        );
+        assert_eq!(handle.agent_addresses(), both);
+        assert!(handle.snapshot(None).unwrap().subagents.is_empty());
+        handle.close().unwrap();
+    }
     /// The host records a run's outcome the moment it is announced and then
     /// asks the handle which conversation produced it.
     #[test]
@@ -8136,6 +8271,7 @@ mod tests {
                 Update::Presentation => panic!("hidden close must not request presentation"),
                 Update::Observed { .. }
                 | Update::AccountUsage { .. }
+                | Update::AgentAddresses(_)
                 | Update::Attention(_)
                 | Update::AttentionContext { .. }
                 | Update::Ready

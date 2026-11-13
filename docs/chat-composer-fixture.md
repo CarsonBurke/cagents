@@ -218,6 +218,10 @@ background work: a `task_updated` frame patching the task `killed`, with no
 further notice. `tests/fixtures/waiting-agent-scene.sh` builds a scene on
 this: an agent that reports it is waiting, then is resumed, finishes, fails,
 is resumed elsewhere, or is stopped from its tab.
+`tests/fixtures/message-card-scene.sh` builds another: an agent started in
+the background, then messages to it with Claude Code's `SendMessage`, one
+short, one long enough to fold, one Claude refuses and one to an agent the
+conversation does not list, each answered with the JSON Claude Code returns.
 
 To check model and usage reporting, copy a recorded `initialize` response to
 `fixture-models.json`, such as `fixtures/accounts/claude-initialize-models.json`,
