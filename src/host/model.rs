@@ -43,6 +43,8 @@ pub(super) mod floor;
 pub(super) use execution::ResidentRelease;
 mod lineage;
 mod mailbox;
+pub(super) use execution::{EARLIER_MESSAGES, UNVERIFIED_BEHIND, UNVERIFIED_REFUSAL};
+pub(super) use mailbox::{MESSAGE_RUN_KEY, MessageHandoff};
 mod native_actor;
 mod native_actor_retirement;
 pub(super) use native_actor::NativeActorEvent;
@@ -1534,7 +1536,8 @@ mod tests {
         let legacy = Connection::open(&path).unwrap();
         legacy
             .execute_batch(
-                "DROP TABLE automation_precheck_history_cleanup;
+                "DROP TABLE console_relaunches;
+                 DROP TABLE automation_precheck_history_cleanup;
                  DROP TABLE automation_retired_manual_requests;
                  DROP INDEX automation_removed_history;
                  DROP INDEX automation_firing_successors;

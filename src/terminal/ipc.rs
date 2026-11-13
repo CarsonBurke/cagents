@@ -227,13 +227,16 @@ use crate::{
 /// Version 173 appends `ServerMessage::ChatAgentAddresses`, which says how a
 /// provider addresses a chat's subagents. Snapshots keep their layout, which
 /// the update sources share.
-/// Version 174 adds scope revisions, closed pane identities and canonical
+/// Version 174 appends the agent operations `Prompt` and `Deliver`, which say
+/// whether an existing agent took a prompt or message as a run now or holds
+/// it behind its current work, and their replies `Prompted` and `Handed`.
+/// Version 175 adds scope revisions, closed pane identities and canonical
 /// changed rows to `WorkspaceModelEdited`. Windows apply matching revisions or
 /// read only the affected scope with `ReadWorkspaceView`; reconnect snapshots,
 /// typed edit receipts and narrow metadata reads have appended requests/replies.
 /// The changed watch snapshot and edge shape require matched windows; older
 /// carried CLIs retain explicit whole-model reads/edits but cannot watch.
-pub const PROTOCOL_VERSION: u16 = 174;
+pub const PROTOCOL_VERSION: u16 = 175;
 /// The install candidate line's protocol. Every message an update exchanges
 /// with its daemon (Connect, the upgrade preview and preparation, and the
 /// inspector's frozen and saved-history requests) has this release's

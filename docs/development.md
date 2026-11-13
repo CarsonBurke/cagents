@@ -2007,6 +2007,47 @@ chat and console agents, an offline Codex app-server, two untitled conversations
 in one project, a channel containing ` Details: `, a shell and `sleep 86400`.
 Use `--untitled 0|1|2`, `--no-codex`, `--no-console` and `--no-child` to vary that baseline.
 
+Use `--codex-pause 90` to keep the offline Codex turn active at the update
+prompt. `--codex-never-confirm-interrupt` acknowledges interruption without a
+completion receipt; `--codex-never-confirm-close` retains the connection to
+exercise Prepared recovery. These options configure the same fake peer through
+the private root's `codex-fixture.json`, restoring its `CAGENTS_TOOL_ROWS_*`
+settings after native launches filter the caller's environment. Accepted turn
+notifications and interruption requests are recorded in
+`logs/codex-provider.jsonl` with their thread and turn identities.
+
+Use `--expect-refusal interrupt` with the unconfirmed-interrupt peer, or
+`--expect-refusal cancel --answer no` to decline the review. These scenarios
+pass only when the exact expected refusal preserves OLD's installed version,
+daemon process, windows and inventory. The interrupt scenario also checks its
+30-second settlement bound and absence of an interrupted receipt.
+`--require-prepared` records the checkpoint transitions and requires this job's
+source proof in Prepared. `--plain-restart` then exercises an ordinary daemon
+start after recovery: it pins only the private daemon by its socket peer,
+executable, namespace and lock, simulates a crash with a pidfd, and verifies the
+original census again through the public command. Both windows must reopen the
+paused history and console without starting provider work. The original
+recovered views and records remain under `recovered/`.
+
+Comparison qualifications use the shared update census verifier's fresh usable
+outcome, bound to this job and the original census bytes. That outcome can
+account for a paused conversation; it cannot excuse a missing pane, changed
+thread or recipe, replacement run, or unrelated daemon. A history presentation
+must match the exact source projection, and a console relaunch must retain its
+pane and Running run while selecting this successful job's target executable.
+Cancellation additionally needs the typed interruption choice and its matching
+accepted parent-turn receipt. Raw changes remain in the report alongside each
+qualified disposition.
+
+`--stall-window-after-flush SLOT` injects a window that stalls after saving: it
+SIGSTOPs that source window once its `final_flush complete=true` record appears
+and its diagnostics append has released the lock. `--stall-suppress-flush` also
+removes that record, so the update cannot prove the save, and
+`--stall-resume-after SECONDS` continues the window later. `--stall-under-lock`
+instead stops the window while that append still holds the diagnostics lock.
+`window-close-trace.jsonl` labels each injection and records whether the stop
+landed under the lock, attributed to the window's own pid in `/proc/locks`.
+
 Optional problem states each have their own switch:
 
 - `--no-init`: a Claude peer that accepts work without reporting a session ID.

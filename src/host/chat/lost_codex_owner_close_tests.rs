@@ -861,6 +861,7 @@ fn bound_agent(fixture: &Fixture, root: &std::path::Path) -> crate::agent_execut
         idempotency_key: root.display().to_string(),
     };
     let accepted = registry.submit_agent(&Origin::User, &submit, 1).unwrap();
+    assert!(registry.claim_agent_dispatch(&accepted, 1).unwrap());
     let source = HostedSession::Chat(fixture.source.clone());
     registry
         .bind_agent(accepted.agent.id, None, source.clone())

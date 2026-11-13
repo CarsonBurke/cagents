@@ -57,7 +57,7 @@ pub struct OlderClient {
 /// across an update to this release and keep running its CLI.
 const CANDIDATE_LINE: OlderClient = OlderClient {
     protocol: CANDIDATE_LINE_PROTOCOL,
-    proven_at: 174,
+    proven_at: 175,
     client_requests: 74,
     server_messages: 17,
     server_responses: 40,
@@ -77,7 +77,7 @@ const FIRING_REPLIES: &[&str] = &["Firing", "History", "Detail"];
 
 /// The first protocol whose `WorkspaceModelEdited` carries the edit's effects.
 /// A client before it cannot read the edge, so it may not watch the model.
-const MODEL_EDGES_WITH_EFFECTS: u16 = 174;
+const MODEL_EDGES_WITH_EFFECTS: u16 = 175;
 
 /// The `ServerMessage` variants that changed shape in place for clients before
 /// [`MODEL_EDGES_WITH_EFFECTS`]. The wire format proof skips exactly these.

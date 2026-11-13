@@ -567,7 +567,7 @@ measurement on a realistic-size workspace.
    file's contents shrink from 31.8 MB to 25.0 MB, but the file keeps its
    high-water mark (37.7 MB) as free pages SQLite reuses until the converted
    operations age out. Closed panes and drafts move to stage 5.
-4. Deltas to subscribers and per-scope reads (protocol 174). Edges carry
+4. Deltas to subscribers and per-scope reads (protocol 175). Edges carry
    changed revisions and closed ids, and the daemon serves scope, snapshot and
    metadata reads and edit receipts. Windows adopting them follows.
 5. Daemon-owned closed-pane history and drafts; windows become subscribers

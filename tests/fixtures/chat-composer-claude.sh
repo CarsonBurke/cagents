@@ -2,6 +2,9 @@
 # Offline native-chat fixture. The first turn stays busy until interrupted,
 # allowing the UI to exercise both asynchronous delivery priorities. Later
 # turns complete immediately so the same session also covers the idle composer.
+# While fixture-first-turn-seconds holds a whole number of seconds, the first
+# turn instead finishes by itself that long after it starts, as real work
+# does, unless it is interrupted first.
 set -eu
 
 if [ "${1:-}" = --version ]; then
@@ -324,9 +327,13 @@ frames_turn() {
 # Claude's Bash tool does, and reports its output and exit code. Checks of
 # where a provider's commands run, and of a command the system stops, use it.
 run_file=$config/fixture-run-command
+# fixture-run-once is the same for one turn: the first turn to start after it
+# is written takes it, so of several providers sharing this configuration,
+# only that one runs it.
+once_file=$config/fixture-run-once
 run_turn() {
     id="run-$turn"
-    command=$(head -n 1 "$run_file")
+    command=$(head -n 1 "$1")
     emit_record "$(jq -cn --arg id "$id" --arg command "$command" '{type:"assistant",uuid:("fixture-"+$id),message:{id:("fixture-"+$id),role:"assistant",content:[{type:"tool_use",id:$id,name:"Bash",input:{command:$command,description:"Run the fixture command"}}]}}')"
     status=0
     output=$(sh -c "$command" 2>&1 </dev/null) || status=$?
@@ -399,6 +406,16 @@ if [ "$probe" = false ] && [ -e "$config/fixture-slow-start" ]; then
 fi
 
 busy=false
+# When the busy first turn finishes by itself, in microseconds of the clock.
+settle_at=
+first_turn_seconds=
+if [ "$probe" = false ] && [ -s "$config/fixture-first-turn-seconds" ]; then
+    first_turn_seconds=$(head -n 1 "$config/fixture-first-turn-seconds")
+    if ! [[ $first_turn_seconds =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "fixture: fixture-first-turn-seconds must hold whole seconds, such as 8, not '$first_turn_seconds'" >&2
+        exit 2
+    fi
+fi
 fast=off
 model=haiku
 if [ "$fast_fixture" = 1 ]; then model=opus; fi
@@ -565,7 +582,34 @@ stream_reply_turn() {
     jq -cn '{type:"stream_event",event:{type:"content_block_stop",index:0}}'
 }
 
-while read_frame; do
+# Ends the busy first turn as finished, unless an interrupt ended it first.
+settle_first_turn() {
+    settle_at=
+    if [ "$busy" = true ]; then
+        busy=false
+        jq -cn --arg session "$session" --arg turn "$turn" \
+            '{type:"result",uuid:("fixture-result-"+$turn),subtype:"success",is_error:false,session_id:$session}'
+    fi
+}
+
+# Reads the next frame, or settles the first turn when its time comes first.
+next_frame() {
+    local now remaining timeout
+    while [ -n "$settle_at" ]; do
+        now=${EPOCHREALTIME/./}
+        remaining=$((settle_at - now))
+        if [ "$remaining" -le 0 ]; then
+            settle_first_turn
+            break
+        fi
+        printf -v timeout '%d.%06d' "$((remaining / 1000000))" "$((remaining % 1000000))"
+        if read_frame "$timeout"; then return 0; fi
+        if [ "$input_eof" = true ]; then return 1; fi
+    done
+    read_frame
+}
+
+while next_frame; do
     kind=$(printf '%s' "$frame" | jq -r '.type')
     case $kind in
         control_request)
@@ -625,7 +669,13 @@ while read_frame; do
                     frames_turn
                     if [ "$frames_ended" = 1 ]; then continue; fi
                 fi
-                if [ -s "$run_file" ]; then run_turn; fi
+                taken=$once_file.$$
+                if mv "$once_file" "$taken" 2>/dev/null; then
+                    run_turn "$taken"
+                    rm -f "$taken"
+                elif [ -s "$run_file" ]; then
+                    run_turn "$run_file"
+                fi
                 if [ -f "$fixture_image" ]; then image_turn; fi
                 # A Markdown file in the config directory can stand in for the
                 # answer, so rendering and long-transcript checks need no live
@@ -646,6 +696,9 @@ while read_frame; do
                 printf '%s\n' "$assistant"
                 if [ "$turn" -eq 1 ]; then
                     busy=true
+                    if [ -n "$first_turn_seconds" ]; then
+                        settle_at=$((${EPOCHREALTIME/./} + first_turn_seconds * 1000000))
+                    fi
                 else
                     busy=false
                     jq -cn --arg session "$session" --arg turn "$turn" \

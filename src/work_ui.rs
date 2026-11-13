@@ -31,6 +31,29 @@ const COLUMN_WIDTH: f32 = 280.0;
 const SCOPE_MENU_WIDTH: f32 = 280.0;
 const CARD_MENU_WIDTH: f32 = 264.0;
 
+/// A board card's height before it has been measured: branch, title, facts
+/// and footer at the compact sizes.
+const CARD_ESTIMATE: f32 = 104.0;
+/// A list row's height before it has been measured: title and facts lines.
+const ROW_ESTIMATE: f32 = 54.0;
+
+/// The keys a culled column keeps each card's widget state by.
+fn card_keys(items: &[&Item]) -> Vec<u64> {
+    items
+        .iter()
+        .map(|item| card_key(&item.project, &item.key))
+        .collect()
+}
+
+/// A card's key in a culled column, from what identifies it.
+fn card_key(project: &std::path::Path, key: &ItemKey) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    project.hash(&mut hasher);
+    key.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// One card on the board, by what identifies it to the daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CardRef {
@@ -622,21 +645,23 @@ impl State {
             .width(Length::Fill)
             .into()
         } else {
-            widget::scrollable(
-                widget::column::with_children(
-                    items
-                        .into_iter()
-                        .map(|item| self.card(item))
-                        .collect::<Vec<_>>(),
+            crate::ui_controls::keep_in_place(
+                widget::scrollable(
+                    widget::container(
+                        crate::ui_controls::culled_column(card_keys(&items), move |index| {
+                            self.card(items[index])
+                        })
+                        .spacing(space::S)
+                        .estimate(CARD_ESTIMATE)
+                        .keep_built(self.open_menu_key()),
+                    )
+                    .padding(design::with_vertical_rail(Padding::from([0.0, space::XS]))),
                 )
-                .spacing(space::S)
-                .padding(design::with_vertical_rail(Padding::from([0.0, space::XS]))),
+                .direction(iced::widget::scrollable::Direction::Vertical(
+                    design::scrollbar(),
+                ))
+                .height(Length::Fill),
             )
-            .direction(iced::widget::scrollable::Direction::Vertical(
-                design::scrollbar(),
-            ))
-            .height(Length::Fill)
-            .into()
         };
         widget::container(
             widget::column::with_children(vec![header.into(), body])
@@ -655,27 +680,39 @@ impl State {
     }
 
     fn list_view(&self) -> Element<'_, Action> {
-        let rows = self
-            .visible()
-            .map(|item| self.row(item))
-            .collect::<Vec<_>>();
-        if rows.is_empty() {
+        let items = self.visible().collect::<Vec<_>>();
+        if items.is_empty() {
             return self.no_match();
         }
-        widget::scrollable(
-            widget::column::with_children(rows)
-                .spacing(space::XS)
+        crate::ui_controls::keep_in_place(
+            widget::scrollable(
+                widget::container(
+                    crate::ui_controls::culled_column(card_keys(&items), move |index| {
+                        self.row(items[index])
+                    })
+                    .spacing(space::XS)
+                    .estimate(ROW_ESTIMATE)
+                    .keep_built(self.open_menu_key()),
+                )
                 .padding(design::with_vertical_rail(Padding::from([
                     space::M,
                     space::L,
                 ]))),
+            )
+            .direction(iced::widget::scrollable::Direction::Vertical(
+                design::scrollbar(),
+            ))
+            .width(Length::Fill)
+            .height(Length::Fill),
         )
-        .direction(iced::widget::scrollable::Direction::Vertical(
-            design::scrollbar(),
-        ))
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+    }
+
+    /// The card whose menu is open stays built while it scrolls away, so
+    /// its menu stays open and closes on a click elsewhere.
+    fn open_menu_key(&self) -> Option<u64> {
+        self.menu
+            .as_ref()
+            .map(|card| card_key(&card.project, &card.key))
     }
 
     fn no_match(&self) -> Element<'_, Action> {
@@ -1623,9 +1660,12 @@ mod tests {
         }
     }
 
-    /// One frame of a Work board at a long-lived installation's scale: 600
-    /// cards, every one with an open pull request whose checks and review
-    /// are known, in the board and list layouts. Run it optimized:
+    /// Frames of a Work board at a long-lived installation's scale, 600 cards
+    /// and, for headroom, 3,000, every one with an open pull request whose
+    /// checks and review are known, in the board and list layouts. A rebuilt
+    /// frame makes the view again, as every message does; a scrolled frame
+    /// delivers a wheel step and the redraw that follows it, as scrolling
+    /// does. Run it optimized:
     ///
     /// ```sh
     /// scripts/cargo-gate test --locked --profile local --no-default-features --features ui \
@@ -1636,79 +1676,176 @@ mod tests {
     fn board_frame_workload() {
         use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
         use std::time::{Duration, Instant};
-        const CARDS: usize = 600;
         const FRAMES: usize = 48;
         const WARMUP: usize = 8;
+        const SCREEN: iced::Size = iced::Size::new(1240.0, 900.0);
+        const STEP: f32 = 96.0;
+
+        /// The furthest any scrollable has been scrolled down.
+        struct Scrolled(f32);
+        impl iced::advanced::widget::Operation for Scrolled {
+            fn traverse(
+                &mut self,
+                operate: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation<()>),
+            ) {
+                operate(self);
+            }
+            fn scrollable(
+                &mut self,
+                _id: Option<&iced::advanced::widget::Id>,
+                _bounds: iced::Rectangle,
+                _content_bounds: iced::Rectangle,
+                translation: iced::Vector,
+                _state: &mut dyn iced::advanced::widget::operation::Scrollable,
+            ) {
+                self.0 = self.0.max(translation.y);
+            }
+        }
+
         let reviews = [
             Some(crate::work::Review::Approved),
             Some(crate::work::Review::ChangesRequested),
             Some(crate::work::Review::Required),
             None,
         ];
-        let items = (0..CARDS)
-            .map(|index| {
-                let mut item = item(&format!("feature/change-{index}"), "cagents");
-                item.column = [Column::Active, Column::InProgress, Column::InReview][index % 3];
-                item.pull_request = Some(PullRequest {
-                    number: index as u64 + 1,
-                    title: format!("Change number {index}"),
-                    url: format!("https://github.com/o/cagents/pull/{}", index + 1),
-                    state: PullRequestState::Open,
-                    draft: false,
-                    head_oid: "a".into(),
-                    contains_local_head: true,
-                    checks: Some(crate::work::Checks {
-                        passed: 40 + index as u32 % 7,
-                        failed: index as u32 % 3,
-                        pending: index as u32 % 2,
-                    }),
-                    review: reviews[index % reviews.len()],
-                    updated_at: String::new(),
-                });
-                item
-            })
-            .collect();
-        let mut state = State::default();
-        connected(&mut state, 1, board(items));
+        let millis = |took: Duration| took.as_secs_f64() * 1e3;
         let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
         let theme = cosmic::Theme::dark();
-        for (name, list) in [("board", false), ("list", true)] {
-            if list {
-                state.update(Action::Layout(Layout::List));
-            }
-            let mut cache = Cache::new();
-            // The view is built lazily inside layout, so building the
-            // interface is where the cards' widgets are made.
-            let mut stages = [Duration::ZERO; 2];
-            for frame in 0..WARMUP + FRAMES {
-                let clock = Instant::now();
-                let mut ui = UserInterface::build(
-                    state.view(),
-                    iced::Size::new(1240.0, 900.0),
-                    std::mem::replace(&mut cache, Cache::new()),
-                    &mut renderer,
-                );
-                let built = clock.elapsed();
-                let clock = Instant::now();
-                ui.draw(
-                    &mut renderer,
-                    &theme,
-                    &iced::advanced::renderer::Style::default(),
-                    iced::mouse::Cursor::Unavailable,
-                );
-                let drawn = clock.elapsed();
-                cache = ui.into_cache();
-                if frame >= WARMUP {
-                    for (stage, took) in stages.iter_mut().zip([built, drawn]) {
-                        *stage += took;
+        let style = iced::advanced::renderer::Style::default();
+        for cards in [600, 3000] {
+            let items = (0..cards)
+                .map(|index| {
+                    let mut item = item(&format!("feature/change-{index}"), "cagents");
+                    item.column = [Column::Active, Column::InProgress, Column::InReview][index % 3];
+                    item.pull_request = Some(PullRequest {
+                        number: index as u64 + 1,
+                        title: format!("Change number {index}"),
+                        url: format!("https://github.com/o/cagents/pull/{}", index + 1),
+                        state: PullRequestState::Open,
+                        draft: false,
+                        head_oid: "a".into(),
+                        contains_local_head: true,
+                        checks: Some(crate::work::Checks {
+                            passed: 40 + index as u32 % 7,
+                            failed: index as u32 % 3,
+                            pending: index as u32 % 2,
+                        }),
+                        review: reviews[index % reviews.len()],
+                        updated_at: String::new(),
+                    });
+                    item
+                })
+                .collect();
+            let mut state = State::default();
+            connected(&mut state, 1, board(items));
+            // Within the first lane, and within the list.
+            for (name, list, pointer) in [
+                ("board", false, iced::Point::new(120.0, 500.0)),
+                ("list", true, iced::Point::new(620.0, 500.0)),
+            ] {
+                if list {
+                    state.update(Action::Layout(Layout::List));
+                }
+                let mut cache = Cache::new();
+                // The view is built lazily inside layout, so building the
+                // interface is where the cards' widgets are made.
+                let mut stages = [Duration::ZERO; 2];
+                for frame in 0..WARMUP + FRAMES {
+                    let clock = Instant::now();
+                    let mut ui = UserInterface::build(
+                        state.view(),
+                        SCREEN,
+                        std::mem::replace(&mut cache, Cache::new()),
+                        &mut renderer,
+                    );
+                    let built = clock.elapsed();
+                    let clock = Instant::now();
+                    ui.draw(
+                        &mut renderer,
+                        &theme,
+                        &style,
+                        iced::mouse::Cursor::Unavailable,
+                    );
+                    let drawn = clock.elapsed();
+                    cache = ui.into_cache();
+                    if frame >= WARMUP {
+                        for (stage, took) in stages.iter_mut().zip([built, drawn]) {
+                            *stage += took;
+                        }
                     }
                 }
+                let [build, draw] = stages.map(|stage| millis(stage) / FRAMES as f64);
+
+                let view = state.view();
+                let mut ui = UserInterface::build(view, SCREEN, cache, &mut renderer);
+                let cursor = iced::mouse::Cursor::Available(pointer);
+                ui.draw(&mut renderer, &theme, &style, cursor);
+                let wheel = iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                    delta: iced::mouse::ScrollDelta::Pixels { x: 0.0, y: -STEP },
+                });
+                let (mut total, mut worst) = (Duration::ZERO, Duration::ZERO);
+                for frame in 0..WARMUP + FRAMES {
+                    let redraw = iced::Event::Window(iced::window::Event::RedrawRequested(
+                        iced::time::Instant::now(),
+                    ));
+                    let clock = Instant::now();
+                    let mut messages = Vec::new();
+                    let _ = ui.update(
+                        &[wheel.clone(), redraw],
+                        cursor,
+                        &mut renderer,
+                        &mut iced::advanced::clipboard::Null,
+                        &mut messages,
+                    );
+                    ui.draw(&mut renderer, &theme, &style, cursor);
+                    let took = clock.elapsed();
+                    if frame >= WARMUP {
+                        total += took;
+                        worst = worst.max(took);
+                    }
+                }
+                let mut scrolled = Scrolled(0.0);
+                ui.operate(&renderer, &mut scrolled);
+                assert!(
+                    scrolled.0 >= STEP * (WARMUP + FRAMES) as f32 * 0.9,
+                    "the {name} scrolled only {} px",
+                    scrolled.0
+                );
+                // The first wheel of a gesture, which on a board that scrolls
+                // sideways decides where the gesture goes: a pointer motion
+                // this long after the last wheel ends the gesture before.
+                const GESTURES: usize = 8;
+                let mut started = Duration::ZERO;
+                for _ in 0..GESTURES {
+                    std::thread::sleep(Duration::from_millis(120));
+                    let moved =
+                        iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: pointer });
+                    let _ = ui.update(
+                        &[moved],
+                        cursor,
+                        &mut renderer,
+                        &mut iced::advanced::clipboard::Null,
+                        &mut Vec::new(),
+                    );
+                    let clock = Instant::now();
+                    let _ = ui.update(
+                        &[wheel.clone()],
+                        cursor,
+                        &mut renderer,
+                        &mut iced::advanced::clipboard::Null,
+                        &mut Vec::new(),
+                    );
+                    started += clock.elapsed();
+                }
+                eprintln!(
+                    "work {name}, {cards} cards: rebuilt frame {build:.3} ms view, build and \
+                     layout + {draw:.3} ms draw; scrolled frame {:.3} ms mean, {:.3} ms worst; \
+                     a gesture's first wheel {:.3} ms",
+                    millis(total) / FRAMES as f64,
+                    millis(worst),
+                    millis(started) / GESTURES as f64,
+                );
             }
-            let [build, draw] = stages.map(|stage| stage.as_secs_f64() * 1e3 / FRAMES as f64);
-            eprintln!(
-                "work {name}, {CARDS} cards: view, build and layout {build:.3} ms, \
-                 draw {draw:.3} ms per frame"
-            );
         }
     }
 

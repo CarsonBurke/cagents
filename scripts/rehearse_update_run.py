@@ -1,6 +1,8 @@
 #!/usr/bin/python3
 """Scenario orchestration for rehearse-update; all application commands use its private env."""
 import argparse
+import copy
+
 from collections import Counter
 from contextlib import closing
 import hashlib
@@ -13,6 +15,7 @@ import select
 import shlex
 import shutil
 import signal
+import stat
 import sqlite3
 import subprocess
 import sys
@@ -82,14 +85,31 @@ def wait_native_lock(root, descriptor, parent_pid):
                 signal.signal(signum,handler)
             signal.pthread_sigmask(signal.SIG_SETMASK,blocked)
 
+import rehearse_update_records as records
 
-def candidate_namespace_cli(root, archive_dir, version):
-    """Extract only the verified candidate CLI into the marked private root."""
+
+def private_candidate_root(root, version):
     root=Path(root).resolve()
     if (root/'.rehearse-update').is_symlink() or (root/'.rehearse-update').read_text().strip()!=str(root):
         raise RuntimeError('candidate probe requires a matching rehearsal root')
-    if not version or version in ('.','..') or '/' in version:
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._+-]*',version):
         raise RuntimeError('candidate probe requires a single version name')
+    return root
+
+
+def private_candidate(root, version):
+    root=private_candidate_root(root,version)
+    prefix=root/'home/.local/share/cagents-install'
+    marker=prefix/'.cagents-install-root'
+    if marker.is_symlink() or marker.read_text()!='cagents install root\n':
+        raise RuntimeError('candidate requires a marked private installation')
+    candidate=prefix/'versions'/version
+    if candidate.resolve()!=candidate:
+        raise RuntimeError('candidate path must not contain symlinks')
+    return root,prefix,candidate
+
+
+def verified_candidate_archive(archive_dir, version):
     archive_dir=Path(archive_dir)
     name=f'cagents-{version}-x86_64-unknown-linux-gnu.tar.gz'
     source=archive_dir/name
@@ -99,6 +119,80 @@ def candidate_namespace_cli(root, archive_dir, version):
               if len(line.split())==2 and line.split()[1].lstrip('*')==name]
     if expected!=[digest]:
         raise RuntimeError('candidate probe requires the checksum-verified archive')
+    return source,digest
+
+
+def file_digest(path):
+    with Path(path).open('rb') as stream:
+        return hashlib.file_digest(stream,'sha256').hexdigest()
+
+
+def candidate_tree(candidate):
+    """Bind the installer's normalized tree, including desktop integration files."""
+    result={}
+    for path in [candidate,*sorted(candidate.rglob('*'))]:
+        info=path.lstat()
+        mode=stat.S_IMODE(info.st_mode)
+        if info.st_uid!=os.getuid() or mode&0o022:
+            raise RuntimeError('candidate tree is not privately owned and immutable to other users')
+        if stat.S_ISDIR(info.st_mode):
+            entry={'kind':'directory','mode':mode}
+        elif stat.S_ISREG(info.st_mode) and info.st_nlink==1:
+            entry={'kind':'file','mode':mode,'sha256':file_digest(path)}
+        else:
+            raise RuntimeError('candidate tree contains a link or special file')
+        result[str(path.relative_to(candidate))]=entry
+    return result
+
+
+def candidate_versions(candidate, version):
+    for name in ('cagents','cagents-ui','cagentsd'):
+        result=subprocess.run([str(candidate/'bin'/name),'--version'],capture_output=True,text=True,timeout=10)
+        if result.returncode or result.stdout.strip()!=f'{name} {version}' or result.stderr.strip():
+            raise RuntimeError(f'staged {name} does not report the exact matched version')
+
+
+def staged_candidate(root, archive_dir, version, installer, *, record=False, transcript=None):
+    """A receipt authorizes reuse only of the exact checksum-bound fresh stage."""
+    root,prefix,candidate=private_candidate(root,version)
+    source,digest=verified_candidate_archive(archive_dir,version)
+    receipt=root/'staged-candidate.json'
+    cli=candidate/'bin/cagents'
+    command=[str(cli),'daemon','upgrade']
+    binding={'version':version,'archive':str(source.resolve()),'archive_sha256':digest,
+             'installer':str(Path(installer).resolve()),'installer_sha256':file_digest(installer),
+             'current':str((prefix/'current').resolve(strict=True)),
+             'command':command,'tree':candidate_tree(candidate)}
+    if record:
+        # The product installer prints this exact executable and invocation.
+        expected=f'Staged cagents {version}; existing windows and the previous service state were preserved. Run cagents daemon upgrade to apply it when ready.'
+        if Path(transcript).read_text().splitlines().count(expected)!=1:
+            raise RuntimeError('stage did not print the exact installed upgrade command')
+        with tarfile.open(source,'r:gz') as archive:
+            for name in ('cagents','cagents-ui','cagentsd'):
+                members=[m for m in archive.getmembers() if m.name==f'cagents-{version}/bin/{name}']
+                if len(members)!=1 or not members[0].isreg() or not 0<members[0].size<=2*1024**3:
+                    raise RuntimeError(f'archive requires one bounded regular {name}')
+                with archive.extractfile(members[0]) as stream:
+                    if hashlib.file_digest(stream,'sha256').hexdigest()!=binding['tree'][f'bin/{name}']['sha256']:
+                        raise RuntimeError(f'staged {name} differs from the checksum-verified archive')
+    else:
+        info=receipt.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or stat.S_IMODE(info.st_mode)!=0o600:
+            raise RuntimeError('unsafe staged candidate receipt')
+        if json.loads(receipt.read_text())!=binding:
+            raise RuntimeError('staged candidate or its archive, installer or current changed')
+    candidate_versions(candidate,version)
+    if record:
+        with open(receipt,'x',opener=lambda path,flags:os.open(path,flags,0o600)) as output:
+            output.write(json.dumps(binding,indent=2,sort_keys=True)+'\n')
+    return cli
+
+
+def candidate_namespace_cli(root, archive_dir, version):
+    """Extract only the verified candidate CLI into the marked private root."""
+    root=private_candidate_root(root,version)
+    source,digest=verified_candidate_archive(archive_dir,version)
     with tarfile.open(source,'r:gz') as archive:
         members=[member for member in archive.getmembers() if member.name==f'cagents-{version}/bin/cagents']
         if len(members)!=1 or not members[0].isreg() or not 0<members[0].size<=128*1024**2:
@@ -116,6 +210,65 @@ def candidate_namespace_cli(root, archive_dir, version):
                                        'member':members[0].name,'cli_sha256':cli_digest},indent=2,sort_keys=True)+'\n')
         manifest.chmod(0o600)
     return cli
+
+
+def seeded_codex(root):
+    items=json.loads((Path(root)/'seeds.json').read_text())['items']
+    targets=[row for row in items if row['state']=='codex-chat']
+    if len(targets)!=1:
+        raise RuntimeError('case-invalid: requires exactly one seeded Codex chat')
+    accepted=targets[0]['response']['data']
+    agent_id=accepted['agent']['id']
+    run=accepted['run']
+    verified=[row for row in targets[0]['verified_agents'] if row['agent']['id']==agent_id]
+    if (not run.get('id') or run.get('agent')!=agent_id or len(verified)!=1
+            or verified[0].get('run')!=run['id']):
+        raise RuntimeError('case-invalid: seed acceptance and verified Codex run differ')
+    return {'agent_id':agent_id,'run':run['id'],'chat':verified[0]['agent']['session']['Chat']}
+
+
+def require_seeded_codex(expected, row):
+    source=copy.deepcopy(row.get('agent',{}).get('session',{}).get('Chat',{}))
+    # The daemon may fill the provider-confirmed thread after seed verification.
+    if expected['chat'].get('launch',{}).get('session_id') is None and isinstance(source.get('launch'),dict):
+        source['launch']['session_id']=None
+    if (row.get('agent',{}).get('id')!=expected['agent_id'] or row.get('run')!=expected['run']
+            or source!=expected['chat']):
+        raise RuntimeError('case-invalid: original accepted Codex agent/run or source changed')
+
+
+def active_working_contract(before, agents, serving, events, agent_id):
+    """Require the same still-running seeded parent, rather than an idle review."""
+    old=before['agents'].get(agent_id,{})
+    matches=[row for row in agents if row.get('agent',{}).get('id')==agent_id]
+    source=old.get('agent',{}).get('session',{}).get('Chat',{})
+    if (len(matches)!=1 or old.get('state')!='Running' or not old.get('run')
+            or matches[0].get('state')!='Running' or matches[0].get('run')!=old['run']
+            or matches[0].get('agent',{}).get('session')!=old['agent'].get('session')
+            or source.get('launch',{}).get('provider')!='Codex'
+            or not serving or serving!=before.get('serving')):
+        raise RuntimeError('case-invalid: original Codex agent/run is not actively Running on the source daemon')
+    threads={pane.get('content',{}).get('launch',{}).get('session_id')
+             for pane in records.panes(before).values()
+             if pane.get('session_id')==source.get('id') and pane.get('content',{}).get('proof')==serving}
+    threads.discard(None)
+    if len(threads)!=1:
+        raise RuntimeError('case-invalid: active Codex parent has no exact source-bound pane')
+    thread=next(iter(threads))
+    starts=[row for row in events if row.get('event')=='notification' and row.get('method')=='turn/started'
+            and row.get('thread_id')==thread and row.get('parent') is True]
+    if not starts or not starts[-1].get('turn_id') or not starts[-1].get('socket'):
+        raise RuntimeError('case-invalid: no exact started Codex parent receipt')
+    started=starts[-1]
+    original=[row for row in before.get('fixture_events',[]) if row.get('event')=='notification'
+              and row.get('method')=='turn/started' and row.get('thread_id')==thread and row.get('parent') is True]
+    if not original or original[-1]!=started:
+        raise RuntimeError('case-invalid: original seeded Codex parent turn was replaced')
+    matching=[row for row in events if row.get('parent') is True
+              and all(row.get(field)==started[field] for field in ('thread_id','turn_id','socket'))]
+    if any(row.get('method') in ('turn/completed','turn/interrupt') for row in matching):
+        raise RuntimeError('case-invalid: seeded Codex parent already completed or received an interrupt')
+    return {'agent_id':agent_id,'run':old['run'],'serving':serving,'parent':started,'observed_at':time.time()}
 
 
 def candidate_namespace_contract(evidence, old_version, new_version):
@@ -431,6 +584,26 @@ def sidebar_channel_ref(observation, title):
     return candidates[0]
 
 
+def visible_phrase(text, phrase):
+    """Match OCR words in order, allowing repeated fragments between neighbors."""
+    words = re.findall(r'[a-z]+',text.lower())
+    expected = re.findall(r'[a-z]+',phrase.lower())
+    for start, word in enumerate(words):
+        if word != expected[0]:
+            continue
+        position = start
+        for wanted in expected[1:]:
+            following = next((index for index in range(position+1,min(position+4,len(words)))
+                              if words[index]==wanted and all(fragment in words[position] or fragment in wanted
+                                  for fragment in words[position+1:index])),None)
+            if following is None:
+                break
+            position = following
+        else:
+            return True
+    return False
+
+
 def selected_chat(root, slot, card_id, channel_id, expected, required_thread=None):
     """Read the exact saved selection; visible labels grant no identity."""
     data = Path(root)/'home/.local/share/cagents'
@@ -450,6 +623,9 @@ def selected_chat(root, slot, card_id, channel_id, expected, required_thread=Non
         launch = descriptor.get('launch', {})
         proof = expected.get('proof')
         thread = launch.get('session_id')
+        bound = copy.deepcopy(descriptor)
+        if expected.get('launch',{}).get('session_id') is None:
+            bound.get('launch',{}).update(session_id=None)
         if (descriptor.get('id') != expected['id']
                 or launch.get('provider') != expected['launch']['provider']
                 or launch.get('recipe') != expected['launch'].get('recipe')
@@ -460,6 +636,7 @@ def selected_chat(root, slot, card_id, channel_id, expected, required_thread=Non
                 or (expected['launch'].get('session_id') is not None
                     and thread != expected['launch']['session_id'])
                 or (required_thread is not None and thread != required_thread)
+                or bound != expected
                 or not active or json.loads(active[0]) != channel_id):
             return None
         return {'database':str(database), 'workspace':row[0], 'card':card_id,
@@ -484,6 +661,65 @@ def refusal_preserved_processes(records):
         return errors
     except (OSError, ValueError, KeyError, TypeError) as exc:
         return [f'console refusal identity evidence missing: {exc}']
+
+
+def expected_refusal(root, kind, old_version):
+    before, after = [json.loads((root/'records'/side/'snapshot.json').read_text())
+                     for side in ('before','after')]
+    errors = refusal_preserved_processes(root/'records')
+    status = json.loads((root/'home/.local/share/cagents-install/.update/status.json').read_text())
+    phase = 'Failed' if kind=='interrupt' else 'Cancelled'
+    if status.get('phase') != phase:
+        errors.append(f'expected {phase}, saw {status.get("phase")}')
+    target = after.get('target',{})
+    if status.get('version') != target.get('version'):
+        errors.append('refusal did not belong to the requested target')
+    if kind=='interrupt' and 'did not stop in time; nothing was changed' not in status.get('message',''):
+        errors.append('update did not report the interruption settlement bound')
+    current = root/'home/.local/share/cagents-install/current'
+    staged = root/'staged-candidate.json'
+    if staged.exists():
+        # The installer's --stage-only already selected the candidate as current
+        # and recorded the running owner; a refusal must leave both as staged.
+        binding = json.loads(staged.read_text())
+        if str(current.resolve()) != binding['current']:
+            errors.append('refusal changed the installed current version')
+        try:
+            owner = json.loads((current.resolve()/'.deferred-owner.json').read_text())
+        except (OSError, ValueError):
+            owner = {}
+        if owner.get('owner_version') != old_version:
+            errors.append('refusal lost the deferred owner of the running service')
+    elif current.resolve().name != old_version:
+        errors.append('refusal changed the installed current version')
+    executable = str(root/'home/.local/share/cagents-install/versions'/old_version/'bin/cagentsd')
+    def daemons(snapshot):
+        return {(row['pid'],row['start_ticks'],row.get('executable')) for row in snapshot['processes']
+                if row.get('executable')==executable and row.get('argv')==[executable]
+                and row.get('state') not in ('Z','X')}
+    if len(daemons(before))!=1 or daemons(before)!=daemons(after):
+        errors.append('refusal replaced the original daemon process')
+    for name in (*records.COLLECTIONS,'panes'):
+        left, right = ((records.panes(before),records.panes(after)) if name=='panes' else (before[name],after[name]))
+        if left.keys()!=right.keys() or any(records.project(row,name)!=records.project(right[key],name)
+                                         for key,row in left.items() if key in right):
+            errors.append(f'refusal changed the original {name}')
+    if (root/'home/.local/share/cagents/daemon-upgrade/daemon-upgrade.json').exists():
+        errors.append('refusal left a preparation checkpoint')
+    started, finished = target.get('started',0), target.get('finished',0)
+    events = [row for row in after.get('fixture_events',[]) if row.get('time',0)>=started]
+    interrupts = [row for row in events if row.get('event')=='request' and row.get('method')=='turn/interrupt']
+    if kind=='cancel':
+        if interrupts:
+            errors.append('review cancellation sent an interrupt request')
+    else:
+        parents = [row for row in interrupts if row.get('parent') is True and row.get('errors')==[]]
+        if not parents or not 25 <= finished-min(row['time'] for row in parents) <= 40:
+            errors.append('interruption refusal did not return at its expected 30-second bound')
+        if any(row.get('event')=='notification' and row.get('method')=='turn/completed'
+               and row.get('status')=='interrupted' for row in events):
+            errors.append('unconfirmed interruption emitted an interrupted receipt')
+    return errors
 
 
 class Rehearsal:
@@ -526,10 +762,118 @@ class Rehearsal:
             Path(__file__).with_name('rehearse_update_records.py'))
         records=importlib.util.module_from_spec(spec)
         spec.loader.exec_module(records)
-        with records.WindowCloseMonitor(self.root) as monitor:
+        with records.WindowCloseMonitor(self.root, getattr(self, 'stall_window_after_flush', None),
+                getattr(self, 'stall_suppress_flush', False), getattr(self, 'stall_resume_after', None),
+                getattr(self, 'stall_under_lock', False)) as monitor:
             result=self.call('update',*args,timeout=300,check=False)
             monitor.command_exit=result[0]
+            if any(flag in args for flag in ('--require-working','--require-idle')) and (
+                    result[0]==2 or 'rehearse-update: case-invalid:' in result[1]):
+                raise RuntimeError('case-invalid: required review failed; this is not an expected refusal')
             return result
+
+    def wait_natural_idle(self, pause):
+        """Observe normal completion of the original private parent without interrupting it."""
+        evidence={'valid':False,'started_at':time.time()}
+        destination=self.root/'natural-idle.json'
+        try:
+            seed=seeded_codex(self.root)
+            agent_id=seed['agent_id']
+            _,listing=self.cli('--no-start','agent','list')
+            original=next(row for row in listing['data']['agents'] if row['agent']['id']==agent_id)
+            require_seeded_codex(seed,original)
+            source=original['agent']['session']['Chat']
+            socket=source['owned_codex_listener']['socket']
+            _,terminals=self.cli('--no-start','terminal','list','--all')
+            proof=terminals['data']['proof']
+            if (source['launch']['provider']!='Codex' or not proof or source['proof']!=proof
+                    or not original.get('run') or original.get('state') not in ('Running','Succeeded')):
+                raise RuntimeError('case-invalid: natural idle source is not the original owned Codex run')
+            evidence.update(agent_id=agent_id,chat_id=source['id'],run=original['run'],serving=proof,socket=socket)
+            deadline=time.monotonic()+pause+45
+            parent=None
+            while True:
+                events=[json.loads(line) for line in (self.root/'logs/codex-provider.jsonl').read_text().splitlines() if line]
+                starts=[row for row in events if row.get('event')=='notification' and row.get('method')=='turn/started'
+                        and row.get('socket')==socket and row.get('parent') is True]
+                if len(starts)!=1 or not starts[0].get('thread_id') or not starts[0].get('turn_id'):
+                    raise RuntimeError('case-invalid: natural idle requires exactly one original parent start')
+                if parent is None:
+                    parent=starts[0]
+                if starts[0]!=parent:
+                    raise RuntimeError('case-invalid: natural idle parent changed')
+                if source['launch'].get('session_id') not in (None,parent['thread_id']):
+                    raise RuntimeError('case-invalid: natural idle parent belongs to another confirmed thread')
+                matching=[row for row in events if row.get('socket')==socket and row.get('parent') is True
+                          and row.get('thread_id')==parent['thread_id'] and row.get('turn_id')==parent['turn_id']]
+                if any(row.get('method')=='turn/interrupt' for row in events if row.get('socket')==socket):
+                    raise RuntimeError('case-invalid: natural idle received an interrupt request')
+                completed=[row for row in matching if row.get('event')=='notification' and row.get('method')=='turn/completed']
+                if completed and (len(completed)!=1 or completed[0].get('status')!='completed'
+                                  or not isinstance(parent.get('time'),(int,float))
+                                  or not isinstance(completed[0].get('time'),(int,float))
+                                  or completed[0]['time']<parent['time']):
+                    raise RuntimeError('case-invalid: original parent did not complete normally')
+                _,listing=self.cli('--no-start','agent','list')
+                current=next(row for row in listing['data']['agents'] if row['agent']['id']==agent_id)
+                if current['agent']['session']!=original['agent']['session'] or current.get('run')!=original['run']:
+                    raise RuntimeError('case-invalid: natural idle changed the original agent/run')
+                evidence.update(parent=parent,fixture_events=events,agent=current)
+                if completed and current.get('state')=='Succeeded':
+                    evidence.update(valid=True,completed=completed[0],finished_at=time.time())
+                    return
+                if current.get('state') not in ('Running','Succeeded') or time.monotonic()>=deadline:
+                    raise RuntimeError('case-invalid: original Codex run did not settle normally before review')
+                time.sleep(.25)
+        except (RuntimeError,OSError,ValueError,KeyError,StopIteration) as exc:
+            evidence['error']=str(exc)
+            raise RuntimeError(f'natural-idle preflight failed: {exc}') from exc
+        finally:
+            with open(destination,'w',opener=lambda path,flags:os.open(path,flags,0o600)) as output:
+                output.write(json.dumps(evidence,indent=2,sort_keys=True)+'\n')
+
+    def failure_console_snapshot(self):
+        """Retain the original console's public output even if full after-recording failed."""
+        evidence={}
+        try:
+            path=self.root/'ui-console-before.json'
+            if path.exists():
+                terminal=json.loads(path.read_text())['terminal']
+            else:
+                seeds=json.loads((self.root/'seeds.json').read_text())['items']
+                seed=next(row for row in seeds if row['state']=='console')
+                consoles=[row['agent']['console']['id'] for row in seed['verified_agents']
+                          if row['agent']['id']==seed['response']['data']['agent']['id'] and row['agent'].get('console')]
+                if len(consoles)!=1:
+                    raise RuntimeError('original console identity is unavailable')
+                terminal=consoles[0]
+            evidence['terminal']=terminal
+            code,output=self.call('env','cagents','--no-start','--json','terminal','snapshot',terminal,
+                                  timeout=20,check=False)
+            evidence.update(exit=code,output=output)
+        except (OSError,RuntimeError,ValueError,KeyError,StopIteration) as exc:
+            evidence['error']=str(exc)
+        (self.root/'logs/failure-console-snapshot.json').write_text(json.dumps(evidence,indent=2,sort_keys=True)+'\n')
+
+    def require_active_working(self):
+        output=self.root/'logs/pre-update-working.json'
+        evidence={}
+        try:
+            before=json.loads((self.root/'records/before/snapshot.json').read_text())
+            seed=seeded_codex(self.root)
+            require_seeded_codex(seed,before['agents'][seed['agent_id']])
+            _,agents=self.cli('--no-start','agent','list')
+            _,terminals=self.cli('--no-start','terminal','list','--all')
+            events=[json.loads(line) for line in (self.root/'logs/codex-provider.jsonl').read_text().splitlines() if line]
+            evidence.update(agents=agents,terminals=terminals,fixture_events=events)
+            evidence['active']=active_working_contract(before,agents['data']['agents'],
+                terminals['data'].get('proof'),events,seed['agent_id'])
+            evidence['valid']=True
+        except (RuntimeError,OSError,ValueError,KeyError,TypeError) as exc:
+            evidence.update(valid=False,error=str(exc))
+            raise RuntimeError(f'working-case preflight failed: {exc}') from exc
+        finally:
+            output.write_text(json.dumps(evidence,indent=2,sort_keys=True)+'\n')
 
     def mapped(self):
         _, output = self.call('wm', '-j', 'windows', timeout=20)
@@ -584,7 +928,7 @@ class Rehearsal:
         Path(output).write_text(json.dumps(observed, indent=2, sort_keys=True)+'\n')
         return observed
 
-    def capture_chats(self, side):
+    def capture_chats(self, side, *, baseline='before'):
         """Exercise the seeded chats themselves, preserving UUID-bound evidence."""
         seeds = json.loads((self.root/'seeds.json').read_text())['items']
         targets = [item for item in seeds if item['state'] in ('named-chat','codex-chat')]
@@ -594,8 +938,10 @@ class Rehearsal:
         agents = {row['agent']['id']:row['agent'] for row in response['data']['agents']}
         _, response = self.cli('--no-start','channel','list')
         channels = response['data']['channels']
-        originals = (json.loads((self.root/'ui-chats-before.json').read_text())
+        originals = (json.loads((self.root/f'ui-chats-{baseline}.json').read_text())
                      if side != 'before' else [])
+        snapshots = ([json.loads((self.root/'records'/name/'snapshot.json').read_text())
+                      for name in (baseline,'after')] if side != 'before' else None)
         evidence = []
         for item in targets:
             original = item['response']['data']['agent']
@@ -633,14 +979,22 @@ class Rehearsal:
                                     if view['agent']==original['id'] and view['slot']==slot)
                     required_thread = previous['selection']['session']['launch']['session_id']
                 _, status = self.cli('--no-start','agent','status',original['id'])
+                actual_agent = status['data']['agent']
                 actual = status['data']['agent']['session']['Chat']
                 if actual['id'] != chat['id'] or actual['launch']['provider'] != chat['launch']['provider']:
                     raise RuntimeError('opening a seeded chat allocated a different session')
+                expected = actual
+                projection = None
+                if snapshots:
+                    projection = records.paused_history_projection(*snapshots,previous['selection']['session'])
+                    if projection is not None:
+                        expected = projection
+                        self.observe_paused(window,f'{side}-{provider}-{slot}')
                 deadline = time.monotonic()+15
                 selected = None
                 while time.monotonic()<deadline:
                     try:
-                        selected = selected_chat(self.root,slot,original['id'],channel_id,actual,required_thread)
+                        selected = selected_chat(self.root,slot,original['id'],channel_id,expected,required_thread)
                     except (sqlite3.Error, OSError):
                         selected = None
                     if selected:
@@ -656,11 +1010,13 @@ class Rehearsal:
                 _, status = self.cli('--no-start','agent','status',original['id'])
                 settled = status['data']['agent']['session']['Chat']
                 if (settled['id'] != actual['id'] or settled.get('proof') != actual.get('proof')
-                        or selected_chat(self.root,slot,original['id'],channel_id,settled,required_thread) is None):
+                        or (projection is not None and status['data']['agent'] != actual_agent)
+                        or selected_chat(self.root,slot,original['id'],channel_id,expected,required_thread) is None):
                     raise RuntimeError('seeded chat ownership or thread changed during native capture')
                 _, observed = self.call('drive','--json','observe',timeout=30)
                 observation = json.loads(observed)
-                if observation['window']['id'] != window['id']:
+                if (observation['window']['id'] != window['id'] or not observation.get('painted')
+                        or observation['window'].get('focused') is False):
                     raise RuntimeError(f'chat observation selected the wrong window for {slot}')
                 shot = f'{side}-{provider}-{slot}'
                 self.call('shot',shot,timeout=45)
@@ -669,6 +1025,135 @@ class Rehearsal:
                                  'observation':observation,'shot':f'shots/{shot}.webp'})
         (self.root/f'ui-chats-{side}.json').write_text(json.dumps(evidence,indent=2,sort_keys=True)+'\n')
         return evidence
+
+    def observe_paused(self, window, label):
+        deadline = time.monotonic()+30
+        reconnected = False
+        observations = []
+        while time.monotonic()<deadline:
+            _, text = self.call('drive','--json','observe',timeout=30)
+            observed = json.loads(text)
+            observations.append(observed)
+            if observed['window']['id'] != window['id']:
+                raise RuntimeError('paused history observation selected another window')
+            words = ' '.join(row.get('text','') for row in observed.get('runs',[]))
+            if (observed.get('painted') and visible_phrase(words,'Resume conversation')
+                    and visible_phrase(words,'Paused after an incomplete update')):
+                (self.root/'logs'/f'{label}-history.json').write_text(json.dumps({
+                    'reconnected':reconnected,'observations':observations},indent=2)+'\n')
+                return
+            buttons = [row for row in observed.get('runs',[]) if row.get('text','').strip().lower()=='reconnect'
+                       and row.get('x',0)>260]
+            if len(buttons)==1 and not reconnected:
+                self.call('drive','click','--stale-ok',buttons[0]['ref'],timeout=30)
+                reconnected = True
+            time.sleep(.2)
+        (self.root/'logs'/f'{label}-history-failed.json').write_text(json.dumps(observations,indent=2)+'\n')
+        self.call('shot',f'{label}-history-failed',timeout=45,check=False)
+        raise RuntimeError('paused history did not show its recovery explanation and Resume control')
+
+    def capture_console(self, side):
+        """Select the seeded console by canonical identity in both windows."""
+        seed = next((item for item in json.loads((self.root/'seeds.json').read_text())['items']
+                     if item['state']=='console'),None)
+        if seed is None:
+            return
+        agent = seed['response']['data']['agent']
+        _, response = self.cli('--no-start','agent','list')
+        status = next(row for row in response['data']['agents'] if row['agent']['id']==agent['id'])
+        console = status['agent'].get('console')
+        if not console or status['state'] != 'Running' or not status.get('run'):
+            raise RuntimeError('the seeded console is not Running with a live run')
+        original = (json.loads((self.root/'ui-console-before.json').read_text()) if side=='after' else None)
+        if original and (status['run'] != original['run'] or console['id'] != original['terminal']):
+            raise RuntimeError('the update replaced the console run or terminal identity')
+        _, response = self.cli('--no-start','channel','list')
+        channel_id = status['agent']['placement']['Channel']
+        title = next(row['title'] for row in response['data']['channels'] if row['id']==channel_id)
+        views = []
+        for slot, window in sorted(self.mapped().items()):
+            if slot not in ('main','second'):
+                continue
+            self.call('wm','action','focus-window','--id',window['id'])
+            _, text = self.call('drive','--json','observe',timeout=30)
+            observation = json.loads(text)
+            if observation['window']['id'] != window['id']:
+                raise RuntimeError('console navigation selected another window')
+            self.call('drive','click','--stale-ok',sidebar_channel_ref(observation,title),timeout=30)
+            self.call('drive','move','850,750',timeout=30)
+            data = self.root/'home/.local/share/cagents'
+            database = data/'sessions.sqlite3' if slot=='main' else data/'windows'/slot/'sessions.sqlite3'
+            deadline = time.monotonic()+15
+            selected = None
+            while time.monotonic()<deadline:
+                with closing(sqlite3.connect(database.as_uri()+'?mode=ro',uri=True,timeout=1)) as db:
+                    db.execute('PRAGMA query_only=ON')
+                    selected = db.execute(
+                        'SELECT c.workspace_id,c.card_id,t.terminal_id FROM cards c '
+                        'JOIN workspaces w ON w.workspace_id=c.workspace_id '
+                        'JOIN terminal_recipes t ON t.card_id=c.card_id '
+                        'WHERE c.card_id=? AND w.focused_card_id=c.card_id AND c.kind_tag=? '
+                        'AND c.existence_json=? AND t.terminal_id=?',
+                        [agent['id'],'terminal','"open"',console['id']]).fetchone()
+                    if selected:
+                        active = db.execute('SELECT value FROM metadata WHERE key=?',
+                                            [f'workspace:{selected[0]}:navigation:active_thread']).fetchone()
+                        if not active or json.loads(active[0]) != channel_id:
+                            selected = None
+                if selected:
+                    break
+                time.sleep(.1)
+            if not selected:
+                raise RuntimeError(f'{slot} did not select the original console pane')
+            _, text = self.call('drive','--json','observe',timeout=30)
+            observed = json.loads(text)
+            if (observed['window']['id'] != window['id'] or not observed.get('painted')
+                    or observed['window'].get('focused') is False):
+                raise RuntimeError('console capture did not show the focused native window')
+            shot = f'{side}-console-{slot}'
+            self.call('shot',shot,timeout=45)
+            views.append({'slot':slot,'selection':selected,'observation':observed,
+                          'shot':f'shots/{shot}.webp'})
+        if len(views)!=2:
+            raise RuntimeError('both windows are required for console evidence')
+        result = {'agent':agent['id'],'terminal':console['id'],'run':status['run'],'state':status['state'],'views':views}
+        (self.root/f'ui-console-{side}.json').write_text(json.dumps(result,indent=2,sort_keys=True)+'\n')
+
+    def watch_checkpoint(self):
+        import hashlib
+        import threading
+        self.checkpoint_stop = threading.Event()
+        self.checkpoint_observations = []
+        def watch():
+            path = self.root/'home/.local/share/cagents/daemon-upgrade/daemon-upgrade.json'
+            previous = None
+            while not self.checkpoint_stop.is_set():
+                try:
+                    raw = path.read_bytes()
+                    phase = json.loads(raw)['phase']
+                    digest = hashlib.sha256(raw).hexdigest()
+                except FileNotFoundError:
+                    raw, phase, digest = None,'absent',None
+                except (OSError,ValueError,KeyError):
+                    self.checkpoint_stop.wait(.02)
+                    continue
+                observed = phase,digest
+                if observed!=previous:
+                    self.checkpoint_observations.append({'time':time.time(),'phase':phase,'sha256':digest})
+                    previous = observed
+                copy = self.root/'logs/checkpoint-first-prepared.json'
+                if phase=='Prepared' and not copy.exists():
+                    copy.write_bytes(raw)
+                self.checkpoint_stop.wait(.02)
+        self.checkpoint_thread = threading.Thread(target=watch,daemon=True)
+        self.checkpoint_thread.start()
+
+    def finish_checkpoint_watch(self):
+        if not hasattr(self,'checkpoint_stop'):
+            return
+        self.checkpoint_stop.set()
+        self.checkpoint_thread.join(2)
+        (self.root/'logs/checkpoint-observations.json').write_text(json.dumps(self.checkpoint_observations,indent=2)+'\n')
 
     def reopen_existing_only(self, version):
         self.call('record','existing-only-before',timeout=150)
@@ -1110,6 +1595,11 @@ class Rehearsal:
         failure = None
         try:
             self.call('init')
+            settings = {'pause': args.codex_pause,
+                        'never_confirm_interrupt': args.codex_never_confirm_interrupt,
+                        'never_confirm_close': args.codex_never_confirm_close}
+            (self.root/'codex-fixture.json').write_text(json.dumps(settings,sort_keys=True)+'\n')
+            (self.root/'rehearsal-target.json').write_text(json.dumps({'version':args.new_version,'working':args.working})+'\n')
             self.call('install', args.old_dir, args.old_version, args.old_installer, timeout=180)
             candidate=candidate_namespace_cli(self.root,args.new_dir,args.new_version)
             current=self.root/'home/.local/share/cagents-install/current'
@@ -1145,6 +1635,8 @@ class Rehearsal:
             candidate_namespace_contract(evidence,args.old_version,args.new_version)
             if current.resolve()!=original_current:
                 raise RuntimeError('read-only candidate namespace probe changed current')
+            if not args.fail_new_daemon:
+                self.call('stage',args.new_dir,args.new_version,args.new_installer,timeout=180)
             self.call('desktop','start','--limit','900', timeout=None)
             self.call('launch','main')
             self.call('launch','second')
@@ -1152,10 +1644,13 @@ class Rehearsal:
             code, _ = self.call('seed', *seed_flags(args), timeout=180, check=False)
             if code:
                 self.errors.append('seed verification failed; see seeds.json')
+            if args.natural_idle:
+                self.wait_natural_idle(args.codex_pause)
             if args.ceditor:
                 self.call('ceditor','start',args.ceditor,timeout=60)
                 self.wait_windows(['main','second','ceditor'])
             self.capture_chats('before')
+            self.capture_console('before')
             code, _ = self.call('record','before',timeout=150,check=False)
             if code:
                 self.errors.append('before record has evidence gaps')
@@ -1164,9 +1659,38 @@ class Rehearsal:
             update_args += ['--working',args.working,'--stop',args.stop]
             if args.fail_new_daemon:
                 update_args.append('--fail-new-daemon')
+            else:
+                update_args.append('--use-staged')
             for flag in args.upgrade_arg:
                 update_args.append(flag)
+            if requires_working(args):
+                self.require_active_working()
+                update_args.append('--require-working')
+            if args.natural_idle:
+                update_args.append('--require-idle')
+            (self.root/'rehearsal-target.json').write_text(json.dumps({
+                'version':args.new_version,'working':args.working,'started':time.time()})+'\n')
+            self.watch_checkpoint()
+            self.stall_window_after_flush = args.stall_window_after_flush
+            self.stall_suppress_flush = args.stall_suppress_flush
+            self.stall_resume_after = args.stall_resume_after
+            self.stall_under_lock = args.stall_under_lock
             code, _ = self.observed_update(args.new_dir,args.new_version,args.new_installer,*update_args)
+            self.finish_checkpoint_watch()
+            if args.natural_idle:
+                idle=json.loads((self.root/'natural-idle.json').read_text())
+                events=[json.loads(line) for line in (self.root/'logs/codex-provider.jsonl').read_text().splitlines() if line]
+                if any(row.get('method')=='turn/interrupt' and row.get('socket')==idle['socket'] for row in events):
+                    self.errors.append('natural-idle case sent a provider interrupt request')
+            if args.require_prepared:
+                prepared = self.root/'logs/checkpoint-first-prepared.json'
+                baseline = json.loads((self.root/'records/before/snapshot.json').read_text())
+                if (not prepared.exists() or json.loads(prepared.read_text()).get('proof')!=baseline['serving']
+                        or not self.checkpoint_observations or self.checkpoint_observations[0]['phase']!='absent'):
+                    self.errors.append('this fresh job did not produce the required source-bound Prepared checkpoint')
+            target = json.loads((self.root/'rehearsal-target.json').read_text())
+            target['finished'] = time.time()
+            (self.root/'rehearsal-target.json').write_text(json.dumps(target)+'\n')
             if args.fail_new_daemon:
                 if not code:
                     self.errors.append('forced daemon startup failure unexpectedly succeeded')
@@ -1194,19 +1718,40 @@ class Rehearsal:
                 if (serving_code or serving.get('data',{}).get('running') is not True
                         or serving.get('data',{}).get('daemon_version') != args.old_version):
                     self.errors.append('old daemon is not serving after failed update')
+            elif args.expect_refusal:
+                if not code or code==124:
+                    self.errors.append('expected refusal did not return a normal nonzero result')
             elif code:
                 self.errors.append(f'update exited {code}')
             try:
-                self.wait_windows(['main','second'],timeout=args.reopen_timeout,version=args.old_version if args.fail_new_daemon else args.new_version if code==0 else None)
+                self.wait_windows(['main','second'],timeout=args.reopen_timeout,version=args.old_version if args.fail_new_daemon or args.expect_refusal else args.new_version if code==0 else None)
             except RuntimeError as exc:
                 self.errors.append(str(exc))
+            # The shared recovery verifier qualifies paused presentations before
+            # inspecting them. Capture again afterwards to retain the final UI.
+            self.call('record','after',timeout=150)
             self.capture_chats('after')
+            self.capture_console('after')
             code, _ = self.call('record','after',timeout=150,check=False)
             if code:
                 self.errors.append('after record has evidence gaps')
             if args.expect_console_refusal:
                 self.errors.extend(refusal_preserved_processes(self.root/'records'))
+            if args.expect_refusal:
+                self.errors.extend(expected_refusal(self.root,args.expect_refusal,args.old_version))
             self.observe(self.root/'records/after/windows.json',shots='after')
+            if args.plain_restart:
+                import rehearse_update_restart
+                recovered = self.root/'recovered'
+                recovered.mkdir()
+                for name in ('ui-chats-after.json','ui-console-after.json'):
+                    source = self.root/name
+                    if source.exists():
+                        shutil.copyfile(source,recovered/name)
+                for name in ('records/after','shots'):
+                    shutil.copytree(self.root/name,recovered/name)
+                rehearse_update_restart.restart(self,args.new_version)
+                self.observe(self.root/'records/after/windows.json',shots='after-restart')
             code, _ = self.call('compare','before','after',timeout=30,check=False)
             if code:
                 self.errors.append('comparison found regressions or missing evidence; see comparison step')
@@ -1222,6 +1767,9 @@ class Rehearsal:
             if not (self.root/'new-terminal-after-restore.json').exists():
                 self.call('record','after',timeout=150,check=False)
         finally:
+            self.finish_checkpoint_watch()
+            if (self.errors or failure) and (self.root/'logs').is_dir():
+                self.failure_console_snapshot()
             if ((self.root/'records/before/snapshot.json').exists()
                     and (self.root/'records/after/snapshot.json').exists()
                     and not any(step['command'][0]=='compare' for step in self.steps)):
@@ -1284,6 +1832,11 @@ class Rehearsal:
         return int(bool(self.errors or failure or any(s['command'][0]=='compare' and s['exit'] for s in self.steps)))
 
 
+def requires_working(args):
+    return (getattr(args,'require_working',False) or args.working=='i' or args.codex_never_confirm_interrupt
+            or args.codex_never_confirm_close or args.require_prepared)
+
+
 def seed_options(parser):
     parser.add_argument('--untitled',type=int,choices=(0,1,2),default=2)
     parser.add_argument('--no-codex',action='store_true')
@@ -1314,6 +1867,8 @@ def main():
     run.add_argument('--answer',default='yes')
     run.add_argument('--yes',action='store_true')
     run.add_argument('--working',default='',help='typed at the working-agents choice; empty waits for them')
+    run.add_argument('--require-working',action='store_true',help='reject this case before updating unless the exact seeded Codex parent is still active; required for an intentional Enter/wait case')
+    run.add_argument('--natural-idle',action='store_true',help='wait for normal completion of the original Codex parent before the baseline review; require its exact idle Resumes (1) review')
     run.add_argument('--stop',default='',help='typed at the destructive stop list; empty cancels')
     run.add_argument('--upgrade-arg',action='append',default=[],help='use --upgrade-arg=--interrupt, for example')
     run.add_argument('--expect-console-refusal', action='store_true', help='with --fail-new-daemon, require console refusal before startup and preserve all work')
@@ -1322,6 +1877,16 @@ def main():
     run.add_argument('--new-terminal-after-restore',action='store_true',help='after verified existing-only reopening deliberately stop the private daemon, then open and use a new terminal through the same native UI')
     run.add_argument('--expect-terminal-restart-failure',action='store_true',help='before example only: require the native new-terminal action to fail with no daemon after the deliberate stop')
     run.add_argument('--reopen-timeout',type=float,default=45)
+    run.add_argument('--expect-refusal',choices=('interrupt','cancel'),help='require the exact refusal and unchanged old service, install, windows and inventory')
+    run.add_argument('--require-prepared',action='store_true',help='require this fresh job to reach source-bound Prepared before recovery')
+    run.add_argument('--plain-restart',action='store_true',help='after verified recovery, crash only the private daemon and start it normally; verify the original census again')
+    run.add_argument('--codex-pause',type=float,default=6,help='offline Codex turn pause in seconds (maximum 300)')
+    run.add_argument('--stall-window-after-flush',metavar='SLOT',help='injected fault: SIGSTOP that source window (main or a --window slot) once it records final_flush complete=true, so it lingers holding its slot as a1 did')
+    run.add_argument('--stall-suppress-flush',action='store_true',help='injected fault, with --stall-window-after-flush: also remove that final_flush record, so the update cannot prove the save')
+    run.add_argument('--stall-under-lock',action='store_true',help='injected fault, with --stall-window-after-flush: SIGSTOP the window while its final_flush append still holds the diagnostics lock; the trace records whether the stop landed under it')
+    run.add_argument('--stall-resume-after',type=float,metavar='SECONDS',help='injected fault, with --stall-window-after-flush: SIGCONT the stalled window after this long')
+    run.add_argument('--codex-never-confirm-interrupt',action='store_true',help='offline peer acknowledges interrupt without settling the turn')
+    run.add_argument('--codex-never-confirm-close',action='store_true',help='offline peer retains its connection to force Prepared recovery')
     seed_options(run)
     seed_options(commands.add_parser('seed'))
     wait=commands.add_parser('wait')
@@ -1331,7 +1896,27 @@ def main():
     lock=commands.add_parser('wait-native-lock')
     lock.add_argument('--fd',type=int,required=True)
     lock.add_argument('--parent-pid',type=int,required=True)
+    staged=commands.add_parser('staged-candidate')
+    staged.add_argument('archive_dir')
+    staged.add_argument('version')
+    staged.add_argument('installer')
+    staged.add_argument('--record',metavar='STAGE_LOG')
     args=parser.parse_args()
+    if args.command=='run' and args.natural_idle and (requires_working(args) or args.no_codex
+            or args.working or args.yes or args.upgrade_arg or args.fail_new_daemon or args.expect_refusal
+            or any(getattr(args,flag) for flag in ('no_init','exit_mid_turn','ignore_term','uncarryable','unreachable'))
+            or args.answer.lower() not in ('yes','y')):
+        parser.error('--natural-idle requires ordinary yes, a seeded Codex chat, and no working/fault/override/refusal modes')
+    if args.command == 'run' and requires_working(args) and (args.yes or any(
+            flag=='--yes' or flag.startswith('--yes=') for flag in args.upgrade_arg)):
+        parser.error('working cases forbid --yes because the actual working choice must be observed')
+    if args.command == 'run' and not 0 < args.codex_pause <= 300:
+        parser.error('--codex-pause must be between 0 and 300 seconds')
+    if args.command=='run' and args.stall_window_after_flush is None and (
+            args.stall_suppress_flush or args.stall_under_lock or args.stall_resume_after is not None):
+        parser.error('--stall-suppress-flush, --stall-under-lock and --stall-resume-after require --stall-window-after-flush')
+    if args.command == 'run' and args.plain_restart and (args.expect_refusal or args.fail_new_daemon):
+        parser.error('--plain-restart requires a successful recovery scenario')
     if args.command == 'run' and args.expect_console_refusal and (not args.fail_new_daemon or args.no_console):
         parser.error('--expect-console-refusal requires --fail-new-daemon and a seeded console')
     if args.command == 'run' and args.reopen_existing_only and (args.fail_new_daemon or args.no_codex or args.ceditor):
@@ -1340,8 +1925,14 @@ def main():
         parser.error('--new-terminal-after-restore requires --reopen-existing-only')
     if args.command == 'run' and args.expect_terminal_restart_failure and not args.new_terminal_after_restore:
         parser.error('--expect-terminal-restart-failure requires --new-terminal-after-restore')
+    if args.command == 'run' and args.require_working and args.no_codex:
+        parser.error('--require-working requires the seeded Codex chat')
     rehearsal=Rehearsal(args.root,args.shell)
     try:
+        if args.command=='staged-candidate':
+            print(staged_candidate(args.root,args.archive_dir,args.version,args.installer,
+                                   record=args.record is not None,transcript=args.record))
+            return 0
         if args.command=='wait-native-lock':
             return wait_native_lock(args.root,args.fd,args.parent_pid)
         if args.command=='wait':

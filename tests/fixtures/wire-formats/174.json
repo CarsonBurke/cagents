@@ -1230,6 +1230,31 @@
               "Container": "cagents::agent_execution::mailbox::Outgoing"
             }
           }
+        ],
+        [
+          "Prompt",
+          {
+            "Struct": [
+              [
+                "request",
+                {
+                  "Container": "cagents::agent_execution::Submit"
+                }
+              ],
+              [
+                "interrupt",
+                "Bool"
+              ]
+            ]
+          }
+        ],
+        [
+          "Deliver",
+          {
+            "Newtype": {
+              "Container": "cagents::agent_execution::mailbox::Outgoing"
+            }
+          }
         ]
       ]
     },
@@ -1399,6 +1424,33 @@
               "Container": "cagents::agent_execution::mailbox::Delivery"
             }
           }
+        ],
+        [
+          "Prompted",
+          {
+            "Struct": [
+              [
+                "accepted",
+                {
+                  "Container": "cagents::agent_execution::Accepted"
+                }
+              ],
+              [
+                "start",
+                {
+                  "Container": "cagents::agent_execution::Start"
+                }
+              ]
+            ]
+          }
+        ],
+        [
+          "Handed",
+          {
+            "Newtype": {
+              "Container": "cagents::agent_execution::mailbox::Handed"
+            }
+          }
         ]
       ]
     },
@@ -1520,6 +1572,34 @@
           "reasoning_effort",
           {
             "Option": "Str"
+          }
+        ]
+      ]
+    },
+    "cagents::agent_execution::Start": {
+      "Enum": [
+        [
+          "Sent",
+          {
+            "Struct": [
+              [
+                "resumed",
+                "Bool"
+              ]
+            ]
+          }
+        ],
+        [
+          "Queued",
+          {
+            "Struct": [
+              [
+                "behind",
+                {
+                  "Option": "Bytes"
+                }
+              ]
+            ]
           }
         ]
       ]
@@ -2028,6 +2108,141 @@
             "Option": {
               "Container": "cagents::agent_execution::directory::Member"
             }
+          }
+        ]
+      ]
+    },
+    "cagents::agent_execution::mailbox::Handed": {
+      "Struct": [
+        [
+          "delivery",
+          {
+            "Container": "cagents::agent_execution::mailbox::Delivery"
+          }
+        ],
+        [
+          "agent",
+          {
+            "Option": {
+              "Container": "cagents::agent_execution::mailbox::Handoff"
+            }
+          }
+        ]
+      ]
+    },
+    "cagents::agent_execution::mailbox::Handoff": {
+      "Enum": [
+        [
+          "Run",
+          {
+            "Struct": [
+              [
+                "agent",
+                "Bytes"
+              ],
+              [
+                "run",
+                "Bytes"
+              ],
+              [
+                "start",
+                {
+                  "Container": "cagents::agent_execution::Start"
+                }
+              ]
+            ]
+          }
+        ],
+        [
+          "Waiting",
+          {
+            "Struct": [
+              [
+                "agent",
+                "Bytes"
+              ],
+              [
+                "behind",
+                {
+                  "Option": "Bytes"
+                }
+              ]
+            ]
+          }
+        ],
+        [
+          "Held",
+          {
+            "Struct": [
+              [
+                "agent",
+                "Bytes"
+              ],
+              [
+                "reason",
+                "Str"
+              ]
+            ]
+          }
+        ],
+        [
+          "Behind",
+          {
+            "Struct": [
+              [
+                "agent",
+                "Bytes"
+              ]
+            ]
+          }
+        ],
+        [
+          "NoSlot",
+          {
+            "Struct": [
+              [
+                "agent",
+                "Bytes"
+              ]
+            ]
+          }
+        ],
+        [
+          "Ended",
+          {
+            "Struct": [
+              [
+                "agent",
+                "Bytes"
+              ],
+              [
+                "run",
+                "Bytes"
+              ],
+              [
+                "reason",
+                "Str"
+              ]
+            ]
+          }
+        ],
+        [
+          "Unknown",
+          {
+            "Struct": [
+              [
+                "agent",
+                "Bytes"
+              ],
+              [
+                "run",
+                "Bytes"
+              ],
+              [
+                "reason",
+                "Str"
+              ]
+            ]
           }
         ]
       ]
@@ -9219,49 +9434,6 @@
               ]
             ]
           }
-        ],
-        [
-          "ReadWorkspaceView",
-          {
-            "Struct": [
-              [
-                "scope",
-                {
-                  "Container": "cagents::workspace_model::views::Scope"
-                }
-              ]
-            ]
-          }
-        ],
-        [
-          "ApplyWorkspaceEdit",
-          {
-            "Struct": [
-              [
-                "edit",
-                {
-                  "Container": "cagents::workspace_model::ModelEdit"
-                }
-              ]
-            ]
-          }
-        ],
-        [
-          "ReadWorkspaceSnapshot",
-          "Unit"
-        ],
-        [
-          "ReadWorkspaceMetadata",
-          {
-            "Struct": [
-              [
-                "query",
-                {
-                  "Container": "cagents::workspace_model::metadata::Query"
-                }
-              ]
-            ]
-          }
         ]
       ]
     },
@@ -9605,12 +9777,6 @@
                 "edit",
                 {
                   "Container": "cagents::workspace_model::ModelEdit"
-                }
-              ],
-              [
-                "effects",
-                {
-                  "Container": "cagents::workspace_model::delta::EditEffects"
                 }
               ]
             ]
@@ -10282,60 +10448,6 @@
                 }
               ]
             ]
-          }
-        ],
-        [
-          "workspace_view",
-          {
-            "Struct": [
-              [
-                "view",
-                {
-                  "Option": {
-                    "Container": "cagents::workspace_model::views::View"
-                  }
-                }
-              ],
-              [
-                "sequence",
-                "U64"
-              ]
-            ]
-          }
-        ],
-        [
-          "workspace_snapshot",
-          {
-            "Struct": [
-              [
-                "model",
-                {
-                  "Container": "cagents::workspace_model::WorkspaceModel"
-                }
-              ],
-              [
-                "closed",
-                {
-                  "Seq": "Bytes"
-                }
-              ]
-            ]
-          }
-        ],
-        [
-          "workspace_edit",
-          {
-            "Newtype": {
-              "Container": "cagents::workspace_model::delta::EditReceipt"
-            }
-          }
-        ],
-        [
-          "workspace_metadata",
-          {
-            "Newtype": {
-              "Container": "cagents::workspace_model::metadata::Reply"
-            }
           }
         ]
       ]
@@ -13345,178 +13457,6 @@
             "Seq": {
               "Container": "cagents::agent_execution::Agent"
             }
-          }
-        ]
-      ]
-    },
-    "cagents::workspace_model::delta::EditEffects": {
-      "Struct": [
-        [
-          "views",
-          {
-            "Seq": {
-              "Container": "cagents::workspace_model::delta::ViewRevision"
-            }
-          }
-        ],
-        [
-          "closed",
-          {
-            "Seq": "Bytes"
-          }
-        ],
-        [
-          "channels",
-          {
-            "Seq": {
-              "Container": "cagents::workspace_model::ModelChannel"
-            }
-          }
-        ],
-        [
-          "projects",
-          {
-            "Seq": {
-              "Container": "cagents::workspace_model::ModelProject"
-            }
-          }
-        ],
-        [
-          "removed_projects",
-          {
-            "Seq": "Str"
-          }
-        ],
-        [
-          "removed_channels",
-          {
-            "Seq": "Bytes"
-          }
-        ],
-        [
-          "navigation_orders",
-          {
-            "Seq": {
-              "Container": "cagents::workspace_model::NavigationOrder"
-            }
-          }
-        ],
-        [
-          "agents",
-          {
-            "Seq": {
-              "Container": "cagents::agent_execution::Agent"
-            }
-          }
-        ],
-        [
-          "removed_agents",
-          {
-            "Seq": "Bytes"
-          }
-        ]
-      ]
-    },
-    "cagents::workspace_model::delta::EditReceipt": {
-      "Struct": [
-        [
-          "identity",
-          "Bytes"
-        ],
-        [
-          "sequence",
-          "U64"
-        ],
-        [
-          "effects",
-          {
-            "Container": "cagents::workspace_model::delta::EditEffects"
-          }
-        ]
-      ]
-    },
-    "cagents::workspace_model::delta::ViewRevision": {
-      "Struct": [
-        [
-          "scope",
-          {
-            "Container": "cagents::workspace_model::views::Scope"
-          }
-        ],
-        [
-          "before",
-          {
-            "Option": "U64"
-          }
-        ],
-        [
-          "after",
-          {
-            "Option": "U64"
-          }
-        ]
-      ]
-    },
-    "cagents::workspace_model::metadata::Query": {
-      "Enum": [
-        [
-          "Identity",
-          "Unit"
-        ],
-        [
-          "Projects",
-          "Unit"
-        ],
-        [
-          "Agents",
-          "Unit"
-        ]
-      ]
-    },
-    "cagents::workspace_model::metadata::Reply": {
-      "Enum": [
-        [
-          "Identity",
-          {
-            "Newtype": "Bytes"
-          }
-        ],
-        [
-          "Projects",
-          {
-            "Struct": [
-              [
-                "identity",
-                "Bytes"
-              ],
-              [
-                "projects",
-                {
-                  "Seq": {
-                    "Container": "cagents::workspace_model::ModelProject"
-                  }
-                }
-              ]
-            ]
-          }
-        ],
-        [
-          "Agents",
-          {
-            "Struct": [
-              [
-                "identity",
-                "Bytes"
-              ],
-              [
-                "agents",
-                {
-                  "Seq": {
-                    "Container": "cagents::agent_execution::Agent"
-                  }
-                }
-              ]
-            ]
           }
         ]
       ]
