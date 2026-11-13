@@ -35,10 +35,10 @@ mod review_refresh;
 pub mod review_requests;
 mod sidebar;
 pub use authored::AuthoredPullRequests;
-pub use conditional::Revalidation;
+pub use conditional::{Revalidation, checks_settling};
 pub use review_batches::VIEWED_BATCH_SIZE;
 pub use review_refresh::ReviewRefresh;
-pub use sidebar::append_recent_history;
+pub use sidebar::{SidebarProbe, SidebarValidator, append_recent_history};
 
 const PR_LIST_FIELDS: &str = "id,number,title,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,baseRefOid,author,updatedAt,url,mergeable,mergeStateStatus,reviewDecision,labels,statusCheckRollup";
 const PR_VIEW_FIELDS: &str = "id,number,title,body,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,baseRefOid,author,createdAt,updatedAt,url,mergeable,mergeStateStatus,reviewDecision,labels,additions,deletions,changedFiles,statusCheckRollup";
@@ -3885,6 +3885,7 @@ mod tests {
             name: name.into(),
             fetch_url: Some(fetch_url.into()),
             push_url: None,
+            gh_resolved: None,
         }
     }
 
@@ -4005,6 +4006,7 @@ mod tests {
                     name: "origin".into(),
                     fetch_url: None,
                     push_url: None,
+                    gh_resolved: None,
                 }],
                 &key,
             ),
@@ -4044,6 +4046,7 @@ mod tests {
             name: "origin".into(),
             fetch_url: Some(url.into()),
             push_url: None,
+            gh_resolved: None,
         };
         let service = GitHubService::new("gh", Arc::new(FakeExecutor::default()));
         assert!(

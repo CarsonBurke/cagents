@@ -22,6 +22,33 @@ pub enum Revalidation {
     Refused,
 }
 
+/// How long after a push a pull request with no checks may still get some.
+const CHECKS_START_WITHIN: Duration = Duration::from_secs(10 * 60);
+
+/// Whether an open pull request's checks may still change without its
+/// `updatedAt` moving, which is all a probe watches: some are pending, or
+/// none have reported yet for one updated so lately that its CI may not have
+/// started. A listing for which this holds is read again every poll.
+pub fn checks_settling(pull_requests: &[PullRequest]) -> bool {
+    let recent = |pull_request: &PullRequest| {
+        pull_request
+            .updated_at
+            .parse::<jiff::Timestamp>()
+            .is_ok_and(|updated| {
+                jiff::Timestamp::now().duration_since(updated)
+                    < jiff::SignedDuration::try_from(CHECKS_START_WITHIN).unwrap_or_default()
+            })
+    };
+    pull_requests
+        .iter()
+        .filter(|pull_request| pull_request.state.0 == "OPEN")
+        .any(|pull_request| {
+            let checks = pull_request.check_summaries();
+            checks.iter().any(|check| check.bucket.0 == "pending")
+                || (checks.is_empty() && recent(pull_request))
+        })
+}
+
 impl<E: ProcessExecutor> GitHubService<E> {
     /// Asks whether the REST resource at `path` changed since `etag`.
     ///
@@ -151,6 +178,40 @@ mod tests {
 
     fn repository(host: &str) -> GitHubRepoKey {
         GitHubRepoKey::new(host, None, "owner", "repo").unwrap()
+    }
+
+    fn pull_request(state: &str, updated: &str, checks: serde_json::Value) -> PullRequest {
+        serde_json::from_value(serde_json::json!({
+            "number": 1, "title": "t", "state": state, "headRefName": "b",
+            "baseRefName": "main", "updatedAt": updated,
+            "url": "https://github.com/owner/repo/pull/1", "statusCheckRollup": checks,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn checks_settle_once_none_are_pending_or_ci_has_had_time_to_start() {
+        let now = jiff::Timestamp::now().to_string();
+        let old = "2026-01-01T00:00:00Z";
+        let pending = serde_json::json!([{"__typename": "StatusContext", "context": "ci", "state": "PENDING"}]);
+        let passed = serde_json::json!([{"__typename": "StatusContext", "context": "ci", "state": "SUCCESS"}]);
+        assert!(checks_settling(&[pull_request(
+            "OPEN",
+            old,
+            pending.clone()
+        )]));
+        assert!(!checks_settling(&[pull_request("OPEN", &now, passed)]));
+        assert!(checks_settling(&[pull_request(
+            "OPEN",
+            &now,
+            serde_json::json!([])
+        )]));
+        assert!(!checks_settling(&[pull_request(
+            "OPEN",
+            old,
+            serde_json::json!([])
+        )]));
+        assert!(!checks_settling(&[pull_request("MERGED", &now, pending)]));
     }
 
     #[test]

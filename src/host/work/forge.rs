@@ -13,7 +13,10 @@ use serde::{Deserialize, Serialize};
 
 use super::scan::ForgeHints;
 use crate::{
-    github::{GitHubRepoKey, GitHubService, PullRequest, Revalidation, remote_repository_key},
+    github::{
+        GitHubRepoKey, GitHubService, PullRequest, Revalidation, checks_settling,
+        remote_repository_key,
+    },
     repository::{CancellationToken, RepositoryService},
 };
 
@@ -31,8 +34,6 @@ const REPOSITORY_FOR: Duration = Duration::from_secs(60 * 60);
 /// someone reads the project, such as a rerun of a finished check.
 const RELIST_WATCHED: Duration = Duration::from_secs(5 * 60);
 const RELIST_UNWATCHED: Duration = Duration::from_secs(30 * 60);
-/// How long after a push a pull request with no checks may still get some.
-const CHECKS_START_WITHIN: Duration = Duration::from_secs(10 * 60);
 /// A probe GitHub refused, such as for a repository with issues disabled, is
 /// asked again after this.
 const PROBE_UNAVAILABLE_FOR: Duration = Duration::from_secs(10 * 60);
@@ -402,7 +403,7 @@ fn listing<E: crate::repository::ProcessExecutor>(
     if let Answer::Current(probe) = &answer
         && freshness != Freshness::Fresh
         && previous.at.elapsed() < relist_after(freshness)
-        && !settling(&previous.pull_requests)
+        && !checks_settling(&previous.pull_requests)
     {
         previous.probe = probe.clone();
         let pull_requests = previous.pull_requests.clone();
@@ -524,29 +525,6 @@ fn relist_after(freshness: Freshness) -> Duration {
         Freshness::Unwatched => RELIST_UNWATCHED,
         Freshness::Watched | Freshness::Fresh => RELIST_WATCHED,
     }
-}
-
-/// Whether an open pull request's checks may still change without its
-/// `updatedAt` moving: some are pending, or none have reported yet for a
-/// pull request updated so lately that its CI may not have started.
-fn settling(pull_requests: &[PullRequest]) -> bool {
-    let recent = |pull_request: &PullRequest| {
-        pull_request
-            .updated_at
-            .parse::<jiff::Timestamp>()
-            .is_ok_and(|updated| {
-                jiff::Timestamp::now().duration_since(updated)
-                    < jiff::SignedDuration::try_from(CHECKS_START_WITHIN).unwrap_or_default()
-            })
-    };
-    pull_requests
-        .iter()
-        .filter(|pull_request| pull_request.state.0 == "OPEN")
-        .any(|pull_request| {
-            let checks = pull_request.check_summaries();
-            checks.iter().any(|check| check.bucket.0 == "pending")
-                || (checks.is_empty() && recent(pull_request))
-        })
 }
 
 /// One list, newest first, in which an open pull request's entry carries the
@@ -1028,19 +1006,6 @@ mod tests {
             Recent::of(b"{\"message\":\"no\"}", jiff::SignedDuration::ZERO),
             None
         );
-    }
-
-    #[test]
-    fn a_pull_request_without_checks_settles_once_ci_has_had_time_to_start() {
-        let mut fresh = pull_request(1, "a", "a", "OPEN", &jiff::Timestamp::now().to_string());
-        fresh.status_check_rollup = Some(vec![]);
-        assert!(settling(std::slice::from_ref(&fresh)));
-        let mut quiet = pull_request(1, "a", "a", "OPEN", "2026-01-01T00:00:00Z");
-        quiet.status_check_rollup = Some(vec![]);
-        assert!(!settling(&[quiet]));
-        let mut closed = fresh;
-        closed.state = RemoteValue("MERGED".into());
-        assert!(!settling(&[closed]));
     }
 
     #[test]

@@ -801,6 +801,10 @@ pub struct RemoteRecord {
     pub fetch_url: Option<String>,
     /// Set only when `remote.<name>.pushurl` overrides the fetch URL.
     pub push_url: Option<String>,
+    /// `remote.<name>.gh-resolved`, which `gh repo set-default` writes and
+    /// which decides the repository gh commands in this checkout name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gh_resolved: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2490,7 +2494,7 @@ pub fn parse_remote_config(output: &[u8]) -> Result<Vec<RemoteRecord>, GitParseE
         let Some((name, variable)) = rest.rsplit_once('.') else {
             continue;
         };
-        if name.is_empty() || !matches!(variable, "url" | "pushurl") {
+        if name.is_empty() || !matches!(variable, "url" | "pushurl" | "gh-resolved") {
             continue;
         }
         let entry = remotes
@@ -2499,19 +2503,24 @@ pub fn parse_remote_config(output: &[u8]) -> Result<Vec<RemoteRecord>, GitParseE
                 name: name.to_owned(),
                 fetch_url: None,
                 push_url: None,
+                gh_resolved: None,
             });
         // URLs are opaque configuration text rather than a path this service
         // reopens, so an undecodable byte is rendered rather than fatal.
         let value = String::from_utf8_lossy(value).into_owned();
         // Git fetches from the first configured URL. Preserve that primary
         // destination when a remote has multiple fetch or push URLs.
-        if variable == "url" {
-            entry.fetch_url.get_or_insert(value);
-        } else {
-            entry.push_url.get_or_insert(value);
+        match variable {
+            "url" => _ = entry.fetch_url.get_or_insert(value),
+            "pushurl" => _ = entry.push_url.get_or_insert(value),
+            _ => entry.gh_resolved = Some(value),
         }
     }
-    Ok(remotes.into_values().collect())
+    // A remote is somewhere to fetch from or push to; gh's note alone is not.
+    Ok(remotes
+        .into_values()
+        .filter(|remote| remote.fetch_url.is_some() || remote.push_url.is_some())
+        .collect())
 }
 
 /// Parses a NUL-delimited path list, deduplicated and sorted.
@@ -9111,10 +9120,12 @@ mod tests {
         );
 
         let remotes = parse_remote_config(
-            b"remote.origin.url\nssh://git@example.invalid/repo.git\0remote.origin.fetch\n+refs/heads/*\0remote.with.dots.pushurl\nhttps://example.invalid/other.git\0",
+            b"remote.origin.url\nssh://git@example.invalid/repo.git\0remote.origin.fetch\n+refs/heads/*\0remote.with.dots.pushurl\nhttps://example.invalid/other.git\0remote.origin.gh-resolved\nbase\0remote.stray.gh-resolved\nbase\0",
         )
         .unwrap();
         assert_eq!(remotes.len(), 2);
+        assert_eq!(remotes[0].gh_resolved.as_deref(), Some("base"));
+        assert_eq!(remotes[1].gh_resolved, None);
         assert_eq!(remotes[0].name, "origin");
         assert_eq!(
             remotes[0].fetch_url.as_deref(),

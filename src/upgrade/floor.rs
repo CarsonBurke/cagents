@@ -212,6 +212,14 @@ impl Ledger {
                 })
             })
             .or_else(|| {
+                self.records.iter().find_map(|record| {
+                    record
+                        .chats
+                        .iter()
+                        .find(|source| record.earlier_form(source, session))
+                })
+            })
+            .or_else(|| {
                 self.records
                     .iter()
                     .flat_map(|record| &record.chats)
@@ -231,7 +239,9 @@ impl Ledger {
         self.records.iter().any(|record| {
             record.chats.iter().any(|original| {
                 original.id == source.id
-                    && (source == original || record.aliases.contains(source))
+                    && (source == original
+                        || record.aliases.contains(source)
+                        || record.earlier_form(original, source))
                     && source.proof != replacement.proof
                     && Self::is_history_replacement(original, replacement)
             })
@@ -688,6 +698,37 @@ mod tests {
     }
 
     #[test]
+    fn a_descriptor_saved_before_the_conversation_id_resolves_to_its_stopped_chat() {
+        let original = chat();
+        let mut earlier = original.clone();
+        earlier.launch.session_id = None;
+        let mut replacement = original.clone();
+        replacement.proof.as_mut().unwrap().host_incarnation =
+            crate::model::HostIncarnation::new("successor");
+        replacement.native_continuity = crate::chat::NativeContinuity::ReconnectOnly;
+        let ledger = Ledger {
+            records: vec![Record::new(source(), vec![original.clone()], vec![])],
+        };
+        assert!(ledger.history_replacement(&original, &replacement));
+        assert!(ledger.history_replacement(&earlier, &replacement));
+        assert_eq!(ledger.resume_source(&earlier), Some(&original));
+
+        let mut other_conversation = earlier.clone();
+        other_conversation.launch.session_id = Some("other".into());
+        assert!(!ledger.history_replacement(&other_conversation, &replacement));
+        assert!(ledger.resume_source(&other_conversation).is_none());
+        let mut other_epoch = earlier.clone();
+        other_epoch.proof.as_mut().unwrap().host_incarnation =
+            crate::model::HostIncarnation::new("different");
+        assert!(!ledger.history_replacement(&other_epoch, &replacement));
+        assert!(ledger.resume_source(&other_epoch).is_none());
+        let mut other_recipe = earlier;
+        other_recipe.launch.recipe.arguments.push("other".into());
+        assert!(!ledger.history_replacement(&other_recipe, &replacement));
+        assert!(ledger.resume_source(&other_recipe).is_none());
+    }
+
+    #[test]
     fn exact_stopped_source_wins_over_an_earlier_epoch_of_the_same_pane() {
         let old = chat();
         let mut current = old.clone();
@@ -855,6 +896,15 @@ pub(crate) fn same_allocation(source: &Session, saved: &Session) -> bool {
 }
 
 impl Record {
+    /// A descriptor of a stopped pane captured before the source learned its
+    /// conversation ID. Panes and agents saved earlier in the source epoch keep
+    /// that form, so it must resolve to the same stopped chat as the exact one.
+    fn earlier_form(&self, original: &Session, earlier: &Session) -> bool {
+        earlier.proof.as_ref() == Some(&self.source)
+            && earlier.launch.session_id.is_none()
+            && same_allocation(original, earlier)
+    }
+
     /// ChatClose's final publication may name a conversation which did not
     /// exist in ChatList yet. Bind that acknowledgement to the exact captured
     /// allocation and retain the old descriptor as its stopped-reader alias.

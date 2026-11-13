@@ -23042,6 +23042,7 @@ pub(crate) mod tests {
             name: name.into(),
             fetch_url: Some(url.into()),
             push_url: None,
+            gh_resolved: None,
         }
     }
 

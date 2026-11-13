@@ -19758,7 +19758,7 @@ fn load_repository(
             pull_request_review::ReviewSource::from_remotes(&repository.selected_path, &remotes)
         })
         .map(|source| source.repository);
-    let github_availability = load_repository_github(&repository, &cancellation);
+    let github_availability = load_repository_github(&repository, false, &cancellation);
     // The shared model's own derivation, not a second copy of it: a project
     // this window opened and one the CLI opened are one row in the registry,
     // and two rules for its name would make the sidebar show whichever of them
@@ -19781,8 +19781,13 @@ fn load_repository(
     })
 }
 
+/// Reads a repository's GitHub state. A `revalidate` read, which a refresh
+/// tick makes, reuses what the last read resolved, and keeps its listing when
+/// GitHub says, for free, that nothing changed; opening or retrying a project
+/// reads both.
 fn load_repository_github(
     repository: &RepositoryInfo,
+    revalidate: bool,
     cancellation: &CancellationToken,
 ) -> GitHubAvailability {
     let service = RepositoryService::system("git");
@@ -19800,37 +19805,54 @@ fn load_repository_github(
             return Err(GitHubAvailability::NotAssociated);
         }
         let key = github
-            .resolve_repository(&repository.selected_path, &remotes, &cancellation)
+            .resolve_repository_cached(
+                &repository.selected_path,
+                &remotes,
+                revalidate,
+                &cancellation,
+            )
             .map_err(GitHubAvailability::from_error)?;
+        let validator = match github.sidebar_probe(&key, revalidate, &cancellation) {
+            // The probe was answered as this account, so it is signed in.
+            crate::github::SidebarProbe::Unchanged(pull_requests) => {
+                return Ok(github_ready(key, pull_requests));
+            }
+            crate::github::SidebarProbe::Read(validator) => validator,
+        };
         let auth = github
             .auth_status(&key, &cancellation)
             .map_err(GitHubAvailability::from_error)?;
         if auth.state != crate::github::GhAuthState::Authenticated {
             return Err(GitHubAvailability::Unauthenticated);
         }
-        let mut pull_requests = github
-            .sidebar_open(&key, sidebar::PULL_REQUEST_LIST_LIMIT, &cancellation)
+        let pull_requests = github
+            .sidebar_listing(
+                &key,
+                validator,
+                sidebar::PULL_REQUEST_LIST_LIMIT,
+                &cancellation,
+            )
             .map_err(GitHubAvailability::from_error)?;
-        // Closed history must not consume the open-PR page. Its failure also
-        // must not discard successfully refreshed open conversation authority.
-        if let Ok(history) =
-            github.recent_history(&key, sidebar::PULL_REQUEST_LIST_LIMIT, &cancellation)
-        {
-            crate::github::append_recent_history(&mut pull_requests, history);
-        }
-        Ok(GitHubAvailability::Ready {
-            repository_key: key,
-            pull_requests: pull_requests
-                .into_iter()
-                .map(|pull_request| {
-                    let checks = pull_request.check_summaries();
-                    (pull_request, checks)
-                })
-                .collect(),
-            refreshed_at: unix_millis(),
-        })
+        Ok(github_ready(key, pull_requests))
     })()
     .unwrap_or_else(|unavailable| unavailable)
+}
+
+fn github_ready(
+    repository_key: GitHubRepoKey,
+    pull_requests: Vec<crate::github::PullRequest>,
+) -> GitHubAvailability {
+    GitHubAvailability::Ready {
+        repository_key,
+        pull_requests: pull_requests
+            .into_iter()
+            .map(|pull_request| {
+                let checks = pull_request.check_summaries();
+                (pull_request, checks)
+            })
+            .collect(),
+        refreshed_at: unix_millis(),
+    }
 }
 
 const SHARED_TERMINAL_DISCONNECTED: &str =
