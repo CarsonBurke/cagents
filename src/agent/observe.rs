@@ -14,7 +14,11 @@ mod codex;
 mod rollout;
 pub(crate) mod socket;
 
+/// How long a census, or a failure to take one, answers without checking.
 const TTL: Duration = Duration::from_secs(2);
+/// A Claude census whose status files are unchanged is still taken again
+/// this often, in case the CLI learns of a change some other way.
+const UNCHANGED_TTL: Duration = Duration::from_secs(60);
 const TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_ACCOUNTS: usize = 32;
 const MAX_ROWS: usize = 256;
@@ -70,9 +74,28 @@ enum Inventory {
     Codex(Census),
 }
 
+#[derive(Default)]
 struct Entry {
-    updated: Option<Instant>,
+    /// When the census was last taken or found unchanged.
+    checked: Option<Instant>,
+    /// When the census was last taken.
+    listed: Option<Instant>,
     census: Option<Inventory>,
+    /// The Claude status files as they were just before the census was taken.
+    inputs: Option<claude::Inputs>,
+}
+
+impl Entry {
+    /// Whether a Claude census can answer for `pid` without listing again:
+    /// the CLI keeps a status file for it, and none changed since the census.
+    fn unchanged(&self, inputs: Option<&claude::Inputs>, pid: i32) -> bool {
+        self.census.is_some()
+            && self
+                .listed
+                .is_some_and(|listed| listed.elapsed() < UNCHANGED_TTL)
+            && inputs
+                .is_some_and(|inputs| inputs.tracks(pid) && self.inputs.as_ref() == Some(inputs))
+    }
 }
 
 /// Shared account census cache used by the daemon's bounded activity workers.
@@ -147,15 +170,7 @@ impl Observer {
                     .ok_or(ObserveError::Busy)?;
                 accounts.remove(&unused);
             }
-            accounts
-                .entry(key.clone())
-                .or_insert_with(|| {
-                    Arc::new(Mutex::new(Entry {
-                        updated: None,
-                        census: None,
-                    }))
-                })
-                .clone()
+            accounts.entry(key.clone()).or_default().clone()
         };
         // Only the account lock spans I/O, never HostState or the registry lock.
         // A slow account must not occupy every daemon worker with duplicate
@@ -168,21 +183,29 @@ impl Observer {
                 // The service contains observation panics and retries. Discard
                 // potentially partial presentation state before allowing this
                 // same account gate to serve a fresh census again.
-                recovered.census = None;
-                recovered.updated = None;
+                *recovered = Entry::default();
                 entry.clear_poison();
                 recovered
             }
         };
-        if entry.updated.is_none_or(|updated| updated.elapsed() >= TTL) {
-            entry.census = match provider {
-                Provider::Claude => claude::census(recipe).map(Inventory::Claude),
-                Provider::Codex => codex::census(&key).map(Inventory::Codex),
-                Provider::Omp => unreachable!(),
+        if entry.checked.is_none_or(|checked| checked.elapsed() >= TTL) {
+            // Read before listing, so a change made during the listing is
+            // still a change at the next check.
+            let inputs = (provider == Provider::Claude)
+                .then(|| claude::Inputs::read(&key.home))
+                .flatten();
+            if !entry.unchanged(inputs.as_ref(), process.pid) {
+                entry.census = match provider {
+                    Provider::Claude => claude::census(recipe).map(Inventory::Claude),
+                    Provider::Codex => codex::census(&key).map(Inventory::Codex),
+                    Provider::Omp => unreachable!(),
+                }
+                .ok();
+                // Failure is cached too, replacing (not retaining) previous Working.
+                entry.listed = Some(Instant::now());
+                entry.inputs = inputs;
             }
-            .ok();
-            // Failure is cached too, replacing (not retaining) previous Working.
-            entry.updated = Some(Instant::now());
+            entry.checked = Some(Instant::now());
         }
         let census = entry.census.as_ref().ok_or(ObserveError::Unavailable)?;
         let state = match census {
@@ -371,7 +394,9 @@ mod tests {
         title: &str,
     ) -> Arc<Mutex<Entry>> {
         let entry = Arc::new(Mutex::new(Entry {
-            updated: Some(Instant::now()),
+            checked: Some(Instant::now()),
+            listed: Some(Instant::now()),
+            inputs: None,
             census: Some(Inventory::Claude(BTreeMap::from([(
                 process.pid,
                 (
@@ -393,7 +418,7 @@ mod tests {
         {
             let held = entry.lock().unwrap();
             assert!(held.census.is_some());
-            assert!(held.updated.unwrap().elapsed() < TTL);
+            assert!(held.checked.unwrap().elapsed() < TTL);
         }
         let failure = std::panic::catch_unwind(|| {
             let _held = entry.lock().unwrap();
@@ -496,14 +521,14 @@ printf '%s\n' "$CAGENTS_OBSERVER_ROWS"
                 cached.census.is_none(),
                 "failed refresh must discard stale Working/title"
             );
-            cached.updated.unwrap()
+            cached.checked.unwrap()
         };
         assert!(matches!(
             observer.try_observe(&process),
             Err(ObserveError::Unavailable)
         ));
         assert_eq!(
-            entry.lock().unwrap().updated,
+            entry.lock().unwrap().checked,
             Some(failed_at),
             "failed census retains its normal TTL"
         );
@@ -515,6 +540,112 @@ printf '%s\n' "$CAGENTS_OBSERVER_ROWS"
         assert_eq!(observed.title.as_deref(), Some("Peer title"));
         assert!(observed.attention.is_none());
         assert_eq!(observer.accounts.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn unchanged_status_files_answer_without_listing_again() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("census-fixture");
+        let marker = directory.path().join("queries");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+set -eu
+printf 'query\n' >> "$CAGENTS_OBSERVER_MARKER"
+printf '%s\n' "$CAGENTS_OBSERVER_ROWS"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut process = process(directory.path(), script);
+        process.launch.environment.extend([
+            (
+                "CAGENTS_OBSERVER_MARKER".into(),
+                marker.to_str().unwrap().into(),
+            ),
+            (
+                "CAGENTS_OBSERVER_ROWS".into(),
+                serde_json::json!([{
+                    "kind": "interactive",
+                    "pid": process.pid,
+                    "cwd": directory.path(),
+                    "status": "idle",
+                    "name": "Idle task"
+                }])
+                .to_string(),
+            ),
+        ]);
+        let observer = Observer::new();
+        let queries = || std::fs::read_to_string(&marker).unwrap().lines().count();
+        let observe = || {
+            let observed = observer
+                .try_observe(&process)
+                .unwrap_or_else(|_| panic!("census failed"));
+            assert_eq!(observed.activity.unwrap().state, ActivityState::Idle);
+            assert_eq!(observed.title.as_deref(), Some("Idle task"));
+        };
+        let entry = || {
+            observer
+                .accounts
+                .lock()
+                .unwrap()
+                .get(&key(process.provider, &process.launch).unwrap())
+                .unwrap()
+                .clone()
+        };
+        let expire = |since: &dyn Fn(&mut Entry) -> &mut Option<Instant>, by: Duration| {
+            let entry = entry();
+            let mut entry = entry.lock().unwrap();
+            let at = since(&mut entry);
+            *at = Some(at.unwrap() - by);
+        };
+        let checked = |entry: &mut Entry| &mut entry.checked;
+        let listed = |entry: &mut Entry| &mut entry.listed;
+
+        // Without a status file for the process, every check lists.
+        observe();
+        expire(&checked, TTL);
+        observe();
+        assert_eq!(queries(), 2);
+
+        let sessions = directory.path().join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        let status = sessions.join(format!("{}.json", process.pid));
+        std::fs::write(&status, r#"{"status":"idle"}"#).unwrap();
+        std::fs::write(sessions.join("1.json"), r#"{"status":"idle"}"#).unwrap();
+        expire(&checked, TTL);
+        observe();
+        assert_eq!(queries(), 3, "the first files seen are a baseline");
+
+        for _ in 0..5 {
+            expire(&checked, TTL);
+            observe();
+        }
+        assert_eq!(queries(), 3, "an idle account is not listed again");
+
+        // Any session's change, arrival or departure is a change.
+        std::fs::write(&status, r#"{"status":"busy"}"#).unwrap();
+        expire(&checked, TTL);
+        observe();
+        assert_eq!(queries(), 4);
+        std::fs::write(sessions.join("2.json"), "{}").unwrap();
+        expire(&checked, TTL);
+        observe();
+        assert_eq!(queries(), 5);
+        std::fs::remove_file(sessions.join("1.json")).unwrap();
+        expire(&checked, TTL);
+        observe();
+        assert_eq!(queries(), 6);
+
+        // Within the TTL nothing is read at all; past the backstop it lists.
+        observe();
+        assert_eq!(queries(), 6);
+        expire(&checked, TTL);
+        expire(&listed, UNCHANGED_TTL);
+        observe();
+        assert_eq!(queries(), 7);
     }
 
     #[test]
@@ -541,10 +672,7 @@ printf '%s\n' "$CAGENTS_OBSERVER_ROWS"
             recovery: launch.clone(),
         };
         let observer = Observer::new();
-        let entry = Arc::new(Mutex::new(Entry {
-            updated: None,
-            census: None,
-        }));
+        let entry = Arc::new(Mutex::new(Entry::default()));
         observer
             .accounts
             .lock()

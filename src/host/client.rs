@@ -4661,6 +4661,12 @@ pub(in crate::host) mod tests {
         let started = directory.path().join("probe-started");
         wait_file(&started);
         let probe_pid: i32 = std::fs::read_to_string(&started).unwrap().parse().unwrap();
+        // Upgrade and shutdown admission never waits for the provider listing.
+        let gate = host.lock().unwrap().control_gate.clone();
+        assert!(
+            gate.try_write().is_ok(),
+            "a provider listing in flight must not hold the control gate"
+        );
 
         // Compatibility refreshes read the cache immediately; none schedules a
         // probe or creates a per-connection worker. Input shares this socket.

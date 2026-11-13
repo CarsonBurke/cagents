@@ -356,9 +356,6 @@ fn observe(host: &Weak<HostLock>, candidate: &Candidate) -> Outcome {
             Arc::clone(&state.agent_observer),
         )
     };
-    // Keep provider observation and owner apply inside upgrade admission, but
-    // never hold HostState during provider I/O or waiting on the PTY owner.
-    let _control = gate.read().unwrap_or_else(|p| p.into_inner());
     let current = || {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         !state.shutting_down
@@ -372,7 +369,13 @@ fn observe(host: &Weak<HostLock>, candidate: &Candidate) -> Outcome {
     if !current() {
         return Outcome::Failed;
     }
+    // Provider I/O can take seconds, so it runs outside upgrade admission and
+    // shutdown or an upgrade never waits for it. Its effects are admitted:
+    // they apply under the gate, and only while the observed process is still
+    // current. HostState is never held during provider I/O or while waiting on
+    // the PTY owner.
     let observation = observer.try_observe(&candidate.process);
+    let _control = gate.read().unwrap_or_else(|p| p.into_inner());
     if !current() {
         return Outcome::Failed;
     }
