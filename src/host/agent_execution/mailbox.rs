@@ -129,7 +129,7 @@ pub(in crate::host) fn hand(
         else {
             return Ok(None);
         };
-        Ok::<_, String>(Some(started(host, &registry, &accepted)))
+        Ok::<_, String>(Some(started(host, &registry, &accepted, message.id)))
     })();
     wake(host);
     // The message is left either way; a failure to start its run is how the
@@ -258,37 +258,49 @@ pub(super) fn to_agent(
         }
     };
     super::announce(host, registry);
-    Ok(Some(started(host, registry, &accepted)))
+    Ok(Some(started(host, registry, &accepted, message.id)))
 }
 
 /// How the agent takes a message as `accepted`, once cagents tried to start
 /// it.
-fn started(host: &SharedHost, registry: &SharedRegistry, accepted: &Accepted) -> Handoff {
+fn started(
+    host: &SharedHost,
+    registry: &SharedRegistry,
+    accepted: &Accepted,
+    message: MessageId,
+) -> Handoff {
     let (agent, run) = (accepted.agent.id, accepted.run.id);
     let reason = match super::start(host, accepted) {
         Ok(start) => return Handoff::Run { agent, run, start },
         Err(reason) => reason,
     };
-    let ended = registry
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .agent_run(run)
-        .map(|run| (run.state, run.provider_key.is_some()));
+    let ended = {
+        let store = registry.lock().unwrap_or_else(|p| p.into_inner());
+        store.agent_run(run).and_then(|run| {
+            let returned = store
+                .message(message)?
+                .is_some_and(|message| message.state == State::Pending);
+            Ok((run.state, run.provider_key.is_some(), returned))
+        })
+    };
     match ended {
+        // Only a run proved never to have reached the provider gives its
+        // message back, which then reaches the conversation as a message.
+        Ok((_, false, true)) => Handoff::Held { agent, reason },
         // The provider may have the message, so it stays given.
-        Ok((crate::agent_execution::State::Interrupted, _)) => {
-            Handoff::Unknown { agent, run, reason }
-        }
         // The provider acknowledged the turn: the agent took the message
         // as this run, which has since ended.
-        Ok((_, true)) => Handoff::Run {
-            agent,
-            run,
-            start: crate::agent_execution::Start::Sent { resumed: false },
-        },
-        // Its run ended unsent and gave the message back, which reaches the
-        // conversation as a message.
-        _ => Handoff::Held { agent, reason },
+        Ok((state, true, _)) if state != crate::agent_execution::State::Interrupted => {
+            Handoff::Run {
+                agent,
+                run,
+                start: crate::agent_execution::Start::Sent { resumed: false },
+            }
+        }
+        // Interrupted, or ended with its prompt perhaps written but not
+        // acknowledged: the provider may have the message, so it stays given.
+        Ok(_) => Handoff::Unknown { agent, run, reason },
+        Err(_) => Handoff::Held { agent, reason },
     }
 }
 

@@ -595,7 +595,6 @@ impl Registry {
         Ok(removed)
     }
 
-    #[cfg(test)]
     pub(crate) fn message(&self, id: MessageId) -> Result<Option<Message>, String> {
         use rusqlite::OptionalExtension;
         self.db

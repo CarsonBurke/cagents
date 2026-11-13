@@ -297,6 +297,9 @@ fn provider(
 /// A prompt that cannot go now or later is recorded failed, with why, rather
 /// than retried: a reopening that failed, or work ahead whose outcome is
 /// unknown. The next prompt tries again.
+/// How `start` reports a run that ended with no diagnostic.
+const RUN_ENDED: &str = "The run ended ";
+
 /// Why `accepted` did not start, beginning with what its run's end proves
 /// about its prompt, so the CLI knows whether retrying its key can help.
 fn unstarted(host: &SharedHost, accepted: &Accepted, error: String) -> String {
@@ -317,10 +320,18 @@ fn unstarted(host: &SharedHost, accepted: &Accepted, error: String) -> String {
         .unwrap_or_default();
     match run.map(|run| (run.state, run.provider_key.is_some())) {
         // The provider acknowledged the turn, so the agent had the prompt.
-        Ok((state @ (State::Succeeded | State::Failed | State::Cancelled), true)) => format!(
-            "{ENDED}run {id} ended {} after the agent received it. {reason}",
-            format!("{state:?}").to_lowercase()
-        ),
+        Ok((state @ (State::Failed | State::Cancelled), true)) => {
+            let ended = format!(
+                "{ENDED}run {id} ended {} after the agent received it.",
+                format!("{state:?}").to_lowercase()
+            );
+            // Without a diagnostic the reason only repeats how it ended.
+            if error.starts_with(RUN_ENDED) {
+                ended
+            } else {
+                format!("{ended} {reason}")
+            }
+        }
         Ok((State::Failed | State::Cancelled, false)) => {
             format!("{NOT_SENT}run {id} ended before the agent received it. {reason}")
         }
@@ -353,7 +364,7 @@ pub(super) fn start(host: &SharedHost, accepted: &Accepted) -> Result<Start, Str
             State::Failed | State::Cancelled | State::Interrupted => Err(run
                 .result
                 .diagnostic
-                .unwrap_or_else(|| format!("The run ended {:?}", run.state))),
+                .unwrap_or_else(|| format!("{RUN_ENDED}{:?}", run.state))),
             _ => Ok(Start::Sent { resumed: false }),
         };
     }
