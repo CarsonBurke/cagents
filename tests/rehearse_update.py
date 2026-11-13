@@ -561,6 +561,69 @@ class ReopenedWindows(unittest.TestCase):
                 rehearsal.wait_windows(['main','second'], timeout=1, version='new')
 
 
+class ScaleSeed(unittest.TestCase):
+    def module(self):
+        spec = importlib.util.spec_from_file_location('rehearsal_scale', REPOSITORY/'scripts/rehearse_update_run.py')
+        scenario = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(scenario)
+        return scenario
+
+    def test_scale_options_reach_the_seed_command(self):
+        import argparse
+        scenario = self.module()
+        parser = argparse.ArgumentParser()
+        scenario.seed_options(parser)
+        args = parser.parse_args(['--scale-chats', '120', '--scale-entries', '300', '--scale-bytes', '2048'])
+        self.assertEqual(parser.parse_args(scenario.seed_flags(args)), args)
+        self.assertNotIn('--scale-chats', scenario.seed_flags(parser.parse_args([])))
+
+    def test_scale_chats_open_long_and_idle_then_their_switches_are_removed(self):
+        scenario = self.module()
+        with tempfile.TemporaryDirectory(prefix='ru-scale-') as temporary:
+            root = Path(temporary)
+            claude = root/'home/.claude'
+            claude.mkdir(parents=True)
+            original = json.dumps({'pause': 6}, sort_keys=True)+'\n'
+            (root/'codex-fixture.json').write_text(original)
+            rehearsal = scenario.Rehearsal(str(root), str(SCRIPT))
+            spawned, channels = [], []
+            states = {}
+            def seed(name, argv, project=None):
+                self.assertEqual((claude/'fixture-long-history').read_text(), '300 2048\n')
+                self.assertEqual((claude/'fixture-first-turn-seconds').read_text(), '1\n')
+                self.assertEqual(json.loads((root/'codex-fixture.json').read_text()),
+                                 {'pause': 6, 'history': [300, 2048]})
+                if argv[:2] == ['channel','spawn']:
+                    channels.append(argv[argv.index('--title')+1])
+                    return {'response': {'data': {'channel': {'id': f'channel-{len(channels)}'}}}}
+                self.assertLess(sum(state == 'Running' for state in states.values()), 8)
+                spawned.append((argv[argv.index('--provider')+1], project, argv[argv.index('--channel')+1]))
+                states[argv[argv.index('--name')+1]] = 'Running'
+            def cli(*arguments, **options):
+                listing = {'data': {'agents': [{'agent': {'name': name, 'origin': 'User'}, 'state': state}
+                                               for name, state in states.items()]}}
+                # Each listing lets one scale run finish; the seed's own chats never do.
+                finished = next((name for name, state in states.items()
+                                 if state == 'Running' and name.startswith('scale-')), None)
+                if finished:
+                    states[finished] = 'Succeeded'
+                return 0, listing
+            # Seven held slots leave room for one scale chat at a time.
+            states.update({f'held-{n}': 'Running' for n in range(7)})
+            args = type('Args', (), {'scale_chats': 4, 'scale_entries': 300, 'scale_bytes': 2048})
+            with patch.object(rehearsal, 'cli', side_effect=cli), patch.object(scenario.time, 'sleep'):
+                rehearsal.seed_scale(args, seed)
+            self.assertEqual(channels, ['Scale alpha', 'Scale beta'])
+            self.assertEqual(spawned, [('codex','alpha','channel-1'),('claude','beta','channel-2'),
+                                       ('claude','alpha','channel-1'),('codex','beta','channel-2')])
+            self.assertEqual(rehearsal.errors, [])
+            self.assertEqual({states[f'scale-{n}'] for n in range(1, 5)}, {'Succeeded'})
+            self.assertFalse((claude/'fixture-long-history').exists())
+            self.assertFalse((claude/'fixture-first-turn-seconds').exists())
+            self.assertEqual((root/'codex-fixture.json').read_text(), original)
+            self.assertEqual(json.loads((root/'scale-seed.json').read_text())['codex'], 2)
+
+
 class ChatViews(unittest.TestCase):
     def module(self):
         spec = importlib.util.spec_from_file_location('rehearsal_chat_views', REPOSITORY/'scripts/rehearse_update_run.py')

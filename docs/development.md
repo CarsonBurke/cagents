@@ -2030,6 +2030,19 @@ chat and console agents, an offline Codex app-server, two untitled conversations
 in one project, a channel containing ` Details: `, a shell and `sleep 86400`.
 Use `--untitled 0|1|2`, `--no-codex`, `--no-console` and `--no-child` to vary that baseline.
 
+Use `--scale-chats 120` to rehearse a daemon that has run for days: it also
+opens that many chats, every third one Codex, across both projects. Each opens
+with `--scale-entries` earlier messages (default 400) of about `--scale-bytes`
+each (default 1536), then settles idle, so the update records long transcript
+pages without treating the chats as working. The Claude fake reads
+`fixture-long-history` and `fixture-first-turn-seconds` at launch, and the
+Codex peer reads `history` from `codex-fixture.json`; the seed removes those
+settings once every scale chat is idle, so later launches are unaffected.
+Spawns wait for a free slot, as the daemon runs at most eight agents a person
+starts at once, so seeding 120 chats takes several minutes; it therefore cannot
+be combined with the working or natural-idle cases, whose Codex turn would end
+first. `scale-seed.json` records the counts and seeding time.
+
 Use `--codex-pause 90` to keep the offline Codex turn active at the update
 prompt. `--codex-never-confirm-interrupt` acknowledges interruption without a
 completion receipt; `--codex-never-confirm-close` retains the connection to
