@@ -420,7 +420,35 @@ pub(super) fn may_auto_retire_in(
             |row| row.get(0),
         )
         .map_err(|error| error.to_string())?;
-    Ok(!has_history)
+    Ok(!has_history && !holds_detached_agent_in(tx, home.channel, &view.retired)?)
+}
+
+/// Whether an open agent is placed in `channel` without a pane there that
+/// someone closed: a session waiting for a window to adopt it, or one whose
+/// adoption failed. Retiring its channel would hide it, so it keeps the
+/// channel. The text filter only narrows the decoded, exact placement check.
+fn holds_detached_agent_in(
+    tx: &Transaction<'_>,
+    channel: ChannelId,
+    closed_panes: &[CardId],
+) -> Result<bool, String> {
+    let mut statement = tx
+        .prepare_cached("SELECT record FROM agents WHERE closed=0 AND instr(record, ?1) > 0")
+        .map_err(|error| error.to_string())?;
+    let records = statement
+        .query_map([channel.to_string()], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?;
+    for record in records {
+        let record = record.map_err(|error| error.to_string())?;
+        // An unreadable record is not proof of absence: keep the channel.
+        let Ok(agent) = serde_json::from_str::<crate::agent_execution::Agent>(&record) else {
+            return Ok(true);
+        };
+        if agent.awaits_pane_in(channel, closed_panes) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn encode(value: &impl serde::Serialize) -> Result<String, String> {
