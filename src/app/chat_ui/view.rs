@@ -4454,13 +4454,18 @@ impl Runtime {
             if slot == Some(turn::Slot::Thinking) {
                 // A newer turn starting does not revive old reasoning that
                 // already has another item after it.
-                reasoning_finished(&self.snapshot.items, self.snapshot.busy, &item.id)
-                    .hash(&mut hasher);
-                if self
-                    .snapshot
-                    .items
-                    .last()
-                    .is_some_and(|last| last.id == item.id)
+                reasoning_finished(
+                    &self.snapshot.items,
+                    self.snapshot.busy && !self.snapshot.has_later,
+                    &item.id,
+                )
+                .hash(&mut hasher);
+                if !self.snapshot.has_later
+                    && self
+                        .snapshot
+                        .items
+                        .last()
+                        .is_some_and(|last| last.id == item.id)
                 {
                     self.snapshot.finished_at.hash(&mut hasher);
                 }
@@ -5521,8 +5526,10 @@ impl Runtime {
                 .map_or(
                     (
                         self.snapshot.items.as_slice(),
-                        self.snapshot.busy,
-                        self.snapshot.finished_at,
+                        self.snapshot.busy && !self.snapshot.has_later,
+                        self.snapshot
+                            .finished_at
+                            .filter(|_| !self.snapshot.has_later),
                     ),
                     |agent| {
                         (
@@ -13438,6 +13445,73 @@ mod tests {
             "Reasoning: First thought",
             "parent busy state cannot revive a completed child"
         );
+    }
+
+    #[test]
+    fn historical_reasoning_pages_do_not_show_live_status_or_borrow_the_latest_turns_end() {
+        use iced::advanced::{Layout, layout, widget::Tree};
+        let renderer = crate::app::tests::headless_renderer();
+        for body in ["**Earlier thought**\nLater line", ""] {
+            let thought = chat::Item {
+                id: "historical-thought".into(),
+                role: chat::Role::Assistant,
+                content: ItemContent::Text {
+                    text: body.into(),
+                    thinking: true,
+                    phase: chat::Phase::Commentary,
+                },
+                started_at: Some(1_000),
+                at: Some(1_000),
+            };
+            let (mut runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&thought));
+            let snapshot = Arc::make_mut(&mut runtime.snapshot);
+            snapshot.has_later = true;
+            snapshot.finished_at = Some(99_000);
+            for busy in [true, false] {
+                Arc::make_mut(&mut runtime.snapshot).busy = busy;
+                let mut element = runtime.text_view(
+                    &thought,
+                    &runtime.cache[&thought.id],
+                    turn::Slot::Thinking,
+                    design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE),
+                );
+                let mut tree = Tree::new(element.as_widget());
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(iced::Size::ZERO, iced::Size::new(320.0, 800.0)),
+                );
+                let accessible = element.as_widget().a11y_nodes(
+                    Layout::new(&node),
+                    &tree,
+                    iced::mouse::Cursor::Unavailable,
+                );
+                let labels = accessible
+                    .root()
+                    .iter()
+                    .chain(accessible.children())
+                    .filter_map(|node| node.node().label())
+                    .collect::<Vec<_>>();
+                let expected = if body.is_empty() {
+                    "Thought process"
+                } else {
+                    "Reasoning: Earlier thought"
+                };
+                assert!(labels.contains(&expected), "older page labels: {labels:?}");
+                assert!(
+                    !labels
+                        .iter()
+                        .any(|label| label.contains("Thinking") || label.contains("38s"))
+                );
+            }
+            let before = fingerprints(&runtime, true);
+            Arc::make_mut(&mut runtime.snapshot).finished_at = Some(123_000);
+            assert_eq!(
+                before,
+                fingerprints(&runtime, true),
+                "latest turn timing cannot invalidate historical reasoning"
+            );
+        }
     }
 
     #[test]
