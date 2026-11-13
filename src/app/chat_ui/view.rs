@@ -5340,6 +5340,11 @@ impl Runtime {
             *kind == chat::DeliveryKind::Notice && !monitor && delivery_command_failed(&heading);
         let glyph = if failed {
             Icon::Error
+        } else if *kind == chat::DeliveryKind::Notice
+            && !monitor
+            && delivery_command_outcome(&heading).is_some()
+        {
+            Icon::Terminal
         } else if *kind == chat::DeliveryKind::Notice {
             Icon::Attention
         } else {
