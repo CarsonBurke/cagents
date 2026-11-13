@@ -66,7 +66,7 @@ use worktree_dialog::{
 
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     pin::Pin,
     process::Stdio,
@@ -2858,7 +2858,7 @@ fn user_message_blocked_during_update(message: &Message) -> bool {
                 | Message::CancelTerminalClose
                 | Message::ConfirmChatClose
                 | Message::CancelChatClose
-                | Message::TerminalCloseDontAskChanged(_)
+                | Message::DontAskAgain(..)
                 | Message::SaveAndCloseRepository(_)
                 | Message::OverwriteAndCloseRepository(_)
                 | Message::DiscardAndCloseRepository(_)
@@ -3063,7 +3063,7 @@ pub enum SettingsField {
     RelaunchAgentsOnUpgrade,
     CheckForUpdates,
     EditorSyntaxTheme,
-    ConfirmTerminalClose,
+    Confirm(settings::Confirmation),
     FocusFollowsMouse,
     LinkOpenGesture,
     PullRequestOpenTarget,
@@ -3222,7 +3222,8 @@ impl SettingsField {
             Self::RelaunchAgentsOnUpgrade => "Unresumable agents",
             Self::CheckForUpdates => "Automatic checks",
             Self::EditorSyntaxTheme => "Syntax theme",
-            Self::ConfirmTerminalClose => "Active processes",
+            Self::Confirm(settings::Confirmation::StopWorkingChat) => "Working chats",
+            Self::Confirm(settings::Confirmation::CloseActiveTerminal) => "Active processes",
             Self::FocusFollowsMouse => "Pane focus",
             Self::LinkOpenGesture => "System browser gesture",
             Self::PullRequestOpenTarget => "Open pull requests in",
@@ -3266,7 +3267,6 @@ impl SettingsField {
             | Self::TerminalFontSize
             | Self::TerminalFontFamily
             | Self::TerminalScrollbackMib
-            | Self::ConfirmTerminalClose
             | Self::ConfirmMultilinePaste
             | Self::RelaunchAgentsOnUpgrade => SettingsCategory::Terminal,
             Self::MaxHotCards
@@ -3277,6 +3277,7 @@ impl SettingsField {
             | Self::SidebarWorktrees
             | Self::DefaultWorktreePane
             | Self::DefaultChannelPane
+            | Self::Confirm(_)
             | Self::FocusFollowsMouse => SettingsCategory::General,
             Self::ChatEnterSends | Self::ChatExpandToolGroups | Self::ChatContentFraction => {
                 SettingsCategory::NativeChat
@@ -3470,7 +3471,8 @@ struct SettingsDraft {
     editor_wrap_lines: bool,
     diff_hide_unchanged: bool,
     editor_syntax_theme: settings::EditorSyntaxTheme,
-    confirm_terminal_close: bool,
+    /// Whether each routine question is asked, as `AppSettings::asks` reads it.
+    confirmations: BTreeMap<settings::Confirmation, bool>,
     chat_enter_sends: bool,
     chat_expand_tool_groups: bool,
     chat_content_fraction: String,
@@ -3532,7 +3534,10 @@ impl SettingsDraft {
             editor_auto_save: settings.editor_auto_save,
             editor_wrap_lines: settings.editor_wrap_lines,
             diff_hide_unchanged: settings.diff_hide_unchanged,
-            confirm_terminal_close: settings.confirm_terminal_close,
+            confirmations: settings::Confirmation::ALL
+                .into_iter()
+                .map(|kind| (kind, settings.asks(kind)))
+                .collect(),
             confirm_multiline_paste: settings.confirm_multiline_paste,
             browser_search_url: settings.browser_search_url.clone(),
             chat_enter_sends: settings.chat_enter_sends,
@@ -3598,7 +3603,9 @@ impl SettingsDraft {
             SettingsField::EditorAutoSave => self.editor_auto_save = value == "true",
             SettingsField::EditorWrapLines => self.editor_wrap_lines = value == "true",
             SettingsField::DiffHideUnchanged => self.diff_hide_unchanged = value == "true",
-            SettingsField::ConfirmTerminalClose => self.confirm_terminal_close = value == "true",
+            SettingsField::Confirm(kind) => {
+                self.confirmations.insert(kind, value == "true");
+            }
             SettingsField::ChatEnterSends => self.chat_enter_sends = value == "true",
             SettingsField::ChatExpandToolGroups => self.chat_expand_tool_groups = value == "true",
             SettingsField::ChatContentFraction => self.chat_content_fraction = value,
@@ -3825,10 +3832,10 @@ fn settings_update(
             .parse::<bool>()
             .map(|enabled| next.focus_follows_mouse = enabled)
             .map_err(|_| "Choose whether hovering activates panes.".to_owned()),
-        SettingsField::ConfirmTerminalClose => value
+        SettingsField::Confirm(kind) => value
             .parse::<bool>()
-            .map(|enabled| next.confirm_terminal_close = enabled)
-            .map_err(|_| "Choose whether active terminal closes require confirmation.".to_owned()),
+            .map(|ask| next.set_asks(kind, ask))
+            .map_err(|_| "Choose whether to ask first.".to_owned()),
         SettingsField::ConfirmMultilinePaste => value
             .parse::<bool>()
             .map(|value| next.confirm_multiline_paste = value)
@@ -4444,7 +4451,7 @@ pub enum Message {
         saved: Result<SettingsSaved, String>,
         result: Result<(), String>,
     },
-    SidebarPreferencesObserved(AppSettings),
+    SharedPreferencesObserved(AppSettings),
     SettingsSaved {
         generation: u64,
         result: Result<SettingsSaved, String>,
@@ -4468,7 +4475,8 @@ pub enum Message {
     CancelTerminalClose,
     ConfirmChatClose,
     CancelChatClose,
-    TerminalCloseDontAskChanged(bool),
+    /// Ticks or clears "Don't ask again" in the open question of this kind.
+    DontAskAgain(settings::Confirmation, bool),
     TerminalCloseFinished {
         card: CardId,
         terminal: TerminalId,
@@ -5403,7 +5411,9 @@ pub struct Cagents {
     /// Resetting settings destroys every customization with no undo, so it
     /// confirms first like every other destructive action in the shell.
     settings_reset_confirm: bool,
-    settings_reset_focus_confirm: bool,
+    /// Routine questions whose open dialog has "Don't ask again" ticked. The
+    /// tick is kept in settings only once the action goes ahead.
+    dont_ask_again: BTreeSet<settings::Confirmation>,
     settings_reset_keyboard_nav: Option<bool>,
     pull_request_dialog: Option<PullRequestDialog>,
     /// Opening or dismissing a newer draft supersedes in-flight draft recovery.
@@ -14495,7 +14505,6 @@ impl Cagents {
         if !std::mem::take(&mut self.settings_reset_confirm) {
             return Task::none();
         }
-        self.settings_reset_focus_confirm = false;
         if let Some(restore) = self.settings_reset_keyboard_nav.take() {
             self.core.set_keyboard_nav(restore);
         }
@@ -14803,7 +14812,7 @@ impl Application for Cagents {
             repository_load_sequence: 0,
             worktree_dialog: None,
             settings_reset_confirm: false,
-            settings_reset_focus_confirm: false,
+            dont_ask_again: BTreeSet::new(),
             settings_reset_keyboard_nav: None,
             pull_request_dialog: None,
             pull_request_dialog_generation: 0,
@@ -16798,22 +16807,28 @@ impl Application for Cagents {
                 }
                 Task::none()
             }
-            Message::SidebarPreferencesObserved(settings) => {
+            Message::SharedPreferencesObserved(settings) => {
                 // A local edit owns these fields until its save is acknowledged.
                 if self.settings_save_generation == self.settings_ack_generation {
                     // Never wait for a disk save on the event loop. An in-flight
                     // save's acknowledgment restarts this observation.
                     let Ok(mut lane) = self.settings_save_lane.try_lock() else { return Task::none(); };
+                    let adopt = |into: &mut AppSettings| {
+                        into.sidebar_worktrees = settings.sidebar_worktrees;
+                        into.sidebar_worktree_overrides = settings.sidebar_worktree_overrides.clone();
+                        into.confirm_terminal_close = settings.confirm_terminal_close;
+                        into.confirmations = settings.confirmations.clone();
+                    };
                     if let Some(saved) = lane.as_mut() {
-                        saved.settings.sidebar_worktrees = settings.sidebar_worktrees;
-                        saved.settings.sidebar_worktree_overrides = settings.sidebar_worktree_overrides.clone();
+                        adopt(&mut saved.settings);
                     }
                     drop(lane);
-                    self.settings.sidebar_worktrees = settings.sidebar_worktrees;
-                    self.settings.sidebar_worktree_overrides = settings.sidebar_worktree_overrides.clone();
-                    self.settings_base.sidebar_worktrees = settings.sidebar_worktrees;
-                    self.settings_base.sidebar_worktree_overrides = settings.sidebar_worktree_overrides.clone();
+                    adopt(&mut self.settings);
+                    adopt(&mut self.settings_base);
                     self.settings_draft.sidebar_worktrees = settings.sidebar_worktrees;
+                    for kind in settings::Confirmation::ALL {
+                        self.settings_draft.confirmations.insert(kind, settings.asks(kind));
+                    }
                     self.sidebar_state.set_sidebar_worktrees(settings.sidebar_worktrees);
                     self.sidebar_state.set_worktree_overrides(settings.sidebar_worktree_overrides);
                 }
@@ -17087,13 +17102,11 @@ impl Application for Cagents {
             Message::CancelTerminalClose => self.cancel_terminal_close(),
             Message::ConfirmChatClose => self.confirm_chat_close(),
             Message::CancelChatClose => self.cancel_chat_close(),
-            Message::TerminalCloseDontAskChanged(value) => {
-                if let Some(intent) = self.terminal_close.as_mut()
-                    && !intent.pending
-                    && intent.active
-                    && intent.detail.is_none()
-                {
-                    intent.dont_ask_again = value;
+            Message::DontAskAgain(confirmation, ticked) => {
+                if ticked {
+                    self.dont_ask_again.insert(confirmation);
+                } else {
+                    self.dont_ask_again.remove(&confirmation);
                 }
                 Task::none()
             }
@@ -17975,20 +17988,8 @@ impl Application for Cagents {
                             .map(cosmic::Action::App)
                     });
                 }
-                if self.settings_reset_on_top() {
-                    if is_escape_press(&event) {
-                        return self.close_settings_reset();
-                    }
-                    if is_tab_press(&event).is_some() {
-                        self.settings_reset_focus_confirm = !self.settings_reset_focus_confirm;
-                        let target = if self.settings_reset_focus_confirm {
-                            "dialog.reset-settings.confirm"
-                        } else {
-                            "dialog.reset-settings.cancel"
-                        };
-                        return iced::widget::operation::focus(widget::Id::new(target))
-                            .map(cosmic::Action::App);
-                    }
+                if self.settings_reset_on_top() && is_escape_press(&event) {
+                    return self.close_settings_reset();
                 }
                 if is_escape_press(&event) && !captured {
                     if self.transient_work_close.is_some() {
@@ -18052,14 +18053,6 @@ impl Application for Cagents {
                             InspectorAction::Close,
                         ));
                     }
-                }
-                if let Some(backwards) = is_tab_press(&event)
-                    && self.terminal_close_dialog_visible()
-                {
-                    return self.cycle_terminal_close_focus(backwards);
-                }
-                if is_tab_press(&event).is_some() && self.chat_close_dialog_visible() {
-                    return self.cycle_chat_close_focus();
                 }
                 if let Some(backwards) = is_tab_press(&event)
                     && self.dirty_repository_close.is_some()
@@ -18347,11 +18340,12 @@ impl Application for Cagents {
                     return Task::none();
                 }
                 self.settings_reset_confirm = true;
-                self.settings_reset_focus_confirm = false;
                 self.settings_reset_keyboard_nav = Some(self.core.keyboard_nav());
                 self.core.set_keyboard_nav(false);
-                iced::widget::operation::focus(widget::Id::new("dialog.reset-settings.cancel"))
-                    .map(cosmic::Action::App)
+                dialog_ui::Consequence::Irreversible.focus(
+                    widget::Id::new("dialog.reset-settings.cancel"),
+                    widget::Id::new("dialog.reset-settings.confirm"),
+                )
             }
             Message::CancelResetSettings => self.close_settings_reset(),
             Message::ConfirmResetSettings => {
@@ -18851,9 +18845,9 @@ impl Application for Cagents {
         subscriptions.push(
             Subscription::run_with(
                 (self.settings_path.clone(), self.settings_ack_generation),
-                |(path, _)| settings_ui::sidebar_preferences_stream(path.clone()),
+                |(path, _)| settings_ui::shared_preferences_stream(path.clone()),
             )
-            .map(Message::SidebarPreferencesObserved),
+            .map(Message::SharedPreferencesObserved),
         );
         subscriptions.extend(operation_subscriptions);
         if let Some(window) = self.core.main_window_id()
@@ -18917,7 +18911,7 @@ impl Application for Cagents {
                 }
             }
             return Some(dialog_ui::overlay(
-                dialog_ui::surface(
+                dialog_ui::confirmation_surface(
                     widget::column::with_children(vec![
                         design::title("Keep unsaved work before closing").into(),
                         notice_detail(self.window_close_transient_blocker().unwrap_or(
@@ -18991,7 +18985,7 @@ impl Application for Cagents {
         // user configured, with no undo.
         if self.settings_reset_confirm {
             return Some(dialog_ui::overlay(
-                dialog_ui::surface(
+                dialog_ui::confirmation_surface(
                     widget::column::with_children(vec![
                         design::title("Reset all settings?").into(),
                         notice_body(
@@ -24623,7 +24617,7 @@ mod tests {
     }
 
     #[test]
-    fn reset_settings_dialog_focus_cycles_and_escape_restores_origin() {
+    fn reset_settings_dialog_starts_on_cancel_cycles_within_and_escape_restores_origin() {
         let mut app = context_inspector_test_app(true);
         app.context_inspector_open = false;
         let card = app.workspace.focused().unwrap();
@@ -24654,22 +24648,31 @@ mod tests {
             text: None,
             repeat: false,
         };
-        // Both directions wrap within the two actions, even if a child has
-        // captured the key before the application receives it.
-        for (backwards, target) in [
-            (false, "dialog.reset-settings.confirm"),
-            (false, "dialog.reset-settings.cancel"),
-            (true, "dialog.reset-settings.confirm"),
-            (true, "dialog.reset-settings.cancel"),
+        // Resetting can't be undone, so Enter on the opening focus cancels,
+        // and the reset is one Tab, Shift+Tab or arrow away. Either way focus
+        // wraps within the two actions rather than reaching the window.
+        let cancel = widget::Id::new("dialog.reset-settings.cancel");
+        let reset = widget::Id::new("dialog.reset-settings.confirm");
+        assert!(matches!(
+            dialog_ui::tests::enter_control(
+                cosmic::Application::dialog(&app).unwrap(),
+                cancel.clone()
+            ),
+            Message::CancelResetSettings
+        ));
+        for (from, backwards, to) in [
+            (&cancel, false, &reset),
+            (&reset, false, &cancel),
+            (&cancel, true, &reset),
+            (&reset, true, &cancel),
         ] {
-            let task = app.update(Message::KeyEvent {
-                event: press(keyboard::key::Named::Tab, backwards),
-                captured: true,
-            });
-            assert_eq!(
-                focused_element(cosmic::Application::dialog(&app).unwrap(), task),
-                Some(widget::Id::new(target))
+            let (focused, captured) = dialog_ui::tests::focus_after_key(
+                cosmic::Application::dialog(&app).unwrap(),
+                from.clone(),
+                press(keyboard::key::Named::Tab, backwards),
             );
+            assert_eq!(focused.as_ref(), Some(to));
+            assert!(captured);
         }
         let task = app.update(Message::KeyEvent {
             event: press(keyboard::key::Named::Escape, false),
@@ -30763,7 +30766,7 @@ mod tests {
             .sidebar_worktree_overrides
             .insert(project, settings::SidebarWorktrees::Expanded);
         settings::save(&path, &external).unwrap();
-        drop(app.update(Message::SidebarPreferencesObserved(external)));
+        drop(app.update(Message::SharedPreferencesObserved(external)));
         assert_eq!(
             app.sidebar_state.worktree_display(project),
             settings::SidebarWorktrees::Expanded
@@ -30933,7 +30936,7 @@ mod tests {
             repository_load_sequence: 0,
             worktree_dialog: None,
             settings_reset_confirm: false,
-            settings_reset_focus_confirm: false,
+            dont_ask_again: BTreeSet::new(),
             settings_reset_keyboard_nav: None,
             pull_request_dialog: None,
             pull_request_dialog_generation: 0,

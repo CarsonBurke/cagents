@@ -562,6 +562,99 @@ pub fn keyboard_modal<'a, Message: 'a>(
     .into()
 }
 
+/// Keeps Tab, Shift+Tab and the Left and Right arrows moving keyboard focus
+/// among the controls inside `content`, wrapping at either end, so a dialog's
+/// choices are one key apart and focus never wanders to the window behind it.
+/// A key a focused control claimed, such as an arrow in a text field, is left
+/// to that control.
+pub fn focus_scope<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    Effect {
+        content: content.into(),
+        kind: Kind::FocusScope,
+        tip: None,
+        on_focused_key: None,
+    }
+    .into()
+}
+
+/// Counts the focusable controls in a subtree and finds the focused one.
+/// Selectable text registers as focusable without an id; it is for the
+/// pointer to copy from, not a stop on the way between a dialog's choices.
+#[derive(Default)]
+struct ScopeFocus {
+    count: usize,
+    focused: Option<usize>,
+}
+
+impl Operation for ScopeFocus {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+        operate(self);
+    }
+    fn focusable(
+        &mut self,
+        id: Option<&Id>,
+        _bounds: Rectangle,
+        state: &mut dyn operation::Focusable,
+    ) {
+        if id.is_none() {
+            return;
+        }
+        if state.is_focused() {
+            self.focused = Some(self.count);
+        }
+        self.count += 1;
+    }
+}
+
+/// Focuses the subtree's `target`th focusable control and no other.
+struct FocusNth {
+    target: usize,
+    index: usize,
+}
+
+impl Operation for FocusNth {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+        operate(self);
+    }
+    fn focusable(
+        &mut self,
+        id: Option<&Id>,
+        _bounds: Rectangle,
+        state: &mut dyn operation::Focusable,
+    ) {
+        if id.is_some() && self.index == self.target {
+            state.focus();
+        } else {
+            state.unfocus();
+        }
+        self.index += usize::from(id.is_some());
+    }
+}
+
+/// Where Tab, Shift+Tab, Left or Right moves focus within a scope.
+fn scope_step(event: &Event) -> Option<bool> {
+    use cosmic::iced::keyboard::{self, key::Named};
+    let Event::Keyboard(keyboard::Event::KeyPressed {
+        key: keyboard::Key::Named(key),
+        modifiers,
+        ..
+    }) = event
+    else {
+        return None;
+    };
+    if modifiers.control() || modifiers.alt() || modifiers.logo() {
+        return None;
+    }
+    match key {
+        Named::Tab => Some(modifiers.shift()),
+        Named::ArrowLeft if !modifiers.shift() => Some(true),
+        Named::ArrowRight if !modifiers.shift() => Some(false),
+        _ => None,
+    }
+}
+
 /// Blocks click-through without hiding the child's accessibility tree.
 pub fn opaque<'a, Message: 'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
     Effect {
@@ -1515,6 +1608,7 @@ enum Kind {
     Opaque,
     KeyboardModal,
     UnclaimedKey,
+    FocusScope,
 }
 
 struct Effect<'a, Message> {
@@ -1619,6 +1713,7 @@ struct TooltipTag;
 struct AnimationDriverTag;
 struct OpaqueTag;
 struct KeyboardModalTag;
+struct FocusScopeTag;
 struct ContextMenuTag;
 struct RevealWidthTag;
 
@@ -1712,6 +1807,7 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
             Kind::DriveAnimation(_) => tree::Tag::of::<AnimationDriverTag>(),
             Kind::Opaque => tree::Tag::of::<OpaqueTag>(),
             Kind::KeyboardModal => tree::Tag::of::<KeyboardModalTag>(),
+            Kind::FocusScope => tree::Tag::of::<FocusScopeTag>(),
             Kind::ContextMenu => tree::Tag::of::<ContextMenuTag>(),
             Kind::RevealWidth { .. } => tree::Tag::of::<RevealWidthTag>(),
         }
@@ -1942,6 +2038,37 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
             shell,
             viewport,
         );
+        if matches!(self.kind, Kind::FocusScope) {
+            if !shell.is_event_captured()
+                && let Some(backwards) = scope_step(event)
+            {
+                let mut focus = ScopeFocus::default();
+                self.content.as_widget_mut().operate(
+                    &mut tree.children[0],
+                    layout,
+                    renderer,
+                    &mut focus,
+                );
+                if focus.count > 0 {
+                    let target = match (focus.focused, backwards) {
+                        (Some(current), false) => (current + 1) % focus.count,
+                        (Some(current), true) => (current + focus.count - 1) % focus.count,
+                        (None, false) => 0,
+                        (None, true) => focus.count - 1,
+                    };
+                    self.content.as_widget_mut().operate(
+                        &mut tree.children[0],
+                        layout,
+                        renderer,
+                        &mut FocusNth { target, index: 0 },
+                    );
+                    shell.request_redraw();
+                }
+                // Even with nothing to focus, the key stays in the dialog.
+                shell.capture_event();
+            }
+            return;
+        }
         if matches!(self.kind, Kind::UnclaimedKey)
             && !shell.is_event_captured()
             && let Event::Keyboard(event) = event

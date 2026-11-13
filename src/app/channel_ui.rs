@@ -1777,7 +1777,7 @@ impl Cagents {
             .id(widget::Id::new("dialog.channel.confirm"))
             .on_press(Message::ChannelUi(Action::ConfirmDelete)),
         ));
-        Some(super::dialog_ui::surface(
+        Some(super::dialog_ui::confirmation_surface(
             widget::column::with_children(rows).spacing(space::M),
             480.0,
         ))

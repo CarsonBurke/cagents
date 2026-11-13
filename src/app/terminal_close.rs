@@ -20,7 +20,6 @@ pub(super) struct CloseIntent {
     pub restore_card: Option<CardId>,
     pub pending: bool,
     pub active: bool,
-    pub dont_ask_again: bool,
     pub detail: Option<String>,
     /// Processes Close couldn't read, which kept the pane: the person may
     /// close it anyway and leave them running.
@@ -28,7 +27,6 @@ pub(super) struct CloseIntent {
     /// Processes the person chose to leave running. Close passes over these
     /// and signals nothing.
     leave: Vec<UnreadableProcess>,
-    focus: usize,
     restore_keyboard_nav: bool,
 }
 
@@ -316,7 +314,7 @@ impl Cagents {
     }
 
     pub(super) fn begin_card_close(&mut self, card: CardId) -> Task<Message> {
-        self.close_card_as(card, !self.settings.confirm_terminal_close, false)
+        self.close_card_as(card, !self.asks(QUESTION), false)
     }
 
     /// Closes `card` without asking whether to stop what its terminal is
@@ -451,18 +449,16 @@ impl Cagents {
                 restore_card: self.workspace.focused(),
                 pending: false,
                 active: false,
-                dont_ask_again: false,
                 unreadable: Vec::new(),
                 leave: Vec::new(),
                 detail: (uncertain && !probe_only).then(|| {
                     "Cagents lost contact with its daemon, so this terminal may still be running. The pane was kept. Use Retry or Reconnect on the pane if it offers them, then close it again.".into()
                 }),
-                focus: 0,
                 restore_keyboard_nav: self.core.keyboard_nav(),
             });
             if self.terminal_close.as_ref().unwrap().detail.is_some() {
                 self.core.set_keyboard_nav(false);
-                return close_focus(0);
+                return close_focus();
             }
             return self.start_terminal_close(allow_active);
         }
@@ -505,14 +501,12 @@ impl Cagents {
                     restore_keyboard_nav: self.core.keyboard_nav(),
                     pending: false,
                     active: true,
-                    dont_ask_again: false,
                     detail: None,
                     unreadable: Vec::new(),
                     leave: Vec::new(),
-                    focus: 0,
                 });
                 self.core.set_keyboard_nav(false);
-                close_focus(0)
+                self.open_confirmation(QUESTION, cancel_id(), confirm_id())
             }
             Err(error) => {
                 self.status = Some(TransientNotice::error(format!(
@@ -724,6 +718,7 @@ impl Cagents {
         let Some(intent) = self.terminal_close.take() else {
             return Task::none();
         };
+        self.dismiss_confirmation(QUESTION);
         // Dismissing a report ends the attempt it reported on. The fence
         // exists so one intent cannot submit two concurrent requests and so
         // no automatic path retries a request whose fate is unknown; it is
@@ -762,12 +757,12 @@ impl Cagents {
         }
         // The opt-out is committed only by Close, never by toggling or Cancel.
         // Do not persist a stale target's dialog either.
-        let save = if (target_matches(intent, self.card_state(intent.card))
-            || exited_target_matches(intent, self.card_state(intent.card)))
-            && intent.dont_ask_again
+        let save = if target_matches(intent, self.card_state(intent.card))
+            || exited_target_matches(intent, self.card_state(intent.card))
         {
-            self.apply_setting_input(SettingsField::ConfirmTerminalClose, "false".into())
+            self.commit_confirmation(QUESTION)
         } else {
+            self.dismiss_confirmation(QUESTION);
             Task::none()
         };
         Task::batch([save, self.start_terminal_close(true)])
@@ -783,7 +778,6 @@ impl Cagents {
         let named = std::mem::take(&mut intent.unreadable);
         intent.leave.extend(named);
         intent.detail = None;
-        intent.focus = 0;
         // An active terminal still asks, as any Close does.
         self.start_terminal_close(false)
     }
@@ -801,7 +795,7 @@ impl Cagents {
             self.terminal_close.as_mut().unwrap().detail =
                 Some("This terminal changed before it could close, so nothing was closed. Try closing the pane again.".into());
             self.core.set_keyboard_nav(false);
-            return close_focus(0);
+            return close_focus();
         }
         if !self.terminal_close_attempts.insert(intent.terminal) {
             self.terminal_close.as_mut().unwrap().detail = Some(
@@ -809,7 +803,7 @@ impl Cagents {
                     .into(),
             );
             self.core.set_keyboard_nav(false);
-            return close_focus(0);
+            return close_focus();
         }
         self.terminal_close_generation = self.terminal_close_generation.wrapping_add(1);
         let intent = self.terminal_close.as_mut().unwrap();
@@ -898,9 +892,8 @@ impl Cagents {
                 intent.restore_keyboard_nav = self.core.keyboard_nav();
                 intent.pending = false;
                 intent.active = true;
-                intent.focus = 0;
                 self.core.set_keyboard_nav(false);
-                close_focus(0)
+                self.open_confirmation(QUESTION, cancel_id(), confirm_id())
             }
             outcome => {
                 // `Stale` and a mismatched identity both mean the request was
@@ -913,7 +906,6 @@ impl Cagents {
                 intent.restore_card = self.workspace.focused();
                 intent.restore_keyboard_nav = self.core.keyboard_nav();
                 intent.pending = false;
-                intent.focus = 0;
                 intent.unreadable = match &outcome {
                     CloseOutcome::Kept(kept) => kept.unreadable.clone(),
                     _ => Vec::new(),
@@ -935,26 +927,9 @@ impl Cagents {
                     }
                 });
                 self.core.set_keyboard_nav(false);
-                close_focus(0)
+                close_focus()
             }
         }
-    }
-
-    pub(super) fn cycle_terminal_close_focus(&mut self, backwards: bool) -> Task<Message> {
-        let Some(intent) = self.terminal_close.as_mut() else {
-            return Task::none();
-        };
-        if intent.pending {
-            return Task::none();
-        }
-        intent.focus = if intent.offers_leaving() {
-            (intent.focus + 1) % 2
-        } else if intent.detail.is_some() || !intent.active {
-            0
-        } else {
-            (intent.focus + if backwards { 2 } else { 1 }) % 3
-        };
-        close_focus(intent.focus)
     }
 
     pub(super) fn terminal_close_dialog(&self) -> Option<Element<'_, Message>> {
@@ -998,22 +973,7 @@ impl Cagents {
             .into(),
         ];
         if intent.active && intent.detail.is_none() {
-            rows.push(
-                widget::button::custom(
-                    crate::ui_controls::field::checkbox(intent.dont_ask_again)
-                        .label("Don't ask me again")
-                        .on_toggle_maybe(
-                            (!intent.pending).then_some(Message::TerminalCloseDontAskChanged),
-                        ),
-                )
-                .class(cosmic::theme::Button::Text)
-                .id(widget::Id::new("dialog.terminal-close.dont-ask"))
-                .on_press_maybe(
-                    (!intent.pending)
-                        .then_some(Message::TerminalCloseDontAskChanged(!intent.dont_ask_again)),
-                )
-                .into(),
-            );
+            rows.push(self.dont_ask_again_control(QUESTION, !intent.pending));
         }
         // A detail is an outcome the dialog is reporting, not a question it is
         // asking: it offers one way out rather than a refusal beside a
@@ -1024,33 +984,33 @@ impl Cagents {
         let buttons = if intent.offers_leaving() {
             vec![super::dialog_ui::confirmation_actions(
                 crate::ui_controls::button::secondary("Keep pane")
-                    .id(widget::Id::new("dialog.terminal-close.cancel"))
+                    .id(cancel_id())
                     .on_press_maybe((!intent.pending).then_some(Message::CancelTerminalClose)),
                 crate::ui_controls::button::destructive("Close anyway")
-                    .id(widget::Id::new("dialog.terminal-close.confirm"))
+                    .id(confirm_id())
                     .on_press_maybe((!intent.pending).then_some(Message::ConfirmTerminalClose)),
             )]
         } else if intent.detail.is_some() {
             vec![
                 crate::ui_controls::button::primary("Dismiss")
-                    .id(widget::Id::new("dialog.terminal-close.cancel"))
+                    .id(cancel_id())
                     .on_press_maybe((!intent.pending).then_some(Message::CancelTerminalClose))
                     .into(),
             ]
         } else {
             vec![super::dialog_ui::confirmation_actions(
                 crate::ui_controls::button::secondary("Cancel")
-                    .id(widget::Id::new("dialog.terminal-close.cancel"))
+                    .id(cancel_id())
                     .on_press_maybe((!intent.pending).then_some(Message::CancelTerminalClose)),
                 crate::ui_controls::button::destructive("Close")
-                    .id(widget::Id::new("dialog.terminal-close.confirm"))
+                    .id(confirm_id())
                     .on_press_maybe(
                         (!intent.pending && intent.active).then_some(Message::ConfirmTerminalClose),
                     ),
             )]
         };
         rows.push(widget::row::with_children(buttons).spacing(space::S).into());
-        Some(super::dialog_ui::surface(
+        Some(super::dialog_ui::confirmation_surface(
             widget::column::with_children(rows).spacing(space::M),
             560.0,
         ))
@@ -1072,13 +1032,22 @@ fn leave_running_title(processes: &[UnreadableProcess]) -> String {
     }
 }
 
-fn close_focus(index: usize) -> Task<Message> {
-    iced::widget::operation::focus(widget::Id::new(match index {
-        1 => "dialog.terminal-close.confirm",
-        2 => "dialog.terminal-close.dont-ask",
-        _ => "dialog.terminal-close.cancel",
-    }))
-    .map(cosmic::Action::App)
+/// Closing a terminal ends its processes, but the pane can be opened again:
+/// a routine question, unlike a report or Close anyway, which keep focus on
+/// keeping the pane.
+const QUESTION: settings::Confirmation = settings::Confirmation::CloseActiveTerminal;
+
+fn cancel_id() -> widget::Id {
+    widget::Id::new("dialog.terminal-close.cancel")
+}
+
+fn confirm_id() -> widget::Id {
+    widget::Id::new("dialog.terminal-close.confirm")
+}
+
+/// A report, or Close anyway, opens on keeping the pane.
+fn close_focus() -> Task<Message> {
+    iced::widget::operation::focus(cancel_id()).map(cosmic::Action::App)
 }
 
 #[cfg(test)]
@@ -1116,11 +1085,9 @@ mod tests {
             restore_card: None,
             pending: true,
             active: false,
-            dont_ask_again: false,
             detail: None,
             unreadable: Vec::new(),
             leave: Vec::new(),
-            focus: 0,
             restore_keyboard_nav: false,
         }
     }
@@ -2117,11 +2084,18 @@ mod tests {
             session: source.clone(),
             result: Ok(CompletedCloseOutcome::Active(proof.clone())),
         });
+        // A routine question opens on its answer, so Enter closes the pane.
         assert_eq!(
             super::super::tests::focused_element(app.terminal_close_dialog().unwrap(), opening),
-            Some(widget::Id::new("dialog.terminal-close.cancel"))
+            Some(confirm_id())
         );
-        assert!(app.terminal_close_dialog().is_some());
+        assert!(matches!(
+            super::super::dialog_ui::tests::enter_control(
+                app.terminal_close_dialog().unwrap(),
+                confirm_id()
+            ),
+            Message::ConfirmTerminalClose
+        ));
         assert!(app.card_state(card).unwrap().existence.is_open());
         let _ = app.update(Message::ConfirmTerminalClose);
         let intent = app.terminal_close.as_ref().unwrap().clone();
