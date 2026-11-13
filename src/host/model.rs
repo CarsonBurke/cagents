@@ -1287,7 +1287,8 @@ mod tests {
         registry
             .db
             .execute_batch(
-                "DROP TABLE automation_precheck_history_cleanup;
+                "DROP TABLE console_relaunches;
+                 DROP TABLE automation_precheck_history_cleanup;
                  DROP TABLE automation_retired_manual_requests;
                  DROP INDEX automation_removed_history;
                  DROP INDEX automation_firing_successors;
