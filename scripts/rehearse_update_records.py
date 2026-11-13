@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import argparse
+import copy
 from contextlib import closing
+import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import select
+import signal
 import sqlite3
 import stat
+import subprocess
 import sys
 import threading
 import time
@@ -218,10 +222,29 @@ def window_close_snapshot(root: Path, originals: list[dict], cancelled=lambda: F
     return result
 
 
+def window_slot(row):
+    argv = row.get('argv') or []
+    return argv[argv.index('--window') + 1] if '--window' in argv[:-1] else 'main'
+
+
 class WindowCloseMonitor:
     """Bounded diagnostic observer; phase samples never assert a commit ACK."""
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, stall_slot=None, suppress_flush=False, resume_after=None,
+                 under_lock=False):
         self.root = root
+        # With under_lock the window is stopped between its final_flush write
+        # and the release of its diagnostics lock, so it keeps holding that lock.
+        self.under_lock = under_lock
+        # With suppress_flush the stalled window's final_flush record is also
+        # removed, as if it were never written or had rotated away; with
+        # resume_after it is continued that many seconds after stopping.
+        self.suppress_flush = suppress_flush
+        self.resume_after = resume_after
+        # Fault injection, labeled in the trace: SIGSTOP this source window
+        # the moment its own final_flush complete=true is recorded, as a1's
+        # window stalled in teardown after saving while still holding its slot.
+        self.stall_slot = stall_slot
+        self.stall_thread = None
         self.stop = threading.Event()
         self.finished = threading.Event()
         self.thread = None
@@ -295,12 +318,189 @@ class WindowCloseMonitor:
                         if seconds not in observed and time.monotonic() - closing >= seconds:
                             observed.add(seconds)
                             self.sample(f'ClosingWindows+{seconds}s (not a commit ACK timestamp)')
+                            if seconds in (5, 40):
+                                self.backtrace_lingering(seconds)
                 self.stop.wait(.1)
         except Exception as error:
             self.write({'event': 'observer_error', 'error': repr(error), 'monotonic': time.monotonic()})
         finally:
             self.write({'event': 'observer_stopped', 'samples': self.samples,
                         'monotonic': time.monotonic()})
+
+    def backtrace_lingering(self, seconds):
+        """Thread backtraces of source windows still alive this long after ClosingWindows."""
+        for row, descriptor in zip(self.pinned, self.pidfds):
+            if row['role'] != 'source_ui' or select.select([descriptor], [], [], 0)[0]:
+                continue
+            if trace_process_identity(Path('/proc') / str(row['pid'])) != (row['start_ticks'], row['executable']):
+                continue
+            name = f"window-backtrace-{row['pid']}-{seconds}s.txt"
+            started = time.monotonic()
+            try:
+                completed = subprocess.run(
+                    ['timeout', '-k', '5', '30', 'gdb', '--batch', '--nx', '-p', str(row['pid']),
+                     '-ex', 'set pagination off', '-ex', 'info threads', '-ex', 'thread apply all bt 40'],
+                    stdin=subprocess.DEVNULL, capture_output=True, text=True, errors='replace')
+                text = completed.stdout[-512 * 1024:] + completed.stderr[-16 * 1024:]
+                result = {'exit': completed.returncode}
+            except OSError as error:
+                text, result = '', {'error': str(error)}
+            descriptor_out = os.open(self.root / 'logs' / name,
+                                     os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+            with os.fdopen(descriptor_out, 'w') as stream:
+                stream.write(text)
+            self.write({'event': 'lingering_window_backtrace', 'pid': row['pid'], 'after_seconds': seconds,
+                        'path': f'logs/{name}', 'gdb_seconds': round(time.monotonic() - started, 3),
+                        'monotonic': time.monotonic(), 'wall_time': time.time(), **result})
+
+    def stall_after_flush(self):
+        target = [(row, descriptor) for row, descriptor, original in
+                  zip(self.pinned, self.pidfds, self.originals_by_pin)
+                  if original is not None and window_slot(original) == self.stall_slot]
+        if len(target) != 1:
+            self.write({'event': 'stall_unavailable', 'slot': self.stall_slot,
+                        'matches': len(target), 'monotonic': time.monotonic()})
+            return
+        row, descriptor = target[0]
+        log = self.root / 'home/.local/state/cagents/diagnostics/cagents-ui.0.jsonl'
+        offset, pending = 0, b''
+        try:
+            offset = log.stat().st_size
+        except FileNotFoundError:
+            pass
+        while not self.stop.is_set():
+            if select.select([descriptor], [], [], 0)[0]:
+                self.write({'event': 'stall_missed', 'slot': self.stall_slot, 'pid': row['pid'],
+                            'reason': 'window exited before its final flush was seen',
+                            'monotonic': time.monotonic(), 'wall_time': time.time()})
+                return
+            try:
+                with log.open('rb') as stream:
+                    stream.seek(offset)
+                    chunk = stream.read()
+            except FileNotFoundError:
+                chunk = b''
+            offset += len(chunk)
+            pending += chunk
+            *lines, pending = pending.split(b'\n')
+            for line in lines:
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                event = record.get('event') or {}
+                if record.get('pid') == row['pid'] and event.get('kind') == 'final_flush' \
+                        and event.get('complete') is True:
+                    lock = log.with_name('cagents-ui.lock')
+                    if self.under_lock:
+                        # The record is visible while the append still syncs it
+                        # under the lock: stop the window only if the lock is held.
+                        held = not self.diagnostics_unlocked(lock)
+                        result = {'diagnostics_lock_held_before_stop': held}
+                    else:
+                        # Stop it after its append released the diagnostics lock:
+                        # the fault is a window that stalled once its save finished.
+                        result = {'diagnostics_lock_free_before_stop':
+                                  self.wait_diagnostics_unlocked(lock)}
+                    try:
+                        signal.pidfd_send_signal(descriptor, signal.SIGSTOP)
+                        result['stopped'] = True
+                    except OSError as error:
+                        result.update(stopped=False, error=str(error))
+                    if self.under_lock and result['stopped']:
+                        # Only the stopped window's own lock proves the stop landed under it.
+                        result['stopped_under_lock'] = self.stopped(row['pid']) \
+                            and self.flock_holder(lock) == row['pid']
+                    if self.suppress_flush:
+                        result['suppressed_flush_record'] = self.remove_record(log, line)
+                    self.write({'event': 'stalled_window_after_flush', 'injected_fault': True,
+                                'slot': self.stall_slot, 'pid': row['pid'],
+                                'flush_at_unix_ms': record.get('at_unix_ms'),
+                                'monotonic': time.monotonic(), 'wall_time': time.time(), **result})
+                    if self.resume_after is not None and result['stopped']:
+                        self.stop.wait(self.resume_after)
+                        try:
+                            signal.pidfd_send_signal(descriptor, signal.SIGCONT)
+                            resumed = {'resumed': True}
+                        except OSError as error:
+                            resumed = {'resumed': False, 'error': str(error)}
+                        self.write({'event': 'stalled_window_resumed', 'injected_fault': True,
+                                    'slot': self.stall_slot, 'pid': row['pid'],
+                                    'monotonic': time.monotonic(), 'wall_time': time.time(), **resumed})
+                    return
+            # Waiting for a lock-held stop must not miss the append's sync window.
+            time.sleep(.0002 if self.under_lock else .002)
+
+    @staticmethod
+    def diagnostics_unlocked(lock):
+        """One LOCK_SH|LOCK_NB probe: False while any writer holds the lock."""
+        try:
+            descriptor = os.open(lock, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except FileNotFoundError:
+            return True
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            return True
+        except BlockingIOError:
+            return False
+        finally:
+            os.close(descriptor)
+
+    @classmethod
+    def wait_diagnostics_unlocked(cls, lock, bound=1.0):
+        deadline = time.monotonic() + bound
+        while time.monotonic() < deadline:
+            if cls.diagnostics_unlocked(lock):
+                return True
+            time.sleep(.001)
+        return False
+
+    @staticmethod
+    def stopped(pid, bound=1.0):
+        """Wait until SIGSTOP has taken effect, so a held lock stays held."""
+        deadline = time.monotonic() + bound
+        while time.monotonic() < deadline:
+            try:
+                stat_line = Path(f'/proc/{pid}/stat').read_text()
+            except OSError:
+                return False
+            if stat_line.rpartition(')')[2].split()[0] in ('T', 't'):
+                return True
+            time.sleep(.001)
+        return False
+
+    @staticmethod
+    def flock_holder(lock, locks=Path('/proc/locks')):
+        """The pid holding an exclusive flock on LOCK's inode, from /proc/locks."""
+        try:
+            info = lock.stat()
+        except FileNotFoundError:
+            return None
+        # /proc/locks names the superblock device, which differs from st_dev on
+        # btrfs subvolumes; callers compare the holder with their own pid.
+        inode = f':{info.st_ino}'
+        holders = set()
+        for line in locks.read_text().splitlines():
+            fields = line.split()
+            # '1: FLOCK  ADVISORY  WRITE 1234 00:1e:5678 0 EOF'; blocked waiters carry '->'.
+            if '->' not in fields and len(fields) >= 6 and fields[1] == 'FLOCK' \
+                    and fields[3] == 'WRITE' and fields[5].endswith(inode):
+                holders.add(int(fields[4]))
+        return holders.pop() if len(holders) == 1 else None
+
+    def remove_record(self, log, line):
+        """Rewrite the private log without one record, keeping its mode."""
+        data = log.read_bytes()
+        kept = b''.join(entry + b'\n' for entry in data.split(b'\n') if entry and entry != line)
+        if len(kept) == len(data):
+            return False
+        temporary = log.with_name(log.name + '.suppress')
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        with os.fdopen(descriptor, 'wb') as stream:
+            stream.write(kept)
+        os.replace(temporary, log)
+        return True
 
     def run_observer(self):
         try:
@@ -349,6 +549,12 @@ class WindowCloseMonitor:
             self.sample('before_update')
             self.thread = threading.Thread(target=self.run_observer, name='rehearsal-window-observer')
             self.thread.start()
+            if self.stall_slot is not None:
+                by_pid = {row['pid']: row for row in self.originals}
+                self.originals_by_pin = [by_pid.get(row['pid']) for row in self.pinned]
+                self.stall_thread = threading.Thread(target=self.stall_after_flush,
+                                                     name='rehearsal-window-stall', daemon=True)
+                self.stall_thread.start()
             return self
         except BaseException:
             self.__exit__(*sys.exc_info())
@@ -369,6 +575,8 @@ class WindowCloseMonitor:
                     break
                 except BaseException as interruption:
                     interrupted = interruption
+        if self.stall_thread is not None:
+            self.stall_thread.join(5)
         try:
             try:
                 snapshot = window_close_snapshot(self.root, self.originals, original_slots=self.slots)
@@ -643,6 +851,15 @@ def record(root: Path, out: Path, windows: Path | None) -> dict:
     except (OSError, ValueError, AttributeError):
         snapshot["serving"] = None
     snapshot["recovery"] = recovery_evidence(out, errors)
+    target = root / "rehearsal-target.json"
+    if target.exists():
+        snapshot["target"] = read_json(target)
+    status = root / "home/.local/share/cagents-install/.update/status.json"
+    if status.exists():
+        snapshot["update_status"] = read_json(status)
+    events = root / "logs/codex-provider.jsonl"
+    if events.exists():
+        snapshot["fixture_events"] = [json.loads(line) for line in events.read_text().splitlines() if line]
     snapshot["stores"] = stores(root / "home", errors)
     snapshot["processes"] = processes(root, errors)
     snapshot["windows"] = {}
@@ -685,7 +902,7 @@ def project(row: dict, name: str) -> dict:
     if name == "agents":
         agent = row.get("agent", {})
         spec = agent.get("spec", {})
-        return {"state": row.get("state"), "name": agent.get("name"), "closed": agent.get("closed"),
+        return {"state": row.get("state"), "run": row.get("run"), "name": agent.get("name"), "closed": agent.get("closed"),
                 "placement": agent.get("placement", agent.get("channel")),
                 "provider": spec.get("provider"), "surface": spec.get("surface")}
     fields = {
@@ -718,28 +935,47 @@ def panes(snapshot: dict) -> dict:
     return result
 
 
-def verified_pauses(before: dict, after: dict) -> tuple[set[str], set[str]]:
-    """Receipts establish disposition; before records establish exact identity."""
+def verified_recovery(before: dict, after: dict) -> dict | None:
+    """Only the shared verifier establishes usable recovery."""
     evidence = after.get("recovery")
     if not isinstance(evidence, dict):
-        return set(), set()
+        return None
     census, issued, current = (evidence.get(name, {}) for name in ("census", "issued", "current"))
     source = census.get("source")
     if (not isinstance(source, dict) or not source or source != before.get("serving")
             or any(not isinstance(source.get(field), str) or not source[field]
                    for field in ("host_session_id", "boot_id", "host_incarnation"))):
-        return set(), set()
+        return None
     for receipt in (issued, current):
         if (receipt.get("version") != 1 or census.get("version") != 1
                 or receipt.get("transaction") != census.get("transaction")
                 or receipt.get("census_digest") != evidence.get("digest")
                 or receipt.get("checkpoint_before") != census.get("checkpoint_before")):
-            return set(), set()
+            return None
     outcome = current.get("outcome", {})
-    if (issued.get("outcome") != outcome or outcome.get("state") != "usable"
+    issued_outcome = issued.get("outcome", {})
+    issued_proof = issued_outcome.get("serving", {})
+    if (outcome.get("state") != "usable" or issued_outcome.get("state") != "usable"
+            or not isinstance(issued_proof,dict)
+            or any(not isinstance(issued_proof.get(field),str) or not issued_proof[field]
+                   for field in ("host_session_id","boot_id","host_incarnation"))
             or not isinstance(outcome.get("serving"), dict)
-            or outcome.get("serving") != after.get("serving")):
+            or any(not isinstance(outcome["serving"].get(field),str) or not outcome["serving"][field]
+                   for field in ("host_session_id","boot_id","host_incarnation"))
+            or outcome.get("serving") != after.get("serving")
+            or outcome["serving"].get("boot_id") != issued_proof["boot_id"]
+            or {**issued_outcome,"serving":outcome["serving"]} != outcome):
+        return None
+    return outcome
+
+
+def verified_pauses(before: dict, after: dict) -> tuple[set[str], set[str]]:
+    """Receipts establish disposition; before records establish exact identity."""
+    outcome = verified_recovery(before, after)
+    if outcome is None:
         return set(), set()
+    census = after["recovery"]["census"]
+    source = census["source"]
     chat_proofs = {card["content"].get("id"): card["content"].get("proof")
                    for card in panes(before).values()
                    if card.get("kind_tag") == "chat" and isinstance(card.get("content"), dict)}
@@ -758,9 +994,174 @@ def verified_pauses(before: dict, after: dict) -> tuple[set[str], set[str]]:
     return set(chats), set(terminals)
 
 
+def console_relaunch(before: dict, after: dict, terminal_id: str) -> bool:
+    if verified_recovery(before, after) is None:
+        return False
+    target = after.get("target", {})
+    status = after.get("update_status", {})
+    if (not isinstance(target.get("version"), str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.+_-]{0,127}", target["version"])
+            or status.get("phase") != "Complete" or status.get("version") != target["version"]
+            or status.get("id") != after["recovery"]["census"]["transaction"]):
+        return False
+    program = str(Path(after["root"])/"home/.local/share/cagents-install/versions"/target["version"]/"bin/cagents")
+    for key, row in before["agents"].items():
+        agent = row.get("agent", {})
+        console = agent.get("console") or {}
+        if console.get("id") != terminal_id:
+            continue
+        current = after["agents"].get(key, {})
+        replacement = current.get("agent", {}).get("console") or {}
+        old_recipe, new_recipe = console.get("launch", {}), replacement.get("launch", {})
+        if (not row.get("run") or current.get("run") != row["run"]
+                or row.get("state") != "Running" or current.get("state") != "Running"
+                or replacement.get("id") != terminal_id or new_recipe.get("program") != program
+                or {**old_recipe,"program":program} != new_recipe
+                or new_recipe.get("arguments") != ["agent","console",agent.get("id")]):
+            return False
+        original_panes = {key for key, pane in panes(before).items() if pane.get("terminal_id") == terminal_id}
+        return bool(original_panes) and all(panes(after).get(key,{}).get("terminal_id") == terminal_id
+                                            for key in original_panes)
+    return False
+
+
+def confirmed_interruption(before: dict, after: dict, key: str) -> bool:
+    """A cancelled run needs this rehearsal's consent and exact parent receipt."""
+    if after.get("target",{}).get("working") != "i" or verified_recovery(before,after) is None:
+        return False
+    old, new = before["agents"][key], after["agents"].get(key,{})
+    source = old.get("agent",{}).get("session",{}).get("Chat",{})
+    if (not old.get("run") or old["run"] != new.get("run") or old.get("state") != "Running"
+            or new.get("state") != "Cancelled" or source.get("launch",{}).get("provider") != "Codex"):
+        return False
+    threads = {pane.get("content",{}).get("launch",{}).get("session_id")
+               for pane in panes(before).values()
+               if pane.get("session_id") == source.get("id") and pane.get("content",{}).get("proof") == before.get("serving")}
+    threads.discard(None)
+    if len(threads)!=1:
+        return False
+    thread = next(iter(threads))
+    starts = [row for row in before.get("fixture_events",[]) if row.get("event")=="notification"
+              and row.get("method")=="turn/started" and row.get("thread_id")==thread and row.get("parent") is True]
+    if not starts:
+        return False
+    started = starts[-1]
+    matching = [row for row in after.get("fixture_events",[]) if row.get("thread_id")==thread
+                and row.get("turn_id")==started.get("turn_id") and row.get("socket")==started.get("socket")
+                and row.get("parent") is True]
+    requests = [row for row in matching if row.get("event")=="request" and row.get("method")=="turn/interrupt"
+                and row.get("errors") == []]
+    receipts = [row for row in matching if row.get("event")=="notification"
+                and row.get("method")=="turn/completed" and row.get("status")=="interrupted"]
+    observed_at = max(row.get("time",0) for row in before.get("fixture_events",[]))
+    update_at = after.get("target",{}).get("started")
+    return isinstance(update_at,(int,float)) and any(started["time"] <= observed_at <= update_at <= request["time"] <= receipt["time"]
+               for request in requests for receipt in receipts)
+
+
+def paused_history_projection(before: dict, after: dict, saved: dict) -> dict | None:
+    """An exact presentation of a source the shared verifier reports paused."""
+    paused, _ = verified_pauses(before, after)
+    if saved.get("id") not in paused:
+        return None
+    source = next(row for row in after["recovery"]["census"]["chats"] if row["id"] == saved["id"])
+    bound = copy.deepcopy(saved)
+    # Frozen source descriptors can predate the provider's confirmed ID.
+    # The before pane supplies it; every other source field must still match.
+    if source.get("launch", {}).get("session_id") is None:
+        bound.get("launch", {}).update(session_id=None)
+    if bound != source:
+        return None
+    expected = copy.deepcopy(saved)
+    launch = expected.get("launch", {})
+    arguments = launch.get("recipe", {}).get("arguments", [])
+    if launch.get("provider") == "Codex":
+        for index, argument in enumerate(arguments):
+            if argument != "--remote" and not argument.startswith("--remote="):
+                continue
+            address = (arguments[index+1] if argument == "--remote" and index+1 < len(arguments)
+                       else argument.removeprefix("--remote=") if argument.startswith("--remote=") else "")
+            if address.startswith("unix://"):
+                socket = Path(address[len("unix://"):])
+                if (socket.is_absolute() and ".." not in socket.parts and socket.name == "control.sock"
+                        and socket.parent.name == "cagents-codex-"+saved["id"]):
+                    if argument == "--remote":
+                        arguments[index+1] = "unix://"
+                    else:
+                        arguments[index] = "--remote=unix://"
+            break
+    expected.update(proof=after["serving"], native_continuity="ReconnectOnly",
+                    terminal=None, owned_codex_listener=None)
+    return expected
+
+
+def paused_codex_reattachments(before: dict, after: dict, paused: set[str], *, observed_events=None) -> list[dict]:
+    """A usable receipt's paused Codex history never reattaches a provider."""
+    if not paused:
+        return []
+    changes = []
+    blocked = {}
+    previous = before.get('fixture_events', [])
+    observed = after.get('fixture_events', []) if observed_events is None else observed_events
+    listening = {}
+    for index, row in enumerate(previous):
+        if row.get('event') == 'listening':
+            listening.setdefault((row.get('pid'), row.get('socket')), index)
+    census = after.get('recovery', {}).get('census', {})
+    saved = list(panes(before).values())
+    for identifier in sorted(paused):
+        source = next(row for row in census['chats'] if row['id'] == identifier)
+        members = [row.get('content', {}) for row in saved if row.get('session_id') == identifier]
+        if source.get('launch', {}).get('provider') != 'Codex' and not any(
+                row.get('launch', {}).get('provider') == 'Codex' for row in members):
+            continue
+        threads = {row.get('launch', {}).get('session_id') for row in members
+                   if row.get('proof') == census['source'] and row.get('launch', {}).get('provider') == 'Codex'}
+        threads.discard(None)
+        source_thread = source.get('launch', {}).get('session_id')
+        if len(threads) != 1 or not all(isinstance(thread, str) and thread for thread in threads) or (
+                source_thread is not None and source_thread not in threads):
+            changes.append({'kind': 'paused-history', 'id': identifier, 'regression': True,
+                            'change': 'paused Codex chat has no exact original native-thread binding'})
+            continue
+        thread = next(iter(threads))
+        parents = [(index, row) for index, row in enumerate(previous)
+                   if row.get('thread_id') == thread and row.get('parent') is True]
+        listeners = {(row.get('pid'), row.get('socket')) for _, row in parents}
+        if not listeners or any(type(pid) is not int or pid <= 1 or not isinstance(path, str) or not path
+                                for pid, path in listeners) or any(
+                listening.get((row.get('pid'), row.get('socket')), index) >= index for index, row in parents):
+            changes.append({'kind': 'paused-history', 'id': identifier, 'regression': True,
+                            'change': 'paused Codex chat has no original fixture listener binding'})
+            continue
+        blocked[thread] = identifier
+        ambiguous = {listener for listener in listeners if {
+            row.get('thread_id') for row in previous if row.get('parent') is True
+            and (row.get('pid'), row.get('socket')) == listener} != {thread}}
+        if ambiguous:
+            changes.append({'kind': 'paused-history', 'id': identifier, 'regression': True,
+                            'change': 'paused Codex listener has ambiguous original parent ownership'})
+        for row in previous:
+            if ((row.get('pid'), row.get('socket')) in listeners - ambiguous and row.get('parent') is False
+                    and isinstance(row.get('thread_id'), str) and row['thread_id']):
+                blocked[row['thread_id']] = identifier
+    if blocked and observed[:len(previous)] != previous:
+        changes.append({'kind': 'paused-history', 'id': 'provider-events', 'regression': True,
+                        'change': 'paused Codex provider event history was replaced or truncated'})
+        return changes
+    for row in observed[len(previous):]:
+        if (row.get('event') == 'request' and row.get('method') == 'thread/resume'
+                and row.get('thread_id') in blocked):
+            changes.append({'kind': 'paused-history', 'id': blocked[row['thread_id']], 'regression': True,
+                            'change': 'paused Codex chat or its recorded child resumed',
+                            'thread_id': row['thread_id'], 'pid': row.get('pid')})
+    return changes
+
+
 def compare(before: dict, after: dict) -> list[dict]:
     changes = []
     paused_chats, paused_terminals = verified_pauses(before, after)
+    changes.extend(paused_codex_reattachments(before, after, paused_chats))
     for side, snapshot in (("before", before), ("after", after)):
         for error in snapshot["errors"]:
             changes.append({"kind": "evidence", "id": side, "change": str(error), "regression": True})
@@ -781,8 +1182,12 @@ def compare(before: dict, after: dict) -> list[dict]:
                 continue
             if (name == "panes" and original.get("session_id") in paused_chats
                     and original.get("content") != right[key].get("content")):
+                projection = paused_history_projection(before, after, original["content"])
+                preserved = projection is not None and projection == right[key].get("content")
                 changes.append({"kind": name, "id": key,
-                                "change": "paused chat descriptor changed", "regression": True})
+                                "change": "paused chat descriptor changed", "regression": not preserved,
+                                "before": original["content"], "after": right[key].get("content"),
+                                **({"disposition": "verified paused history presentation"} if preserved else {})})
             a, b = project(original, name), project(right[key], name)
             for field in sorted(a.keys() | b.keys()):
                 if a.get(field) != b.get(field):
@@ -795,10 +1200,15 @@ def compare(before: dict, after: dict) -> list[dict]:
                     # title. Only a title that goes blank was lost.
                     retitled = field == "title" and (name == "windows" or bool(b.get(field)))
                     verified_pause = ((paused and field in {"state", "failure", "exit", "attached"})
-                                      or (paused_agent and field == "state"))
+                                      or (paused_agent and field == "state" and str(b.get(field)).lower() in {"stopped","paused"}))
+                    relaunched_console = (name == "terminals" and field == "program"
+                                          and console_relaunch(before,after,key))
+                    interrupted = name == "agents" and field == "state" and confirmed_interruption(before,after,key)
                     changes.append({"kind": name, "id": key, "change": field,
                                     "before": a.get(field), "after": b.get(field),
-                                    "regression": not (healthy_state or resumed_id or retitled or verified_pause),
+                                    "regression": not (healthy_state or resumed_id or retitled or verified_pause or relaunched_console or interrupted),
+                                    **({"disposition": "confirmed requested interruption"} if interrupted else {}),
+                                    **({"disposition": "verified console relaunch"} if relaunched_console else {}),
                                     **({"disposition": "verified paused by update"} if verified_pause else {})})
         for key in sorted(right.keys() - left.keys()):
             changes.append({"kind": name, "id": key, "change": "added", "regression": False})
