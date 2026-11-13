@@ -2556,14 +2556,24 @@ impl Runtime {
         // shares. The symmetric inset already exceeds the scrollbar rail.
         // Reserving the rail a second time would make transcript rows
         // narrower than the composer in a pane no wider than the column.
+        // The viewport runs right up to whatever is pinned above and below
+        // it, the composer included, so a line scrolling past either edge
+        // meets that surface rather than a strip of pane laid over it. The
+        // gap the pane keeps between its blocks moves inside the viewport
+        // instead: it is the room the first and last rows rest at, and
+        // scrolled content passes through it.
+        let transcript_index = content.len();
         let transcript = widget::container(
             widget::container(virtualized::column(transcript.children, Default::default()))
-                .padding(iced::Padding::new(step::GAP_M))
+                .padding(
+                    iced::Padding::new(step::GAP_M)
+                        .top(step::GAP_M + if transcript_index > 0 { space::S } else { 0.0 })
+                        .bottom(step::GAP_M + step::GAP_S),
+                )
                 .width(Length::Fill)
                 .max_width(super::layout::READING_COLUMN),
         )
         .center_x(Length::Fill);
-        let transcript_index = content.len();
         let transcript_layer = if self.visible.load(Ordering::Relaxed) {
             let (catalog, bookmark) = self.selection_document();
             crate::ui_memory::gate(selection::transcript_virtualized(
@@ -2937,6 +2947,7 @@ impl Runtime {
         // finds named siblings but does not move their trees to new indices.
         // Only the transcript layer spans the pane; everything around it
         // keeps the reading column.
+        let transcript_last = content.len() == transcript_index + 1;
         let mut content = vec![
             widget::column::with_children(content.into_iter().enumerate().map(|(index, child)| {
                 if index == transcript_index {
@@ -2945,15 +2956,18 @@ impl Runtime {
                     widget::container(child)
                         .padding(iced::Padding::from([0.0, step::GAP_M]).top(if index == 0 {
                             step::GAP_M
-                        } else {
+                        } else if index == transcript_index + 1 {
+                            // Against the transcript's edge: its own
+                            // padding keeps the rows clear of this.
                             0.0
+                        } else {
+                            space::S
                         }))
                         .width(Length::Fill)
                         .max_width(super::layout::READING_COLUMN)
                         .into()
                 }
             }))
-            .spacing(space::S)
             .align_x(Alignment::Center)
             .height(Length::Fill)
             .into(),
@@ -3471,18 +3485,25 @@ impl Runtime {
             action(Action::PermissionPicker(target, false)),
         );
         let pane = widget::container(super::layout::pane(
+            // The first block holds the transcript, which runs on down to
+            // the next block when it ends that one: see `transcript` above.
             widget::column::with_children(content.into_iter().enumerate().map(|(index, child)| {
                 if index == 0 {
                     child
                 } else {
                     widget::container(child)
-                        .padding([0.0, step::GAP_M])
+                        .padding(iced::Padding::from([0.0, step::GAP_M]).top(
+                            if index == 1 && transcript_last {
+                                0.0
+                            } else {
+                                step::GAP_S
+                            },
+                        ))
                         .width(Length::Fill)
                         .max_width(super::layout::READING_COLUMN)
                         .into()
                 }
             }))
-            .spacing(step::GAP_S)
             .align_x(Alignment::Center)
             .height(Length::Fill)
             .width(Length::Fill)
@@ -4927,25 +4948,31 @@ impl Runtime {
                         .spacing(step::GAP_S)
                         .padding([0.0, step::GAP_XS])
                         .into(),
-                    widget::container(
+                    // The list runs to the panel's foot, its inset scrolling
+                    // with it, so a row passing the foot fades into the
+                    // panel rather than stopping short of it.
+                    widget::container(crate::interaction::overflow_fade_y(
                         widget::scrollable(
                             widget::column::with_children(rows)
                                 .spacing(step::GAP_XS)
-                                .padding(design::with_vertical_rail(iced::Padding::ZERO)),
+                                .padding(design::with_vertical_rail(
+                                    iced::Padding::ZERO.bottom(step::GAP_S),
+                                )),
                         )
                         .id(card_control_id(self.target.card, "chat-queue"))
                         .direction(iced::widget::scrollable::Direction::Vertical(
                             design::scrollbar(),
                         ))
                         .height(Length::Shrink),
-                    )
-                    .max_height(QUEUE_CEILING)
+                        design::sunken,
+                    ))
+                    .max_height(QUEUE_CEILING + step::GAP_S)
                     .into(),
                 ])
                 .spacing(step::GAP_XS),
             )
             .width(Length::Fill)
-            .padding(step::GAP_S)
+            .padding(iced::Padding::new(step::GAP_S).bottom(0.0))
             .class(design::surface(
                 Some(design::sunken),
                 [design::RADIUS_M, design::RADIUS_M, 0.0, 0.0],
@@ -6293,7 +6320,9 @@ fn model_list<'a>(
         // The popover owns dismissal. Unfocusing on mouse-down inside a
         // model row must not remove that row before its mouse-up selects it.
         .into(),
-        widget::container(
+        // The popover's own frame inset stays; a model passing it fades into
+        // the popover rather than being cut at the inset.
+        widget::container(crate::interaction::overflow_fade_y(
             widget::scrollable(
                 widget::column::with_children(rows)
                     .padding(design::with_vertical_rail(iced::Padding::ZERO)),
@@ -6302,7 +6331,8 @@ fn model_list<'a>(
                 design::scrollbar(),
             ))
             .height(Length::Shrink),
-        )
+            design::component_base,
+        ))
         .max_height(design::MODEL_POPUP_CEILING)
         .into(),
     ])
@@ -12093,6 +12123,16 @@ mod tests {
                     "state {state}"
                 );
                 assert_eq!(*baseline.get_or_insert(geometry), geometry, "state {state}");
+                // Nothing of the pane lies between the transcript and the
+                // composer: a row scrolling down meets the composer's own
+                // edge, never a strip of pane drawn over it.
+                if state != 2 && state != 4 {
+                    assert_eq!(
+                        viewport.y + viewport.height,
+                        editor.y,
+                        "the transcript runs on to the composer in state {state} at {width}"
+                    );
+                }
             }
         }
     }
