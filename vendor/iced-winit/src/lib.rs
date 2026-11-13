@@ -726,6 +726,80 @@ where
     }
 }
 
+// An accessibility tree can retain structurally necessary nodes that are
+// explicitly hidden after clipping. Such nodes must not regain focus through
+// a stale native action before the widget's ordinary event guard runs.
+#[cfg(feature = "a11y")]
+fn visible_accessibility_target(
+    tree: &iced_accessibility::A11yTree,
+    target: &core::widget::Id,
+) -> bool {
+    let target = iced_accessibility::A11yId::from(target.clone());
+    tree.root().iter().chain(tree.children()).any(|node| {
+        iced_accessibility::IdEq::eq(node.id(), &target)
+            && !node.node().is_hidden()
+    })
+}
+
+#[cfg(all(test, feature = "a11y"))]
+mod accessibility_focus_tests {
+    use super::visible_accessibility_target;
+    use crate::core::widget::Id;
+    use iced_accessibility::{
+        A11yNode, A11yTree,
+        accesskit::{Node, Role},
+    };
+
+    #[test]
+    fn native_focus_requires_a_visible_existing_target() {
+        let root = Id::unique();
+        let child = Id::unique();
+        let missing = Id::unique();
+        let tree = A11yTree::node_with_child_tree(
+            A11yNode::new(Node::new(Role::Window), root.clone()),
+            A11yTree::leaf(Node::new(Role::Button), child.clone()),
+        );
+        assert!(visible_accessibility_target(&tree, &root));
+        assert!(visible_accessibility_target(&tree, &child));
+        assert!(!visible_accessibility_target(&tree, &missing));
+    }
+
+    #[test]
+    fn native_focus_rejects_explicitly_hidden_root_and_child_nodes() {
+        let root = Id::unique();
+        let child = Id::unique();
+        let mut parent = Node::new(Role::Window);
+        parent.set_hidden();
+        let mut button = Node::new(Role::Button);
+        button.set_hidden();
+        let tree = A11yTree::node_with_child_tree(
+            A11yNode::new(parent, root.clone()),
+            A11yTree::leaf(button, child.clone()),
+        );
+        // Structural membership remains available to other tree consumers.
+        assert!(tree.contains(&root.clone().into()));
+        assert!(tree.contains(&child.clone().into()));
+        assert!(!visible_accessibility_target(&tree, &root));
+        assert!(!visible_accessibility_target(&tree, &child));
+    }
+
+    #[test]
+    fn native_focus_keeps_stable_named_identity_when_target_returns() {
+        let original = Id::new("workspace-editor");
+        // Native action IDs carry the numeric identity, while a rebuilt
+        // widget can also retain the same stable name.
+        let numeric = Id::from(u64::from(original.clone()));
+        let rebuilt = Id::new("workspace-editor");
+        let mut hidden = Node::new(Role::TextInput);
+        hidden.set_hidden();
+        let hidden = A11yTree::leaf(hidden, original.clone());
+        assert!(!visible_accessibility_target(&hidden, &numeric));
+        let returned = A11yTree::leaf(Node::new(Role::TextInput), original);
+        assert!(visible_accessibility_target(&returned, &numeric));
+        assert!(visible_accessibility_target(&returned, &rebuilt));
+    }
+}
+
 enum Event<Message: 'static> {
     WindowCreated {
         id: window::Id,
@@ -1692,10 +1766,11 @@ async fn run_instance<P>(
                             let target = core::widget::Id::from(
                                 action_request.target_node.0,
                             );
-                            if interface
-                                .a11y_nodes(mouse::Cursor::Unavailable)
-                                .contains(&target.clone().into())
-                            {
+                            if visible_accessibility_target(
+                                &interface
+                                    .a11y_nodes(mouse::Cursor::Unavailable),
+                                &target,
+                            ) {
                                 interface.operate(
                                     &window.renderer,
                                     &mut operation::focusable::focus::<()>(

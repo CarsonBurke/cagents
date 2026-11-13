@@ -56,3 +56,24 @@ window without moving and the state can change under a still pointer. The border
 is scaled by the window's current scale factor on every event, so it follows the
 window between outputs. Remove this backport when the pinned dependency honors
 tiled edges.
+
+Accessibility nodes can stay in the tree while hidden, as a wrapper's clipped
+content does: an offscreen workspace pane, or the lines a folded message cuts.
+A native Focus request now reaches the widget focus operation only when its
+target is present and not hidden, so a stale request cannot focus a control the
+reader cannot see. Published snapshots report the window as focused while the
+focused widget's node is hidden; the widget keeps its focus, and the node's
+identity is published again once it is visible. Remove this backport when the
+pinned dependency treats hidden nodes the same way.
+
+This standalone package is not a workspace member and does not see the root
+manifest's patches. Run its tests against the vendored packages with a Cargo
+configuration that repeats the root `[patch]` entries as absolute paths, for
+example:
+
+```sh
+cargo test --manifest-path vendor/iced-winit/Cargo.toml --features a11y \
+  --config /path/to/patches.toml -- accessibility_focus_tests a11y::tests
+```
+
+Its lockfile and `target/` directory are local test output.
