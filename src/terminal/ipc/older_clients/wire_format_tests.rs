@@ -421,8 +421,9 @@ fn variant_count(shapes: &Shapes, name: &str) -> u32 {
 fn this_protocols_wire_format_is_recorded() {
     let current = traced();
     if std::env::var_os(RECORD).is_some() {
-        // Written to the checkout the test ran in, and printed for a build
-        // host whose checkout is a copy.
+        // Written to the checkout the test ran in; scripts/cargo-gate brings
+        // it back from a build host's copy. Printed as well, for a runner
+        // that does not.
         let path = fixture(PROTOCOL_VERSION);
         let text = serde_json::to_string_pretty(&current).unwrap() + "\n";
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();

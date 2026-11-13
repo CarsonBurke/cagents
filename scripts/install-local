@@ -30,8 +30,8 @@ and edits in other checkouts never reach the binaries.
   --build-host HOST  Build on HOST over ssh, then install here. HEAD is pushed
                      to the repository at the same path relative to $HOME.
   --stage-only       Stop after staging; finish later with: cagents daemon upgrade
-  --this-commit      Build HEAD even when it is detached or its branch is
-                     behind its upstream.
+  --this-commit      Build HEAD even when detached, without an upstream,
+                     or behind its upstream.
   --yes, --interrupt
                      Passed to `cagents daemon upgrade`.
 
@@ -88,45 +88,65 @@ refuse_stale_head() {
     exit 1
 }
 
-# A detached HEAD or a branch behind its upstream is usually a checkout nobody
-# updated rather than a chosen commit; building it would install old code.
+# A checkout without an upstream must match the published default branch tip.
+# Otherwise it needs an explicit choice, just like a branch behind its upstream.
 check_head() {
-    local branch default tip behind worktree remote merge upstream ahead
+    local branch default tip behind worktree remote merge upstream ahead description
     default=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || :)
     default=${default#origin/}
     default=${default:-main}
-    if ! branch=$(git symbolic-ref --quiet --short HEAD); then
+    branch=$(git symbolic-ref --quiet --short HEAD || :)
+    remote=
+    merge=
+    upstream=
+    if [[ -n $branch ]]; then
+        remote=$(git config --get "branch.$branch.remote" || :)
+        merge=$(git config --get "branch.$branch.merge" || :)
+        if [[ -n $remote && -n $merge ]]; then
+            upstream=$(git rev-parse --quiet --abbrev-ref '@{upstream}' 2>/dev/null || :)
+        fi
+    fi
+    if [[ -z $upstream ]]; then
+        if [[ -z $branch ]]; then
+            description="HEAD is detached at $SHORT"
+        else
+            description="Branch $branch at $SHORT has no upstream"
+        fi
         refresh_remote_ref origin "refs/heads/$default"
         tip=$(git rev-parse --quiet --verify "refs/remotes/origin/$default^{commit}" || :)
         if [[ $tip == "$COMMIT" ]]; then
-            printf 'Building detached HEAD %s, the tip of origin/%s.\n' "$SHORT" "$default"
-            return
+            if [[ -z $branch ]]; then
+                printf 'Building detached HEAD %s, the tip of origin/%s.\n' "$SHORT" "$default"
+                return
+            fi
+        elif ((THIS_COMMIT)); then
+            if [[ -z $branch ]]; then
+                printf 'Building detached HEAD %s.\n' "$SHORT"
+                return
+            fi
+        else
+            if [[ -z $tip ]]; then
+                refuse_stale_head "$description; origin/$default is unavailable." \
+                    "Configure the origin remote if needed, then fetch the published tip: git fetch origin $default"
+            fi
+            behind=
+            if git merge-base --is-ancestor HEAD "$tip"; then
+                behind=" ($(commits "$(git rev-list --count "HEAD..$tip")") behind origin/$default)"
+            fi
+            # A branch checked out in another worktree cannot be checked out here.
+            # awk reads to the end: exiting early could kill git with SIGPIPE,
+            # which pipefail and set -e would turn into a silent exit.
+            worktree=$(git worktree list --porcelain | awk -v ref="refs/heads/$default" '
+                /^worktree / { path = substr($0, 10) }
+                $0 == "branch " ref && !found { print path; found = 1 }')
+            if [[ -n $worktree ]]; then
+                refuse_stale_head "$description$behind." \
+                    "To build $default, run: cd $(printf '%q' "$worktree") && git pull --ff-only origin $default && scripts/install-local$ARGUMENTS"
+            fi
+            refuse_stale_head "$description$behind." \
+                "To build $default, run: git checkout $default && git pull --ff-only origin $default"
         fi
-        if ((THIS_COMMIT)); then
-            printf 'Building detached HEAD %s.\n' "$SHORT"
-            return
-        fi
-        behind=
-        if [[ -n $tip ]] && git merge-base --is-ancestor HEAD "$tip"; then
-            behind=" ($(commits "$(git rev-list --count "HEAD..$tip")") behind origin/$default)"
-        fi
-        # A branch checked out in another worktree cannot be checked out here.
-        # awk reads to the end: exiting early could kill git with SIGPIPE,
-        # which pipefail and set -e would turn into a silent exit.
-        worktree=$(git worktree list --porcelain | awk -v ref="refs/heads/$default" '
-            /^worktree / { path = substr($0, 10) }
-            $0 == "branch " ref && !found { print path; found = 1 }')
-        if [[ -n $worktree ]]; then
-            refuse_stale_head "HEAD is detached at $SHORT$behind." \
-                "To build $default, run: cd $(printf '%q' "$worktree") && git pull --ff-only && scripts/install-local$ARGUMENTS"
-        fi
-        refuse_stale_head "HEAD is detached at $SHORT$behind." \
-            "To build $default, run: git checkout $default && git pull --ff-only"
-    fi
-    remote=$(git config --get "branch.$branch.remote" || :)
-    merge=$(git config --get "branch.$branch.merge" || :)
-    if [[ -n $remote && -n $merge ]] \
-        && upstream=$(git rev-parse --quiet --abbrev-ref '@{upstream}' 2>/dev/null); then
+    else
         # A local upstream (remote ".") is already current.
         [[ $remote == . ]] || refresh_remote_ref "$remote" "$merge"
         read -r ahead behind < <(git rev-list --left-right --count 'HEAD...@{upstream}')
