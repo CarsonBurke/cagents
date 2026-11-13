@@ -396,13 +396,14 @@ fn short_id(id: &str) -> &str {
     id.char_indices().nth(8).map_or(id, |(end, _)| &id[..end])
 }
 
-/// Whom started agents are, as one phrase.
+/// Whom started agents are, as one phrase. One agent goes by its name, else
+/// its task's first line, else its type, as its tab will name it.
 fn started(spawn: &Spawn) -> String {
     match spawn.agents.as_slice() {
-        [only] => [&only.name, &only.kind]
+        [only] => [&only.name, &only.description, &only.kind]
             .into_iter()
-            .find(|name| !name.is_empty())
-            .map_or_else(|| "an agent".to_owned(), |name| name.clone()),
+            .find_map(|text| text.lines().map(str::trim).find(|line| !line.is_empty()))
+            .map_or_else(|| "an agent".to_owned(), str::to_owned),
         agents => format!("{} agents", agents.len()),
     }
 }
@@ -1006,14 +1007,22 @@ impl Runtime {
             Some(state) => self.card_indicator(state.tool_status(), Icon::Agent),
             None => self.card_indicator(status, Icon::Agent),
         };
-        // The agent is named as its tab names it. Its task describes it in
-        // the tooltip but never stands in for an absent name; agent origin
-        // and launch options belong on their own secondary line.
-        let primary = match reading.subagents.as_slice() {
-            [id] => self.listed_agent_name(id),
+        // The agent is named as its tab names it: an unnamed one by its task,
+        // which the tooltip gives whole. Agent origin, launch options and its
+        // type belong on their own secondary line.
+        let listed = match reading.subagents.as_slice() {
+            [id] => self.subagent(id),
             _ => None,
-        }
-        .unwrap_or_else(|| started(spawn));
+        };
+        let primary = listed
+            .map(|agent| self.child_label(agent, 80).into_owned())
+            .unwrap_or_else(|| started(spawn));
+        // A heading that already is the task needs no line repeating it.
+        let headed_by_task = match (listed, spawn.agents.as_slice()) {
+            (Some(agent), _) => Self::named_by_task(agent),
+            (None, [agent]) => agent.name.trim().is_empty(),
+            _ => false,
+        };
         let task = match spawn.agents.as_slice() {
             [agent] if !agent.description.trim().is_empty() => agent.description.clone(),
             _ => primary.clone(),
@@ -1082,7 +1091,7 @@ impl Runtime {
                         .cloned(),
                 );
             }
-            if !agent.description.is_empty() && (several || agent.description != primary) {
+            if !agent.description.is_empty() && (several || !headed_by_task) {
                 title.push(agent.description.clone());
             }
             if !title.is_empty() {

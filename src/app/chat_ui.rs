@@ -18746,7 +18746,7 @@ mod tests {
         runtime.replace_draft(text_editor::Content::with_text("Keep this message"));
         Arc::make_mut(&mut runtime.snapshot).subagents = vec![chat::Subagent {
             id: "toolu_dev_server".into(),
-            kind: "general-purpose".into(),
+            kind: "Run the dev server".into(),
             description: "Run the dev server".into(),
             status: chat::ToolStatus::Waiting,
             model: None,

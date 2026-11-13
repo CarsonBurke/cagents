@@ -112,8 +112,22 @@ fn direct_tabs<'a>(
     rows.into_iter().map(|(_, child)| child).collect()
 }
 
+/// How many characters of its name a child's tab shows.
+pub(super) const TAB_CHARS: usize = 24;
+
+/// What a tab shows of `name` before any number: the name itself, or its
+/// first [`TAB_CHARS`] characters when the tab cuts it, which is then marked.
+/// Two names that read the same there are namesakes, so two tasks that start
+/// alike are told apart by their numbers.
+fn tab_namesake(name: &str) -> (&str, bool) {
+    match name.char_indices().nth(TAB_CHARS) {
+        Some((end, _)) => (name[..end].trim_end(), true),
+        None => (name, false),
+    }
+}
+
 /// The number each child's name carries, so two Explore agents read
-/// "Explore" and "Explore 2". A child keeps its number from the publication
+/// "Explore" and "Explore 2", and so do two tasks a tab cuts to one text. A child keeps its number from the publication
 /// it first appears in under that name: re-sorting the tabs, trimming older
 /// children or renaming another child never renumbers it.
 ///
@@ -137,9 +151,13 @@ impl Ordinals {
         // A child that left, or now goes by another name, frees its number.
         self.0
             .retain(|id, (name, _)| names.get(id.as_str()) == Some(&name.as_str()));
-        let mut taken: HashMap<String, HashSet<usize>> = HashMap::new();
+        let mut taken: HashMap<(String, bool), HashSet<usize>> = HashMap::new();
+        let namesake = |name: &str| {
+            let (shown, cut) = tab_namesake(name);
+            (shown.to_owned(), cut)
+        };
         for (name, ordinal) in self.0.values() {
-            taken.entry(name.clone()).or_default().insert(*ordinal);
+            taken.entry(namesake(name)).or_default().insert(*ordinal);
         }
         let literal: HashSet<&str> = names.values().copied().collect();
         for child in children {
@@ -147,7 +165,7 @@ impl Ordinals {
                 continue;
             }
             let name = Runtime::native_child_name(child);
-            let taken = taken.entry(name.to_owned()).or_default();
+            let taken = taken.entry(namesake(name)).or_default();
             // Skip a number another child already carries in its own name,
             // so a second Explore beside a real "Explore 2" reads "Explore 3".
             let ordinal = (1..)
@@ -182,10 +200,11 @@ pub(super) fn child_label<'a>(
     // A publication the pane has not installed yet, such as one a test built
     // in place, numbers by earlier namesakes: one pass with no allocation.
     let ordinal = ordinals.get(child).unwrap_or_else(|| {
+        let namesake = tab_namesake(name);
         1 + children
             .iter()
             .take_while(|other| other.id != child.id)
-            .filter(|other| Runtime::native_child_name(other) == name)
+            .filter(|other| tab_namesake(Runtime::native_child_name(other)) == namesake)
             .count()
     });
     let cut = name.chars().nth(limit).is_some();
@@ -285,7 +304,7 @@ impl Runtime {
     /// which tells apart rows whose names and tasks read the same.
     pub(super) fn child_choice_name(child: &chat::Subagent, label: &str) -> String {
         let status = Self::native_child_status(child);
-        match Self::native_child_task(child) {
+        match Self::native_child_task(child).filter(|_| !Self::named_by_task(child)) {
             Some(task) => format!(
                 "{label} · {status} · Task: {} · {}",
                 Self::short_description(task, 120),
@@ -311,7 +330,7 @@ impl Runtime {
                 let description = self.child_description(child, &self.child_label(child, 80));
                 let tab = crate::ui_controls::view_tab(
                     crate::ui_controls::ViewTab {
-                        label: self.child_label(child, 24),
+                        label: self.child_label(child, TAB_CHARS),
                         description: description.into(),
                         count: None,
                         selected: selected == Some(child.id.as_str()),
@@ -744,6 +763,38 @@ mod tests {
             labels(&children, &Ordinals::default()),
             ["Explore", "Explore 2", "Explore 3"]
         );
+    }
+
+    #[test]
+    fn tasks_a_tab_cuts_to_one_text_are_numbered_apart() {
+        use chat::ToolStatus::*;
+        let children = vec![
+            named(
+                "a",
+                "Review persistence stage 4 of the plan",
+                Running,
+                false,
+            ),
+            named(
+                "b",
+                "Review persistence stage 5 of the plan",
+                Running,
+                false,
+            ),
+            named("c", "Review persistence", Running, false),
+        ];
+        let mut ordinals = Ordinals::default();
+        ordinals.observe(&children);
+        for ordinals in [&ordinals, &Ordinals::default()] {
+            assert_eq!(
+                labels(&children, ordinals),
+                [
+                    "Review persistence stage…",
+                    "Review persistence stage… 2",
+                    "Review persistence",
+                ]
+            );
+        }
     }
 
     #[test]

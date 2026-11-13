@@ -2135,8 +2135,11 @@ impl Runtime {
                 .into(),
             ];
             // The name titles the transcript; the task it was given sits
-            // beneath it, quieter, so the reader knows what it is for.
-            if let Some(task) = Self::native_child_task(agent) {
+            // beneath it, quieter, so the reader knows what it is for, unless
+            // the agent already goes by that task.
+            if let Some(task) =
+                Self::native_child_task(agent).filter(|_| !Self::named_by_task(agent))
+            {
                 heading.push(
                     design::caption(Self::short_description(task, 80))
                         .class(cosmic::theme::Text::Custom(design::muted_text))

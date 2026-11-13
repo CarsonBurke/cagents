@@ -129,6 +129,9 @@ struct Omp {
     subscription_request: Option<String>,
     children_request: Option<String>,
     child_loaded: std::collections::HashSet<String>,
+    /// Children a description has named. OMP's progress frames may carry
+    /// only the agent's type, which must not rename one back to it.
+    child_described: std::collections::HashSet<String>,
     child_buffer: HashMap<String, Vec<Value>>,
     child_finished: VecDeque<String>,
     branch_draft: Option<String>,
@@ -281,6 +284,7 @@ impl Omp {
         {
             self.children.remove(&old);
             self.child_loaded.remove(&old);
+            self.child_described.remove(&old);
             self.child_buffer.remove(&old);
             self.child_requests.retain(|_, id| id != &old);
         }
@@ -329,22 +333,26 @@ impl Omp {
         {
             self.child_finished.push_back(id.into());
         }
+        // What it goes by: its short description, which tells apart agents
+        // of one type, else that type. Its task is a whole prompt. An empty
+        // kind leaves the name it has in place.
+        let described = [text(payload, "description"), text(progress, "description")]
+            .into_iter()
+            .find_map(|field| field.lines().map(str::trim).find(|line| !line.is_empty()));
+        let kind = match described {
+            Some(description) => {
+                self.child_described.insert(id.into());
+                description
+            }
+            None if self.child_described.contains(id) => "",
+            None => text(payload, "agent").trim(),
+        };
         step.events.push(Event::Subagent {
             model: None,
             waiting: None,
             detail: None,
             id: id.into(),
-            // What it goes by: its short description, which tells apart
-            // agents of one type, else that type. Its task is a whole prompt.
-            kind: [
-                text(payload, "description"),
-                text(progress, "description"),
-                text(payload, "agent"),
-            ]
-            .into_iter()
-            .find_map(|field| field.lines().map(str::trim).find(|line| !line.is_empty()))
-            .unwrap_or_default()
-            .into(),
+            kind: kind.into(),
             description: payload["task"]
                 .as_str()
                 .or_else(|| payload["description"].as_str())
@@ -1121,6 +1129,7 @@ impl Adapter for Omp {
                             self.children.clear();
                             self.child_requests.clear();
                             self.child_loaded.clear();
+                            self.child_described.clear();
                             self.child_buffer.clear();
                             self.child_finished.clear();
                             self.children_request = None;
@@ -1289,6 +1298,7 @@ impl Adapter for Omp {
                             self.children.clear();
                             self.child_requests.clear();
                             self.child_loaded.clear();
+                            self.child_described.clear();
                             self.child_buffer.clear();
                             self.child_finished.clear();
                             self.children_request = None;
@@ -2294,6 +2304,16 @@ mod tests {
                 "{payload}"
             );
         }
+        // OMP's progress frames name the agent's type, and their progress
+        // need not repeat the description, which then still names it.
+        let mut adapter = Omp {
+            ready: true,
+            ..Default::default()
+        };
+        adapter.receive(json!({"type":"subagent_lifecycle","payload":{"id":"child","agent":"explore","status":"started","description":"Map the parser","progress":{"id":"child","status":"running"}}})).unwrap();
+        let progress = adapter.receive(json!({"type":"subagent_progress","payload":{"agent":"explore","task":"Long prompt","progress":{"id":"child","status":"running"}}})).unwrap();
+        assert!(progress.events.iter().any(|event| matches!(event,
+            Event::Subagent { id, kind, .. } if id == "child" && kind.is_empty())));
     }
 
     #[test]
