@@ -157,6 +157,8 @@ mod tests {
         let (started, ready) = std::sync::mpsc::channel();
         let (finish, finished) = std::sync::mpsc::channel::<()>();
         let other = std::thread::spawn(move || {
+            // Whatever mask the harness inherited, this thread receives it.
+            unblock_sigchld_for_exec().unwrap();
             started.send(()).unwrap();
             let _ = finished.recv();
         });

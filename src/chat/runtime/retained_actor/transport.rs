@@ -3903,8 +3903,8 @@ fn disconnected(control: &UnixStream) -> Result<bool, String> {
 /// actor does not wake. Without that descriptor, as in a process whose other
 /// threads receive SIGCHLD, it runs every [`Self::INTERVAL`] instead.
 ///
-/// The helper has no log sink, so a sweep failure is retried on the next
-/// child exit or call rather than reported here. Its durable symptom is the
+/// The helper has no log sink, so a failed sweep is retried after
+/// [`Self::INTERVAL`] rather than reported here. Its durable symptom is the
 /// per-holder zombie count that `cagents diagnostics` observes from outside
 /// the process.
 struct OrphanSweep {
@@ -3955,12 +3955,13 @@ impl OrphanSweep {
             .children
             .is_none()
             .then(|| Instant::now() + Self::INTERVAL);
-        if let Ok(sweep) = crate::daemon::adopted_orphans::reap_exited(Self::LIMIT)
-            && sweep.truncated
-        {
+        match crate::daemon::adopted_orphans::reap_exited(Self::LIMIT) {
             // Continue the backlog on the next serve iteration: its exits
             // were already read from the descriptor.
-            self.due = Some(Instant::now());
+            Ok(sweep) if sweep.truncated => self.due = Some(Instant::now()),
+            Ok(_) => {}
+            // No further exit may come to retry it.
+            Err(_) => self.due = Some(Instant::now() + Self::INTERVAL),
         }
     }
 }
@@ -4369,7 +4370,6 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s"}
         // This isolated process stands in for the helper: a subreaper that
         // adopts every orphan its provider's tools leave behind.
         assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
-        let children = ChildEvents::new().expect("every fixture thread blocks SIGCHLD");
         let state = |pid: i32| {
             let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
             stat[stat.rfind(')')? + 2..].chars().next()
@@ -4452,6 +4452,8 @@ while IFS= read -r frame; do :; done
         let worker = thread::spawn(move || {
             // SAFETY: gettid has no preconditions.
             serving.send(unsafe { libc::gettid() }).unwrap();
+            // Its owner's thread creates and drops it, as the helper's does.
+            let children = ChildEvents::new().expect("every fixture thread blocks SIGCHLD");
             let mut server = server;
             server.serve(control, Some(children))
         });

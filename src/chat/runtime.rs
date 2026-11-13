@@ -2466,7 +2466,7 @@ impl Actor {
             .stderr
             .take()
             .ok_or("Provider stderr unavailable")?;
-        // Every stdout read and stdin write below pokes the scope.
+        // Every read and write of the provider's pipes below pokes the scope.
         if let Some(scope) = self.child.as_ref().and_then(|c| c.scope.as_ref()) {
             scope.reports_activity();
         }
@@ -2777,6 +2777,7 @@ impl Actor {
                 match stderr.read(&mut buffer) {
                     Ok(0) => stderr_eof = true,
                     Ok(n) => {
+                        self.poke_scope();
                         for byte in &buffer[..n] {
                             if self.stderr.len() == 16384 {
                                 self.stderr.pop_front();

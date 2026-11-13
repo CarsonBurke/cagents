@@ -15,7 +15,8 @@
 //!
 //! The provider starts its commands, so they begin in its leaf. A sweeper
 //! moves each one into its own leaf shortly after it starts: within
-//! [`FAST`] while the provider is active, and [`SLOW`] otherwise. Memory a
+//! [`FAST`] while the provider is active, [`SLOW`] otherwise, and up to
+//! [`QUIET`] for a provider that has long been quiet (below). Memory a
 //! command allocated before it moved stays charged to the provider leaf,
 //! because cgroup v2 does not move charges, so the sweeper is woken early
 //! whenever the provider reports activity. Command leaves are checked for
@@ -25,7 +26,9 @@
 //! owner reports all its activity, its output and the input it is sent, does
 //! not start commands unannounced: once it has been quiet for a while with no
 //! command running, sweeps slow towards [`QUIET`]. A provider idle for hours
-//! then wakes this thread rarely instead of every second.
+//! then wakes this thread rarely instead of every second. What it might still
+//! start unannounced while quiet, such as an idle-time hook, moves within
+//! [`QUIET`].
 //!
 //! The scope's `OOMPolicy=continue` keeps an OOM kill in one leaf from
 //! stopping the whole scope, which `stop` would do.
