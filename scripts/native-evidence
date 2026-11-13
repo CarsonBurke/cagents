@@ -36,10 +36,12 @@ Usage: scripts/native-evidence --task DIR COMMAND
 Sides are "before" and "after". Each has its own checkout and target directory;
 both use the same fixture data and selected providers.
 
-  build SIDE CHECKOUT
+  build SIDE CHECKOUT [--integrated]
                   Build the runner's three browserless executables in one of
                   the build host's shared slots, and keep them in the side's
-                  target. scripts/prune-build-dirs reclaims a task's targets
+                  target. --integrated builds the UI with the embedded
+                  browser instead, and the side's sessions run the runner
+                  without --browserless. scripts/prune-build-dirs reclaims a task's targets
                   once no build or session has used them for 12 hours, or 1
                   hour while the disk is low.
   start SIDE [--width PX] [--height PX] [--keep-state] [--wait-lock SECONDS] [--limit SECONDS]
@@ -197,15 +199,19 @@ zig_executable() (
         -e 's/^[[:space:]]*\.zig_exe[[:space:]]*=[[:space:]]*"\([^"]*\)",\{0,1\}[[:space:]]*$/\1/p'
 )
 
-# What `build` compiles, and all a session's cargo accepts. Keep these in step with
-# scripts/run-development's browserless builds, which cannot be asked to only build: the
-# before side may predate any option. A real-runner test fails if they drift.
+# What `build` compiles, and all a session's cargo accepts, for the lane in $1:
+# browserless, or integrated for the UI with the embedded browser. Keep these in
+# step with scripts/run-development's builds, which cannot be asked to only build:
+# the before side may predate any option. A real-runner test fails if they drift.
 build_arguments() {
     local common='--locked --profile dev-runtime --no-default-features --features'
     printf '%s\n' \
         "$common development --bin cagents" \
-        "$common development,host --bin cagentsd" \
-        "$common development,ui --bin cagents-ui"
+        "$common development,host --bin cagentsd"
+    case ${1:-browserless} in
+        integrated) printf '%s\n' '--locked --profile dev-runtime --features development,integrated-browser --bin cagents-ui' ;;
+        *) printf '%s\n' "$common development,ui --bin cagents-ui" ;;
+    esac
 }
 
 refuse_running_side() {
@@ -215,12 +221,13 @@ refuse_running_side() {
 }
 
 cmd_build() {
-    local side=${1:-} checkout=${2:-}
+    local side=${1:-} checkout=${2:-} lane=browserless
     require_side "$side"
     [ -n "$checkout" ] || die 'build needs a checkout' 2
     shift 2
     while [ "$#" -gt 0 ]; do
         case $1 in
+            --integrated) lane=integrated; shift ;;
             --seed-target)
                 # A slot already holds a nearby build; a copied target adds only disk.
                 : "${2:?--seed-target needs a directory}"
@@ -265,7 +272,7 @@ cmd_build() {
     # CAGENTS_BUILD_REMOTE=local here. The hold is the checkout's, whose
     # builds alone can use it.
     (cd -- "$checkout" && "$tool_root/scripts/cargo-gate" exec --hold "$self" --task "$task" \
-        __build "$side" "$checkout" "$zig" "${cargo_path%/*}")
+        __build "$side" "$checkout" "$zig" "${cargo_path%/*}" "$lane")
 }
 
 # Whether this build compiles on this host: in its own slots, reached by
@@ -290,7 +297,7 @@ mark_used() {
 }
 
 run_build() {
-    local side=$1 checkout=$2 zig=$3 cargo_bin=$4 target revision
+    local side=$1 checkout=$2 zig=$3 cargo_bin=$4 lane=${5:-browserless} target revision
     # A session may have started during the wait for this slot.
     refuse_running_side "$side"
     target=$(target_of "$side")
@@ -312,15 +319,16 @@ run_build() {
         while IFS= read -r arguments; do
             # shellcheck disable=SC2086 # Deliberately one word per argument.
             cargo build $arguments 8<&-
-        done < <(build_arguments)
+        done < <(build_arguments "$lane")
     )
     [ "$(source_state "$checkout")" = "$revision" ] ||
         die "$checkout changed during the build; build it again"
     {
         printf '%s\n' "$checkout" "$zig" "$cargo_bin"
         printf '%s\n' "$revision"
+        printf 'lane %s\n' "$lane"
     } >"$target/evidence-source"
-    printf 'built %s at %s\n' "$side" "$(head -n1 <<<"$revision")"
+    printf 'built %s (%s) at %s\n' "$side" "$lane" "$(head -n1 <<<"$revision")"
 }
 
 # What a side without a build says. scripts/prune-build-dirs reclaims one that
@@ -340,7 +348,11 @@ load_side() {
         read -r cargo_bin
         read -r built_revision
         read -r built_tree
+        # A record from before lanes has no such line: it was browserless.
+        read -r lane || :
     } <"$record"
+    lane=${lane#lane }
+    [ "$lane" = integrated ] || lane=browserless
     target=$(target_of "$side")
 }
 
@@ -859,7 +871,7 @@ write_session_cargo() {
         printf '#!/bin/bash\n'
         printf 'state=%q\nadvice=%q\nreal_cargo=%q\nprofile=dev-runtime\n' \
             "$state" "run: build $side $checkout" "$cargo_bin/cargo"
-        printf 'recorded=%q\n' "$(build_arguments)"
+        printf 'recorded=%q\n' "$(build_arguments "$lane")"
         cat <<'CARGO'
 [ ! -e "$state/ready" ] || [ -e "$state/replaying" ] || exec "$real_cargo" "$@"
 refuse() {
@@ -922,13 +934,14 @@ run_app() {
     # pruner, under this private HOME, beside the app being captured, and
     # sync the file system for each one while the disk is low. Builds run
     # inside the session once it is ready are not disk-guarded either.
-    local status=0 stage_environment=() runner_instance=()
+    local status=0 stage_environment=() runner_instance=() runner_lane=(--browserless)
+    [ "$lane" != integrated ] || runner_lane=()
     [ -z "$instance_name" ] || runner_instance=(--instance "$instance_name" --in-session)
     [ -z "${chat_stage_output:-}" ] || stage_environment+=("CAGENTS_CHAT_STAGE_OUTPUT=$chat_stage_output")
     [ "$(cat "$state/ui-trace" 2>/dev/null)" != 1 ] || stage_environment+=(CAGENTS_UI_TRACE=1)
     fixture_env env "${stage_environment[@]}" CAGENTS_BUILD_LOCK="$state/session-build.lock" CAGENTS_BUILD_SLOTS=1 CAGENTS_BUILD_SEED=0 \
         CAGENTS_BUILD_REMOTE=local CAGENTS_BUILD_FREE_FLOOR_GIB=0 \
-        scripts/run-development --browserless "${runner_instance[@]}" \
+        scripts/run-development "${runner_lane[@]}" "${runner_instance[@]}" \
             --debug --log-file "$logs/ui-$side.log" || status=$?
     # Don't leave the lock held until the harness gives up on a window.
     if [ ! -e "$state/ready" ] && [ ! -e "$state/failed" ]; then
