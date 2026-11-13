@@ -48,6 +48,10 @@ through the native Resume picker before sending the live prompt. A repeated
 seed refuses to overwrite the existing transcript. Native-evidence starts each
 side from a fresh fixture unless a seed was explicitly saved.
 
+The scene detects whether the installed harness calls pointer motion `move`
+or `hover`. Failure controls and chooser tasks are located through their visible
+captions, so the scene also supports older OCR-only harnesses.
+
 The scene reads its JSONL and seed script from beside itself. Set
 `CAGENTS_EVIDENCE_COMMAND` to an executable `native-evidence` path to run a
 prepared copy of the scene outside the repository tool checkout. The default
@@ -64,9 +68,18 @@ A remote pair steps file can contain:
 CAGENTS_EVIDENCE_TASK=$task "$tool/tests/fixtures/live-agent-status-scene.sh"
 ```
 
-Run `native-evidence pair` with `--width 1200 --height 900`. Repeat with
-`--width 900 --height 900` and pass `narrow-` as the scene's argument for narrow
-shot names. The scene captures loaded history, current status, failure hover,
+Run `native-evidence pair` with `--width 1200 --height 900` and set
+`CAGENTS_EVIDENCE_NARROW_WIDTH=900` in the steps file when invoking the scene.
+For each ordinary screenshot, the scene captures the full-width state, resizes
+only the task's private native column to 900 logical pixels, captures the
+`narrow-` state, and restores the column to 100% of its viewport. This captures
+both layouts in a single session per revision. The framebuffer stays wide;
+`layout-SIDE-narrow-STATE.json` in the task directory records the observed
+native window size for each narrow shot. Hover tooltips are captured at
+the initial wide width. All compositor commands run through `native-evidence
+nested`; the host desktop is never addressed. Alternatively, repeat the pair
+with `--width 900 --height 900` and pass `narrow-` as the scene's argument.
+The scene captures loaded history, current status, failure hover,
 and the result of clicking the failure, including expansion of its notification
 diagnostic. The follow-up captures three failures, their tooltip, the Failed
 chooser with task descriptions, and selection and expanded diagnostics of the
