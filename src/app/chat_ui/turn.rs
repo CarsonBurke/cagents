@@ -1354,8 +1354,10 @@ mod tests {
             ];
             let turns = group(&items, &unasked(), plain);
             assert_eq!(turns.len(), 2);
-            assert_eq!(slots(&turns[0]), [(0, Slot::Step), (1, Slot::Thinking)]);
-            assert_eq!(slots(&turns[1]), [(2, Slot::Step)]);
+            assert_eq!(steps(&turns[0]), [0]);
+            assert_eq!(slots(&turns[0]), [(1, Slot::Thinking)]);
+            assert_eq!(steps(&turns[1]), [2]);
+            assert!(slots(&turns[1]).is_empty());
             let active = group(&[thought], &unasked(), plain);
             assert_eq!(slots(&active[0]), [(0, Slot::Thinking)]);
         }
