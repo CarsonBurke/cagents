@@ -40,7 +40,9 @@
 #           task longer than a row shows and a message that never confirmed,
 #           for a session at --width 1200, whose side panels leave the chat
 #           its narrowest
-#   keys    the rows by keyboard, at --width 1200: keyboard-focus (the long
+#   keys    the agent named by the long task, at --width 1200: long-name-hover
+#           (the first message's tooltip, naming the agent whole), then the
+#           rows by keyboard: keyboard-focus (the long
 #           message focused), keyboard-menu (its menu from the Menu key),
 #           keyboard-refused-open and keyboard-refused-closed (Enter twice
 #           on the refused message, its tool call opening and closing while
@@ -94,6 +96,10 @@ if [ "$scene" = long ]; then
     # to it never hears back, so its row says it was not confirmed.
     sed -e 's/"Relocate the repo"/"Relocate the t3code checkout and every worktree"/g' \
         -e '/fixture-moved-@TURN@-result/d' \
+        "$here/message-card-scene/frames.jsonl" >"$config/fixture-frames.jsonl"
+elif [ "$scene" = keys ]; then
+    # The same long name, every message confirmed.
+    sed -e 's/"Relocate the repo"/"Relocate the t3code checkout and every worktree"/g' \
         "$here/message-card-scene/frames.jsonl" >"$config/fixture-frames.jsonl"
 else
     cp "$here/message-card-scene/frames.jsonl" "$config/fixture-frames.jsonl"
@@ -151,6 +157,16 @@ if [ "$scene" = keys ]; then
     # window's traversal starts again: one step back is the tab strip's new
     # tab button, and the rows follow it after the conversation's tab and
     # its terminal button.
+    # The first message's tooltip names the agent its row cuts short.
+    first=$(locate 'The repo is now')
+    if [ -n "$first" ]; then
+        "$ne" drive move "$first" >/dev/null 2>&1
+        sleep 3
+        "$ne" shot long-name-hover >/dev/null && log "shot long-name-hover" ||
+            log "shot failed: long-name-hover"
+    else
+        log "not found: the first message"
+    fi
     "$ne" drive click "$transcript" >/dev/null 2>&1
     sleep 1
     key shift+Tab
