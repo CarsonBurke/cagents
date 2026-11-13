@@ -101,7 +101,7 @@ done | head -n 1)
 [ -n "$daemon" ] || { printf '%s\n' 'The fixture daemon is not running' >&2; exit 1; }
 printf 'worktrees=%s active=%s directories=%s budget=%s\n' \
     "$worktrees" "$active" "$directories" "$budget"
-python3 -I - "$daemon" "$seconds" "$((worktrees + 1))" <<'EOF'
+/usr/bin/python3 -I - "$daemon" "$seconds" "$((worktrees + 1))" <<'EOF'
 import glob, os, sys, time
 
 daemon, seconds, checkouts = sys.argv[1], float(sys.argv[2]), int(sys.argv[3])
