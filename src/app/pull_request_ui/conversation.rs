@@ -186,6 +186,11 @@ impl State {
         }
     }
 
+    /// The inspected conversation's latest list, with its revision.
+    pub(super) fn latest_list(&self) -> Option<(TerminalId, u64, &Arc<ConversationPullRequests>)> {
+        Some((self.conversation?, self.revision, self.list.as_ref()?))
+    }
+
     /// Follows the inspected conversation, and reports whether it changed.
     pub(super) fn retarget(&mut self, inspected: Option<(CardId, TerminalId)>) -> bool {
         let card = inspected.map(|(card, _)| card);

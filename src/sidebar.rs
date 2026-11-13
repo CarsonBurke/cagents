@@ -416,6 +416,10 @@ pub struct SidebarProject {
     /// and the reads that fail are the slow ones, so the row has to say that
     /// it is trying rather than look untouched for several seconds.
     pub reloading: bool,
+    /// Identifies the pull requests this project displays, so an index built
+    /// from them can tell it is current without comparing them. See
+    /// [`Self::pull_requests_revision`].
+    pull_requests_revision: Revision,
     chrome: ProjectChrome,
 }
 
@@ -560,6 +564,7 @@ impl SidebarProject {
             avatar: None,
             unreachable: None,
             reloading: false,
+            pull_requests_revision: Revision::next(),
             chrome,
         }
     }
@@ -648,6 +653,9 @@ impl SidebarProject {
     }
 
     pub fn replace_pull_requests(&mut self, pull_requests: Vec<SidebarPullRequest>) {
+        if self.display_pull_requests() != pull_requests.as_slice() {
+            self.pull_requests_revision = Revision::next();
+        }
         self.pull_requests = pull_requests;
         self.cached_display = None;
         self.refresh_worktree_pull_requests();
@@ -666,6 +674,15 @@ impl SidebarProject {
                 row.clear_pull_request();
             }
         }
+    }
+
+    /// Changes when [`Self::replace_pull_requests`] changes which pull
+    /// requests, or what of them, the project displays. Revisions come from
+    /// one count for the whole process, so a project rebuilt from a fresh
+    /// load never repeats the revision of the one it replaces. Review
+    /// request flags, which no index reads, leave it alone.
+    pub fn pull_requests_revision(&self) -> u64 {
+        self.pull_requests_revision.0
     }
 
     pub fn display_pull_requests(&self) -> &[SidebarPullRequest] {
@@ -700,6 +717,29 @@ impl SidebarProject {
         })
     }
 }
+
+/// A revision of a project's displayed pull requests, unique in the process.
+///
+/// It is bookkeeping for indexes built from the project, not part of what the
+/// project is: two projects that show the same thing are equal whatever their
+/// revisions.
+#[derive(Debug, Clone, Copy)]
+struct Revision(u64);
+
+impl Revision {
+    fn next() -> Self {
+        static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        Self(COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1)
+    }
+}
+
+impl PartialEq for Revision {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for Revision {}
 
 /// Presentation strings and widget identities a project determines. Building
 /// them per frame would allocate once per project per terminal wake, so they
@@ -14269,6 +14309,28 @@ pub(crate) mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_project_rebuilt_from_a_fresh_load_has_a_new_pull_request_revision() {
+        let id = ProjectId::new();
+        let project = || {
+            SidebarProject::new(
+                id,
+                crate::repository::RepositoryId(id.as_uuid()),
+                "widgets".into(),
+                "/w/widgets".into(),
+                Vec::new(),
+                Vec::new(),
+            )
+        };
+        let (loaded, reloaded) = (project(), project());
+        assert_ne!(
+            loaded.pull_requests_revision(),
+            reloaded.pull_requests_revision(),
+            "an index built from the first must see the second as new"
+        );
+        assert_eq!(loaded, reloaded, "the revision is not part of the project");
+    }
     use crate::{
         github::RemoteValue,
         repository::{

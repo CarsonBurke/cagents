@@ -5314,6 +5314,9 @@ pub struct Cagents {
     worktree_owners: HashMap<CardId, PathBuf>,
     known_worktree_roots: HashSet<PathBuf>,
     worktree_paths: worktree_ui::WorktreePathIndex,
+    /// What the projects list of pull requests, by repository and number,
+    /// which every chat labels its pull request links from.
+    pull_request_board: chat_ui::PullRequestBoard,
     workspace_view_generation: u64,
     workspace_scroll_id: widget::Id,
     github_availability: HashMap<ProjectId, GitHubAvailability>,
@@ -14714,6 +14717,7 @@ impl Application for Cagents {
                 .map(|worktree| worktree.path.clone())
                 .collect(),
             worktree_paths: worktree_ui::WorktreePathIndex::default(),
+            pull_request_board: chat_ui::PullRequestBoard::default(),
             workspace_view_generation: 0,
             workspace_scroll_id: widget::Id::new("workspace-strip-0"),
             github_availability: HashMap::new(),
@@ -18648,6 +18652,7 @@ impl Application for Cagents {
         if attention_scope_changed {
             self.notification_ui.scope_changed();
         }
+        self.sync_pull_request_labels();
         let activation = self.retry_notification_activation();
         let visibility = self.sync_visible_attention();
         self.sync_notification_presence();
@@ -30814,6 +30819,7 @@ mod tests {
             worktree_owners: HashMap::new(),
             known_worktree_roots: HashSet::new(),
             worktree_paths: worktree_ui::WorktreePathIndex::default(),
+            pull_request_board: chat_ui::PullRequestBoard::default(),
             workspace_view_generation: 0,
             workspace_scroll_id: widget::Id::new("workspace-strip-0"),
             github_availability: HashMap::new(),

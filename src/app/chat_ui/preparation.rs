@@ -61,6 +61,8 @@ struct Request {
     version: u64,
     theme: crate::settings::EditorSyntaxTheme,
     reader_proofs: Arc<HashMap<u64, reader_source::Proof>>,
+    /// How pull request links read in what this parses.
+    labels: Arc<pull_request_links::Labels>,
 }
 
 #[derive(Clone, Default)]
@@ -302,6 +304,7 @@ pub(super) struct State {
     local_error: Option<(std::sync::Weak<prompt::LocalSource>, String)>,
     errors: HashMap<String, (std::sync::Weak<chat::Item>, String)>,
     reader_proofs: Arc<HashMap<u64, reader_source::Proof>>,
+    labels: Arc<pull_request_links::Labels>,
     provider: Option<Provider>,
     // Cursor into the authoritative selected Snapshot, never another retained
     // source queue. A pump examines at most128 metadata entries per event.
@@ -531,6 +534,7 @@ impl State {
                 .unwrap_or_else(|e| e.into_inner());
             *current == target
                 && latest.theme == theme
+                && Arc::ptr_eq(&latest.labels, &self.labels)
                 && matches!(&latest.input, Input::Local(previous) if Arc::ptr_eq(previous, source))
         }) {
             return;
@@ -565,6 +569,9 @@ impl State {
                         version: 1,
                         theme,
                         reader_proofs: Arc::default(),
+                        // The prompt just sent reads its links as the
+                        // transcript does, so they don't change on arrival.
+                        labels: self.labels.clone(),
                     }),
                     // The prompt just sent shows where the reader is, so it
                     // ranks with the growing answer, and like it never takes
@@ -622,6 +629,34 @@ impl State {
 
     pub(super) fn set_reader_proofs(&mut self, proofs: Arc<HashMap<u64, reader_source::Proof>>) {
         self.reader_proofs = proofs;
+    }
+    /// How pull request links read in what is parsed from now on, including
+    /// what is staged but not yet started, so a long transcript staged just
+    /// before the labels arrive is parsed once. A publication already parsed,
+    /// or being parsed, keeps its labels until it changes or is
+    /// [forgotten](Self::forget); the caller relabels it on arrival.
+    pub(super) fn set_labels(&mut self, labels: Arc<pull_request_links::Labels>) {
+        for entry in self
+            .entries
+            .values()
+            .chain(self.local.as_ref().map(|(_, entry)| entry))
+        {
+            entry
+                .shared
+                .latest
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .labels = labels.clone();
+        }
+        self.labels = labels;
+    }
+    /// Drops `id`'s preparation, running or done, so that staging it again
+    /// parses its whole text afresh.
+    pub(super) fn forget(&mut self, id: &str) {
+        if let Some(entry) = self.entries.get(id) {
+            entry.shared.cancel();
+        }
+        self.remove(id);
     }
     pub(super) fn clear(&mut self) {
         self.clear_local();
@@ -837,6 +872,7 @@ impl State {
                         version: latest.version.wrapping_add(1),
                         theme,
                         reader_proofs: self.reader_proofs.clone(),
+                        labels: self.labels.clone(),
                     };
                     if !entry.running {
                         entry.run = next_attempt();
@@ -874,6 +910,7 @@ impl State {
                         version: 1,
                         theme,
                         reader_proofs: self.reader_proofs.clone(),
+                        labels: self.labels.clone(),
                     }),
                     priority: AtomicU64::new(UNRANKED),
                     place: Place::default(),
@@ -1027,6 +1064,8 @@ impl State {
 pub(super) struct Prepared {
     request: Request,
     pub(super) parsed: Parsed,
+    /// The pull requests the prepared text links to.
+    links: Box<[crate::github_identity::PullRequestKey]>,
     document: prose_document::Data,
     prompt: Option<Box<prompt::Prepared>>,
     literal: Option<literal_content::Prepared>,
@@ -1055,6 +1094,10 @@ impl Prepared {
     }
     pub(super) fn is_coordination(&self) -> bool {
         self.coordination.is_some()
+    }
+    /// The labels the text was parsed with.
+    pub(super) fn labels(&self) -> &Arc<pull_request_links::Labels> {
+        &self.request.labels
     }
     pub(super) fn item(&self) -> &Arc<chat::Item> {
         self.request.input.transcript().expect("transcript output")
@@ -1171,6 +1214,7 @@ impl Prepared {
                 .expect("transcript output")
                 .content,
         );
+        cached.pull_request_links = self.links;
         cached.preparing = self.request.growing || managed;
         cached.placeholder = false;
         cached.open = None;
@@ -1845,6 +1889,7 @@ fn execute(shared: Arc<Shared>, permit: impl Into<Permit>) -> Result<Prepared, S
             document: prose_document::Data::snapshot(&markdown::Content::default()),
             prompt: Some(prompt),
             literal: None,
+            links: Box::default(),
             coordination: None,
             blocks: HashMap::new(),
             palettes: prose::palettes(&HashMap::new()),
@@ -1879,6 +1924,7 @@ fn execute(shared: Arc<Shared>, permit: impl Into<Permit>) -> Result<Prepared, S
             &mut canonical.parsed,
             body,
             request.growing,
+            &request.labels,
             &shared.cancelled,
         )?;
         prime_plain(canonical.parsed.markdown.items(), &shared.cancelled)?;
@@ -1895,7 +1941,7 @@ fn execute(shared: Arc<Shared>, permit: impl Into<Permit>) -> Result<Prepared, S
         verify_tool_readers(&item, &request.reader_proofs, &mut reader_verifications);
     }
     let coordinated = chat::coordination::recognize(&item, request.provider)
-        .map(|reading| coordination::Prepared::prepare(reading, &shared.cancelled))
+        .map(|reading| coordination::Prepared::prepare(reading, &request.labels, &shared.cancelled))
         .transpose()?;
     if let Some(coordinated) = &coordinated {
         for (index, content) in coordinated.contents().enumerate() {
@@ -1980,12 +2026,23 @@ fn execute(shared: Arc<Shared>, permit: impl Into<Permit>) -> Result<Prepared, S
         .is_none()
         .then(|| Arc::new(tool_text::PreparedSources::new(&item.content)));
     let document = prose_document::Data::snapshot(&parsed.markdown);
+    // What the message links to, so a change of labels finds the messages it
+    // reads otherwise in without reading their text again.
+    let mut links = CachedItem::prose(&item.content)
+        .filter(|_| prompt.is_none() && literal.is_none())
+        .map(pull_request_links::named)
+        .unwrap_or_default();
+    if let Some(coordinated) = &coordinated {
+        links.extend(coordinated.links());
+    }
+    pull_request_links::deduplicate(&mut links);
     Ok(Prepared {
         request,
         parsed,
         document,
         prompt,
         literal,
+        links: links.into_boxed_slice(),
         coordination: coordinated,
         blocks,
         palettes,
@@ -2132,18 +2189,38 @@ pub(super) struct Update {
 /// rich block on append; feeding a cold body in artificial chunks amplifies
 /// that cost. Cancellation fences ownership before and after the parser call;
 /// it does not preempt pulldown-cmark inside a single rich block.
+///
+/// Text parsed before keeps the labels it was parsed with. When `labels`
+/// read a pull request that `body` names differently, the whole body is
+/// parsed again; otherwise only what is appended reads them.
 fn parse_publication(
     parsed: &mut Parsed,
     body: &str,
     growing: bool,
+    labels: &Arc<pull_request_links::Labels>,
     cancelled: &AtomicBool,
 ) -> Result<(), String> {
     if cancelled.load(Ordering::Relaxed) {
         return Err("Message loading was cancelled.".into());
     }
+    let previous = parsed.markdown.labels();
+    // A fresh parser has parsed nothing to relabel.
+    if parsed.markdown.items().is_empty() {
+        parsed.markdown.set_labels(labels.clone());
+    } else if !Arc::ptr_eq(previous, labels) {
+        if pull_request_links::named(body)
+            .iter()
+            .any(|key| !previous.reads_alike(labels, key))
+        {
+            *parsed = Parsed::default();
+        }
+        parsed.markdown.set_labels(labels.clone());
+    }
     match parsed.source.advance_append(body, growing) {
         markdown_source::Step::Append(text) => parsed.markdown.push_str(&text),
-        markdown_source::Step::Restart(text) => parsed.markdown = markdown::Content::parse(&text),
+        markdown_source::Step::Restart(text) => {
+            parsed.markdown = markdown::Content::parse_labelled(&text, labels.clone());
+        }
     }
     if cancelled.load(Ordering::Relaxed) {
         return Err("Message loading was cancelled.".into());
@@ -3761,6 +3838,165 @@ mod tests {
     }
 
     #[test]
+    fn new_pull_request_labels_reparse_only_the_messages_whose_links_read_otherwise() {
+        let message = |id: &str, body: &str| chat::Item {
+            id: id.into(),
+            ..(*item(body)).clone()
+        };
+        let agent = |id: &str, prompt: &str| chat::Item {
+            id: id.into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Tool {
+                name: "Agent".into(),
+                input: serde_json::json!({"prompt": prompt, "run_in_background": true}).to_string(),
+                output: "Background task launched".into(),
+                status: chat::ToolStatus::Succeeded,
+            },
+            started_at: None,
+            at: None,
+        };
+        let (mut runtime, _handle) = view::prepared_runtime_for_test(&[
+            message("named", "Fixed in https://github.com/acme/widgets/pull/20."),
+            message("other", "Nothing to link here."),
+            agent(
+                "card",
+                "Review https://github.com/acme/widgets/pull/20 again.",
+            ),
+            agent("plain card", "Review the parser."),
+        ]);
+        drain_fixture(&mut runtime);
+        retirement_barrier();
+        let shown = |runtime: &Runtime, id: &str| {
+            let markdown::Item::Paragraph(text) = &runtime.cache[id].markdown.items()[0] else {
+                panic!("a paragraph");
+            };
+            text.plain()
+        };
+        // Before the daemon says anything, the link reads as a reference.
+        assert!(shown(&runtime, "named").contains("acme/\u{2060}widgets#20"));
+        let other = shown(&runtime, "other");
+        let other_revision = runtime.cache["other"].revision;
+        runtime.set_pull_request_labels(Arc::new(pull_request_links::fixture::fixture()));
+        assert!(runtime.cache["named"].preparing);
+        assert!(!runtime.cache["other"].preparing);
+        // A coordination card is prepared again only for a link it holds.
+        assert!(runtime.cache["card"].coordination.is_some());
+        assert!(runtime.cache["card"].preparing);
+        assert!(!runtime.cache["plain card"].preparing);
+        drain_fixture(&mut runtime);
+        retirement_barrier();
+        assert!(
+            shown(&runtime, "named").contains("#20\u{a0}Retry stalled"),
+            "{:?}",
+            shown(&runtime, "named")
+        );
+        assert!(Arc::ptr_eq(&other, &shown(&runtime, "other")));
+        assert_eq!(runtime.cache["other"].revision, other_revision);
+        // The same labels again change nothing.
+        let named_revision = runtime.cache["named"].revision;
+        runtime.set_pull_request_labels(Arc::new(pull_request_links::fixture::fixture()));
+        assert_eq!(runtime.cache["named"].revision, named_revision);
+        // Opening or closing a card rebuilds its row around the coordination
+        // it keeps, which still shows these links' labels, so a later label
+        // change still finds it.
+        let card = runtime.active_item("card").cloned().expect("the card");
+        let previous = runtime.cache.remove("card");
+        let toggled = CachedItem::updated(
+            &card.content,
+            runtime.syntax_theme,
+            previous,
+            true,
+            false,
+            None,
+        );
+        assert!(toggled.coordination.is_some());
+        assert_eq!(toggled.pull_request_links.len(), 1);
+        runtime.cache.insert("card".into(), toggled);
+        runtime.set_pull_request_labels(Arc::new(pull_request_links::Labels::default()));
+        assert!(runtime.cache["card"].preparing);
+        runtime.show(false);
+        retirement_barrier();
+    }
+
+    #[test]
+    fn a_message_prepared_under_older_labels_is_relabelled_on_arrival() {
+        let (mut runtime, handle) = linked_edit_staged();
+        // The worker took the edit before the labels arrived, so it parses
+        // with none, and the message held no link to relabel it by.
+        let (run, shared) = {
+            let entry = &runtime.preparation.entries["named"];
+            (entry.run, entry.shared.clone())
+        };
+        let permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = iced::futures::executor::block_on(permits.acquire_owned()).unwrap();
+        let ready = Ready::new(execute(shared, permit));
+        runtime.set_pull_request_labels(Arc::new(pull_request_links::fixture::fixture()));
+        let target = runtime.target;
+        runtime.markdown_prepared(target, "named", run, ready);
+        drain_fixture(&mut runtime);
+        retirement_barrier();
+        assert_labelled_edit(&runtime);
+        drop(handle);
+        runtime.show(false);
+        retirement_barrier();
+    }
+
+    #[test]
+    fn a_message_staged_before_the_labels_arrive_parses_with_them() {
+        let (mut runtime, handle) = linked_edit_staged();
+        let labels = Arc::new(pull_request_links::fixture::fixture());
+        runtime.set_pull_request_labels(labels.clone());
+        let staged = runtime.preparation.entries["named"]
+            .shared
+            .latest
+            .lock()
+            .unwrap()
+            .labels
+            .clone();
+        assert!(Arc::ptr_eq(&staged, &labels), "the queued parse reads them");
+        drain_fixture(&mut runtime);
+        retirement_barrier();
+        assert_labelled_edit(&runtime);
+        drop(handle);
+        runtime.show(false);
+        retirement_barrier();
+    }
+
+    /// A chat whose message has just been edited to add a pull request link,
+    /// staged for preparation while no labels are known.
+    fn linked_edit_staged() -> (Runtime, Arc<ClientHandle>) {
+        let (mut runtime, handle) = view::prepared_runtime_for_test(&[chat::Item {
+            id: "named".into(),
+            ..(*item("Fixed it.")).clone()
+        }]);
+        retirement_barrier();
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        let ItemContent::Text { text, .. } = &mut Arc::make_mut(&mut snapshot.items[0]).content
+        else {
+            unreachable!()
+        };
+        text.push_str(" See https://github.com/acme/widgets/pull/20 again.");
+        handle.publish_delta_snapshot_for_test(snapshot);
+        runtime.refresh();
+        assert!(runtime.preparation.entries.contains_key("named"));
+        assert!(runtime.cache["named"].pull_request_links.is_empty());
+        (runtime, handle)
+    }
+
+    fn assert_labelled_edit(runtime: &Runtime) {
+        let markdown::Item::Paragraph(text) = &runtime.cache["named"].markdown.items()[0] else {
+            panic!("a paragraph");
+        };
+        assert!(
+            text.plain().contains("#20\u{a0}Retry stalled") && text.plain().ends_with("again."),
+            "{:?}",
+            text.plain()
+        );
+        assert_eq!(runtime.cache["named"].pull_request_links.len(), 1);
+    }
+
+    #[test]
     fn metadata_reuse_refuses_full_resets_rewrites_shape_changes_and_inflight_work() {
         for case in [
             "full reset",
@@ -4063,7 +4299,14 @@ mod tests {
         };
         let parsed = std::thread::spawn(move || {
             let mut parsed = Parsed::default();
-            parse_publication(&mut parsed, &body, false, &AtomicBool::new(false)).unwrap();
+            parse_publication(
+                &mut parsed,
+                &body,
+                false,
+                &Arc::default(),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
             parsed
         })
         .join()
@@ -4080,7 +4323,14 @@ mod tests {
             "emphasis *word* and `code` ".repeat(40_000)
         );
         let mut parsed = Parsed::default();
-        parse_publication(&mut parsed, &body, false, &AtomicBool::new(false)).unwrap();
+        parse_publication(
+            &mut parsed,
+            &body,
+            false,
+            &Arc::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert_eq!(
             parsed.markdown.parsed_work_bytes(),
             body.len(),
@@ -5128,8 +5378,14 @@ mod tests {
         assert_eq!(state.queued_bytes(), 0);
         let mut parsed = Parsed::default();
         assert!(
-            parse_publication(&mut parsed, "must not parse", false, &AtomicBool::new(true))
-                .is_err()
+            parse_publication(
+                &mut parsed,
+                "must not parse",
+                false,
+                &Arc::default(),
+                &AtomicBool::new(true)
+            )
+            .is_err()
         );
         assert!(parsed.markdown.items().is_empty());
     }
