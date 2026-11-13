@@ -831,7 +831,7 @@ mod tests {
             Self::with_nested_destination(false)
         }
         fn with_nested_destination(nested: bool) -> Self {
-            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let directory = crate::test_fixture::tempdir().unwrap();
             let primary = directory.path().join("primary");
             let destination = if nested {
                 primary.join(".worktrees/new")

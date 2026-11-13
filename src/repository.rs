@@ -13514,7 +13514,7 @@ mod worktree_journal_tests {
 
     impl Fixture {
         fn new() -> Self {
-            let directory = tempfile::tempdir().unwrap();
+            let directory = crate::test_fixture::tempdir().unwrap();
             let repository = directory.path().join("repo");
             fs::create_dir(&repository).unwrap();
             let git = |arguments: &[&str]| {

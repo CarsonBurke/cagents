@@ -525,7 +525,7 @@ mod tests {
     #[cfg(feature = "ui")]
     #[test]
     fn installed_bundle_is_discovered_by_each_native_provider_catalog() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_fixture::tempdir().unwrap();
         let environment =
             BTreeMap::from([("HOME".into(), directory.path().to_str().unwrap().into())]);
         for provider in Provider::ALL {
@@ -551,7 +551,7 @@ mod tests {
 
     #[test]
     fn native_locations_follow_process_home_and_selected_claude_account() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_fixture::tempdir().unwrap();
         let home = directory.path().join("other-home");
         let selected = directory.path().join("selected-claude");
         std::fs::create_dir(&home).unwrap();
@@ -581,7 +581,7 @@ mod tests {
 
     #[test]
     fn user_content_is_preserved_and_removed_account_is_never_recreated() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_fixture::tempdir().unwrap();
         install_at(directory.path(), false).unwrap();
         let path = directory.path().join("skills/cagents/SKILL.md");
         std::fs::write(&path, "user-authored skill").unwrap();
@@ -626,7 +626,7 @@ mod tests {
     #[test]
     fn managed_skills_adopt_late_personal_directory_and_follow_future_edits() {
         for previous in ["missing", "empty", "legacy", "current", "both"] {
-            let directory = tempfile::tempdir().unwrap();
+            let directory = crate::test_fixture::tempdir().unwrap();
             let root = directory.path().join("account");
             let system = directory.path().join("system");
             fs::create_dir(&root).unwrap();
@@ -665,12 +665,37 @@ mod tests {
 
     #[test]
     fn managed_skills_resolve_relative_system_paths() {
-        let directory = tempfile::tempdir_in(".").unwrap();
-        let root = directory.path().canonicalize().unwrap().join("account");
+        let directory = crate::test_fixture::tempdir().unwrap();
+        let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let ascents = cwd.ancestors().skip(1).count();
+        // A shallow account would let the relative input's '..' components
+        // clamp at '/', hiding an incorrect resolution against the account.
+        let root = (0..ascents).fold(directory.path().join("account"), |root, _| {
+            root.join("nested")
+        });
         let system = directory.path().join("system");
-        fs::create_dir(&root).unwrap();
+        fs::create_dir_all(&root).unwrap();
         fs::create_dir_all(system.join("skills")).unwrap();
-        share_managed_skills(&root, &system).unwrap();
+        // Keep the production call relative to the unchanged process cwd while
+        // placing every fixture file outside the account home.
+        let relative_system = (0..ascents)
+            .map(|_| "..")
+            .collect::<std::path::PathBuf>()
+            .join(system.strip_prefix("/").unwrap());
+        assert!(relative_system.is_relative());
+        assert_eq!(
+            relative_system.canonicalize().unwrap(),
+            system.canonicalize().unwrap()
+        );
+        assert_eq!(
+            root.join(&relative_system)
+                .canonicalize()
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound,
+            "resolving relative to the account must not reach the system fixture"
+        );
+        share_managed_skills(&root, &relative_system).unwrap();
         assert!(fs::read_link(root.join("skills")).unwrap().is_absolute());
         assert_eq!(
             root.join("skills").canonicalize().unwrap(),
@@ -688,7 +713,7 @@ mod tests {
             "skills-link",
             "dangling-link",
         ] {
-            let directory = tempfile::tempdir().unwrap();
+            let directory = crate::test_fixture::tempdir().unwrap();
             let root = directory.path().join("account");
             let system = directory.path().join("system");
             fs::create_dir(&root).unwrap();
@@ -735,7 +760,7 @@ mod tests {
 
     #[test]
     fn managed_skill_sharing_preserves_account_customizations_and_removed_homes() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_fixture::tempdir().unwrap();
         let system = directory.path().join("system");
         fs::create_dir_all(system.join("skills")).unwrap();
         let root = directory.path().join("removed");
@@ -757,7 +782,7 @@ mod tests {
 
     #[test]
     fn legacy_bundle_is_retired_and_current_bundle_is_installed() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_fixture::tempdir().unwrap();
         let path = legacy(directory.path());
         install_at(directory.path(), false).unwrap();
         assert!(!path.parent().unwrap().exists());
@@ -770,7 +795,7 @@ mod tests {
 
     #[test]
     fn personal_current_skill_is_preserved_while_legacy_bundle_is_retired() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_fixture::tempdir().unwrap();
         let path = legacy(directory.path());
         let current = installed(directory.path());
         fs::create_dir_all(current.parent().unwrap()).unwrap();
@@ -790,7 +815,7 @@ mod tests {
             "resources",
             "fifo",
         ] {
-            let directory = tempfile::tempdir().unwrap();
+            let directory = crate::test_fixture::tempdir().unwrap();
             let path = legacy(directory.path());
             let outside = directory.path().join("outside");
             match case {
@@ -845,7 +870,7 @@ mod tests {
 
     #[test]
     fn unedited_earlier_bundle_is_upgraded_in_place() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_fixture::tempdir().unwrap();
         install_bundle(directory.path(), false, OLD, &[]).unwrap();
         let path = installed(directory.path());
         fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
@@ -866,7 +891,7 @@ mod tests {
 
     #[test]
     fn content_outside_the_allowlist_is_preserved() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_fixture::tempdir().unwrap();
         install_bundle(directory.path(), false, OLD, &[]).unwrap();
         let path = installed(directory.path());
         let mut edited = OLD.to_vec();
@@ -878,7 +903,7 @@ mod tests {
 
     #[test]
     fn linked_skill_file_is_never_replaced() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_fixture::tempdir().unwrap();
         let root = directory.path().join("root");
         fs::create_dir(&root).unwrap();
         let managed = directory.path().join("dotfiles-SKILL.md");
@@ -898,7 +923,7 @@ mod tests {
 
     #[test]
     fn linked_skill_directory_is_never_written() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_fixture::tempdir().unwrap();
         let root = directory.path().join("root");
         let managed = directory.path().join("dotfiles").join(NAME);
         fs::create_dir_all(&managed).unwrap();
@@ -912,7 +937,7 @@ mod tests {
 
     #[test]
     fn earlier_bundle_under_linked_root_and_skills_directory_is_upgraded() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_fixture::tempdir().unwrap();
         let dotfiles = directory.path().join("dotfiles");
         fs::create_dir_all(dotfiles.join("claude")).unwrap();
         fs::create_dir_all(dotfiles.join("skills").join(NAME)).unwrap();
@@ -939,7 +964,7 @@ mod tests {
 
     #[test]
     fn hard_linked_skill_file_is_never_replaced() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_fixture::tempdir().unwrap();
         install_bundle(directory.path(), false, OLD, &[]).unwrap();
         let path = installed(directory.path());
         let managed = directory.path().join("managed-SKILL.md");
@@ -955,7 +980,7 @@ mod tests {
     #[test]
     fn non_regular_skill_file_is_preserved_without_blocking() {
         use std::os::unix::ffi::OsStrExt;
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_fixture::tempdir().unwrap();
         install_bundle(directory.path(), false, OLD, &[]).unwrap();
         let path = installed(directory.path());
         fs::remove_file(&path).unwrap();
