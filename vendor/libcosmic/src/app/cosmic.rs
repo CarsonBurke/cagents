@@ -554,7 +554,7 @@ where
         }
 
         #[cfg(all(target_env = "gnu", not(target_os = "windows")))]
-        crate::malloc::trim(0);
+        crate::malloc::note_activity();
 
         task
     }
@@ -764,7 +764,7 @@ where
         };
 
         #[cfg(all(target_env = "gnu", not(target_os = "windows")))]
-        crate::malloc::trim(0);
+        crate::malloc::note_activity();
 
         view
     }
@@ -777,7 +777,7 @@ where
         let view = self.app.view_main();
 
         #[cfg(all(target_env = "gnu", not(target_os = "windows")))]
-        crate::malloc::trim(0);
+        crate::malloc::note_activity();
 
         view
     }

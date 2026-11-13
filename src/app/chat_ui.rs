@@ -533,16 +533,330 @@ pub enum Action {
 }
 
 impl std::fmt::Debug for Action {
+    /// The variant's name alone, so diagnostics such as the UI trace can tell
+    /// the actions apart. App-message diagnostics must never expose secret
+    /// answers, composer text, attachment paths, or provider authorization
+    /// URLs, so no payload is formatted.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // App-message diagnostics must never expose secret answers, composer
-        // text, attachment paths, or provider authorization URLs.
-        f.debug_tuple("ChatAction")
-            .field(&std::mem::discriminant(self))
-            .finish()
+        f.write_str(self.name())
+    }
+}
+
+/// What an action may confine itself to: one conversation, or the
+/// background work of every visible one.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum LocalScope {
+    Card(CardId),
+    Visible,
+}
+
+/// The facts a workspace projection reads that a conversation-local action
+/// can change, captured on either side of it.
+#[derive(PartialEq)]
+pub(super) struct ProjectionInputs {
+    card: Option<CardState>,
+    presence: Option<PanePresence>,
+    channel_title: Option<String>,
+    scope: Option<std::path::PathBuf>,
+    activity: Option<crate::agent::Activity>,
+    attention: sidebar::AttentionSummary,
+    attention_stale: bool,
+    update: bool,
+    preview: Option<usize>,
+    cards: usize,
+    channels: usize,
+    active_channel: Option<crate::model::ChannelId>,
+    focused: Option<CardId>,
+}
+
+impl ProjectionInputs {
+    fn capture(app: &Cagents, scope: LocalScope) -> Self {
+        let card = match scope {
+            LocalScope::Card(card) => Some(card),
+            LocalScope::Visible => None,
+        };
+        let state = card.and_then(|card| app.card_state(card));
+        let session = state.and_then(|state| match &state.kind {
+            CardKind::Chat(session) => Some(session.id),
+            _ => None,
+        });
+        Self {
+            card: state.cloned(),
+            presence: card.map(|card| app.presence(card).clone()),
+            channel_title: card.and_then(|card| {
+                app.durable
+                    .channels
+                    .iter()
+                    .find(|channel| channel.cards.contains(&card))
+                    .map(|channel| channel.title.clone())
+            }),
+            // The worktree the pane holds, which its protections and
+            // sidebar row follow.
+            scope: card.and_then(|card| {
+                app.worktree_owners
+                    .get(&card)
+                    .or_else(|| app.durable.card_scopes.get(&card))
+                    .cloned()
+            }),
+            activity: card.and_then(|card| app.sidebar_state.card_activity(card)),
+            attention: card.map_or_else(Default::default, |card| {
+                app.sidebar_state.card_attention(card)
+            }),
+            // Attention can change owner without changing its summary.
+            attention_stale: app.sidebar_state.attention_projection_stale(),
+            update: card.is_some_and(|card| app.sidebar_state.has_card_update(card)),
+            preview: session
+                .and_then(|session| app.notification_ui.previews.get(&session))
+                .map(|preview| preview.rank),
+            cards: app.durable.cards.len(),
+            channels: app.durable.channels.len(),
+            active_channel: app.durable.active_channel,
+            focused: app.workspace.focused(),
+        }
+    }
+
+    /// A changed title reaches only the chrome, as a terminal's does; any
+    /// other change reaches the whole projection.
+    fn projection(&self, after: &Self) -> Projection {
+        if self == after {
+            return Projection::Unchanged;
+        }
+        let retitled = match (&self.card, &after.card) {
+            (Some(before), Some(after)) => {
+                before.title != after.title
+                    && CardState {
+                        title: after.title.clone(),
+                        ..before.clone()
+                    } == *after
+            }
+            _ => false,
+        };
+        let others_unchanged = self.presence == after.presence
+            && self.channel_title == after.channel_title
+            && self.scope == after.scope
+            && self.activity == after.activity
+            && self.attention == after.attention
+            && self.attention_stale == after.attention_stale
+            && self.update == after.update
+            && self.preview == after.preview
+            && self.cards == after.cards
+            && self.channels == after.channels
+            && self.active_channel == after.active_channel
+            && self.focused == after.focused;
+        if retitled && others_unchanged {
+            Projection::Chrome
+        } else {
+            Projection::Full
+        }
     }
 }
 
 impl Action {
+    /// What the action confines itself to, when it never touches the
+    /// workspace beyond the facts [`ProjectionInputs`] holds.
+    ///
+    /// These are a conversation's wakes and the results of the background
+    /// work they start. An account report changes the window's accounts, so
+    /// its wake is not among them.
+    fn local_scope(&self) -> Option<LocalScope> {
+        match self {
+            Self::Wake(_, Wake::AccountUsage) => None,
+            Self::Wake(target, _)
+            | Self::FlowRequest(target, ..)
+            | Self::FlowReady(target, ..)
+            | Self::LogicalProseRead(target, ..)
+            | Self::MarkdownPrepared(target, ..)
+            | Self::LocalPromptPrepared(target, ..)
+            | Self::ThumbnailLoaded(target, ..)
+            | Self::FindGroups(target, ..)
+            | Self::FindHighlight(target, ..)
+            | Self::FindHighlighted(target, ..)
+            | Self::FindResume(target, ..)
+            | Self::FindExpired(target, ..)
+            | Self::FindIndexed(target, ..)
+            | Self::FindLocated(target, ..)
+            // Typing, caret moves and scrolling arrive at input rate.
+            | Self::Composer(target, ..)
+            | Self::ComposerCursor(target, ..)
+            | Self::Scrolled(target, ..)
+            | Self::CompletionScrolled(target, ..)
+            | Self::CompletionMove(target, ..)
+            | Self::ChangeListScrolled(target, ..)
+            | Self::DropHover(target, ..)
+            | Self::ClearCopied(target, ..) => Some(LocalScope::Card(target.card)),
+            Self::PreparationAvailable | Self::FlowAvailable | Self::FindAvailable => {
+                Some(LocalScope::Visible)
+            }
+            _ => None,
+        }
+    }
+
+    /// The variant's name, which carries none of its payload.
+    fn name(&self) -> &'static str {
+        match self {
+            Self::PreparationAvailable => "PreparationAvailable",
+            Self::FlowAvailable => "FlowAvailable",
+            Self::FlowRequest(..) => "FlowRequest",
+            Self::FlowReady(..) => "FlowReady",
+            Self::DraftModel(..) => "DraftModel",
+            Self::ChooseAccount(..) => "ChooseAccount",
+            Self::RecoverAccount(..) => "RecoverAccount",
+            Self::RestoreAccount(..) => "RestoreAccount",
+            Self::AccountRestored(..) => "AccountRestored",
+            Self::DraftSkills(..) => "DraftSkills",
+            Self::AccountPicker(..) => "AccountPicker",
+            Self::DispatchQueued(..) => "DispatchQueued",
+            Self::CancelQueued(..) => "CancelQueued",
+            Self::Switch(..) => "Switch",
+            Self::Ready(..) => "Ready",
+            Self::AccountCommitted(..) => "AccountCommitted",
+            Self::UpgradeCommitted(..) => "UpgradeCommitted",
+            Self::ResumeCommitted(..) => "ResumeCommitted",
+            Self::RetainedCopyCommitted(..) => "RetainedCopyCommitted",
+            Self::Retired(..) => "Retired",
+            Self::ReturnedLocally(..) => "ReturnedLocally",
+            Self::Wake(..) => "Wake",
+            Self::UpdatesAcknowledged(..) => "UpdatesAcknowledged",
+            Self::Reconnect(..) => "Reconnect",
+            Self::DraftStartCheckpointed(..) => "DraftStartCheckpointed",
+            Self::ResumeSaved(..) => "ResumeSaved",
+            Self::CopyClosedDraft(..) => "CopyClosedDraft",
+            Self::DiscardClosedDraft(..) => "DiscardClosedDraft",
+            Self::SignIn(..) => "SignIn",
+            Self::ResumeAfterSignIn(..) => "ResumeAfterSignIn",
+            Self::StartFresh(..) => "StartFresh",
+            Self::Composer(..) => "Composer",
+            Self::ComposerUp(..) => "ComposerUp",
+            Self::ComposerCursor(..) => "ComposerCursor",
+            Self::Paste(..) => "Paste",
+            Self::PastedImage(..) => "PastedImage",
+            Self::PastedText(..) => "PastedText",
+            Self::PasteRefused(..) => "PasteRefused",
+            Self::ImageSaved(..) => "ImageSaved",
+            Self::AttachmentsPrepared(..) => "AttachmentsPrepared",
+            Self::Submit(..) => "Submit",
+            Self::SubmitControl(..) => "SubmitControl",
+            Self::HistoryOlder(..) => "HistoryOlder",
+            Self::HistoryNewer(..) => "HistoryNewer",
+            Self::AppendProviderDraft(..) => "AppendProviderDraft",
+            Self::Command(..) => "Command",
+            Self::Interrupt(..) => "Interrupt",
+            Self::DisarmInterrupt(..) => "DisarmInterrupt",
+            Self::CommandFinished(..) => "CommandFinished",
+            Self::Toggle(..) => "Toggle",
+            Self::ToggleTurn(..) => "ToggleTurn",
+            Self::SelectSubagent(..) => "SelectSubagent",
+            Self::SubagentPicker(..) => "SubagentPicker",
+            Self::SubagentQuery(..) => "SubagentQuery",
+            Self::ToggleFailure(..) => "ToggleFailure",
+            Self::CopyFailure(..) => "CopyFailure",
+            Self::FailureCopied(..) => "FailureCopied",
+            Self::SubagentFilter(..) => "SubagentFilter",
+            Self::SubagentPage(..) => "SubagentPage",
+            Self::Unfold(..) => "Unfold",
+            Self::OpenSession(..) => "OpenSession",
+            Self::SessionResolved(..) => "SessionResolved",
+            Self::SessionLinkOpened(..) => "SessionLinkOpened",
+            Self::SessionLinkWindowBackend(..) => "SessionLinkWindowBackend",
+            Self::SessionLinkToken(..) => "SessionLinkToken",
+            Self::Copy(..) => "Copy",
+            Self::CopyMessage(..) => "CopyMessage",
+            Self::MessageCopied(..) => "MessageCopied",
+            Self::LogicalProseRead(..) => "LogicalProseRead",
+            Self::MarkdownPrepared(..) => "MarkdownPrepared",
+            Self::LocalPromptPrepared(..) => "LocalPromptPrepared",
+            Self::RetryMarkdown(..) => "RetryMarkdown",
+            Self::OpenUrl(..) => "OpenUrl",
+            Self::OpenDocument(..) => "OpenDocument",
+            Self::OpenSharedDocument(..) => "OpenSharedDocument",
+            Self::OpenSharedUrl(..) => "OpenSharedUrl",
+            Self::OpenDocumentFrom(..) => "OpenDocumentFrom",
+            Self::OpenChangedFile(..) => "OpenChangedFile",
+            Self::ChangedFileResolved(..) => "ChangedFileResolved",
+            Self::OpenImage(..) => "OpenImage",
+            Self::LoadImage(..) => "LoadImage",
+            Self::ImageLoaded(..) => "ImageLoaded",
+            Self::ThumbnailLoaded(..) => "ThumbnailLoaded",
+            Self::RetryThumbnails(..) => "RetryThumbnails",
+            Self::CloseImage => "CloseImage",
+            Self::ImageNext(..) => "ImageNext",
+            Self::ImageFit => "ImageFit",
+            Self::ImageExternal => "ImageExternal",
+            Self::Image(..) => "Image",
+            Self::ImageCopied(..) => "ImageCopied",
+            Self::CopyLiteral(..) => "CopyLiteral",
+            Self::CopySharedCode(..) => "CopySharedCode",
+            Self::CopyQueued(..) => "CopyQueued",
+            Self::Latest(..) => "Latest",
+            Self::TakeBackQueued(..) => "TakeBackQueued",
+            Self::RemoveQueued(..) => "RemoveQueued",
+            Self::DismissRestoredWaiting(..) => "DismissRestoredWaiting",
+            Self::ComposerActions(..) => "ComposerActions",
+            Self::ComposerActionsQuery(..) => "ComposerActionsQuery",
+            Self::ComposerActionsSubmit(..) => "ComposerActionsSubmit",
+            Self::ComposerName(..) => "ComposerName",
+            Self::BranchPicker(..) => "BranchPicker",
+            Self::ChangesPicker(..) => "ChangesPicker",
+            Self::ChangeFiles(..) => "ChangeFiles",
+            Self::ChangeSelect(..) => "ChangeSelect",
+            Self::ChangeBack(..) => "ChangeBack",
+            Self::ChangeListScrolled(..) => "ChangeListScrolled",
+            Self::ChangePatches(..) => "ChangePatches",
+            Self::ChangePatch(..) => "ChangePatch",
+            Self::ChangesLoaded(..) => "ChangesLoaded",
+            Self::Files(..) => "Files",
+            Self::Find(..) => "Find",
+            Self::FindNext(..) => "FindNext",
+            Self::FindAvailable => "FindAvailable",
+            Self::FindRetry(..) => "FindRetry",
+            Self::FindGroups(..) => "FindGroups",
+            Self::FindHighlight(..) => "FindHighlight",
+            Self::FindHighlighted(..) => "FindHighlighted",
+            Self::FindResume(..) => "FindResume",
+            Self::FindExpired(..) => "FindExpired",
+            Self::FindIndexed(..) => "FindIndexed",
+            Self::FindLocated(..) => "FindLocated",
+            Self::CloseFind(..) => "CloseFind",
+            Self::Tick => "Tick",
+            Self::ClearCopied(..) => "ClearCopied",
+            Self::DropHover(..) => "DropHover",
+            Self::Attach(..) => "Attach",
+            Self::Attached(..) => "Attached",
+            Self::Dropped(..) => "Dropped",
+            Self::RemoveAttachment(..) => "RemoveAttachment",
+            Self::Model(..) => "Model",
+            Self::Reasoning(..) => "Reasoning",
+            Self::PermissionMode(..) => "PermissionMode",
+            Self::PermissionRetry(..) => "PermissionRetry",
+            Self::PermissionDismiss(..) => "PermissionDismiss",
+            Self::PermissionPage(..) => "PermissionPage",
+            Self::PermissionRuleText(..) => "PermissionRuleText",
+            Self::PermissionBehavior(..) => "PermissionBehavior",
+            Self::PermissionEnvironmentText(..) => "PermissionEnvironmentText",
+            Self::PermissionSetting(..) => "PermissionSetting",
+            Self::Field(..) => "Field",
+            Self::Choice(..) => "Choice",
+            Self::Answer(..) => "Answer",
+            Self::Complete(..) => "Complete",
+            Self::AcceptSuggestion(..) => "AcceptSuggestion",
+            Self::CompletionMove(..) => "CompletionMove",
+            Self::CompletionDismiss(..) => "CompletionDismiss",
+            Self::CompletionScrolled(..) => "CompletionScrolled",
+            Self::HandoffFinished(..) => "HandoffFinished",
+            Self::CloseFinished(..) => "CloseFinished",
+            Self::RetainedCloseFinished(..) => "RetainedCloseFinished",
+            Self::CloseHolders(..) => "CloseHolders",
+            Self::EndCloseHolders(..) => "EndCloseHolders",
+            Self::CloseHoldersEnded(..) => "CloseHoldersEnded",
+            Self::DismissCloseRefusal(..) => "DismissCloseRefusal",
+            Self::Scrolled(..) => "Scrolled",
+            Self::ModelPicker(..) => "ModelPicker",
+            Self::ReasoningPicker(..) => "ReasoningPicker",
+            Self::PermissionPicker(..) => "PermissionPicker",
+            Self::ModelQuery(..) => "ModelQuery",
+        }
+    }
+
     pub(super) fn allowed_while_modal(&self) -> bool {
         matches!(
             self,
@@ -8388,10 +8702,20 @@ impl Cagents {
                 }
             }
         }
-        if self.cards.values().any(|card| {
-            matches!(card, CardRuntime::Chat(runtime) if runtime.visible.load(Ordering::Relaxed))
-        }) {
+        // A freed slot matters only to work waiting for one, so the signal is
+        // not delivered, and the whole update run, for every finished job.
+        let visible = || {
+            self.cards.values().filter_map(|card| match card {
+                CardRuntime::Chat(runtime) if runtime.visible.load(Ordering::Relaxed) => {
+                    Some(runtime)
+                }
+                _ => None,
+            })
+        };
+        if visible().any(|runtime| flow_layout::has_deferred(runtime.target)) {
             subscriptions.push(flow_layout::availability());
+        }
+        if visible().any(|runtime| runtime.find.is_some()) {
             subscriptions.push(find_navigation::availability());
         }
         if self.cards.values().any(|card| {
@@ -10461,6 +10785,25 @@ impl Cagents {
             Message::ChatUi(Action::CommandFinished(target, id, result))
         })
     }
+    /// [`Self::handle_chat_ui`] for the update loop, which also answers how
+    /// much of the workspace projection the action changed.
+    ///
+    /// A visible streaming conversation brings several actions per
+    /// presentation: its wake, then the layouts, prose and Find work the new
+    /// text starts. Each confines itself to the conversation's own runtime
+    /// unless it changes the facts [`ProjectionInputs`] holds, so it reports
+    /// [`Projection::Unchanged`] then, rather than rebuilding every card's
+    /// sidebar row and chrome. `None` leaves the update's own choice.
+    pub(super) fn update_chat_ui(&mut self, action: Action) -> (Task<Message>, Option<Projection>) {
+        let Some(scope) = action.local_scope() else {
+            return (self.handle_chat_ui(action), None);
+        };
+        let before = ProjectionInputs::capture(self, scope);
+        let task = self.handle_chat_ui(action);
+        let projection = before.projection(&ProjectionInputs::capture(self, scope));
+        (task, Some(projection))
+    }
+
     pub(super) fn handle_chat_ui(&mut self, action: Action) -> Task<Message> {
         let closed_refresh = match &action {
             Action::Ready(target, _) => Some(target.card),
@@ -16375,6 +16718,102 @@ mod tests {
         snapshot.items.clear();
         assert!(observation.observe(&snapshot).is_none());
         assert!(observation.title.is_none());
+    }
+
+    /// A streaming answer changes only its conversation's transcript, so its
+    /// wakes and the background work they start skip the workspace
+    /// projection; a wake that changes what the sidebar shows still takes it.
+    #[test]
+    fn streaming_wakes_skip_the_workspace_projection() {
+        use crate::agent_execution::directory::UsageLimit;
+        use crate::app::terminal_output_tests::projections;
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let handle = chat_runtime(&app, card).handle().unwrap().clone();
+        let mut answer = String::new();
+        let mut stream = |app: &mut Cagents, delta: &str| {
+            answer.push_str(delta);
+            let mut snapshot = (*handle.snapshot()).clone();
+            snapshot.generation += 1;
+            snapshot.items.retain(|item| item.id != "answer");
+            snapshot.items.push(
+                chat::Item {
+                    id: "answer".into(),
+                    role: chat::Role::Assistant,
+                    content: text(&answer),
+                    started_at: None,
+                    at: None,
+                }
+                .into(),
+            );
+            handle.publish_snapshot_for_test(snapshot);
+            drop(app.update(Message::ChatUi(Action::Wake(target, Wake::Changed))));
+        };
+        // The first wake finishes attaching the conversation.
+        stream(&mut app, "Streaming");
+        let before = projections();
+        for delta in [" answers", " arrive", " in", " small", " deltas."] {
+            stream(&mut app, delta);
+            drop(app.update(Message::ChatUi(Action::FlowAvailable)));
+            drop(app.update(Message::ChatUi(Action::PreparationAvailable)));
+            drop(app.update(Message::ChatUi(Action::Tick)));
+        }
+        // Typing alongside the stream stays in the conversation too.
+        for character in "next".chars() {
+            drop(app.update(Message::ChatUi(Action::Composer(
+                target,
+                text_editor::Action::Edit(text_editor::Edit::Insert(character)),
+            ))));
+        }
+        assert_eq!(chat_runtime(&app, card).composer.text(), "next");
+        assert_eq!(projections(), before);
+        // Nothing the skipped projections would have shown is missing.
+        let sidebar = app.sidebar_model.clone();
+        app.refresh_sidebar_channels();
+        app.refresh_sidebar_worktree_panes();
+        assert_eq!(app.sidebar_model, sidebar);
+        // A pane name the provider reports reaches the tab through the
+        // chrome alone.
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.title = Some("Renamed by the provider".into());
+        handle.publish_snapshot_for_test(snapshot);
+        drop(app.update(Message::ChatUi(Action::Wake(target, Wake::Changed))));
+        assert_eq!(
+            app.card_state(card).unwrap().title,
+            "Renamed by the provider"
+        );
+        assert!(
+            app.card_chrome[&card]
+                .tooltip
+                .contains("Renamed by the provider")
+        );
+        assert_eq!(projections(), before);
+        // Every delta still reached the conversation.
+        assert_eq!(
+            chat_runtime(&app, card).snapshot.generation,
+            handle.snapshot().generation
+        );
+
+        handle.judge_limit_for_test(Some(UsageLimit {
+            summary: "Claude weekly limit reached".into(),
+            reset: None,
+            resets_at: None,
+        }));
+        drop(app.update(Message::ChatUi(Action::Wake(target, Wake::Limit))));
+        assert_eq!(projections(), before + 1);
+        assert_eq!(
+            app.sidebar_state.card_attention(card).state(),
+            Some(crate::sidebar::AttentionState::Limited)
+        );
+    }
+
+    #[test]
+    fn chat_actions_name_their_variant_without_their_payload() {
+        let action = Action::OpenUrl("https://example.com/?token=secret".into());
+        assert_eq!(format!("{action:?}"), "OpenUrl");
+        assert_eq!(format!("{:?}", Action::FlowAvailable), "FlowAvailable");
     }
 
     /// A message card names the agent it reached by the address the daemon
@@ -29022,7 +29461,6 @@ mod tests {
         // Named as its tab names it.
         let tab = app
             .repository_chrome(app.card_state(id).unwrap())
-            .0
             .into_owned();
         assert_eq!(
             errors(&app),
