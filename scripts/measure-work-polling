@@ -7,11 +7,11 @@
 #
 # BIN_DIR holds a matched `cagents` and `cagentsd`. The fixture project has
 # WORKTREES (default 250) worktrees of 40 tracked directories each, more than
-# the watcher's directory budget, and ACTIVE (default 3) of them have a fresh
-# edit. The fixture project also has a few edits outside the active window.
-# After the first scans settle, it counts the `git status` reads the
-# daemon starts and the CPU its exited children used over SECONDS (default
-# 120). Nothing outside the fixture is touched.
+# the watcher's directory budget. ACTIVE (default 3) of them have a fresh edit
+# and ten more an edit outside the active window. Once the board has read
+# every worktree, it counts the `git status` reads the daemon starts and the
+# CPU its exited children used over SECONDS (default 300). Nothing outside the
+# fixture is touched.
 set -euo pipefail
 
 if [ "${CAGENTS_AGENT_AUTHORITY+x}" ]; then
@@ -19,18 +19,20 @@ if [ "${CAGENTS_AGENT_AUTHORITY+x}" ]; then
     exit 77
 fi
 if [ $# -lt 1 ] || [ $# -gt 4 ]; then
-    sed -n '2,13p' "$0" >&2
+    sed -n '2,14p' "$0" >&2
     exit 2
 fi
 bin=$(realpath "$1")
 worktrees=${2:-250}
-seconds=${3:-120}
+seconds=${3:-300}
 active=${4:-3}
 [ -x "$bin/cagents" ] && [ -x "$bin/cagentsd" ] || {
     printf 'No matched cagents and cagentsd in %s\n' "$bin" >&2
     exit 2
 }
 checkout=$(cd "$(dirname "$0")/.." && pwd)
+budget=$(sed -n 's/^const MAX_DIRECTORIES: usize = \([0-9]*\);$/\1/p' "$checkout/src/git_watch.rs")
+[ -n "$budget" ] || { printf '%s\n' 'The watcher budget was not found in src/git_watch.rs' >&2; exit 2; }
 root=$(mktemp -d "$HOME/.local/state/work-polling.XXXXXX")
 # Unix socket paths are short: keep the runtime beneath the real one.
 runtime=$(mktemp -d "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/wp.XXXXXX")
@@ -60,6 +62,9 @@ trap cleanup EXIT
 
 project="$root/project"
 git init -q --initial-branch=main "$project"
+# Otherwise the primary checkout reports the worktrees as untracked, fresh
+# edits and so counts as active.
+printf '/.worktrees/\n' >> "$project/.git/info/exclude"
 for directory in $(seq -w 1 40); do
     mkdir -p "$project/src/d$directory"
     printf '%s\n' "$directory" > "$project/src/d$directory/file.txt"
@@ -70,6 +75,15 @@ git -C "$project" -c user.name=fixture -c user.email=fixture@example.test \
 for index in $(seq 1 "$worktrees"); do
     git -C "$project" worktree add -q -b "w$index" "$project/.worktrees/w$index"
 done
+# The watcher needs one watch per tracked directory, root included, in every
+# checkout. Within its budget the project is watched, not polled.
+per_checkout=$(git -C "$project" ls-files | awk -F/ '{p=""; for (i = 1; i < NF; i++) {p = p $i "/"; print p}}' | sort -u | wc -l)
+directories=$(( (worktrees + 1) * (per_checkout + 1) ))
+if [ "$directories" -le "$budget" ]; then
+    printf '%s directories fit the watcher budget of %s; use more worktrees\n' \
+        "$directories" "$budget" >&2
+    exit 2
+fi
 # Old edits: dirty, but outside the active window.
 for index in $(seq $((active + 1)) $((active + 10))); do
     [ "$index" -le "$worktrees" ] || break
@@ -81,52 +95,64 @@ for index in $(seq 1 "$active"); do
     printf 'edit\n' >> "$project/.worktrees/w$index/src/d01/file.txt"
 done
 fixture "$bin/cagents" project open "$project" >/dev/null
-# The board learns of the project within a model refresh, then reads every
-# worktree once.
-printf 'worktrees=%s active=%s; waiting 90 s for the first scans\n' "$worktrees" "$active"
-sleep 90
 daemon=$(fixture_processes | while read -r pid; do
     if [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = cagentsd ]; then echo "$pid"; fi
 done | head -n 1)
 [ -n "$daemon" ] || { printf '%s\n' 'The fixture daemon is not running' >&2; exit 1; }
-python3 -I - "$daemon" "$seconds" <<'EOF'
+printf 'worktrees=%s active=%s directories=%s budget=%s\n' \
+    "$worktrees" "$active" "$directories" "$budget"
+python3 -I - "$daemon" "$seconds" "$((worktrees + 1))" <<'EOF'
 import glob, os, sys, time
 
-daemon, seconds = sys.argv[1], float(sys.argv[2])
+daemon, seconds, checkouts = sys.argv[1], float(sys.argv[2]), int(sys.argv[3])
 ticks = os.sysconf("SC_CLK_TCK")
+seen = set()
+
 
 def times():
     fields = open(f"/proc/{daemon}/stat").read().rsplit(")", 1)[1].split()
-    own = int(fields[11]) + int(fields[12])
-    children = int(fields[13]) + int(fields[14])
-    return own, children
+    return int(fields[11]) + int(fields[12]), int(fields[13]) + int(fields[14])
 
-seen, statuses = set(), 0
-own, children = times()
-end = time.monotonic() + seconds
-while time.monotonic() < end:
-    for task in glob.glob(f"/proc/{daemon}/task/*/children"):
-        try:
-            pids = open(task).read().split()
-        except OSError:
-            continue
-        for pid in pids:
-            if pid in seen:
-                continue
+
+def watch(until, stop=None):
+    """Git processes and status reads the daemon starts before `until`."""
+    git = statuses = 0
+    while time.monotonic() < until and not (stop and stop(statuses)):
+        for task in glob.glob(f"/proc/{daemon}/task/*/children"):
             try:
-                arguments = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")
+                pids = open(task).read().split()
             except OSError:
                 continue
-            # Caught between fork and exec: look again next pass.
-            if not arguments or arguments[0] != b"git":
-                continue
-            seen.add(pid)
-            statuses += b"status" in arguments
-    time.sleep(0.002)
+            for pid in pids:
+                if pid in seen:
+                    continue
+                try:
+                    arguments = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")
+                except OSError:
+                    continue
+                # Caught between fork and exec: look again next pass.
+                if not arguments or arguments[0] != b"git":
+                    continue
+                seen.add(pid)
+                git += 1
+                statuses += b"status" in arguments
+        time.sleep(0.002)
+    return git, statuses
+
+
+# The board learns of the project within a model refresh, then reads every
+# checkout once. Measure only after that first read.
+started = time.monotonic()
+_, first = watch(started + 600, lambda statuses: statuses >= checkouts)
+if first < checkouts:
+    sys.exit(f"the board read {first} of {checkouts} checkouts in 600 s")
+print(f"first read of every checkout took {time.monotonic() - started:.0f} s")
+own, children = times()
+git, statuses = watch(time.monotonic() + seconds)
 now_own, now_children = times()
-print(f"seconds={seconds:g} git={len(seen)} status={statuses}")
+print(f"seconds={seconds:g} git={git} status={statuses}")
 print(f"git status per second {statuses / seconds:.2f}")
-print(f"git processes per second {len(seen) / seconds:.2f}")
+print(f"git processes per second {git / seconds:.2f}")
 print(f"exited children cpu % core {100 * (now_children - children) / ticks / seconds:.2f}")
 print(f"daemon cpu % core {100 * (now_own - own) / ticks / seconds:.2f}")
 EOF

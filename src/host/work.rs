@@ -473,6 +473,50 @@ impl Shared {
         )
     }
 
+    /// Adds each due poll to its project's pending change. A project still
+    /// scanning is left until its scan publishes: its facts predate that
+    /// scan, which may already be reading the same worktrees.
+    fn queue_polls(&mut self, now: Instant) {
+        let polls = self
+            .projects
+            .iter()
+            .filter(|(_, tracked)| !tracked.scanning)
+            .filter_map(|(repository, tracked)| {
+                Some((repository.clone(), self.due_polls(tracked, now)?))
+            })
+            .collect::<Vec<_>>();
+        for (repository, worktrees) in polls {
+            let tracked = self.projects.get_mut(&repository).expect("listed above");
+            tracked
+                .pending
+                .get_or_insert_with(Default::default)
+                .merge(git_watch::Change {
+                    worktrees,
+                    ..git_watch::Change::default()
+                });
+        }
+    }
+
+    /// How long until some project needs the scanner: a pending scan once
+    /// its spacing allows, otherwise its next poll. A scanning project's
+    /// worker wakes the scanner when it is done.
+    fn until_scan(&self, now: Instant) -> Option<Duration> {
+        self.projects
+            .values()
+            .filter(|tracked| !tracked.scanning)
+            .filter_map(|tracked| {
+                if tracked.pending.is_some() {
+                    let since = tracked
+                        .last_scan
+                        .map_or(Duration::MAX, |last| now.saturating_duration_since(last));
+                    Some(tracked.spacing().saturating_sub(since))
+                } else {
+                    Some(self.next_poll(tracked)?.saturating_duration_since(now))
+                }
+            })
+            .min()
+    }
+
     fn worktree_due(&self, worktree: &scan::Worktree, last_scan: Instant) -> Instant {
         let interval = if self.worktree_active(worktree) {
             ACTIVE_POLL
@@ -1625,24 +1669,7 @@ impl Scanner {
     fn dispatch(&mut self, handle: &Handle) {
         let jobs = {
             let mut shared = handle.shared();
-            let now = Instant::now();
-            let polls = shared
-                .projects
-                .iter()
-                .filter_map(|(repository, tracked)| {
-                    Some((repository.clone(), shared.due_polls(tracked, now)?))
-                })
-                .collect::<Vec<_>>();
-            for (repository, worktrees) in polls {
-                let tracked = shared.projects.get_mut(&repository).expect("listed above");
-                tracked
-                    .pending
-                    .get_or_insert_with(Default::default)
-                    .merge(git_watch::Change {
-                        worktrees,
-                        ..git_watch::Change::default()
-                    });
-            }
+            shared.queue_polls(Instant::now());
             shared
                 .projects
                 .iter_mut()
@@ -1711,21 +1738,8 @@ impl Scanner {
                     .map_or(Duration::ZERO, |refreshed| refreshed.elapsed()),
             ),
         );
-        for tracked in shared.projects.values() {
-            let since = tracked
-                .last_scan
-                .map_or(Duration::MAX, |last| last.elapsed());
-            // A scanning project's worker wakes this thread when it is done.
-            if tracked.pending.is_some() && !tracked.scanning {
-                next = next.min(tracked.spacing().saturating_sub(since));
-            }
-            // A pending scan waits only for its spacing, above.
-            if !tracked.scanning
-                && tracked.pending.is_none()
-                && let Some(poll) = shared.next_poll(tracked)
-            {
-                next = next.min(poll.saturating_duration_since(Instant::now()));
-            }
+        if let Some(scan) = shared.until_scan(Instant::now()) {
+            next = next.min(scan);
         }
         next.max(Duration::from_millis(100))
     }
@@ -2080,13 +2094,8 @@ mod tests {
         assert!(tracked.live_pin("unknown-layout"));
     }
 
-    #[test]
-    fn an_unwatched_project_polls_only_its_due_worktrees() {
-        let handle = polling_handle();
-        let mut shared = handle.shared();
-        let now = Instant::now();
-        let ago = |seconds| now - Duration::from_secs(seconds);
-        let worktree = |path: &str, read: Instant, modified: Option<u64>| scan::Worktree {
+    fn polled_worktree(path: &str, read: Instant, modified: Option<u64>) -> scan::Worktree {
+        scan::Worktree {
             id: WorktreeId::new(),
             path: path.into(),
             primary: false,
@@ -2103,45 +2112,64 @@ mod tests {
             link: None,
             error: None,
             status_read_at: Some(read),
-        };
+        }
+    }
+
+    fn track_polled(
+        shared: &mut Shared,
+        worktrees: Vec<scan::Worktree>,
+        last_scan: Instant,
+    ) -> &mut Tracked {
+        let mut local = scan::Local::default();
+        local.worktrees = worktrees;
+        let tracked = shared.track(Path::new("/repo"), "repo");
+        tracked.local = Some(Arc::new(local));
+        tracked.last_scan = Some(last_scan);
+        tracked.pending = None;
+        tracked
+    }
+
+    #[test]
+    fn an_unwatched_project_polls_only_its_due_worktrees() {
+        let handle = polling_handle();
+        let mut shared = handle.shared();
+        let start = Instant::now();
+        let at = |seconds| start + Duration::from_secs(seconds);
         // An agent edits one checkout; another has a live session; the rest
-        // of a large project sits untouched.
-        let edited = worktree("/repo/.worktrees/edited", ago(16), Some(now_unix_ms()));
-        let session = worktree("/repo/.worktrees/session", ago(16), None);
+        // of a large project sits untouched, most of it read more recently.
+        let edited = polled_worktree("/repo/.worktrees/edited", start, Some(now_unix_ms()));
+        let session = polled_worktree("/repo/.worktrees/session", start, None);
+        let nearly_due = polled_worktree("/repo/.worktrees/nearly-due", start, None);
         let quiet = (0..300)
-            .map(|index| worktree(&format!("/repo/.worktrees/quiet-{index}"), ago(16), None))
+            .map(|index| polled_worktree(&format!("/repo/.worktrees/quiet-{index}"), at(94), None))
             .collect::<Vec<_>>();
-        let nearly_due = worktree("/repo/.worktrees/nearly-due", ago(110), None);
         shared
             .session_activity
             .insert(session.path.clone(), now_unix_ms());
-        let mut local = scan::Local::default();
-        local.worktrees = [edited.clone(), session.clone(), nearly_due.clone()]
+        let worktrees = [edited.clone(), session.clone(), nearly_due.clone()]
             .into_iter()
             .chain(quiet)
             .collect();
-        let tracked = shared.track(Path::new("/repo"), "repo");
-        tracked.local = Some(Arc::new(local));
-        tracked.last_scan = Some(ago(16));
+        track_polled(&mut shared, worktrees, at(94));
         let tracked = &shared.projects[Path::new("/repo")];
 
         assert_eq!(
-            shared.due_polls(tracked, now),
+            shared.next_poll(tracked),
+            Some(at(15)),
+            "the next poll is the earliest worktree's"
+        );
+        assert_eq!(shared.due_polls(tracked, at(14)), None);
+        assert_eq!(
+            shared.due_polls(tracked, at(110)),
             Some(BTreeSet::from([edited.id, session.id, nearly_due.id])),
             "only active worktrees poll at the active cadence; one about to \
              come due joins them"
         );
-        assert_eq!(shared.due_polls(tracked, ago(2)), None);
-        assert_eq!(
-            shared.next_poll(tracked),
-            Some(ago(1)),
-            "the next poll is the earliest worktree's"
-        );
-
         // The quiet worktrees still come due at the idle cadence.
-        let later = ago(16) + IDLE_POLL;
         assert_eq!(
-            shared.due_polls(tracked, later).map(|due| due.len()),
+            shared
+                .due_polls(tracked, at(94) + IDLE_POLL)
+                .map(|due| due.len()),
             Some(303)
         );
     }
@@ -2151,31 +2179,10 @@ mod tests {
         let handle = polling_handle();
         let mut shared = handle.shared();
         let now = Instant::now();
-        let mut local = scan::Local::default();
-        local.worktrees = (0..3)
-            .map(|index| scan::Worktree {
-                id: WorktreeId::new(),
-                path: format!("/repo/{index}").into(),
-                primary: index == 0,
-                locked: false,
-                created_at_unix_ms: None,
-                branch: None,
-                head: None,
-                comparison: None,
-                dirty: Some(crate::work::Dirty {
-                    paths: 1,
-                    conflicted: 0,
-                    newest_modified_at_unix_ms: Some(now_unix_ms()),
-                }),
-                link: None,
-                error: None,
-                status_read_at: Some(now),
-            })
+        let worktrees = (0..3)
+            .map(|index| polled_worktree(&format!("/repo/{index}"), now, Some(now_unix_ms())))
             .collect();
-        let tracked = shared.track(Path::new("/repo"), "repo");
-        tracked.local = Some(Arc::new(local));
-        tracked.last_scan = Some(now);
-        tracked.covered = true;
+        track_polled(&mut shared, worktrees, now).covered = true;
         let tracked = &shared.projects[Path::new("/repo")];
         assert_eq!(shared.next_poll(tracked), Some(now + WATCHED_POLL));
         assert_eq!(shared.due_polls(tracked, now + ACTIVE_POLL), None);
@@ -2184,6 +2191,59 @@ mod tests {
                 .due_polls(tracked, now + WATCHED_POLL)
                 .map(|due| due.len()),
             Some(3)
+        );
+    }
+
+    #[test]
+    fn a_scanning_project_queues_its_polls_only_after_the_scan_publishes() {
+        let handle = polling_handle();
+        let mut shared = handle.shared();
+        let start = Instant::now();
+        let edited = polled_worktree("/repo/edited", start, Some(now_unix_ms()));
+        let quiet = polled_worktree("/repo/quiet", start, None);
+        track_polled(&mut shared, vec![edited.clone(), quiet], start).scanning = true;
+        let due = start + ACTIVE_POLL;
+
+        // The facts predate the running scan, which may be reading the same
+        // worktrees: queuing them now would read them again after it.
+        shared.queue_polls(due);
+        assert!(shared.projects[Path::new("/repo")].pending.is_none());
+        assert_eq!(
+            shared.until_scan(due),
+            None,
+            "its worker wakes the scanner when it is done"
+        );
+
+        let tracked = shared.projects.get_mut(Path::new("/repo")).unwrap();
+        tracked.scanning = false;
+        shared.queue_polls(due);
+        assert_eq!(
+            shared.projects[Path::new("/repo")]
+                .pending
+                .as_ref()
+                .map(|change| change.worktrees.clone()),
+            Some(BTreeSet::from([edited.id]))
+        );
+    }
+
+    #[test]
+    fn a_pending_scan_waits_for_its_spacing_rather_than_the_poll() {
+        let handle = polling_handle();
+        let mut shared = handle.shared();
+        let start = Instant::now();
+        let edited = polled_worktree("/repo/edited", start, Some(now_unix_ms()));
+        track_polled(&mut shared, vec![edited], start);
+        assert_eq!(shared.until_scan(start), Some(ACTIVE_POLL));
+
+        // A poll already queued but held by the spacing must not keep the
+        // scanner waking for the overdue poll that queued it.
+        let late = start + ACTIVE_POLL + Duration::from_secs(1);
+        shared.queue_polls(late);
+        let tracked = shared.projects.get_mut(Path::new("/repo")).unwrap();
+        tracked.last_scan = Some(start + ACTIVE_POLL);
+        assert_eq!(
+            shared.until_scan(late),
+            Some(SCAN_SPACING - Duration::from_secs(1))
         );
     }
 }

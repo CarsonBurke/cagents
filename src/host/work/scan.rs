@@ -717,6 +717,23 @@ mod tests {
         };
         assert_eq!(dirty(&second, &fixture.root), 1);
         assert_eq!(dirty(&second, &fixture.linked), 1, "not re-read");
+        // Each worktree remembers when its status was last read, which the
+        // board's polls are scheduled from.
+        let read_at = |local: &Local, path: &Path| {
+            local
+                .worktrees
+                .iter()
+                .find(|worktree| worktree.path == path)
+                .unwrap()
+                .status_read_at
+                .unwrap()
+        };
+        assert!(read_at(&second, &fixture.root) > read_at(&first, &fixture.root));
+        assert_eq!(
+            read_at(&second, &fixture.linked),
+            read_at(&first, &fixture.linked),
+            "carried forward with the status it dates"
+        );
         let third = run(
             &fixture,
             Some(&second),
@@ -726,6 +743,7 @@ mod tests {
             },
         );
         assert_eq!(dirty(&third, &fixture.linked), 0);
+        assert!(read_at(&third, &fixture.linked) > read_at(&second, &fixture.linked));
 
         // A shared ref change re-reads the worktree whose head it moved and
         // carries the others forward.
